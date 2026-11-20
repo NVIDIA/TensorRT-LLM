@@ -703,6 +703,9 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._gpu_match_len = None
         self._gpu_draft_tokens = None
         self._gpu_batch_indices = None
+        self._gpu_nondummy_mask = None
+        self._cpu_batch_indices = None
+        self._cpu_nondummy_mask = None
         self._gpu_active_slot_mask = None
         self._gpu_match_slot = None
         self._pending_mask_updates.clear()

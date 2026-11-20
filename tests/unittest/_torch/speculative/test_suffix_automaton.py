@@ -93,6 +93,11 @@ class TestSuffixAutomatonManager:
         draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
         assert draft_list == [0, 0, 0, 0], f"Expected zeroed draft, got {draft_list}"
 
+        manager.shutdown()
+        assert manager._gpu_nondummy_mask is None
+        assert manager._cpu_batch_indices is None
+        assert manager._cpu_nondummy_mask is None
+
     def test_global_pool_size_below_max_requests_rejected(self, make_manager):
         """global_pool_size smaller than max_num_requests must be rejected."""
         config = SAConfig(
