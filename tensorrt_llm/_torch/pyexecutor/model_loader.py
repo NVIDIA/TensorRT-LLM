@@ -974,6 +974,13 @@ def _copy_weights_into_model(model_load_weights: Callable[..., None],
             torch.cuda.synchronize()
 
 
+def _model_reads_own_checkpoint(model: Any) -> bool:
+    """Whether the model defines `load_checkpoint(checkpoint_dir)` and reads its
+    checkpoint's files itself, so the checkpoint loader opens nothing and no
+    weight mapper applies."""
+    return getattr(type(model), "load_checkpoint", None) is not None
+
+
 def load_model_from_auto_load_format(
     checkpoint_loader: BaseCheckpointLoader,
     checkpoint_dir: str,
@@ -987,7 +994,7 @@ def load_model_from_auto_load_format(
     qualification: PostTransformQualificationDecision,
     metrics: dict[str, float],
     startup_metadata: _CheckpointStartupMetadata,
-) -> tuple[BaseWeightMapper, bool]:
+) -> tuple[Optional[BaseWeightMapper], bool]:
     """Load the target and any separate draft checkpoint for ``LoadFormat.AUTO``.
 
     The model is already built and has CUDA memory; post-load hooks run
@@ -995,6 +1002,8 @@ def load_model_from_auto_load_format(
 
     Built-in and custom checkpoint loaders, including custom weight loaders,
     read the checkpoint here.
+    A model that defines ``load_checkpoint(checkpoint_dir)`` reads its target
+    checkpoint itself; the checkpoint loader opens none of its files.
 
     Args:
         checkpoint_loader: checkpoint loader of this load
@@ -1011,8 +1020,9 @@ def load_model_from_auto_load_format(
             policy of the target and draft reads is recorded in place
 
     Returns:
-        The target weight mapper, and whether the checkpoint loader wrote
-        the target weights into the model directly (MX P2P).
+        The target weight mapper (None for a model that reads its checkpoint
+        itself), and whether the checkpoint loader wrote the target weights
+        into the model directly (MX P2P).
     """
     # load target weights
     weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
@@ -1026,20 +1036,31 @@ def load_model_from_auto_load_format(
             mx_loading.get_mx_load_weights_kwargs(model_config=model_config,
                                                   llm_args=llm_args,
                                                   qualification=qualification))
-    weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-        model, model_config)
-    startup_metadata["checkpoint_io_policy"] = _load_checkpoint_into_model(
-        checkpoint_loader,
-        weights_checkpoint_dir,
-        model=model,
-        is_draft_model=False,
-        mapping=mapping,
-        weight_mapper=weight_mapper,
-        extra_load_weights_kwargs=target_load_weights_kwargs,
-        metrics=metrics)
-    # Read before the draft load: an MX draft read without MX state resets
-    # this flag.
-    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+    if _model_reads_own_checkpoint(model):
+        weight_mapper = None
+        startup_metadata["checkpoint_io_policy"] = None
+        with timing_metric(
+                ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
+                metrics):
+            model.load_checkpoint(weights_checkpoint_dir)
+            if torch.cuda.is_available():  # CPU guard
+                torch.cuda.synchronize()
+        weights_preloaded = False
+    else:
+        weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+            model, model_config)
+        startup_metadata["checkpoint_io_policy"] = _load_checkpoint_into_model(
+            checkpoint_loader,
+            weights_checkpoint_dir,
+            model=model,
+            is_draft_model=False,
+            mapping=mapping,
+            weight_mapper=weight_mapper,
+            extra_load_weights_kwargs=target_load_weights_kwargs,
+            metrics=metrics)
+        # Read before the draft load: an MX draft read without MX state
+        # resets this flag.
+        weights_preloaded = checkpoint_loader.is_weights_preloaded()
 
     # load separate draft weights
     if spec_config is not None and spec_config.needs_separate_draft_weights:
@@ -1590,11 +1611,8 @@ class ModelLoader:
                     self.spec_config.speculative_model)
 
         elif load_format == LoadFormat.DUMMY:
-            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                model, model_config)
-            initialize_dummy_weights(model)
-            if loads_draft_weights:
-                model.draft_model.load_weights_from_target_model(model)
+            self._initialize_dummy_weights(checkpoint_loader, model,
+                                           model_config, loads_draft_weights)
 
         elif load_format == LoadFormat.VISION_ONLY:
             # Vision weights are already loaded within the model.
@@ -1773,6 +1791,16 @@ class ModelLoader:
                                f"{self._checkpoint_loader!r}: {exc!r}")
             finally:
                 self._checkpoint_loader = None
+
+    def _initialize_dummy_weights(self, checkpoint_loader, model, config,
+                                  loads_draft_weights: bool) -> None:
+        """Fill the model with dummy weights instead of reading a checkpoint."""
+        if not _model_reads_own_checkpoint(model):
+            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                model, config)
+        initialize_dummy_weights(model)
+        if loads_draft_weights:
+            model.draft_model.load_weights_from_target_model(model)
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,

@@ -65,6 +65,9 @@ l0_cpu:
   # catches a pruned reference before the post-merge canary does.
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
+  - unittest/test_ruler_accuracy.py
+  - unittest/test_mmmu_accuracy.py
+  - unittest/test_multimodal_accuracy.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
   # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a
@@ -199,6 +202,11 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
+  # mistral_large4 targets' cpu_only tests (weight manifests, engine configs, tiny-config
+  # slicing and loading). Run with -m cpu_only, this entry collects only the marked files; the
+  # rest of unittest/_torch/modeling_v2 needs a GPU. Cases that read the checkpoint skip when it
+  # is not under LLM_MODELS_ROOT.
+  - unittest/_torch/modeling_v2/models/mistral_large4
   - unittest/_torch/models/test_minimax_m3.py
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py::test_sparse_moe_keeps_shared_expert_tokens_unpadded
   # MiniMax-M3 VL input processor and wrapper forward; the CPU stage's -m cpu_only
@@ -209,6 +217,7 @@ l0_cpu:
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
+  - unittest/_torch/misc/test_tekken_guided_decoding.py
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -352,6 +361,7 @@ l0_cpu:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/test_disagg_worker_role.py
+  - unittest/llmapi/test_tokenizer_factory_mistral.py
   - unittest/llmapi/test_session_reuse.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py

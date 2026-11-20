@@ -44,6 +44,7 @@ from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
+from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
 from tensorrt_llm._torch.configs.musespark_open import MuseSparkOpenConfig
 from tensorrt_llm._torch.configs.nemotron_h import NemotronHConfig
 from tensorrt_llm._torch.configs.qwen4_exp import (
@@ -168,6 +169,7 @@ __all__ = [
     "LagunaConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
+    "MistralLarge4Config",
     "MuseSparkOpenConfig",
     "NemotronHConfig",
     "Qwen4ExpConfig",

@@ -38,6 +38,7 @@ from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
 from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkForCausalLM
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.model_loader import (
+    ModelLoader,
     _checkpoint_startup_metadata,
     _load_checkpoint_into_model,
     _resolve_checkpoint_io_policy,
@@ -790,6 +791,85 @@ def test_read_ahead_copies_inside_weight_session_and_reports_its_timings(
     # The model loader reports the timings the session recorded.
     assert metrics["checkpoint_preparation_seconds"] == 2.0
     assert metrics["checkpoint_finalization_seconds"] == 3.0
+
+
+def test_model_loader_lets_a_model_read_its_own_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_loader_module.torch.cuda, "is_available", lambda: False)
+    events = []
+
+    class _Model:
+        def load_checkpoint(self, checkpoint_dir):
+            events.append(("load_checkpoint", checkpoint_dir))
+
+    checkpoint_loader = MagicMock(checkpoint_format=CheckpointFormat.MISTRAL)
+    metrics = {}
+    startup_metadata = {"checkpoint_io_policy": "stale"}
+    weight_mapper, weights_preloaded = load_model_from_auto_load_format(
+        checkpoint_loader,
+        "/checkpoint",
+        model_config=object(),
+        model=_Model(),
+        mapping=Mapping(),
+        llm_args=None,
+        spec_config=None,
+        source_identity=None,
+        qualification=None,
+        metrics=metrics,
+        startup_metadata=startup_metadata,
+    )
+
+    assert weight_mapper is None and not weights_preloaded
+    assert events == [("load_checkpoint", "/checkpoint")]
+    checkpoint_loader.get_initialized_weight_mapper.assert_not_called()
+    checkpoint_loader.load_weights.assert_not_called()
+    # No checkpoint loader read the files, so no checkpoint IO policy applied.
+    assert startup_metadata["checkpoint_io_policy"] is None
+    assert "weight_population_seconds" in metrics
+    assert "checkpoint_preparation_seconds" not in metrics
+
+
+@pytest.mark.parametrize("reads_own_checkpoint", [False, True])
+def test_dummy_loading_builds_a_weight_mapper_unless_the_model_reads_its_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, reads_own_checkpoint: bool
+) -> None:
+    filled = []
+    monkeypatch.setattr(
+        model_loader_module, "initialize_dummy_weights", lambda model: filled.append(model)
+    )
+
+    class _Model:
+        pass
+
+    if reads_own_checkpoint:
+        _Model.load_checkpoint = lambda self, checkpoint_dir: None
+    model = _Model()
+    checkpoint_loader = MagicMock()
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.weight_mapper = None
+
+    loader._initialize_dummy_weights(checkpoint_loader, model, object(), False)
+
+    assert filled == [model]
+    if reads_own_checkpoint:
+        checkpoint_loader.get_initialized_weight_mapper.assert_not_called()
+        assert loader.weight_mapper is None
+    else:
+        assert loader.weight_mapper is checkpoint_loader.get_initialized_weight_mapper.return_value
+
+
+def test_dummy_loading_copies_the_draft_weights_from_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_loader_module, "initialize_dummy_weights", lambda model: None)
+    model = MagicMock()
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.weight_mapper = None
+
+    loader._initialize_dummy_weights(MagicMock(), model, object(), True)
+
+    model.draft_model.load_weights_from_target_model.assert_called_once_with(model)
 
 
 def test_shadow_plan_disabled_does_not_call_inspection_hooks(

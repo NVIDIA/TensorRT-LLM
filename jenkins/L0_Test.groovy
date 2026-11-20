@@ -7915,7 +7915,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-KeyModels-Post-Merge-{split}_of_2",
         "auto:gb300-x4",
         "l0_gb300_multi_gpus_perf_sanity_key_models",
-        2,
+        4,
         4,
         1, true
     )
@@ -8017,8 +8017,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge-1_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_node4_gpu16", 1, 1, 16, 4],
         // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
         "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge-3_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32", 1, 1, 32, 8],
-        // GLM-5.3-Flash FP8 8k1k con16: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
-        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-KeyModels-Post-Merge-1_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4_key_models", 1, 1, 8, 2],
+        // GLM-5.3-Flash FP8 8k1k con16 and Mistral Large 4 NVFP4 8k1k con64/256/1024:
+        // ctx1 (1 node, 4 GPUs) + gen1 (1 node, 4 GPUs) = 8 GPUs, one split per build slot
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-KeyModels-Post-Merge-1_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4_key_models", 1, 2, 8, 2],
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-KeyModels-Post-Merge-2_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4_key_models", 2, 2, 8, 2],
         // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge-3_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4", 1, 1, 8, 2],
     ]

@@ -37,10 +37,14 @@ import importlib
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
 
 if TYPE_CHECKING:
+    from tensorrt_llm.sampling_params import GuidedDecodingParams
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 
-RequiredToolChoiceMode = Literal["template", "grammar"]
+# "template": the chat template enforces the call; "grammar": a mandatory
+# structural tag built by the tool parser; "native": the extension's own
+# grammar (see ``ServingExtension.forced_tool_call_decoding``).
+RequiredToolChoiceMode = Literal["template", "grammar", "native"]
 
 
 class OutputMode(enum.Enum):
@@ -123,6 +127,15 @@ class ServingExtension:
         ``model_type`` this extension is registered for.
         """
 
+    def validate_chat_request(
+        self, request: "ChatCompletionRequest", *, max_seq_len: Optional[int]
+    ) -> None:
+        """Refuse a chat request the model cannot serve within the engine's limits.
+
+        Raises ``ValueError`` (a 400 on the routes). The default accepts every
+        request and leaves the limits to the engine.
+        """
+
     def required_tool_choice_mode(self) -> Optional[RequiredToolChoiceMode]:
         """Return the required-tool policy; boolean permission selects template enforcement."""
         return "template" if self.allows_required_tool_choice() else None
@@ -137,6 +150,35 @@ class ServingExtension:
         template default applies. The default forwards the value unchanged.
         """
         return effort
+
+    def forced_tool_call_decoding(
+        self,
+        request: "ChatCompletionRequest",
+        tokenizer: Any,
+        *,
+        tool_parser: Optional[str],
+        guided_decoding_backend: Optional[str],
+    ) -> Optional["GuidedDecodingParams"]:
+        """Guided decoding that forces the call a required or named ``tool_choice`` asks for.
+
+        ``None`` leaves the request to the generic paths: the named-tool begin
+        prefix and the mode :meth:`required_tool_choice_mode` returns. A model
+        whose own grammar describes its tool-call format returns that grammar
+        instead; it replaces both, and cannot be combined with a client-supplied
+        guided-decoding setting. Raises ``ValueError`` for a server configuration
+        the grammar cannot be built for.
+        """
+        return None
+
+    def render_needs_media(self) -> bool:
+        """Whether the prompt renderer needs the request's media loaded first.
+
+        The default renders the chat template while the media loads. A renderer
+        that tokenizes the media itself (it derives the media token count from
+        the decoded item) is handed the loaded ``mm_data`` instead, and cannot
+        take precomputed multimodal embeddings.
+        """
+        return False
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]

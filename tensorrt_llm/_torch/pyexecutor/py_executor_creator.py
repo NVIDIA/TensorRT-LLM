@@ -27,6 +27,7 @@ from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -585,7 +586,26 @@ def _extend_full_attention_windows_for_spec_decode(
 def get_guided_decoding_config(guided_decoding_backend: str,
                                tokenizer: Optional[TokenizerBase] = None):
     guided_decoding_config = None
-    if guided_decoding_backend == 'xgrammar':
+    if (guided_decoding_backend is not None and getattr(
+            type(tokenizer), "xgrammar_tokenizer_info", None) is not None):
+        # A tokenizer with no Hugging Face tokenizer JSON describes its own
+        # vocabulary (Mistral's Tekken: bytes, with separate control tokens).
+        # xgrammar takes it as the byte vocabulary; llguidance takes the
+        # tokenizer itself, which the guided decoder gets from
+        # `_llguidance_tokenizer`.
+        if guided_decoding_backend == 'xgrammar':
+            guided_decoding_config = GuidedDecodingConfig(
+                backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+                **tokenizer.xgrammar_tokenizer_info())
+        elif guided_decoding_backend == 'llguidance':
+            guided_decoding_config = GuidedDecodingConfig(
+                backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
+                stop_token_ids=[tokenizer.eos_token_id])
+        else:
+            raise ValueError(
+                f"Unsupported guided decoding backend {guided_decoding_backend}"
+            )
+    elif guided_decoding_backend == 'xgrammar':
         assert tokenizer is not None
         guided_decoding_config = GuidedDecodingConfig(
             backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
@@ -599,6 +619,66 @@ def get_guided_decoding_config(guided_decoding_backend: str,
         raise ValueError(
             f"Unsupported guided decoding backend {guided_decoding_backend}")
     return guided_decoding_config
+
+
+def _llguidance_tokenizer(guided_decoding_config: GuidedDecodingConfig,
+                          tokenizer: Optional[TokenizerBase],
+                          vocab_size_padded: int):
+    """The ready llguidance tokenizer of a vocabulary with no Hugging Face
+    tokenizer JSON (Mistral's Tekken), or None to build it from the config's
+    `tokenizer_str`."""
+    if (guided_decoding_config.backend
+            != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+            or getattr(type(tokenizer), "llguidance_tokenizer", None) is None):
+        return None
+    return tokenizer.llguidance_tokenizer(vocab_size_padded)
+
+
+def _llguidance_json_schema_lark(guided_decoding_config: GuidedDecodingConfig,
+                                 tokenizer: Optional[TokenizerBase]):
+    """Renders the llguidance grammar of a JSON response for a tokenizer whose
+    structured responses may open with a reasoning section (Mistral's [THINK]),
+    or None to constrain a JSON response from its first token."""
+    if (guided_decoding_config.backend
+            != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+            or getattr(tokenizer, "renders_grammars", False) is not True):
+        return None
+    return tokenizer.llguidance_json_schema_lark
+
+
+def _load_guided_decoding_tokenizer(llm_args: TorchLlmArgs,
+                                    checkpoint_dir: str) -> TokenizerBase:
+    """Load the tokenizer whose vocabulary guided decoding masks, from the checkpoint.
+
+    A Mistral-native checkpoint (``checkpoint_format`` ``mistral`` or
+    ``mistral_large_3``) with a Tekken tokenizer (``tekken.json``) is read
+    through mistral-common, as its input processor reads it, whatever Hugging
+    Face tokenizer files it also ships; guided decoding supports Tekken
+    vocabularies only, so other checkpoints keep their Hugging Face tokenizer.
+    An explicit ``custom_tokenizer`` takes precedence.
+
+    Args:
+        llm_args: The LLM arguments, for ``custom_tokenizer``,
+            ``checkpoint_format`` and ``trust_remote_code``.
+        checkpoint_dir: The checkpoint directory.
+
+    Returns:
+        The loaded tokenizer.
+    """
+    custom_tokenizer = llm_args.custom_tokenizer
+    if (custom_tokenizer is None and llm_args.checkpoint_format
+            in (CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3)
+            and os.path.isfile(os.path.join(checkpoint_dir, "tekken.json"))):
+        custom_tokenizer = "mistral_common"
+    if custom_tokenizer:
+        from tensorrt_llm.tokenizer import load_custom_tokenizer
+        return load_custom_tokenizer(
+            custom_tokenizer,
+            checkpoint_dir,
+            trust_remote_code=llm_args.trust_remote_code)
+    from tensorrt_llm.tokenizer import TransformersTokenizer
+    return TransformersTokenizer.from_pretrained(
+        checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
 
 
 def _load_config_and_create_checkpoint_loader(
@@ -771,19 +851,10 @@ def _create_py_executor(
     # when guided decoding needs it.
     if (tokenizer is None and llm_args.guided_decoding_backend is not None
             and checkpoint_dir is not None):
+        tokenizer = _load_guided_decoding_tokenizer(llm_args, checkpoint_dir)
         logger.info(
-            "Tokenizer not provided; loading from checkpoint for guided decoding"
-        )
-        if llm_args.custom_tokenizer:
-            from tensorrt_llm.tokenizer import load_custom_tokenizer
-            tokenizer = load_custom_tokenizer(
-                llm_args.custom_tokenizer,
-                checkpoint_dir,
-                trust_remote_code=llm_args.trust_remote_code)
-        else:
-            from tensorrt_llm.tokenizer import TransformersTokenizer
-            tokenizer = TransformersTokenizer.from_pretrained(
-                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+            "Tokenizer not provided; loaded "
+            f"{type(tokenizer).__name__} from checkpoint for guided decoding")
 
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
@@ -1233,6 +1304,12 @@ def _create_py_executor(
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
+                kwargs["llguidance_tokenizer"] = _llguidance_tokenizer(
+                    guided_decoding_config, tokenizer,
+                    model_engine.model.vocab_size_padded)
+                kwargs[
+                    "llguidance_json_schema_lark"] = _llguidance_json_schema_lark(
+                        guided_decoding_config, tokenizer)
                 if spec_config is not None:
                     kwargs[
                         "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1

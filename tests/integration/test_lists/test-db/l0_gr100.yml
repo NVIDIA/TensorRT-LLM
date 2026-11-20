@@ -113,6 +113,16 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/ops/moe
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/ops/quantization
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec
+  # The Mistral Large 4 sm_107 targets' own entries: the Rubin MXFP8 linear, the Triton
+  # indexer scorer, the split radix top-k of DSpark verification and sparse MLA decode's
+  # low-row global split. The B300 list reaches the family's op tests too, where the sm_107
+  # cases skip. The sm_107 tp target's own ops (narrow BF16 projections, fused FP8 GEMV)
+  # follow.
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/gemm/test_modeling_v2_cute_dsl_fp8_block_scale_linear.py
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/attention/test_modeling_v2_triton_fp8_mqa_logits.py
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/attention/test_modeling_v2_split_radix_topk_decode.py
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/attention/test_modeling_v2_cute_dsl_ds_mla_sparse_decode.py
+  - unittest/_torch/modeling_v2/models/mistral_large4/mistral_large_4_nvfp4__sm_107__tp
   - unittest/_torch/visual_gen/kernels/parallel/test_fmha_dense_fp8.py
   - unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_qk_norm_rope_fp8.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput

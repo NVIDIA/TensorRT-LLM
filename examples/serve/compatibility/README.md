@@ -15,6 +15,21 @@ This directory contains individual, self-contained examples demonstrating Tensor
    trtllm-serve Qwen/Qwen3-8B --reasoning_parser "qwen3" --tool_parser "qwen3"
    ```
 
+   Native `mistral_large_4` required and named tool choices need the `llguidance`
+   guided-decoding backend. Override an xgrammar serving configuration with:
+
+   ```bash
+   trtllm-serve /path/to/checkpoint --config serve.yaml \
+       --tool_parser mistral_large_4 --reasoning_parser mistral_large_4 \
+       --set guided_decoding_backend=llguidance
+   ```
+
+   Required tool choices allow parallel calls unless the request explicitly sets
+   `parallel_tool_calls` to `false`. Named choices constrain generation to one
+   call, including when `parallel_tool_calls` is `true`, matching the single-call
+   forced-choice post-processing. Native required and named choices return HTTP
+   400 when the server uses xgrammar.
+
 
 ## Running Examples
 
