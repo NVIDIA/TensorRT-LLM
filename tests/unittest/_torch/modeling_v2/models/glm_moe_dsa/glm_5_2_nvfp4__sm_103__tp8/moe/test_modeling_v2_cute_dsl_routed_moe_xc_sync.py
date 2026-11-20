@@ -29,6 +29,8 @@ import pytest
 
 import tensorrt_llm
 
+pytestmark = pytest.mark.cpu_only
+
 _KERNELS = (
     Path(tensorrt_llm.__file__).parent
     / "_torch"
