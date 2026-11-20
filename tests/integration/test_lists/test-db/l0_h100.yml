@@ -58,10 +58,9 @@ l0_h100:
   - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
   # ------------- MoE components tests ---------------
-  - unittest/_torch/moe/test_moe_load_balancer.py
+  # Pre-merge runs the SM-agnostic load balancer and fused DeepGEMM helper tests on B200
+  # (l0_b200), and post-merge here.
   - unittest/_torch/moe/test_moe_routing.py
-  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
-  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   - unittest/_torch/moe/fused_moe/test_triton_fp8_block_scale.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
   # ------------- MoE: test_single_gpu (by backend) ---------------
@@ -463,6 +462,10 @@ l0_h100:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   # ---- non-quantized (quant=None) moved to post-merge ----
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
+  # SM90 runs of the SM-agnostic MoE checks that pre-merge runs on B200 (l0_b200).
+  - unittest/_torch/moe/test_moe_load_balancer.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
+  - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # Documentation link validation (CPU-only, no GPU needed)
   - test_doc.py::test_http_url_validity
   - test_doc.py::test_relative_path_validity
