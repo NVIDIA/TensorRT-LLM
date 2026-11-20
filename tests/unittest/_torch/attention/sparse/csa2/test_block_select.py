@@ -39,7 +39,7 @@ def _block_scores(logits, valid, visible):
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="CSA2 block selection requires SM100, SM103 or SM107",
 )
-@pytest.mark.parametrize("next_n", [6])
+@pytest.mark.parametrize("next_n", [4, 6])
 @torch.inference_mode()
 def test_block_select_matches_topk_decode(monkeypatch, next_n):
     torch.manual_seed(4401 + next_n)
@@ -58,6 +58,7 @@ def test_block_select_matches_topk_decode(monkeypatch, next_n):
     paged = source._paged_mqa_logits
 
     def keep_logits(*args, **kwargs):
+        scored["split_heads"] = metadata.csa2_indexer_split_heads
         logits = paged(*args, **kwargs)
         scored["logits"] = logits.clone()
         return logits
@@ -93,6 +94,7 @@ def test_block_select_matches_topk_decode(monkeypatch, next_n):
         )
         for _ in range(2):
             result = forward()
+        assert scored["split_heads"] == (32 if next_n == 6 or block_select else 0)
         torch.cuda.synchronize()
         return outputs(result)
 

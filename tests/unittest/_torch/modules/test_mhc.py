@@ -3121,10 +3121,13 @@ def test_split_boundary_replicated_coefficients_one_launch() -> None:
         assert torch.equal(got, want)
 
     if sm == 107:
-        # In-place weight writes must reach the captured full-precision mixer.
+        # A replacement must refresh the weight storage held by the captured mixer.
+        captured_weight = module._fma_weight
+        assert captured_weight is not None
         with torch.no_grad():
-            module.fn.mul_(-0.5)
+            module.fn = torch.nn.Parameter(-0.5 * module.fn, requires_grad=module.fn.requires_grad)
             module.cache_derived_state()
+        assert module._fma_weight is captured_weight
         graph.replay()
         torch.cuda.synchronize()
         refreshed = module.hc_coeffs(out[0])

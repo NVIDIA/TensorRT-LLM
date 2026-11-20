@@ -15,6 +15,7 @@ import platform
 import random
 import sys
 import traceback
+from types import SimpleNamespace
 
 import cloudpickle
 import pytest
@@ -195,6 +196,36 @@ def _fabric_supported() -> bool:
 
 _SM107 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
 _TP_SIZE = 8 if _SM107 else 4
+
+
+def test_markov_exchange_uses_only_nonempty_vocabulary_slices(monkeypatch):
+    from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=128),
+    )
+    num_ctas = markov._num_ctas.__wrapped__
+    assert num_ctas(17, 0) == 17
+    assert num_ctas(128 * 256, 0) == 128
+    assert num_ctas(128 * 256 + 1, 0) == 0
+
+
+def test_sm107_markov_requires_tp8(monkeypatch):
+    from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
+    monkeypatch.setattr(markov, "_num_ctas", lambda vocab, device: 128)
+    base = torch.empty((2, 5, 16160), device="meta", dtype=torch.bfloat16)
+    w2 = torch.empty((16160, RANK_DIM), device="meta")
+    w1 = torch.empty((VOCAB, RANK_DIM), device="meta")
+    assert markov.markov_chain_supported(
+        base, w2, w1, SimpleNamespace(nranks=8, slot_bytes=1 << 24)
+    )
+    assert not markov.markov_chain_supported(
+        base, w2, w1, SimpleNamespace(nranks=4, slot_bytes=1 << 24)
+    )
 
 
 @pytest.mark.skipif(

@@ -7,6 +7,7 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import decode_select
 from tensorrt_llm._torch.attention.backends.sparse.csa2 import indexer as indexer_module
 from tensorrt_llm._torch.attention.backends.sparse.csa2 import reindex_select as rs
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
@@ -91,8 +92,10 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
     original = rs.reindex_select_
 
     def counting(*args, **kwargs):
-        calls.append(args[0].shape[0])
-        return original(*args, **kwargs)
+        launched = original(*args, **kwargs)
+        if launched:
+            calls.append(args[0].shape[0])
+        return launched
 
     monkeypatch.setattr(rs, "reindex_select_", counting)
     prebuild = metadata.prebuild_sparse_schedule
@@ -132,15 +135,22 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         plain, fused = both()
-    # Reused graph storage must read the new query, head weights and page mapping.
+    # Hold the projected inputs fixed to isolate replay of the page mapping and visibility.
     graph.replay()
     previous = plain.clone()
-    q.neg_()
-    weights.copy_(torch.rand_like(weights))
     table.copy_(table.roll(7, 1))
     visible.clamp_max_(8192)
     graph.replay()
-    torch.cuda.synchronize()
+    _plan_indexer(metadata)
+    expected = forward(False)
     assert not torch.equal(plain, previous)
-    assert torch.equal(fused, plain)
+    assert torch.equal(plain, expected)
+    assert torch.equal(fused, expected)
     assert int((plain >= 0).sum()) == tokens * TOP_K
+
+    # The same shape must take the two-launch path where even an 8-CTA cluster cannot fit.
+    calls.clear()
+    monkeypatch.setattr(decode_select, "_max_cluster_size", lambda: 4)
+    monkeypatch.setattr(rs, "_APPLIES", {})
+    assert torch.equal(forward(True), expected)
+    assert not calls

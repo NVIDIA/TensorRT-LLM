@@ -273,6 +273,7 @@ def test_runner_forward_dispatch(m, decode_tuning, monkeypatch):
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
 
+    monkeypatch.setenv("TLLM_USE_FINE_GRAINED_SYNC", "0")
     runner = _runner()
     shape = _ALL_LOCAL._replace(local=192, local_picks=3) if _SM107 else _ALL_LOCAL
     ids, w, (xq, xsf, w13, w13s, clamp, w2, w2s, one, alpha2) = _inputs(m, shape, "random")
@@ -329,6 +330,47 @@ def test_runner_forward_dispatch(m, decode_tuning, monkeypatch):
     torch.cuda.synchronize()
     assert bool(called) == (decode_tuning and (not _SM107 or m <= 16))
     _assert_same_expert_rows(got, ref)
+
+
+@pytest.mark.skipif(not _SM107, reason="requires the SM107 FC2 selector")
+def test_sm107_fc2_selector_rejects_incompatible_operands_and_cubin(monkeypatch):
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
+
+    def cubin_name(tile, config):
+        return decode_moe._SM107_FC2_CUBIN if config == 0 else "other_cubin"
+
+    runner = SimpleNamespace(
+        get_gemm2_kernel_name=cubin_name,
+        uses_fine_grained_sync=lambda *args: False,
+    )
+    weights = torch.empty((192, 5120, 288), device="meta", dtype=torch.uint8)
+    args = dict(
+        hidden_states=torch.empty((16, 2560), device="meta", dtype=torch.uint8),
+        gemm2_weights=weights,
+        gemm2_weights_scale=torch.empty((192, 5120, 36), device="meta", dtype=torch.uint8),
+        gemm2_bias=None,
+        output2_scale_scalar=torch.empty(192, device="meta"),
+    )
+    monkeypatch.setattr(decode_moe, "_FC2_REPRODUCED", {})
+
+    def select(config=0, **overrides):
+        return decode_moe.select(
+            runner,
+            0,
+            [_TILE, config],
+            SimpleNamespace(**(args | overrides)),
+            top_k=6,
+            do_finalize=False,
+            output=None,
+            intermediate_size=576,
+            prerouted=False,
+            engine_state=None,
+        )
+
+    assert select() == decode_moe.DecodeKernel.CUTE_FC2
+    assert select(gemm2_weights=weights[:-1]) == decode_moe.DecodeKernel.CUBIN
+    assert select(output2_scale_scalar=None) == decode_moe.DecodeKernel.CUBIN
+    assert select(config=1) == decode_moe.DecodeKernel.CUBIN
 
 
 @pytest.mark.parametrize("prerouted", [False, True])

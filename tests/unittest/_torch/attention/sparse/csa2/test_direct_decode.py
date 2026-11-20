@@ -5,6 +5,7 @@ backend's choice between it and the staged FP8 path."""
 
 import pytest
 import torch
+from _torch.helpers import late_copy
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.direct_decode import direct_sparse_decode
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
@@ -170,6 +171,33 @@ def test_graph_replay_follows_new_inputs(rows: int, heads: int) -> None:
     mapping[4][0] = 600
     graph.replay()
     torch.cuda.synchronize()
+    _assert_close_to_fp32(output, _reference(case))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="main pre-wait loads require the SM107 eight-head kernel",
+)
+@torch.inference_mode()
+def test_main_ready_waits_for_swa_indices(monkeypatch):
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    case = _case(1, 8, 128, 512, mapped=True)
+    swa_indices = case[2]
+    published = swa_indices.clone()
+    swa_indices.fill_(-1)
+    stale = _run(case, inputs_ready=False, main_ready=True)
+    late_copy(published, swa_indices, 1_000)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        late_copy(published, swa_indices, 2_000_000)
+        output = _run(case, inputs_ready=False, main_ready=True)
+    swa_indices.fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert not torch.equal(output, stale)
     _assert_close_to_fp32(output, _reference(case))
 
 

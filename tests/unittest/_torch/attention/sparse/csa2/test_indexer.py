@@ -254,7 +254,9 @@ def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
         assert kwargs["gvr_r_cap"] == 4
         assert not kwargs["gvr_pdl"]
         assert kwargs["gvr_finalize"] is not None
-        return select(*args, **kwargs)
+        result = select(*args, **kwargs)
+        assert kwargs["gvr_finalize"]["done"], "the cluster launch must finalize its own output"
+        return result
 
     monkeypatch.setattr(indexer, "select_prepared_scores", checked_select)
 
@@ -267,16 +269,20 @@ def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
     with torch.cuda.graph(graph):
         run()
 
-    # Newly unbacked tail pages and shorter live prefixes belong to each replay.
-    visible.copy_(torch.tensor([width - 17, 768], device="cuda", dtype=torch.int32))
-    valid[:, 3] = False
-    valid[0, -2:] = False
-    logits.neg_()
-    graph.replay()
     columns = torch.arange(width, device="cuda")
-    valid_columns = valid[:, columns // INDEX_PAGE_ROWS] & (columns < visible[:, None])
-    expected = logits.masked_fill(~valid_columns, -torch.inf).topk(top_k, dim=1).indices
-    torch.testing.assert_close(output.long().sort(dim=1).values, expected.sort(dim=1).values)
+
+    def check_replay():
+        graph.replay()
+        valid_columns = valid[:, columns // INDEX_PAGE_ROWS] & (columns < visible[:, None])
+        expected = logits.masked_fill(~valid_columns, -torch.inf).topk(top_k, dim=1).indices
+        torch.testing.assert_close(output.long(), expected.sort(dim=1).values)
+
+    # Keep scores fixed. Each metadata update removes columns from the previous Top-K.
+    visible.copy_(torch.tensor([width - 17, 768], device="cuda", dtype=torch.int32))
+    check_replay()
+    valid[0, -2:] = False
+    valid[1, 10] = False
+    check_replay()
 
 
 def _reference_candidate_mask(

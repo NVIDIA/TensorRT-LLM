@@ -15,10 +15,10 @@ TOP_K = 512
 _FUSED_SELECT_MAX_ROWS = 19  # one wave of 8-CTA clusters on 152 SMs
 
 
-def cluster_for_rows(rows: int, num_sms: int) -> int:
-    """CTAs per row: 16 while the rows' clusters fit one wave, else 8 (0: not supported)."""
+def cluster_for_rows(rows: int, num_sms: int, max_cluster: int) -> int:
+    """Largest supported cluster whose rows fit in one wave (0 if neither fits)."""
     for cluster in (16, 8):
-        if 0 < rows * cluster <= num_sms:
+        if cluster <= max_cluster and 0 < rows * cluster <= num_sms:
             return cluster
     return 0
 
@@ -965,35 +965,36 @@ def _kernel_class():
     return ReindexSelectKernel
 
 
-def reindex_select_supported(rows: int, width: int, top_k: int, num_sms: int) -> bool:
-    return width == WIDTH and top_k == TOP_K and cluster_for_rows(rows, num_sms) > 0
-
-
 _APPLIES: dict = {}
 
 
 def reindex_select_applies(rows: int, width: int, top_k: int) -> bool:
     """Whether a candidate consumer's decode rows take the fused launch: the shape fits and the
     two-launch path would select them with ``select_mapped_consumer_topk_``."""
-    if rows > _FUSED_SELECT_MAX_ROWS:
+    if not 0 < rows <= _FUSED_SELECT_MAX_ROWS or width != WIDTH or top_k != TOP_K:
         return False
-    key = (rows, width, top_k)
+    device = torch.cuda.current_device()
+    key = (device, rows, width, top_k)
     cached = _APPLIES.get(key)
     if cached is not None:
         return cached
-    ok = False
+    cluster = 0
     try:
         import cutlass  # noqa: F401
 
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
-        from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 
         from . import decode_select
 
-        num_sms = ops._get_num_sms()
+        properties = torch.cuda.get_device_properties(device)
+        num_sms = properties.multi_processor_count
+        cluster = (
+            cluster_for_rows(rows, num_sms, decode_select._max_cluster_size())
+            if (properties.major, properties.minor) in ((10, 0), (10, 3), (10, 7))
+            else 0
+        )
         ok = (
-            (is_blackwell_datacenter() or get_sm_version() == 107)
-            and reindex_select_supported(rows, width, top_k, num_sms)
+            cluster > 0
             and width % 32 == 0
             and width <= decode_select._MAX_COLUMNS
             and rows <= num_sms
@@ -1014,7 +1015,7 @@ def reindex_select_applies(rows: int, width: int, top_k: int) -> bool:
 
         logger.info(
             f"CSA2 reindex select: candidate logits + Top-{top_k} in one launch "
-            f"({rows} rows x {width} columns, {cluster_for_rows(rows, num_sms)} CTAs per row)"
+            f"({rows} rows x {width} columns, {cluster} CTAs per row)"
         )
     return ok
 
@@ -1036,19 +1037,24 @@ def reindex_select_(
     cluster: int | None = None,
 ) -> bool:
     """Top-512 positions per row into ``output`` [R, 512] int32 from ``q`` [R, 32, 64] MXFP4 and
-    index ``pages`` [P, 64, 1, 68]; False, launching nothing, if a capture would compile it."""
+    index ``pages`` [P, 64, 1, 68]. Return False if there is no eligible cluster or if compilation
+    would be required during capture."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
 
-    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from .decode_select import _max_cluster_size
 
     rows = q.shape[0]
-    num_sms = ops._get_num_sms()
-    if not reindex_select_supported(rows, WIDTH, output.shape[1], num_sms):
+    if rows <= 0 or output.shape[1] != TOP_K:
         raise ValueError("CSA2 reindex select: unsupported shape")
-    cluster = cluster_for_rows(rows, num_sms) if cluster is None else cluster
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    max_cluster = _max_cluster_size()
+    if cluster is None:
+        cluster = cluster_for_rows(rows, num_sms, max_cluster)
+    if cluster not in (8, 16) or cluster > max_cluster or rows * cluster > num_sms:
+        return False
     for t, name in ((q, "q"), (sf_q, "sf_q"), (weights, "weights"), (output, "output")):
         if not t.is_contiguous():
             raise ValueError(f"CSA2 reindex select: {name} must be contiguous")

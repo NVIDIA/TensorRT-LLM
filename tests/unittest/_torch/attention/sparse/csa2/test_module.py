@@ -742,15 +742,17 @@ def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch, q_lora_
 @pytest.mark.parametrize("lowm_qkv", [False, True])
 @pytest.mark.parametrize("rows", [6])
 @torch.inference_mode()
-def test_decode_graph_query_projections_match_unfused(rows, lowm_qkv):
+def test_decode_graph_query_projections_match_unfused(monkeypatch, rows, lowm_qkv):
     """Decode-graph query/SWA, Q and index-Q projections (index Q with its RoPE) on the small-M
     kernel, with and without the fused Q-A and KV projection on it, match the plain path at the
     model's shapes (hidden 5120, 8 heads, 32 index heads)."""
     from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.modules import low_m_gemm
     from tensorrt_llm._torch.modules.linear import (
         flashinfer_mxfp8_autotune,
         flashinfer_mxfp8_decode_graph_capture,
     )
+    from tensorrt_llm._utils import get_sm_version
 
     torch.manual_seed(946)
     model, _ = _native_model(q_lora_rank=1280, hidden_size=5120)
@@ -762,6 +764,12 @@ def test_decode_graph_query_projections_match_unfused(rows, lowm_qkv):
         assert model._lowm_projects_qkv(rows) == lowm_qkv
     x = torch.randn(rows, 5120, dtype=torch.bfloat16, device="cuda")
     positions = torch.randint(0, 32, (rows,), dtype=torch.int32, device="cuda")
+    mma_options = {}
+    lowm_linear = low_m_gemm.mxfp8_lowm_linear
+
+    def record_mma_options(x, weight, *args, **kwargs):
+        mma_options[id(weight)] = kwargs.get("mma_options")
+        return lowm_linear(x, weight, *args, **kwargs)
 
     def plain():
         qr = model.q_norm(model.wq_a(x))
@@ -779,9 +787,14 @@ def test_decode_graph_query_projections_match_unfused(rows, lowm_qkv):
             model._project_query_and_swa(x, decode_only=True)
             plain()
         graph = torch.cuda.CUDAGraph()
+        monkeypatch.setattr(low_m_gemm, "mxfp8_lowm_linear", record_mma_options)
         with torch.cuda.graph(graph):
             qr, q, swa = model._project_query_and_swa(x, decode_only=True)
             index_q, _ = model._project_index_q(qr, positions)
+    expected_mma = (True, False) if get_sm_version() == 107 else None
+    assert mma_options[id(model.wq_b.weight)] == expected_mma
+    if lowm_qkv:
+        assert mma_options[id(model._fused_qkv_weight)] == expected_mma
     x.normal_()
     graph.replay()
     expected_qr, expected_q, expected_index_q, expected_swa = plain()
@@ -798,6 +811,17 @@ def test_decode_graph_query_projections_match_unfused(rows, lowm_qkv):
             rtol=0,
             atol=5e-2 * expected.abs().max().item(),
         )
+
+
+def test_sm107_query_mma_options_at_decode_boundary(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module
+
+    monkeypatch.setattr(module, "get_sm_version", lambda: 107)
+    for shape in ((1792, 5120), (4096, 1280)):
+        weight = torch.empty(shape, device="meta")
+        assert module._lowm_query_mma_options(weight, 8) == (True, False)
+        assert module._lowm_query_mma_options(weight, 9) is None
+    assert module._lowm_query_mma_options(torch.empty((8192, 1280), device="meta"), 8) is None
 
 
 @skip_pre_blackwell

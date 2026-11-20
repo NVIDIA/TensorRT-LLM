@@ -710,7 +710,7 @@ def test_fp8_lowm_index_query_matches_packed_rope_projection(m):
     reason="the fused shared expert requires SM100, SM103 or SM107",
 )
 @torch.inference_mode()
-@pytest.mark.parametrize("m", [6])
+@pytest.mark.parametrize("m", [6, 16] if get_sm_version() == 107 else [6])
 def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
     """The full-TP shared-expert piece's gate_up GEMM stores the clamped SwiGLU: the bits of the
     GEMM, the separate SwiGLU launch and the down GEMM, eagerly and in graph replays."""
@@ -734,7 +734,7 @@ def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
         x[0] *= 16  # past the clamp limit
 
     def separate():
-        mma_options = (True, False) if get_sm_version() == 107 else None
+        mma_options = (True, False) if get_sm_version() == 107 and m <= 8 else None
         gate_up = mxfp8_lowm_linear(x, w13, s13, mma_options=mma_options)
         hidden = swiglu_module.swiglu(gate_up, swiglu_limit=limit)
         return mxfp8_lowm_linear(hidden, w2, s2, mma_options=mma_options)

@@ -56,6 +56,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv41 import (
     DeepseekV41Attention,
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
+    _EngramKvPair,
 )
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
 from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig
@@ -66,6 +67,56 @@ __extra_import_path__ = ["~/tests/integration"]
 from defs.deepseek_v41_serving import model_kwargs as serving_model_kwargs
 
 # Configuration and checkpoint topology
+
+
+def test_engram_consumer_pair_schedule_at_row_limit():
+    gather = Mock()
+    gather.supports_pair.return_value = True
+    layer = SimpleNamespace(engram=SimpleNamespace(_ll_allgather=gather))
+    model = SimpleNamespace(
+        _engram_projection_schedule={0: (1, 14)},
+        _engram_pair_on_consumer=True,
+        _engram_precompute_eligible=lambda target, embedding: True,
+        layers={1: layer, 14: layer},
+    )
+    lookup = DeepseekV41Model._engram_lookup_pair
+    at_limit = {i: torch.empty(8, 16) for i in (1, 14)}
+    above_limit = {i: torch.empty(9, 16) for i in (1, 14)}
+    assert lookup(model, 0, at_limit) == ([1, 14], gather)
+    assert lookup(model, 0, above_limit) == ([1], None)
+    assert lookup(model, 2, above_limit) == ([14], None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires two CUDA streams")
+def test_engram_wkv_pair_joins_projection_once(monkeypatch):
+    consumer, producer = torch.cuda.current_stream(), torch.cuda.Stream()
+    published = torch.arange(16, device="cuda", dtype=torch.float32).reshape(2, 8)
+    producer.wait_stream(consumer)
+    with torch.cuda.stream(producer):
+        first = published.clone()
+        second = -published
+        ready = producer.record_event()
+
+    waits = []
+    wait_event = torch.cuda.Stream.wait_event
+
+    def record_wait(stream, event):
+        waits.append((stream, event))
+        wait_event(stream, event)
+
+    def gather_pair(*shards):
+        assert torch.cuda.current_stream() == consumer
+        assert waits == [(consumer, ready)]
+        return tuple(torch.cat((shard, shard + 100), dim=1) for shard in shards)
+
+    gather = SimpleNamespace(gather_pair=Mock(side_effect=gather_pair))
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", record_wait)
+    pair = _EngramKvPair.on_first_use(gather, (first, second), ready)
+    gather.gather_pair.assert_not_called()
+    for index, expected in enumerate((published, -published)):
+        torch.testing.assert_close(pair.take(index), torch.cat((expected, expected + 100), dim=1))
+    gather.gather_pair.assert_called_once()
+    assert waits == [(consumer, ready)]
 
 
 # The released DeepSeek-V4.1-Flash topology: 40 decoder layers + 3 DSpark stages.

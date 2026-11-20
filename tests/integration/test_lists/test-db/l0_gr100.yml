@@ -66,10 +66,16 @@ l0_gr100:
   - unittest/_torch/attention/sparse/csa2/test_block_select.py::test_block_select_matches_topk_decode
   - unittest/_torch/attention/sparse/csa2/test_direct_decode.py::test_matches_fp32_reference
   - unittest/_torch/attention/sparse/csa2/test_direct_decode.py::test_graph_replay_follows_new_inputs
+  - unittest/_torch/attention/sparse/csa2/test_direct_decode.py::test_main_ready_waits_for_swa_indices
   - unittest/_torch/attention/sparse/csa2/test_reindex_select.py::test_indexer_consumer_fused_equals_two_launches
+  - unittest/_torch/attention/sparse/csa2/test_module.py::test_decode_graph_query_projections_match_unfused
+  - unittest/_torch/attention/sparse/csa2/test_module.py::test_sm107_query_mma_options_at_decode_boundary
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py::test_engram_consumer_pair_schedule_at_row_limit
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py::test_engram_wkv_pair_joins_projection_once
   - unittest/_torch/modules/test_mhc.py::test_split_boundary_replicated_coefficients_one_launch
   - unittest/_torch/modules/test_low_m_gemm.py::test_shared_expert_piece_stores_the_swiglu
   - unittest/_torch/moe/test_moe_lowm_fc2.py::test_runner_forward_dispatch
+  - unittest/_torch/moe/test_moe_lowm_fc2.py::test_sm107_fc2_selector_rejects_incompatible_operands_and_cubin
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py

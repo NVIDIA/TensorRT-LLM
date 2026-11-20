@@ -517,8 +517,12 @@ def test_engine_reserve_is_the_moe_sm_reserve_hook():
         TRTLLMGenFp4BlockScaleBase,
     )
 
-    def leaf(decode_tuning, prerouted):
-        obj = SimpleNamespace(decode_tuning=decode_tuning, supports_prerouted_routing=prerouted)
+    def leaf(decode_tuning, prerouted, persistent):
+        obj = SimpleNamespace(
+            decode_tuning=decode_tuning,
+            supports_prerouted_routing=prerouted,
+            decode_fp4_persistent_engine=persistent,
+        )
         obj.sm_reserve_ceiling = functools.partial(
             TRTLLMGenFp4BlockScaleBase.sm_reserve_ceiling, obj
         )
@@ -527,7 +531,7 @@ def test_engine_reserve_is_the_moe_sm_reserve_hook():
         )
         return obj
 
-    declared = leaf(True, True)
+    declared = leaf(True, True, True)
     assert declared.sm_reserve_ceiling() == ENGINE_SPARE_SMS
     assert declared.reserve(ENGINE_SPARE_SMS) == ENGINE_SPARE_SMS
     assert declared._concurrent_sm_reserve == ENGINE_SPARE_SMS
@@ -535,10 +539,31 @@ def test_engine_reserve_is_the_moe_sm_reserve_hook():
     assert declared.reserve(0) == 0 and declared._concurrent_sm_reserve == 0
     with pytest.raises(ValueError):
         declared.reserve(-1)
-    for decode_tuning, prerouted in ((False, True), (True, False)):
-        other = leaf(decode_tuning, prerouted)
+    for other in (leaf(False, True, True), leaf(True, False, True), leaf(True, True, False)):
         assert other.sm_reserve_ceiling() == 0
         assert other.reserve(ENGINE_SPARE_SMS) == 0
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_persistent_engine_state_follows_decode_option(persistent, monkeypatch):
+    from tensorrt_llm._torch.kernels.blackwell import moe_persistent_engine
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.fp4_block_scale import (
+        TRTLLMGenFp4BlockScaleBase,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
+    from tensorrt_llm._torch.utils import ActivationType
+
+    leaf = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
+    torch.nn.Module.__init__(leaf)
+    leaf.decode_tuning = True
+    leaf.decode_fp4_persistent_engine = persistent
+    leaf.activation = SimpleNamespace(kind=ActivationType.SwiGlu)
+    leaf.quant_method = SimpleNamespace(cache_derived_state=lambda module: None)
+    leaf.w3_w1_weight = torch.empty(0, device="meta")
+    state = torch.empty(0, device="meta")
+    monkeypatch.setattr(moe_persistent_engine, "new_state", lambda device: state)
+    TRTLLMGenFp4BlockScaleBase.cache_derived_state(leaf)
+    assert leaf.decode_engine_state is (state if persistent else None)
 
 
 def test_engine_grid_leaves_the_global_sm_reserve(monkeypatch):

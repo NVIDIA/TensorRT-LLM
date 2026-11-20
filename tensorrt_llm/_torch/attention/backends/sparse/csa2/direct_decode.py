@@ -1699,8 +1699,7 @@ def _kernel_type():
                 oacc1.fill(0.0)
 
             # ---- before the dependent wait: inputs final before the preceding launch ----
-            # The SWA slots are final whenever the main rows are promised before the query.
-            swa_first: cutlass.Constexpr = self.inputs_ready or self.main_prewait
+            # SWA follows input readiness independently of the main rows.
             if const_expr(self.inputs_ready):
                 for i in cutlass.range_constexpr(q_chunks // _THREADS):
                     c = tidx + _THREADS * i
@@ -1728,7 +1727,7 @@ def _kernel_type():
                     max_positions,
                     swa_capacity,
                     main_capacity,
-                    swa_first,
+                    self.inputs_ready,
                     self.main_ready,
                     sSlot,
                     sKind,
@@ -1815,7 +1814,7 @@ def _kernel_type():
                     cp_async16(
                         q_addr + (c // 64) * _KEY_ROW + (c % 64) * 16, q_base + Int64(16 * c)
                     )
-            if const_expr((not swa_first) or (not self.main_ready)):
+            if const_expr((not self.inputs_ready) or (not self.main_ready)):
                 if tidx < keys:
                     self._resolve(
                         tidx,
@@ -1835,7 +1834,7 @@ def _kernel_type():
                         max_positions,
                         swa_capacity,
                         main_capacity,
-                        not swa_first,
+                        not self.inputs_ready,
                         not self.main_ready,
                         sSlot,
                         sKind,
@@ -2453,9 +2452,9 @@ def direct_sparse_decode(
     logical positions mapped in-kernel when ``main_mapping = (page_table, page_size,
     max_positions, requests, visible)`` is given (CSA2's owner page-table rules). ``sink [H]``
     FP32 logits, ``scale`` the softmax scale. Returns BF16 ``[T, H, 512]`` (``output`` if given).
-    ``inputs_ready``: the query, SWA slots and page tables were final before the launch preceding
-    this one on the stream started. ``main_ready``: the main selections and rows are final when
-    this launch starts (the launch preceding it releases it only after its own dependency wait).
+    ``inputs_ready``: the query and SWA slots are final before this launch's PDL wait.
+    ``main_ready``: the main selections, their mapping metadata and the main KV rows are final
+    before that wait. The two readiness promises are independent.
 
     ``query_rope = (positions, cos_sin)``: ``q`` is the projected query before its interleaved RoPE
     (int32 positions ``[T]``, FP32 table of 32 cos then 32 sin per position), rotated in the
