@@ -115,6 +115,11 @@ REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
     "medium": ReasoningEffort.MEDIUM,
     "low": ReasoningEffort.LOW,
+    # OpenAI's "minimal" takes harmony's lowest level and "xhigh" and "max"
+    # its highest, as on the chat completions route.
+    "minimal": ReasoningEffort.LOW,
+    "xhigh": ReasoningEffort.HIGH,
+    "max": ReasoningEffort.HIGH,
 }
 
 # Set TRTLLM_RESPONSES_DEBUG=1 to log each parsed input item and the full
@@ -507,7 +512,8 @@ class ConversationHistoryStore:
 
 def _get_system_message(
     model_identity: Optional[str] = None,
-    reasoning_effort: Optional[Literal["high", "medium", "low"]] = None,
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium",
+                                       "high", "xhigh", "max"]] = None,
     start_date: Optional[str] = None,
     browser_description: Optional[str] = None,
     python_description: Optional[str] = None,
@@ -515,7 +521,12 @@ def _get_system_message(
     sys_msg_content = SystemContent.new()
     if model_identity is not None:
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
-    if reasoning_effort is not None:
+    if reasoning_effort == "none":
+        # "none" names no harmony level, so the harmony adapter's default
+        # level applies, as on the chat completions route.
+        sys_msg_content = sys_msg_content.with_reasoning_effort(
+            get_harmony_adapter().default_reasoning_effort)
+    elif reasoning_effort is not None:
         sys_msg_content = sys_msg_content.with_reasoning_effort(
             REASONING_EFFORT[reasoning_effort])
     if start_date:
