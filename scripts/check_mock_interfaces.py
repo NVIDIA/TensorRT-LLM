@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import inspect
 import json
 import re
 import sys
@@ -87,6 +88,9 @@ class Source:
     tree: ast.Module
     imports: dict[str, str] = field(default_factory=dict)
     star_imports: list[str] = field(default_factory=list)
+    scope_bindings: dict[ast.AST, dict[str, set[ast.AST]]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def qualified(self, node: ast.AST) -> str:
         if isinstance(node, ast.Name):
@@ -94,6 +98,31 @@ class Source:
         if isinstance(node, ast.Attribute):
             return self.qualified(node.value) + "." + node.attr
         return UNKNOWN
+
+    def bindings(self, scope: ast.AST) -> dict[str, set[ast.AST]]:
+        """Collect lexical bindings that can shadow module imports and builtins."""
+        if scope not in self.scope_bindings:
+            bindings: dict[str, set[ast.AST]] = {}
+            for node in statements(scope):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    bindings.setdefault(node.id, set()).add(node)
+                elif isinstance(node, ast.arg):
+                    bindings.setdefault(node.arg, set()).add(node)
+                elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                    if node.name is not None:
+                        bindings.setdefault(node.name, set()).add(node)
+                elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                    bindings.setdefault(node.rest, set()).add(node)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    if node not in self.tree.body:
+                        for alias in node.names:
+                            name = alias.asname or alias.name.split(".")[0]
+                            bindings.setdefault(name, set()).add(node)
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, DEFINITIONS):
+                        bindings.setdefault(child.name, set()).add(child)
+            self.scope_bindings[scope] = bindings
+        return self.scope_bindings[scope]
 
 
 @dataclass
@@ -123,6 +152,8 @@ class Shape:
     members: dict[str, Member] = field(default_factory=dict)
     unknown: list[str] = field(default_factory=list)
     skipped_bases: list[str] = field(default_factory=list)
+    initializer_fields: dict[str, Member] = field(default_factory=dict)
+    initializer_unknown: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -339,7 +370,9 @@ class Sources:
             return self.dotted(name)
         return self.definition(source.module + ":" + name)
 
-    def callable(self, definition: Definition, *, bound: bool = False) -> Member:
+    def callable(
+        self, definition: Definition, *, bound: bool = False, keep_binding: bool = False
+    ) -> Member:
         """Read a function or a method as accessed through its class or instance."""
         source, node = definition.source, definition.node
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -366,8 +399,9 @@ class Sources:
             raise Incomplete("bound=True requires an instance method")
         if binding == "method" and not bound:
             member = callable_members(owner.body, source, True, keep_receiver=True)[node.name]
-        for sig in member.signatures:
-            sig["binding"] = "function"
+        if not keep_binding:
+            for sig in member.signatures:
+                sig["binding"] = "function"
         return member
 
     def class_mro(
@@ -460,12 +494,15 @@ def default_value(node: ast.AST | None) -> str:
         return UNKNOWN
 
 
-def signature(node: ast.FunctionDef | ast.AsyncFunctionDef, binding: str) -> dict:
+def signature(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, binding: str, *, keep_receiver: bool = False
+) -> dict:
     positional = [*node.args.posonlyargs, *node.args.args]
     defaults = [None] * (len(positional) - len(node.args.defaults)) + list(node.args.defaults)
+    has_receiver = binding in {"method", "classmethod", "property-get", "property-set"}
     parameters = []
     for index, (arg, default) in enumerate(zip(positional, defaults)):
-        if index == 0 and binding in {"method", "classmethod", "property-get", "property-set"}:
+        if index == 0 and has_receiver and not keep_receiver:
             continue
         kind = "positional-only" if index < len(node.args.posonlyargs) else "positional-or-keyword"
         parameters.append((arg.arg, kind, default_value(default)))
@@ -475,12 +512,15 @@ def signature(node: ast.FunctionDef | ast.AsyncFunctionDef, binding: str) -> dic
         parameters.append((arg.arg, "keyword-only", default_value(default)))
     if node.args.kwarg:
         parameters.append((node.args.kwarg.arg, "var-keyword", "required"))
-    return {
+    result = {
         "binding": binding,
         "async": isinstance(node, ast.AsyncFunctionDef),
         "generator": any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in statements(node)),
         "parameters": parameters,
     }
+    if has_receiver and not (positional or node.args.vararg):
+        result["missing_receiver"] = True
+    return result
 
 
 def preserves_call_signature(decorator: ast.AST, source: Source) -> bool:
@@ -583,7 +623,7 @@ def callable_members(
         if repeated:
             member.signature_issue = "Decorator or repeated declaration can change the interface"
         member.signatures.append(
-            signature(node, "function" if keep_receiver and binding == "method" else binding)
+            signature(node, binding, keep_receiver=keep_receiver and binding == "method")
         )
         allowed = {
             "staticmethod",
@@ -642,8 +682,70 @@ def class_shape(
         _extend_class_shape(
             base, shape, members_only=members_only, include_type_checking=include_type_checking
         )
+    for name, member in shape.initializer_fields.items():
+        previous = shape.members.get(name)
+        if previous is None or (previous.conditional and not member.conditional):
+            shape.members[name] = member
+    shape.unknown.extend(shape.initializer_unknown)
     sources.shapes[cache_key] = shape
     return copy.deepcopy(shape)
+
+
+def matches_initializer_call(
+    call: ast.Call,
+    initializer: Member | None,
+    caller: ast.FunctionDef | ast.AsyncFunctionDef,
+    source: Source,
+) -> bool:
+    """Check the arguments of a direct call against a known inherited initializer."""
+    if (
+        initializer is None
+        or initializer.signature_issue
+        or len(initializer.signatures) != 1
+        or any(isinstance(arg, ast.Starred) for arg in call.args)
+    ):
+        return False
+    signature = initializer.signatures[0]
+    if (
+        signature["binding"] != "method"
+        or signature.get("missing_receiver")
+        or signature["async"]
+        or signature["generator"]
+    ):
+        return False
+    parameters = [
+        inspect.Parameter(
+            name,
+            getattr(inspect.Parameter, kind.replace("-", "_").upper()),
+            default=inspect.Parameter.empty if default == "required" else None,
+        )
+        for name, kind, default in signature["parameters"]
+    ]
+    keywords = {kw.arg: None for kw in call.keywords if kw.arg is not None}
+    try:
+        inspect.Signature(parameters).bind(*([None] * len(call.args)), **keywords)
+    except TypeError:
+        return False
+    unpacked = [kw.value for kw in call.keywords if kw.arg is None]
+    if not unpacked:
+        return True
+    # A direct **kwargs forward cannot supply any of the caller's named parameters.
+    # Verify that it can only add keywords the inherited initializer accepts.
+    named_parameters = {arg.arg for arg in (*caller.args.args, *caller.args.kwonlyargs)}
+    explicitly_bound = keywords.keys() | {
+        param.name
+        for param in parameters[: len(call.args)]
+        if param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+    }
+    return (
+        len(unpacked) == 1
+        and isinstance(unpacked[0], ast.Name)
+        and caller.args.kwarg is not None
+        and unpacked[0].id == caller.args.kwarg.arg
+        and source.bindings(caller).get(unpacked[0].id) == {caller.args.kwarg}
+        and explicitly_bound <= named_parameters
+        and any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters)
+    )
 
 
 def _extend_class_shape(
@@ -696,6 +798,12 @@ def _extend_class_shape(
         else:
             runtime_body.append(item)
     declared_callables = callable_members(runtime_body, source, True)
+    inherited_initializer = shape.members.get("__init__")
+    inherited_fields = shape.initializer_fields
+    inherited_unknown = shape.initializer_unknown
+    if "__init__" in declared_callables or generated_initializer:
+        shape.initializer_fields = {}
+        shape.initializer_unknown = []
     shape.members.update(declared_callables)
     if generated_initializer and "__init__" not in declared_callables:
         shape.members["__init__"] = Member(
@@ -703,7 +811,7 @@ def _extend_class_shape(
         )
     initializer = shape.members.get("__init__")
     if initializer is not None and initializer.signature_issue and "__init__" in declared_callables:
-        shape.unknown.append("Initializer decorator can change instance fields")
+        shape.initializer_unknown.append("Initializer decorator can change instance fields")
     if "__init__" not in shape.members:
         shape.members["__init__"] = Member(
             "callable",
@@ -724,6 +832,11 @@ def _extend_class_shape(
                     if target.id in declared_callables:
                         # The last binding for this name is a callable.
                         continue
+                    if target.id == "__init__" and item.value is not None:
+                        shape.initializer_fields = {}
+                        shape.initializer_unknown = [
+                            "Initializer binding requires source resolution"
+                        ]
                     declared_member = shape.members.get(target.id)
                     if (
                         isinstance(item, ast.AnnAssign)
@@ -770,6 +883,16 @@ def _extend_class_shape(
             ):
                 continue
             receiver = args[0].arg
+            is_initializer = item.name == "__init__"
+            fields = shape.initializer_fields if is_initializer else shape.members
+            unknown = shape.initializer_unknown if is_initializer else shape.unknown
+            direct_calls = {
+                stmt.value
+                for stmt in item.body
+                if is_initializer
+                and isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+            }
             for assignment in statements(item):
                 if isinstance(assignment, (ast.Assign, ast.AnnAssign)):
                     targets = (
@@ -788,18 +911,18 @@ def _extend_class_shape(
                             and isinstance(target.value, ast.Name)
                             and target.value.id == receiver
                         ):
-                            previous = shape.members.get(target.attr)
-                            conditional = item.name != "__init__" or assignment not in item.body
+                            previous = fields.get(target.attr)
+                            conditional = not is_initializer or assignment not in item.body
                             if previous is None or (previous.conditional and not conditional):
-                                shape.members[target.attr] = Member(
+                                fields[target.attr] = Member(
                                     "attribute", conditional=conditional, line=assignment.lineno
                                 )
                 if (
                     isinstance(assignment, ast.Call)
                     and source.qualified(assignment.func) == "setattr"
                 ):
-                    shape.unknown.append("Dynamic setattr in target class")
-                if item.name == "__init__" and isinstance(assignment, ast.Call):
+                    unknown.append("Dynamic setattr in target class")
+                if is_initializer and isinstance(assignment, ast.Call):
                     # Passing self or invoking one of its methods may initialize
                     # fields; merely reading self.field as an argument does not.
                     def passes_receiver(value: ast.AST) -> bool:
@@ -817,16 +940,37 @@ def _extend_class_shape(
                         and isinstance(assignment.func.value, ast.Name)
                         and assignment.func.value.id == receiver
                     )
-                    if uses_receiver or (
-                        isinstance(assignment.func, ast.Attribute)
+                    super_call = (
+                        assignment.func.value
+                        if isinstance(assignment.func, ast.Attribute)
                         and isinstance(assignment.func.value, ast.Call)
                         and source.qualified(assignment.func.value.func) == "super"
+                        else None
+                    )
+                    if (
+                        isinstance(assignment.func, ast.Attribute)
+                        and super_call is not None
+                        and assignment.func.attr == "__init__"
+                        and not super_call.args
+                        and not super_call.keywords
+                        and assignment in direct_calls
+                        and not shape.skipped_bases
+                        and "super" not in source.imports
+                        and "super" not in source.bindings(source.tree)
+                        and "super" not in source.bindings(item)
+                        and matches_initializer_call(
+                            assignment, inherited_initializer, item, source
+                        )
                     ):
-                        shape.unknown.append("Initializer helper effects require source resolution")
-            if item.name == "__init__" and any(
+                        for name, member in inherited_fields.items():
+                            fields.setdefault(name, member)
+                        unknown.extend(inherited_unknown)
+                    elif uses_receiver or super_call is not None:
+                        unknown.append("Initializer helper effects require source resolution")
+            if is_initializer and any(
                 isinstance(n, (ast.Return, ast.Delete)) for n in statements(item)
             ):
-                shape.unknown.append("Initializer has early exit or deleted fields")
+                unknown.append("Initializer has early exit or deleted fields")
         elif not (isinstance(item, (ast.Pass, ast.Expr))):
             shape.unknown.append("Conditional/dynamic class body")
     # A guarded property may describe an inherited native descriptor.
@@ -871,6 +1015,9 @@ def compare_member(name: str, expected: Member, actual: Member, line: int) -> li
                 )
             )
         return errors
+    for label, member in (("target", expected), ("replacement", actual)):
+        if any(sig.get("missing_receiver") for sig in member.signatures):
+            return [issue("signature", f"{name}: {label} cannot accept a bound receiver", line)]
     if reason := expected.signature_issue or actual.signature_issue:
         return [issue("unverified-signature", f"{name}: {reason}", line, True)]
     if expected.origin is not None and expected.origin == actual.origin:
@@ -918,6 +1065,8 @@ def compare_shapes(expected: Shape, actual: Shape, line: int) -> list[dict]:
         for message in dict.fromkeys(expected.unknown + actual.unknown)
     ]
     for name in sorted(expected.members.keys() - actual.members.keys()):
+        if name in expected.initializer_fields and actual.initializer_unknown:
+            continue
         errors.append(issue("missing-member", name, line))
     for name in sorted(actual.members.keys() - expected.members.keys()):
         errors.append(issue("extra-member", name, actual.members[name].line or line))
@@ -1046,6 +1195,9 @@ class Analyzer:
     def expression(self, node: ast.AST | None, env: dict[str, Value]) -> Value:
         if isinstance(node, ast.Name):
             return env.get(node.id, Value())
+        if isinstance(node, ast.Attribute):
+            owner = self.expression(node.value, env).state
+            return owner.fields.get(node.attr, Value()) if owner is not None else Value()
         if isinstance(node, ast.Call):
             name = self.source.qualified(node.func)
             if name == MARKERS + ".verify_instance" and node.args:
@@ -1053,6 +1205,8 @@ class Analyzer:
                     self.instance_registration(node, env)
                 return self.expression(node.args[0], env)
             if name == "types.SimpleNamespace":
+                if self.uses_rebound_names(node, [node.func]):
+                    return Value(State(unknown=["Namespace constructor has an unresolved binding"]))
                 state = State()
                 if node.args:
                     state.unknown.append("Namespace positional arguments are not supported")
@@ -1074,6 +1228,10 @@ class Analyzer:
                             "Only object.__new__(Real) or Real.__new__(Real) is supported"
                         )
                     definition = self.sources.reference(self.source, node.args[0])
+                    if self.uses_rebound_names(
+                        node, [node.func.value, node.args[0]], allowed=definition.node
+                    ):
+                        raise Incomplete("Allocator has an unresolved binding")
                     if owner != "object":
                         shape = class_shape(definition, self.sources, members_only=True)
                         allocator = shape.members.get("__new__")
@@ -1085,6 +1243,8 @@ class Analyzer:
                 except Incomplete as error:
                     return Value(State(unknown=[str(error)]))
             if name.startswith("unittest.mock.") or name == "types.ModuleType":
+                if self.uses_rebound_names(node, [node.func]):
+                    return Value(State(unknown=["Mock constructor has an unresolved binding"]))
                 return Value(
                     State(unknown=[DYNAMIC_MOCK_MEMBERS]),
                     name,
@@ -1154,7 +1314,9 @@ class Analyzer:
                 [issue("unverified-state", str(error), call.lineno, True)],
             )
 
-    def patch_uses_rebound_name(self, call: ast.Call, references: list[ast.expr]) -> bool:
+    def uses_rebound_names(
+        self, call: ast.Call, references: list[ast.expr], *, allowed: ast.AST | None = None
+    ) -> bool:
         names = set()
         for ref in references:
             while isinstance(ref, ast.Attribute):
@@ -1169,24 +1331,11 @@ class Analyzer:
             if isinstance(parent, DEFINITIONS + (ast.Lambda,)):
                 scopes.append(parent)
             parent = self.parents.get(parent)
-        return any(
-            (
-                isinstance(node, ast.Name)
-                and isinstance(node.ctx, (ast.Store, ast.Del))
-                and node.id in names
-            )
-            or (isinstance(node, ast.arg) and node.arg in names)
-            or (
-                isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar))
-                and node.name in names
-            )
-            or any(
-                isinstance(child, DEFINITIONS) and child.name in names
-                for child in ast.iter_child_nodes(node)
-            )
-            for scope in scopes
-            for node in statements(scope)
-        )
+        for scope in scopes:
+            bindings = self.source.bindings(scope)
+            if any(bindings.get(name, set()) - {allowed} for name in names):
+                return True
+        return False
 
     def autospecced_patch(self, patch_call: ast.Call, target: str, *, bound: bool) -> list[dict]:
         """Verify a callable patch whose signature is copied by unittest.mock."""
@@ -1207,7 +1356,7 @@ class Analyzer:
         referenced = [patch_call.func]
         if patch_name == "unittest.mock.patch.object" and len(args) == 2:
             referenced.append(args[0])
-        if self.patch_uses_rebound_name(patch_call, referenced):
+        if self.uses_rebound_names(patch_call, referenced):
             raise Incomplete("Cannot verify an autospec patch that uses a rebound name")
         if patch_name == "unittest.mock.patch" and len(args) == 1:
             if not isinstance(args[0], ast.Constant) or not isinstance(args[0].value, str):
@@ -1237,6 +1386,7 @@ class Analyzer:
             member.signature_issue
             or len(member.signatures) != 1
             or member.signatures[0]["generator"]
+            or member.signatures[0].get("missing_receiver")
         ):
             raise Incomplete("Cannot establish the autospecced callable's signature from source")
         return []
@@ -1272,6 +1422,8 @@ class Analyzer:
                     and len(replacement.args) == 1
                     and not replacement.keywords
                 ):
+                    if self.uses_rebound_names(replacement, [replacement.func]):
+                        raise Incomplete("Descriptor constructor has an unresolved binding")
                     binding = descriptor
                     replacement = replacement.args[0]
             if not isinstance(replacement, ast.Lambda):
@@ -1282,7 +1434,24 @@ class Analyzer:
             if isinstance(real.node, ast.ClassDef):
                 errors = [issue("target-kind", "Lambda mock targets a class", call.lineno)]
             else:
-                expected = self.sources.callable(real, bound=self.bound_replacement(marker))
+                bound = self.bound_replacement(marker)
+                expected = self.sources.callable(real, bound=bound, keep_binding=True)
+                bindings = {sig["binding"] for sig in expected.signatures}
+                if binding != "function" and (bound or bindings != {binding}):
+                    expected_binding = "function" if bound else ", ".join(sorted(bindings))
+                    self.result(
+                        target,
+                        call.lineno,
+                        "replacement",
+                        [
+                            issue(
+                                "signature",
+                                f"Expected {expected_binding} binding, got {binding}",
+                                call.lineno,
+                            )
+                        ],
+                    )
+                    return True
                 function = ast.FunctionDef(
                     name="_mock_lambda",
                     args=replacement.args,
@@ -1296,6 +1465,8 @@ class Analyzer:
                 sig = signature(function, binding)
                 sig["binding"] = "function"
                 actual = Member("callable", signatures=[sig])
+                for expected_signature in expected.signatures:
+                    expected_signature["binding"] = "function"
                 errors = compare_member(function.name, expected, actual, call.lineno)
             self.result(target, call.lineno, "replacement", errors)
         except (Incomplete, OSError, SyntaxError, UnicodeError) as error:
@@ -1405,7 +1576,6 @@ class Analyzer:
         unknown = set(state.unknown)
         if value.kind in {"unittest.mock.Mock", "unittest.mock.MagicMock"}:
             unknown.discard(DYNAMIC_MOCK_MEMBERS)
-        errors = [issue("unverified-state", message, line, True) for message in sorted(unknown)]
         available = state.fields.keys()
         if state.definition:
             actual = class_shape(state.definition, self.sources, members_only=True)
@@ -1414,9 +1584,19 @@ class Analyzer:
                 for name, member in actual.members.items()
                 if member.default or member.kind in {"callable", "property"}
             }
+            if "__getattribute__" in actual.members or (
+                "__getattr__" in actual.members and any(name not in available for name in selected)
+            ):
+                unknown.add("Custom attribute lookup on the supplied instance")
+        errors = [issue("unverified-state", message, line, True) for message in sorted(unknown)]
         for name in selected:
             if name not in expected.members:
-                errors.append(issue("unknown-target-member", name, line))
+                if expected.skipped_bases:
+                    self.skipped_bases.update(expected.skipped_bases)
+                elif expected.initializer_unknown:
+                    errors.append(issue("unverified-target-member", name, line, True))
+                else:
+                    errors.append(issue("unknown-target-member", name, line))
             elif name not in available:
                 code = (
                     "possibly-uninitialized" if name in state.possible else "missing-initialization"
@@ -1438,22 +1618,27 @@ class Analyzer:
         """Invalidate tracked instances passed to calls whose effects are not modeled."""
         if isinstance(expression, ast.Lambda):
             return
-        for call in statements(expression):
+        nodes = list(statements(expression))
+        for node in nodes:
+            if isinstance(node, ast.NamedExpr):
+                self.assignment(node.target, Value(), env)
+        for call in nodes:
             if (
                 isinstance(call, ast.Call)
                 and self.source.qualified(call.func) == MARKERS + ".verify_instance"
                 and id(call) not in self.handled
             ):
                 self.instance_registration(call, env)
-        for call in statements(expression):
+        for call in nodes:
             if not isinstance(call, ast.Call):
                 continue
             name = self.source.qualified(call.func)
             if name in {
                 MARKERS + ".verify_instance",
                 MARKERS + ".mock_target",
-                "types.SimpleNamespace",
-            }:
+            } or (
+                name == "types.SimpleNamespace" and not self.uses_rebound_names(call, [call.func])
+            ):
                 continue
             arguments = [*call.args, *(kw.value for kw in call.keywords)]
             if isinstance(call.func, ast.Attribute):
@@ -1465,7 +1650,8 @@ class Analyzer:
                         if state is not None:
                             state.unknown.append(f"Unresolved call effects at line {call.lineno}")
 
-    def block(self, body: list[ast.stmt], env: dict[str, Value]) -> None:
+    def block(self, body: list[ast.stmt], env: dict[str, Value]) -> bool:
+        """Track statements and report whether execution can reach the end of the block."""
         for statement in body:
             if isinstance(statement, DEFINITIONS):
                 for decorator in statement.decorator_list:
@@ -1523,14 +1709,8 @@ class Analyzer:
                                 "definition",
                                 [issue("unverified-interface", str(error), decorator.lineno, True)],
                             )
-                nested = copy.deepcopy(env)
-                if not isinstance(statement, ast.ClassDef):
-                    for arg in [
-                        *statement.args.posonlyargs,
-                        *statement.args.args,
-                        *statement.args.kwonlyargs,
-                    ]:
-                        nested[arg.arg] = Value()
+                # Function bodies run later, when captured objects may have changed.
+                nested = copy.deepcopy(env) if isinstance(statement, ast.ClassDef) else {}
                 self.block(statement.body, nested)
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 if isinstance(statement, ast.AnnAssign) and statement.value is None:
@@ -1571,8 +1751,14 @@ class Analyzer:
             elif isinstance(statement, ast.If):
                 self.effects(statement.test, env)
                 left, right = copy.deepcopy(env), copy.deepcopy(env)
-                self.block(statement.body, left)
-                self.block(statement.orelse, right)
+                left_continues = self.block(statement.body, left)
+                right_continues = self.block(statement.orelse, right)
+                if not (left_continues or right_continues):
+                    return False
+                if left_continues != right_continues:
+                    env.clear()
+                    env.update(left if left_continues else right)
+                    continue
                 merged = {}
                 for name in env.keys() | left.keys() | right.keys():
                     a, b = left.get(name, Value()), right.get(name, Value())
@@ -1627,10 +1813,7 @@ class Analyzer:
             elif isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
                 self.effects(statement, env)
                 # Remaining markers are discovered as unsupported, never as successful checks.
-                for value in env.values():
-                    if value.state:
-                        value.state.unknown.append(f"Early exit at line {statement.lineno}")
-                break
+                return False
             elif not isinstance(statement, (ast.Import, ast.ImportFrom, ast.Pass)):
                 self.effects(statement, env)
                 for value in env.values():
@@ -1638,6 +1821,7 @@ class Analyzer:
                         value.state.unknown.append(
                             f"Unsupported statement at line {statement.lineno}"
                         )
+        return True
 
     def analyze(self) -> list[dict]:
         for node in ast.walk(self.source.tree):
@@ -1761,7 +1945,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     paths = []
-    for entry in args.paths or [args.root / "tests"]:
+    for entry in args.paths or [Path("tests")]:
         entry = entry if entry.is_absolute() else args.root / entry
         paths.extend(entry.rglob("*.py") if entry.is_dir() else [entry])
     report = check(args.root, paths, args.search_path)
