@@ -232,6 +232,74 @@ def test_generation_with_return_logits(
         assert idx == len(prompts) - 1
 
 
+@force_ampere  # Save H100 resource
+@pytest.mark.parametrize("end_index", [0, 2])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.timeout(120, method="signal")
+@pytest.mark.threadleak(enabled=False)
+def test_generation_logits_of_request_stopped_by_end_id(llm, end_index: int, streaming: bool):
+    """A request that stops on its end id keeps one generation logits row per output token.
+
+    With the overlap scheduler, such a request is still in the next batch, which stores no logits
+    for it, so there is no extra row for exclude_last_generation_logits to drop.
+    """
+    reference = llm.generate(
+        prompts[0], SamplingParams(max_tokens=8, temperature=0.0, end_id=-1)
+    ).outputs[0]
+    end_id = reference.token_ids[end_index]
+    assert end_id not in reference.token_ids[:end_index], "pick an end id the output reaches once"
+    sampling_params = SamplingParams(
+        max_tokens=8, temperature=0.0, end_id=end_id, return_generation_logits=True
+    )
+
+    if streaming:
+        sequence = None
+        # The streamed output is updated in place, so check each chunk as it arrives.
+        for output in llm.generate_async(
+            prompts[0], sampling_params=sampling_params, streaming=True
+        ):
+            sequence = output.outputs[0]
+            assert sequence.generation_logits is not None
+            assert sequence.generation_logits.shape[0] == 1
+            assert torch.argmax(sequence.generation_logits, dim=1).tolist() == [
+                sequence.token_ids[-1]
+            ]
+        assert sequence is not None
+    else:
+        sequence = llm.generate(prompts[0], sampling_params=sampling_params).outputs[0]
+        assert sequence.generation_logits is not None
+        assert torch.argmax(sequence.generation_logits, dim=1).tolist() == sequence.token_ids
+
+    assert sequence.token_ids == reference.token_ids[: end_index + 1]
+    assert sequence.finish_reason == "stop"
+
+
+@force_ampere  # Save H100 resource
+@pytest.mark.timeout(120, method="signal")
+@pytest.mark.threadleak(enabled=False)
+def test_generation_logits_of_request_stopped_by_stop_token(llm):
+    """Stop-word trimming drops the stop token's row, and the rows left still match the tokens."""
+    reference = llm.generate(
+        prompts[0], SamplingParams(max_tokens=8, temperature=0.0, end_id=-1)
+    ).outputs[0]
+    stop_token = reference.token_ids[2]
+    assert stop_token not in reference.token_ids[:2], "pick a stop token the output reaches once"
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        temperature=0.0,
+        end_id=-1,
+        stop_token_ids=[stop_token],
+        return_generation_logits=True,
+    )
+
+    sequence = llm.generate(prompts[0], sampling_params=sampling_params).outputs[0]
+
+    assert sequence.token_ids == reference.token_ids[:2]
+    assert sequence.finish_reason == "stop"
+    assert sequence.generation_logits is not None
+    assert torch.argmax(sequence.generation_logits, dim=1).tolist() == sequence.token_ids
+
+
 @pytest.mark.parametrize("logprobs_k", [0, 1, 3], ids=["top_0", "top_1", "top_3"])
 @pytest.mark.parametrize("logprobs_mode", ["raw", "processed"])
 @pytest.mark.threadleak(enabled=False)
