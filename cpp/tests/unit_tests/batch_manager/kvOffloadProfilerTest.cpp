@@ -104,10 +104,34 @@ private:
     at::CallbackHandle mHandle;
 };
 
+bool hasField(std::string const& metadata, std::string const& field)
+{
+    auto const position = metadata.find(field);
+    if (position == std::string::npos)
+    {
+        return false;
+    }
+    auto const end = metadata.find_first_not_of(" \t\r\n", position + field.size());
+    return end != std::string::npos && (metadata[end] == ',' || metadata[end] == '}');
+}
+
 void expectField(Observation const& value, std::string const& field)
 {
-    EXPECT_NE(value.metadata.find(field), std::string::npos) << value.metadata;
+    EXPECT_TRUE(hasField(value.metadata, field)) << value.metadata;
 }
+
+#if !defined(TRTLLM_KV_OFFLOAD_DISABLED_TEST)
+TEST(KvOffloadProfilerMetadataTest, RequiresCompleteNumericValues)
+{
+    std::string const metadata{R"({"kv.copy_count":20,"kv.bytes_per_copy":40960,"kv.payload_bytes":81920})"};
+    EXPECT_FALSE(hasField(metadata, R"("kv.copy_count":2)"));
+    EXPECT_FALSE(hasField(metadata, R"("kv.bytes_per_copy":4096)"));
+    EXPECT_FALSE(hasField(metadata, R"("kv.payload_bytes":8192)"));
+    EXPECT_TRUE(hasField(metadata, R"("kv.copy_count":20)"));
+    EXPECT_TRUE(hasField(metadata, R"("kv.payload_bytes":81920)"));
+    EXPECT_TRUE(hasField(R"({"kv.copy_count":2 })", R"("kv.copy_count":2)"));
+}
+#endif
 
 class StreamObservingColdPageCodec : public v2::IKvCacheColdPageCodec
 {
