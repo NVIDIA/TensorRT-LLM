@@ -21,7 +21,9 @@ def test_w4a16_eplb_migrates_linear_block_scales(gated: bool, streamed: bool) ->
     module.tp_size = 1
     module.tp_rank = 0
     module.initial_local_expert_ids = [2, 0]
-    module.layer_load_balancer = SimpleNamespace(get_load_expert_ids=lambda: [0, 1, 2, 3])
+    module.layer_load_balancer = SimpleNamespace(
+        get_load_expert_ids=lambda: [0, 1, 2, 3], spare_slot_count=0
+    )
     fc1_rows = 256 if gated else 128
     module.w3_w1_weight_scale = torch.nn.Parameter(
         torch.zeros(2, fc1_rows, 4, dtype=torch.int32), requires_grad=False

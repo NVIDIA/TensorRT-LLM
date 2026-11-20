@@ -374,6 +374,85 @@ void HostAccessibleDeviceAllocator::memcpyToDevice(void* dst, void const* src, s
     }
 }
 
+void HostAccessibleDeviceAllocator::memcpyToDeviceAddress(void* devDst, void const* src, size_t size)
+{
+    if (mGdrHandle == nullptr)
+    {
+        // The host accesses the memory at its device address.
+        memcpy(devDst, src, size);
+        return;
+    }
+    auto* dst = static_cast<char*>(devDst);
+    auto const* from = static_cast<char const*>(src);
+    while (size > 0)
+    {
+        auto const allocationInfo = getAllocationInfoFromDevPtr(dst);
+        auto* const begin = static_cast<char*>(allocationInfo.devPtr);
+        TLLM_CHECK_WITH_INFO(allocationInfo.memDesc != nullptr && dst < begin + allocationInfo.size,
+            "%p is not host accessible device memory", static_cast<void*>(dst));
+        size_t const part = std::min(size, static_cast<size_t>(begin + allocationInfo.size - dst));
+        // Like memcpyToDevice, rely on the range check above rather than the return code.
+        tensorrt_llm::runtime::gdrcopy::copy_to_mapping(
+            allocationInfo.memDesc->gdrMh, static_cast<char*>(allocationInfo.hostPtr) + (dst - begin), from, part);
+        dst += part;
+        from += part;
+        size -= part;
+    }
+}
+
+bool HostAccessibleDeviceAllocator::usesGdrCopy() const
+{
+    TLLM_CHECK_WITH_INFO(mIsInited, "Host accessible device memory is chosen once a load balancer exists");
+    return mGdrHandle != nullptr;
+}
+
+void HostAccessibleDeviceAllocator::mapDeviceMemory(void* devPtr, size_t size)
+{
+    TLLM_CHECK_WITH_INFO(mGdrHandle != nullptr, "Mapping device memory for the host needs GDRCopy");
+    auto const address = reinterpret_cast<uint64_t>(devPtr);
+    TLLM_CHECK_WITH_INFO(size > 0 && address % GPU_PAGE_SIZE == 0 && size % GPU_PAGE_SIZE == 0,
+        "GDRCopy maps whole GPU pages, not %p (%zu bytes)", devPtr, size);
+    gdr_mh_t mh{};
+    TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::gdrcopy::pin_buffer(mGdrHandle, address, size, 0, 0, &mh) == 0,
+        "GDR pin_buffer failed for %p (%zu bytes)", devPtr, size);
+    void* map = nullptr;
+    if (tensorrt_llm::runtime::gdrcopy::map(mGdrHandle, mh, &map, size) != 0)
+    {
+        tensorrt_llm::runtime::gdrcopy::unpin_buffer(mGdrHandle, mh);
+        TLLM_THROW("GDR map failed for %p (%zu bytes)", devPtr, size);
+    }
+    // The descriptor owns no device memory, so free() would release only the host mapping, never the range.
+    auto* memDesc = new gdrcopy::GdrMemDesc{nullptr, map, 0, size, mh};
+    recordAllocation(devPtr, size, map, memDesc);
+}
+
+void HostAccessibleDeviceAllocator::unmapDeviceMemory(void* devPtr) noexcept
+{
+    gdrcopy::GdrMemDesc* memDesc = nullptr;
+    {
+        std::unique_lock<std::shared_mutex> lock(mAllocationsMutex);
+        auto it = mDeviceAllocations.find(devPtr);
+        if (it == mDeviceAllocations.end() || it->second.memDesc == nullptr
+            || it->second.memDesc->gdrDeviceMem != nullptr)
+        {
+            TLLM_LOG_ERROR("%p is not device memory that mapDeviceMemory mapped", devPtr);
+            return;
+        }
+        memDesc = it->second.memDesc;
+        mHostAllocations.erase(it->second.hostPtr);
+        mDeviceAllocations.erase(it);
+    }
+    if (tensorrt_llm::runtime::gdrcopy::unmap(mGdrHandle, memDesc->gdrMh, memDesc->gdrMap, memDesc->gdrMapSize) != 0)
+    {
+        TLLM_LOG_ERROR("Unmapping device memory at %p for the host failed", devPtr);
+    }
+    if (tensorrt_llm::runtime::gdrcopy::unpin_buffer(mGdrHandle, memDesc->gdrMh) != 0)
+    {
+        TLLM_LOG_ERROR("Unpinning device memory at %p failed", devPtr);
+    }
+    delete memDesc;
+}
+
 void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
 {
     int currentDevId = -1;

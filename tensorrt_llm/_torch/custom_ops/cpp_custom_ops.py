@@ -995,6 +995,15 @@ def _register_fake():
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
 
+    @torch.library.register_fake("trtllm::moe_unbacked_slots_set_backed")
+    def _(tensors: List[torch.Tensor], slots: List[int],
+          slots_per_tensor: List[int], backed: bool) -> int:
+        return 0
+
+    @torch.library.register_fake("trtllm::moe_unbacked_slots_bytes_to_back")
+    def _(tensor: torch.Tensor, slots: List[int]) -> int:
+        return 0
+
     @torch.library.register_fake("trtllm::memset_expert_ids")
     def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
           max_token_count_per_rank: int, top_k: int, invalid_expert_id: int,
