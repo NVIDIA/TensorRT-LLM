@@ -924,6 +924,18 @@ deprecation in favour of tactics, `MoEImplRequest.fallback` exists only for
 them and for auto, and new request kinds leave it empty, so that what is
 configured is what runs.
 
+The embedded MTP layers of a model make their own selection
+(`speculative_config.moe_tactic`, else `speculative_config.moe_backend`). With
+neither they inherit the target's literal, or resolve auto for their own
+weights when a tactic pins the target. For example, the MTP block of an NVFP4
+DeepSeek-V4 checkpoint keeps MXFP4 experts, which the NVFP4-only
+`MEGAMOE_CUTEDSL` kernel cannot serve. With the body on that kernel and the MTP
+layers on auto (a tactic on the target, or `moe_backend: AUTO` on the draft),
+which resolves to `TRTLLM` for DeepSeek-V4 on SM100-SM119, that layer runs on
+the TRTLLM-Gen leaf for its format while the other layers stay on MegaMoE.
+Under the `MEGAMOE_CUTEDSL` literal with no draft selection, the layer inherits
+the literal and degrades to the CUTLASS leaves.
+
 Tests that pin a tactic keep its promise and do not rely on a fallback
 (`tests/test_common/moe_tactics.py`):
 

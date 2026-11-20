@@ -57,7 +57,10 @@ class _StreamingMoEModule(nn.Module):
         super().__init__()
         self.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
         self.num_experts = NUM_EXPERTS
+        self.layer_idx = 0
         self.hidden_size = HIDDEN_SIZE
+        self.intermediate_size = INTERMEDIATE_SIZE
+        self.is_gated_activation = True
         self.intermediate_size_per_partition = INTERMEDIATE_SIZE
         self.expand_intermediate_size_per_partition = 2 * INTERMEDIATE_SIZE
         self.expert_size_per_partition = NUM_EXPERTS
