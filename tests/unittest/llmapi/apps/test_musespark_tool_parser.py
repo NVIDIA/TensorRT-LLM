@@ -16,6 +16,7 @@
 
 import json
 import random
+import time
 
 import pytest
 
@@ -609,6 +610,54 @@ def test_musespark_held_whitespace_is_not_rescanned_per_delta(monkeypatch, muses
     assert normal.strip() == "Hi" and not calls
     # Once the header arrives, not once per delta of the run.
     assert len(scanned) <= 4
+
+
+class _MatchRecorder:
+    """Wraps a compiled pattern and counts its `match` calls."""
+
+    def __init__(self, pattern):
+        self._pattern, self.calls = pattern, 0
+
+    def match(self, text, *args):
+        self.calls += 1
+        return self._pattern.match(text, *args)
+
+
+def test_musespark_held_whitespace_is_measured_once_per_delta(monkeypatch, musespark_sample_tools):
+    """A held whitespace run is matched against the header prefix once per delta.
+
+    The word that ends the run releases it without a match for every
+    suffix that starts inside the run.
+    """
+    recorder = _MatchRecorder(MuseSparkToolParser._HEADER_PREFIX_RE)
+    monkeypatch.setattr(MuseSparkToolParser, "_HEADER_PREFIX_RE", recorder)
+    text = "Answer:" + " " * 4000 + "done."
+    normal, calls = musespark_stream_chunks(
+        MuseSparkToolParser(), musespark_sample_tools, text, [4] * (len(text) // 4)
+    )
+    assert normal == text and not calls
+    assert recorder.calls <= 2 * (len(text) // 4)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Answer:" + " " * 100_000 + "done.",
+        "set to=x" + " " * 100_000 + "done.",
+        f" to=user{MS_M}Answer:" + "\n" * 100_000 + "done.",
+    ],
+    ids=["spaces", "spaces_after_to", "newlines_in_answer"],
+)
+def test_musespark_header_patterns_are_linear_in_a_whitespace_run(text, musespark_sample_tools):
+    """The header patterns try a whitespace run from its start only.
+
+    Trying every start inside a run of this length takes minutes.
+    """
+    parser = MuseSparkToolParser()
+    start = time.monotonic()
+    result = parser.detect_and_parse(text, musespark_sample_tools)
+    assert time.monotonic() - start < 5
+    assert not result.calls and result.normal_text.endswith("done.")
 
 
 def test_musespark_long_open_argument_is_parsed_once_per_closed_parameter(
