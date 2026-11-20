@@ -12,18 +12,22 @@ hold, and records what every routed target does with them today.
 
 ## Feature kinds
 
-Features fall into three kinds, by what goes wrong when a target does not serve
-one:
+Features are basic or advanced, by whether every target is expected to serve
+them, and advanced features are functional or perf, by what goes wrong when a
+target does not serve one:
 
 - **Basic** features are the foundational features every target is expected to
   serve, so a target serves them by default. A target that does not is the
   exception and says so, and turning the feature on for it is an error.
-- **Advanced functional** features change what the engine computes. A target
-  that ignores one returns wrong results, so only a target that declares it is
-  built; otherwise `auto` falls back to Modeling V1.
-- **Advanced perf** features change only how fast the engine runs. A target that
-  does not declare one still computes the right result in principle, so it is
-  built and the gap is reported.
+- **Advanced** features are ones some users need but not every target is
+  required to serve, so a target serves one only once it declares it. They come
+  in two kinds:
+  - **Advanced functional** features change what the engine computes. A target
+    that ignores one returns wrong results, so only a target that declares it is
+    built; otherwise `auto` falls back to Modeling V1.
+  - **Advanced perf** features change only how fast the engine runs. A target
+    that does not declare one still computes the right result in principle, so
+    it is built and the gap is reported.
 
 | Kind | A step target serves it | Declared with | When the route's target has a step target that does not serve it |
 |---|---|---|---|
