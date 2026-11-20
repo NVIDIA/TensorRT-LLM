@@ -678,14 +678,13 @@ class MXFP8GemmRunner(TunableRunner):
 
     @classmethod
     def sync_all_tactic_caches(cls, tuner: AutoTuner) -> None:
-        """Register every profiled MXFP8 tactic in the native serving cache."""
-        cache = tuner.profiling_cache.get_specific_custom_op(
-            _MXFP8_AUTOTUNED_OP)
+        """Register every MXFP8 tactic profiled for the current code in the
+        native serving cache."""
         runners = {str(key): runner for key, runner in cls.runner_dict.items()}
-        for cache_key, (_runner_id, tactic, _min_time) in cache.items():
-            _, cached_runner_name, cached_unique_id, profile = cache_key
-            if cached_runner_name != cls.__name__:
-                continue
+        for cached_unique_id, profile, (
+                _runner_id, tactic,
+                _min_time) in tuner.profiling_cache.entries_of(
+                    _MXFP8_AUTOTUNED_OP, cls):
             native_runner = runners.get(cached_unique_id)
             if native_runner is None:
                 continue

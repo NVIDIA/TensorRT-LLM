@@ -2004,6 +2004,7 @@ def fp_modules(tmp_path, monkeypatch):
 
     def fingerprints(*runner_classes):
         autotuner._code_fingerprint.cache_clear()
+        autotuner._candidates_fingerprint.cache_clear()
         return [autotuner._code_fingerprint(k) for k in runner_classes]
 
     before = set(sys.modules)
@@ -2319,6 +2320,8 @@ def test_code_fingerprint_follows_which_definition_a_name_binds(fp_modules):
 
 def test_code_fingerprint_follows_modules_imported_in_a_function(fp_modules):
     fp_modules.load("fp_helpers", "def helper():\n    return 0\n")
+    fp_modules.load("fp_backend_a", "def run():\n    return 0\n")
+    fp_modules.load("fp_backend_b", "def run():\n    return 1\n")
     (fp_modules.root / "fp_moe").mkdir()
     fp_modules.write("fp_moe/__init__", "")
     fp_modules.write(
@@ -2352,20 +2355,37 @@ def test_code_fingerprint_follows_modules_imported_in_a_function(fp_modules):
             def forward(self, inputs, tactic=-1, **kwargs):
                 from fp_moe import decode
                 return run_with(decode)
+
+
+        class PicksBackend(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                if tactic == 0:
+                    import fp_backend_a as backend
+                else:
+                    import fp_backend_b as backend
+                return backend.run()
         """)
-    classes = (runners.UsesAttribute, runners.PassesModule)
+    classes = (runners.UsesAttribute, runners.PassesModule,
+               runners.PicksBackend)
 
     before = fp_modules.fingerprints(*classes)
     # What the module's code uses counts, in another file too.
     fp_modules.edit("fp_helpers", "return 0", "return 42")
     after_helper = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_helper) == [True, True]
+    assert _changed(before, after_helper) == [True, True, False]
     # A module used only through its attributes counts by those; one passed
     # on as a whole counts whole.
     fp_modules.edit("fp_moe/decode", "def unused():\n    return 0",
                     "def unused():\n    return 42")
     after_unused = fp_modules.fingerprints(*classes)
-    assert _changed(after_helper, after_unused) == [False, True]
+    assert _changed(after_helper, after_unused) == [False, True, False]
+    # A local that either of two imports binds counts both modules.
+    for backend in ("fp_backend_a", "fp_backend_b"):
+        previous = fp_modules.fingerprints(*classes)
+        fp_modules.edit(backend, "return ", "return 4")
+        assert _changed(previous, fp_modules.fingerprints(*classes)) == [
+            False, False, True
+        ]
 
 
 def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
@@ -2428,6 +2448,40 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
     assert _changed(after_kernel_edit, after_rebuild) == [False, True, True]
 
 
+_CANDIDATE_RUNNERS = """
+    import fp_util
+    from fp_base import Base
+
+
+    class Winner(Base):
+        pass
+
+
+    class Loser(Base):
+        def forward(self, inputs, tactic=-1, **kwargs):
+            return fp_util.helper()
+    """
+
+
+def test_candidates_fingerprint_covers_every_candidate(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return 0\n")
+    runners = fp_modules.load("fp_runners", _CANDIDATE_RUNNERS)
+
+    def fingerprints():
+        [own] = fp_modules.fingerprints(runners.Winner)
+        candidates = autotuner._candidates_fingerprint
+        return (own, candidates(
+            (runners.Winner, )), candidates((runners.Winner, runners.Loser)),
+                candidates((runners.Loser, runners.Winner)))
+
+    before = fingerprints()
+    own, alone, pair, pair_reversed = before
+    assert alone == own and pair == pair_reversed and pair != alone
+    # A change to the runner that lost re-keys entries tuned against it.
+    fp_modules.edit("fp_util", "return 0", "return 42")
+    assert _changed(before, fingerprints()) == [False, False, True, True]
+
+
 def test_code_fingerprint_marks_sources_edited_after_start(
         fp_modules, monkeypatch):
     runners = fp_modules.load(
@@ -2474,6 +2528,72 @@ def test_native_library_id_is_the_elf_build_id(tmp_path):
     other.write_bytes(b"not an ELF file")
     assert autotuner._library_id(other) == hashlib.sha256(
         b"not an ELF file").hexdigest()
+
+
+def test_search_cache_reopens_the_comparison_when_a_loser_changes(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return 0\n")
+    runners = fp_modules.load("fp_runners", _CANDIDATE_RUNNERS)
+    cache = autotuner.AutoTuner().profiling_cache
+    winner, loser = runners.Winner(), runners.Loser()
+    key = cache.get_cache_key("test_candidates",
+                              winner,
+                              _TACTIC_SPACE_SHAPES,
+                              TuningConfig(),
+                              candidates=[winner, loser])
+    cache.cache[key] = (0, 7, 1.0)
+
+    def search(candidates):
+        return cache.search_cache("test_candidates", candidates,
+                                  _TACTIC_SPACE_SHAPES, TuningConfig())
+
+    assert search([winner, loser]) == (True, 0, 7, 1.0)
+    assert not search([winner])[0]  # Tuned among other candidates.
+    fp_modules.edit("fp_util", "return 0", "return 42")
+    fp_modules.fingerprints()  # A new process: fingerprints recomputed.
+    assert not search([winner, loser])[0]
+
+
+def test_entries_of_skips_older_key_layouts_and_fingerprints():
+    cache = autotuner.AutoTuner().profiling_cache
+    current = _tactic_space_cache_key(cache, _TacticSpaceRunner())
+    op, name, unique_id = current[:3]
+    cache.cache = {
+        current: (0, 7, 1.0),
+        (op, name, unique_id, ((32, 64), )): (0, 8, 1.0),  # Older layout.
+        (op, name, unique_id, ((48, 64), ), "0" * 16): (0, 9, 1.0),
+        ("other_op", *current[1:]): (0, 10, 1.0),
+    }
+    assert list(cache.entries_of(op, _TacticSpaceRunner)) == [
+        (unique_id, current[3], (0, 7, 1.0))
+    ]
+
+
+def test_mxfp8_sync_registers_only_entries_for_the_current_code(monkeypatch):
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops as ops
+
+    registered = []
+
+    class _NativeRunner:
+
+        def register_tactic(self, m, n, k, tactic):
+            registered.append((m, n, k, tactic))
+
+    runner_cls = ops.MXFP8GemmRunner
+    monkeypatch.setattr(runner_cls, "runner_dict", {"weights": _NativeRunner()})
+    tuner = autotuner.AutoTuner()
+    current = autotuner._candidates_fingerprint((runner_cls, ))
+
+    def key(m, *fingerprint):
+        return (ops._MXFP8_AUTOTUNED_OP, runner_cls.__name__, "weights",
+                ((m, 64), (m, 2), (32, 64)), *fingerprint)
+
+    tuner.profiling_cache.cache = {
+        key(16, current): (0, 3, 1.0),
+        key(32): (0, 4, 1.0),  # The key layout before code fingerprints.
+        key(48, "0" * 16): (0, 5, 1.0),  # Tuned against other code.
+    }
+    runner_cls.sync_all_tactic_caches(tuner)
+    assert registered == [(16, 32, 64, 3)]
 
 
 def test_search_cache_misses_across_tactic_spaces():

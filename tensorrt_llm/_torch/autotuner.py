@@ -707,7 +707,11 @@ def _code_refs(code: types.CodeType, globals_: Dict[str, Any], outer=None):
             attrs.append(nxt.argval)
         return attrs
 
-    modules: Dict[str, Tuple[str, Any]] = dict(outer or {})
+    # local -> every (name, module) an import in this code may bind it to.
+    modules: Dict[str, List[Tuple[str, Any]]] = {
+        local: list(bound)
+        for local, bound in (outer or {}).items()
+    }
     for i, ins in enumerate(instructions):
         if ins.opname != "IMPORT_NAME":
             continue
@@ -718,7 +722,9 @@ def _code_refs(code: types.CodeType, globals_: Dict[str, Any], outer=None):
                 fromlist, instructions[i + 1:]):
             if local is not None and inspect.ismodule(obj):
                 # Counted where it is used, through the attributes used.
-                modules[local] = (name, obj)
+                bound = modules.setdefault(local, [])
+                if (name, obj) not in bound:
+                    bound.append((name, obj))
             else:
                 yield name, obj
     for i, ins in enumerate(instructions):
@@ -729,12 +735,11 @@ def _code_refs(code: types.CodeType, globals_: Dict[str, Any], outer=None):
             continue
         loaded = _loaded_locals(ins)
         for k, local in enumerate(loaded):
-            if local in modules:
-                name, module = modules[local]
-                # Only the last variable an instruction loads can be followed
-                # by its attributes; any other use counts the whole module.
-                last = k == len(loaded) - 1
-                yield from _narrow(name, module, attrs_after(i) if last else [])
+            # Only the last variable an instruction loads can be followed by
+            # its attributes; any other use counts the whole module.
+            attrs = attrs_after(i) if k == len(loaded) - 1 else []
+            for name, module in modules.get(local, ()):
+                yield from _narrow(name, module, attrs)
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
             yield from _code_refs(const, globals_, modules)
@@ -1139,6 +1144,18 @@ def _code_fingerprint(runner_cls: type) -> str:
     return _FingerprintWalk(runner_cls).digest()
 
 
+@lru_cache(maxsize=None)
+def _candidates_fingerprint(runner_classes: Tuple[type, ...]) -> str:
+    """The code fingerprint in the key of an entry tuned among the runners of
+    `runner_classes`: the runner's own when it was the only candidate, else a
+    digest over every candidate's, so that a change to a runner that lost
+    also re-opens the comparison."""
+    fingerprints = sorted({_code_fingerprint(k) for k in runner_classes})
+    if len(fingerprints) == 1:
+        return fingerprints[0]
+    return hashlib.sha256("\0".join(fingerprints).encode()).hexdigest()[:16]
+
+
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True,
              cache_path: str = None,
@@ -1445,9 +1462,13 @@ class AutoTunerProfilingCache:
                     DistributedTuningStrategy.PARALLEL)
         found = None
         for idx, r in enumerate(runners):
-            if (cache_key := self.get_cache_key(
-                    custom_op, r, input_shapes, tuning_config,
-                    apply_map_to_tuning_buckets)) in self.cache:
+            if (cache_key :=
+                    self.get_cache_key(custom_op,
+                                       r,
+                                       input_shapes,
+                                       tuning_config,
+                                       apply_map_to_tuning_buckets,
+                                       candidates=runners)) in self.cache:
                 # Return the current index in runners list, not the cached runner_id
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
                 if not parallel:
@@ -1466,7 +1487,13 @@ class AutoTunerProfilingCache:
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
         apply_map_to_tuning_buckets: bool = True,
+        candidates: Optional[List[TunableRunner]] = None,
     ) -> Tuple:
+        """The key of `runner`'s entry for `input_shapes`. `candidates` are the
+        runners it was tuned among (only `runner` when omitted); their code
+        fingerprints are part of the key."""
+        runner_classes = tuple(
+            dict.fromkeys(type(r) for r in candidates or (runner, )))
         cache_key = (
             custom_op,
             runner.__class__.__name__,
@@ -1478,12 +1505,25 @@ class AutoTunerProfilingCache:
                 tuning_config.tune_max_num_tokens,
                 apply_map_to_tuning_buckets,
             ),
-            _code_fingerprint(type(runner)),
+            _candidates_fingerprint(runner_classes),
         )
         tactic_space_key = runner.tactic_space_key()
         if tactic_space_key is not None:
             cache_key += (tactic_space_key, )
         return cache_key
+
+    def entries_of(self, custom_op: str, runner_cls: type):
+        """(unique_id, profile, entry) for each entry of `custom_op` won by
+        `runner_cls` tuned as the only candidate, under its current code.
+        Entries of an older key layout or code fingerprint (loaded from an
+        older cache file) are left out: their tactics may index another
+        candidate list."""
+        fingerprint = _candidates_fingerprint((runner_cls, ))
+        for key, entry in self.cache.items():
+            if (len(key) > 4 and key[0] == custom_op
+                    and key[1] == runner_cls.__name__
+                    and key[4] == fingerprint):
+                yield key[2], key[3], entry
 
     def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
@@ -2131,8 +2171,8 @@ class AutoTuner:
                     runners[best_runner_id],
                     input_shapes,
                     tuning_config,
-                    apply_map_to_tuning_buckets=True)
-                not in self._keys_profiled_in_process):
+                    apply_map_to_tuning_buckets=True,
+                    candidates=runners) not in self._keys_profiled_in_process):
             # Only an entry this process profiled proves its JIT side
             # effects already ran here; re-profile anything else.
             is_cache_hit = False
@@ -2614,7 +2654,8 @@ class AutoTuner:
                         runner,
                         profile.get_opt_shapes(),
                         tuning_config,
-                        apply_map_to_tuning_buckets=False))
+                        apply_map_to_tuning_buckets=False,
+                        candidates=runners))
                 has_tuning_failure_occurred = True
             # The shortcut's candidate is recorded like the timed path's, so a
             # run's log lists every pair either way: 0.000 is the documented
@@ -2690,7 +2731,8 @@ class AutoTuner:
                                 runner,
                                 profile.get_opt_shapes(),
                                 tuning_config,
-                                apply_map_to_tuning_buckets=False))
+                                apply_map_to_tuning_buckets=False,
+                                candidates=runners))
 
                         # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                         # or some runtime error occurs during profiling.
@@ -2712,7 +2754,8 @@ class AutoTuner:
                 runners[best_runner_id],
                 profile.get_opt_shapes(),
                 tuning_config,
-                apply_map_to_tuning_buckets=False)
+                apply_map_to_tuning_buckets=False,
+                candidates=runners)
 
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
