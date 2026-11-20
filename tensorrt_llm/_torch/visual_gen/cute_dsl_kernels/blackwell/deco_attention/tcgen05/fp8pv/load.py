@@ -153,8 +153,8 @@ class LoadRole:
             q1_handle = load_q_producer.acquire_and_advance()
             self.qk.copy_q(qk_load, q1_coord, q1_handle)
             kv_coord += 1
-            if cutlass.const_expr(not self.split):
-                # prefetch the next work tile's Q tiles (each Q tile is read by one CTA only)
+            if cutlass.const_expr(not self.split and not self.lens):
+                # prefetch the next work tile's Q tiles (each Q tile is read by one CTA only; not with lengths)
                 next_idx = tile_sched._current_work_linear_idx + tile_sched.num_persistent_sm
                 if next_idx < tile_sched._num_blocks:
                     nb = tile_sched._problem_shape_mhb.get_hier_coord(next_idx)

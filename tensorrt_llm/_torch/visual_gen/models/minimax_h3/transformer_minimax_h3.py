@@ -110,14 +110,20 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
     return dense_config
 
 
+def _is_deco_recipe(model_config: DiffusionModelConfig) -> bool:
+    """Whether the attention of the config runs a DeCo-Attention recipe."""
+
+    quant_config = getattr(model_config.attention, "quant_attention_config", None)
+    return quant_config is not None and quant_config.deco_attention
+
+
 def _refiner_attention_model_config(model_config: DiffusionModelConfig) -> DiffusionModelConfig:
     """Return the config of the text-only token refiner: dense, and under a DeCo-Attention
     recipe unquantized on VANILLA. The recipe is for the packed sequence of the transformer
     blocks, and its backend runs every other call on VANILLA."""
 
     dense_config = _dense_attention_model_config(model_config)
-    quant_config = dense_config.attention.quant_attention_config
-    if quant_config is None or not quant_config.deco_attention:
+    if not _is_deco_recipe(dense_config):
         return dense_config
 
     refiner_config = dense_config.model_copy(deep=False)
@@ -557,7 +563,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
         fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self._attn_backend = model_config.attention.backend.upper()
+        # The refiner blocks run on the refiner config: VANILLA under a DeCo-Attention recipe.
+        self._attn_backend = _refiner_attention_model_config(model_config).attention.backend.upper()
         self._supports_key_padding_mask = self._attn_backend in (
             "VANILLA",
             "FA4",
@@ -776,8 +783,13 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        # Only VANILLA supports arbitrary padding between packed modalities.
-        self._supports_key_padding_mask = self._attn_backend in (
+        # A DeCo-Attention recipe takes, like TRTLLM, the length of the valid prefix of a
+        # padded sequence instead of a key padding mask.
+        self._deco_recipe = _is_deco_recipe(model_config)
+        self._padded_token_tags: tuple[torch.Tensor, int, torch.Tensor] | None = None
+        # Only VANILLA supports arbitrary padding between packed modalities; the others take
+        # trailing padding, as a mask or as the length of the valid prefix.
+        self._supports_key_padding_mask = self._deco_recipe or self._attn_backend in (
             "VANILLA",
             "FA4",
             "TRTLLM",
@@ -1099,8 +1111,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         rotary_emb = static_context.rotary_emb
         pad = _padding_to_multiple(sequence_length, self.sharder.size)
         has_existing_padding = bool((token_tags < 0).any())
+        takes_valid_seq_len = self._attn_backend == "TRTLLM" or self._deco_recipe
         valid_seq_len = None
-        if self._attn_backend == "TRTLLM" and (pad or has_existing_padding):
+        if takes_valid_seq_len and (pad or has_existing_padding):
             valid_seq_len = sequence_length
             if has_existing_padding:
                 valid_seq_len = int((token_tags >= 0).sum().item())
@@ -1109,7 +1122,13 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             packed_hidden_states = _pad_tensor_dim(packed_hidden_states, 1, pad)
             adaln_indices = _pad_tensor_dim(adaln_indices, 0, pad)
             timestep_indices_for_norm = _pad_tensor_dim(timestep_indices, 0, pad)
-            token_tags_for_mask = _pad_tensor_dim(token_tags, 0, pad, -1)
+            # One padded tensor per tags tensor: a backend that draws tokens by modality keeps
+            # its draw with the tensor it is given.
+            padded_tags = self._padded_token_tags
+            if padded_tags is None or padded_tags[0] is not token_tags or padded_tags[1] != pad:
+                padded_tags = (token_tags, pad, _pad_tensor_dim(token_tags, 0, pad, -1))
+                self._padded_token_tags = padded_tags
+            token_tags_for_mask = padded_tags[2]
             rotary_emb = _pad_rotary_emb(rotary_emb, pad)
 
         key_padding_mask = None
@@ -1121,15 +1140,15 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     f"{self._attn_backend} backend cannot express it. Use "
                     "VANILLA, FA4, TRTLLM or FLASHINFER."
                 )
-            # FA4 seqused_k and TRTLLM prefix trimming require trailing padding.
-            # Ulysses appends padding in this layout.
-            if self._attn_backend in ("FA4", "TRTLLM") and bool(
+            # FA4 seqused_k and the valid prefix of TRTLLM and of a DeCo-Attention recipe
+            # require trailing padding. Ulysses appends padding in this layout.
+            if (self._attn_backend == "FA4" or takes_valid_seq_len) and bool(
                 ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
             ):
                 raise NotImplementedError(
                     f"{self._attn_backend} requires trailing packed-row padding; use VANILLA for interior padding."
                 )
-            if self._attn_backend != "TRTLLM":
+            if not takes_valid_seq_len:
                 # Attention caches use the mask version to detect changes.
                 with torch.inference_mode(False):
                     key_padding_mask = (

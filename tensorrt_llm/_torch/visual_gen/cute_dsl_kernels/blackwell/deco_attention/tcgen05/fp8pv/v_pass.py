@@ -27,6 +27,7 @@ from ...common.dsl import nanosleep
 from ...common.expmath import bf16x2, e4m3x4, f2u, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.ptx import ld_global_acquire_b32
+from ..valid_len import valid_len
 
 V_BLOCK = 128  # keys per mean: one 128-key tile of the attention
 V_THREADS = 256
@@ -69,23 +70,16 @@ def _grid_inv8(
     return Float32(1.0) / pow2_ceil_448(vmax)
 
 
-@cute.kernel
-def v_kernel(
-    v: cute.Tensor,
-    v8: cute.Tensor,
-    v_mean: cute.Tensor,
-    gmax: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    NB: Int32,
-    nunits: Int32,
-):
+@cute.jit
+def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
     """E4M3 V minus its BF16 means of every V_BLOCK keys. Unit u = (batch u // nblk, block u % nblk of V_BLOCK keys)
     over every head; a CTA takes units bidx, bidx + gdim, ... and its threads the same 16-byte chunks (8 channels of
     a head) of a unit in both passes. Pass 1: per chunk the sum, minimum and maximum over the block's valid keys, the
     BF16 mean mu into v_mean (row = block) and max(max - mu, mu - min) into the grid's maximum (byte 24 of gmax,
     behind the counter at byte 32: all CTAs of the grid run at once). Pass 2: E4M3((V - mu) / s), s the power-of-two
-    scale of that maximum (the encode launch's v8_scale), and mu / s into v_mean (exact). v_mean is [B, H, NB, 128]."""
+    scale of that maximum (the encode launch's v8_scale), and mu / s into v_mean (exact). v_mean is [B, H, NB, 128].
+    lens: None, or the global address of the valid prefix lengths: the valid keys of a block are then those below the
+    length of its batch element, the keys after them get zero codes and a block without valid keys a zero mean."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
@@ -110,6 +104,9 @@ def v_kernel(
         s0 = j * Int32(V_BLOCK)
         nvalid = cutlass.min(Int32(V_BLOCK), S - s0)
         rcp_n = Float32(1.0) / Float32(nvalid)
+        if cutlass.const_expr(lens is not None):
+            nvalid = cutlass.max(cutlass.min(nvalid, valid_len(lens, b, S) - s0), Int32(0))
+            rcp_n = Float32(1.0) / Float32(cutlass.max(nvalid, Int32(1)))
         q = tidx
         while q < nchunk:
             hh = q >> 4
@@ -159,7 +156,10 @@ def v_kernel(
         b = u // nblk
         j = u - b * nblk
         s0 = j * Int32(V_BLOCK)
-        nvalid = cutlass.min(Int32(V_BLOCK), S - s0)
+        nrows = cutlass.min(Int32(V_BLOCK), S - s0)
+        nvalid = nrows
+        if cutlass.const_expr(lens is not None):
+            nvalid = cutlass.max(cutlass.min(nrows, valid_len(lens, b, S) - s0), Int32(0))
         q = tidx
         while q < nchunk:
             hh = q >> 4
@@ -194,6 +194,10 @@ def v_kernel(
                 dst = ob + obase + Int64(r) * Int64(H) * Int64(128)
                 codes = (e4m3x4(*f[0:4]), e4m3x4(*f[4:8]))
                 store_vector(gptr(Uint32, dst, 8), codes)
+            if cutlass.const_expr(lens is not None):
+                for r in cutlass.range(nvalid, nrows, unroll=1):
+                    dst = ob + obase + Int64(r) * Int64(H) * Int64(128)
+                    store_vector(gptr(Uint32, dst, 8), (Uint32(0), Uint32(0)))
             means = tuple(bf16x2(mu[2 * e] * inv8, mu[2 * e + 1] * inv8) for e in range(4))
             store_vector(gptr(Uint32, maddr, 16), means)
             q = q + Int32(256)
@@ -201,3 +205,34 @@ def v_kernel(
 
     # every thread waits before the grid retires, so the next plain launch cannot race the eigensolver grid
     cute.arch.griddepcontrol_wait()
+
+
+@cute.kernel
+def v_kernel(
+    v: cute.Tensor,
+    v8: cute.Tensor,
+    v_mean: cute.Tensor,
+    gmax: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    nunits: Int32,
+):
+    """The V pass (_v_body) of a call whose batch elements are all full."""
+    _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, None)
+
+
+@cute.kernel
+def v_kernel_lens(
+    v: cute.Tensor,
+    v8: cute.Tensor,
+    v_mean: cute.Tensor,
+    gmax: cute.Tensor,
+    lens: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    nunits: Int32,
+):
+    """The V pass (_v_body) of a call with valid prefix lengths lens [B] (int32)."""
+    _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, Int64(lens.iterator.toint()))

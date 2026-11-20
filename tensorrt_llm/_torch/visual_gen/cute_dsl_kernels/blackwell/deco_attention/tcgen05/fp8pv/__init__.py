@@ -56,16 +56,18 @@ def layout(b, s, h, rank, nsm):
     }
 
 
-def prepare(q, k, v, rows, buffers, rank):
+def prepare(q, k, v, rows, buffers, rank, lens=None, map_rows=False):
     """The preparation of this kernel on the buffers of a call (layout): the operands from BF16 q, k, v and the
     sampled rows. Every buffer may hold anything on entry. Only the ready flags of a split launch must be zero when
-    the attention starts: they are zeroed here."""
+    the attention starts: they are zeroed here. lens: None, or the int32 valid prefix lengths [B], with map_rows for
+    the default draw (prep.run)."""
     flags = buffers.get("split_flags")
     if flags is not None:
         flags.zero_()
-    prep.run(q, k, v, rows, buffers, rank)
+    prep.run(q, k, v, rows, buffers, rank, lens, map_rows)
 
 
-def attention(buffers, o, rank):
-    """The attention of this kernel: BF16 o from the buffers of a call that prepare has filled."""
-    launch.run(buffers, o, rank)
+def attention(buffers, o, rank, lens=None):
+    """The attention of this kernel: BF16 o from the buffers of a call that prepare has filled. lens: the valid prefix
+    lengths that prepare took (None: every batch element is full)."""
+    launch.run(buffers, o, rank, lens)

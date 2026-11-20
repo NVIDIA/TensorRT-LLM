@@ -21,7 +21,8 @@ each) that share one physical S tile in TMEM, with independent FP8 P tiles and O
   warp 12          MMA warp: QK0, PV0, QK1, PV1 per KV tile (../qk.py, mma.py), K(i) and V(i-1) from one ring slot
   warp 13          load warp: the TMA loads of Q', K', V and the v_mean rows
   warp 14          store warp: the TMA stores of O
-  warp 15          idle (it hands its registers to the softmax warpgroups)
+  warp 15          idle (it hands its registers to the softmax warpgroups); with valid prefix lengths it stores the
+                   zero rows of the units no role runs (epilogue.py)
 
 This module holds the kernel object: its configuration (PingPongAttention.__init__), the host-side setup of a launch
 (__call__: operand layouts, TMA atoms, the CTA's shared memory) and the CTA body (kernel: the setup of the CTA, then
@@ -60,6 +61,7 @@ from .epilogue import EpilogueRole
 from .load import LoadRole
 from .mma import MEANS_A_BYTES, MEANS_TILER, MmaRole
 from .sched import (
+    LiveTileScheduler,
     SplitTileSchedParams,
     SplitTileScheduler,
     TileSchedParams,
@@ -85,9 +87,19 @@ def _rebase_pipe(pipe, off):
 
 class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
     def __init__(
-        self, sm_count: int, rank: int, cluster_m: int = 1, split: bool = False, pdl: bool = True
+        self,
+        sm_count: int,
+        rank: int,
+        cluster_m: int = 1,
+        split: bool = False,
+        pdl: bool = True,
+        lens: bool = False,
     ):
         self.sm_count = sm_count
+        # lens: the launch takes per-sample valid prefix lengths: a batch element of n valid tokens attends its first
+        # n keys, and its query rows from n on are zero in O. The roles run the live units (sched.py) over the KV
+        # tiles that hold a valid key; the idle warp stores the rows of the other units
+        self.lens = lens
         # split: only the tail units after n_valid, each split along KV into n_parts pieces merged in the epilogue
         self.split = split
         # pdl: the split launch follows a main launch, so it launches as its programmatic dependent; without a main
@@ -100,6 +112,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         self.o_dtype = cutlass.BFloat16
         mma_tiler = (128, 128)
         tune = tuning.tuning()
+        # the roles of a main launch with lengths that read the lengths with loads of their own (_role_work)
+        self.own_loads = tune.lens_own_loads
         # the QK component of the target at this compensation rank
         self.qk = qk.for_target(mma_tiler, rank)
         self.load_sleep_ns = tune.load_sleep_ns
@@ -244,6 +258,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         split_o_addr: Int64,
         split_ml_addr: Int64,
         split_flag_addr: Int64,
+        lens_addr: Int64,
         stream: cuda.CUstream,
     ):
         dv = self.head_dim_v
@@ -455,7 +470,9 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             v_smem_layout_staged,
             o_smem_layout_staged,
             self.tile_sched_params,
-            (split_o_addr, split_ml_addr, split_flag_addr),
+            (split_o_addr, split_ml_addr, split_flag_addr, lens_addr, Int64(o_ptr.toint()))
+            if self.lens
+            else (split_o_addr, split_ml_addr, split_flag_addr),
             vs_args,
         ).launch(
             grid=grid,
@@ -608,15 +625,24 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         branch of the role."""
         return self.shared_storage(st.storage.base)
 
-    def _tile_scheduler(self, tile_sched_params):
+    def _tile_scheduler(self, tile_sched_params, lens=None):
         """The scheduler of the work tiles of this CTA; in the split launch its work items come after the n_full whole
-        units of the main launch."""
+        units of the main launch. lens: None, or (the global address of the valid prefix lengths, the padded sequence
+        length): the scheduler of the live work of a launch with lengths."""
         if cutlass.const_expr(self.split):
             return SplitTileScheduler(
                 tile_sched_params,
                 cute.arch.block_idx()[0] + tile_sched_params.n_full,
                 cute.arch.grid_dim(),
+                lens,
             )
+        if cutlass.const_expr(lens is not None):
+            return LiveTileScheduler(
+                tile_sched_params,
+                cute.arch.block_idx()[0],
+                cute.arch.grid_dim(),
+                (*lens, self.cluster_shape_mn[0]),
+            ).start()
         return TileScheduler(tile_sched_params, cute.arch.block_idx()[0], cute.arch.grid_dim())
 
     @cute.kernel
@@ -719,7 +745,10 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             pv_thr_mma.partition_shape_C(self.pv_mma_tiler[:2])
         ).layout
 
-        tile_sched = self._tile_scheduler(tile_sched_params)
+        if cutlass.const_expr(self.lens):
+            tile_sched = self._tile_scheduler(tile_sched_params, (split_args[3], mK_kdl.shape[0]))
+        else:
+            tile_sched = self._tile_scheduler(tile_sched_params)
         work_tile = tile_sched.get_current_work()
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         # TMEM: the allocator warp allocates, then every warp of the CTA passes one barrier at this common PC
@@ -748,7 +777,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             tma_tensor_vm=tma_tensor_vm,
             score_scale_addr=score_scale_addr,
             v_scale_addr=v_scale_addr,
-            split_args=split_args,
+            split_args=split_args[:3],
             # the CTA in its cluster
             cta_coord_vmnk=cta_coord_vmnk,
             kv_cta_layout=kv_cta_layout,
@@ -788,6 +817,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         # warpgroups.
         if warp_idx == self.idle_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+            if cutlass.const_expr(self.lens):
+                self.zero_rows(tile_sched_params, split_args[3], split_args[4], seqlen_k, tidx)
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             self._run_load_warp(st)
@@ -797,7 +828,11 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         if warp_idx == self.store_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.store_warp(
-                mO_qdl, tma_atom_o, sO, pipes.epi_store_consumer, (tile_sched, work_tile)
+                mO_qdl,
+                tma_atom_o,
+                sO,
+                pipes.epi_store_consumer,
+                self._role_work("store", tile_sched, work_tile),
             )
         if warp_idx < self.epilogue_warp_ids[0]:
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
@@ -808,10 +843,11 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             cute.arch.setmaxregister_decrease(self.num_regs_epilogue)
             epi = self._epilogue_operands(st, tmem)
             epi_pipes = pipes.epilogue
-            while work_tile.is_valid_tile:
-                epi_pipes = self._epilogue_work_tile(st, epi, epi_pipes, work_tile)
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+            epi_sched, epi_work = self._role_work("epilogue", tile_sched, work_tile)
+            while epi_work.is_valid_tile:
+                epi_pipes = self._epilogue_work_tile(st, epi, epi_pipes, epi_work)
+                epi_sched.advance_to_next_work()
+                epi_work = epi_sched.get_current_work()
             tmem.relinquish_alloc_permit()
             self.tmem_dealloc_barrier.arrive_and_wait()
             tmem.free(epi.tmem_ptr)
@@ -826,6 +862,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         and V, the v_mean ring, the Q and K/V producers with the K/V ring's empty barriers, and the CTA's place in
         its cluster for the K/V multicast."""
         storage = self._role_storage(st)
+        tile_sched, work_tile = self._role_work("load", st.tile_sched, st.work_tile)
         self.load_warp(
             (
                 st.tma_atom_q,
@@ -847,7 +884,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
                 storage.load_kv_mbar_ptr.data_ptr() + self.kv_stage,
             ),
             (st.cta_coord_vmnk, st.kv_cta_layout, st.kv_mcast_mask),
-            (st.tile_sched, st.work_tile),
+            (tile_sched, work_tile),
             st.n_kv_tiles,
             st.tidx,
         )
@@ -897,7 +934,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
                 pipes.p0_mma_consumer,
                 pipes.p1_mma_consumer,
             ),
-            (st.tile_sched, st.work_tile),
+            self._role_work("mma", st.tile_sched, st.work_tile),
             st.n_kv_tiles,
             st.tidx,
         )
@@ -952,7 +989,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             pipeline_args=(mma_si_consumer, si_epi_producer, pi_mma_producer),
             qk_thr_mma=st.qk_thr_mma,
             value_args=(st.seqlen_k, st.n_kv_tiles, score_scale),
-            sched_args=(st.tile_sched, st.work_tile),
+            sched_args=self._role_work("softmax", st.tile_sched, st.work_tile),
             vs_row=vs_row,
         )
 
@@ -986,6 +1023,10 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         epi_pipes: the consumers of the row statistics of softmax warpgroups 0 and 1 and of O, and the producer of the
         staged O tiles; returns them as they are after the work tile."""
         s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer = epi_pipes
+        # with lengths: the rows of the work tile's 256 below the length of its batch element
+        live_rows = None
+        if cutlass.const_expr(self.lens):
+            live_rows = self.valid_keys(work_tile) - work_tile.tile_idx[0] * self.cta_tiler[0]
         if cutlass.const_expr(self.split):
             # both O tiles in one pass: publish first, then merge (the two merges run on different SMs)
             s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer = (
@@ -1002,6 +1043,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
                     (work_tile.tile_idx[5], work_tile.tile_idx[6], work_tile.tile_idx[7]),
                     st.split_args,
                     epi.score_scale,
+                    live_rows,
                 )
             )
         else:
@@ -1012,6 +1054,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
                 (s0_epi_consumer, mma_epi_consumer, epi_store_producer),
                 epi.scale_output,
                 0,
+                live_rows,
             )
             s1_epi_consumer, mma_epi_consumer, epi_store_producer = self.epilogue_tile(
                 st.pv_thr_mma,
@@ -1019,11 +1062,28 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
                 (s1_epi_consumer, mma_epi_consumer, epi_store_producer),
                 epi.scale_output,
                 1,
+                live_rows,
             )
         return s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer
 
+    def _role_work(self, role, tile_sched, work_tile):
+        """The scheduler and the first work of a warp role: those of the CTA, or, for the roles of own_loads in a
+        main launch with lengths, a scheduler at the same work that reads the lengths with loads of its own."""
+        if self.lens and not self.split and role in self.own_loads:
+            tile_sched = tile_sched.own_loads()
+            work_tile = tile_sched.get_current_work()
+        return tile_sched, work_tile
+
     def kv_range(self, work_tile, n_kv_tiles):
-        """(first KV tile, KV tile count) of a work item: the whole row, or one KV piece of a split unit."""
+        """(first KV tile, KV tile count) of a work item: the whole row, or one KV piece of a split unit. With
+        lengths the row ends with the KV tile that holds the last valid key of the batch element (and so does the
+        last live piece of a split unit: sched.py)."""
         if cutlass.const_expr(self.split):
             return work_tile.tile_idx[3], work_tile.tile_idx[4]
+        if cutlass.const_expr(self.lens):
+            return 0, cute.ceil_div(self.valid_keys(work_tile), self.qk_mma_tiler[1])
         return 0, n_kv_tiles
+
+    def valid_keys(self, work_tile):
+        """The valid prefix length of the batch element of a work item of a launch with lengths."""
+        return work_tile.tile_idx[8 if self.split else 3]

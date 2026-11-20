@@ -44,6 +44,7 @@ def attn_launch(
     o_ptr: cute.Pointer,
     img_ptr: cute.Pointer,
     ws_ptr: cute.Pointer,
+    lens_ptr,
     S: cutlass.Constexpr,
     H: cutlass.Constexpr,
     B: cutlass.Constexpr,
@@ -51,12 +52,25 @@ def attn_launch(
     stream: cuda.CUstream,
 ):
     nT = (S + 127) // 128
-    relayout_kernel(k_ptr, ksf_ptr, v_ptr, vsf_ptr, vm_ptr, img_ptr, S, H).launch(
+    # lens_ptr: None, or the valid prefix lengths, which both kernels read in place
+    relayout_kernel(k_ptr, ksf_ptr, v_ptr, vsf_ptr, vm_ptr, img_ptr, S, H, lens_ptr).launch(
         grid=[nT * H * B, 1, 1], block=[256, 1, 1], stream=stream
     )
     nfull, rsplit, kmid = split_plan(S, H, B, NSM)
     attn_kernel(
-        q_ptr, qsf_ptr, score_scale_ptr, vs_ptr, img_ptr, o_ptr, ws_ptr, S, H, nfull, rsplit, kmid
+        q_ptr,
+        qsf_ptr,
+        score_scale_ptr,
+        vs_ptr,
+        img_ptr,
+        o_ptr,
+        ws_ptr,
+        S,
+        H,
+        nfull,
+        rsplit,
+        kmid,
+        lens_ptr,
     ).launch(
         grid=[nfull + 2 * rsplit, 1, 1], block=[NTHREADS, 1, 1], smem=SMEM_BYTES, stream=stream
     )
@@ -100,10 +114,11 @@ def split_counters(split):
 _compiled = {}
 
 
-def run(buffers, o):
+def run(buffers, o, lens=None):
     """BF16 o [B, S, H, 128] from the operands of the preparation (buffers: the buffers of the call, the layout of
     this package) on the current stream: the re-layout launch, then the attention launch. Nothing here reads a device
-    value or allocates."""
+    value or allocates. lens: None, or the int32 valid prefix lengths [B] of the preparation, read in place by the
+    kernel variant with lengths; the launch plan follows the padded sequence either way."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device
@@ -126,7 +141,17 @@ def run(buffers, o):
             (cutlass.Uint8, buffers["split"]),
         )
     ]
+    lens_ptr = gmem_ptr(cutlass.Int32, lens, 4) if lens is not None else None
     fn = compiled(
-        _compiled, (dev.index, B, S, H, nsm), lambda: attn_launch, *ptrs, S, H, B, nsm, stream
+        _compiled,
+        (dev.index, B, S, H, nsm, lens is not None),
+        lambda: attn_launch,
+        *ptrs,
+        lens_ptr,
+        S,
+        H,
+        B,
+        nsm,
+        stream,
     )
-    fn(*ptrs, stream)
+    fn(*ptrs, lens_ptr, stream)

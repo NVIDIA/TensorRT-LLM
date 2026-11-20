@@ -103,6 +103,9 @@ class AttentionBackend(ABC):
           key row counts, padding included, as the Attention module derives them from
           the tensor shapes.
         * ``attention_mask``, ``key_padding_mask``: the mask, if the backend takes one.
+        * ``valid_seq_len``: a host integer, the number of leading rows that hold tokens
+          when the rows after them are padding. A backend that takes it attends the keys
+          of that prefix only and returns zeros in the padded rows.
         * ``token_tags``: an integer tensor ``[S]`` with the modality of every row of a
           packed multimodal sequence, padding included: 0 video or image, positive text
           or audio, negative padding. Advisory: a backend that samples tokens by

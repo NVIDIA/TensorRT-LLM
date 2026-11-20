@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import cpasync
 from ...runtime import compiled, current_stream, gmem_ptr, num_sms
 from .epilogue import PART_N, merge_partial_kernel
 from .kernel import attn_kernel
-from .layout import EP, K_STEPS, KA_BYTES, KT, NTHR, QT, SF_BYTES, SMEM_BYTES
+from .layout import EP, K_STEPS, KA_BYTES, KT, LEN_BYTES, NTHR, QT, SF_BYTES, SMEM_BYTES
 from .scan import SCAN_THREADS, v_tile_nan_kernel
 from .small import SMALL_SMEM_BYTES, small_kernel
 
@@ -60,6 +60,7 @@ def attn_launch(
     o_ptr: cute.Pointer,
     part_ptr: cute.Pointer,
     flags_ptr: cute.Pointer,
+    lens_ptr,
     S: cutlass.Constexpr,
     H: cutlass.Constexpr,
     B: cutlass.Constexpr,
@@ -114,7 +115,8 @@ def attn_launch(
         (128, 8, 2),
     )
     n_full, n_tail, parts = split_plan(nT * H * B, nT, NSM)
-    v_tile_nan_kernel(v_ptr, vm_ptr, flags_ptr, S, H).launch(
+    # lens_ptr: None, or the valid prefix lengths, which the three kernels read in place
+    v_tile_nan_kernel(v_ptr, vm_ptr, flags_ptr, S, H, lens_ptr).launch(
         grid=[nT, H, B], block=[SCAN_THREADS, 1, 1], smem=16, stream=stream
     )
     attn_kernel(
@@ -138,11 +140,15 @@ def attn_launch(
         n_full,
         n_tail,
         parts,
+        lens_ptr,
     ).launch(
-        grid=[n_full + n_tail * parts, 1, 1], block=[NTHR, 1, 1], smem=SMEM_BYTES, stream=stream
+        grid=[n_full + n_tail * parts, 1, 1],
+        block=[NTHR, 1, 1],
+        smem=SMEM_BYTES + (LEN_BYTES if lens_ptr is not None else 0),
+        stream=stream,
     )
     if cutlass.const_expr(n_tail > 0):
-        merge_partial_kernel(part_ptr, o_ptr, vs_ptr, S, H, nT, parts, n_full).launch(
+        merge_partial_kernel(part_ptr, o_ptr, vs_ptr, S, H, nT, parts, n_full, lens_ptr).launch(
             grid=[n_tail, 1, 1], block=[NTHR, 1, 1], smem=QT * EP, stream=stream
         )
 
@@ -158,13 +164,25 @@ def small_launch(
     vs_ptr: cute.Pointer,
     vm_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
+    lens_ptr,
     S: cutlass.Constexpr,
     H: cutlass.Constexpr,
     B: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
     small_kernel(
-        q_ptr, k_ptr, qsf_ptr, ksf_ptr, score_scale_ptr, v_ptr, vs_ptr, vm_ptr, o_ptr, S, H
+        q_ptr,
+        k_ptr,
+        qsf_ptr,
+        ksf_ptr,
+        score_scale_ptr,
+        v_ptr,
+        vs_ptr,
+        vm_ptr,
+        o_ptr,
+        S,
+        H,
+        lens_ptr,
     ).launch(grid=[1, H, B], block=[NTHR, 1, 1], smem=SMALL_SMEM_BYTES, stream=stream)
 
 
@@ -185,9 +203,11 @@ def scratch(B, S, H, nsm):
 _compiled = {}
 
 
-def run(buffers, o):
+def run(buffers, o, lens=None):
     """BF16 o [B, S, H, 128] = (P V' + S M) * v8_scale / l from the operands of the preparation (buffers: the buffers
-    of the call, the layout of this package) on the current stream. Nothing here reads a device value or allocates."""
+    of the call, the layout of this package) on the current stream. Nothing here reads a device value or allocates.
+    lens: None, or the int32 valid prefix lengths [B] of the preparation, read in place by the kernel variants with
+    lengths; the launch plan follows the padded sequence either way."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device
@@ -203,10 +223,18 @@ def run(buffers, o):
         (cutlass.Uint8, buffers["v_mean"]),
         (cutlass.BFloat16, o),
     )
+    lens_ptr = gmem_ptr(cutlass.Int32, lens, 4) if lens is not None else None
     if S < KT:
-        args = [gmem_ptr(dt, x, 16) for dt, x in ops]
+        args = [gmem_ptr(dt, x, 16) for dt, x in ops] + [lens_ptr]
         fn = compiled(
-            _compiled, (dev.index, "small", B, S, H), lambda: small_launch, *args, S, H, B, stream
+            _compiled,
+            (dev.index, "small", B, S, H, lens is not None),
+            lambda: small_launch,
+            *args,
+            S,
+            H,
+            B,
+            stream,
         )
         fn(*args, stream)
         return
@@ -216,7 +244,16 @@ def run(buffers, o):
         for dt, x in ops
         + ((cutlass.Float32, buffers["partial"]), (cutlass.Int32, buffers["scan_flags"]))
     ]
+    args.append(lens_ptr)
     fn = compiled(
-        _compiled, (dev.index, B, S, H, nsm), lambda: attn_launch, *args, S, H, B, nsm, stream
+        _compiled,
+        (dev.index, B, S, H, nsm, lens is not None),
+        lambda: attn_launch,
+        *args,
+        S,
+        H,
+        B,
+        nsm,
+        stream,
     )
     fn(*args, stream)

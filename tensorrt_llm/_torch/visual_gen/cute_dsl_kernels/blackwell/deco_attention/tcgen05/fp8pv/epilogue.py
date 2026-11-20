@@ -29,6 +29,8 @@ from cutlass.cute.typing import Float32, Int32, Int64
 from ...common.mem import gptr, store_vector
 from ...common.ptx import ld_global_acquire_b32, ld_global_cg_v4
 from ...constants import HEAD_DIM
+from ..valid_len import valid_len
+from .sched import SplitTileScheduler, TileScheduler
 
 
 def _merge_slot(slot_base, j, merger, stage):
@@ -88,12 +90,14 @@ class EpilogueRole:
         split_info,
         split_args,
         score_scale,
+        live_rows=None,
     ):
         """Split launch epilogue for both O tiles of a KV piece. O tile s is merged by piece s % nparts; every other
         piece publishes its unnormalized O rows, anchor and row sum into its (unit, piece, tile) slot and then sets
         the slot's ready flag. All publishes come first, so the two merges (on different SMs) run in parallel. The
         flags are zero on entry (the host zeroes them before the launches of a call) and on exit: the merger returns
-        each flag it waited for to zero."""
+        each flag it waited for to zero. live_rows: with lengths, the rows of the work tile's 256 below the length
+        of its batch element; the rows after them are stored as zeros."""
         tOtO0, tOtO1, vec0, vec1, sO = tensor_args
         s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer = pipeline_args
         part, nparts, slot_base = split_info
@@ -241,6 +245,10 @@ class EpilogueRole:
                         )
                         for jj in cutlass.range_constexpr(cute.size(tTMrO)):
                             tTMrO[jj] = tTMrO[jj] + s_a * vals_a[jj] + s_b * vals_b[jj]
+                    if cutlass.const_expr(live_rows is not None):
+                        live = stage * 128 + thread_idx < live_rows
+                        for jj in cutlass.range_constexpr(cute.size(tTMrO)):
+                            tTMrO[jj] = cutlass.select_(live, tTMrO[jj], Float32(0.0))
                     tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
                     o_vec = tTMrO.load()
                     tDMrO.store(o_vec.to(self.o_dtype))
@@ -279,13 +287,16 @@ class EpilogueRole:
         return tTMrS[0]
 
     @cute.jit
-    def epilogue_tile(self, thr_mma, tensor_args, pipeline_args, scale_output, stage: int):
+    def epilogue_tile(
+        self, thr_mma, tensor_args, pipeline_args, scale_output, stage: int, live_rows=None
+    ):
         """Main launch epilogue of O tile `stage`: O times v_scale over the row sum (column 128), BF16 into its SMEM
-        staging tile for the store warp's TMA store."""
+        staging tile for the store warp's TMA store. live_rows: with lengths, the rows of the work tile's 256 below
+        the length of its batch element; the rows after them are stored as zeros."""
         tOtO, dest_O = tensor_args
         si_epi_consumer, mma_epi_consumer, epi_store_producer = pipeline_args
         chunk_cols = 32 * 8 // self.o_dtype.width
-        tiled_tmem_load, tTMEM_LOADtO, tTMEM_LOADdO, tTMEM_LOADoO, tiled_smem_store, _ = (
+        tiled_tmem_load, tTMEM_LOADtO, tTMEM_LOADdO, tTMEM_LOADoO, tiled_smem_store, thread_idx = (
             self._epi_copy(thr_mma, tOtO, dest_O)
         )
 
@@ -310,6 +321,10 @@ class EpilogueRole:
                 tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                     (tTMrO[j], tTMrO[j + 1]), (scale, scale)
                 )
+            if cutlass.const_expr(live_rows is not None):
+                live = stage * 128 + thread_idx < live_rows
+                for j in cutlass.range_constexpr(cute.size(tTMrO)):
+                    tTMrO[j] = cutlass.select_(live, tTMrO[j], Float32(0.0))
             tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tDMrO.store(o_vec.to(self.o_dtype))
@@ -367,3 +382,44 @@ class EpilogueRole:
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
         cute.arch.cp_async_bulk_wait_group(0, read=False)
+
+    @cute.jit
+    def zero_rows(self, tile_sched_params, lens_addr, o_addr, seqlen, tidx):
+        """The idle warp of a launch with valid prefix lengths: zeros in the O rows of the units that no role runs,
+        those without a query row below the length of their batch element (with CTA pairs: whose pair has none). The
+        warp walks the units of the CTA's share of the static schedule (in the split launch the work of the CTA,
+        where the first piece of a unit stores its rows) and each thread stores its share of the 16-byte chunks of a
+        unit's rows. lens_addr, o_addr: the global addresses of the lengths and of O [B, S, H, 128]."""
+        lane = tidx % self.threads_per_warp
+        heads = tile_sched_params.problem_shape_mhb[1]
+        group = self.cluster_shape_mn[0]
+        if cutlass.const_expr(self.split):
+            sched = SplitTileScheduler(
+                tile_sched_params,
+                cute.arch.block_idx()[0] + tile_sched_params.n_full,
+                cute.arch.grid_dim(),
+            )
+        else:
+            sched = TileScheduler(tile_sched_params, cute.arch.block_idx()[0], cute.arch.grid_dim())
+        work = sched.get_current_work()
+        z = Int32(0)
+        while work.is_valid_tile:
+            m = work.tile_idx[0]
+            h, b = work.tile_idx[2]
+            no_row = (m - m % group) * self.cta_tiler[0] >= valid_len(lens_addr, b, seqlen)
+            if cutlass.const_expr(self.split):
+                no_row = no_row & (work.tile_idx[5] == 0)
+            if no_row:
+                row0 = m * self.cta_tiler[0]
+                rows = cutlass.min(Int32(self.cta_tiler[0]), seqlen - row0)
+                row_bytes = Int64(heads) * Int64(2 * HEAD_DIM)
+                base = (
+                    Int64(o_addr)
+                    + (Int64(b) * Int64(seqlen) + Int64(row0)) * row_bytes
+                    + Int64(h) * Int64(2 * HEAD_DIM)
+                )
+                for c in cutlass.range(lane, rows * 16, self.threads_per_warp, unroll=1):
+                    dst = base + Int64(c >> 4) * row_bytes + Int64((c & 15) * 16)
+                    store_vector(gptr(Int32, dst, 16), (z, z, z, z))
+            sched.advance_to_next_work()
+            work = sched.get_current_work()

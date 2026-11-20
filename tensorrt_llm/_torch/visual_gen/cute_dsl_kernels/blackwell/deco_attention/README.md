@@ -1,8 +1,8 @@
 # DeCo-Attention kernels
 
-Attention kernels of DeCo-Attention in CuTe DSL, with their preparation. A call computes
-`softmax(q k^T / sqrt(128)) v` per head for BF16 `q`, `k`, `v` of shape [B, S, H, 128] (queries and keys of the same
-length S, no mask) and returns BF16 [B, S, H, 128]. The head dimension is 128.
+Attention kernels of DeCo-Attention in CuTe DSL, with their preparation. A call computes `softmax(q k^T / sqrt(128)) v`
+per head for BF16 `q`, `k`, `v` of shape [B, S, H, 128] (queries and keys of the same length S; padding at the end of a
+batch element is given as its valid length) and returns BF16 [B, S, H, 128]. The head dimension is 128.
 
 Every kernel takes NVFP4 Q' and K' of 128 + 2 x rank channels (the QK compensation of rank 32, or 64), forms P with
 I-ExpCast and rescales lazily at T = 4. The kernels of a GPU family differ in the format of the PV, selected by `pv`:
@@ -56,6 +56,31 @@ with torch.cuda.graph(graph):
     attention(prepare(q, k, v, workspace), out)
 graph.replay()     # after writing new data into q, k, v
 ```
+
+## Valid lengths
+
+```python
+lens = torch.tensor([4096, 3000], dtype=torch.int32, device="cuda")     # one valid prefix length per batch element
+attention(prepare(q, k, v, workspace, valid_seq_lens=lens), out)
+```
+
+`valid_seq_lens` is an int32 tensor [B] on the device of `q`: batch element b holds valid tokens on its first
+n = clamp(valid_seq_lens[b], 0, S) positions and padding after them. Its output rows below n are the attention of its
+first n queries over its first n keys; its output rows from n on are zero; what `q`, `k` and `v` hold from n on has
+no influence on the output. A batch element of length 0 is all zeros. The batch runs in one call: the kernels read
+the lengths on the device and compute only the tiles that hold a valid token, while the launches and
+`workspace_size` follow the padded S. `None` (the default) is a call without padding and runs the kernels without
+the lengths; a call with every length equal to S returns the same bits.
+
+The kernels read the tensor in place, in `prepare` and in `attention`, so it must hold until `attention` has run,
+like `q`, `k` and `v`. A CUDA graph captured with a lengths tensor holds its address: the caller writes other lengths
+into the same tensor before a replay. A graph captured without lengths takes none later, so a caller that may see
+padding captures with a tensor (all S for full rows).
+
+Rows of the compensation basis with lengths: the default draw is mapped into each valid prefix (its row r stands
+for token floor(r n / S)). `rows` given by the caller are taken as given, a one-dimensional tensor for every batch
+element or a two-dimensional one [B, m] per batch element (for instance the tagged draw of each batch element's
+tags, with negative tags on its padding); a given row from n on stands for token n - 1.
 
 `rank=64` doubles the compensation channels: Q' and K' fill their 256-channel rows and the basis holds 64 directions.
 `ranks()` tells whether the current target offers it.

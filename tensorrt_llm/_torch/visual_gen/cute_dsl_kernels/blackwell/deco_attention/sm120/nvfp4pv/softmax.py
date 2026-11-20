@@ -70,9 +70,10 @@ MIN_SCORE_LOG2 = -6
 # A thread's scores of a tile: Sacc[8 s + 4 h + i] = the four accumulators of n-tile i of the 32-key group (s, h),
 # elements 2 rr + e of row g + 8 rr, key 64 s + 32 h + 8 t + 2 i + e of the tile. A 16-key block is (s, h, t // 2):
 # the lanes t and t ^ 1 hold its two halves. Straight-line emitters (plain Python, unrolled at trace time).
-def emit_block_max(Sacc, masked):
+def emit_block_max(Sacc, masked, floor=None):
     """16-key block maxima of the raw scores: bm[s][h] = (row g, row g + 8); the pair (t, t ^ 1) holds one block.
-    masked: the tile has keys past the sequence (scores -inf), whose blocks keep a finite max."""
+    masked: the tile has keys past the sequence (scores -inf), whose blocks keep a finite max. floor: with lengths,
+    the run-time lower bound of the maxima (-1e30 for the last tile of the keys, else -inf)."""
     bm = [[None, None], [None, None]]
     for s_ in range(2):
         for h_ in range(2):
@@ -92,6 +93,8 @@ def emit_block_max(Sacc, masked):
                 mm = cute.arch.fmax(mm, cute.arch.shuffle_sync_bfly(mm, offset=1))
                 if masked:
                     mm = cute.arch.fmax(mm, Float32(-1e30))
+                if floor is not None:
+                    mm = cute.arch.fmax(mm, floor)
                 pr.append(mm)
             bm[s_][h_] = pr
     return bm
@@ -179,8 +182,12 @@ def softmax_phase(
 ):
     """Softmax of the current tile (scores Sacc), without an MMA: NVFP4 P into st.Pst, its means operand into st.Mlo
     (even tile) or st.Pst[10..11] (odd tile), the row sums; an anchor move rescales O (after the burst's PV, behind a
-    warp-uniform branch) and the pending means operand of the even tile."""
-    bm = emit_block_max(Sacc, masked)
+    warp-uniform branch) and the pending means operand of the even tile. masked, cur_odd "lens": a tile of a range
+    that ends at a run-time tile, with the floor of its block maxima in st.mask[1] and its parity in st.odd."""
+    if cutlass.const_expr(masked == "lens"):
+        bm = emit_block_max(Sacc, False, st.mask[1])
+    else:
+        bm = emit_block_max(Sacc, masked)
     bml = [bm[s_][h_][rr] for s_ in range(2) for h_ in range(2) for rr in range(2)]
     anchor, thr, safe, lsum = st.anchor, st.thr, st.safe, st.lsum
     # Raw thresholds round down: no skipped anchor move even for a non-power-of-two c.
@@ -201,12 +208,23 @@ def softmax_phase(
     for i in cutlass.range_constexpr(64):
         O[i] = vals[i]
     Mlo = st.Mlo
-    if cutlass.const_expr(cur_odd):
-        if vneed != 0:
-            # the even tile's means operand waits for its partner: bring it to the new anchor
+    if cutlass.const_expr(cur_odd == "lens"):
+        if (vneed & st.odd) != 0:
             Mlo[0] = scale_bf16x2(Mlo[0], f0)
             Mlo[1] = scale_bf16x2(Mlo[1], f1)
-    if cutlass.const_expr(cur_odd):
-        emit_p(st, Sacc, bm, st.Pst, 10, two_step)
+        # the means operand of the tile, then into the place of its parity
+        ma = cute.make_rmem_tensor((2,), Int32)
+        emit_p(st, Sacc, bm, ma, 0, two_step)
+        for i in cutlass.range_constexpr(2):
+            st.Pst[10 + i] = Int32(cutlass.select_(st.odd != 0, ma[i], st.Pst[10 + i]))
+            Mlo[i] = Int32(cutlass.select_(st.odd != 0, Mlo[i], ma[i]))
     else:
-        emit_p(st, Sacc, bm, Mlo, 0, two_step)
+        if cutlass.const_expr(cur_odd):
+            if vneed != 0:
+                # the even tile's means operand waits for its partner: bring it to the new anchor
+                Mlo[0] = scale_bf16x2(Mlo[0], f0)
+                Mlo[1] = scale_bf16x2(Mlo[1], f1)
+        if cutlass.const_expr(cur_odd):
+            emit_p(st, Sacc, bm, st.Pst, 10, two_step)
+        else:
+            emit_p(st, Sacc, bm, Mlo, 0, two_step)

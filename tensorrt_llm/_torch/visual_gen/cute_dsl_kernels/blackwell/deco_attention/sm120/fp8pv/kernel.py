@@ -64,14 +64,17 @@ from ..ptx.fp8pv import (
     stage_next,
 )
 from ..ptx.shared import mbar_init_imm
-from .epilogue import inv_row_sums, store_partials, store_rows
+from ..valid_len import valid_len
+from .epilogue import inv_row_sums, store_partials, store_rows, store_zero_rows
 from .layout import (
     BAR_OFF,
     CNT_OFF,
     EP,
     K_BYTES,
     KT,
+    LEN_OFF,
     NTHR,
+    QT,
     SF_BYTES,
     SF_OFF,
     STAGE_BYTES,
@@ -412,6 +415,95 @@ def refill_part0(st, old, t0, nK):
         refill_if_last(st, old, t0 + 3, t0 + 2, hk0, t0 + 2, t0 + 2, nvm0)
 
 
+# The ring of a range of key tiles of a call with lengths. The range is rng = (t0, n, rot, lim), four functions of no
+# argument: the n() >= 1 tiles from t0(), step j taking tile lens_tile(j) in the order of a whole unit (diagonal
+# first with rot(), the last tile last) or, with rot 0, of a key-range piece; lim(): the valid keys of the last tile.
+
+
+def valid_keys(st):
+    """With lengths: the valid tokens of the unit's batch element, from its word of shared memory (thread 0 writes it
+    before the barrier of start_ring), where the epilogue reads the bound of its zero rows."""
+    return cute.arch.load(sptr(Int32, st.smem + LEN_OFF), Int32)
+
+
+@cute.jit
+def lens_tile(j, rng):
+    """Key tile of step j (a step past the last counts as the last) of the range."""
+    n = rng[1]()
+    t = n - 1
+    if j < n - 1:
+        t = rot_tile(j, rng[2](), n - 1)
+    return rng[0]() + t
+
+
+@cute.jit
+def first_stages_lens(st, rng):
+    """The first loads of the range, issued by warp 4, as first_stages_full for a run-time n: stage 0 K' of step 0;
+    stage 1 K' of step 1 (n >= 2) and V of step 0, with its v_mean rows when it is the only step; stage 2 (n >= 2)
+    K' of step 2 (n >= 3), V of step 1 and the v_mean rows of the step pair (0, 1)."""
+    n = rng[1]()
+    ta = lens_tile(0, rng)
+    tb = lens_tile(1, rng)
+    issue_tile(st, 0, ta, ta, Int32(1), Int32(0), ta, ta, Int32(0), Int32(0))
+    issue_tile(st, 1, tb, ta, Int32(n >= 2), Int32(1), ta, ta, Int32(n == 1), Int32(0))
+    if n >= 2:
+        issue_tile(
+            st, 2, lens_tile(2, rng), tb, Int32(n >= 3), Int32(1), ta, tb, Int32(2), Int32(0)
+        )
+
+
+@cute.jit
+def refill_lens0(st, old, rng):
+    """The refill of stage 0 for phase 3 of the range (n > 2), as refill_full0."""
+    if (old & 7) == 7:
+        n = rng[1]()
+        if 2 < n:
+            vt2 = lens_tile(2, rng)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            issue_tile(
+                st,
+                0,
+                lens_tile(3, rng),
+                vt2,
+                Int32(3 < n),
+                Int32(1),
+                vt2,
+                vt2,
+                Int32(n == 3),
+                Int32(1),
+            )
+
+
+@cute.jit
+def refill_loop_lens(st, old, k, stage, rng):
+    """refill_loop_full for the range (a phase k + 3 to load: k + 2 < n)."""
+    if (old & 7) == 7:
+        n = rng[1]()
+        if k + 2 < n:
+            vt = lens_tile(k + 2, rng)
+            nvm = Int32(0)
+            vma = vt
+            if (k & 1) == 1:
+                nvm = Int32(2)
+                vma = lens_tile(k + 1, rng)
+            else:
+                if k + 2 == n - 1:
+                    nvm = Int32(1)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            issue_tile(
+                st,
+                stage,
+                lens_tile(k + 3, rng),
+                vt,
+                Int32(k + 3 < n),
+                Int32(1),
+                vma,
+                vt,
+                nvm,
+                ((k + 2) >> 1) & 1,
+            )
+
+
 # ------------------------------------------------------------------------------------------------ phases
 # MMA phase k = [PV(k - 1), means, QK(k)], k = 0 .. n (n: the key tiles of the CTA); the warps of a pair alternate (w
 # first). The means of the step pair (2m, 2m + 1) take phase 2m + 2: 16 BF16 m16n8k16 (8 channel tiles x 2 query
@@ -736,6 +828,130 @@ def partial_body(
     store_partials(part_ptr, bid, st.tidx, st.O, anc0, anc1, l0, l1)
 
 
+@cute.jit
+def lens_phases(st, ops, rng, S: cutlass.Constexpr, H: cutlass.Constexpr, vs_ptr=None):
+    """The phases of a CTA of a call with lengths over the key tiles of the range rng (see first_stages_lens), the
+    keys of the last tile from its valid count on masked: the ring and the operands as in full_body, the phases as in
+    partial_body, a single tile going from its QK straight to the last phase. Returns the softmax state."""
+    nT = (S + KT - 1) // KT
+    start_ring(st, ops, H, nT)
+    if st.warp == 4:
+        first_stages_lens(st, rng)
+    if st.grp == 1:
+        # warp w takes the first turn of its pair
+        pass_turn(st)
+    load_operands(st, ops, S, H, nT, vs_ptr)
+    sm = softmax_init()
+    nzp = Int32(0)  # step k - 2's P had a nonzero byte (or V / v_mean a non-finite value)
+    # ---- phase 0: QK(0); its tile is masked when it is the only one
+    acc = qk_phase(st, st.smem, (st.fbar, Int32(0)), st.turn)
+    lim0 = Int32(cutlass.select_(rng[1]() == 1, rng[3](), Int32(KT)))
+    sm = softmax_step(st, acc, sm, lim0, stage=0, refill=lambda old: refill_lens0(st, old, rng))
+    sk_i = Int32(1)  # stage of step k (loop-carried: no modulo in the loop)
+    ph = Int32(0)  # its full-barrier parity, (k // STAGES) & 1
+    # ---- phases k = 1 .. n - 2
+    for k in cutlass.range(1, rng[1]() - 1, unroll=1):
+        nzp, sm = loop_phase(
+            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_lens(st, old, k, sk_i, rng)
+        )
+        sk_i, ph = stage_next(sk_i, ph, STAGES)
+    # ---- phase n - 1: PV(n - 2), means(n - 2), QK(n - 1) with the last tile's mask
+    n = rng[1]()
+    if n >= 2:
+        nzp, sm = last_qk_phase_part(st, n - 1, nzp, sm, rng[3](), Int32(0), 1)
+    # ---- phase n: PV(n - 1) and the means of the last step pair (or unpaired last step)
+    last_pv_phase(st, n, nzp)
+    if st.grp == 0:
+        # warp w + 4 takes the last turn of its pair
+        pass_turn(st)
+    return sm
+
+
+def _picker(whole):
+    """pick(a, b): a for a whole unit and b for a piece, by a select when whole is known at run time only."""
+    if isinstance(whole, bool):
+        return lambda a, b: a if whole else b
+    return lambda a, b: Int32(cutlass.select_(whole, a, b))
+
+
+@cute.jit
+def body_lens(
+    ops,
+    lens_ptr,
+    vs_ptr,
+    o_ptr,
+    part_ptr,
+    S: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    split: cutlass.Constexpr,
+    n_full: cutlass.Constexpr,
+    n_tail: cutlass.Constexpr,
+    bid,
+):
+    """The CTA body of a call with lengths, of a whole unit (bid < n_full) or of a key-range piece: the key tiles of
+    the unit's batch element end with the one that holds its last valid key. A whole unit runs them in its order and
+    stores its rows, those from the length on as zeros; a piece runs those of its tiles among them and leaves its
+    partials, or an anchor of -inf and zeros when it has none. A whole unit without a valid query row stores zeros
+    without the phases; its pieces return at once (the merge launch stores the zeros of that unit)."""
+    nT = (S + KT - 1) // KT
+    tidx = Int32(cute.arch.thread_idx()[0])
+    # whole: this CTA takes a whole unit, known at trace time for a launch without pieces or without whole units
+    whole = True if n_tail == 0 else (False if n_full == 0 else bid < n_full)
+
+    pick = _picker(whole)
+    unit = pick(bid, n_full + (bid - n_full) // split)
+    st = cta_state(tidx, unit % nT, (unit // nT) % H, unit // (nT * H), DIST)
+    # a whole unit counts as the only piece of one
+    st.piece = pick(Int32(0), (bid - n_full) % split)
+    st.parts = pick(Int32(1), Int32(split))
+    nv = valid_len(lens_ptr.toint(), st.bb, S)
+    if st.tidx == 0:
+        cute.arch.store(sptr(Int32, st.smem + LEN_OFF), nv)
+    # the range of lens_phases: the tiles of this CTA up to the last valid one, diagonal first for a whole unit
+    r0 = st.piece * nT // st.parts
+    kv = (nv + KT - 1) // KT
+    r1 = cutlass.min((st.piece + 1) * nT // st.parts, kv) - r0
+    r2 = pick(st.qt % cutlass.max(kv - 1, Int32(1)), Int32(0))
+    r3 = Int32(cutlass.select_(r0 + r1 == kv, (nv - 1) % KT + 1, Int32(KT)))
+    rng = (lambda: r0, lambda: r1, lambda: r2, lambda: r3)
+    if st.qt * QT < nv:
+        if st.piece * nT // st.parts < (nv + KT - 1) // KT:
+            anc0, anc1, l0, l1, _ = lens_phases(st, ops, rng, S, H, vs_ptr)
+            if whole:
+                f = inv_row_sums(l0, l1, st.q)
+                # every warp must be past its last stage read before stages 0 and 1 are reused for the output rows
+                barrier_cta_sync(Int32(0), thread_count=NTHR)
+                store_rows(
+                    st.O,
+                    f,
+                    st.vsc,
+                    st.smem + st.grp * STAGE_BYTES + (st.warp & 3) * (16 * EP),
+                    st.g,
+                    st.q,
+                    st.lane,
+                    st.warp,
+                    st.qt,
+                    o_ptr.toint(),
+                    st.bb,
+                    st.hh,
+                    S,
+                    H,
+                    valid_keys(st),
+                )
+            else:
+                store_partials(part_ptr, bid - n_full, st.tidx, st.O, anc0, anc1, l0, l1)
+        else:
+            zero = cute.make_rmem_tensor(cute.make_layout(64), Float32)
+            zero.fill(0.0)
+            ninf = Float32(-math.inf)
+            store_partials(
+                part_ptr, bid - n_full, st.tidx, zero, ninf, ninf, Float32(0.0), Float32(0.0)
+            )
+    else:
+        if whole:
+            store_zero_rows(st.lane, st.warp, st.qt, o_ptr.toint(), st.bb, st.hh, S, H)
+
+
 # ------------------------------------------------------------------------------------------------ kernel
 @cute.kernel
 def attn_kernel(
@@ -759,17 +975,38 @@ def attn_kernel(
     n_full: cutlass.Constexpr,
     n_tail: cutlass.Constexpr,
     split: cutlass.Constexpr,
+    lens_ptr,
 ):
     """One launch: CTAs 0 .. n_full - 1 take whole query tiles; the CTAs after them take the key-range pieces (split
     per unit) of the last n_tail units of the grid (launch.split_plan). ss_ptr, vs_ptr: the score scale and v8_scale;
-    part_ptr: the pieces' partials; flags_ptr: the per-tile flags of the scan launch."""
+    part_ptr: the pieces' partials; flags_ptr: the per-tile flags of the scan launch. lens_ptr: None, or the valid
+    prefix lengths, which select the bodies with lengths."""
     bid_, _, _ = cute.arch.block_idx()
     bid = Int32(bid_)
     # what both bodies read: Q', its scales, the score scale, the scan flags, and the TMA atoms and tensors of K', V,
     # the K' scales and v_mean
     tiles = (tma_atom_k, tma_k, tma_atom_v, tma_v, tma_atom_s, tma_s, tma_atom_m, tma_m)
     ops = (q_ptr, qsf_ptr, ss_ptr, flags_ptr, tiles)
-    if cutlass.const_expr(n_tail == 0):
+    if cutlass.const_expr(lens_ptr is not None):
+        # a unit of a full batch element takes the bodies without lengths, any other the body with lengths
+        nT = (S + KT - 1) // KT
+        unit = bid
+        if cutlass.const_expr(n_tail > 0):
+            if bid >= n_full:
+                unit = n_full + (bid - n_full) // split
+        if valid_len(lens_ptr.toint(), unit // (nT * H), S) == S:
+            if cutlass.const_expr(n_tail == 0):
+                full_body(ops, vs_ptr, o_ptr, S, H, bid)
+            elif cutlass.const_expr(n_full == 0):
+                partial_body(ops, part_ptr, S, H, split, 0, bid)
+            else:
+                if bid < n_full:
+                    full_body(ops, vs_ptr, o_ptr, S, H, bid)
+                else:
+                    partial_body(ops, part_ptr, S, H, split, n_full, bid - n_full)
+        else:
+            body_lens(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, n_tail, bid)
+    elif cutlass.const_expr(n_tail == 0):
         full_body(ops, vs_ptr, o_ptr, S, H, bid)
     elif cutlass.const_expr(n_full == 0):
         partial_body(ops, part_ptr, S, H, split, 0, bid)

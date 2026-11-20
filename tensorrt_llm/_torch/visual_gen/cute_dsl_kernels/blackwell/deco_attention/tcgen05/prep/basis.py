@@ -41,6 +41,7 @@ from ..ptx import (
     tc_mma,
 )
 from ..tmem import ld_tmem_f32_x32_wait
+from ..valid_len import valid_len
 
 EIG_THREADS = 288  # eigensolver CTA: eight row warps and the pivot warp
 # The per-call words of gmax (float32, cleared by the clear launch): 0..2 the maxima of the three scale groups of Q'
@@ -76,10 +77,14 @@ def _gram(
     H: Int32,
     NQK: Int32,
     NCQ: Int32,
+    lens,
 ):
     """The Gram matrices of the sampled q and k rows of (batch, head) bh, 256 rows per chunk, and their sum, each
     normalized by its trace, staged in VH. All 288 threads participate; eight warps stage, four read TMEM rows. The
-    step has barriers of its own; its last one publishes the staged matrix."""
+    step has barriers of its own; its last one publishes the staged matrix. lens: None, or (the global address of
+    the valid prefix lengths, rows per sample, mapped rows): with rows per sample qk_rows is [B, NQK] and the batch
+    element uses its own row; a row r of a batch element of n valid tokens stands for token floor(r n / S) with
+    mapped rows and for token min(r, n - 1) otherwise (token 0 when n is 0)."""
     sRed = st.sRed
     if st.tidx == 0:
         cute.arch.mbarrier_init(sptr(Int64, st.mbar), 1)
@@ -103,10 +108,20 @@ def _gram(
             mbar_wait_bounded(st.mbar, (ch - 1) & 1)
         if st.tidx < 256:
             sample = cutlass.min(ch * 256 + st.tidx, NQK - 1)
-            cute.arch.store(
-                sptr(Uint32, st.rbb + st.tidx * 4),
-                load_invariant(Uint32, rowsb + Int64(sample) * Int64(4)),
-            )
+            if cutlass.const_expr(lens is None):
+                tok_bits = load_invariant(Uint32, rowsb + Int64(sample) * Int64(4))
+            else:
+                # with lengths: the row of the batch element, mapped into its valid prefix or kept below its end
+                if cutlass.const_expr(lens[1]):
+                    sample = batch * NQK + sample
+                r = Int32(load_invariant(Uint32, rowsb + Int64(sample) * Int64(4)))
+                n = valid_len(lens[0], batch, S)
+                if cutlass.const_expr(lens[2]):
+                    tok = Int32((Int64(r) * Int64(n)) // Int64(S))
+                else:
+                    tok = cutlass.max(cutlass.min(r, n - 1), Int32(0))
+                tok_bits = Uint32(tok)
+            cute.arch.store(sptr(Uint32, st.rbb + st.tidx * 4), tok_bits)
         cute.arch.sync_threads()
         if st.tidx < 256:
             for j in cutlass.range_constexpr(16):
@@ -1315,26 +1330,16 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
 # ---------------------------------------------------------------- eigensolver launch: the CTA body
 
 
-@cute.kernel
-def eig_kernel(
-    qtens: cute.Tensor,
-    ktens: cute.Tensor,
-    qk_rows: cute.Tensor,
-    hadamard: cute.Tensor,
-    uT: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    NQK: Int32,
-    NCQ: Int32,
-    RANK: cutlass.Constexpr,
-):
+@cute.jit
+def _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
     """One eigenproblem per CTA, CTA bh that of (batch, head) bh: the Q/K basis U of RANK directions, U^T [B, H, RANK,
     128]. The launch is a programmatic dependent of the clear launch and releases its own dependent at once: the V
     pass launched beside it touches only the original V, its own outputs and its words of gmax. The body is the
     schedule of the CTA: each step runs on the threads its docstring names, and each sync_threads is the CTA barrier
     that publishes what the steps since the barrier before it wrote to shared memory. _gram and _cluster_repair have
     barriers of their own, the last of which publishes their result. st is the state that every step shares; rows,
-    search and twist hold the registers and coordinates of the thread in one phase, built where that phase begins."""
+    search and twist hold the registers and coordinates of the thread in one phase, built where that phase begins.
+    lens: None, or the lengths argument of _gram."""
     # the preceding launch on this stream clears the per-call words that the launches after this one read
     cute.arch.griddepcontrol_wait()
     tidx, _, _ = cute.arch.thread_idx()
@@ -1344,7 +1349,7 @@ def eig_kernel(
     # DMB/YLB hold aligned Gram operand images until TC completion. The normalized
     # matrix is then staged in VH, whose first reflector is written only after
     # all paired-row math threads have loaded their register tiles.
-    _gram(st, qtens, ktens, qk_rows, bh, S, H, NQK, NCQ)
+    _gram(st, qtens, ktens, qk_rows, bh, S, H, NQK, NCQ, lens)
 
     # Householder tridiagonalization: the reflectors in VH, tau, and the tridiagonal matrix (d, e)
     rows = _load_row_pairs(st)
@@ -1394,3 +1399,54 @@ def eig_kernel(
     _back_transform(st)
     cute.arch.sync_threads()
     _write_basis(st, uT, bh)
+
+
+@cute.kernel
+def eig_kernel(
+    qtens: cute.Tensor,
+    ktens: cute.Tensor,
+    qk_rows: cute.Tensor,
+    hadamard: cute.Tensor,
+    uT: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NQK: Int32,
+    NCQ: Int32,
+    RANK: cutlass.Constexpr,
+):
+    """The eigensolver CTA (_eig_body) of a call whose batch elements are all full: qk_rows [NQK] are tokens."""
+    _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, None)
+
+
+@cute.kernel
+def eig_kernel_lens(
+    qtens: cute.Tensor,
+    ktens: cute.Tensor,
+    qk_rows: cute.Tensor,
+    hadamard: cute.Tensor,
+    uT: cute.Tensor,
+    lens: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NQK: Int32,
+    NCQ: Int32,
+    RANK: cutlass.Constexpr,
+    ROWS_PER_SAMPLE: cutlass.Constexpr,
+    MAP_ROWS: cutlass.Constexpr,
+):
+    """The eigensolver CTA (_eig_body) of a call with valid prefix lengths lens [B] (int32): qk_rows is [B, NQK]
+    with ROWS_PER_SAMPLE, else [NQK]; with MAP_ROWS they are positions in the padded sequence that _gram maps into
+    each valid prefix."""
+    _eig_body(
+        qtens,
+        ktens,
+        qk_rows,
+        hadamard,
+        uT,
+        S,
+        H,
+        NQK,
+        NCQ,
+        RANK,
+        (Int64(lens.iterator.toint()), ROWS_PER_SAMPLE, MAP_ROWS),
+    )
