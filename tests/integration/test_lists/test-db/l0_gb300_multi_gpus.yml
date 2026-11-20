@@ -100,6 +100,11 @@ l0_gb300_multi_gpus:
   - unittest/_torch/moe/test_moe_routing.py
   # MegaMoE on four ranks drops padding rows on the SM103 kernel too (SM100: l0_dgx_b200).
   - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_megamoe_cutedsl_drops_padding_rows
+  # Adaptive EPLB on four ranks: the dispatch router's route bit for bit against the staged route and a layer
+  # without the balancer, a graph replayed after an install, and the per-layer cost of each path.
+  - unittest/_torch/moe/test_megamoe_adaptive_route_e2e.py
+  # Adaptive EPLB: expert copies between four local ranks over MNNVL memory (torchrun).
+  - unittest/_torch/moe/multi_gpu/test_adaptive_eplb_transport_peer.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   # Muse Spark Open's fused expert finalize + TP4 all-reduce over CUDA IPC; each
@@ -163,6 +168,8 @@ l0_gb300_multi_gpus:
   # DeepSeek-V4-Pro NVFP4 export with the embedded DSpark drafter on MegaMoE
   # CuTe DSL, DEP4 on one node: GSM8K plus an acceptance-length gate.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl TIMEOUT (30)
+  # The same run with adaptive EPLB replicating hot experts while decoding.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl_adaptive_eplb TIMEOUT (30)
   # DSpark confidence scheduling (ragged verification) on DeepSeek-V4-Flash, DEP4: GSM8K.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashDSpark::test_gsm8k_dep4_confidence_scheduling TIMEOUT (60)
   # DeepSeek-V4 DP4 on 4x GB300 (288 GB/GPU); Pro needs 288 GB-class GPUs for 4 ranks.

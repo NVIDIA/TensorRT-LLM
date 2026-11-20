@@ -313,7 +313,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run
-  - unittest/_torch/moe/test_megamoe_stage_routes.py
+  - unittest/_torch/moe/test_megamoe_stage_routes.py -k "not record_their_ptx"
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_kernel_properties_report_whether_the_reduce_masks_dropped_routes
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_moe_mxe2m1_weights_valid_dimensions

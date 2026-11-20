@@ -768,6 +768,10 @@ _WARMUP_PLACEMENT = {"start_step": 0, "interval_steps": 4000}
             {"mode": "per_layer_dynamic", "num_slots": 320, "warmup_placement": _WARMUP_PLACEMENT},
             False,
         ),
+        ({"mode": "adaptive", "num_slots": 512}, True),
+        ({"mode": "adaptive"}, False),
+        ({"mode": "adaptive", "num_slots": 512, "auxiliary_sms": 4}, False),
+        ({"mode": "adaptive", "num_slots": 0}, False),
     ],
 )
 def test_load_balancer_schema_matches_runtime(

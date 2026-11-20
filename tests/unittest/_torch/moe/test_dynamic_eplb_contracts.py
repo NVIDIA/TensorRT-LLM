@@ -2450,11 +2450,20 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ta
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
         "RouterLogitPartials": type("RouterLogitPartials", (), {}),
         "MoERunContext": lambda **kwargs: SimpleNamespace(**kwargs),
+        "functools": functools,
     }
     _extract_function(source, "_record_routes", namespace)
     _extract_function(source, "_leading_rows", namespace)
+    _extract_function(source, "_routes_recorded", namespace)
     _extract_function(source, "_num_rows", namespace)
-    _extract_class(source, "MoEScheduler", {"_try_fused_route_quant"}, namespace)
+    methods = {
+        "_try_fused_route_quant",
+        "_router_route",
+        "_route_quant_eligible",
+        "_partials_route",
+        "_route_only",
+    }
+    _extract_class(source, "MoEScheduler", methods, namespace)
     scheduler_cls = _extract_class(
         source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace, bases=("MoEScheduler",)
     )
@@ -2469,7 +2478,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ta
         )
     )
 
-    def route(routes, use_dp):
+    def route(routes, use_dp, token_final_scales=None):
         trace.append(("route", routes.name))
         return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
 
@@ -2974,3 +2983,54 @@ def test_live_plane_binding_restores_per_expert_scalar_defaults():
         [("fc31_alpha", 1.0), ("fc2_alpha", 1.0), ("fc1_norm_const", 1.0)]
     )
     assert all(getattr(module, name).data is alias for name, alias in zip(names, aliases))
+
+
+def test_adp_moe_rows_use_owner_snapshot_and_preserve_missing():
+    """Regression: ADP rows dropped MoE stats. Fanout must not copy rank zero's MoE counts to
+    other owners or idle ranks."""
+    import importlib.util
+    import json
+    import re
+
+    path = _TORCH_ROOT / "pyexecutor/scheduler/rank_state.py"
+    spec = importlib.util.spec_from_file_location("_test_adp_moe_rank_state", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        source = _TORCH_ROOT / "pyexecutor/adp_iter_stats.py"
+        tree = ast.parse(source.read_text())
+        ns = dict(vars(module), json=json, re=re)
+        constants = [n for n in tree.body if isinstance(n, ast.Assign)]
+        exec(compile(ast.Module(body=constants, type_ignores=[]), str(source), "exec"), ns)
+        for name in ("_kv_cache_stats_text", "_specdec_stats_text"):
+            _extract_function(source, name, ns)
+        _extract_function(
+            _TORCH_ROOT / "pyexecutor/iteration_stats_json.py", "iteration_stats_row", ns
+        )
+        ns["append_kv_cache_iteration_stats"] = lambda row, stats: None
+        buffer = _extract_class(source, "ADPIterStatsBuffer", {"_rank_rows"}, ns)()
+        stats = SimpleNamespace(
+            to_json_str=lambda: json.dumps(
+                dict(inflightBatchingStats={}, kvCacheStats=None, specDecodingStats=None)
+            )
+        )
+        buffer._make_rank_iter_stats = lambda original, state: stats
+        states = [module.RankState(rank=rank) for rank in range(4)]
+        for state in states[:3]:
+            state.iter_stats.moe_load_balancer_stats = module.RankMoeLoadBalancerStats(
+                state.rank + 1, state.rank * 2, state.rank * 3
+            )
+        rows = [
+            json.loads(row)
+            for row in buffer._rank_rows(
+                SimpleNamespace(specdec_stats=None), states, None, None, {}, is_queue_snapshot=False
+            )
+        ]
+        for rank in range(3):
+            assert rows[rank]["moeLoadBalancerStats"] == dict(
+                windows=rank + 1, installs=rank * 2, installedLayers=rank * 3
+            )
+        assert "moeLoadBalancerStats" not in rows[3]
+    finally:
+        sys.modules.pop(spec.name, None)

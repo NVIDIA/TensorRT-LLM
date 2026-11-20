@@ -172,7 +172,7 @@ class TestStatsSerializer:
         assert json.loads(BaseWorker._stats_serializer(record)) == expected
         assert json.loads(BaseWorker._stats_serializer(tuple(record))) == expected
 
-    @pytest.mark.parametrize("field_count", range(2, 13))
+    @pytest.mark.parametrize("field_count", range(2, 14))
     def test_legacy_tuple_prefixes_and_future_trailing_fields(self, field_count):
         iter_stats = _make_mock_iteration_stats()
         loop = {"kind": "loop", "per_iter": {"iter": 9}}
@@ -188,6 +188,7 @@ class TestStatsSerializer:
             {"gpuTimesMS": [2.5]},
             loop,
             True,
+            {"windows": 3, "installs": 1, "installedLayers": 2},
             "future field",
         )[:field_count]
         expected = {
@@ -202,6 +203,7 @@ class TestStatsSerializer:
             (9, "multimodalEncoderStats", {"gpuTimesMS": [2.5]}),
             (10, "executorLoop", loop),
             (11, "isQueueSnapshot", True),
+            (12, "moeLoadBalancerStats", {"windows": 3, "installs": 1, "installedLayers": 2}),
         ):
             if field_count >= required_fields:
                 expected[key] = value
@@ -435,6 +437,24 @@ class TestStatsSerializer:
         assert data["executorLoop"]["per_iter"]["iter"] == 9
         # Old tuple producers retain their original shape and do not gain fake loops.
         assert "executorLoop" not in json.loads(BaseWorker._stats_serializer((iter_stats, None)))
+
+    def test_record_emits_the_moe_load_balancer_stats(self):
+        """The record's MoE load balancer counters serialize as moeLoadBalancerStats.
+
+        None omits the key. The counters are ``BaseMoeLoadBalancer.iteration_stats``.
+        """
+        iter_stats = _make_mock_iteration_stats()
+        counters = {"windows": 3, "installs": 1, "installedLayers": 2}
+        result = BaseWorker._stats_serializer(
+            IterationStatsRecord(
+                iter_stats, scheduler_mode="non_overlap", moe_load_balancer_stats=counters
+            )
+        )
+        assert json.loads(result)["moeLoadBalancerStats"] == counters
+        result = BaseWorker._stats_serializer(
+            IterationStatsRecord(iter_stats, scheduler_mode="non_overlap")
+        )
+        assert "moeLoadBalancerStats" not in json.loads(result)
 
     def test_serializer_with_v2_pool_group_stats(self):
         """KV cache manager V2 stats should include pool group breakdown."""

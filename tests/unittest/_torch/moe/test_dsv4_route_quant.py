@@ -208,3 +208,23 @@ def test_moe_with_routing_tables_is_bitwise_to_its_own_routing(num_tokens, do_fi
             e2p = [out[2].flatten()[: num_tokens * TOP_K].long() for out in (expected, got)]
             rows = [out[0][e] for out, e in zip((expected, got), e2p)]
             torch.testing.assert_close(rows[1], rows[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 65, 256, 1280])
+@pytest.mark.parametrize("splits", [2, 4, 8])
+@torch.inference_mode()
+def test_route_only_sums_router_partials_in_fixed_order(num_tokens, splits):
+    from tensorrt_llm._torch.custom_ops.router_logit_partials import RouterLogitPartials
+    from tensorrt_llm._torch.moe.kernels.blackwell.dsv4_route_quant import dsv4_route
+
+    _, bias, _, _ = _inputs(num_tokens)
+    parts = torch.randn((splits, num_tokens, NUM_EXPERTS), device="cuda")
+    expected_logits = parts[0].clone()
+    for part in parts[1:]:
+        expected_logits.add_(part)
+    expected = _routing(bias).apply(expected_logits)
+    ids, weights, tables = dsv4_route(
+        RouterLogitPartials(parts), bias, TOP_K, SCALING, torch.float32, HIDDEN
+    )
+    assert tables is None
+    _assert_equal((ids, weights), expected)
