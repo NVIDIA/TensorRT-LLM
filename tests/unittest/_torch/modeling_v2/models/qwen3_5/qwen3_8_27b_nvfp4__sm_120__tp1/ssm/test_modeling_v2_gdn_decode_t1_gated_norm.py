@@ -23,17 +23,17 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
     rms_norm_gated_token_major,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.gdn_decode_t1 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.gdn_decode_t1 import (  # noqa: E501
     POOL_SLOTS,
     gdn_decode_t1,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.gdn_decode_t1_gated_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.gdn_decode_t1_gated_norm import (  # noqa: E501
     EPS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.gdn_decode_t1_gated_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.gdn_decode_t1_gated_norm import (  # noqa: E501
     gdn_decode_t1_gated_norm as op,
 )
 from tensorrt_llm._utils import get_sm_version

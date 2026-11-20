@@ -35,7 +35,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5 import (
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5 import (
     qwen3_8_27b_nvfp4__sm_120__tp1 as target,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -61,9 +61,15 @@ def _fp32_matmul():
     torch.backends.cuda.matmul.allow_tf32 = prev
 
 
-def _choose_num_pieces(b: int, s: int) -> int:
-    """contextFmhaLastTileSplit.cuh choose_num_pieces, 2 CTAs/SM (48 KB smem, 128 threads)."""
-    slots = torch.cuda.get_device_properties(0).multi_processor_count * 2
+def _choose_num_pieces(b: int, s: int, sms: int | None = None) -> int:
+    """contextFmhaLastTileSplit.cuh choose_num_pieces, 2 CTAs/SM (48 KB smem, 128 threads).
+
+    ``sms`` defaults to this GPU's SM count: the split runs only where dropping the last
+    q-tile saves a whole wave, so which shapes split depends on the GPU (e.g. RTX PRO 6000,
+    188 SMs, against an RTX PRO 6000D with fewer)."""
+    if sms is None:
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+    slots = sms * 2
     if b <= 0 or b > 3:
         return 0
     q_tiles = (s + STEP_Q - 1) // STEP_Q
@@ -251,9 +257,9 @@ def test_matches_reference(nseq, q_len, prefix):
 
 
 def test_split_runs_for_long_single_prefill():
-    # 1 x 2048 with 24 heads is 768 CTAs: a tail wave on 188 SMs x 2.
-    assert _choose_num_pieces(1, 2048) > 0
-    assert _choose_num_pieces(4, 2048) == 0
+    # 1 x 2048 with 24 heads is 768 CTAs: a tail wave on 188 SMs x 2 (RTX PRO 6000).
+    assert _choose_num_pieces(1, 2048, sms=188) > 0
+    assert _choose_num_pieces(4, 2048, sms=188) == 0
 
 
 def test_batch_of_eight_mixed_lengths():
@@ -272,7 +278,11 @@ def test_batch_of_eight_mixed_lengths():
 )
 def test_skip_leading_writes_only_the_last_q_tile(q_lens, prefixes):
     case = _Case(q_lens, prefixes, seed=5)
-    assert case.pieces(True) > 0
+    if case.pieces(True) == 0:
+        pytest.skip(
+            f"the last q-tile split does not run for these shapes on "
+            f"{torch.cuda.get_device_properties(0).multi_processor_count} SMs"
+        )
     full = case.run(split=True)
     skipped = case.run(split=True, skip_leading=True)
     lead = case.leading_mask()

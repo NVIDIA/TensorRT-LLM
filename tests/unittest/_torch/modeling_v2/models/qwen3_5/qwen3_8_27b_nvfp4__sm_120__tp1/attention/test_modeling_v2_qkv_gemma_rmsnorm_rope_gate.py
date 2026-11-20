@@ -29,7 +29,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.attention.qkv_gemma_rmsnorm_rope_gate import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.attention.qkv_gemma_rmsnorm_rope_gate import (  # noqa: E501
     qkv_gemma_rmsnorm_rope_gate as op,
 )
 from tensorrt_llm._torch.attention.kernels import fused_qk_norm_rope_gate as _in_tree  # noqa: F401

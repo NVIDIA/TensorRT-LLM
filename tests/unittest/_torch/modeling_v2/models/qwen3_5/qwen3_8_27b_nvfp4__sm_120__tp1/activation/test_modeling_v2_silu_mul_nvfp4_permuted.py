@@ -13,13 +13,13 @@ for both kernels; which kernel runs at which rows; graph replay; the scale guard
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation import (  # noqa: E501
     _silu_mul_nvfp4 as kernels,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation.silu_mul_nvfp4_permuted import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation.silu_mul_nvfp4_permuted import (  # noqa: E501
     silu_mul_nvfp4_permuted as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.quantization._nvfp4_recipes import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.quantization._nvfp4_recipes import (  # noqa: E501
     gate_up_swiglu_row_permutation,
 )
 from tensorrt_llm._utils import get_sm_version

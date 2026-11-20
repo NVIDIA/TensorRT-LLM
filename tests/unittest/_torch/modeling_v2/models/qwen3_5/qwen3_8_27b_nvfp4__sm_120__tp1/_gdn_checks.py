@@ -18,7 +18,7 @@ import math
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm._gdn_state_q8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm._gdn_state_q8 import (  # noqa: E501
     Q8_QMAX,
     dequantize_slots,
     q8_state_rows,

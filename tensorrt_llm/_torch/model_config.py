@@ -567,6 +567,8 @@ class ModelConfig(Generic[TConfig]):
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
         '_kv_cache_layer_specs' is set by models that publish per-layer KV geometry.
+        'ssm_state_pool_geometry' is set with the recurrent-state cache dtype, which
+        is resolved against the selected target after the config is built.
         '_preserve_kv_cache_quant_algo' scopes an explicit draft KV precision override.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
@@ -575,6 +577,7 @@ class ModelConfig(Generic[TConfig]):
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
                            'quant_config', '_kv_cache_layer_specs',
+                           'ssm_state_pool_geometry',
                            '_preserve_kv_cache_quant_algo'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")

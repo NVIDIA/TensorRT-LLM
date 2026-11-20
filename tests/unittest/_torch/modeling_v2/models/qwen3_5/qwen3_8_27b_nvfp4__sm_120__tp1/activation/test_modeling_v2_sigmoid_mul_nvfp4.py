@@ -13,10 +13,10 @@ poisoned allocation; the attention output is not modified; graph replay; the gua
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
     fused_sigmoid_mul_inplace,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation.sigmoid_mul_nvfp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation.sigmoid_mul_nvfp4 import (  # noqa: E501
     sigmoid_mul_nvfp4 as op,
 )
 from tensorrt_llm._utils import get_sm_version

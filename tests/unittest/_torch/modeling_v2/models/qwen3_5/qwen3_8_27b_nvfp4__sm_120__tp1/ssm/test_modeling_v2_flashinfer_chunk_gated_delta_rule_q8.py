@@ -27,10 +27,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm._fi_gdn_prefill import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm._fi_gdn_prefill import (  # noqa: E501
     plan,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.flashinfer_chunk_gated_delta_rule_q8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.flashinfer_chunk_gated_delta_rule_q8 import (  # noqa: E501
     flashinfer_chunk_gated_delta_rule_q8 as op,
 )
 from tensorrt_llm._utils import get_sm_version

@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
@@ -120,7 +120,7 @@ def test_qwen38_27b_tp1_matches(mode):
 
 
 def test_state_pool_rows_hold_two_code_bytes_per_element_and_the_row_scales():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1 import (  # noqa: E501
         state_pool,
     )
 
@@ -238,7 +238,7 @@ def test_engine_choices_the_target_refuses(kv, kwargs, missed):
 
 
 def test_off_never_imports_or_claims(monkeypatch):
-    module = "tensorrt_llm._torch._experimental.modeling_v2." + _TARGET.rsplit(".", 1)[0]
+    module = "tensorrt_llm._torch.modeling_v2." + _TARGET.rsplit(".", 1)[0]
     monkeypatch.delitem(sys.modules, module, raising=False)
     config = _model_config(_qwen38_config())
     assert modeling_v2_resolve(config, _llm_args("off")) is None

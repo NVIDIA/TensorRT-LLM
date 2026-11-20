@@ -11,7 +11,7 @@ eager, and the layout guard.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.small_n_bf16_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.small_n_bf16_gemv import (  # noqa: E501
     small_n_bf16_gemv as op,
 )
 from tensorrt_llm._utils import get_sm_version

@@ -2000,6 +2000,25 @@ class TestInt8RecurrentStatePool:
         assert config.quant_config.mamba_ssm_cache_dtype == torch.int8
         assert config.ssm_state_pool_geometry == geometry
 
+    def test_loader_accepts_a_frozen_model_config(self) -> None:
+        """`ModelConfig.from_pretrained` returns a frozen config, and the layer-wise
+        benchmarks' `Runner.create_kv_cache_manager` passes it straight to the loader."""
+        import torch
+
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        config = ModelConfig(
+            pretrained_config=SimpleNamespace(model_type="qwen3_next", torch_dtype=torch.bfloat16)
+        )
+        config._frozen = True
+        validate_and_set_mamba_ssm_cache_dtype(config, "auto")
+        assert config.ssm_state_pool_geometry is None
+        validate_and_set_mamba_ssm_cache_dtype(config, "float32")
+        assert config.quant_config.mamba_ssm_cache_dtype == torch.float32
+
     def test_loader_rejects_a_geometry_with_the_wrong_storage_dtype(self) -> None:
         from dataclasses import replace
 

@@ -14,10 +14,10 @@ wait), graph replay against eager with poisoned outputs, and the layout guard.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.marlin_nvfp4_w4a16 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.marlin_nvfp4_w4a16 import (  # noqa: E501
     marlin_nvfp4_w4a16 as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.quantization import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.quantization import (  # noqa: E501
     _nvfp4_recipes as recipes,
 )
 from tensorrt_llm._utils import get_sm_version

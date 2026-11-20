@@ -26,17 +26,17 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (
     Fp4Quantize,
     fp4_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm._gemma_add_rmsnorm_nvfp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm._gemma_add_rmsnorm_nvfp4 import (  # noqa: E501
     gemma_fused_add_rmsnorm_nvfp4_cute,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.flashinfer_gemma_fused_add_rmsnorm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.flashinfer_gemma_fused_add_rmsnorm import (  # noqa: E501
     flashinfer_gemma_fused_add_rmsnorm as stock,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.gemma_add_rmsnorm_nvfp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.gemma_add_rmsnorm_nvfp4 import (  # noqa: E501
     gemma_add_rmsnorm_nvfp4 as op,
 )
 from tensorrt_llm._utils import get_sm_version

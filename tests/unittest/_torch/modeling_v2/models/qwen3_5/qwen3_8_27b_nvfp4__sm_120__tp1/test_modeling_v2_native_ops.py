@@ -14,8 +14,8 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import namespace_of
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5 import (
+from tensorrt_llm._torch.modeling_v2._native import namespace_of
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5 import (
     qwen3_8_27b_nvfp4__sm_120__tp1 as target,
 )
 from tensorrt_llm._utils import get_sm_version

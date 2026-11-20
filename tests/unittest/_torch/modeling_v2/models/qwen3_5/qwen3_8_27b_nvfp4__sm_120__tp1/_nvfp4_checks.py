@@ -19,7 +19,7 @@ import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.quantization._nvfp4_reference import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.quantization._nvfp4_reference import (  # noqa: E501
     SF_VEC,
     e2m1_to_float,
     e4m3_to_float,

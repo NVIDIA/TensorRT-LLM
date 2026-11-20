@@ -12,7 +12,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.embedding.masked_embedding_gather import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.embedding.masked_embedding_gather import (  # noqa: E501
     masked_embedding_gather as op,
 )
 from tensorrt_llm._torch.modules.embedding import pre_comm_embedding_ops

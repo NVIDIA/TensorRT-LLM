@@ -182,9 +182,10 @@ On one RTX PRO 6000 Blackwell (SM120), Qwen3.8-27B NVFP4 can run on an experimen
 * The checkpoint is the ModelOpt `MIXED_PRECISION` export of Qwen3.8-27B: FP8 attention and GDN projections, NVFP4 MLP and LM head (for example, RadixArk/Qwen3.8-27B-NVFP4).
 * One GPU (`tensor_parallel_size: 1`) and no speculative decoding.
 * An FP8 KV cache (`kv_cache_config.dtype: fp8`, or `auto` with a checkpoint that declares an FP8 KV cache) and `kv_cache_config.mamba_ssm_cache_dtype: int8`.
+* The model runs in bf16 (`dtype: auto` with this checkpoint, or `dtype: bfloat16`).
 * `attn_backend: TRTLLM`, KV cache manager V2, `prefill_cuda_graph_backend: disabled`, no LoRA, and no disaggregated serving.
 
-With `auto`, any other configuration falls back to the built-in implementation; with `require`, it raises an error. The target serves text only and refuses requests that carry images or video.
+With `auto`, any other configuration falls back to the built-in implementation; with `require`, it raises an error. The built-in implementation does not accept `mamba_ssm_cache_dtype: int8`, so a configuration that keeps `int8` but misses another condition fails at startup instead of falling back: set `mamba_ssm_cache_dtype` to `auto` (or another supported dtype) whenever the target is not used. The target serves text only and refuses requests that carry images or video.
 
 The target changes numerics. At load it requantizes the checkpoint's FP8 attention and GDN projections to NVFP4, which is lossy, and it stores the GDN recurrent state as int16 rows with one fp32 scale per row. Measured against the built-in implementation (bf16 recurrent state, otherwise the same settings):
 

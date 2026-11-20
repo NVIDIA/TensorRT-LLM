@@ -13,13 +13,13 @@ included), over several stateful calls; and the slot guards.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.nvfp4_w4a16_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.nvfp4_w4a16_gemv import (  # noqa: E501
     nvfp4_w4a16_gemv,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.nvfp4_w4a16_gemv_conv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.nvfp4_w4a16_gemv_conv import (  # noqa: E501
     CONV_DIM,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.nvfp4_w4a16_gemv_conv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.gemm.nvfp4_w4a16_gemv_conv import (  # noqa: E501
     nvfp4_w4a16_gemv_conv as op,
 )
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_update
