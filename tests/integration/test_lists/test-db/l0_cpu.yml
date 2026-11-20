@@ -252,6 +252,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_importable.py
   - unittest/_torch/visual_gen/test_cache_dit.py
+  - unittest/_torch/visual_gen/test_cosmos3_parameter_resolver.py
   - unittest/_torch/visual_gen/test_dynamic_batching.py
   - unittest/_torch/visual_gen/test_cuda_graph_cache.py
   - unittest/_torch/visual_gen/test_executor_lifecycle.py

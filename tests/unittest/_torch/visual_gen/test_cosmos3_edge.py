@@ -19,6 +19,7 @@ import numpy as np
 import PIL.Image
 import pytest
 import torch
+from cosmos3_fixtures import bare_resolver, write_checkpoint_files
 from diffusers import UniPCMultistepScheduler
 from utils.llm_data import get_checkpoint
 
@@ -31,15 +32,16 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     ACTION_MODE_POLICY,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_720P_PARAMS,
-    COSMOS3_ACTION_PARAMS,
-    COSMOS3_EDGE_T2I_PARAMS,
-    COSMOS3_EDGE_VIDEO_PARAMS,
+    COSMOS3_DEFAULTS,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_GENERATION_DEFAULTS,
-    COSMOS3_POLICY_SAMPLING_PARAMS,
-    COSMOS3_T2I_PARAMS,
-    resolve_checkpoint_policy_defaults,
+)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.overrides import COSMOS3_OVERRIDES
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
+    CONFIG_FILE,
+    MODEL_INDEX_FILE,
+    SCHEDULER_FILE,
+    ParameterResolver,
+    RequestParameters,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
@@ -61,6 +63,13 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
+
+QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["video"]
+QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["image"]
+EDGE_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["video"]
+EDGE_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["image"]
+ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["action"]["common"]
+DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["policy"]["droid_lerobot"]
 
 DEVICE = "cuda"
 
@@ -401,7 +410,6 @@ class TestEdgeTransformerStructure:
         assert model.audio_gen is False
         assert model.has_action_weights is True
         assert model.temporal_compression_factor == 4
-        assert model.temporal_compression_factor_declared is True
 
     def test_und_attention_norms(self, model):
         attn = model.language_model.layers[0].self_attn
@@ -819,7 +827,15 @@ def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     pipeline.action_gen = False
     pipeline.has_action_weights = family == NEMOTRON_DENSE_RECIPE.name
     pipeline.use_native_flow_schedule = family == NEMOTRON_DENSE_RECIPE.name
+    pipeline.resolver = bare_resolver(family)
     return pipeline
+
+
+DROID_POLICY = {"action_chunk_size": 32, "conditioning_fps": 15.0, "domain_name": "droid_lerobot"}
+
+
+def _policy_resolver(family: str) -> ParameterResolver:
+    return bare_resolver(family, policy=DROID_POLICY)
 
 
 class TestEdgePolicyReferenceInput:
@@ -852,21 +868,21 @@ class TestEdgePolicyReferenceInput:
 
 class TestEdgeDefaults:
     def test_generation_defaults_matrix(self):
-        edge_video = COSMOS3_GENERATION_DEFAULTS[(NEMOTRON_DENSE_RECIPE.name, "video")]
-        assert edge_video is COSMOS3_EDGE_VIDEO_PARAMS
+        edge_video = COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["video"]
+        assert edge_video is EDGE_VIDEO_DEFAULTS
         assert (edge_video["height"], edge_video["width"]) == (480, 832)
         assert edge_video["num_frames"] == 121
         assert edge_video["num_inference_steps"] == 50
         assert edge_video["guidance_scale"] == 5.0
-        assert edge_video["flow_shift"] == 3.0
+        assert "flow_shift" not in edge_video  # the checkpoint scheduler's shift applies
 
-        edge_t2i = COSMOS3_GENERATION_DEFAULTS[(NEMOTRON_DENSE_RECIPE.name, "image")]
-        assert edge_t2i is COSMOS3_EDGE_T2I_PARAMS
+        edge_t2i = COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["image"]
+        assert edge_t2i is EDGE_IMAGE_DEFAULTS
         assert (edge_t2i["height"], edge_t2i["width"]) == (640, 640)
         assert edge_t2i["guidance_scale"] == 4.0
         assert edge_t2i["guidance_interval"] is None
 
-        assert COSMOS3_GENERATION_DEFAULTS[(QWEN3_RECIPE.name, "video")] is COSMOS3_720P_PARAMS
+        assert COSMOS3_DEFAULTS[QWEN3_RECIPE.name]["video"] is QWEN3_VIDEO_DEFAULTS
 
     def test_executor_defaults_are_edge_shaped(self):
         params = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name).default_generation_params
@@ -896,53 +912,20 @@ class TestEdgeDefaults:
 
     def test_policy_manifest_overrides_policy_sampling_only(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
-        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
-            {
-                "action_chunk_size": 32,
-                "conditioning_fps": 15.0,
-                "domain_name": "droid_lerobot",
-            }
-        )
+        pipeline.resolver = _policy_resolver(NEMOTRON_DENSE_RECIPE.name)
 
-        policy = pipeline._mode_params("video", action_mode=ACTION_MODE_POLICY)
-
-        assert policy["num_inference_steps"] == 4
-        assert policy["guidance_scale"] == 3.0
-        assert policy["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
-        resolved_policy = pipeline._resolve_generation_params(
-            "video",
-            action_mode=ACTION_MODE_POLICY,
-            num_inference_steps=None,
-            guidance_scale=None,
-            guidance_interval=None,
-        )
-        assert resolved_policy == {
-            "num_inference_steps": 4,
-            "guidance_scale": 3.0,
-            "guidance_interval": COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"],
-        }
+        policy = pipeline.resolver.request(RequestParameters(action_mode=ACTION_MODE_POLICY))
+        assert (policy.num_inference_steps, policy.guidance_scale) == (4, 3.0)
+        assert policy.guidance_interval == DROID_POLICY_DEFAULTS["guidance_interval"]
         assert (
-            pipeline._mode_params("video", action_mode=ACTION_MODE_FORWARD_DYNAMICS)
-            is COSMOS3_ACTION_PARAMS
-        )
-        assert (
-            pipeline._mode_params("video", action_mode=ACTION_MODE_INVERSE_DYNAMICS)
-            is COSMOS3_ACTION_PARAMS
+            COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["action"]["common"]
+            is ACTION_GENERATION_DEFAULTS
         )
         for action_mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS):
-            resolved = pipeline._resolve_generation_params(
-                "video",
-                action_mode=action_mode,
-                num_inference_steps=None,
-                guidance_scale=None,
-                guidance_interval=None,
-            )
-            assert resolved == {
-                "num_inference_steps": 30,
-                "guidance_scale": 1.0,
-                "guidance_interval": None,
-            }
-        assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
+            resolved = pipeline.resolver.request(RequestParameters(action_mode=action_mode))
+            assert (resolved.num_inference_steps, resolved.guidance_scale) == (30, 1.0)
+            assert resolved.guidance_interval is None
+        assert COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["video"] is EDGE_VIDEO_DEFAULTS
 
     @pytest.mark.parametrize(
         "action_mode",
@@ -989,13 +972,7 @@ class TestEdgeDefaults:
     def test_policy_manifest_sampling_does_not_cross_domain_override(self, monkeypatch):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
         pipeline.action_gen = True
-        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
-            {
-                "action_chunk_size": 32,
-                "conditioning_fps": 15.0,
-                "domain_name": "droid_lerobot",
-            }
-        )
+        pipeline.resolver = _policy_resolver(NEMOTRON_DENSE_RECIPE.name)
         monkeypatch.setattr(pipeline, "_scheduler_for", lambda *args, **kwargs: object())
         monkeypatch.setattr(pipeline_module, "action_reference_size", lambda **kwargs: (480, 640))
 
@@ -1024,8 +1001,8 @@ class TestEdgeDefaults:
             transfer_config=None,
         )
 
-        assert request.num_inference_steps == COSMOS3_ACTION_PARAMS["num_inference_steps"]
-        assert request.guidance_scale == COSMOS3_ACTION_PARAMS["guidance_scale"]
+        assert request.num_inference_steps == ACTION_GENERATION_DEFAULTS["num_inference_steps"]
+        assert request.guidance_scale == ACTION_GENERATION_DEFAULTS["guidance_scale"]
         assert request.guidance_interval is None
         assert request.domain_name == "bridge_orig_lerobot"
         assert request.action_chunk_size == 16
@@ -1036,62 +1013,41 @@ class TestEdgeDefaults:
 
         # Audio is an extra stream on a video request and therefore shares the
         # video request's resolved CFG interval.
-        video_and_audio = pipeline._resolve_generation_params("video", guidance_interval=None)
-        image = pipeline._resolve_generation_params("image", guidance_interval=None)
+        video_and_audio = pipeline.resolver.request(RequestParameters(mode="video"))
+        image = pipeline.resolver.request(RequestParameters(mode="image"))
 
-        assert video_and_audio["guidance_interval"] is None
-        assert image["guidance_interval"] == COSMOS3_T2I_PARAMS["guidance_interval"]
+        assert video_and_audio.guidance_interval is None
+        assert image.guidance_interval == QWEN3_IMAGE_DEFAULTS["guidance_interval"]
 
     def test_policy_manifest_declares_policy_as_the_action_mode_default(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
-        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
-            {
-                "action_chunk_size": 32,
-                "conditioning_fps": 15.0,
-                "domain_name": "droid_lerobot",
-            }
-        )
+        pipeline.resolver = _policy_resolver(NEMOTRON_DENSE_RECIPE.name)
 
         assert pipeline.extra_param_specs["action_mode"].default == ACTION_MODE_POLICY
         assert COSMOS3_EXTRA_SPECS["action_mode"].default is None
 
     def test_none_params_resolve_from_edge_tables(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
-        resolved = pipeline._resolve_generation_params(
-            "video",
-            height=None,
-            width=None,
-            num_frames=None,
-            num_inference_steps=None,
-            guidance_scale=None,
-            max_sequence_length=None,
-            frame_rate=None,
-        )
-        assert resolved == {
-            "height": 480,
-            "width": 832,
-            "num_frames": 121,
-            "num_inference_steps": 50,
-            "guidance_scale": 5.0,
-            "max_sequence_length": 4096,
-            "frame_rate": 24.0,
-        }
+        resolved = pipeline.resolver.request(RequestParameters(mode="video"))
+        assert (resolved.height, resolved.width, resolved.num_frames) == (480, 832, 121)
+        assert (resolved.num_inference_steps, resolved.guidance_scale) == (50, 5.0)
+        assert (resolved.max_sequence_length, resolved.frame_rate) == (4096, 24.0)
         # Image mode falls back to the video table for fields the image table
         # omits, and explicit values always win.
-        image = pipeline._resolve_generation_params(
-            "image", height=None, max_sequence_length=None, num_inference_steps=8
+        image = pipeline.resolver.request(RequestParameters(mode="image", num_inference_steps=8))
+        assert (image.height, image.max_sequence_length, image.num_inference_steps) == (
+            640,
+            4096,
+            8,
         )
-        assert image == {"height": 640, "max_sequence_length": 4096, "num_inference_steps": 8}
 
     def test_sampling_overrides_beat_tables(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
-        pipeline.sampling = Cosmos3SamplingPolicy(fixed_sigmas=(1.0, 0.5))
-        resolved = pipeline._resolve_generation_params(
-            "video", num_inference_steps=None, guidance_scale=None, height=None
-        )
-        assert resolved["num_inference_steps"] == 2
-        assert resolved["guidance_scale"] == 1.0
-        assert resolved["height"] == 480
+        pipeline.resolver = bare_resolver(NEMOTRON_DENSE_RECIPE.name, fixed_sigmas=(1.0, 0.5))
+        resolved = pipeline.resolver.request(RequestParameters(mode="video"))
+        assert resolved.num_inference_steps == 2
+        assert resolved.guidance_scale == 1.0
+        assert resolved.height == 480
 
     def test_warmup_runs_at_family_guidance(self, monkeypatch):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
@@ -1104,23 +1060,6 @@ class TestEdgeDefaults:
         pipeline._run_warmup(height=480, width=832, num_frames=121, steps=2)
         assert captured["guidance_scale"] == 5.0
         assert captured["max_sequence_length"] == 4096
-
-    def test_declared_temporal_factor_must_match_vae(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
-            _validate_temporal_compression,
-        )
-
-        declared = SimpleNamespace(
-            temporal_compression_factor=4, temporal_compression_factor_declared=True
-        )
-        _validate_temporal_compression(declared, 4)
-        with pytest.raises(ValueError, match="temporal_compression_factor"):
-            _validate_temporal_compression(declared, 8)
-        # Nano-style configs don't declare it; the VAE value simply wins.
-        undeclared = SimpleNamespace(
-            temporal_compression_factor=4, temporal_compression_factor_declared=False
-        )
-        _validate_temporal_compression(undeclared, 8)
 
 
 class TestSamplingRecipeMatrix:
@@ -1158,13 +1097,10 @@ class TestSamplingRecipeMatrix:
     def test_component_loading_rejects_edge_without_native_flag(self, tmp_path):
         """End to end through load_standard_components: a UniPC Edge
         checkpoint whose model_index omits the flag must fail at load."""
-        import json
-
-        scheduler_dir = tmp_path / "scheduler"
-        scheduler_dir.mkdir()
-        (scheduler_dir / "scheduler_config.json").write_text(
-            json.dumps(
-                {
+        write_checkpoint_files(
+            tmp_path,
+            {
+                SCHEDULER_FILE: {
                     "_class_name": "UniPCMultistepScheduler",
                     "num_train_timesteps": 1000,
                     "flow_shift": 1.0,
@@ -1172,29 +1108,37 @@ class TestSamplingRecipeMatrix:
                     "use_flow_sigmas": True,
                     "use_karras_sigmas": True,
                     "solver_order": 2,
-                }
-            )
-        )
-        (tmp_path / "model_index.json").write_text(
-            json.dumps({"_class_name": "Cosmos3OmniPipeline"})
+                },
+                MODEL_INDEX_FILE: {"_class_name": "Cosmos3OmniPipeline"},
+                CONFIG_FILE: {"model": {"config": {"vlm_config": {"use_system_prompt": False}}}},
+            },
+            vae=True,
         )
 
         def fresh_pipeline():
             pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
-            pipeline.default_use_system_prompt = False
             # Mirror __init__: the flag starts False and only the checkpoint's
             # model_index may turn it on.
             pipeline.use_native_flow_schedule = False
             return pipeline
 
         skip = ["text_tokenizer", "tokenizer", "vae", "sound_tokenizer"]
+        pipeline = fresh_pipeline()
+        pipeline._read_checkpoint_settings(str(tmp_path))
         with pytest.raises(ValueError, match="use_native_flow_schedule"):
-            fresh_pipeline().load_standard_components(str(tmp_path), torch.device("cpu"), skip)
+            pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
 
-        (tmp_path / "model_index.json").write_text(
-            json.dumps({"_class_name": "Cosmos3OmniPipeline", "use_native_flow_schedule": True})
+        write_checkpoint_files(
+            tmp_path,
+            {
+                MODEL_INDEX_FILE: {
+                    "_class_name": "Cosmos3OmniPipeline",
+                    "use_native_flow_schedule": True,
+                }
+            },
         )
         pipeline = fresh_pipeline()
+        pipeline._read_checkpoint_settings(str(tmp_path))
         pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
         assert pipeline.sampling.native_flow_schedule is True
         scheduler = pipeline._scheduler_for(_native_flow_schedule(3.0))
@@ -1226,33 +1170,22 @@ class TestSchedulerCacheBounds:
         pipeline._cacheable_flow_shifts_cache = None
         return pipeline
 
-    def test_every_cacheable_shift_source_contributes(self, monkeypatch) -> None:
-        """Each source must be read independently.
-
-        Distinct values throughout, so dropping any one source -- or hard-coding
-        today's Edge values, where checkpoint and both mode tables all say 3.0 --
-        fails instead of passing by coincidence.
-        """
-        monkeypatch.setitem(
-            pipeline_module.COSMOS3_GENERATION_DEFAULTS,
-            ("nemotron_dense", "video"),
-            {"flow_shift": 4.5},
-        )
-        monkeypatch.setitem(
-            pipeline_module.COSMOS3_GENERATION_DEFAULTS,
-            ("nemotron_dense", "image"),
-            {"flow_shift": 6.25},
-        )
-        pipeline = self._pipeline(checkpoint_shift=2.75)
+    def test_every_cacheable_shift_source_contributes(self) -> None:
+        """The checkpoint's shift, every transfer default and every override; nothing else."""
+        family = "nemotron_dense"
+        hint_shifts = {
+            float(defaults["flow_shift"])
+            for defaults in COSMOS3_DEFAULTS[family]["transfer"].values()
+            if "flow_shift" in defaults
+        }
+        override_shifts = {
+            float(row["flow_shift"].value)
+            for row in COSMOS3_OVERRIDES[family].values()
+            if "flow_shift" in row
+        }
+        pipeline = self._pipeline(family, checkpoint_shift=2.75)
         assert pipeline._cacheable_flow_shifts() == frozenset(
-            {2.75, 4.5, 6.25, pipeline_module.COSMOS3_V2V_FLOW_SHIFT}
-        )
-
-    def test_cacheable_set_for_the_shipped_edge_tables(self) -> None:
-        pipeline = self._pipeline()
-        # Edge declares 3.0 in both mode tables; V2V contributes its stronger shift.
-        assert pipeline._cacheable_flow_shifts() == frozenset(
-            {3.0, pipeline_module.COSMOS3_V2V_FLOW_SHIFT}
+            {2.75} | hint_shifts | override_shifts
         )
 
     def test_arbitrary_shifts_never_enter_the_cache(self) -> None:
@@ -1853,7 +1786,7 @@ class TestEdgeCheckpoint:
     def test_tokenization_matches_diffusers_golden(self):
         from transformers import AutoTokenizer
 
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
             COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
             COSMOS3_DURATION_TEMPLATE,
         )
@@ -1924,14 +1857,16 @@ class TestEdgeCheckpoint:
         assert edge_pipeline.transformer.recipe is NEMOTRON_DENSE_RECIPE
         assert edge_pipeline.use_native_flow_schedule is True
         assert edge_pipeline.sampling.native_flow_schedule is True
-        # Both Edge tables declare shift 3.0 on the native flow schedule, so
-        # the two modes resolve to the same (shift, karras) pair and share one
-        # cached scheduler rather than building two identical ones.
-        schedulers = {
-            mode: edge_pipeline._scheduler_for(
-                _native_flow_schedule(edge_pipeline._mode_params(mode)["flow_shift"])
-            )
+        # Both modes resolve to the Edge override shift on the native flow schedule, so
+        # they share one cached scheduler rather than building two identical ones.
+        shifts = {
+            mode: edge_pipeline.resolver.request(RequestParameters(mode=mode)).flow_shift
             for mode in ("video", "image")
+        }
+        assert shifts == {"video": 3.0, "image": 3.0}
+        schedulers = {
+            mode: edge_pipeline._scheduler_for(_native_flow_schedule(shift))
+            for mode, shift in shifts.items()
         }
         for scheduler in schedulers.values():
             assert float(scheduler.config.flow_shift) == 3.0
