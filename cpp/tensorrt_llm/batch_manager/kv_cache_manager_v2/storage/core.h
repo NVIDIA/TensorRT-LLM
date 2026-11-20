@@ -285,7 +285,14 @@ public:
     void prepareForShrink(SlotCount newNumSlots);
     //! Start shrinking the window to `target`, which must lie inside the current one.
     void prepareForShrinkWindow(SlotWindow target);
-    bool finishShrink();
+    //! Adopt the target window once every overflow id is back. By default the host waits for the copies still
+    //! reading the overflow slots. With `pendingCopies`, it does not: the overflow slots' events are merged into
+    //! *pendingCopies instead, and whoever takes over that memory must wait on it (setFreshIdReadyEvent).
+    bool finishShrink(CachedCudaEvent* pendingCopies = nullptr);
+    //! Fresh ids in `range` are handed out with `event` as their ready event: the memory they name was given up by
+    //! another pool group whose copies out of it may still run (copy-based rebalancing). Merges with any event
+    //! already pending.
+    void setFreshIdReadyEvent(SlotWindow range, CachedCudaEvent event);
 
     [[nodiscard]] bool shrinkInProgress() const noexcept
     {
@@ -344,6 +351,9 @@ private:
     SlotCount mNumReadyRecycledSlots;
     std::deque<Slot, PoolAllocator<Slot>> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
+    //! Fresh ids in mFreshIdEventRange wait on mFreshIdEvent (setFreshIdReadyEvent).
+    SlotWindow mFreshIdEventRange{};
+    CachedCudaEvent mFreshIdEvent = CachedCudaEvent::makeNull();
     //! Indexed by slot id, so sized to the window's end rather than its size.
     DynamicBitset mOccupiedMask;
 };

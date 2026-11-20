@@ -23,6 +23,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -206,6 +207,10 @@ Slot SlotAllocator::takeFreeSlot()
     else if (mIssued.size() < mTarget.size())
     {
         slot.setSlotId(issueFreshId());
+        if (!mFreshIdEvent.isClosed() && mFreshIdEventRange.contains(slot.slotId()))
+        {
+            slot.readyEvent = mFreshIdEvent;
+        }
     }
     else
     {
@@ -331,7 +336,23 @@ void SlotAllocator::prepareForShrinkWindow(SlotWindow target)
     TLLM_CHECK_DEBUG(check());
 }
 
-bool SlotAllocator::finishShrink()
+void SlotAllocator::setFreshIdReadyEvent(SlotWindow range, CachedCudaEvent event)
+{
+    if (event.isClosed() || range.empty())
+    {
+        return;
+    }
+    if (!mFreshIdEvent.isClosed())
+    {
+        std::array<CachedCudaEvent, 2> events{std::move(mFreshIdEvent), std::move(event)};
+        event = mergeEvents(events);
+        range = range.hull(mFreshIdEventRange);
+    }
+    mFreshIdEvent = std::move(event);
+    mFreshIdEventRange = range;
+}
+
+bool SlotAllocator::finishShrink(CachedCudaEvent* pendingCopies)
 {
     TLLM_CHECK_DEBUG(check());
     // Every issued id outside the target has to come back before the window can shrink. An
@@ -350,10 +371,31 @@ bool SlotAllocator::finishShrink()
             }
             TLLM_CHECK_WITH_INFO(ids.size() == mOverflowSlots.size(), "Duplicate slot IDs in overflow slots");
         }
-        // Synchronize overflow events. Slots often share an event; synchronize() closes it, so
-        // later slots holding the same event return immediately.
-        for (auto& s : mOverflowSlots)
-            s.readyEvent.synchronize();
+        if (pendingCopies != nullptr)
+        {
+            // Hand the copies still reading the overflow slots on instead of waiting for them. Slots often share an
+            // event: merge each distinct one once.
+            std::vector<CachedCudaEvent> events;
+            std::set<CUevent> seen;
+            if (!pendingCopies->isClosed())
+            {
+                seen.insert(pendingCopies->handle());
+                events.push_back(std::move(*pendingCopies));
+            }
+            for (auto& s : mOverflowSlots)
+            {
+                if (CUevent const h = s.readyEvent.handle(); h != nullptr && seen.insert(h).second)
+                    events.push_back(s.readyEvent);
+            }
+            *pendingCopies = mergeEvents(events);
+        }
+        else
+        {
+            // Synchronize overflow events. Slots often share an event; synchronize() closes it, so
+            // later slots holding the same event return immediately.
+            for (auto& s : mOverflowSlots)
+                s.readyEvent.synchronize();
+        }
         for (auto& s : mOverflowSlots)
             s.resetSlot();
         mOverflowSlots.clear();
@@ -411,6 +453,10 @@ bool SlotAllocator::check() const noexcept
 
 void SlotAllocator::scrubEvents()
 {
+    if (!mFreshIdEvent.isClosed() && mFreshIdEvent.queryComplete())
+    {
+        mFreshIdEvent = CachedCudaEvent::makeNull();
+    }
     for (size_t i = slotCountToSizeT(mNumReadyRecycledSlots); i < mRecycledSlots.size(); ++i)
     {
         if (mRecycledSlots[i].queryReady())

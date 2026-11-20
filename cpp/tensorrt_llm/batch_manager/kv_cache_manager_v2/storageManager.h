@@ -770,6 +770,11 @@ private:
     bool mGpuArena = false;
     bool mDropUnreferencedOnRebalance = false;
     bool mInPlaceRelocation = false;
+    // During one arena adjust (adjustArenaLevel), a shrinking group does not wait for the copies out of the region
+    // it gives up; their merged event is collected here and handed to the fresh ids of the groups that take the
+    // region over (moveArenaWindow).
+    bool mDeferArenaShrinkSync = false;
+    CachedCudaEvent mArenaVacatedCopies = CachedCudaEvent::makeNull();
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     RetentionExpiryQueue mRetentionExpiries;

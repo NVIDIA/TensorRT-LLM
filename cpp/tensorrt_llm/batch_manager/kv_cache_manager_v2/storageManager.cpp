@@ -3226,8 +3226,9 @@ void StorageManager::shrinkPoolGroupToWindow(CacheLevel level, PoolGroupIndex pg
     TLLM_CHECK_DEBUG_WITH_INFO(
         allocator.numOverflowSlots() == allocator.numIssuedOutsideTarget(), "Post-defrag overflow slot count mismatch");
 
-    // Finalize shrink and resize pools.
-    allocator.finishShrink();
+    // Finalize shrink and resize pools. In an arena adjust the copies still reading the vacated region are not waited
+    // for here: whoever takes the region over waits for them (moveArenaWindow).
+    allocator.finishShrink(mDeferArenaShrinkSync ? &mArenaVacatedCopies : nullptr);
     pg.setPoolWindows(target);
 }
 
@@ -3386,6 +3387,12 @@ void StorageManager::moveArenaWindow(CacheLevel level, PoolGroupIndex pgIdx, Slo
     {
         pg.setPoolWindows(hull);
         pg.slotAllocator().expandWindow(hull);
+        if (mDeferArenaShrinkSync)
+        {
+            // The space gained was given up by a group that moved first in this adjust; copies out of it may still
+            // run. (Ids of `from` that were never issued wait too: harmless.)
+            pg.slotAllocator().setFreshIdReadyEvent(hull, mArenaVacatedCopies);
+        }
     }
     if (hull != to)
     {
@@ -3469,6 +3476,16 @@ void StorageManager::adjustArenaLevel(CacheLevel level, std::optional<size_t> ne
         kDone
     };
     TypedVec<PoolGroupIndex, State> state(numPg, State::kPending);
+    // Groups that shrink hand their pending copies to the groups that grow into the space (see moveArenaWindow) rather
+    // than make the host wait for them.
+    mDeferArenaShrinkSync = true;
+    mArenaVacatedCopies = CachedCudaEvent::makeNull();
+    auto endDeferredSync = FuncGuard(
+        [this]()
+        {
+            mDeferArenaShrinkSync = false;
+            mArenaVacatedCopies = CachedCudaEvent::makeNull();
+        });
     std::function<void(PoolGroupIndex)> move = [&](PoolGroupIndex pgIdx)
     {
         if (state[pgIdx] == State::kDone)

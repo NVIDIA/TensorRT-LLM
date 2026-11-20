@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -349,6 +350,61 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ReleaseOrderRecyclingIgnoresEventReadine
     std::vector<Slot> last;
     last.push_back(std::move(again));
     releaseSlots(readyFirst, last);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+// Copy-based rebalancing hands a vacated region to the neighbouring group without a host wait: finishShrink with
+// `pendingCopies` returns at once with the merged event of the copies still reading the overflow slots, and the
+// group that grows into the region hands that event out with its fresh ids there (and only there).
+TEST(KvCacheManagerV2SlotAllocatorTest, DeferredShrinkHandsPendingCopiesToFreshIds)
+{
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    // Hold the stream until released (or 5 s, so that a host wait in finishShrink fails the test instead of hanging).
+    std::atomic<bool> go{false};
+    ASSERT_EQ(cudaLaunchHostFunc(
+                  stream,
+                  [](void* flag)
+                  {
+                      auto const t0 = std::chrono::steady_clock::now();
+                      while (!static_cast<std::atomic<bool>*>(flag)->load()
+                          && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+                      {
+                      }
+                  },
+                  &go),
+        cudaSuccess);
+
+    // Group A gives up [4, 8); one of the slots there is still being copied out (id 6).
+    SlotAllocator shrinking{window(0, 8), SlotAllocator::Growth::kAscending, SlotAllocator::Recycling::kReleaseOrder};
+    auto slots = allocateSlots(shrinking, 8);
+    slots[6].readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+    ASSERT_FALSE(slots[6].queryReady());
+    shrinking.prepareForShrinkWindow(window(0, 4));
+    releaseSlots(shrinking, slots, 4, 8);
+    CachedCudaEvent pending = CachedCudaEvent::makeNull();
+    EXPECT_TRUE(shrinking.finishShrink(&pending));
+    EXPECT_EQ(shrinking.window(), window(0, 4));
+    ASSERT_FALSE(pending.isClosed()) << "the pending copy was not handed on";
+    EXPECT_FALSE(pending.queryComplete()) << "finishShrink waited for the pending copy";
+
+    // Group B (same slot size here) grows into [4, 8).
+    SlotAllocator growing{window(8, 16), SlotAllocator::Growth::kAscending, SlotAllocator::Recycling::kReleaseOrder};
+    growing.expandWindow(window(4, 16));
+    growing.setFreshIdReadyEvent(window(4, 8), pending);
+    auto taken = allocateSlots(growing, 5); // fresh ids 4..8
+    EXPECT_EQ(idsOf(taken), (std::vector<SlotCount>{4, 5, 6, 7, 8}));
+    for (size_t i = 0; i < 4; ++i)
+    {
+        EXPECT_EQ(taken[i].readyEvent.handle(), pending.handle()) << "id " << i + 4 << " does not wait";
+    }
+    EXPECT_TRUE(taken[4].readyEvent.isClosed()) << "id 8 lies outside the vacated region";
+
+    go.store(true);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    releaseSlots(growing, taken);
+    releaseSlots(shrinking, slots, 0, 4);
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
