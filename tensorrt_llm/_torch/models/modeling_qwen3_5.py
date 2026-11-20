@@ -15,12 +15,13 @@
 
 import re
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.recurrent_state_spec import RecurrentStateSpec
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
@@ -795,6 +796,17 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     ) -> Literal["PYTHON"]:
         """Match the hybrid text decoder's Python disaggregated route."""
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the hybrid text decoder's declaration, read from ``text_config``."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return Qwen3NextForCausalLM.get_recurrent_state_spec(text_config, quant_config=quant_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel

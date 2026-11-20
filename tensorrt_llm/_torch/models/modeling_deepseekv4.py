@@ -3538,6 +3538,8 @@ _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
     prioritize_decode_graphs=True,
     loop_on_execution_stream=True,
     prompts_to_owners=True,
+    skip_adp_count_gather=True,
+    skip_verify_row_gather=True,
 )
 
 
@@ -3627,10 +3629,12 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             model=self.model_cls(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
-        # FP8 block-scale projections race the small-M kernel against the quantized GEMM.
+        # FP8 block-scale projections race the small-M kernel against the quantized GEMM; on SM107
+        # prefill-sized MXFP8 projections run on the CuTe DSL GEMM.
         for module in self.modules():
             if isinstance(module, Linear):
                 module.use_fp8_small_m_gemm = True
+                module.use_sm107_mxfp8_prefill_gemm = True
         self.logits_processor = self.logits_processor_cls(
             model_config, self.model.hc_head, self.model.norm
         )

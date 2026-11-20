@@ -38,13 +38,16 @@ The kernel processes BLOCK_N tokens per program (2D [BLOCK_N, HALF] tiles)
 so each thread issues wide vectorized loads/stores instead of one scalar
 element; tile size and warp count are fixed host-side as a pure function of
 head_dim (no runtime autotuning, so launches stay deterministic under
-CUDA-graph capture). Tuned on B200: 363 -> ~75 us/call at ~6.5k tokens for
-the 64-head hd=256 shape (~4.3 TB/s effective), 2.8x on the graph-replayed
-decode shape.
+CUDA-graph capture), with one tile size for SM100 and a smaller one for
+SM120.
+
+With ``num_kv_heads=0`` the kernel runs Q only (KV-shared layers, whose K/V
+come from an earlier layer's cache): per-head q_norm + RoPE over a [N, NQ*HD]
+input, with every program a Q head.
 
 The unfused path is kept only for configurations this kernel does not
-support (KV-shared layers, non-FP8 KV cache, custom-mask multimodal
-prefill, torch.compile).
+support (custom-mask multimodal prefill, torch.compile, rope tables that do
+not span the head).
 """
 
 from typing import Optional, Tuple
@@ -52,6 +55,22 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._utils import get_sm_version
+
+from ...flashinfer_utils import get_env_enable_pdl
+from ..fla.op import gdc_wait_with_memory_clobber
+
+
+@triton.jit
+def _store_head(out, o1, o2, rmask, HALF: tl.constexpr, FP8: tl.constexpr):
+    # o1/o2 are the bf16 head halves; FP8 stores them as float8_e4m3fn.
+    if FP8:
+        tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
+        tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
+    else:
+        tl.store(out, o1, mask=rmask[:, None])
+        tl.store(out + HALF, o2, mask=rmask[:, None])
 
 
 @triton.jit
@@ -74,9 +93,13 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     N,  # num tokens (rows)
     HD: tl.constexpr,  # head dim
     HALF: tl.constexpr,  # HD // 2 (power of two)
-    OUT_FP8: tl.constexpr,
+    Q_FP8: tl.constexpr,  # Q stored as fp8 (else bf16)
+    KV_FP8: tl.constexpr,  # K/V stored as fp8 (else bf16)
     BLOCK_N: tl.constexpr,  # tokens per program (power of two)
+    PDL: tl.constexpr,
 ):
+    if PDL:
+        gdc_wait_with_memory_clobber()
     h = tl.program_id(0)
     rows = tl.program_id(1).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
     rmask = rows < N
@@ -103,16 +126,25 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         sin = tl.load(cs + HALF, mask=rmask[:, None], other=0.0)
         o1 = (y1 * cos - y2 * sin).to(tl.bfloat16)
         o2 = (y2 * cos + y1 * sin).to(tl.bfloat16)
+        # Q and K outputs may differ in dtype, so each branch stores through its own pointer.
         if h < NQ:
-            out = q_out_ptr + rows[:, None] * Q_OUT_SW + h * HD + offs[None, :]
+            _store_head(
+                q_out_ptr + rows[:, None] * Q_OUT_SW + h * HD + offs[None, :],
+                o1,
+                o2,
+                rmask,
+                HALF,
+                Q_FP8,
+            )
         else:
-            out = k_out_ptr + rows[:, None] * K_OUT_SW + (h - NQ) * HD + offs[None, :]
-        if OUT_FP8:
-            tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
-            tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
-        else:
-            tl.store(out, o1, mask=rmask[:, None])
-            tl.store(out + HALF, o2, mask=rmask[:, None])
+            _store_head(
+                k_out_ptr + rows[:, None] * K_OUT_SW + (h - NQ) * HD + offs[None, :],
+                o1,
+                o2,
+                rmask,
+                HALF,
+                KV_FP8,
+            )
     else:
         # V head: weightless norm, no rope (v_norm is applied to the raw v
         # slice; reads happen before any write, matching HF's
@@ -120,12 +152,7 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         o1 = (x1 * rms[:, None]).to(tl.bfloat16)
         o2 = (x2 * rms[:, None]).to(tl.bfloat16)
         out = v_out_ptr + rows[:, None] * V_OUT_SW + (h - NQ - NK) * HD + offs[None, :]
-        if OUT_FP8:
-            tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
-            tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
-        else:
-            tl.store(out, o1, mask=rmask[:, None])
-            tl.store(out + HALF, o2, mask=rmask[:, None])
+        _store_head(out, o1, o2, rmask, HALF, KV_FP8)
 
 
 def gemma4_fused_qkv_norm_rope_quant(
@@ -140,12 +167,14 @@ def gemma4_fused_qkv_norm_rope_quant(
     head_dim: int,
     out_fp8: bool,
     packed_output: bool = False,
+    kv_out_fp8: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Run the fused per-head norm + rope + quant over a packed QKV tensor.
 
     Args:
         qkv: [N, num_q_heads*head_dim + 2*num_kv_heads*head_dim] bf16, packed
-            [q | k | v]; may have a row stride larger than its width.
+            [q | k | v]; may have a row stride larger than its width. With
+            num_kv_heads=0 it holds Q only.
         position_ids: flattenable to [N]; integer rope positions per token.
         cos_sin: [max_positions, 2, head_dim // 2] fp32 contiguous table
             (RotaryEmbedding.rotary_cos_sin layout).
@@ -153,18 +182,27 @@ def gemma4_fused_qkv_norm_rope_quant(
         eps: shared RMSNorm epsilon.
         out_fp8: emit float8_e4m3fn outputs (KV-cache dtype) when True,
             bf16 otherwise.
+        kv_out_fp8: K/V output dtype, overriding ``out_fp8`` for K/V only
+            (e.g. BF16 Q with FP8 K/V for an FP8 cache whose attention kernel
+            takes BF16 Q). Defaults to ``out_fp8``.
         packed_output: emit one contiguous BF16 packed-QKV tensor instead of
             separate Q/K/V tensors. Packed FP8 is not supported because the
             native TRTLLM preprocessing contract consumes BF16 packed QKV.
 
     Returns:
         Separate mode returns contiguous ``(q, k, v)`` tensors in the
-        requested output dtype. Packed mode returns ``(qkv, None, None)``
+        requested output dtype; Q-only input (num_kv_heads=0) returns
+        ``(q, None, None)``. Packed mode returns ``(qkv, None, None)``
         with contiguous BF16 QKV. In both modes q/k are roped and v is
         norm-only.
     """
-    if packed_output and out_fp8:
+    if kv_out_fp8 is None:
+        kv_out_fp8 = out_fp8
+    if packed_output and (out_fp8 or kv_out_fp8):
         raise ValueError("packed_output requires BF16 output")
+    q_only = num_kv_heads == 0
+    if q_only and packed_output:
+        raise ValueError("packed_output requires K/V heads")
 
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
     assert qkv.dtype == torch.bfloat16
@@ -177,6 +215,7 @@ def gemma4_fused_qkv_norm_rope_quant(
 
     n = qkv.shape[0]
     out_dtype = torch.float8_e4m3fn if out_fp8 else torch.bfloat16
+    kv_dtype = torch.float8_e4m3fn if kv_out_fp8 else torch.bfloat16
     packed_qkv = None
     if packed_output:
         packed_qkv = torch.empty(
@@ -190,20 +229,20 @@ def gemma4_fused_qkv_norm_rope_quant(
         )
     else:
         q_out = torch.empty((n, q_size), dtype=out_dtype, device=qkv.device)
-        k_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
-        v_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
+        k_out = torch.empty((n, kv_size), dtype=kv_dtype, device=qkv.device)
+        v_out = torch.empty((n, kv_size), dtype=kv_dtype, device=qkv.device)
     if n == 0:
         if packed_output:
             assert packed_qkv is not None
             return packed_qkv, None, None
-        return q_out, k_out, v_out
+        return (q_out, None, None) if q_only else (q_out, k_out, v_out)
 
-    # ~2k-element tiles keep every thread on wide vectorized accesses without
-    # spilling: 16 tokens/program for hd=256, 8 for hd=512 (B200-tuned, see
-    # module docstring). head_dim is a power of two on every gated shape, so
-    # block_n is too (required by tl.arange).
-    block_n = max(1, min(32, 4096 // head_dim))
+    # 4k-element tiles on SM100, 2k on SM120 (more CTAs). head_dim is a power
+    # of two, so block_n is too (required by tl.arange).
+    tile_elems = 2048 if get_sm_version() >= 120 else 4096
+    block_n = max(1, min(32, tile_elems // head_dim))
     grid = (num_q_heads + 2 * num_kv_heads, triton.cdiv(n, block_n))
+    pdl = get_env_enable_pdl() and get_sm_version() >= 90
     _gemma4_qkv_norm_rope_quant_kernel[grid](
         qkv,
         q_out,
@@ -223,11 +262,14 @@ def gemma4_fused_qkv_norm_rope_quant(
         n,
         HD=head_dim,
         HALF=half,
-        OUT_FP8=out_fp8,
+        Q_FP8=out_fp8,
+        KV_FP8=kv_out_fp8,
         BLOCK_N=block_n,
+        PDL=pdl,
         num_warps=8,
+        launch_pdl=pdl,
     )
     if packed_output:
         assert packed_qkv is not None
         return packed_qkv, None, None
-    return q_out, k_out, v_out
+    return (q_out, None, None) if q_only else (q_out, k_out, v_out)

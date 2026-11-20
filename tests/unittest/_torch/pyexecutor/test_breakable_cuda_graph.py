@@ -779,7 +779,9 @@ def test_padded_context_replay_with_spec_worker_matches_eager():
     assert not padded.is_contiguous()
     attn_metadata = SimpleNamespace(num_contexts=1, padded_num_tokens=16, num_tokens=12)
     spec_metadata = SimpleNamespace(
-        gather_ids=torch.arange(12, device="cuda"), is_layer_capture=lambda layer_idx: False
+        gather_ids=torch.arange(12, device="cuda"),
+        is_layer_capture=lambda layer_idx: False,
+        skip_verify_row_gather=False,
     )
 
     def forward():
