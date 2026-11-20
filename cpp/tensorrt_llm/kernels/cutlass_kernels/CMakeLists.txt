@@ -248,14 +248,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
       "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_fp8.cu"
       "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_uint4.cu"
       "${MOE_CUTLASS_DIR}/moe_gemm_tma_warp_specialized_input.cu"
-      "${MOE_CUTLASS_DIR}/moe_kernels.cu"
-      "${MOE_CUTLASS_DIR}/moe_lora_pointer_expand.cu"
-      "${MOE_CUTLASS_DIR}/moe_lora_problem_builder.cu"
-      "${MOE_CUTLASS_DIR}/moe_lora_slot_expand.cu")
-  list(
-    REMOVE_ITEM MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/moe_lora_pointer_expand.cu"
-    "${MOE_CUTLASS_DIR}/moe_lora_problem_builder.cu"
-    "${MOE_CUTLASS_DIR}/moe_lora_slot_expand.cu")
+      "${MOE_CUTLASS_DIR}/moe_kernels.cu")
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
