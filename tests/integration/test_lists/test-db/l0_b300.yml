@@ -299,6 +299,10 @@ l0_b300:
       stage: post_merge
       backend: pytorch
   tests:
+  # Kimi K3 routing shape (896 experts, top_k 16). Single-GPU, random weights.
+  # Same sm100f routing kernel as the B200 entry; this is the SM103 run.
+  # Too heavy for pre_merge, and it does not need the 4-GPU stage.
+  - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   # ---- moved to post-merge (MoE CI optimization) ----
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"

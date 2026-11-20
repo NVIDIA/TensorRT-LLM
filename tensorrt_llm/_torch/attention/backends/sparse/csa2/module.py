@@ -1558,11 +1558,25 @@ class DeepseekV41Attention(nn.Module):
             and self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
         )
         weights_stream = None
+        index_ready = None
         if overlap:
             if self.aux_stream.device != hidden_states.device:
                 raise ValueError("CSA2 auxiliary stream must use the input CUDA device")
             attn_metadata.resolve_swa_slots()
             self._prepare_start.record()
+            indexer = getattr(self.backend, "indexer", None)
+            if (
+                self.layer.mode == CSA2Mode.REINDEX
+                and attn_metadata.num_ctx_tokens == 0
+                and indexer is not None
+                and indexer.prefetches_candidates(attn_metadata, hidden_states.shape[0])
+            ):
+                # The published candidates' index rows go to L2 while this layer projects.
+                with torch.cuda.stream(csa2_side_stream(hidden_states.device, 1)):
+                    self._prepare_start.wait()
+                    indexer.prefetch_candidate_pages(attn_metadata)
+                    self._descriptors_done.record()
+                index_ready = self._descriptors_done
             if (
                 self.layer.mode == CSA2Mode.FULL
                 and global_source is not None
@@ -1572,7 +1586,7 @@ class DeepseekV41Attention(nn.Module):
                 # nor the compressor's rows: in forwards without context tokens, derive them on
                 # two more side streams next to the compression chain.
                 weights_stream = csa2_side_stream(hidden_states.device)
-                indexer = getattr(self.backend, "indexer", None)
+                index_ready = self._weights_done
                 descriptor_stream = None
                 if indexer is not None:
                     descriptor_stream = csa2_side_stream(hidden_states.device, 1)
@@ -1822,7 +1836,7 @@ class DeepseekV41Attention(nn.Module):
             swa_transform=swa_transform,
             main_transform=main_transform,
             index_transform=index_transform,
-            index_ready=self._weights_done if weights_stream is not None else None,
+            index_ready=index_ready,
             output_position_ids=positions if inverse_rope_applied else None,
             output_rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin
             if inverse_rope_applied
