@@ -5011,6 +5011,45 @@ def test_megamoe_genphase_defaults_build_the_genphase_kernel(
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("bucket", [32, 64, 128, 192])
+def test_glm_rubin_runner_keeps_phase_interleave_genphase_tactics(
+    monkeypatch: pytest.MonkeyPatch, bucket: int
+) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__high_throughput.ops.moe import (  # noqa: E501
+        megamoe_runner as glm_runner,
+    )
+
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
+    runner = glm_runner.RubinMegaMoERunner(
+        local_rank=0,
+        output_dtype=torch.bfloat16,
+        world_size=4,
+        num_topk=8,
+        num_experts_per_rank=64,
+        hidden_size=6144,
+        intermediate_size_per_partition=2048,
+        expand_intermediate_size_per_partition=4096,
+        max_tokens_per_rank=bucket,
+        apply_topk_in_fc1=True,
+        in_kernel_fc2_reduce=megamoe_op._sm107_use_in_kernel_fc2_reduce(bucket, True),
+    )
+    # The shared gen-phase table runs the decode scheduler, which GLM's own gen-phase kernel
+    # lacks: GLM keeps its phase_interleave tactics and refuses a decode one.
+    shared_tactic = megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
+    assert shared_tactic[3][0] == "decode"
+    assert runner._default_tactic(bucket) == megamoe_op._unpack_tactic(
+        glm_runner._GLM_GENPHASE_TACTICS[bucket]
+    )
+    with pytest.raises(ValueError, match="no decode scheduler"):
+        runner._build_kernel_once(shared_tactic)
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize("hidden_size,uses_genphase", [(7168, True), (2880, False)])
 def test_megamoe_genphase_rejects_compact_rows_it_cannot_address(
     monkeypatch: pytest.MonkeyPatch, hidden_size: int, uses_genphase: bool
