@@ -1200,6 +1200,7 @@ def load_pretrained_config(model_name_or_path: str,
         from tensorrt_llm._torch.configs import KimiK3Config
         model_config = KimiK3Config.from_dict(config_dict, **kwargs)
         model_config.architectures = ["KimiK3ForConditionalGeneration"]
+        model_config.text_config.architectures = ["KimiLinearForCausalLM"]
     elif model_type in ("kimi_k3", "kimi_linear"):
         # Kimi K3 text-only (or multimodal explicitly disabled): flatten to the
         # in-tree KimiLinearConfig and run the text model only (this also avoids
