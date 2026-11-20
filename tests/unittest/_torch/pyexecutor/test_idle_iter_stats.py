@@ -930,7 +930,10 @@ def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds)
 
 
 @pytest.mark.parametrize("payload_kind", ["idle", "queued", "synthetic"])
-def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
+@pytest.mark.parametrize(("refresh_ms", "idle_wait_s"), [(2300, 2.3), (5, 1.0)])
+def test_adp_exchange_publishes_current_peer_observations(
+    clock, payload_kind, refresh_ms, idle_wait_s
+):
     from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
     from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -941,7 +944,7 @@ def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
     rank0._pending_rank_observations = {}
     rank0.max_stats_len = 0
     rank0.stats.append(json.dumps({"attentionDpRank": 1, "iter": 3, "inflightBatchingStats": {}}))
-    activity = ConversationActivityStats(1, 1, 0, 0, 2, 0, 0, 0, refresh_after_ms=2300)
+    activity = ConversationActivityStats(1, 1, 0, 0, 2, 0, 0, 0, refresh_after_ms=refresh_ms)
     outcomes = Mock(return_value=(0, 0, 0))
     rank1._adp_iter_stats = ADPIterStatsBuffer(
         activity_snapshot=lambda: activity, transfer_outcomes_snapshot=outcomes
@@ -963,7 +966,7 @@ def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
     for count in (1, 2):
         outcomes.return_value = (0, count, 0)
         exchange()
-    assert rank0._next_adp_activity_refresh == pytest.approx(clock.value + 2.3)
+    assert rank0._next_adp_activity_refresh == pytest.approx(clock.value + idle_wait_s)
     assert PyExecutor.get_latest_iteration_stats(rank0) == [
         (
             "per_rank_dict",
