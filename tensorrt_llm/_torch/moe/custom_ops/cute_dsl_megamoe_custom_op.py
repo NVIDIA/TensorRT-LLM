@@ -173,6 +173,9 @@ _TACTIC_LEN = 12
 _TACTIC_LEN_V5 = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
+# SM versions whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter
+# work ids; measured on SM103, and SM100 runs the same kernel.
+_ATOMIC_COUNTER_TWIN_SM_VERSIONS = (100, 103)
 _DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
 _TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
@@ -1331,6 +1334,38 @@ def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
     return 0, int(local_bytes), 0, int(shared_bytes), f"export-{type(kernel).__name__}"
 
 
+def _require_megamoe_shared_workspace(
+    kernel, shared_workspace: torch.Tensor, num_experts_per_rank: int
+) -> None:
+    """Refuse a caller's shared workspace smaller than ``kernel`` addresses.
+
+    Its layout grows with the expert count and the token bucket, so a workspace sized for
+    another problem lets the kernel write and read past the end of the allocation.
+    """
+    _, needed = kernel.get_workspace_sizes()
+    have = shared_workspace.numel() * shared_workspace.element_size()
+    if have < int(needed):
+        raise ValueError(
+            f"MegaMoE-CuteDSL: the shared workspace has {have} bytes, but the kernel for "
+            f"{num_experts_per_rank} experts per rank needs {int(needed)}; size it with "
+            f"query_megamoe_kernel_properties for this runner's problem."
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class MegaMoeKernelProperties:
+    """What a bucket's default kernel tells the backend before its first launch
+    (``query_megamoe_kernel_properties``). Read the fields by name: a new field then breaks no
+    caller."""
+
+    shared_workspace_bytes: int
+    # The kernel reads the caller's inputs in place (an exact-size generation-phase bucket).
+    supports_direct_inputs: bool
+    # The kernel's top-k reduce masks routes with an invalid expert, so routes staged as -1
+    # drop their rows.
+    masks_invalid_routes: bool
+
+
 def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
     """Return the per-row byte width the MegaMoE kernel expects for the
     activation SF tensor.
@@ -1565,6 +1600,10 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         #     requires use_bulk_fc2_store, and get_valid_tactics already drops
         #     every bulk candidate when in_kernel_fc2_reduce is set.
         unmet = []
+        if sm_version in (100, 103):
+            # The vendored Blackwell kernel builds only expert readiness (_validate_geometry:
+            # "Blackwell requires token_back_ready_granularity='expert'").
+            unmet.append(f"SM{sm_version} (token_tile builds on SM107 only)")
         if work_id_mode != "atomic_counter":
             unmet.append(f"work_id_mode={work_id_mode!r} (need 'atomic_counter')")
         if token_back_mode not in ("standalone_warps", "reuse_dispatch_warps"):
@@ -1601,6 +1640,31 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             )
         if unmet:
             raise ValueError("combine_dedup=True is unmet by: " + "; ".join(unmet))
+
+
+def _with_atomic_counter_work_ids(candidates: list[Tuple], sm_version: int) -> list[Tuple]:
+    """The candidates of a helper-bearing (load-balanced) launch and, on
+    _ATOMIC_COUNTER_TWIN_SM_VERSIONS, each one's twin with atomic-counter work ids.
+
+    The autotuner then chooses the work-id mode per shape.
+
+    Per-layer dynamic EPLB launches MegaMoE on the full grid while the HALO-Q
+    + TMA copy kernel can still hold its auxiliary SMs, so with grid-stride work
+    ids the CTAs that start late keep a static share of the tiles. A twin differs
+    from its candidate only in the work-id field and is validated again. Other
+    SMs keep their candidates.
+    """
+    if sm_version not in _ATOMIC_COUNTER_TWIN_SM_VERSIONS:
+        return list(candidates)
+    tactics = list(candidates)
+    canonical = [tuple(_unpack_tactic(tactic)) for tactic in candidates]
+    for fields in list(canonical):
+        twin = fields[:4] + ("atomic_counter",) + fields[5:]  # the fifth field is the work-id mode
+        if twin not in canonical:
+            validate_megamoe_tactic(twin, sm_version=sm_version)
+            tactics.append(twin)
+            canonical.append(twin)
+    return tactics
 
 
 def _expand_megamoe_ready_tactics(
@@ -1817,6 +1881,8 @@ def enumerate_megamoe_candidate_tactics(
         )
         validate_megamoe_tactic(tactic, sm_version=sm_version)
         candidates.append(tactic)
+    if load_balance:
+        candidates = _with_atomic_counter_work_ids(candidates, sm_version)
     return _expand_megamoe_ready_tactics(candidates, sm_version, load_balance=load_balance)
 
 
@@ -2465,8 +2531,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
-    ) -> Tuple[int, bool]:
-        """Probe workspace size and direct-input support of the default kernel."""
+    ) -> MegaMoeKernelProperties:
+        """Probe the default kernel: its shared workspace bytes, whether it reads its inputs in
+        place (direct inputs), and whether its top-k reduce masks routes with an invalid expert
+        (``masks_invalid_combine_slots``), so that routes staged as -1 drop their rows."""
 
         sm_version = get_sm_version()
         use_default_tactic = tactic is None
@@ -2598,7 +2666,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 build=build,
             )
             shared_bytes = max(shared_bytes, plain.get_workspace_sizes()[1])
-        return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
+        return MegaMoeKernelProperties(
+            shared_workspace_bytes=int(shared_bytes),
+            supports_direct_inputs=isinstance(probe, RubinInferenceGenphaseMegaMoE),
+            masks_invalid_routes=bool(getattr(probe, "masks_invalid_combine_slots", False)),
+        )
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
         """Shape-derivation rule: the activation token count (input[0] dim0)
@@ -2812,8 +2884,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
             )
-            if default_tactic not in candidates:
-                candidates.append(default_tactic)
+            defaults = [default_tactic]
+            if self.helper_expert_count > 0:
+                defaults = _with_atomic_counter_work_ids(defaults, self.sm_version)
+            candidates.extend(tactic for tactic in defaults if tactic not in candidates)
             for default_tactic in (
                 _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
                 _SM107_KIMI_K3_GENPHASE_TACTICS.get(self._tactic_lookup_key()),
@@ -3183,6 +3257,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tactic_t,
                 allow_fallback=use_default_tactic,
             )
+            if shared_workspace is not None:
+                _require_megamoe_shared_workspace(
+                    kernel, shared_workspace, self.num_experts_per_rank
+                )
 
             # form-B accumulates the top-k reduction into ``combine_output``,
             # so its live rows MUST start at 0; the CALLER zeros [:num_tokens]

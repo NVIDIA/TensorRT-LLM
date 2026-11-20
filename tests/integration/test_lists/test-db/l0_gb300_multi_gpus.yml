@@ -98,6 +98,8 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  # MegaMoE on four ranks drops padding rows on the SM103 kernel too (SM100: l0_dgx_b200).
+  - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_megamoe_cutedsl_drops_padding_rows
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   # Muse Spark Open's fused expert finalize + TP4 all-reduce over CUDA IPC; each
