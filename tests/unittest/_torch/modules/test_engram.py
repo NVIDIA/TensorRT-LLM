@@ -546,6 +546,43 @@ class _OwnerRows:
         return self.rows[index]
 
 
+def test_off_home_claim_wait_is_short_and_not_renewed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unclaimed per-rank table cannot add a two-minute election delay."""
+    now = [0.0]
+    monkeypatch.setattr(engram_module, "_off_home_waited_s", 0.0)
+    monkeypatch.setattr(engram_module.time, "monotonic", lambda: now[0])
+    share = Mock()
+
+    def join_unclaimed(claim_after_s: float) -> None:
+        now[0] += 3.0
+        return None
+
+    share.join.side_effect = join_unclaimed
+    assert engram_module._OFF_HOME_CLAIM_WAIT_S == 2
+    assert engram_module._join_off_home(share) is None
+    assert engram_module._join_off_home(share) is None
+    assert [call.args[0] for call in share.join.call_args_list] == [2.0, 0.0]
+    assert engram_module._off_home_waited_s == 6.0
+
+
+def test_off_home_join_passes_through_an_existing_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shorter claim grace does not alter a successfully joined owner's descriptors."""
+    now = [0.0]
+    owner = ([7], {"size": 128, "granularity": None})
+    monkeypatch.setattr(engram_module, "_off_home_waited_s", 0.0)
+    monkeypatch.setattr(engram_module.time, "monotonic", lambda: now[0])
+    share = Mock()
+
+    def join_existing(claim_after_s: float):
+        assert claim_after_s == 2.0
+        now[0] += 0.25
+        return owner
+
+    share.join.side_effect = join_existing
+    assert engram_module._join_off_home(share) is owner
+    assert engram_module._off_home_waited_s == 0.25
+
+
 def _node_shared_table_process(
     rank: int, scenario: str, key: str, loading, imported, write, written, results
 ) -> None:

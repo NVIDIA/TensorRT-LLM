@@ -1232,9 +1232,10 @@ def _host_bytes(host: object, nbytes: int) -> torch.Tensor:
     return torch.frombuffer(raw, dtype=torch.uint8)
 
 
-# A node's workers reach a table seconds apart; one off the home node waits for home owners this long
-# in all, so a node without one costs the wait once per process.
-_OFF_HOME_CLAIM_WAIT_S = 120  # 2 min
+# A per-rank share cannot be served by another TP rank. Give a concurrently starting matching
+# owner only a short grace before allocating, instead of delaying the first table for two minutes.
+# The budget applies across tables in one process, so an empty name cannot repeat this delay.
+_OFF_HOME_CLAIM_WAIT_S = 2  # seconds
 _off_home_waited_s = 0.0
 
 
