@@ -26,7 +26,7 @@ import pytest
 
 from tensorrt_llm.inputs.utils import MultimodalDataTracker
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content
-from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+from tensorrt_llm.serve.openai_protocol import ResponsesRequest, ResponsesResponse
 from tensorrt_llm.serve.responses_utils import (
     _create_input_messages,
     _get_chat_completion_function_tools,
@@ -402,6 +402,42 @@ def test_meaningful_values_survive_the_null_scrub():
     )
     assert request.temperature == 0.25
     assert request.tool_choice == "none"
+
+
+# ---------------------------------------------------------------------------
+# parallel_tool_calls: true unless the request says otherwise
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
+        ({}, True),
+        ({"parallel_tool_calls": None}, True),
+        ({"parallel_tool_calls": True}, True),
+        ({"parallel_tool_calls": False}, False),
+    ],
+    ids=["omitted", "null", "true", "false"],
+)
+def test_parallel_tool_calls_defaults_to_true_as_in_openai(fields, expected):
+    request = ResponsesRequest(model="m", input="hi", **fields)
+    response = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="m",
+        created_time=0,
+        output=[],
+        status="completed",
+    )
+
+    assert request.parallel_tool_calls is expected, (
+        "parallel_tool_calls must default to true, as in the OpenAI API; only an explicit "
+        "false turns it off"
+    )
+    assert response.model_dump(mode="json")["parallel_tool_calls"] is expected, (
+        "the response must echo the request's parallel_tool_calls, true when the request "
+        "does not set it"
+    )
 
 
 # ---------------------------------------------------------------------------
