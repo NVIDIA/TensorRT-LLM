@@ -6536,7 +6536,8 @@ class PyExecutor:
         The gate opens when all three conditions hold globally:
 
         (A) The executor has fetched at least ``benchmark_req_queues_size``
-            requests in the current benchmark stage (cumulatively for scalar mode).
+            requests in the current benchmark stage (cumulatively for scalar mode),
+            or the executor is shutting down.
         (B) Every request in ``active_requests`` on this rank completed the
             KV-transfer phase (not in INIT, TRANS_IN_PROGRESS, or ERROR).
         (C) The KV cache transceiver has no pending receive sessions.
@@ -6564,9 +6565,11 @@ class PyExecutor:
 
         # (A) All benchmark requests have been fetched from the queue. Keep
         # going to the shared allgather even when this rank is not done so
-        # model-parallel ranks cannot diverge in collective order.
+        # model-parallel ranks cannot diverge in collective order. Shutdown
+        # admits no more requests, so a partial fill only waits for transfers.
         local_all_fetched = (self._benchmark_stage_fetched()
-                             >= self.benchmark_req_queues_size)
+                             >= self.benchmark_req_queues_size
+                             or self.is_shutdown)
         if not local_all_fetched:
             if self.dist.rank == 0:
                 logger.debug(

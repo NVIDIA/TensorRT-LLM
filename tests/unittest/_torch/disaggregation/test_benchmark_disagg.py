@@ -187,6 +187,7 @@ class MockBenchmarkExecutor:
         self.max_num_active_requests = max_num_active_requests
         self.num_fetch_requests = num_fetch_requests
         self.is_warmup = is_warmup
+        self.is_shutdown = False
         self.active_requests = active_requests if active_requests is not None else []
 
         self.dist = Mock()
@@ -1906,6 +1907,25 @@ class TestBenchmarkRequestStages:
         assert ex._benchmark_stage_index == 3
         assert not ex._benchmark_fill_phase_active
         assert not ex._benchmark_gate_rearm_pending
+
+    def test_shutdown_opens_a_partially_filled_stage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ex = self._executor(monkeypatch, "2/2,2/2")
+        ex._allgather_model_parallel_status = Mock(side_effect=lambda status: [status])
+        ex._maybe_advance_benchmark_stage(0)
+        ex.num_fetch_requests = 2
+        ex._benchmark_fill_phase_active = False
+        ex._maybe_advance_benchmark_stage(0)
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_index == 1
+        ex.num_fetch_requests += 1
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep"):
+            assert ex._check_benchmark_disagg_gate(ScheduledRequests(), True) == (False, True)
+            # Shutdown still waits for the admitted request's KV transfer.
+            ex.is_shutdown = True
+            ex.kv_cache_transceiver.check_gen_transfer_complete.return_value = False
+            assert ex._check_benchmark_disagg_gate(ScheduledRequests(), False) == (False, True)
+        ex.kv_cache_transceiver.check_gen_transfer_complete.return_value = True
+        assert ex._check_benchmark_disagg_gate(ScheduledRequests(), False) == (True, False)
 
     @pytest.mark.parametrize("blocker", ["live", "batch", "transfer", "fill"])
     def test_local_blocker_still_votes_symmetrically(
