@@ -721,6 +721,7 @@ def _fetch_stub(**overrides):
         is_shutdown=False,
         enable_iter_perf_stats=True,
         _disable_mpi=False,
+        _benchmark_sweep=False,
         iter_counter=7,
         dist=SimpleNamespace(rank=0, pp_size=1),
         disagg=SimpleNamespace(has_retiring_gen_receives=False),
