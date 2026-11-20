@@ -161,6 +161,7 @@ def tiny_dense(monkeypatch):
         )
     block._loaded = False
     block.layer_idx, block.num_kv_heads, block.head_dim = 0, 1, 2
+    block.window = dense.SUPPORTED_CONFIG["sliding_window"]
     monkeypatch.setattr(dense._attention, "check_step", lambda *args, **kwargs: None)
     return block
 
