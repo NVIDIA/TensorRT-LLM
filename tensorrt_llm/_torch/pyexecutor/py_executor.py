@@ -70,7 +70,7 @@ from ..disaggregation.kv_cache_transceiver import (
 from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
-    DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
+    DisaggTransferCoordinator, NoopDisaggCoordinator,
     is_gen_only_no_context_benchmark, transfer_window_bypass_eligible)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
@@ -137,6 +137,7 @@ from .request_utils import (RequestBroadcaster,
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, is_context_only_kv_cache,
                                request_context)
+from .response_utils import prepare_response, publish_execution_metadata
 from .runtime_hooks import ExecutorEvents, RuntimeHooks, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
@@ -6442,10 +6443,8 @@ class PyExecutor:
         if not request.is_finished:
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
-            request.decoding_iter = request.py_decoding_iter
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 if self.enable_attention_dp:
                     # Owner-local completions cannot enter a response gather.
                     self._pending_transfer_responses.append(
@@ -11785,13 +11784,6 @@ class PyExecutor:
                                              dtype=torch.long)] = True
         return True
 
-    @staticmethod
-    def _maybe_attach_ctx_usage(request: LlmRequest, response):
-        """Surface gen-first ctx usage (delivered via the KV-transfer aux
-        buffer in RxSession.unpack_aux) onto the response so the postprocessor
-        adopts the context-side prompt/cached token accounting."""
-        attach_ctx_usage(request, response)
-
     def _maybe_prepend_logprobs_and_logits(
             self,
             req,
@@ -13266,12 +13258,10 @@ class PyExecutor:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
-                has_prepended_logits = self._has_prepended_logits(req)
-                logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
-                                   if has_prepended_logits else None)
-                response = req.create_response()
-                if logits_snapshot is not None and response is not None:
-                    response.result.generation_logits = logits_snapshot
+                response = prepare_response(
+                    req, include_latest_logits=self._has_prepended_logits(req))
+                if response is None:
+                    continue
                 new_responses.append((req.py_request_id, response))
 
         if (ride_transfer_flush and self.enable_attention_dp
@@ -13311,32 +13301,15 @@ class PyExecutor:
                 f'Send first token response for request {request.py_request_id}'
             )
 
-            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
-                request) > 0 else []
-            request.decoding_iter = request.py_decoding_iter
-
-            # Snapshot first-token logits before `exclude_last_generation_logits`
-            # would hide them; only the first logits chunk is appended at this
-            # point. Same approach as in `_handle_first_token_response`.
-            logits_snapshot = None
-            if (self.should_exclude_last_generation_logits
-                    and request.py_return_generation_logits):
-                logits_snapshot = request.py_result.get_latest_logits_unexcluded(
-                )
-
-            response = request.create_response()
+            response = prepare_response(
+                request,
+                publish_metadata=True,
+                include_latest_logits=(
+                    self.should_exclude_last_generation_logits
+                    and request.py_return_generation_logits),
+            )
             if response is None:
                 continue
-            response.result.cached_tokens = request.cached_tokens
-            response.result.ctx_computed_tokens = getattr(
-                request, 'py_ctx_computed_tokens', 0)
-            response.result.ctx_first_begin = getattr(request,
-                                                      'py_ctx_first_begin', -1)
-            response.result.ctx_num_chunks = getattr(request,
-                                                     'py_ctx_num_chunks', 0)
-            self._maybe_attach_ctx_usage(request, response)
-            if logits_snapshot is not None:
-                response.result.generation_logits = logits_snapshot
             new_responses.append((request.py_request_id, response))
 
         self._enqueue_responses(new_responses)
@@ -13372,25 +13345,7 @@ class PyExecutor:
             # Response creation may finalize and copy scalar ctx GPU totals.
             self.perf_manager.compute_batch_gpu_times(
                 [request], gpu_times_cache=gpu_times_cache)
-        response = request.create_response()
-        if response:
-            response.result.cached_tokens = request.cached_tokens
-            response.result.ctx_computed_tokens = getattr(
-                request, 'py_ctx_computed_tokens', 0)
-            response.result.ctx_first_begin = getattr(request,
-                                                      'py_ctx_first_begin', -1)
-            response.result.ctx_num_chunks = getattr(request,
-                                                     'py_ctx_num_chunks', 0)
-            self._maybe_attach_ctx_usage(request, response)
-            response.result.per_pos_drafted = request.py_per_pos_drafted
-            response.result.per_pos_accepted = request.py_per_pos_accepted
-            if request.py_total_draft_tokens > 0:
-                # Backfill RequestPerfMetrics.speculative_decoding on
-                # the client side from the Python-owned counters.
-                response.result.spec_dec_totals = (
-                    request.py_total_accepted_draft_tokens,
-                    request.py_total_draft_tokens)
-        return response
+        return prepare_response(request)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
@@ -13475,8 +13430,7 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
-            request.draft_tokens = request.py_draft_tokens or []
-            request.decoding_iter = request.py_decoding_iter
+            publish_execution_metadata(request)
 
             # append_step_metrics returns immediately while metrics are off.
             if perf_metrics_enabled:

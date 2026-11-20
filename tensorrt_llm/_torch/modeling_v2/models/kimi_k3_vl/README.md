@@ -15,6 +15,20 @@
 | `kimi_k3_nvfp4__sm_107__helix8_moeep8` | sm_107 | NVFP4 | generation: Helix CP8 (TP1, no attention DP, NCCL off for the all-to-all), MoE EP8, `CUTEDSL_FC12` |
 | `kimi_k3_nvfp4__sm_107__helix8_moetp2ep4` | sm_107 | NVFP4 | generation: Helix CP8 as above, MoE TP2 x EP4, `CUTEDSL_FC12` |
 
+## Blackwell targets (sm_100)
+
+The MXFP4 checkpoint runs on sm_100 on two targets, TP16 with the experts split MoE TP4 x EP4 or MoE TP16.
+
+- The layers both targets share are family modules: `mla.py`, `moe.py`, `norm.py`, `attn_res.py`, `step.py` and the
+  weight loader `weights.py`. Each target keeps its own KDA layer and decode modules.
+- `routing.py` and the target constructors call the same checks in `engine_settings.py`, `drafter_config.py` and
+  `environment.py`.
+- Their kernels are `kernels/k3_*`, and their OpWrappers are in `ops/`. Where an SM107 target and these targets need
+  different kernels for one op, these targets' OpWrapper has the `k3_` prefix (`ops/activation/k3_situ_and_mul.py`,
+  `ops/norm/k3_rms_norm_gated_token_major.py`, `ops/norm/k3_attn_res_fwd.py`).
+- These targets read the environment switches in `environment.py`, and the engine-wide `TRTLLM_ENABLE_PDL`. The SM107
+  targets import none of these modules.
+
 ## Rubin targets (sm_107)
 
 The NVFP4 checkpoint runs on sm_107 only, on four specialized targets, each one layout of the
@@ -56,8 +70,8 @@ The recipe:
 The SM107 targets and the family code they use read no environment variable
 (`test_kimi_k3_no_env_switches.py`): what a target runs is its constants. Engine-wide decisions
 the targets follow (forced MNNVL all-reduce, the MNNVL test override) come from the engine's
-helpers (`use_mnnvl_fabric_handle`, `MNNVLAllReduce.is_mnnvl`). Only `routing.py` reads the
-deployment's environment, to decline.
+helpers (`use_mnnvl_fabric_handle`, `MNNVLAllReduce.is_mnnvl`). Of the code the SM107 targets
+use, only `routing.py` reads the deployment's environment, to decline.
 
 ### Log lines
 
