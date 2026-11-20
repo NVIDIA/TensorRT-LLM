@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the qwen3_8_flash_next_fp8__sm_10x__default target on sm_103.
+"""Whole-model gates for the qwen3_8_flash_next_fp8__sm_10x__default target.
 
 GSM8K at tp1, tep4, dep4 and dep2 disaggregated; long-context pass keys at tep4.
 """
@@ -22,7 +22,6 @@ from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     KvCacheConfig,
@@ -48,10 +47,7 @@ from ..qwen3_8_flash_next_nvfp4__sm_10x__default.test_accuracy import (
     _PASSKEY_MAX_TOKENS,
     _acceptance_length_from_requests,
     _passkey_prompts,
-)
-
-skip_not_sm103 = pytest.mark.skipif(
-    get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
+    skip_unserved_gpu,
 )
 
 # Check the step contract on the first forward; the flag has to reach the worker ranks.
@@ -108,7 +104,7 @@ def _passkey_acceptance(llm, prompts, label: str, draft_len: int) -> float:
 
 _TEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=False)
 _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
-
+_DEP2 = dict(tensor_parallel_size=2, moe_expert_parallel_size=2, enable_attention_dp=True)
 # Only tep4 runs the breakable prefill graph: routing admits it under attention TP alone.
 _MTP3_ENGINES = [
     pytest.param(_TEP4, "fp8", True, {}, id="tep4_fp8_kv_breakable"),
@@ -116,6 +112,7 @@ _MTP3_ENGINES = [
     pytest.param(
         _DEP4, "auto", False, {"TRTLLM_FORCE_COMM_METHOD": "NVLINK_ONE_SIDED"}, id="dep4_alltoall"
     ),
+    pytest.param(_DEP2, "nvfp4", False, {}, id="dep2_nvfp4_kv"),
 ]
 
 
@@ -196,7 +193,7 @@ class TestModelingV2Qwen38FlashNextFp8Sm10xDefault(LlmapiAccuracyTestHarness):
         print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
         assert_acceptance_length(key, acceptance_length)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(145000)
     @pytest.mark.parametrize("parallel, kv_dtype, breakable, env", _MTP3_ENGINES)
@@ -204,8 +201,8 @@ class TestModelingV2Qwen38FlashNextFp8Sm10xDefault(LlmapiAccuracyTestHarness):
         """Three drafts with block reuse and chunked prefill, against the FP8_BLOCK_SCALES MTP row.
 
         Block reuse needs the Gated-DeltaNet and PLE snapshots (every 256 tokens); without them the
-        runtime turns reuse off. An FP8 pool reads the FP8_BLOCK_SCALES row with an FP8 KV cache
-        and its own acceptance-length floor (`mtp3_fp8_kv`).
+        runtime turns reuse off. A quantized pool reads the FP8_BLOCK_SCALES row for its KV dtype
+        and its own acceptance-length floor (`mtp3_fp8_kv`, `mtp3_nvfp4_kv`).
         """
         if env.get("TRTLLM_FORCE_COMM_METHOD") == "NVLINK_ONE_SIDED":
             from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
@@ -250,7 +247,7 @@ class TestModelingV2Qwen38FlashNextFp8Sm10xDefault(LlmapiAccuracyTestHarness):
                 )
             self._gsm8k(mocker, llm, request.node.callspec.id, key)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(145000)
     def test_mtp3_long_context(self):
@@ -283,7 +280,7 @@ class TestModelingV2Qwen38FlashNextFp8Sm10xDefault(LlmapiAccuracyTestHarness):
             )
         assert_acceptance_length(self.ACCEPTANCE_KEY_LONG_CONTEXT, acceptance_length)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     @pytest.mark.timeout(5400)
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(145000)
@@ -343,7 +340,7 @@ class TestModelingV2Qwen38FlashNextFp8Sm10xDefault(LlmapiAccuracyTestHarness):
                 timeout=3000,
             )
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     def test_tp1_gsm8k(self, mocker):
         """One rank without speculation, against the FP8_BLOCK_SCALES row."""
         with (

@@ -799,9 +799,10 @@ unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latenc
 
 # ModelingV2 GLM-5.2: four Rubin GPUs (SM107), TP4/MTP5.
 accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp4_mtp5_gsm8k_and_acceptance
-# Qwen3.8-Flash-Next-NVFP4, modeling_v2 qwen4_exp target (sm_103 only): every accuracy test of
-# the target, the CI ones included, and those that run only here (tp1 without speculation,
-# tp1's breakable prefill graph against eager, mmmu at tep4).
+# Qwen3.8-Flash-Next-NVFP4, modeling_v2 qwen4_exp target (sm_103 and sm_107): every one-node
+# accuracy test of the target, the CI ones included, and those that run only here (tp1 without
+# speculation, tp1's breakable prefill graph against eager, mmmu at tep4, tp2, dep2 with MTP).
+# The CuteDSL and FlashInfer-ring cases skip on sm_107.
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_gsm8k
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp3_gsm8k_and_long_context
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp1_gsm8k_mmmu_and_video
@@ -810,6 +811,8 @@ accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_ac
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_breakable_prefill_matches_eager
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_disaggregated_mtp2 TIMEOUT (90)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k[tp2] TIMEOUT (60)
+accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k[dep2] TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring] TIMEOUT (60)
@@ -817,13 +820,15 @@ accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_ac
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_mmmu TIMEOUT (90)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_disaggregated_dep2 TIMEOUT (90)
 
-# Qwen3.8-Flash-Next-FP8, modeling_v2 qwen4_exp FP8 target (sm_103 only): every accuracy test of
-# the target, the CI ones included.
+# Qwen3.8-Flash-Next-FP8, modeling_v2 qwen4_exp FP8 target (sm_103 and sm_107): every accuracy
+# test of the target, the CI ones included, and its collective matrices (four GPUs).
+unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/comm/test_fp8_unified_op_matrices.py
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_tp1_gsm8k TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_long_context TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[dep4] TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[dep4_alltoall] TIMEOUT (60)
+accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[dep2_nvfp4_kv] TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_disaggregated_dep2 TIMEOUT (90)
 
 # Dense FP4 MLA accuracy

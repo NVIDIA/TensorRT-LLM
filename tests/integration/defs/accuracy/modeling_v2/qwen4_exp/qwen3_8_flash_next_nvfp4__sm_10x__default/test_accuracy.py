@@ -14,9 +14,9 @@
 # limitations under the License.
 """Whole-model gates for the qwen4_exp modeling_v2 target qwen3_8_flash_next_nvfp4__sm_10x__default.
 
-``TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault``: Qwen3.8-Flash-Next-NVFP4 on sm_103 at every
-layout the target serves: one rank (tp1, the ``test_tp1_*`` cases), four (tp4, tep4, dep4) and
-two (dep2).
+``TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault``: Qwen3.8-Flash-Next-NVFP4 on the GPUs the
+family serves (``archs.SERVED``): one rank (tp1, the ``test_tp1_*`` cases), two (tp2, dep2),
+four (tp4, tep4, dep4) and eight over two nodes (dep8).
 
 Each test runs one engine (two for the breakable-graph comparison) and checks every feature
 that engine carries, so a feature is covered without a test of its own. Every test passes
@@ -36,12 +36,13 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     modeling as target_modeling,
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm._utils import get_sm_version, is_flashinfer_gdn_decode_supported_arch
+from tensorrt_llm.executor.utils import RequestError, get_spawn_proxy_process_env
 from tensorrt_llm.inputs import VideoData
 from tensorrt_llm.inputs.utils import (
     ConversationMessage,
@@ -70,9 +71,21 @@ from ....accuracy_core import (
 from ....test_disaggregated_serving import launch_disaggregated_llm, run_accuracy_test
 from ..._env import scoped_env_overrides
 
-# The target is certified on sm_103 only.
-skip_not_sm103 = pytest.mark.skipif(
-    get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
+_GPU = divmod(get_sm_version(), 10)
+
+skip_unserved_gpu = pytest.mark.skipif(
+    not archs.served(_GPU), reason=f"the qwen4_exp targets serve {archs.served_names()}"
+)
+skip_without_cute_dsl_moe = pytest.mark.skipif(
+    not archs.fast_path("cute_dsl_moe", _GPU), reason="the CuTe DSL MoE does not run on this GPU"
+)
+skip_without_flashinfer_ring = pytest.mark.skipif(
+    not is_flashinfer_gdn_decode_supported_arch(),
+    reason="FlashInfer ships no GDN decode / verify kernels for this GPU",
+)
+# A world across nodes is launched from outside (`trtllm-llmapi-launch` under an MPI launcher).
+skip_not_in_a_world_across_nodes = pytest.mark.skipif(
+    not get_spawn_proxy_process_env(), reason="runs inside an MPI world launched over two nodes"
 )
 
 # Check the target's step contract on the first forward, against metadata the
@@ -406,8 +419,45 @@ _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
-    pytest.param(_TEP4, "fp8", dict(flashinfer_ring=True), id="tep4_fp8_kv_flashinfer_ring"),
+    pytest.param(
+        _TEP4,
+        "fp8",
+        dict(flashinfer_ring=True),
+        id="tep4_fp8_kv_flashinfer_ring",
+        marks=skip_without_flashinfer_ring,
+    ),
     pytest.param(_TEP4, "nvfp4", dict(paged_context=False), id="tep4_nvfp4_kv_no_reuse"),
+]
+
+
+# tp2 (attention TP2, every expert split by intermediate), dep2 (attention DP, experts EP2) and
+# dep8 (attention DP over two nodes of four GPUs).
+_MTP3_LAYOUTS = [
+    pytest.param(
+        dict(
+            tensor_parallel_size=2,
+            moe_tensor_parallel_size=2,
+            moe_expert_parallel_size=1,
+            enable_attention_dp=False,
+        ),
+        id="tp2",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        dict(tensor_parallel_size=2, moe_expert_parallel_size=2, enable_attention_dp=True),
+        id="dep2",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        dict(
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=True,
+            gpus_per_node=4,
+        ),
+        id="dep8",
+        marks=[skip_not_in_a_world_across_nodes, pytest.mark.skip_less_mpi_world_size(8)],
+    ),
 ]
 
 
@@ -640,7 +690,12 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 env_overrides=rank_env,
             ) as llm,
         ):
-            assert _target_core(llm).mtp_index_share == index_share
+            core = _target_core(llm)
+            assert core.mtp_index_share == index_share
+            if engine["kv_cache_config"].dtype == "nvfp4":
+                assert core.quant_mode == target_modeling.QM_NVFP4_KV_CACHE, (
+                    "the engine did not keep the NVFP4 KV pool the case asks for"
+                )
             if mocker is not None:
                 mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
                 GSM8K(self.MODEL_NAME).evaluate(
@@ -682,7 +737,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
         return acceptance_length
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     @pytest.mark.skip_less_device(4)
     def test_mtp3_gsm8k_and_long_context(self, mocker):
         """tep4 with three drafts and IndexShare: gsm8k, then pass keys over 3k-6k tokens.
@@ -716,7 +771,26 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             acceptance_length = self._passkey_acceptance(llm, prompts, "tep4 mtp3 long context")
         assert_acceptance_length(self.ACCEPTANCE_KEY_LONG_CONTEXT, acceptance_length)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
+    @pytest.mark.parametrize("parallel", _MTP3_LAYOUTS)
+    def test_mtp3_gsm8k(self, mocker, request, parallel):
+        """gsm8k with three drafts over bf16 KV: the tep4 case's engine at tp2, dep2 and dep8."""
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                enable_iter_perf_stats=True,
+                **self.ENGINE_MTP,
+                **parallel,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            label = f"{request.node.callspec.id} mtp3 gsm8k"
+            self._gsm8k(mocker, llm, label, self.ACCEPTANCE_KEY_MTP3)
+
+    @skip_unserved_gpu
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("parallel, kv_dtype, variant", _QUANTIZED_KV)
     def test_mtp3_gsm8k_quantized_kv(self, mocker, parallel, kv_dtype, variant):
@@ -761,7 +835,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 llm, _PASSKEY_LENGTHS, 3, f"{key}_long_context", f"mtp3 {kv_dtype} kv long context"
             )
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     @pytest.mark.skip_less_device(4)
     def test_mtp3_mmmu(self):
         """MMMU at tep4 with three drafts, against the MTP row of references/mmmu.yaml.
@@ -781,7 +855,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         ):
             _mmmu(llm, self.MODEL_NAME)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     @pytest.mark.timeout(5400)
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(145000)
@@ -846,7 +920,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 timeout=3000,
             )
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     def test_tp1_gsm8k(self, mocker):
         """The text model without speculation, against the gsm8k anchor."""
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
@@ -863,7 +937,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     def test_tp1_mtp1_gsm8k_mmmu_and_video(self, mocker):
         """gsm8k with its acceptance-length floor, MMMU and synthetic videos on one MTP engine.
 
@@ -895,7 +969,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             _mmmu(llm, self.MODEL_NAME)
             self._video_checks(llm)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
+    @skip_without_cute_dsl_moe
     def test_tp1_mtp3_cutedsl_fp8_kv_bf16_state(self, mocker):
         """gsm8k and 3k-6k-token pass keys with three drafts over the opt-in choices.
 
@@ -936,7 +1011,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 "tp1 mtp3 opt-in long context",
             )
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     def test_tp1_mtp3_gsm8k_and_long_context(self, mocker, monkeypatch):
         """gsm8k, then 3k-6k-token pass keys, with three drafts and IndexShare on one engine.
 
@@ -960,7 +1035,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             mocker=mocker,
         )
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     def test_tp1_breakable_prefill_matches_eager(self, monkeypatch):
         """Greedy continuations of the same prompts, with the breakable prefill graph and without.
 
@@ -1058,7 +1133,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             assert not wrong, f"wrong or missing answers: {wrong}"
         assert long_tokens[:4] == eager_long_tokens[:4], (long_tokens, eager_long_tokens)
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     def test_tp1_mtp7_long_context_passkey(self, monkeypatch):
         """Pass key retrieval over 3k-12k-token prompts with seven drafts and IndexShare.
 
@@ -1098,7 +1173,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         "TRTLLM_MODELING_V2_MTP_DENSE_FP8": "1",
     }
 
-    @skip_not_sm103
+    @skip_unserved_gpu
     @pytest.mark.timeout(5400)
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(145000)

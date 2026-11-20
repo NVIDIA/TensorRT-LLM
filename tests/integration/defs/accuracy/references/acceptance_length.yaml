@@ -328,6 +328,10 @@ ModelingV2Qwen38FlashNextFp8Sm10xDefault::mtp3:
 ModelingV2Qwen38FlashNextFp8Sm10xDefault::mtp3_fp8_kv:
   ref_al: 3.274
   min_al: 3.110
+# test_mtp3_gsm8k[dep2_nvfp4_kv], over gsm8k: an NVFP4 KV pool under attention DP; dep2 read 3.281.
+ModelingV2Qwen38FlashNextFp8Sm10xDefault::mtp3_nvfp4_kv:
+  ref_al: 3.281
+  min_al: 3.117
 # test_mtp3_long_context, over the 3k-6k-token pass keys at tep4 (the sparse attention path):
 # IndexShare on, bf16 KV. Every draft of a pass-key answer is accepted.
 ModelingV2Qwen38FlashNextFp8Sm10xDefault::mtp3_long_context:

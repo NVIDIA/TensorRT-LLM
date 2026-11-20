@@ -38,20 +38,14 @@ assert torch.cuda.is_available(), "qsa_prefill_compress requires a CUDA device"
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor, flips: int = 0) -> None:
-    """Bitwise over the whole cache, except for `flips` elements one bf16 step off.
+    """Bitwise over the whole cache, except for at most `flips` elements one bf16 step off.
 
-    Measured on sm_103: the kernel matches this fp32 reference on every element of every
-    cell but one, so there is no tolerance to derive. It has to be bitwise -- a pool
-    accumulated in bf16 instead of fp32 lands only 0.03125 away, inside any bf16 band.
-    Comparing every slot, not just the anchors, is the untouched-slot lock.
-
-    The exception is the cell of 32 MTP7 verify blocks (64 anchors, `rounding_flips`): the
-    kernel takes `tl.rsqrt`, the hardware approximation, where the reference takes torch's,
-    and the two differ by an fp32 ulp, which moves the bf16 rounding of an element whose fp32
-    value sits on a rounding boundary. One element of its 8192 anchor elements is one bf16
-    step off. The 8192-row tep4 prefill cell has five of 262016, each an exact bf16 tie in
-    the reference's fp32 value; the nearest wrong variant measured there (sequential bf16
-    pooling) moves 94580.
+    The kernel's fp32 norm can be an fp32 ulp from torch's, which flips the bf16 rounding of
+    an element sitting exactly on a tie; a cell's `rounding_flips` is how many it may flip.
+    It has to be bitwise otherwise: a pool accumulated in bf16 instead of fp32 lands only
+    0.03125 away, and the nearest wrong variant (sequential bf16 pooling) moves 94580 elements
+    of the 8192-row prefill cell. Comparing every slot, not just the anchors, is the
+    untouched-slot lock.
     """
     assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)

@@ -250,6 +250,12 @@ def _flashinfer_path(spec) -> str:
     return "cp" if cp else "chunked"
 
 
+def _certified_path(spec) -> str:
+    """`fi_path` was recorded on sm_103; FlashInfer picks the pipeline by SM count elsewhere."""
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    return spec["fi_path"] if on_sm103 else _flashinfer_path(spec)
+
+
 def _chunk_build(spec, seed):
     """`(args, engine)`: inputs in a GDN post-conv step's domain (unit-norm q/k, g < 0 in log
     space, beta a sigmoid), and the `_EnginePool` behind the pool or None."""
@@ -359,7 +365,7 @@ def _check_flashinfer_chunk_gated_delta_rule(cell) -> None:
         got_pool = pool if engine is None else engine.touched()
         _chunk_compare((o, final_state, got_pool), ref)
         if "fi_path" in cell.spec:
-            assert path == cell.spec["fi_path"], (path, fallback)
+            assert path == _certified_path(cell.spec), (path, fallback)
         if output is not None:
             assert o.data_ptr() == output.data_ptr(), "output= must be written in place"
         if tail_before is not None:
@@ -937,7 +943,8 @@ def _variant_ht_verify(n) -> None:
     assert _m._gdn_verify_folds_norm(core, n, t)
     conv_fold = _m._gdn_verify_folds_conv(core, n)
     pdl, mapping = _m._gdn_replay_launch(core, n)
-    assert (pdl, mapping) != (False, None), "every HT bucket changes the launch"
+    tuned = torch.cuda.get_device_capability() in _m._GDN_REPLAY_HT_GPUS
+    assert ((pdl, mapping) != (False, None)) is tuned, "the HT table applies on its GPUs only"
     spec = dict(
         state_dtype=torch.bfloat16, H=h, HV=hv, path="all_layer", n=n, t=t, layers=1, slots=n + 8
     )

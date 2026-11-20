@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as mtp_cublas_mm
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_gated_residual import (
     qwen4_exp_gated_residual,
 )
@@ -42,8 +43,8 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="the fused hyper-connection entries are certified on sm_103",
+    not torch.cuda.is_available() or not archs.served(torch.cuda.get_device_capability()),
+    reason="the fused hyper-connection entries run on the GPUs the family serves",
 )
 
 DEV = "cuda"

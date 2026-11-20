@@ -15,7 +15,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import ple_host_table, routing
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs, ple_host_table, routing
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default import (  # noqa: E501
     modeling as M,
 )
@@ -55,6 +55,11 @@ MEMBERS = {
     "tep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4),
     "dep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=True),
 }
+
+# Eight ranks over two nodes of four GPUs at attention DP.
+_DEP8 = dict(
+    world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8, enable_attention_dp=True, gpus_per_node=4
+)
 
 _RANKS = [(m, r) for m, layout in MEMBERS.items() for r in range(layout["world_size"])]
 #: The last rank of one member per attention layout: one rank, TP2, TP4, attention DP.
@@ -222,7 +227,7 @@ def test_each_member_is_admitted_as_the_llm_api_spells_it(on_sm103, member, para
     inferred from one visible GPU, a multi-rank world would span nodes, which `layout` declines."""
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     mapping = _llm_args(gpus_per_node=4, **parallel).parallel_config.to_mapping()
-    assert routing.layout(mapping, routing._FP8_LAYOUTS) == member
+    assert routing.layout(mapping) == member
     _admitted(_routed_config(member))
 
 
@@ -265,10 +270,21 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("gpu", sorted(archs.SERVED))
+def test_every_layout_is_admitted_on_every_served_gpu(on_sm103, monkeypatch, gpu):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: gpu)
+    for member in MEMBERS:
+        _admitted(_routed_config(member))
+    for spec_config in (None, _MTP3):
+        config = _routed_config(spec_config=spec_config, **_DEP8)
+        assert routing.layout(config.mapping) == "dep8"
+        _admitted(config, kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="bfloat16"))
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config_kwargs, llm_args_kwargs, match",
     [
-        (dict(member="dep2", spec_config=_MTP3), {}, r"attention DP \(dep2\)"),
         (dict(member="dep4"), dict(prefill_cuda_graph_backend="breakable"), "breakable"),
         (dict(member="tep4"), dict(prefill_cuda_graph_backend="piecewise"), "piecewise"),
         (
@@ -300,10 +316,14 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
             {},
             "draft length",
         ),
-        (dict(world_size=2, tp_size=1, pp_size=2), {}, "tp2 or tep2"),
-        (dict(MEMBERS["tep4"], gpus_per_node=2), {}, "tp2 or tep2"),
-        (dict(MEMBERS["dep4"], enable_lm_head_tp_in_adp=True), {}, "tp2 or tep2"),
-        (dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8), {}, "tp2 or tep2"),
+        (dict(world_size=2, tp_size=1, pp_size=2), {}, "the qwen4_exp targets serve"),
+        (dict(MEMBERS["tep4"], gpus_per_node=2), {}, "the qwen4_exp targets serve"),
+        (dict(MEMBERS["dep4"], enable_lm_head_tp_in_adp=True), {}, "the qwen4_exp targets serve"),
+        (
+            dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8),
+            {},
+            "the qwen4_exp targets serve",
+        ),
         (
             dict(member="tep4", pretrained_config=_qwen4_exp_config(dict(num_hidden_layers=60))),
             {},
@@ -359,7 +379,6 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
         ),
     ],
     ids=[
-        "dep2-mtp",
         "dep4-breakable",
         "piecewise",
         "fp32-state",
@@ -580,7 +599,7 @@ def _core(member: str, rank: int, spec_config=None, **config):
     )
     # The core asserts the device it runs on; the weights it declares stay on meta.
     with (
-        mock.patch.object(torch.cuda, "get_device_capability", return_value=M._SM),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=archs.SM_103),
         torch.device("meta"),
     ):
         return M.Qwen4ExpDefaultModelingV2(model_config, composite)
@@ -709,8 +728,8 @@ def test_the_fused_decode_sum_runs_at_auto_with_fp32_accumulation(
         assert (state.workspace, state.rank, state.nranks) == ("ipc", 0, 4)
 
 
-#: Every rank; MTP with 7 drafts at a member's last rank, 1 elsewhere, and none at dep2.
-_CORE_CASES = [(m, r, None if m == "dep2" else 7 if r == _world(m) - 1 else 1) for m, r in _RANKS]
+#: Every rank; MTP with 7 drafts at a member's last rank, 1 elsewhere.
+_CORE_CASES = [(m, r, 7 if r == _world(m) - 1 else 1) for m, r in _RANKS]
 
 
 @pytest.mark.cpu_only

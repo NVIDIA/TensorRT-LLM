@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Collected entry point for the FP8 target's collective matrices: each `_<entry>_op_matrix.py`
 beside this file is its own launcher, which `_rank_job` runs in a fresh interpreter on `world`
-sm_103 GPUs of one node.
+GPUs of one node that the family serves (`models/qwen4_exp/archs.py`).
 
 Pre-merge CI runs this directory in the GB300 multi-GPU stage (`l0_gb300.yml`), which it
 schedules only when a file listed in `getMultiGpuFileChanged` (`jenkins/L0_MergeRequest.groovy`)
@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 import torch
+
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 
 __extra_import_path__ = ["../../../../comm"]
 import _rank_job  # noqa: E402 — needs the path declared above
@@ -32,20 +34,20 @@ _WORLDS = {
 _CASES = [(entry, world) for entry, worlds in _WORLDS.items() for world in worlds]
 
 
-def _sm103_devices(world: int) -> int:
-    """How many of the devices a `world`-rank job would claim are sm_103."""
+def _served_devices(world: int) -> int:
+    """How many of the devices a `world`-rank job would claim are GPUs the family serves."""
     if not torch.cuda.is_available():
         return 0
     claimed = range(min(torch.cuda.device_count(), world))
-    return sum(torch.cuda.get_device_capability(i) == (10, 3) for i in claimed)
+    return sum(archs.served(torch.cuda.get_device_capability(i)) for i in claimed)
 
 
 # Each case spawns its own ranks over the visible devices, so xdist workers would share GPUs.
 @pytest.mark.no_xdist
 @pytest.mark.parametrize("entry, world", _CASES, ids=[f"{e}-world{w}" for e, w in _CASES])
 def test_op_matrix(entry: str, world: int) -> None:
-    if _sm103_devices(world) < world:
-        pytest.skip(f"the {entry} matrix at world {world} runs on {world} sm_103 GPUs in one node")
+    if _served_devices(world) < world:
+        pytest.skip(f"the {entry} matrix at world {world} runs on {world} served GPUs of one node")
     if entry == "moe_a2a__dp_dispatch_combine":
         from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 
