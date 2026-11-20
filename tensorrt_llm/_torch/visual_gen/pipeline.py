@@ -173,6 +173,19 @@ class BasePipeline(nn.Module):
 
         self._install_nccl_window_tensor_scope_hooks()
 
+        cfg = self.pipeline_config
+        if (
+            cfg.cuda_graph.enable
+            and cfg.cache_backend == "cache_dit"
+            and not self.supports_blockwise_cuda_graphs
+        ):
+            logger.warning(
+                f"{type(self).__name__} has no per-block CUDA graphs: with Cache-DiT, its "
+                "whole-forward CUDA graph freezes one cache decision, so no block is cached, "
+                "and max_warmup_steps <= 2 can fail graph capture. Disable "
+                "cuda_graph_config.enable to use Cache-DiT with this pipeline."
+            )
+
         # CUDA graph runner - wrap transformer.forward
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.

@@ -338,6 +338,57 @@ def test_clear_releases_graph_buffers(model):
     assert all(len(runner.graphs) == 1 for runner in runners.values())
 
 
+@torch.inference_mode()
+def test_cache_dit_caches_through_block_graphs():
+    """Real Cache-DiT caches the same steps with block graphs as without, bit for bit.
+
+    Steps 1-2 and 4-5 change hidden_states slightly, so Cache-DiT reuses the middle block's
+    residual and feeds the sum to the last block's graph; step 3 has new inputs.
+    """
+    import cache_dit
+
+    torch.manual_seed(0)
+    model = _TwoBlockModel()
+    model.blocks.append(_RopeLikeBlock())
+    model = model.cuda().eval()
+    graph_model = deepcopy(model)
+    noise = torch.randn(2, 16, _DIM, device="cuda")
+    calls = [
+        dict(call, hidden_states=call["hidden_states"] + 1e-3 * step * noise)
+        for step, call in enumerate([_inputs(1)] * 3 + [_inputs(2)] * 3)
+    ]
+
+    def run(model):
+        adapter = cache_dit.BlockAdapter(
+            transformer=model,
+            blocks=model.blocks,
+            forward_pattern=cache_dit.ForwardPattern.Pattern_1,
+        )
+        config = cache_dit.DBCacheConfig(
+            Fn_compute_blocks=1,
+            Bn_compute_blocks=1,
+            max_warmup_steps=1,
+            residual_diff_threshold=0.08,
+        )
+        cached = cache_dit.enable_cache(adapter, cache_config=config)
+        try:
+            cache_dit.refresh_context(model, num_inference_steps=len(calls))
+            outputs = [tuple(t.clone() for t in model(**call)) for call in calls]
+            stats = cache_dit.summary(model, details=False)
+        finally:
+            cache_dit.disable_cache(cached)
+        return outputs, [(s.cached_steps, s.residual_diffs) for s in stats]
+
+    expected, expected_stats = run(model)
+    runners = wrap_blocks_with_cuda_graphs(graph_model, ["blocks"])
+    outputs, stats = run(graph_model)
+
+    assert expected_stats[0][0] == [1, 2, 4, 5]
+    assert stats == expected_stats
+    _assert_same(outputs, expected)
+    assert all(len(runner.graphs) == 1 for runner in runners.values())
+
+
 _FLUX1_TINY_CONFIG = {
     "attention_head_dim": 128,
     "guidance_embeds": True,
