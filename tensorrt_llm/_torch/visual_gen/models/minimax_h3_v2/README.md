@@ -34,39 +34,70 @@ Wire a specialization during construction. For example, [FastH3](fasth3/pipeline
 
 ## Where to put code
 
+Choose the **role** from the behavior you are changing and the **owner** from the callers that need it. A target and its model family can each own components, ops and kernels. The VisualGen V2 catalog exposes reusable ops. A catalog op can own a private implementation or call an existing provider kernel.
+
 ### Choose the implementation layer
 
-Place a change according to the decision it makes. Then choose its [sharing scope](#choose-the-sharing-scope).
+| Role | What belongs here |
+| --- | --- |
+| Pipeline | How a request moves through conditioning, denoising steps and decoding. The [family pipeline](pipeline.py) runs the joint audio/video loop. |
+| Component | A model block that composes ops and owns weights or execution state when needed. [H3 attention](components/attention.py) owns the projections and decides when to fuse Q/K normalization and RoPE. |
+| Operation | One tensor computation or collective with explicit inputs, outputs and observable mutations. Its reference specifies the expected result. The caller supplies any runner or workspace. |
+| Kernel | The device implementation of an op, including launch geometry, tiling, memory access and fusion. An op can dispatch to one or more kernels or an existing library primitive. |
 
-| Layer | Decision it owns | H3 example |
+```text
+Owner           Component             Op                       Kernel
+--------------  --------------------  -----------------------  ------------------
+Base H3 target  TP text encoder  -->  text Q/K norm + RoPE --> Gluon text kernel
+H3 family       DiT attention    -->  DiT Q/K norm + RoPE  --> Triton DiT kernel
+```
+
+Changing which channels the DiT rotates changes the [family op](ops/rope.py) and its reference tests. Changing the tile size for the same result belongs in the [kernel](kernels/fused_rope.py). The TP text encoder has its [own op](default_pipeline/ops/text_qk_norm_rope.py) and [kernel](default_pipeline/kernels/text_qk_norm_rope.py) for one-dimensional text positions.
+
+### Choose the sharing scope
+
+| Owner | When to use it | Example |
 | --- | --- | --- |
-| Pipeline | How a request moves through conditioning, denoising and decoding, including which components run at each step. | The [family pipeline](pipeline.py) advances the joint audio/video denoising loop. The [FastH3 target](fasth3/pipeline.py) supplies its trained schedule. |
-| Component | How a model block computes its output. It composes operations and holds the parameters or other instance state that block needs. | [H3 attention](components/attention.py) owns its projections and normalization weights and chooses when to apply fused Q/K norm and RoPE. |
-| Operation | The inputs, outputs and observable buffer mutations of one tensor computation or collective. The caller supplies any runner, workspace or other execution state. | The [Q/K norm and RoPE op](ops/rope.py) takes packed QKV, norm weights and rotation tables. Its PyTorch reference defines the expected Q and K. |
-| Kernel | How the device executes the operation, including fusion, tiling, memory access and launch configuration. | The [fused Triton kernel](kernels/fused_rope.py) loads the Q/K head data, computes RMS normalization and rotates the leading channels in one launch. |
+| Target (`models/<family>/<target>/`) | The [router](pipeline_registry.py) selects this implementation for a checkpoint or deployment. Keep code specific to that target in its directory. | Base H3's TP text encoder or FastH3's trained schedule. |
+| Model family (`models/<family>/`) | The family owns H3 routing and common model behavior. Put code shared by sibling targets here so each can import it independently. | Joint token packing, DiT blocks and gated VSA attention. |
+| [VisualGen V2 catalog](../../catalog/) (`catalog/<category>/`) | Another V2 family could call the same op with the same tensor semantics, reference and supported configurations. The first V2 consumer may introduce it. V1 callers keep their existing backend paths. | Fine attention over explicit KV tile indices, counts and valid lengths. |
+| Existing runtime or library | Call its existing interface directly when the contract fits. | H3 [projections](components/linear.py) use the LLM V2 GEMM ops and [normalization](components/norm.py) uses `flashinfer_rmsnorm`. |
 
-Changing the fused RoPE tile size belongs in `kernels/`. Changing which channels rotate changes the contract in `ops/` and its reference tests.
+```text
+FastH3 with CUTEDSL VSA
+  FastH3Pipeline                             [target]
+    | selects the trunk attention class
+    v
+  MiniMaxH3VSAAttention                      [family component]
+    | supplies Q/K/V, the learned gate and H3 metadata
+    v
+  h3_vsa_attention                           [family op]
+    | passes Q/K/V, tile indices, counts and valid lengths to the fine step
+    v
+  block_sparse_attention                     [VisualGen V2 catalog op]
+    | calls the CuTe kernel entry to compute fine attention and logsumexp
+    v
+  block_sparse_attn_from_indices_cute
+```
+
+Change H3's tile selection or coarse/fine merge in the [family VSA op](ops/vsa.py). Change the computation over an already selected tile list in the [catalog op](../../catalog/attention/block_sparse_attention.py). A new model supplies its own selection policy.
 
 ### Where parallel behavior belongs
 
 | Change | Where to start |
 | --- | --- |
-| Change which projection channels each TP rank owns, or when its partial results are summed | [Linear](components/linear.py) owns the projection shard bounds, quantization alignment and row-parallel output reduction. [MLP](components/mlp.py) uses the same bounds for gate/up and down. [Attention](components/attention.py) assigns complete Ulysses head groups to each TP rank. |
-| Change how projection, communication and attention overlap | [Ulysses attention](components/ulysses_attention.py) runs both paths. The synchronous path exchanges projected Q/K/V. The asynchronous path starts each transfer after its V, Q or K projection and waits before local attention. Both exchange the output back to sequence shards. |
-| Change which Q/K/V rows or heads a rank receives, or the layout of its receive buffers | The [H3 QKV ops](ops/ulysses_qkv.py) specify the exchange and local buffer rearrangement. Each has a tensor reference independent of the attention schedule. |
+| Change which projection channels a TP rank owns or when it sums partial results | [Linear](components/linear.py) owns projection shard bounds, quantization alignment and row-parallel output reduction. [MLP](components/mlp.py) uses the same bounds for gate/up and down. [Attention](components/attention.py) assigns complete Ulysses head groups to each TP rank. |
+| Change when transfers run relative to Q/K/V projections and local attention | The [Ulysses component](components/ulysses_attention.py) holds the process group and coordinates both execution paths. |
+| Change which rows or heads a rank receives, or how its receive buffers are laid out | The [H3 QKV ops](ops/ulysses_qkv.py) specify the exchange and local rearrangement. Each has an independent tensor reference. |
+
+```text
+Base H3 / H3UlyssesAttention
+  sync   exchange projected Q/K/V -------------------+
+                                                     +-> local attention -> output all-to-all
+  async  project/push V, Q, K -> wait -> unscatter --+
+```
 
 The [sequence sharder](components/sequence_sharder.py) pads, shards and gathers DiT and refiner rows. The [tiled VAE](components/tiled_vae.py) distributes video decode tiles. Base H3 uses these parallel paths. FastH3 runs on one GPU. The V1 [token-sharded TP layout](../../parallel/token_sharded_tp.py) is a separate feature used by Wan.
-
-### Choose the sharing scope
-
-Keep a target independent of its siblings. When two targets need the same implementation, put it in the family and import it from both. The VisualGen V2 catalog can accept an operation from its first consumer when another family could use the same tensor contract, reference and supported configurations unchanged. V1 callers keep their existing backend paths.
-
-| Scope of the change | Place it here | Example |
-| --- | --- | --- |
-| One checkpoint target | The target directory | Base H3's text-only TP encoder, or FastH3's trained schedule |
-| Model-specific computation shared by sibling targets | The family directory | Joint audio/video token packing, DiT blocks and gated VSA attention |
-| A reusable model-independent computation | The [VisualGen V2 catalog](../../catalog/) | Attention over explicit valid KV lengths or preselected KV tiles |
-| An existing operation or runtime interface with the required contract | Import it from its owner | H3 [projections](components/linear.py) use the LLM V2 `cublas_mm` and `nvfp4_gemm` ops, and [normalization](components/norm.py) uses `flashinfer_rmsnorm`. |
 
 ### How large is a catalog operation?
 
