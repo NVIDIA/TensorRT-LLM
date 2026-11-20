@@ -2073,6 +2073,18 @@ def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
 
 
         TACTICS = build_tactics()
+
+        # Tables and classes completed after they are bound.
+        LAUNCH = {100: (2048, 4)}
+        LAUNCH[103] = LAUNCH[100]
+        LAUNCH.update({90: (512, 2)})
+
+
+        class Config:
+            tile = 1
+
+
+        Config.tile = 2
         """)
     runners = fp_modules.load(
         "fp_runners", """
@@ -2117,18 +2129,35 @@ def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
             def get_valid_tactics(self, inputs, profile, **kwargs):
                 from fp_util import OVERRIDE
                 return [OVERRIDE or 0]
+
+
+        class UsesCompletedTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.LAUNCH[103]]
+
+
+        class UsesPatchedClass(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.Config.tile]
         """)
     classes = (runners.UsesDerivedConstant, runners.UsesTable,
                runners.UsesClassAttribute, runners.UsesDefaultArgument,
                runners.UsesBuiltTable, runners.UsesNoneConstant,
-               runners.ImportsNoneConstant)
+               runners.ImportsNoneConstant, runners.UsesCompletedTable,
+               runners.UsesPatchedClass)
 
     # Each edit, and which of the runners above it must re-key.
     edits = [
-        (("BLOCK = 128", "BLOCK = 1024"), [1, 0, 1, 1, 0, 0, 0]),
-        (('{"small": 1}', '{"small": 1, "large": 2}'), [0, 1, 0, 0, 0, 0, 0]),
-        (("return [0]", "return [0, 1]"), [0, 0, 0, 0, 1, 0, 0]),
-        (("OVERRIDE = None", "OVERRIDE = 1024"), [0, 0, 0, 0, 0, 1, 1]),
+        (("BLOCK = 128", "BLOCK = 1024"), [1, 0, 1, 1, 0, 0, 0, 0, 0]),
+        (('{"small": 1}', '{"small": 1, "large": 2}'),
+         [0, 1, 0, 0, 0, 0, 0, 0, 0]),
+        (("return [0]", "return [0, 1]"), [0, 0, 0, 0, 1, 0, 0, 0, 0]),
+        (("OVERRIDE = None", "OVERRIDE = 1024"), [0, 0, 0, 0, 0, 1, 1, 0, 0]),
+        # The repository's _SILU_AND_MUL_2IN_LAUNCH_PARAMS is completed so.
+        (("LAUNCH[103] = LAUNCH[100]", "LAUNCH[103] = (1024, 8)"),
+         [0, 0, 0, 0, 0, 0, 0, 1, 0]),
+        (("{90: (512, 2)}", "{90: (512, 32)}"), [0, 0, 0, 0, 0, 0, 0, 1, 0]),
+        (("Config.tile = 2", "Config.tile = 32"), [0, 0, 0, 0, 0, 0, 0, 0, 1]),
     ]
     before = fp_modules.fingerprints(*classes)
     for (old, new), expected in edits:

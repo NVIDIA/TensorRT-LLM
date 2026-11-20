@@ -397,6 +397,10 @@ class _SourceIndex(NamedTuple):
     loads: Dict[str, Tuple[str, ...]]
     # name -> (level, module, attr) of each module-level `from` import.
     imports: Dict[str, Tuple[int, str, str]]
+    # name -> (digest, loads) of the statements that change, rather than
+    # bind, the value of a name when the file runs: `TABLE[k] = v`,
+    # `Cls.attr = v`, `X += v`, `del TABLE[k]`, `TABLE.update(...)`.
+    mutations: Dict[str, Tuple[str, Tuple[str, ...]]]
 
 
 class _Alias(NamedTuple):
@@ -450,6 +454,31 @@ def _evaluated_at_definition(node) -> List[ast.AST]:
     ]
 
 
+def _root_name(node) -> Optional[str]:
+    """The name a chain of attributes and subscripts starts from, or None."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _mutated_names(node) -> List[str]:
+    """The names a statement changes the value of without binding them."""
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = node.targets if isinstance(node,
+                                             ast.Assign) else [node.target]
+        targets = [t for t in targets if not isinstance(t, ast.Name)]
+    elif isinstance(node, ast.AugAssign):
+        targets = [node.target]
+    elif isinstance(node, ast.Delete):
+        targets = node.targets
+    elif (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+          and isinstance(node.value.func, ast.Attribute)):
+        targets = [node.value.func.value]  # TABLE.update(...)
+    else:
+        return []
+    return [n for n in map(_root_name, targets) if n is not None]
+
+
 def _source_index(path: str) -> _SourceIndex:
     """The index of a file, rebuilt whenever its size or mtime changes."""
     st = os.stat(path)
@@ -464,6 +493,7 @@ def _source_index(path: str) -> _SourceIndex:
     eager: Dict[str, List[str]] = {}
     loads: Dict[str, List[str]] = {}
     imports: Dict[str, Tuple[int, str, str]] = {}
+    mutations: Dict[str, List[ast.AST]] = {}
 
     def add(name, node, eager_nodes, load_nodes):
         start = min([node.lineno] +
@@ -492,6 +522,8 @@ def _source_index(path: str) -> _SourceIndex:
                 add(name, child, _evaluated_at_definition(child), [child])
                 visit(child, name + ".<locals>.")
             else:
+                for mutated in _mutated_names(child):
+                    mutations.setdefault(prefix + mutated, []).append(child)
                 if isinstance(child, (ast.Assign, ast.AnnAssign)):
                     targets = (child.targets if isinstance(child, ast.Assign)
                                else [child.target])
@@ -516,7 +548,11 @@ def _source_index(path: str) -> _SourceIndex:
     }, {
         k: tuple(dict.fromkeys(v))
         for k, v in loads.items()
-    }, imports)
+    }, imports, {
+        k: (_digest("".join("".join(lines[n.lineno - 1:n.end_lineno])
+                            for n in v)), tuple(_dotted_loads(v)))
+        for k, v in mutations.items()
+    })
     _SOURCE_INDEXES[path] = index
     return index
 
@@ -1075,6 +1111,8 @@ class _FingerprintWalk:
             return
         self.sources[f"{module}:{obj.__qualname__}"] = _definition_digest(
             obj, index)
+        if module in sys.modules:
+            self.add_mutations(module, obj.__qualname__, index)
         globals_ = (obj.__globals__ if inspect.isfunction(obj) else getattr(
             sys.modules.get(module), "__dict__", {}))
         self.todo.extend(
@@ -1090,11 +1128,15 @@ class _FingerprintWalk:
 
     def locate(self, module: str, attr: str):
         """(module, attr, index) of the definition of global `attr` of
-        `module`, following `from` imports to the module that defines it."""
+        `module`, following `from` imports to the module that defines it.
+        Module-level statements that change the value, in each module on the
+        way, count with it."""
         for _ in range(16):
             if module not in sys.modules or not self.counts(module):
                 return module, attr, None
             index = self.index(sys.modules[module])
+            if index is not None:
+                self.add_mutations(module, attr, index)
             if (index is None or attr in index.spans
                     or attr not in index.imports):
                 return module, attr, index
@@ -1106,6 +1148,16 @@ class _FingerprintWalk:
             except (ImportError, ValueError):
                 return module, attr, None
         return module, attr, None
+
+    def add_mutations(self, module: str, name: str,
+                      index: _SourceIndex) -> None:
+        """Count the module-level statements of `module` that change global
+        `name` after it is bound, and the names they load."""
+        mutation = index.mutations.get(name)
+        if mutation is not None:
+            digest, loads = mutation
+            self.sources[f"{module}:{name}<changed>"] = digest
+            self.todo.extend(_resolve_loads(loads, vars(sys.modules[module])))
 
     def visit_value(self, name: str, obj) -> None:
         """A value reached by name: it counts by the source that defines it
@@ -1172,6 +1224,9 @@ def _code_fingerprint(runner_cls: type) -> str:
       source that defines it, following `from` imports to the module that
       does, and by the names that source loads; a value without a source
       definition counts by its own repr when it is a literal;
+    * a value, class or function also by the module-level statements that
+      change it after it is bound (`TABLE[k] = v`, `Cls.attr = v`,
+      `TABLE.update(...)`), and the names those load;
     * a torch.ops operator by its Python implementation, else by the build IDs
       of TensorRT-LLM's native libraries, as does a native module or class;
     * code outside tensorrt_llm by the installed version of its package; such
