@@ -1953,15 +1953,40 @@ def test_tactic_space_key_extends_the_cache_key():
         ("nvmmh", "x", 5))) != guided
 
 
-def test_code_fingerprint_follows_the_definitions_a_runner_uses(
-        tmp_path, monkeypatch):
+_FP_BASE = """
+from tensorrt_llm._torch.autotuner import TunableRunner
+
+
+class Base(TunableRunner):
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0]
+
+    def forward(self, inputs, tactic=-1, **kwargs):
+        return inputs[0]
+"""
+
+
+@pytest.fixture
+def fp_modules(tmp_path, monkeypatch):
+    """Modules written to tmp_path; those named fp_* stand in for tensorrt_llm
+    ones, and fp_base holds a TunableRunner base."""
     import importlib.util
     import textwrap
 
+    monkeypatch.setattr(autotuner, "_tracked",
+                        lambda module: module.startswith("fp_"))
+    # The modules are written after this process started; only
+    # test_code_fingerprint_marks_sources_edited_after_start wants that seen.
+    monkeypatch.setattr(autotuner, "_EPOCH_NS", float("inf"))
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    def write(name, text):
+        (tmp_path / f"{name}.py").write_text(textwrap.dedent(text))
+
     def load(name, text):
-        path = tmp_path / f"{name}.py"
-        path.write_text(textwrap.dedent(text))
-        spec = importlib.util.spec_from_file_location(name, path)
+        write(name, text)
+        spec = importlib.util.spec_from_file_location(name,
+                                                      tmp_path / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, module)
         spec.loader.exec_module(module)
@@ -1969,12 +1994,27 @@ def test_code_fingerprint_follows_the_definitions_a_runner_uses(
 
     def edit(name, old, new):
         path = tmp_path / f"{name}.py"
-        path.write_text(path.read_text().replace(old, new))
+        text = path.read_text()
+        assert old in text
+        path.write_text(text.replace(old, new))
 
-    # Modules named fp_* stand in for tensorrt_llm ones.
-    monkeypatch.setattr(autotuner, "_tracked",
-                        lambda module: module.startswith("fp_"))
-    load(
+    def fingerprints(*runner_classes):
+        autotuner._code_fingerprint.cache_clear()
+        return [autotuner._code_fingerprint(k) for k in runner_classes]
+
+    load("fp_base", _FP_BASE)
+    return SimpleNamespace(write=write,
+                           load=load,
+                           edit=edit,
+                           fingerprints=fingerprints)
+
+
+def _changed(before, after):
+    return [b != a for b, a in zip(before, after)]
+
+
+def test_code_fingerprint_follows_the_definitions_a_runner_uses(fp_modules):
+    fp_modules.load(
         "fp_util", """
         def used():
             return 0
@@ -1983,18 +2023,10 @@ def test_code_fingerprint_follows_the_definitions_a_runner_uses(
         def unused():
             return 0
         """)
-    runners = load(
+    runners = fp_modules.load(
         "fp_runners", """
         import fp_util
-        from tensorrt_llm._torch.autotuner import TunableRunner
-
-
-        class Base(TunableRunner):
-            def get_valid_tactics(self, inputs, profile, **kwargs):
-                return [0]
-
-            def forward(self, inputs, tactic=-1, **kwargs):
-                return inputs[0]
+        from fp_base import Base
 
 
         class UsesUtil(Base):
@@ -2005,21 +2037,217 @@ def test_code_fingerprint_follows_the_definitions_a_runner_uses(
         class Other(Base):
             pass
         """)
+    classes = (runners.UsesUtil, runners.Other)
 
-    def fingerprints():
-        autotuner._code_fingerprint.cache_clear()
-        return [
-            autotuner._code_fingerprint(runners.UsesUtil),
-            autotuner._code_fingerprint(runners.Other)
-        ]
+    before = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_util", "def unused():\n    return 0",
+                    "def unused():\n    return 42")
+    assert fp_modules.fingerprints(*classes) == before
+    fp_modules.edit("fp_util", "def used():\n    return 0",
+                    "def used():\n    return 42")
+    assert _changed(before, fp_modules.fingerprints(*classes)) == [True, False]
 
-    before = fingerprints()
-    edit("fp_util", "def unused():\n    return 0",
-         "def unused():\n    return 42")
-    assert fingerprints() == before
-    edit("fp_util", "def used():\n    return 0", "def used():\n    return 42")
-    after = fingerprints()
-    assert after[0] != before[0] and after[1] == before[1]
+
+def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
+    fp_modules.load(
+        "fp_util", """
+        BLOCK = 128
+        TILE = BLOCK * 2
+        TABLE = {"small": 1}
+        """)
+    runners = fp_modules.load(
+        "fp_runners", """
+        import fp_util
+        from fp_base import Base
+
+
+        def tactics(limit=fp_util.BLOCK):
+            return [limit]
+
+
+        class UsesDerivedConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.TILE]
+
+
+        class UsesTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return list(fp_util.TABLE)
+
+
+        class UsesClassAttribute(Base):
+            block = fp_util.BLOCK + 0
+
+
+        class UsesDefaultArgument(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return tactics()
+        """)
+    classes = (runners.UsesDerivedConstant, runners.UsesTable,
+               runners.UsesClassAttribute, runners.UsesDefaultArgument)
+
+    before = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_util", "BLOCK = 128", "BLOCK = 1024")
+    after_block = fp_modules.fingerprints(*classes)
+    assert _changed(before, after_block) == [True, False, True, True]
+    fp_modules.edit("fp_util", '{"small": 1}', '{"small": 1, "large": 2}')
+    after_table = fp_modules.fingerprints(*classes)
+    assert _changed(after_block, after_table) == [False, True, False, False]
+
+
+def test_code_fingerprint_follows_kernel_objects_and_imports(
+        fp_modules, monkeypatch):
+    # jitlib stands in for a kernel DSL outside tensorrt_llm (as triton.jit):
+    # its kernels are callable objects, not functions.
+    fp_modules.load(
+        "jitlib", """
+        class jit:
+            def __init__(self, fn):
+                self.fn = fn
+                self.__module__ = fn.__module__
+                self.__qualname__ = fn.__qualname__
+
+            def __call__(self, *args):
+                return self.fn(*args)
+        """)
+    fp_modules.load(
+        "fp_kernels", """
+        import jitlib
+
+
+        @jitlib.jit
+        def helper():
+            return 0
+
+
+        @jitlib.jit
+        def kernel():
+            return helper()
+        """)
+    # Importing it would fail the test: a key must not import modules
+    # outside tensorrt_llm.
+    fp_modules.write("side_effect_mod",
+                     "raise RuntimeError('imported for a key')\n")
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+        from fp_kernels import kernel
+
+
+        class UsesKernel(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return kernel()
+
+
+        class ImportsInForward(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import side_effect_mod
+                from fp_kernels import helper
+                return helper(), side_effect_mod
+
+
+        class Other(Base):
+            pass
+        """)
+    versions = {"side_effect_mod": "1.0"}
+    monkeypatch.setattr(autotuner, "_package_versions",
+                        lambda top: versions.get(top, ""))
+    classes = (runners.UsesKernel, runners.ImportsInForward, runners.Other)
+
+    before = fp_modules.fingerprints(*classes)
+    assert "side_effect_mod" not in sys.modules
+    fp_modules.edit("fp_kernels", "def helper():\n    return 0",
+                    "def helper():\n    return 42")
+    after_helper = fp_modules.fingerprints(*classes)
+    assert _changed(before, after_helper) == [True, True, False]
+    versions["side_effect_mod"] = "2.0"
+    after_upgrade = fp_modules.fingerprints(*classes)
+    assert _changed(after_helper, after_upgrade) == [False, True, False]
+
+
+def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
+    import uuid
+
+    op = f"op_{uuid.uuid4().hex[:12]}"
+    fp_modules.load(
+        "fp_ops", f"""
+        import torch
+
+        _lib = torch.library.Library("fp_test", "FRAGMENT")
+        _lib.define("native_{op}(Tensor x) -> Tensor")
+
+
+        @torch.library.custom_op("fp_test::python_{op}", mutates_args=())
+        def python_op(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+        """)
+    runners = fp_modules.load(
+        "fp_runners", f"""
+        import torch
+        import fp_ops
+        from fp_base import Base
+
+
+        class UsesPythonOp(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.ops.fp_test.python_{op}(inputs[0])
+
+
+        class UsesNativeOp(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.ops.fp_test.native_{op}(inputs[0])
+        """)
+    build = {"id": "a"}
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: build["id"])
+    classes = (runners.UsesPythonOp, runners.UsesNativeOp)
+
+    before = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_ops", "return x.clone()", "return x.clone() + 0")
+    after_edit = fp_modules.fingerprints(*classes)
+    assert _changed(before, after_edit) == [True, False]
+    build["id"] = "b"
+    after_rebuild = fp_modules.fingerprints(*classes)
+    assert _changed(after_edit, after_rebuild) == [False, True]
+
+
+def test_code_fingerprint_marks_sources_edited_after_start(
+        fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Runner(Base):
+            pass
+        """)
+    [unchanged_since_start] = fp_modules.fingerprints(runners.Runner)
+    monkeypatch.setattr(autotuner, "_EPOCH_NS", 0)
+    [edited_since_start] = fp_modules.fingerprints(runners.Runner)
+    assert edited_since_start != unchanged_since_start
+    assert fp_modules.fingerprints(runners.Runner) == [edited_since_start]
+
+
+def test_native_library_id_is_the_elf_build_id(tmp_path):
+    import hashlib
+    import struct
+
+    build_id = bytes(range(20))
+    note = struct.pack("<III", 4, len(build_id), 3) + b"GNU\0" + build_id
+    header = bytearray(64)
+    header[:6] = b"\x7fELF\x02\x01"  # 64-bit, little-endian
+    struct.pack_into("<Q", header, 0x28, 64 + len(note))  # section headers
+    struct.pack_into("<HH", header, 0x3A, 64, 2)
+    note_section = bytearray(64)
+    struct.pack_into("<I", note_section, 4, 7)  # SHT_NOTE
+    struct.pack_into("<QQ", note_section, 0x18, 64, len(note))
+    library = tmp_path / "libfp.so"
+    library.write_bytes(bytes(header) + note + bytes(64) + note_section)
+    assert autotuner._library_id(library) == build_id.hex()
+
+    other = tmp_path / "libother.so"
+    other.write_bytes(b"not an ELF file")
+    assert autotuner._library_id(other) == hashlib.sha256(
+        b"not an ELF file").hexdigest()
 
 
 def test_search_cache_misses_across_tactic_spaces():

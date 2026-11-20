@@ -21,21 +21,25 @@ import enum
 import errno
 import fcntl
 import hashlib
+import importlib.metadata
 import importlib.util
 import inspect
 import itertools
 import json
 import os
+import struct
 import sys
 import time
 import types
+import weakref
 import zlib
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple,
+                    Union)
 
 import torch
 from cuda.bindings import driver
@@ -350,89 +354,277 @@ class TunableRunner(ABC):
         return None
 
 
+_TRACKED_PACKAGE = "tensorrt_llm"
+
+
 def _tracked(module: str) -> bool:
     """Whether code of `module` counts toward a runner's fingerprint. This
     module is left out: a change to the tuner is not a change to any kernel."""
-    return module.split(".")[0] == "tensorrt_llm" and module != __name__
+    return module.split(".")[0] == _TRACKED_PACKAGE and module != __name__
 
 
 _CONSTANT_TYPES = (int, float, complex, str, bytes, bool, type(None), enum.Enum)
 _DEFINITIONS = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+# Entries of a class's namespace that describe the class rather than add to it.
+_CLASS_METADATA = frozenset(
+    ("__annotations__", "__dict__", "__doc__", "__firstlineno__", "__module__",
+     "__orig_bases__", "__parameters__", "__qualname__",
+     "__static_attributes__", "__weakref__"))
+_OPERATOR_TYPES = (torch._ops.OpOverload, torch._ops.OpOverloadPacket)
+# A source file changed after this may no longer hold the code this process
+# runs.
+_EPOCH_NS = time.time_ns()
 
 
-@lru_cache(maxsize=None)
-def _source_index(path: str, stamp: Tuple[int, int]):
-    """A file's lines and the line spans of its classes, functions and
-    name assignments by qualified name (several when branches define one
-    name). `stamp` (mtime, size) keys the cache to the file's content."""
+class _SourceIndex(NamedTuple):
+    """Digests of a file and of each class, function and name assignment in
+    it, by qualified name (several definitions of one name share a digest),
+    with the names each definition loads, as `a.b.c` chains."""
+    path: str
+    mtime_ns: int
+    size: int
+    digest: str
+    spans: Dict[str, str]
+    # Names evaluated when the definition runs: decorators, defaults, bases,
+    # class bodies and assigned values, without the callees of calls (what a
+    # value is built from, not the code that builds it).
+    eager: Dict[str, Tuple[str, ...]]
+    # Every name a definition loads, its body included.
+    loads: Dict[str, Tuple[str, ...]]
+    # name -> (level, module, attr) of each module-level `from` import.
+    imports: Dict[str, Tuple[int, str, str]]
+
+
+class _External(NamedTuple):
+    """A module outside the tracked code, named by an import that is not run."""
+    module: str
+
+
+_SOURCE_INDEXES: Dict[str, _SourceIndex] = {}
+_FUNCTION_REFS: "weakref.WeakKeyDictionary[Callable, Tuple]" = (
+    weakref.WeakKeyDictionary())
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _dotted_loads(nodes, skip_callees: bool) -> List[str]:
+    """The names, as `a.b.c` chains, that AST nodes load."""
+    names: List[str] = []
+
+    def walk(node):
+        attrs = []
+        base = node
+        while isinstance(base, ast.Attribute):
+            attrs.append(base.attr)
+            base = base.value
+        if isinstance(base, ast.Name):
+            if isinstance(base.ctx, ast.Load):
+                names.append(".".join([base.id, *reversed(attrs)]))
+            return
+        if skip_callees and isinstance(base, ast.Call):
+            children = [*base.args, *(k.value for k in base.keywords)]
+        else:
+            children = ast.iter_child_nodes(base)
+        for child in children:
+            walk(child)
+
+    for node in nodes:
+        if node is not None:
+            walk(node)
+    return list(dict.fromkeys(names))
+
+
+def _evaluated_at_definition(node) -> List[ast.AST]:
+    """The expressions a `def` evaluates when it runs."""
+    return [
+        *node.decorator_list, *node.args.defaults,
+        *(d for d in node.args.kw_defaults if d is not None)
+    ]
+
+
+def _source_index(path: str) -> _SourceIndex:
+    """The index of a file, rebuilt whenever its size or mtime changes."""
+    st = os.stat(path)
+    index = _SOURCE_INDEXES.get(path)
+    if (index is not None and index.mtime_ns == st.st_mtime_ns
+            and index.size == st.st_size):
+        return index
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    index: Dict[str, List[Tuple[int, int]]] = {}
+    lines = text.splitlines(keepends=True)
+    spans: Dict[str, List[str]] = {}
+    eager: Dict[str, List[str]] = {}
+    loads: Dict[str, List[str]] = {}
+    imports: Dict[str, Tuple[int, str, str]] = {}
+
+    def add(name, node, eager_nodes, load_nodes):
+        start = min([node.lineno] +
+                    [d.lineno for d in getattr(node, "decorator_list", ())])
+        spans.setdefault(name,
+                         []).append("".join(lines[start - 1:node.end_lineno]))
+        eager.setdefault(name, []).extend(_dotted_loads(eager_nodes, True))
+        loads.setdefault(name, []).extend(
+            _dotted_loads(load_nodes, load_nodes is eager_nodes))
 
     def visit(node, prefix):
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, _DEFINITIONS):
-                name = prefix + child.name
-                start = min([child.lineno] +
-                            [d.lineno for d in child.decorator_list])
-                index.setdefault(name, []).append((start, child.end_lineno))
-                visit(
-                    child, name +
-                    ("." if isinstance(child, ast.ClassDef) else ".<locals>."))
-                continue
-            targets = (
-                child.targets if isinstance(child, ast.Assign) else
-                [child.target] if isinstance(child, ast.AnnAssign) else [])
-            for target in targets:
-                if isinstance(target, ast.Name):
-                    index.setdefault(prefix + target.id, []).append(
-                        (child.lineno, child.end_lineno))
-            visit(child, prefix)
+            name = (prefix +
+                    child.name if isinstance(child, _DEFINITIONS) else None)
+            if isinstance(child, ast.ClassDef):
+                nested = [s for s in child.body if isinstance(s, _DEFINITIONS)]
+                evaluated = [
+                    *child.decorator_list, *child.bases,
+                    *(k.value for k in child.keywords),
+                    *(s for s in child.body if not isinstance(s, _DEFINITIONS)),
+                    *(e for s in nested if not isinstance(s, ast.ClassDef)
+                      for e in _evaluated_at_definition(s))
+                ]
+                add(name, child, evaluated, evaluated)
+                visit(child, name + ".")
+            elif isinstance(child, _DEFINITIONS):
+                add(name, child, _evaluated_at_definition(child), [child])
+                visit(child, name + ".<locals>.")
+            else:
+                if isinstance(child, (ast.Assign, ast.AnnAssign)):
+                    targets = (child.targets if isinstance(child, ast.Assign)
+                               else [child.target])
+                    value = [child.value]
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            add(prefix + target.id, child, value, value)
+                elif isinstance(child, ast.ImportFrom) and not prefix:
+                    for alias in child.names:
+                        imports[alias.asname
+                                or alias.name] = (child.level, child.module
+                                                  or "", alias.name)
+                visit(child, prefix)
 
     visit(ast.parse(text), "")
-    return text.splitlines(keepends=True), index
+    index = _SourceIndex(path, st.st_mtime_ns, st.st_size, _digest(text), {
+        k: _digest("".join(v))
+        for k, v in spans.items()
+    }, {
+        k: tuple(dict.fromkeys(v))
+        for k, v in eager.items()
+    }, {
+        k: tuple(dict.fromkeys(v))
+        for k, v in loads.items()
+    }, imports)
+    _SOURCE_INDEXES[path] = index
+    return index
 
 
-def _definition_source(obj, qualname: Optional[str] = None) -> str:
-    """The source of a class or function (or of the assignment to `qualname`
-    in module `obj`), or of its whole file when the definition cannot be
-    found in it."""
+def _index_of(obj) -> Optional[_SourceIndex]:
+    """The index of the file that defines `obj`, or None without one."""
     try:
         path = inspect.getsourcefile(obj)
-        st = os.stat(path)
-        lines, index = _source_index(path, (st.st_mtime_ns, st.st_size))
-    except (TypeError, OSError, SyntaxError, ValueError):
-        return ""
-    if qualname is not None:
-        return "".join("".join(lines[s - 1:e])
-                       for s, e in index.get(qualname, ()))
-    if inspect.ismodule(obj):
-        return "".join(lines)
-    spans = index.get(obj.__qualname__)
-    if spans:
-        return "".join("".join(lines[s - 1:e]) for s, e in spans)
+    except TypeError:  # A builtin module, class or function.
+        return None
     try:
-        return inspect.getsource(obj)
-    except (OSError, TypeError):
-        return "".join(lines)
+        return _source_index(path) if path else None
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+
+def _definition_digest(obj, index: _SourceIndex) -> str:
+    """The digest of a module, or of a class's or function's definition (its
+    whole file when the definition cannot be found in it)."""
+    if inspect.ismodule(obj):
+        return index.digest
+    digest = index.spans.get(obj.__qualname__)
+    if digest is None:
+        try:
+            digest = _digest(inspect.getsource(obj))
+        except (OSError, TypeError):
+            digest = index.digest
+    return digest
+
+
+def _is_extension(obj) -> bool:
+    """Whether a module, or the module of a class, is native code."""
+    name = obj.__name__ if inspect.ismodule(obj) else obj.__module__
+    modules = [obj] if inspect.ismodule(obj) else []
+    while name:
+        modules.append(sys.modules.get(name))
+        name = name.rpartition(".")[0]
+    for module in modules:
+        path = getattr(module, "__file__", None)
+        if isinstance(path, str):
+            return path.endswith((".so", ".pyd"))
+    return False
 
 
 def _attribute(obj, name: str):
-    """getattr, or None for an attribute that is missing or raises (a lazy
-    stand-in for an optional package can raise anything)."""
+    """getattr, or None for an attribute that is missing or cannot load (a
+    lazy stand-in for an optional package raises ImportError or
+    RuntimeError)."""
     try:
         return getattr(obj, name)
-    except Exception:  # noqa: BLE001
+    except (AttributeError, ImportError, RuntimeError):
         return None
 
 
-def _resolve_import(name: str, package: str, level: int):
+def _narrow(name: str, obj, attrs) -> Tuple[str, Any]:
+    """module.attr chains name the attribute, not the whole module."""
+    for attr in attrs:
+        if not inspect.ismodule(obj):
+            break
+        value = _attribute(obj, attr)
+        if value is None:
+            break
+        name, obj = f"{obj.__name__}.{attr}", value
+    return name, obj
+
+
+def _resolve_loads(names, globals_: Dict[str, Any]):
+    """(name, object) for `a.b.c` chains looked up in a module's globals."""
+    module_name = globals_.get("__name__", "")
+    for dotted in names:
+        head, *attrs = dotted.split(".")
+        if head in globals_:
+            yield _narrow(f"{module_name}.{head}", globals_[head], attrs)
+
+
+def _load_module(name: str):
+    """Module `name`, imported only when it is tracked code (code the runner
+    runs imports it anyway); other modules count by their package, so they
+    are not imported for a key."""
+    module = sys.modules.get(name)
+    if module is None and _tracked(name):
+        try:
+            module = importlib.import_module(name)
+        except (ImportError, OSError, RuntimeError):
+            return None  # What cannot load is not run either.
+    return module
+
+
+def _import_refs(name: str, package: str, level: int, following):
+    """(name, object) for what an import statement binds."""
     try:
-        if level:
-            name = importlib.util.resolve_name("." * level + name, package)
-        return importlib.import_module(name)
-    except Exception:  # noqa: BLE001 - what cannot load is not run either
-        return None
+        target = (importlib.util.resolve_name("." * level +
+                                              name, package) if level else name)
+    except (ImportError, ValueError):
+        return
+    module = _load_module(target)
+    if module is None:
+        yield target, _External(target)
+        return
+    imported = []
+    for ins in following:
+        if ins.opname == "IMPORT_FROM":
+            imported.append(ins.argval)
+        elif not ins.opname.startswith("STORE"):
+            break
+    if not imported:
+        yield target, module
+    for attr in imported:
+        value = _attribute(module, attr)
+        if value is None:
+            value = _load_module(f"{target}.{attr}") or _External(
+                f"{target}.{attr}")
+        yield f"{target}.{attr}", value
 
 
 def _code_refs(code: types.CodeType, globals_: Dict[str, Any]):
@@ -445,117 +637,363 @@ def _code_refs(code: types.CodeType, globals_: Dict[str, Any]):
         if ins.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
             if ins.argval not in globals_:
                 continue
-            name, obj = f"{module_name}.{ins.argval}", globals_[ins.argval]
+            attrs = []
+            for nxt in instructions[i + 1:]:
+                if nxt.opname not in ("LOAD_ATTR", "LOAD_METHOD"):
+                    break
+                attrs.append(nxt.argval)
+            yield _narrow(f"{module_name}.{ins.argval}", globals_[ins.argval],
+                          attrs)
         elif ins.opname == "IMPORT_NAME":
             level = instructions[i - 2].argval if i >= 2 else 0
-            obj = _resolve_import(ins.argval, package,
-                                  level if isinstance(level, int) else 0)
-            if obj is None:
-                continue
-            name, items = obj.__name__, []
-            for nxt in instructions[i + 1:]:
-                if nxt.opname == "IMPORT_FROM":
-                    attr = _attribute(obj, nxt.argval)
-                    if attr is None:
-                        attr = _resolve_import(f"{obj.__name__}.{nxt.argval}",
-                                               "", 0)
-                    items.append((f"{obj.__name__}.{nxt.argval}", attr))
-                elif not nxt.opname.startswith("STORE"):
-                    break
-            if items:
-                yield from ((n, a) for n, a in items if a is not None)
-                continue
-        else:
-            continue
-        # module.attr chains name the attribute, not the whole module.
-        for nxt in instructions[i + 1:]:
-            attr = (_attribute(obj, nxt.argval) if inspect.ismodule(obj)
-                    and nxt.opname in ("LOAD_ATTR", "LOAD_METHOD") else None)
-            if attr is None:
-                break
-            name, obj = f"{obj.__name__}.{nxt.argval}", attr
-        yield name, obj
+            yield from _import_refs(ins.argval, package,
+                                    level if isinstance(level, int) else 0,
+                                    instructions[i + 1:])
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
             yield from _code_refs(const, globals_)
 
 
-@lru_cache(maxsize=None)
 def _function_refs(fn) -> Tuple[Tuple[str, Any], ...]:
-    return tuple(_code_refs(fn.__code__, fn.__globals__))
+    refs = _FUNCTION_REFS.get(fn)
+    if refs is None:
+        refs = _FUNCTION_REFS[fn] = tuple(
+            _code_refs(fn.__code__, fn.__globals__))
+    return refs
+
+
+def _is_literal(obj, depth: int = 0) -> bool:
+    if isinstance(obj, _CONSTANT_TYPES):
+        return True
+    if depth > 4:
+        return False
+    if isinstance(obj, (tuple, list, set, frozenset)):
+        return all(_is_literal(v, depth + 1) for v in obj)
+    if isinstance(obj, dict):
+        return all(
+            _is_literal(k, depth + 1) and _is_literal(v, depth + 1)
+            for k, v in obj.items())
+    return False
+
+
+def _stable_repr(obj) -> str:
+    """repr of a literal, with sets in a fixed order (their iteration order
+    can change from one process to the next)."""
+    if isinstance(obj, (set, frozenset)):
+        return "{" + ", ".join(sorted(map(_stable_repr, obj))) + "}"
+    if isinstance(obj, dict):
+        return "{" + ", ".join(f"{_stable_repr(k)}: {_stable_repr(v)}"
+                               for k, v in obj.items()) + "}"
+    if isinstance(obj, (tuple, list)):
+        return (type(obj).__name__ + "(" + ", ".join(map(_stable_repr, obj)) +
+                ")")
+    return repr(obj)
+
+
+@lru_cache(maxsize=None)
+def _packages_distributions() -> Dict[str, List[str]]:
+    return importlib.metadata.packages_distributions()
+
+
+@lru_cache(maxsize=None)
+def _package_versions(top: str) -> str:
+    """The installed versions of the distributions that provide top-level
+    package `top` ('' for the standard library and unknown packages)."""
+    versions = []
+    for dist in sorted(set(_packages_distributions().get(top, ()))):
+        try:
+            versions.append(f"{dist}=={importlib.metadata.version(dist)}")
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return ",".join(versions)
+
+
+def _elf_build_id(path: Path) -> Optional[str]:
+    """The GNU build ID of an ELF file, or None."""
+    with open(path, "rb") as f:
+        header = f.read(64)
+        if header[:4] != b"\x7fELF":
+            return None
+        wide = header[4] == 2
+        order = "<" if header[5] == 1 else ">"
+        if wide:
+            (table_offset, ) = struct.unpack_from(order + "Q", header, 0x28)
+            entry_size, count = struct.unpack_from(order + "HH", header, 0x3A)
+        else:
+            (table_offset, ) = struct.unpack_from(order + "I", header, 0x20)
+            entry_size, count = struct.unpack_from(order + "HH", header, 0x2E)
+        f.seek(table_offset)
+        table = f.read(entry_size * count)
+        for entry in range(0, entry_size * count, entry_size):
+            (kind, ) = struct.unpack_from(order + "I", table, entry + 4)
+            if kind != 7:  # SHT_NOTE
+                continue
+            offset, size = struct.unpack_from(order + ("QQ" if wide else "II"),
+                                              table,
+                                              entry + (0x18 if wide else 0x10))
+            f.seek(offset)
+            notes = f.read(size)
+            pos = 0
+            while pos + 12 <= len(notes):
+                name_size, desc_size, note = struct.unpack_from(
+                    order + "III", notes, pos)
+                pos += 12
+                owner = notes[pos:pos + name_size]
+                pos += (name_size + 3) & ~3
+                if note == 3 and owner.rstrip(b"\0") == b"GNU":
+                    return notes[pos:pos + desc_size].hex()  # NT_GNU_BUILD_ID
+                pos += (desc_size + 3) & ~3
+    return None
+
+
+def _library_id(path: Path) -> str:
+    """A shared library's build ID, else the digest of its content."""
+    try:
+        build_id = _elf_build_id(path)
+        if build_id:
+            return build_id
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 24), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except (OSError, struct.error):
+        return ""
+
+
+@lru_cache(maxsize=None)
+def _native_build_id() -> str:
+    """IDs of TensorRT-LLM's native libraries, which hold its C++ kernels."""
+    root = Path(tensorrt_llm.__file__).parent
+    libraries = sorted([*root.glob("*.so"), *(root / "libs").glob("*.so")])
+    return "\n".join(f"{path.name}:{_library_id(path)}" for path in libraries)
+
+
+class _FingerprintWalk:
+    """Collects the digests of what a runner class's tactics depend on."""
+
+    def __init__(self, runner_cls: type):
+        owners = [
+            k for k in runner_cls.__mro__
+            if issubclass(k, TunableRunner) and k is not TunableRunner
+        ]
+        self.homes = {k.__module__ for k in owners}
+        self.todo: List[Tuple[str,
+                              Any]] = [(f"{k.__module__}.{k.__qualname__}", k)
+                                       for k in owners]
+        self.sources: Dict[str, str] = {}
+        self.packages: Set[str] = set()
+        self.edited: Dict[str, int] = {}
+        self.native = False
+        self.seen: Set[int] = set()
+        self.seen_names: Set[str] = set()
+
+    def digest(self) -> str:
+        while self.todo:
+            self.visit(*self.todo.pop())
+        for top in self.packages:
+            versions = _package_versions(top)
+            if versions:
+                self.sources[f"<package>:{top}"] = versions
+        if self.native:
+            self.sources["<native>"] = _native_build_id()
+        for path, mtime_ns in self.edited.items():
+            self.sources[f"<edited>:{path}"] = str(mtime_ns)
+            logger.warning_once(
+                f"[Autotuner] {path} changed after this process started; "
+                "cache entries tuned here will not be reused by later runs.",
+                key=("autotuner_source_edited", path))
+        digest = hashlib.sha256()
+        for label in sorted(self.sources):
+            digest.update(f"{label}\0{self.sources[label]}\0".encode())
+        return digest.hexdigest()[:16]
+
+    def counts(self, module: str) -> bool:
+        return _tracked(module) or module in self.homes
+
+    def add_package(self, module: str) -> None:
+        top = module.partition(".")[0]
+        if top != _TRACKED_PACKAGE:
+            self.packages.add(top)
+
+    def index(self, obj) -> Optional[_SourceIndex]:
+        index = _index_of(obj)
+        if index is not None and index.mtime_ns > _EPOCH_NS:
+            self.edited[index.path] = index.mtime_ns
+        return index
+
+    def visit(self, name: str, obj) -> None:
+        if isinstance(obj, _External):
+            self.add_package(obj.module)
+            return
+        if isinstance(obj, (staticmethod, classmethod)):
+            obj = obj.__func__
+        if isinstance(obj, property):
+            self.todo.extend(
+                (name, f) for f in (obj.fget, obj.fset, obj.fdel) if f)
+            return
+        if isinstance(obj, _OPERATOR_TYPES):
+            self.visit_operator(getattr(obj, "overloadpacket", obj))
+            return
+        if isinstance(obj, partial):
+            self.todo.append((f"{name}[func]", obj.func))
+            self.todo.extend(
+                (f"{name}[{i}]", v)
+                for i, v in enumerate((*obj.args, *obj.keywords.values())))
+        elif callable(obj) and not inspect.isclass(obj):
+            try:
+                obj = inspect.unwrap(obj)
+            except ValueError:
+                pass  # A cycle of __wrapped__: keep the outermost callable.
+        if inspect.ismodule(obj) or inspect.isclass(obj) or inspect.isfunction(
+                obj):
+            self.visit_definition(obj)
+        else:
+            self.visit_value(name, obj)
+
+    def visit_operator(self, packet) -> None:
+        """A torch.ops operator: its Python implementation if it has one,
+        else the native library that registers it."""
+        qualname = getattr(packet, "_qualified_op_name", "")
+        if qualname in self.seen_names:
+            return
+        self.seen_names.add(qualname)
+        custom_ops = _attribute(_attribute(torch, "_library"), "custom_ops")
+        definition = (_attribute(custom_ops, "OPDEFS") or {}).get(qualname)
+        implementation = _attribute(definition, "_init_fn")
+        if implementation is not None:
+            self.todo.append((qualname, implementation))
+        elif qualname.partition("::")[0] in ("aten", "prim", "prims"):
+            self.packages.add("torch")
+        else:
+            self.native = True
+
+    def visit_definition(self, obj) -> None:
+        if id(obj) in self.seen:
+            return
+        self.seen.add(id(obj))
+        module = obj.__name__ if inspect.ismodule(obj) else obj.__module__
+        if not isinstance(module, str):
+            return
+        if not self.counts(module):
+            self.add_package(module)
+            return
+        index = self.index(obj)
+        if index is None:
+            self.native = self.native or _is_extension(obj)
+            return
+        if inspect.ismodule(obj):
+            self.sources[f"{module}:<module>"] = index.digest
+            return
+        self.sources[f"{module}:{obj.__qualname__}"] = _definition_digest(
+            obj, index)
+        globals_ = (obj.__globals__ if inspect.isfunction(obj) else getattr(
+            sys.modules.get(module), "__dict__", {}))
+        self.todo.extend(
+            _resolve_loads(index.eager.get(obj.__qualname__, ()), globals_))
+        if inspect.isfunction(obj):
+            self.todo.extend(_function_refs(obj))
+            return
+        self.todo.extend((f"{module}.{obj.__qualname__}.{k}", v)
+                         for k, v in vars(obj).items()
+                         if k not in _CLASS_METADATA)
+        self.todo.extend(
+            (f"{b.__module__}.{b.__qualname__}", b) for b in obj.__mro__[1:])
+
+    def locate(self, module: str, attr: str):
+        """(module, attr, index) of the definition of global `attr` of
+        `module`, following `from` imports to the module that defines it."""
+        for _ in range(16):
+            if module not in sys.modules or not self.counts(module):
+                return module, attr, None
+            index = self.index(sys.modules[module])
+            if (index is None or attr in index.spans
+                    or attr not in index.imports):
+                return module, attr, index
+            level, source, attr = index.imports[attr]
+            try:
+                module = (importlib.util.resolve_name(
+                    "." * level + source, sys.modules[module].__package__)
+                          if level else source)
+            except (ImportError, ValueError):
+                return module, attr, None
+        return module, attr, None
+
+    def visit_value(self, name: str, obj) -> None:
+        """A value reached by name: it counts by the source that defines it
+        and by the names that source loads."""
+        module, _, attr = name.rpartition(".")
+        if module not in sys.modules:
+            # A class attribute: the class's source and the names its body
+            # loads cover it.
+            return
+        if name in self.seen_names:
+            return
+        self.seen_names.add(name)
+        module, attr, index = self.locate(module, attr)
+        if not self.counts(module):
+            self.add_package(module)
+            return
+        if index is not None and attr in index.spans:
+            self.sources[f"{module}:{attr}"] = index.spans[attr]
+            self.todo.extend(
+                _resolve_loads(index.loads[attr], vars(sys.modules[module])))
+            return
+        if index is None and module in sys.modules and _is_extension(
+                sys.modules[module]):
+            self.native = True
+            return
+        # No definition in the source (a value set some other way): count
+        # the value itself.
+        label = f"{module}.{attr}"
+        if _is_literal(obj):
+            self.sources[label] = _stable_repr(obj)
+        elif isinstance(obj, (tuple, list)):
+            self.todo.extend((f"{label}[{i}]", v) for i, v in enumerate(obj))
+        elif isinstance(obj, dict):
+            self.todo.extend(
+                (f"{label}[{i}]", v)
+                for i, v in enumerate(itertools.chain(*obj.items())))
+        else:
+            own_module = _attribute(obj, "__module__")
+            own_name = _attribute(obj, "__qualname__")
+            if (isinstance(own_module, str) and isinstance(own_name, str)
+                    and f"{own_module}.{own_name}" != label):
+                self.todo.append((f"{own_module}.{own_name}", obj))
+            elif self.counts(type(obj).__module__):
+                self.todo.append(
+                    (f"{type(obj).__module__}.{type(obj).__qualname__}",
+                     type(obj)))
 
 
 @lru_cache(maxsize=None)
 def _code_fingerprint(runner_cls: type) -> str:
-    """A digest of the source a runner's tactics depend on, in its cache keys.
+    """A digest of the code a runner's tactics depend on, in its cache keys.
 
-    It covers the definitions the runner reaches by name, at the granularity of
-    one class, function or constant: the runner and its TunableRunner bases,
-    and every tensorrt_llm class (with its bases) or function they use as a
-    class attribute, global, module attribute or import, followed through the
-    code of each. A TRT-LLM change thus re-tunes only the runners whose code
-    it touches; a module that cannot be narrowed counts whole.
+    It starts from the runner and its TunableRunner bases and follows, one
+    definition at a time, what they reach by name in tensorrt_llm code
+    (TensorRT-LLM itself, and the modules that define the runner):
+
+    * a function counts by its source, the globals, module attributes and
+      imports its code loads, and the names its decorators and defaults
+      evaluate;
+    * a class by its source, its bases, its attributes, and the names its body
+      evaluates;
+    * any other value (a constant, table, kernel object or instance) by the
+      source that defines it, following `from` imports to the module that
+      does, and by the names that source loads; a value without a source
+      definition counts by its own repr when it is a literal;
+    * a torch.ops operator by its Python implementation, else by the build IDs
+      of TensorRT-LLM's native libraries, as does a native module or class;
+    * code outside tensorrt_llm by the installed version of its package; such
+      modules are not imported for a key.
+
+    A TRT-LLM change thus re-tunes only the runners whose code it touches; a
+    module that cannot be narrowed counts whole. Sources are read from disk:
+    a source changed after this process started may not be the code it runs,
+    so it marks the key as this process's own.
     """
-    owners = [
-        k for k in runner_cls.__mro__
-        if issubclass(k, TunableRunner) and k is not TunableRunner
-    ]
-    homes = {k.__module__ for k in owners}
-    sources: Dict[str, str] = {}
-    seen = set()
-    todo: List[Tuple[str, Any]] = [(f"{k.__module__}.{k.__qualname__}", k)
-                                   for k in owners]
-    while todo:
-        name, obj = todo.pop()
-        if isinstance(obj, (staticmethod, classmethod)):
-            obj = obj.__func__
-        if isinstance(obj, _CONSTANT_TYPES) or (
-                isinstance(obj, (tuple, frozenset))
-                and all(isinstance(v, _CONSTANT_TYPES) for v in obj)):
-            # A module global: its assignment, else its value. A class
-            # attribute is in its class's source already.
-            module, _, attr = name.rpartition(".")
-            if module in sys.modules and (_tracked(module) or module in homes):
-                sources[name] = (_definition_source(sys.modules[module], attr)
-                                 or repr(obj))
-            continue
-        if id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        if isinstance(obj, property):
-            todo.extend((name, f) for f in (obj.fget, obj.fset, obj.fdel) if f)
-            continue
-        if isinstance(obj, (tuple, list)):
-            todo.extend((name, v) for v in obj)
-            continue
-        if callable(obj) and not inspect.isclass(obj):
-            try:
-                obj = inspect.unwrap(obj)
-            except Exception:  # noqa: BLE001
-                continue
-        module = (obj.__name__ if inspect.ismodule(obj) else _attribute(
-            obj, "__module__"))
-        if not isinstance(module, str) or not (_tracked(module)
-                                               or module in homes):
-            continue
-        if inspect.ismodule(obj):
-            sources[f"{module}:<module>"] = _definition_source(obj)
-        elif inspect.isclass(obj):
-            sources[f"{module}:{obj.__qualname__}"] = _definition_source(obj)
-            todo.extend((f"{module}.{obj.__qualname__}.{k}", v)
-                        for k, v in vars(obj).items())
-            todo.extend((f"{b.__module__}.{b.__qualname__}", b)
-                        for b in obj.__mro__[1:])
-        elif inspect.isfunction(obj):
-            sources[f"{module}:{obj.__qualname__}"] = _definition_source(obj)
-            try:
-                todo.extend(_function_refs(obj))
-            except Exception:  # noqa: BLE001 - a key must not fail tuning
-                continue
-    digest = hashlib.sha256()
-    for label in sorted(sources):
-        digest.update(f"{label}\0{sources[label]}\0".encode())
-    return digest.hexdigest()[:16]
+    return _FingerprintWalk(runner_cls).digest()
 
 
 @contextlib.contextmanager
