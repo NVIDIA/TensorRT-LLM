@@ -17,8 +17,8 @@ at that precision (``M3Eagle3Worker``).
 
 **The core** (``MiniMaxM3Tp4ModelingV2``) holds the weights (``weights.MODEL_WEIGHTS``) and the runtime resources the
 steps use -- one MSA attention backend per layer, the TP all-reduce communicator, the RoPE table, the MXFP8 GEMM
-dispatch state the engine tunes -- and dispatches each step, on the host, from its context count alone
-(``_select_target``):
+dispatch state the engine tunes. The shell passes the step's phase as ``has_context``. Direct core calls
+can derive it from the attention metadata:
 
 * ``DecodeTarget`` takes every pure generation step. Up to ``DECODE_MAX_TOKENS`` tokens (up to 8 requests, each one
   token or a draft verify of 1 + 3 rows) with 1-D input ids it runs the decode-step kernels and picks each layer
@@ -1293,6 +1293,7 @@ _VALUES: set = set()
 
 
 def _record(*meta: Hashable) -> None:
+    """Collect eager value dumps without specializing symbolic counts during tracing."""
     if _VALUE_DUMP and not torch.compiler.is_compiling():
         _VALUES.add(meta)
 
@@ -2614,11 +2615,6 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
 
     # --------------------------------------------------------------------------------------------- the dispatch
 
-    def _select_target(self, attn_metadata: AttentionMetadata):
-        """Which target runs this step: one host-side integer, fixed per CUDA-graph capture. A step with context rows
-        (a mixed step included) is prefill's; every pure generation step is decode's, whatever its width."""
-        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2628,6 +2624,8 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         capture: Callable[..., None] = _plain_capture,
         capture_target: Optional[Callable[..., Any]] = None,
+        *,
+        has_context: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         """``capture_target``: the worker's capture-norm target (``CAPTURE_NORM_IN_BOUNDARY``) for a capture layer
@@ -2636,7 +2634,10 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if kwargs.get("lora_params") is not None:
             raise ValueError("this MiniMax-M3 target serves no LoRA adapters")
-        return self._select_target(attn_metadata).forward(
+        if has_context is None:
+            has_context = attn_metadata.num_contexts != 0
+        target = self._prefill if has_context else self._decode
+        return target.forward(
             attn_metadata,
             input_ids,
             position_ids,
@@ -2707,16 +2708,8 @@ class PrefillTarget:
         self._contract_pending = False
 
     def step_args(self, md) -> dict:
-        """The one projection of the MSA metadata this target's forward reads, computed once per step.
-
-        Counts and per-step host scalars are read here; device tensors are the metadata's persistent buffers, held
-        by reference; ``msa_idx_k_cache`` is the metadata's per-layer index-K cache getter. ``metadata`` is the
-        prepared object itself: the MSA backend's step (``m3_msa_attention``) takes it as its argument.
-        """
+        """Borrow the metadata and cache handles used by eager prefill attention."""
         return dict(
-            num_contexts=md.num_contexts,
-            num_ctx_tokens=md.num_ctx_tokens,
-            num_tokens=md.num_tokens,
             kv_cache_manager=md.kv_cache_manager,
             msa_idx_k_cache=md.msa_idx_k_cache,
             msa_out_cache_loc=md.msa_out_cache_loc,
@@ -2736,13 +2729,15 @@ class PrefillTarget:
         """``capture_target`` is unused: the generic boundary takes no multicast all-reduce at this TP
         (``GENERIC_MC_AR_MAX_TOKENS`` 0), so a capture layer always runs its own capture norm."""
         core = self.core
+        # The compiled path uses its own boundary even inside a breakable context.
         if not is_torch_compiling() and is_in_breakable_cuda_graph():
             raise RuntimeError(
                 "this MiniMax-M3 target does not run under piecewise (breakable) prefill CUDA graphs"
             )
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
-        _record("prefill", int(step["num_tokens"]), int(step["num_contexts"]))
+        if _VALUE_DUMP and not torch.compiler.is_compiling():
+            _record("prefill", int(attn_metadata.num_tokens), int(attn_metadata.num_contexts))
         hidden = (
             m3_embedding(input_ids, core.w["embed"]) if inputs_embeds is None else inputs_embeds
         )
@@ -5721,6 +5716,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp4(
             raise ValueError(
                 "this MiniMax-M3 target is text only; the request carries multimodal input"
             )
+        has_context = attn_metadata.num_contexts != 0
         worker = self.spec_worker
         capture = _plain_capture
         if worker is not None:
@@ -5729,13 +5725,26 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp4(
                 worker.arm_capture_norm(
                     attn_metadata, spec_metadata, self.lm_head, self.draft_model
                 )
+        capture_for_core = capture
+        if (
+            worker is not None
+            and spec_metadata is not None
+            and has_context
+            and is_torch_compiling()
+        ):
+            assert worker._m3_capture_norm is None and worker._m3_fc_early_drafter is None, (
+                "compiled prefill requires plain Eagle3 capture"
+            )
+            capture_for_core = _modeling_support._prepare_prefill_eagle3_capture(spec_metadata)
         hidden_states = self.model(
             attn_metadata=attn_metadata,
+            # Pass the local phase into the compiled core without tracing request counts.
+            has_context=has_context,
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             spec_metadata=spec_metadata,
-            capture=capture,
+            capture=capture_for_core,
             capture_target=worker.capture_target if worker is not None else None,
             **kwargs,
         )

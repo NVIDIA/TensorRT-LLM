@@ -8,13 +8,18 @@ norm, the final norm after the last layer), and a capture layer captures the red
 writes, with no residual of its own. Synthetic attention, feed-forward and collectives isolate the residual routing.
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounter
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
     modeling,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.modeling_support import (
+    _prepare_prefill_eagle3_capture,
 )
 
 LAYERS = 4
@@ -150,3 +155,38 @@ def test_a_decode_capture_layer_takes_the_fast_layer_with_the_capture_norm(
     assert out == ("h", 2)
     assert seen == [(0, None), (1, ("capture_out", 1, 4)), (2, None)]
     assert captured == [(1, ("r", 1), None, written)]
+
+
+@dataclass
+class _CaptureBuffer:
+    hidden_states: torch.Tensor
+    num_capture_tokens: int
+    layers_to_capture: tuple[int, ...] = (0, 1)
+    hidden_size: int = 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="uses the CUDA capture buffer copy")
+def test_compiled_prefill_capture_uses_bucket_shape() -> None:
+    hidden = torch.ones((8, 4), device="cuda", dtype=torch.bfloat16)
+    metadata = _CaptureBuffer(hidden.new_zeros((6, 8)), num_capture_tokens=5)
+    capture = _prepare_prefill_eagle3_capture(metadata)
+
+    def forward(states: torch.Tensor) -> torch.Tensor:
+        capture(metadata, 1, states, None)
+        return states + 1
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(forward, fullgraph=True, backend=counter)
+    for live_rows in (5, 6, 4):
+        metadata.num_capture_tokens = live_rows
+        hidden.add_(1)
+        _prepare_prefill_eagle3_capture(metadata)
+        compiled(hidden)
+        torch.testing.assert_close(metadata.hidden_states[:live_rows, 4:], hidden[:live_rows])
+    assert counter.frame_count == 1
+    assert (metadata.hidden_states[:, :4] == 0).all()
+
+    metadata.num_capture_tokens = 7
+    with pytest.raises(RuntimeError, match="buffer capacity 6"):
+        _prepare_prefill_eagle3_capture(metadata)

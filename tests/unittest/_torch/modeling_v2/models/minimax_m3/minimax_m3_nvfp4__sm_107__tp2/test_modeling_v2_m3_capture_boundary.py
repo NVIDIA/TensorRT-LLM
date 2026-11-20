@@ -16,6 +16,12 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+    BreakableCUDAGraph,
+    BreakableCUDAGraphCapture,
+    enable_breakable_cuda_graph,
+)
+from tensorrt_llm._torch.utils import model_extra_attrs, torch_compiling
 
 LAYERS = 4
 
@@ -152,3 +158,52 @@ def test_a_prefill_moe_layer_takes_the_mc_finalize_boundary_when_it_folds(
     assert out == (("normed", 2), ("updated", 2))
     assert seen and seen[0][0] == 2 and seen[0][3] is core.w["l3_in_norm"]
     assert captured == [(2, ("updated", 2), None)]
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["dense", "fused-sparse"])
+def test_breakable_prefill_replay_uses_live_attention_rows(
+    make_cuda_m3_config, monkeypatch, fused
+) -> None:
+    core = modeling.MiniMaxM3Tp2ModelingV2(make_cuda_m3_config(2, fused_projection=fused))
+    layer_id = int(fused)
+    hidden = torch.ones((8, core.q_size), device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(8, device="cuda")[None]
+    output = torch.empty_like(hidden)
+    metadata = SimpleNamespace(
+        num_tokens=8, kv_cache_manager=None, msa_idx_k_cache=None, msa_out_cache_loc=None
+    )
+
+    def project(core, x, weight, *args):
+        return (x.repeat(1, 3) if weight == f"l{layer_id}_qkv_w" else x), False
+
+    def producer(core, layer, packed, positions, *cache_args):
+        assert packed.shape[0] == positions.shape[-1] == metadata.num_tokens
+        return packed[:, : core.q_size], packed[:, : core.q_size]
+
+    def attend(backend, q, k, v, idx_q, step, out, sparse, *scales):
+        assert (idx_q is not None) is fused
+        assert sparse is fused
+        assert q.shape[0] == step.num_tokens
+        out.copy_(q + 1)
+
+    monkeypatch.setattr(modeling, "_linear", project)
+    monkeypatch.setattr(modeling, "_dense_qk_norm_rope_fp8", lambda core, layer, qkv, pos: qkv)
+    monkeypatch.setattr(modeling, "_sparse_qkv_producer", producer)
+    monkeypatch.setattr(modeling, "m3_msa_attention", attend)
+    target = modeling.PrefillTarget(core)
+    graph = BreakableCUDAGraph()
+    with model_extra_attrs({"attention_metadata": lambda: metadata}), torch_compiling(False):
+        with (
+            enable_breakable_cuda_graph(),
+            BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()),
+        ):
+            attended, _ = target._attention(layer_id, positions, hidden, target.step_args(metadata))
+            output.copy_(attended + 1)
+        assert graph.num_breaks == 1
+        assert graph.num_segments == 2
+        for live_rows in (5, 7):
+            metadata.num_tokens = live_rows
+            hidden.fill_(live_rows)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output[:live_rows], hidden[:live_rows] + 2)
