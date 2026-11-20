@@ -637,9 +637,13 @@ finalize (scatter-add) into one persistent kernel, driven through
 - Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
   swizzled layout produced by `block_scale_interleave` (int32-packed storage,
   viewed as bytes). FC1 weight and scales are gate/up interleaved at
-  granularity 64 (`MXFP8CuteDslFusedMoEMethod`, applied once per slot after the
-  parent's deferred swizzle, and undone before a partial refit writes one
-  projection of a finalized slot).
+  granularity 64 (`MXFP8CuteDslFusedMoEMethod`). The weight is written in that
+  layout at load time, each projection through a strided view of its slot, so
+  a refit of one projection overwrites only its own rows. The scales of a slot
+  whose two projections both arrive are interleaved on the raw rows and then
+  swizzled once at finalize; a refit of one projection's scales first returns
+  a finalized slot to the parent's layout, and the next finalize reapplies the
+  interleave to the whole slot.
 - Per-expert `fc1_alpha` / `fc2_alpha` and the FC1 `norm_const` are 1.0 for
   MXFP8 (all scaling lives in the block scales).
 - The output is accumulated into, so `moe_output_memset_inplace` must run
@@ -650,11 +654,12 @@ finalize (scatter-add) into one persistent kernel, driven through
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
   `l2_atomic` / `static`. The outer `CuteDslFusedMoEMxfp8Runner` tunes the
   routing tile and the comb checker pins the inner `mma_tiler_m` to it.
-- **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
-  than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
+- **DSL build requirement.** The kernel needs a newer CuTe DSL build (the
+  `nvidia-cutlass-dsl` version pinned in `requirements.txt`, 4.8.0) than the
+  bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
   `IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE` (true when `cutlass.memory` and
-  `cutlass.tensor_utils` are importable, i.e. builds like `0.3.0+20260803` and
-  newer), which the op registration and `MoEDep.CUTEDSL_MXFP8_FUSED_FC12_RUBIN` read.
+  `cutlass.tensor_utils` are importable, as in `nvidia-cutlass-dsl` 4.8.0),
+  which the op registration and `MoEDep.CUTEDSL_MXFP8_FUSED_FC12_RUBIN` read.
   An older build (e.g. `0.3.0+20260518`, which compiles the kernel but
   miscomputes its MXFP8 path) degrades the layer to Cutlass.
 
