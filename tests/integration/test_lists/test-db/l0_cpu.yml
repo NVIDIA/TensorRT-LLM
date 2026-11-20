@@ -183,6 +183,10 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_weight_table.py
+  - unittest/_torch/modeling_v2/models/inkling2/test_config.py
+  - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_cache.py
+  - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_modeling.py
+  - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_weights.py
   # The Kimi K3 SM107 targets' cpu_only cases: CuTe DSL hint tables, the FP4 MLA
   # decode plan geometry, each target's constants and model defaults, the routing
   # of the recipes' mappings, the context MLA split-K dispatch gates, the

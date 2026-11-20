@@ -187,6 +187,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/inkling2/ops TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default TIMEOUT (30)
   # GLM-5.3-Flash FP8 modeling_v2 target (sm_100 / sm_103): its operations. The 4-rank boundary matrix runs in
