@@ -8377,12 +8377,12 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
     """
     backend_type = MoeBackendType.CUTEDSL
     # Same gate as TrtllmCutedslFusedFc12Mxfp8Impl.can_implement: the fused
-    # FC1+FC2 kernel needs Rubin and a CuTE DSL internal build with the fused
-    # FC12 submodules.
+    # FC1+FC2 kernel needs Rubin and a CuTe DSL build with the fused FC12
+    # submodules.
     if get_sm_version() != 107:
         pytest.skip(f"CuteDSL MXFP8 fused FC12 requires SM107 (Rubin), got SM{get_sm_version()}")
     if not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
-        pytest.skip("MXFP8 on SM107 requires a CuTE DSL internal build with the fused FC12 kernel")
+        pytest.skip("MXFP8 on SM107 requires a CuTe DSL build with the fused FC12 kernel")
     dtype = torch.bfloat16
     skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
 
