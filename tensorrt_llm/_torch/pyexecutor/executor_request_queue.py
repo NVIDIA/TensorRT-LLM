@@ -378,7 +378,6 @@ class ExecutorRequestQueue:
         timeout: Optional[datetime.timedelta],
         *,
         wait_for_batch: bool = True,
-        batch_wait_deadline: Optional[float] = None,
         idle_tick: Optional[Callable[[],
                                      float]] = None) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
@@ -386,7 +385,6 @@ class ExecutorRequestQueue:
         Args:
             timeout: Optional timeout for waiting on queue.
             wait_for_batch: Whether to wait for additional items to fill a batch.
-            batch_wait_deadline: Optional monotonic deadline limiting batch-fill waiting.
             idle_tick: Optional callback used while blocked on an empty queue.
                 It runs before each wait and returns the seconds until it
                 should run again, so the caller can do periodic local work
@@ -423,8 +421,6 @@ class ExecutorRequestQueue:
             return items
 
         deadline = time.monotonic() + self.batch_wait_timeout_ms / 1000.0
-        if batch_wait_deadline is not None:
-            deadline = min(deadline, batch_wait_deadline)
         while len(items) < self.max_batch_size:
             remaining_timeout = deadline - time.monotonic()
 

@@ -6889,102 +6889,6 @@
         }
       }
     },
-    "observability-202": {
-      "kind": "Panel",
-      "spec": {
-        "id": 202,
-        "title": "Prefill - Request KV transfer duration p50/p95",
-        "description": "Completed-request KV-transfer start/end duration, counted once across output candidates. Includes only supplied valid measurements. Prefill and decode observations are separate. The elapsed time can differ from the request stall.",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "@@PROMETHEUS_UID@@"
-                    },
-                    "spec": {
-                      "expr": "histogram_quantile(0.5,sum by(le,pod)(rate(trtllm_kv_cache_transfer_duration_seconds_bucket{job=~\"@@METRIC_JOBS@@\",namespace=\"$namespace\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\"}[5m])))",
-                      "legendFormat": "{{pod}} / p50",
-                      "refId": "A"
-                    }
-                  },
-                  "refId": "A",
-                  "hidden": false
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "@@PROMETHEUS_UID@@"
-                    },
-                    "spec": {
-                      "expr": "histogram_quantile(0.95,sum by(le,pod)(rate(trtllm_kv_cache_transfer_duration_seconds_bucket{job=~\"@@METRIC_JOBS@@\",namespace=\"$namespace\",pod=~\"${role:raw}\",pod=~\"${prefill_worker:regex}\",pod=~\"@@PREFILL_PODS@@\"}[5m])))",
-                      "legendFormat": "{{pod}} / p95",
-                      "refId": "B"
-                    }
-                  },
-                  "refId": "B",
-                  "hidden": false
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "last"
-                ],
-                "displayMode": "table",
-                "placement": "bottom"
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "unit": "s",
-                "noValue": "—",
-                "custom": {
-                  "drawStyle": "line",
-                  "lineInterpolation": "linear",
-                  "lineWidth": 2,
-                  "showPoints": "never",
-                  "spanNulls": false,
-                  "stacking": {
-                    "mode": "none",
-                    "group": "A"
-                  }
-                }
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
     "observability-203": {
       "kind": "Panel",
       "spec": {
@@ -7294,7 +7198,7 @@
       "spec": {
         "id": 209,
         "title": "Decode - Request KV transfer duration p50/p95",
-        "description": "Completed-request KV-transfer start/end duration, counted once across output candidates. Includes only supplied valid measurements. Prefill and decode observations are separate. The elapsed time can differ from the request stall.",
+        "description": "Completed generation-side request KV-transfer duration, counted once across output candidates. Includes valid start and end measurements. The elapsed time can differ from the request stall.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -8900,30 +8804,6 @@
                       "element": {
                         "kind": "ElementReference",
                         "name": "observability-199"
-                      },
-                      "conditionalRendering": {
-                        "kind": "ConditionalRenderingGroup",
-                        "spec": {
-                          "visibility": "show",
-                          "condition": "and",
-                          "items": [
-                            {
-                              "kind": "ConditionalRenderingData",
-                              "spec": {
-                                "value": true
-                              }
-                            }
-                          ]
-                        }
-                      }
-                    }
-                  },
-                  {
-                    "kind": "AutoGridLayoutItem",
-                    "spec": {
-                      "element": {
-                        "kind": "ElementReference",
-                        "name": "observability-202"
                       },
                       "conditionalRendering": {
                         "kind": "ConditionalRenderingGroup",

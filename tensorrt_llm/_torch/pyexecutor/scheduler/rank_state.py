@@ -11,6 +11,24 @@ from typing import ClassVar, NamedTuple
 from ..kv_cache_stats import ConversationActivityStats
 
 
+class RankTransferOutcomes(NamedTuple):
+    success: int
+    error: int
+    timeout: int
+
+    @classmethod
+    def wire_size(cls) -> int:
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, values: list[int | float]) -> RankTransferOutcomes:
+        if len(values) != cls.wire_size() or any(
+            value < 0 or value != int(value) for value in values
+        ):
+            raise ValueError("Transfer outcome counters must be nonnegative integers")
+        return cls(*(int(value) for value in values))
+
+
 class RankKvCacheStats(NamedTuple):
     """Immutable rank-local KV snapshot containing only transportable scalars."""
 
@@ -255,7 +273,8 @@ class RankIterStatsPayload:
             + int(data[4]) * RankSpecDecodingStats.wire_size()
             + int(data[5]) * RankSchedulingCounters.wire_size()
             + (
-                3 * int(data[6]) + len(ConversationActivityStats._fields) * int(data[7])
+                RankTransferOutcomes.wire_size() * int(data[6])
+                + ConversationActivityStats.wire_size() * int(data[7])
                 if has_observations
                 else 0
             )
@@ -306,21 +325,13 @@ class RankIterStatsPayload:
                 result.has_pending_work = bool(values[queue_end])
                 cursor = queue_end + 1
             if has_observations and values[6]:
-                counts = values[cursor : cursor + 3]
-                if any(value < 0 or value != int(value) for value in counts):
-                    raise ValueError("Transfer outcome counters must be nonnegative integers")
-                result.kv_transfer_outcomes = tuple(int(value) for value in counts)
-                cursor += 3
+                end = cursor + RankTransferOutcomes.wire_size()
+                result.kv_transfer_outcomes = RankTransferOutcomes.deserialize(values[cursor:end])
+                cursor = end
             if has_observations and values[7]:
-                activity = values[cursor:]
-                if any(value < 0 or value != int(value) for value in activity) or any(
-                    activity[index] not in (0, 1) for index in (1, 5)
-                ):
-                    raise ValueError(
-                        "Conversation activity requires nonnegative integers and boolean completeness"
-                    )
-                result.conversation_activity = ConversationActivityStats(
-                    *(int(value) for value in activity)
+                end = cursor + ConversationActivityStats.wire_size()
+                result.conversation_activity = ConversationActivityStats.deserialize(
+                    values[cursor:end]
                 )
             return result
         scalar_field_count = cls._ITER_STATS_FIELD_COUNT + cls._KV_LOAD_FIELD_COUNT

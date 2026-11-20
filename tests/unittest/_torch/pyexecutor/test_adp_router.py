@@ -263,7 +263,7 @@ class TestRankState:
         with pytest.raises(ValueError):
             RankIterStatsPayload.deserialize(wire[:-1])
         if activity is not None:
-            wire[-3] = 2  # The 1h completeness field must be boolean.
+            wire[-4] = 2  # The 1h completeness field must be boolean.
             with pytest.raises(ValueError):
                 RankIterStatsPayload.deserialize(wire)
 

@@ -95,6 +95,7 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
+from .conversation_activity import ConversationActivityTracker
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
@@ -112,7 +113,7 @@ from .hang_detector import (HangDetector, distributed_warmup_guard,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .iteration_stats import IterationStatsRecord
-from .kv_cache.kv_cache_manager_v2 import ConversationManager, KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
 from .kv_cache_load import KvLoadTracker, aggregate_load
@@ -1631,9 +1632,11 @@ class PyExecutor:
                 "KV cache iteration stats are reported every "
                 f"{math.lcm(self._kv_iter_stats_interval, self.iter_perf_stats_interval)} "
                 "iterations.")
-        self._conversation_manager: Optional[ConversationManager] = (
-            self.kv_cache_manager.enable_conversation_activity()
-            if self._is_kv_manager_v2 and self.enable_iter_perf_stats else None)
+        self._conversation_activity = (
+            ConversationActivityTracker() if self.enable_iter_perf_stats and
+            (self.enable_attention_dp or self.dist.rank == 0) else None)
+        self._next_adp_activity_refresh = math.inf
+        self._conversation_activity_refresh = math.inf
         self._conversation_activity_capture_time = float("-inf")
         self._conversation_activity_cached: Optional[
             ConversationActivityStats] = None
@@ -1641,7 +1644,7 @@ class PyExecutor:
             int, int, int]], Optional[ConversationActivityStats]]] = {}
         self._adp_iter_stats = ADPIterStatsBuffer(
             activity_snapshot=self._snapshot_conversation_activity
-            if self._conversation_manager is not None else None,
+            if self._conversation_activity is not None else None,
             transfer_outcomes_snapshot=self._snapshot_transfer_outcomes)
         # Per-loop CPU wall and GPU forward time captured by the profile_step
         # closure (see _profiler). Populated whenever enable_iter_perf_stats or
@@ -3036,10 +3039,24 @@ class PyExecutor:
 
         with self.stats_lock:
             latest_stats, self.stats = self.stats, []
-            latest_stats.extend(
-                ("per_rank_dict", row)
-                for row in self._pending_rank_observations.values())
-            self._pending_rank_observations.clear()
+            pending = self._pending_rank_observations
+            if pending:
+                for index in range(len(latest_stats) - 1, -1, -1):
+                    entry = latest_stats[index]
+                    if isinstance(entry, str):
+                        row = json.loads(entry)
+                    elif isinstance(entry, IterationStatsRecord):
+                        if (entry.attention_dp_rank or 0) not in pending:
+                            continue
+                        row = entry.to_dict()
+                    else:
+                        continue
+                    fields = pending.pop(row.get("attentionDpRank", 0), None)
+                    if fields is not None:
+                        row.update(fields)
+                        latest_stats[index] = ("per_rank_dict", row)
+                    if not pending:
+                        break
         return latest_stats
 
     def _read_kv_cache_capacity(self) -> dict:
@@ -3983,13 +4000,6 @@ class PyExecutor:
         # are fanned out pre-serialized by the ADP buffer, so this path leaves
         # it unset.
         attention_dp_rank = None
-        loop_metrics = None
-        runtime_metrics = getattr(self, "_perf_metrics", None)
-        if (attention_dp_rank is None or attention_dp_rank
-                == self.dist.rank) and runtime_metrics is not None:
-            loop = runtime_metrics.latest_loop
-            if loop is not None:
-                loop_metrics = {"kind": "loop", "per_iter": dict(loop.per_iter)}
 
         mm_encoder_stats = self._take_mm_encoder_stats()
         entry = IterationStatsRecord(
@@ -4002,7 +4012,7 @@ class PyExecutor:
             scheduler_mode=scheduler_mode,
             gpu_forward_time_ms=gpu_forward_time_ms,
             mm_encoder_stats=mm_encoder_stats,
-            executor_loop=loop_metrics)
+            executor_loop=PyExecutor._latest_executor_loop_metrics(self))
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
@@ -4021,6 +4031,14 @@ class PyExecutor:
                     and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
             self.stats.append(entry)
+
+    def _latest_executor_loop_metrics(self) -> Optional[dict]:
+        runtime_metrics = getattr(self, "_perf_metrics", None)
+        loop = runtime_metrics.latest_loop if runtime_metrics is not None else None
+        return {
+            "kind": "loop",
+            "per_iter": dict(loop.per_iter)
+        } if loop is not None else None
 
     def _stats_scheduler_mode(self) -> str:
         """Per-record indicator so consumers can interpret iterLatencyMS without
@@ -4177,7 +4195,9 @@ class PyExecutor:
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                executor_loop=(PyExecutor._latest_executor_loop_metrics(self)
+                               if self.dist.rank == 0 else None))
         else:
             self._append_iter_stats(
                 stats,
@@ -5934,7 +5954,9 @@ class PyExecutor:
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
             is_kv_manager_v2=is_kv_manager_v2,
-            defer_unready_gen_receives=defer_unready_gen_receives)
+            defer_unready_gen_receives=defer_unready_gen_receives,
+            enable_transfer_metrics=getattr(self, "enable_iter_perf_stats",
+                                            False))
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:
@@ -6841,7 +6863,7 @@ class PyExecutor:
 
         # RankState built exactly as _fetch_new_requests does (next_payload
         # only peeks; finalize consumes once the states are aligned).
-        iter_stats_payload = (self._adp_iter_stats.next_payload()
+        iter_stats_payload = (self._adp_iter_stats.payload_for_exchange()
                               if self.enable_iter_perf_stats else None)
         if self.enable_iter_perf_stats:
             iter_stats_payload = self._with_pending_work_flag(
@@ -9054,15 +9076,23 @@ class PyExecutor:
 
     def _snapshot_conversation_activity(
             self) -> Optional[ConversationActivityStats]:
-        """Capture at most once per second on the executor thread, including idle passes."""
-        manager = getattr(self, "_conversation_manager", None)
-        if manager is None or not self.enable_iter_perf_stats:
+        """Refresh on the executor thread at window expiry or after one second."""
+        tracker = getattr(self, "_conversation_activity", None)
+        if tracker is None or not self.enable_iter_perf_stats:
             return None
         now = time.monotonic()
-        if now - self._conversation_activity_capture_time >= 1.0:
-            self._conversation_activity_cached = manager.snapshot_activity(now)
+        if (now >= self._conversation_activity_refresh
+                or now - self._conversation_activity_capture_time >= 1.0):
+            self._conversation_activity_cached = tracker.snapshot_activity(now)
             self._conversation_activity_capture_time = now
-        return self._conversation_activity_cached
+            self._conversation_activity_refresh = tracker.next_refresh(now)
+        snapshot = self._conversation_activity_cached
+        if snapshot is not None and self.enable_attention_dp and math.isfinite(
+                self._conversation_activity_refresh):
+            return snapshot._replace(refresh_after_ms=max(
+                1, math.ceil((self._conversation_activity_refresh - now) *
+                             1000)))
+        return snapshot
 
     def _snapshot_transfer_outcomes(self) -> Optional[tuple[int, int, int]]:
         if not self.enable_iter_perf_stats:
@@ -9073,8 +9103,10 @@ class PyExecutor:
     def _publish_rank_observations(self,
                                    rank_states: Optional[List[RankState]] = None
                                    ) -> None:
-        """Publish changed endpoint observations independently of iterations."""
-        if not self.enable_iter_perf_stats or self.dist.rank != 0:
+        """Stage changed endpoint observations for the next exported row on each rank."""
+        if (not getattr(self, "enable_iter_perf_stats", False)
+                or self.dist.rank != 0
+                or not hasattr(self, "_pending_rank_observations")):
             return
         if rank_states is None:
             if self.enable_attention_dp:
@@ -9082,23 +9114,34 @@ class PyExecutor:
             snapshots = ((0, self._snapshot_transfer_outcomes(),
                           self._snapshot_conversation_activity()), )
         else:
-            snapshots = ((state.rank, state.iter_stats.kv_transfer_outcomes,
+            snapshots = [(state.rank, state.iter_stats.kv_transfer_outcomes,
                           state.iter_stats.conversation_activity)
-                         for state in rank_states)
-        with self.stats_lock:
-            for rank, outcomes, activity in snapshots:
-                snapshot = (outcomes, activity)
-                if snapshot == (None, None) or self._last_rank_observations.get(
-                        rank) == snapshot:
-                    continue
-                row = {"attentionDpRank": rank}
-                if outcomes is not None:
-                    row["kvTransferOutcomes"] = dict(
-                        zip(("success", "error", "timeout"), outcomes))
-                if activity is not None:
-                    row["conversationActivity"] = activity.to_dict()
-                self._pending_rank_observations[rank] = row
-                self._last_rank_observations[rank] = snapshot
+                         for state in rank_states]
+            self._next_adp_activity_refresh = time.monotonic() + min(
+                (activity.refresh_after_ms / 1000
+                 for _, _, activity in snapshots
+                 if activity is not None and activity.refresh_after_ms),
+                default=math.inf)
+        changed = {}
+        for rank, outcomes, activity in snapshots:
+            if activity is not None and activity.refresh_after_ms:
+                activity = activity._replace(refresh_after_ms=0)
+            snapshot = (outcomes, activity)
+            if snapshot == (
+                    None,
+                    None) or self._last_rank_observations.get(rank) == snapshot:
+                continue
+            fields = {}
+            if outcomes is not None:
+                fields["kvTransferOutcomes"] = dict(
+                    zip(("success", "error", "timeout"), outcomes))
+            if activity is not None:
+                fields["conversationActivity"] = activity.to_dict()
+            changed[rank] = fields
+            self._last_rank_observations[rank] = snapshot
+        if changed:
+            with self.stats_lock:
+                self._pending_rank_observations.update(changed)
 
     def _idle_kv_transfer_poll_timeout(self) -> Optional[datetime.timedelta]:
         """Idle request-queue wait bound while context KV transfers are tracked.
@@ -9185,7 +9228,10 @@ class PyExecutor:
                 None (attention DP off, PP/CP, or non-ADP callers) keeps the
                 probe path unchanged.
         """
-        self._publish_rank_observations()
+        if (not self.enable_attention_dp
+                and getattr(self, "enable_iter_perf_stats", False)
+                and hasattr(self, "_pending_rank_observations")):
+            self._publish_rank_observations()
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # Continue the existing broadcast slot for cancellations during drain.
@@ -9266,22 +9312,9 @@ class PyExecutor:
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
-            activity_wait_kwargs = {}
-            if idle and getattr(
-                    self, "_conversation_manager",
-                    None) is not None and self.enable_iter_perf_stats:
-                wait_budget = min(1.0, poll_timeout.total_seconds()
-                                  ) if poll_timeout is not None else 1.0
-                idle_tick = None
-                activity_wait_kwargs["batch_wait_deadline"] = time.monotonic(
-                ) + wait_budget
-                activity_timeout = datetime.timedelta(seconds=1)
-                timeout = activity_timeout if timeout is None else min(
-                    timeout, activity_timeout)
             fetch_kwargs = {
                 "wait_for_batch": not (pending_retirement or self.is_shutdown)
             }
-            fetch_kwargs.update(activity_wait_kwargs)
             if idle_tick is not None:
                 fetch_kwargs["idle_tick"] = idle_tick
             self._fetch_may_block = (timeout is None
@@ -9433,6 +9466,13 @@ class PyExecutor:
         if adp_stats.last_idle_rank_states is not None:
             # This pass fanned out an idle heartbeat: the peers' rows are
             # current.
+            activity_refresh = getattr(self, "_next_adp_activity_refresh",
+                                       math.inf)
+            if math.isfinite(activity_refresh):
+                # One exchange at the next possible change, while the local
+                # heartbeats continue without waking peers.
+                remaining = max(0.0, activity_refresh - time.monotonic())
+                timeout = at_most(datetime.timedelta(seconds=remaining))
             return timeout, self._idle_heartbeat_tick
         due = datetime.timedelta(
             seconds=max(0.0, self._next_idle_heartbeat_time - time.monotonic()))
@@ -9455,6 +9495,7 @@ class PyExecutor:
             rows = self._adp_iter_stats.make_idle_heartbeat_rows(
                 stats, self._stats_scheduler_mode())
         else:
+            PyExecutor._publish_rank_observations(self)
             rows = [self._zero_duration_stats_row(stats)]
         self._publish_idle_heartbeat(rows)
         self._next_idle_heartbeat_time = (time.monotonic() +
@@ -9777,7 +9818,7 @@ class PyExecutor:
                     and ADPIterStatsBuffer.rank0_sent_payload(all_rank_states)):
                 return
             all_rank_states = self.adp_router.gather_iter_stats(
-                self._adp_iter_stats.next_payload())
+                self._adp_iter_stats.payload_for_exchange())
             if not ADPIterStatsBuffer.rank0_sent_payload(all_rank_states):
                 # Nothing is left to fan out, and finalize() would only
                 # forget what the last fanout was: the idle wait is planned
@@ -9816,8 +9857,9 @@ class PyExecutor:
             all_rank_states = getattr(self, "_prefetched_rank_states", None)
             self._prefetched_rank_states = None
             if all_rank_states is None:
-                iter_stats_payload = (self._adp_iter_stats.next_payload()
-                                      if self.enable_iter_perf_stats else None)
+                iter_stats_payload = (
+                    self._adp_iter_stats.payload_for_exchange()
+                    if self.enable_iter_perf_stats else None)
                 if self.enable_iter_perf_stats:
                     iter_stats_payload = self._with_pending_work_flag(
                         iter_stats_payload)
@@ -9999,12 +10041,13 @@ class PyExecutor:
             _should_exclude_last_generation_logits(),
             is_disagg=self.kv_cache_transceiver is not None,
             track_unique_tokens=self.track_unique_tokens)
-        conversation_manager = getattr(self, "_conversation_manager", None)
-        if conversation_manager is not None and admitted_requests and self.enable_iter_perf_stats:
+        activity = getattr(self, "_conversation_activity", None)
+        if activity is not None and admitted_requests:
             now = time.monotonic()
             for request in admitted_requests:
-                if not request.is_child:
-                    conversation_manager.observe_admission(request, now)
+                if not request.is_child and activity.observe_admission(
+                        request, now):
+                    self._conversation_activity_capture_time = -math.inf
         return admitted_requests
 
     def _cancel_queued_context_requests(self,
@@ -12709,8 +12752,7 @@ class PyExecutor:
                         source_kv_request_owned=False,
                     )
         self._prefetched_request_ids.discard(request.py_request_id)
-        self.disagg.forget_request(request.py_request_id,
-                                   transfer_id=get_unique_rid(request))
+        self.disagg.forget_request(request)
         for engine in (self.model_engine, self.draft_model_engine):
             release = getattr(getattr(engine, "model", None),
                               "release_request_state", None)

@@ -42,11 +42,11 @@ def _admission_executor(
         enable_attention_dp=True,
         max_num_active_requests=batch_size,
         enable_iter_perf_stats=True,
-        _adp_iter_stats=SimpleNamespace(next_payload=lambda: None),
+        _adp_iter_stats=SimpleNamespace(payload_for_exchange=lambda: None),
         _with_pending_work_flag=lambda payload: payload,
         _publish_adp_iter_stats=lambda *args, **kwargs: None,
         _update_new_active_requests_queue_latency=lambda requests: None,
-        _conversation_manager=SimpleNamespace(
+        _conversation_activity=SimpleNamespace(
             observe_admission=lambda request, now: observed.append(request)
         ),
         observed_conversation_admissions=observed,
@@ -87,7 +87,8 @@ def _fetch_all_ranks(
     # Produce peer payloads through the real router before simulating transport.
     payloads = []
     for executor, active in zip(executors, residents, strict=True):
-        executor.dist.tp_allgather_int64 = lambda payload: np.asarray([payload], dtype=np.int64)
+        executor.dist.tp_allgather_int64 = lambda payload: [np.asarray(payload)]
+        executor.dist.tp_allgather = lambda payload: [payload]
         state = executor.adp_router.gather_all_rank_states(active)[0]
         payloads.append(state.serialize())
 
@@ -95,13 +96,9 @@ def _fetch_all_ranks(
     for rank, (executor, queue, active) in enumerate(
         zip(executors, queues, residents, strict=True)
     ):
-        executor.dist.tp_allgather_int64 = lambda payload, rank=rank: np.asarray(
-            [
-                payload if peer == rank else peer_payload
-                for peer, peer_payload in enumerate(payloads)
-            ],
-            dtype=np.int64,
-        )
+        executor.dist.tp_allgather = lambda payload, rank=rank: [
+            payload if peer == rank else peer_payload for peer, peer_payload in enumerate(payloads)
+        ]
         admitted.append(PyExecutor._fetch_new_requests(executor, queue, active))
     return admitted
 

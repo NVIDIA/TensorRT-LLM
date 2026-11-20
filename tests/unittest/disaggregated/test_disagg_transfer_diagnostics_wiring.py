@@ -1493,9 +1493,7 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert request.py_request_id not in executor._prefetched_request_ids
-    executor._disagg_coordinator.forget_request.assert_called_once_with(
-        request.py_request_id, transfer_id=5051
-    )
+    executor._disagg_coordinator.forget_request.assert_called_once_with(request)
     for engine in (executor.model_engine, executor.draft_model_engine):
         engine.model.release_request_state.assert_called_once_with(request.py_request_id)
 
@@ -1805,6 +1803,8 @@ def test_shared_receive_outcome_is_counted_once_until_last_candidate_is_forgotte
         request.is_child, request.parent_request_id = True, 10
         request.py_kv_transfer_timed_out = outcome == "timeout"
     coordinator = _coordinator(active_requests=requests)
+    coordinator._transfer_outcomes = [0, 0, 0]
+    coordinator._started_gen_receives = {request.py_request_id: request for request in requests}
     coordinator._check_transfer_errors = Mock()
     coordinator.inflight_cancel_active = lambda: False
     coordinator._transceiver.check_gen_transfer_status = Mock(
@@ -1817,10 +1817,11 @@ def test_shared_receive_outcome_is_counted_once_until_last_candidate_is_forgotte
     assert coordinator.transfer_outcomes == expected
     while requests:
         request = requests.pop(0)
-        coordinator.forget_request(request.py_request_id, transfer_id=73)
+        coordinator.forget_request(request)
         coordinator.reap_gen_receives()
         assert coordinator.transfer_outcomes == expected
     requests.append(_disagg_request(3, 73))
+    coordinator._started_gen_receives[3] = requests[-1]
     coordinator._transceiver.check_gen_transfer_status.return_value = GenTransferStatus(
         [73], [], []
     )

@@ -28,6 +28,23 @@ class ConversationActivityStats(NamedTuple):
     complete_1h: int
     overflow_entries_1h: int
     overflow_bytes_1h: int
+    refresh_after_ms: int = 0
+
+    @classmethod
+    def wire_size(cls) -> int:
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, values: list[int | float]) -> "ConversationActivityStats":
+        """Restore the activity snapshot from its integer wire fields."""
+        if len(values) != cls.wire_size() or any(
+            value < 0 or value != int(value) for value in values
+        ):
+            raise ValueError("Conversation activity requires nonnegative integer fields")
+        activity = cls(*(int(value) for value in values))
+        if activity.complete_10m not in (0, 1) or activity.complete_1h not in (0, 1):
+            raise ValueError("Conversation activity requires boolean completeness")
+        return activity
 
     def to_dict(self) -> dict[str, dict[str, int]]:
         return {

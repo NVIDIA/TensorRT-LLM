@@ -75,23 +75,25 @@ Set request histogram buckets in seconds through `prometheus_metrics_config`.
   error, and timeout once per transfer on each reporting rank. CTX sends and GEN
   receives count their own endpoints. User cancellation alone is excluded.
   `trtllm_kv_cache_transfer_duration_seconds` and `trtllm_kv_cache_transfer_bytes_total`
-  use completed-request observations.
+  use completed generation-side request observations.
 - **Tier capacity and movement.** `trtllm_kv_cache_tier_{blocks,bytes}` reports
   free, evictable, and unavailable capacity per level and pool group. The exported
   unavailable remainder includes retained cold copies that can be reclaimed.
   `trtllm_kv_cache_tier_moved_{blocks,bytes}_total` counts accepted restores,
-  evictions, and drops. Its byte totals use logical slot sizes. Detailed tier
+  evictions, and drops. Evictions count changes in residency, including reuse
+  of retained copies. Its byte totals use logical slot sizes. Detailed tier
   snapshots report rank 0 under attention DP.
 - **Conversation activity.** `trtllm_kv_cache_num_conversations` counts retention
   entries, including saved plans. `trtllm_conversation_unique_seen` counts distinct
   conversation identities admitted by a worker in rolling `10m` and `1h` windows.
   Workers can see the same identity, so summing their counts can double-count it. Use
   `trtllm_conversation_unique_seen_complete` to identify full windows. The fixed
-  limits are 100,000 window entries and 16 MiB of accounted identity storage.
-  Capacity skips increment `trtllm_conversation_tracking_overflow_total`.
+  limits are 100,000 distinct identities and 16 MiB of accounted identity storage.
+  Capacity skips increment `trtllm_conversation_tracking_overflow_total`. The exporter
+  updates these gauges when it drains iteration stats, including idle heartbeats.
 - **Executor timing.** Host and GPU forward histograms observe measured rank-0
   iterations. The previous device-step gauge lags by one loop. Per-loop work
-  metrics use the producing `global_rank`.
+  metrics use the producing `global_rank`. Attention DP publishes loop metrics from rank 0.
 
 ## Transport cost and KV utilization semantics
 

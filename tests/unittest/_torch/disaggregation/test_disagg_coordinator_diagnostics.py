@@ -390,7 +390,7 @@ def test_deferred_receive_diagnostics_follow_publication_not_admission(
     emit.assert_not_called()
 
     if action == "forget":
-        h.coordinator.forget_request(request.py_request_id)
+        h.coordinator.forget_request(request)
     elif action == "terminate":
         request.state = LlmRequestState.GENERATION_COMPLETE
     fence.query.return_value = True

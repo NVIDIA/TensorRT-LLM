@@ -1521,7 +1521,10 @@ void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, Ca
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, lifeCycle);
     PageIndexPair const pageIndex{slotIdToPageIndexValue(dstSlotId), slotIdToPageIndexValue(srcSlotId)};
     submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, &pageIndex, 1, stream);
-    recordMigration(dstLevel, srcLevel, batchingLayerGroupId, 1);
+    if (dstLevel < srcLevel)
+    {
+        recordMigration(dstLevel, srcLevel, batchingLayerGroupId, 1);
+    }
 }
 
 CacheTier StorageManager::cacheTier(CacheLevel level) const
@@ -2727,7 +2730,6 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             {
                 submitMigrationBatch(
                     dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(), stream);
-                recordMigration(dstLevel, srcLevel, batchingLayerGroupId, pageIndices.size());
             }
         }
         updateReadyEvents.run();
@@ -2801,6 +2803,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 if (wasScheduled)
                     scheduleForEviction(*srcPages.at(i));
             }
+        }
+        if (updateSrc && !defrag)
+        {
+            recordMigration(dstLevel, srcLevel, batchingLayerGroupId, srcPages.size());
         }
         mDiskCopyCounters.reused += static_cast<uint64_t>(numSlots - numNewSlots);
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::move(dstSlots)};

@@ -1148,7 +1148,7 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently() -
     assert request.py_mm_encoder_state is None
     assert request.py_multimodal_data == {}
     assert executor._prefetched_request_ids == set()
-    executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
+    executor._disagg_coordinator.forget_request.assert_called_once_with(request)
     stats = cache.stats()
     assert (stats.item_count, stats.in_use_bytes, stats.reserved_bytes) == (0, 0, 0)
 

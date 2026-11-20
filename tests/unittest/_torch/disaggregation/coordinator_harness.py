@@ -124,6 +124,7 @@ class CoordinatorHarness:
             admission_controller=admission_controller,
             is_kv_manager_v2=is_kv_manager_v2,
             defer_unready_gen_receives=defer_unready_gen_receives,
+            enable_transfer_metrics=True,
         )
 
     def send(self, *requests: TransferRequest) -> None:
