@@ -1804,12 +1804,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self, view: Optional[TokenMajorGenView]) -> Iterator[None]:
         """Temporarily present the generation half as one row per query token.
 
-        The MLA rope and sparse-MLA generation ops learn their sequence count
-        from ``host_context_lengths.size(0)`` and then require the query tokens
-        to divide evenly across it. A ragged batch does not divide. Swapping in
-        per-token views for the duration of those two calls makes the division
-        trivial (seq_len == 1) and satisfies their asserts rather than weakening
-        them.
+        The MLA rope and the dense and sparse MLA generation ops learn their
+        sequence count from ``host_context_lengths.size(0)`` and then require
+        the query tokens to divide evenly across it. A ragged batch does not
+        divide. Swapping in per-token views for the duration of those calls
+        makes the division trivial (seq_len == 1) and satisfies their asserts
+        rather than weakening them.
 
         Scoped deliberately: ``num_seqs`` is read as a *request* count almost
         everywhere else -- spec workers sizing acceptance rectangles, the

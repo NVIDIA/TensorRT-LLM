@@ -2640,7 +2640,11 @@ class DFlashWorker(SpecWorkerBase):
         """
 
     def _gen_target_rows(
-        self, captured_hs: torch.Tensor, spec_metadata, gen_start: int, num_gens: int
+        self,
+        captured_hs: torch.Tensor,
+        spec_metadata: SpecMetadata,
+        gen_start: int,
+        num_gens: int,
     ) -> torch.Tensor:
         """The ``K + 1`` captured target rows of every generation request, request-major.
 

@@ -819,8 +819,8 @@ def get_spec_worker(spec_config,
     # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose rolling-window
     # plumbing reads V4-draft-only attributes (num_stages, write_context_windows,
     # forward_batched). A standalone drafter is DFlash lineage and is served by
-    # DSparkWorker, which adds only the Markov bias and the shift_label
-    # slot convention on top of DFlashWorker.
+    # DSparkWorker, which adds the Markov bias, the shift_label slot
+    # convention and the confidence state on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
         if spec_config.draft_is_embedded_in_target:
             if spec_config.use_ancestral_draft_sampling:

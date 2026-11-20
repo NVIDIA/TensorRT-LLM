@@ -287,14 +287,17 @@ does not describe the step times of a server that runs with it.
 On GB300 with the MXFP4 checkpoint, confidence scheduling raised output
 throughput over the best fixed draft length by 1.8% to 5.2% for TEP8 at
 concurrency 16, and by 3.2% to 4.3% for DEP16 at concurrency 512
-(`trtllm-bench`, Arena-Hard prompts). GSM8K accuracy matched the fixed draft
-length within noise. No gain was measured for TEP8 at 8 or fewer concurrent
-requests, or for TEP16.
+(`trtllm-bench`, Arena-Hard prompts). The DEP16 runs set
+`kv_cache_config.dtype: fp8`; the TEP8 range covers runs with that setting
+and with the default BF16 KV cache, which had the same decode step times.
+GSM8K accuracy matched the fixed draft length within noise. No gain was
+measured for TEP8 at 8 or fewer concurrent requests, or for TEP16.
 
 Confidence scheduling is validated for TEP8 and DEP16 on GB300. The
-limitations of the DeepSeek-V4 section apply. In addition, an NVFP4 or
-mixed-precision KV cache is rejected when confidence scheduling is enabled
-for Kimi K3.
+limitations of the DeepSeek-V4 section apply. In addition, Kimi K3 requires
+KV cache manager V2 (`kv_cache_config.use_kv_cache_manager_v2: true`, the
+default) and rejects an NVFP4 or mixed-precision KV cache when confidence
+scheduling is enabled.
 
 ## Current limitations
 

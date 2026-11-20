@@ -34,6 +34,7 @@ import statistics
 import subprocess  # nosec B404 - runs sys.executable workers with a fixed argv, no shell
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 import yaml
@@ -116,7 +117,7 @@ def without_adp_balance(config: dict) -> dict:
     return dict(config, attention_dp_config=dict(adp_config, enable_balance=False))
 
 
-def with_profile_environment(config: dict, environ) -> dict:
+def with_profile_environment(config: dict, environ: Mapping[str, str]) -> dict:
     """``config`` that hands the profiler's settings in ``environ`` to every rank.
 
     Each rank's executor reads them from its own environment. Ranks started

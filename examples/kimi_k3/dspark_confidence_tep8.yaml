@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Kimi K3 TEP8 (TP8 attention, EP8 MoE; 8 GPUs on two GB300 nodes) with a
-# standalone DSpark drafter and confidence scheduling. The keys outside
-# speculative_config follow the TEP8 recipe of perf_sweep/perf_sweep.sbatch;
+# standalone DSpark drafter and confidence scheduling. The parallel layout,
+# scheduler and KV cache keys follow the TEP8 recipe of
+# perf_sweep/perf_sweep.sbatch, which also sets stream_interval for serving;
 # see "DSpark confidence scheduling" in README.md for the cost table.
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8

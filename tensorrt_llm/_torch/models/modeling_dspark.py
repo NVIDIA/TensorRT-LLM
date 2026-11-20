@@ -137,6 +137,7 @@ from .modeling_speculative import (
     _draft_moe_selection,
     _mxfp4_run_quant_config,
     build_markov_head,
+    markov_prev_embeddings,
 )
 from .modeling_utils import (
     DecoderModel,
@@ -4185,13 +4186,16 @@ class _DSparkHeadMixin:
         ``block_hidden`` is the drafter's output hidden state at the K draft
         slots (``[num_gens, K, hidden]``). A head trained with the Markov
         feature also reads ``markov_w1`` of each position's previous token: the
-        anchor ``first_prev_tokens`` for position 0, then the drafts.
+        anchor ``first_prev_tokens`` (``[num_gens]``) for position 0, then the
+        drafts ``draft_tokens`` (``[num_gens, K]``).
         """
         head = self.confidence_head
         if not head.with_markov:
             return head(block_hidden)
         prev_tokens = torch.cat([first_prev_tokens.view(-1, 1), draft_tokens[:, :-1]], dim=1)
-        return head(block_hidden, prev_embeddings=self.markov_w1[prev_tokens.long()])
+        return head(
+            block_hidden, prev_embeddings=markov_prev_embeddings(prev_tokens, self.markov_w1)
+        )
 
     def _build_confidence_head(
         self, weight: torch.Tensor, bias: Optional[torch.Tensor]

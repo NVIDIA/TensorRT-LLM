@@ -2005,7 +2005,7 @@ class DSparkWorker(DSparkConfidenceMixin, DFlashWorker):
         spec_config: "DSparkDecodingConfig",
         mapping: Mapping,
         use_separate_draft_kv_cache: bool = False,
-    ):
+    ) -> None:
         super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
         # Confidence rows and the verify planner follow the context buffers.
         self._init_confidence_state()
@@ -2017,7 +2017,7 @@ class DSparkWorker(DSparkConfidenceMixin, DFlashWorker):
 
     def _lazy_init_ctx_buffers(
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
-    ):
+    ) -> None:
         super()._lazy_init_ctx_buffers(
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )

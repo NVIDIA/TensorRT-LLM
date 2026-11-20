@@ -566,8 +566,8 @@ attention DP it raised throughput in 14 of 16 settings at batch sizes 8 to 64, b
 Confidence scheduling requires a target validated for it: DeepSeek-V4 with its embedded DSpark
 drafter, or Kimi K3 with a standalone drafter (see the
 [Kimi K3 example](../../../kimi_k3/README.md#dspark-confidence-scheduling-prototype)). It also
-requires padded CUDA graphs, PP=1 and CP=1. Guided decoding, LoRA, per-request logits
-post-processors, per-layer dynamic EPLB, heuristic sparse top-k, the acceptance-rate gate
+requires padded CUDA graphs, PP=1 and CP=1. Locality domains, guided decoding, LoRA, per-request
+logits post-processors, per-layer dynamic EPLB, heuristic sparse top-k, the acceptance-rate gate
 (`acceptance_rate_window_size` / `acceptance_rate_threshold`) and non-greedy rejection draft
 sampling are rejected.
 

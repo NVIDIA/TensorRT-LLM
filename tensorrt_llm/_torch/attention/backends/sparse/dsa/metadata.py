@@ -84,8 +84,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # The ragged rows are sized with the expanded indexer buffers, built from
     # the device-window KV bound and refreshed between the indexer updates.
     uses_base_ragged_row_hooks: ClassVar[bool] = False
-    # Ragged verification on a DSA target relies on the DSv4 KV compressor, whose
-    # metadata helpers the engine compiles at warmup and requires.
+    # The DSA target validated for ragged verification is DeepSeek-V4, whose KV
+    # compressor metadata helpers the engine compiles at warmup and requires.
     needs_ragged_compressor_warmup: ClassVar[bool] = True
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
