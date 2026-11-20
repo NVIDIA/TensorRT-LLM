@@ -1926,7 +1926,7 @@ class TestKVCacheFailuresCtx:
         assert ids(out.context_requests) == [0]
         assert draft_mgr.prepare_context_cache.call_args_list == [call(req, expected)]
         mgr.prepare_context_cache.assert_called_once_with(req, expected)
-        mgr.note_context_fork.assert_called_once_with(req, draft_probe)
+        mgr.note_context_fork.assert_called_once_with(req, draft_probe, target_probe)
         draft_mgr.free_resources.assert_not_called()
 
     @pytest.mark.parametrize(

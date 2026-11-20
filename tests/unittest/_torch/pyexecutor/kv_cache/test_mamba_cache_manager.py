@@ -4195,6 +4195,7 @@ def _run_v2_hybrid_context(
     request.context_current_position = request.prompt_len
     assert request.context_remaining_length == 0
     manager.update_context_resources(batch)
+    manager.commit_scheduled_kv_cache_stats(batch)
 
 
 def _build_v2_inforward_snapshot_manager():
@@ -5265,7 +5266,7 @@ def test_branch_snapshot_uses_a_paired_fork_hidden_by_the_claim():
     request = _fake_context_request(prompt_len=256, context_current_position=64)
     kv_cache = _fake_reuse_match(divergence=64, reused=64)
 
-    mgr.note_context_fork(request, 192)
+    mgr.note_context_fork(request, 192, 64)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=64)
 
     assert mgr._branch_snapshot_points == {1: 192}
@@ -5284,7 +5285,7 @@ def test_branch_snapshot_ignores_a_paired_fork_within_a_block_of_the_reuse():
     request = _fake_context_request(prompt_len=512, context_current_position=392)
     kv_cache = _fake_reuse_match(divergence=392, reused=392)
 
-    mgr.note_context_fork(request, 450)
+    mgr.note_context_fork(request, 450, 392)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=392)
 
     assert mgr._branch_snapshot_points == {}
@@ -5365,7 +5366,7 @@ def test_branch_snapshot_is_inert_when_the_flag_is_off():
     request = _fake_context_request(prompt_len=256)
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
-    mgr.note_context_fork(request, 192)
+    mgr.note_context_fork(request, 192, 64)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
     mgr.prepare_expect_snapshot_points([request])
 
@@ -5388,6 +5389,8 @@ def test_branch_snapshot_points_match_on_attention_only_pp_rank():
 
     mamba_mgr._record_branch_snapshot_point(mamba_request, kv_cache, num_lookup_tokens=255)
     attention_mgr._record_branch_snapshot_point(attention_request, kv_cache, num_lookup_tokens=255)
+    mamba_mgr._commit_prefix_loss(mamba_request.py_request_id)
+    attention_mgr._commit_prefix_loss(attention_request.py_request_id)
 
     assert mamba_request.expect_snapshot_points == [192, 256]
     assert attention_request.expect_snapshot_points == [192, 256]
@@ -5539,6 +5542,7 @@ def test_branch_snapshot_counters_are_zero_when_nothing_was_pruned():
     kv_cache = _fake_reuse_match(divergence=192, hybrid=192, reused=192)
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    mgr._commit_prefix_loss(request.py_request_id)
 
     assert mgr._snapshot_pruned_tokens_total == 0
     assert mgr._page_pruned_tokens_total == 0

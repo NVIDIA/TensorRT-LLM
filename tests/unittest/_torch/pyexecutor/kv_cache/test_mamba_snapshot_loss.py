@@ -18,9 +18,11 @@ from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig, MambaS
 _MIN_MATCHED = mamba_cache_manager_v2._SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
 
 
-def _fake_kv_cache(matched: int, reused: int) -> SimpleNamespace:
+def _fake_kv_cache(matched: int, reused: int, divergence: Optional[int] = None) -> SimpleNamespace:
     return SimpleNamespace(
-        _get_num_reusable_tokens_before_pruning=lambda: matched,
+        _get_num_reusable_tokens_before_pruning=lambda: (
+            matched if divergence is None else divergence
+        ),
         _get_num_reusable_tokens_before_hybrid_pruning=lambda: matched,
         num_committed_tokens=reused,
     )
@@ -49,6 +51,9 @@ def _manager(
 ) -> MambaHybridCacheManagerV2:
     """Bare manager carrying only what the loss accounting reads; no cache pools."""
     manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.is_draft = False
+    manager.enable_stats = False
+    manager._request_stats_enabled_ids = set()
     manager.local_num_mamba_layers = 1
     manager.is_estimating_kv_cache = False
     manager.mapping = SimpleNamespace(rank=rank)
@@ -59,12 +64,18 @@ def _manager(
     manager.block_reuse_policy = policy
     manager._snapshot_pruned_tokens_total = 0
     manager._page_pruned_tokens_total = 0
+    manager._context_fork_hints = {}
     manager._pending_prefix_loss = {}
     manager._prefix_matched_tokens_total = 0
     manager._iter_prefix_matched_tokens = 0
     manager._iter_prefix_snapshot_lost_tokens = 0
     manager._snapshot_loss_warned = False
     return manager
+
+
+def _commit(manager: MambaHybridCacheManagerV2, *requests: SimpleNamespace) -> None:
+    """Commit the stats of a batch holding these requests' first chunks."""
+    manager.commit_scheduled_kv_cache_stats(SimpleNamespace(context_requests=list(requests)))
 
 
 def _admit(
@@ -76,22 +87,22 @@ def _admit(
     """Look a request up and schedule its first chunk."""
     request = request or _fake_request()
     manager._record_prefix_loss(request, _fake_kv_cache(matched, reused))
-    manager._commit_prefix_loss(request.py_request_id)
+    _commit(manager, request)
 
 
 def test_counts_loss_without_branch_snapshots() -> None:
     manager = _manager()
-    # Attention matched 20k tokens, the deepest snapshot was at 4k
+    # Attention matched 20k tokens, the deepest snapshot was at 4k, and 4k more
+    # shared tokens had their attention pages evicted.
     first, second = _fake_request(1), _fake_request(2)
-    manager._record_branch_snapshot_point(first, _fake_kv_cache(20_000, 4_000), 20_000)
+    manager._record_branch_snapshot_point(first, _fake_kv_cache(20_000, 4_000, 24_000), 20_000)
     manager._record_branch_snapshot_point(second, _fake_kv_cache(8_000, 8_000), 8_000)
-    manager._commit_prefix_loss(first.py_request_id)
-    manager._commit_prefix_loss(second.py_request_id)
+    assert manager._prefix_matched_tokens_total == 0
+    _commit(manager, first, second)
     assert manager._iter_prefix_matched_tokens == 28_000
     assert manager._iter_prefix_snapshot_lost_tokens == 16_000
     assert manager._snapshot_pruned_tokens_total == 16_000
-    # The attention page diagnostics are counted only with enable_branch_snapshot, off here.
-    assert manager._page_pruned_tokens_total == 0
+    assert manager._page_pruned_tokens_total == 4_000
 
 
 def test_counts_a_refused_admission_once() -> None:
@@ -99,14 +110,40 @@ def test_counts_a_refused_admission_once() -> None:
     request = _fake_request()
     # Refused for budget or pages twice: each retry is a fresh lookup.
     for _ in range(3):
-        manager._record_prefix_loss(request, _fake_kv_cache(24_000, 4_000))
+        manager._record_prefix_loss(request, _fake_kv_cache(24_000, 4_000, 30_000))
     assert manager._prefix_matched_tokens_total == 0
-    manager._commit_prefix_loss(request.py_request_id)
+    assert manager._page_pruned_tokens_total == 0
+    _commit(manager, request)
     # Later chunks of the same request add nothing.
-    manager._commit_prefix_loss(request.py_request_id)
+    _commit(manager, request)
     assert manager._prefix_matched_tokens_total == 24_000
     assert manager._iter_prefix_matched_tokens == 24_000
     assert manager._iter_prefix_snapshot_lost_tokens == 20_000
+    assert manager._page_pruned_tokens_total == 6_000
+
+
+@pytest.mark.parametrize(
+    ("draft_match", "target_match", "matched", "lost"),
+    [
+        # Attention matched through 192, the target's last snapshot is at 64.
+        (192, 64, 192, 128),
+        # The draft matched only 64; the target's snapshot at 192 is not lost.
+        (64, 192, 192, 0),
+    ],
+)
+def test_measures_a_paired_claim_against_the_uncapped_probes(
+    draft_match: int, target_match: int, matched: int, lost: int
+) -> None:
+    manager = _manager()
+    request = _fake_request()
+    common = min(draft_match, target_match)
+    manager.note_context_fork(request, draft_match, target_match)
+    # The claim stops the lookup at the common depth, which it fully reuses.
+    manager._record_branch_snapshot_point(request, _fake_kv_cache(common, common), common)
+    _commit(manager, request)
+    assert manager._context_fork_hints == {}
+    assert manager._iter_prefix_matched_tokens == matched
+    assert manager._iter_prefix_snapshot_lost_tokens == lost
 
 
 def test_skips_resumed_dummy_disagg_and_estimation_lookups() -> None:
@@ -120,8 +157,7 @@ def test_skips_resumed_dummy_disagg_and_estimation_lookups() -> None:
         manager._record_branch_snapshot_point(request, _fake_kv_cache(100, 0), num_lookup_tokens)
     manager.is_estimating_kv_cache = True
     manager._record_branch_snapshot_point(_fake_request(4), _fake_kv_cache(100, 0), 100)
-    for request_id in (1, 2, 3, 4):
-        manager._commit_prefix_loss(request_id)
+    _commit(manager, *(_fake_request(request_id) for request_id in (1, 2, 3, 4)))
     assert manager._prefix_matched_tokens_total == 0
     assert manager._snapshot_pruned_tokens_total == 0
     assert manager._iter_prefix_matched_tokens == 0
