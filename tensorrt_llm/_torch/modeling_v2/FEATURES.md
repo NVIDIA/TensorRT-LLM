@@ -60,10 +60,6 @@ before they are classified.
 | `ChunkedPrefill` | `enable_chunked_prefill` | in code | none |
 | `OverlapScheduler` | `disable_overlap_scheduler=False` | in code | none (GLM-5.2 sm103 tp8 fast paths fall back without it) |
 | `KvCacheBlockReuse` | `kv_cache_config.enable_block_reuse` | in code | Kimi K3 tp16 (both): asserted off at the first forward; should declare `unsupported` |
-| `GuidedDecoding` | `guided_decoding_backend` | planned | GLM-5.3-Flash mtp_fused (refused in `route`) |
-| `ReturnLogits` | `gather_generation_logits` | planned | GLM-5.3-Flash mtp_fused drops `return_context_logits` |
-| `LogitsPostProcessor` | `batched_logits_processor` | to verify | sampler side; check targets that fuse sampling into a draft loop |
-| `TextWatermarking` | `watermark_config` | to verify | as above |
 
 ### Advanced functional features
 
@@ -76,6 +72,10 @@ before they are classified.
 | `DisaggregatedServing` | `cache_transceiver_config` | to verify | KV transfer planners already declare the deployments they serve (`supports_deployment`) |
 | `KvConnector` | `kv_connector_config` | to verify | |
 | `KvCacheCompression` | `kv_cache_compression_config` | to verify | |
+| `GuidedDecoding` | `guided_decoding_backend` | planned | GLM-5.3-Flash mtp_fused refuses it in `route`. |
+| `ReturnLogits` | `gather_generation_logits` | planned | GLM-5.3-Flash mtp_fused drops `return_context_logits`. |
+| `LogitsPostProcessor` | `batched_logits_processor` | to verify | Sampler side; check the targets that fuse sampling into a draft loop. |
+| `TextWatermarking` | `watermark_config` | to verify | As above. |
 
 ### Advanced perf features
 
