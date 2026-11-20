@@ -12,33 +12,27 @@ hold, and records what every routed target does with them today.
 
 ## Feature kinds
 
-A deployment's core hands each step to one of its step targets
-(`_select_target`): every step with context rows to `PrefillTarget`, every step
-without to `DecodeTarget`. A deployment class that declares features on its step
-targets names them in `step_targets`; one without it is its own step target.
+Features fall into three kinds, by what goes wrong when a target does not serve
+one:
 
-A feature is a class in `_features.py`. Its `from_args` reads the facts that
-decide support from `ModelConfig` and the LLM arguments, and returns None while
-the feature is off. A step target declares itself with the feature's class
-decorator; `when`, if given, sees the feature instance and limits the
-declaration to the settings it holds for.
+- **Basic** features are the ones every model in Modeling V1 serves (see the
+  Model-Feature Support Matrix in
+  [supported models](../../../docs/source/models/supported-models.md)). A user
+  expects them to work, so every target serves them by default; a target that
+  does not is the exception and says so, and turning the feature on for it is an
+  error.
+- **Advanced functional** features change what the engine computes. A target
+  that ignores one returns wrong results, so only a target that declares it is
+  built; otherwise `auto` falls back to Modeling V1.
+- **Advanced perf** features change only how fast the engine runs. A target that
+  does not declare one still computes the right result in principle, so it is
+  built and the gap is reported.
 
 | Kind | A step target serves it | Declared with | When the route's target has a step target that does not serve it |
 |---|---|---|---|
 | `BasicFeature` | unless it declares otherwise | `@Feature.unsupported(when=...)` | `ValueError` in every mode |
 | `AdvancedFunctionalFeature` | only once it declares it | `@Feature.supported(when=...)` | the target is refused: `auto` builds Modeling V1, `require` raises |
 | `AdvancedPerfFeature` | only once it declares it | `@Feature.supported(when=...)` | the target is built, with a warning |
-
-- **Basic** features are the ones every model in Modeling V1 serves (see the
-  Model-Feature Support Matrix in
-  [supported models](../../../docs/source/models/supported-models.md)); a target
-  that does not is the exception and says so.
-- **Advanced functional** features change what the engine computes. A target
-  that ignores one returns wrong results, so only a target that declares it is
-  built.
-- **Advanced perf** features change only how fast the engine runs. A target that
-  does not declare one still computes the right result in principle, so it is
-  built and the gap is reported.
 
 A declaration describes the step target. It does not replace a check in
 `route`: when a feature setting makes a target fail (rather than run slower),
