@@ -316,7 +316,28 @@ def test_public_api_post_merge_can_use_post_merge_validation() -> None:
     [
         (
             "tensorrt_llm/_torch/modeling_v2/catalog/_op.py",
-            {"default_pipeline", "fasth3", "ops", "legacy"},
+            {"default_pipeline", "fasth3", "ops", "second_consumer", "second_other"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/models/wan/ops/attention.py",
+            {
+                "default_pipeline",
+                "fasth3",
+                "ops",
+                "legacy",
+                "catalog",
+                "unused",
+                "second_consumer",
+                "second_other",
+            },
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/catalog/attention/_native.py",
+            {"fasth3", "ops", "catalog", "contracts", "second_consumer"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/catalog/attention/unused.py",
+            {"unused", "contracts"},
         ),
         ("tensorrt_llm/_torch/modeling_v2/catalog/attention/core.py", {"fasth3", "ops"}),
         (
@@ -356,7 +377,19 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
             "from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as project"
         ),
         f"tensorrt_llm/_torch/visual_gen/models/{family}/ops/vsa.py": (
-            "from tensorrt_llm._torch.modeling_v2.catalog.attention.adapter import sparse"
+            "from tensorrt_llm._torch.modeling_v2.catalog.attention.adapter import sparse\n"
+            "from tensorrt_llm._torch.visual_gen.catalog.attention.sparse import launch"
+        ),
+        "tensorrt_llm/_torch/visual_gen/models/second_v2/pipeline_registry.py": (
+            "from .consumer.pipeline import Consumer\nfrom .other.pipeline import Other\n"
+            "def route(config):\n    if config.fast:\n        return Consumer\n    return Other\n"
+        ),
+        "tensorrt_llm/_torch/visual_gen/models/second_v2/consumer/pipeline.py": (
+            "from tensorrt_llm._torch.visual_gen.catalog.attention.sparse import launch\nclass Consumer: pass"
+        ),
+        "tensorrt_llm/_torch/visual_gen/catalog/attention/sparse.py": "from ._native import launch",
+        "tests/unittest/_torch/visual_gen/catalog/attention/test_sparse.py": (
+            "from tensorrt_llm._torch.visual_gen.catalog.attention.sparse import launch"
         ),
         "tensorrt_llm/_torch/modeling_v2/catalog/attention/adapter.py": "from .core import sparse",
         f"tests/{unit}/ops/test_vsa.py": (
@@ -375,6 +408,10 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         "fasth3": {f"{unit}/fasth3/test_pipeline.py", f"{quality}/fasth3/test_quality.py"},
         "ops": {f"{unit}/ops/test_vsa.py"},
         "legacy": {"visual_gen/test_unrelated.py", "examples/visual_gen/test_minimax_h3_e2e.py"},
+        "catalog": {"unittest/_torch/visual_gen/catalog/attention/test_sparse.py"},
+        "unused": {"unittest/_torch/visual_gen/catalog/attention/test_unused.py"},
+        "second_consumer": {"visual_gen/second_v2/consumer/test_quality.py"},
+        "second_other": {"visual_gen/second_v2/other/test_quality.py"},
         "contracts": {"unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"},
     }
     index = YAMLIndex()
@@ -423,29 +460,23 @@ def _visualgen_selection(changed):
     return {path for filters in result.block_filters.values() for path in filters}
 
 
-def test_visualgen_catalog_selects_block_sparse_attention_and_its_consumers():
-    selected = _visualgen_selection(
-        "tensorrt_llm/_torch/visual_gen/catalog/attention/block_sparse_attention.py"
-    )
-    assert {
-        "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
-        "unittest/_torch/visual_gen/catalog/attention",
-        "unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_minimax_h3_vsa.py",
-        "unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py",
-        "unittest/_torch/visual_gen/test_wan_vsa_pipeline.py",
-    } <= selected
-
-
-def test_h3_ulysses_ops_select_the_family():
-    selected = _visualgen_selection(
-        "tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/ops/ulysses.py"
-    )
+@pytest.mark.parametrize(
+    "op",
+    ["block_sparse_attention", "cute_fmha", "flash_attention_4", "flashinfer_prefill", "ulysses"],
+)
+def test_visualgen_ops_select_only_importing_families(op):
+    scope = "models/minimax_h3_v2/ops" if op == "ulysses" else "catalog/attention"
+    selected = _visualgen_selection(f"tensorrt_llm/_torch/visual_gen/{scope}/{op}.py")
     unit = "unittest/_torch/visual_gen/models/minimax_h3_v2"
+    mirror = f"unittest/_torch/visual_gen/{scope}/test_{op}.py"
+    contracts = "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"
     assert {
-        f"{unit}/ops/test_ulysses.py",
+        mirror,
+        contracts,
         f"{unit}/default_pipeline/test_minimax_h3_pipeline.py",
         f"{unit}/fasth3/test_fasth3_pipeline.py",
-        "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
     } <= selected
-    h3_tests = selected - {"unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"}
-    assert all(path.startswith((unit + "/", "visual_gen/minimax_h3_v2/")) for path in h3_tests)
+    assert all(
+        path.startswith((unit + "/", "visual_gen/minimax_h3_v2/"))
+        for path in selected - {mirror, contracts}
+    )

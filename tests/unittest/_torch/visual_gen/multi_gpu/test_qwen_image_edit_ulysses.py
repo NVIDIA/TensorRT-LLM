@@ -30,8 +30,6 @@ import torch.distributed as dist
 _OLD_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
-from test_common.visual_gen._worker_pool import run_distributed
-
 from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
@@ -39,6 +37,8 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image imp
     QwenJointAttention,
 )
 from tensorrt_llm.visual_gen.args import ParallelConfig
+
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True)

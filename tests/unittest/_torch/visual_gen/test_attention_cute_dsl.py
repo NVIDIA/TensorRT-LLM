@@ -19,9 +19,9 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha import CuTeDSLAttention
-from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.fmha_interface import (
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha import (
     _COMPILE_CACHE,
+    CuTeDSLAttention,
     _quantize_blockscaled_one,
     _quantize_fp8,
     clear_cute_dsl_fmha_cache,

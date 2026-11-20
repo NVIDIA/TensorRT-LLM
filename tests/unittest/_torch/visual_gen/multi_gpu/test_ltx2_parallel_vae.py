@@ -23,13 +23,14 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.video_vae import TilingConfig
 from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.video_vae.model_configurator import (
     VideoDecoderConfigurator,
 )
 from tensorrt_llm._torch.visual_gen.models.ltx2.parallel_vae import tile_parallel_decode
+
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")

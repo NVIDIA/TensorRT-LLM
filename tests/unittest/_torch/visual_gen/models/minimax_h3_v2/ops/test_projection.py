@@ -107,6 +107,35 @@ def test_quantized_checkpoint_partition_matches_baseline(algo, kind, monkeypatch
         torch.testing.assert_close(candidate(x), reference(x), rtol=1e-3, atol=1e-3)
 
 
+def test_nvfp4_text_projection_with_bias():
+    k, n = 5120, 5376
+    quant = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    config = SimpleNamespace(quant_config=quant, dynamic_weight_quant=True)
+    projection = Linear(
+        k, n, dtype=torch.bfloat16, bias=True, quant_config=quant, force_dynamic_quantization=True
+    ).cuda()
+    rows = torch.arange(n, device="cuda")
+    columns = rows * 17 % k
+    signs = ((rows % 2) * 2 - 1).to(torch.bfloat16)
+    weight = torch.zeros((n, k), device="cuda", dtype=torch.bfloat16)
+    weight[rows, columns] = signs
+    bias = (rows % 5).to(torch.bfloat16) * 0.125 + 0.25
+    assert (
+        projection.load_checkpoint(
+            "context_embedder",
+            {"context_embedder.weight": weight, "context_embedder.bias": bias},
+            config,
+        )
+        == []
+    )
+    projection.post_load_weights()
+    row = ((torch.arange(k, device="cuda") % 3 == 0).to(torch.bfloat16) * 2) - 1
+    x = torch.stack((row, -row))
+    with torch.inference_mode():
+        actual = projection(x)
+    torch.testing.assert_close(actual, x[:, columns] * signs + bias, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("cell", swiglu.CELLS)
 def test_swiglu(cell):
     spec = cell.spec

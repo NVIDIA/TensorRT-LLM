@@ -4,7 +4,7 @@
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention.interface import (
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
     block_sparse_attn_from_indices_cute,
 )
 
@@ -16,7 +16,7 @@ class BlockSparseAttention(OpWrapper):
 
     Each 64-token query tile supplies its own KV tile indices. Paired query
     tiles (2i, 2i+1) share a route count. Each KV tile supplies its valid prefix length.
-    Returns attention output in the query dtype and per-query FP32 logsumexp.
+    Returns attention output in the query dtype and FP32 logsumexp (natural log) for each query.
     """
 
     ARCHS = frozenset({Arch.SM_100})

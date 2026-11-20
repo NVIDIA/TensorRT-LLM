@@ -124,8 +124,10 @@ class FlashAttention4(OpWrapper):
             dict(dtype=torch.float16, sq=11, sk=27, hq=4, hk=2, dim=64, lengths=None, causal=True),
         ),
         Cell(
-            "FP32 cross-attention via BF16",
-            dict(dtype=torch.float32, sq=17, sk=19, hq=2, hk=2, dim=64, lengths=None, causal=False),
+            "uncached BF16 prefill",
+            dict(
+                dtype=torch.bfloat16, sq=17, sk=17, hq=2, hk=2, dim=64, lengths=None, causal=False
+            ),
         ),
     )
 
@@ -139,11 +141,13 @@ class FlashAttention4(OpWrapper):
         causal: bool = False,
         seqused_k: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        dtype = q.dtype
-        if dtype not in (torch.float16, torch.bfloat16):
-            q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
-        output, lse = _run_fa4(q, k, v, softmax_scale, causal, seqused_k)
-        return output.to(dtype), lse
+        if (
+            q.dtype not in (torch.float16, torch.bfloat16)
+            or q.dtype != k.dtype
+            or q.dtype != v.dtype
+        ):
+            raise ValueError("FA4 requires matching FP16 or BF16 Q/K/V tensors.")
+        return _run_fa4(q, k, v, softmax_scale, causal, seqused_k)
 
     def reference(
         self,
@@ -155,11 +159,10 @@ class FlashAttention4(OpWrapper):
         causal: bool = False,
         seqused_k: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
         queries_per_kv = q.size(2) // k.size(2)
-        qh = q.to(dtype).transpose(1, 2).double()
-        kh = k.to(dtype).transpose(1, 2).double().repeat_interleave(queries_per_kv, dim=1)
-        vh = v.to(dtype).transpose(1, 2).double().repeat_interleave(queries_per_kv, dim=1)
+        qh = q.transpose(1, 2).double()
+        kh = k.transpose(1, 2).double().repeat_interleave(queries_per_kv, dim=1)
+        vh = v.transpose(1, 2).double().repeat_interleave(queries_per_kv, dim=1)
         scores = (qh @ kh.transpose(-1, -2)) * softmax_scale
         positions = torch.arange(k.size(1), device=q.device)
         if seqused_k is not None:
@@ -169,7 +172,7 @@ class FlashAttention4(OpWrapper):
             query_rows = torch.arange(q.size(1), device=q.device)[:, None]
             scores = scores.masked_fill(positions > query_rows + lengths - q.size(1), -torch.inf)
         output = (scores.softmax(-1).nan_to_num() @ vh).transpose(1, 2)
-        return output.to(dtype).to(q.dtype), scores.logsumexp(-1).float()
+        return output.to(q.dtype), scores.logsumexp(-1).float()
 
     def is_valid(
         self,
@@ -181,7 +184,9 @@ class FlashAttention4(OpWrapper):
         causal: bool = False,
         seqused_k: torch.Tensor | None = None,
     ) -> None:
+        assert q.device == k.device == v.device
         if seqused_k is not None:
+            assert seqused_k.device == q.device
             assert ((seqused_k >= 0) & (seqused_k <= k.size(1))).all(), (
                 "valid key lengths must fit the KV sequence"
             )

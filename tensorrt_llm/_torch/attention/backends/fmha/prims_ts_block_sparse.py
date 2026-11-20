@@ -16,7 +16,7 @@
 """TRT-LLM FMHA adapter for the vendored PrimTS block-sparse kernels."""
 
 import math
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
@@ -26,6 +26,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.attention.backends.prims_ts._block_sparse.config import (
+    _validate_block_sparse_static_profile,
+)
 from tensorrt_llm._torch.attention.backends.prims_ts.sage import (
     SageAttentionConfig,
     SageAttentionParams,
@@ -33,7 +36,6 @@ from tensorrt_llm._torch.attention.backends.prims_ts.sage import (
 from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForwardInputs
 from tensorrt_llm.logger import logger
 
-from .block_sparse_plan import BlockSparsePlan
 from .interface import FmhaPhase
 from .phased import FmhaParams
 from .prims_ts import (
@@ -50,6 +52,113 @@ if TYPE_CHECKING:
         BlockSparseTSWrapper,
     )
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+from tensorrt_llm._torch.attention.backends.prims_ts import (
+    BlockSparsePagedTSWrapper as _BlockSparsePagedTSWrapper,
+)
+from tensorrt_llm._torch.attention.backends.prims_ts import (
+    BlockSparseTSWrapper as _BlockSparseTSWrapper,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockSparsePlanKey:
+    """Static wrapper profile shared by compatible attention layers.
+
+    The key is the single description of a plan: support checks validate it
+    against the kernel library and the wrapper cache plans from it. Every field
+    is an argument of ``plan()``, so two requests share a planned wrapper
+    exactly when the kernel could serve both with one plan. Per-layer constants
+    such as the head topology and dtype stay in the key because a bound cache
+    may be shared by layers with different geometries.
+    """
+
+    device: torch.device
+    batch_size: int
+    seq_len_q: int
+    kv_capacity: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    page_size: int | None
+    q_block_size: int
+    kv_block_size: int
+    max_blocks_per_row: int | None
+    mask_type: Literal["dense", "causal"]
+    dtype: torch.dtype
+    qk_dtype: torch.dtype
+    v_dtype: torch.dtype
+    use_kv_valid_bits: bool
+    sparse_format: Literal["bsr", "bitmask"]
+    use_proxy_routes: bool
+    sage: SageAttentionConfig | None
+    use_block_sparse: bool = True
+
+    def unsupported_reason(self) -> str | None:
+        # A dense plan has no route capacity.
+        capacity = {"max_blocks_per_row": self.max_blocks_per_row} if self.use_block_sparse else {}
+        try:
+            _validate_block_sparse_static_profile(
+                batch_size=self.batch_size,
+                seq_len_q=self.seq_len_q,
+                seq_len_kv=self.kv_capacity,
+                num_qo_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                q_block_size=self.q_block_size,
+                kv_block_size=self.kv_block_size,
+                use_kv_valid_bits=self.use_kv_valid_bits,
+                mask_type=self.mask_type,
+                q_dtype=self.qk_dtype,
+                kv_dtype=self.qk_dtype,
+                v_dtype=self.v_dtype,
+                output_dtype=self.dtype,
+                page_size=self.page_size,
+                sage=self.sage,
+                use_block_sparse=self.use_block_sparse,
+                **capacity,
+            )
+        except (ValueError, NotImplementedError, OverflowError) as error:
+            return str(error)
+        return None
+
+    def plan(self) -> "BlockSparseTSWrapper | BlockSparsePagedTSWrapper":
+        paged = self.page_size is not None
+        wrapper_type = _BlockSparsePagedTSWrapper if paged else _BlockSparseTSWrapper
+        assert wrapper_type is not None
+        wrapper = wrapper_type()
+        plan_args = (
+            self.batch_size,
+            self.seq_len_q,
+            self.kv_capacity,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.q_block_size,
+            self.kv_block_size,
+        )
+        plan_kwargs = {
+            "device": self.device,
+            "max_blocks_per_row": self.max_blocks_per_row,
+            "use_kv_valid_bits": self.use_kv_valid_bits,
+            "mask_type": self.mask_type,
+            "q_data_type": self.qk_dtype,
+            "o_data_type": self.dtype,
+        }
+        if paged:
+            plan_args += (self.page_size,)
+            plan_kwargs.update(kv_data_type=self.qk_dtype)
+        else:
+            plan_kwargs.update(
+                use_block_sparse=self.use_block_sparse,
+                sparse_format=self.sparse_format,
+                use_proxy_routes=self.use_proxy_routes,
+                k_data_type=self.qk_dtype,
+                v_data_type=self.v_dtype,
+                sage_config=self.sage,
+            )
+        wrapper.plan(*plan_args, **plan_kwargs)
+        return wrapper
 
 
 def _get_block_sparse_inputs(
@@ -219,7 +328,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         page_size: int | None,
         mask_type: Literal["dense", "causal"],
         sage: tuple[SageAttentionConfig, torch.dtype] | None = None,
-    ) -> BlockSparsePlan:
+    ) -> _BlockSparsePlanKey:
         if inputs is None:
             # Dense plans use 128-token blocks, which select the Q128/KV128 Sage profile, faster
             # for dense attention than Q64/KV256.
@@ -234,7 +343,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         if sage is not None:
             sage_config, qk_dtype = sage
             v_dtype = torch.float8_e4m3fn
-        return BlockSparsePlan(
+        return _BlockSparsePlanKey(
             device=q.device,
             batch_size=batch_size,
             seq_len_q=seq_len_q,
@@ -259,7 +368,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
 
     def _get_or_plan_wrapper(
         self,
-        key: BlockSparsePlan,
+        key: _BlockSparsePlanKey,
         metadata: "TrtllmAttentionMetadata",
     ) -> "BlockSparseTSWrapper | BlockSparsePagedTSWrapper":
         """Return the planned wrapper for ``key`` from the metadata's plan cache.

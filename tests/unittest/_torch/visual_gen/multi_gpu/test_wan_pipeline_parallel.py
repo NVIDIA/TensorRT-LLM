@@ -30,7 +30,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
-from test_common.visual_gen._worker_pool import run_distributed
 from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -40,6 +39,8 @@ from tensorrt_llm.visual_gen.args import (
     TorchCompileConfig,
     VisualGenArgs,
 )
+
+from ._worker_pool import run_distributed
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (

@@ -5,11 +5,13 @@
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
-from tensorrt_llm._torch.visual_gen.attention import flashinfer_runner
+
+from . import _flashinfer_runtime
+from ._flashinfer_runtime import FlashInferPrefillRunner
 
 
 def _validate_inputs(
-    runner: flashinfer_runner.FlashInferPrefillRunner,
+    runner: FlashInferPrefillRunner,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -54,6 +56,7 @@ def _validate_inputs(
 class FlashInferPrefill(OpWrapper):
     """FP16/BF16 prefill over [batch, rows, heads, dim] queries, keys and values.
 
+    qk_dtype and v_dtype select dynamic quantization; None uses the input precision.
     Padding masks use True for visible keys. Returns output in the query layout
     and FP32 natural-log LSE in [batch, query heads, query rows].
     """
@@ -75,7 +78,7 @@ class FlashInferPrefill(OpWrapper):
         ),
         Cell("FP16 input and output", dict(dtype=torch.float16, batch=2, q=47, kv=47)),
         Cell(
-            "static global scale with native NVFP4 blocks",
+            "dynamic global scale with native NVFP4 blocks",
             dict(
                 dtype=torch.bfloat16,
                 batch=1,
@@ -84,7 +87,6 @@ class FlashInferPrefill(OpWrapper):
                 heads=2,
                 dim=128,
                 recipe="nvfp4",
-                static_global_scale=True,
             ),
         ),
     )
@@ -95,7 +97,9 @@ class FlashInferPrefill(OpWrapper):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        runner: flashinfer_runner.FlashInferPrefillRunner,
+        runner: FlashInferPrefillRunner,
+        qk_dtype: str | None = None,
+        v_dtype: str | None = None,
         is_causal: bool = False,
         key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -105,11 +109,12 @@ class FlashInferPrefill(OpWrapper):
         if is_causal and key_padding_mask is not None:
             raise ValueError("FlashInfer attention does not combine causal and padding masks.")
 
-        quant_config = runner.quant_attention_config
-        if quant_config is None:
+        if (qk_dtype is None) != (v_dtype is None):
+            raise ValueError("FlashInfer quantization requires both qk_dtype and v_dtype.")
+        if qk_dtype is None:
             # FlashInfer's single-prefill FA2/FA3 heuristics regress on SM10x.
             if q.shape[0] == 1 and torch.cuda.get_device_capability(q.device)[0] != 10:
-                return flashinfer_runner.run_single_prefill(
+                return _flashinfer_runtime.run_single_prefill(
                     runner,
                     q,
                     k,
@@ -117,7 +122,7 @@ class FlashInferPrefill(OpWrapper):
                     is_causal=is_causal,
                     key_padding_mask=key_padding_mask,
                 )
-            return flashinfer_runner.run_batch_prefill(
+            return _flashinfer_runtime.run_batch_prefill(
                 runner,
                 q,
                 k,
@@ -129,13 +134,8 @@ class FlashInferPrefill(OpWrapper):
             raise ValueError("FlashInfer quantized attention does not support key padding masks.")
 
         capability = torch.cuda.get_device_capability(q.device)
-        qk_dtype = quant_config.qk_dtype
-        if (
-            capability in ((10, 0), (10, 3))
-            and qk_dtype in ("mxfp8", "nvfp4")
-            and quant_config.v_dtype == "fp8"
-        ):
-            return flashinfer_runner.run_blockscaled_sm10x(
+        if capability in ((10, 0), (10, 3)) and qk_dtype in ("mxfp8", "nvfp4") and v_dtype == "fp8":
+            return _flashinfer_runtime.run_blockscaled_sm10x(
                 runner,
                 q,
                 k,
@@ -143,12 +143,12 @@ class FlashInferPrefill(OpWrapper):
                 qk_mode=qk_dtype,
                 is_causal=is_causal,
             )
-        if capability[0] == 12 and qk_dtype == "nvfp4" and quant_config.v_dtype == "nvfp4":
-            return flashinfer_runner.run_nvfp4_sm12x(runner, q, k, v, is_causal=is_causal)
+        if capability[0] == 12 and qk_dtype == "nvfp4" and v_dtype == "nvfp4":
+            return _flashinfer_runtime.run_nvfp4_sm12x(runner, q, k, v, is_causal=is_causal)
         raise RuntimeError(
             "Unsupported FlashInfer quantized attention recipe for "
             f"SM{capability[0]}{capability[1]}: qk_dtype={qk_dtype!r}, "
-            f"v_dtype={quant_config.v_dtype!r}. Use qk_dtype='mxfp8' or 'nvfp4' with "
+            f"v_dtype={v_dtype!r}. Use qk_dtype='mxfp8' or 'nvfp4' with "
             "v_dtype='fp8' on SM100/SM103, or qk_dtype='nvfp4' with "
             "v_dtype='nvfp4' on SM120/SM121."
         )
@@ -159,7 +159,9 @@ class FlashInferPrefill(OpWrapper):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        runner: flashinfer_runner.FlashInferPrefillRunner,
+        runner: FlashInferPrefillRunner,
+        qk_dtype: str | None = None,
+        v_dtype: str | None = None,
         is_causal: bool = False,
         key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:

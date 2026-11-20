@@ -284,9 +284,10 @@ class _ImportGraph:
         parse: Callable[[Path], Optional[ast.AST]],
         *,
         package: str = PACKAGE,
-        catalog_root: Optional[Path] = None,
+        catalog_roots: Optional[dict[str, Path]] = None,
     ) -> None:
         self.package = package
+        self.packages = {PACKAGE, package, *(catalog_roots or {})}
         # Module name -> file path relative to the subtree.
         self.files = {
             _module_name(rel, package): rel
@@ -309,9 +310,9 @@ class _ImportGraph:
         # Package -> modules that import a computed name, which may be any module under it.
         self._computed: dict[str, set[str]] = defaultdict(set)
         paths = {module: src_root / rel for module, rel in self.files.items()}
-        if catalog_root is not None:
-            for path in sorted(catalog_root.rglob("*.py")):
-                paths[_module_name(PurePosixPath(path.relative_to(catalog_root.parent)))] = path
+        for name, root in (catalog_roots or {}).items():
+            for path in sorted(root.rglob("*.py")):
+                paths[_module_name(PurePosixPath(path.relative_to(root)), name)] = path
         for module, path in paths.items():
             tree = parse(path)
             if tree is None:
@@ -346,10 +347,7 @@ class _ImportGraph:
                 self._importers[dep].add(key)
 
     def _package_names(self, names: set[str]) -> set[str]:
-        result = package_names(names)
-        if self.package != PACKAGE:
-            result |= package_names(names, self.package)
-        return result
+        return set().union(*(package_names(names, package) for package in self.packages))
 
     def _direct_importers(self, name: str) -> set[str]:
         found = set(self._importers.get(name, ()))

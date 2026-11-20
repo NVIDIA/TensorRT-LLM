@@ -188,7 +188,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
 
 @pytest.mark.parametrize("world_size", [2, 4], ids=["tp2_world2", "tp2_world4"])
 def test_minimax_h3_text_encoder_tp(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
-    from test_common.visual_gen._visual_gen_dist_utils import spawn_with_retry
+    from ._visual_gen_dist_utils import spawn_with_retry
 
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} CUDA GPUs")

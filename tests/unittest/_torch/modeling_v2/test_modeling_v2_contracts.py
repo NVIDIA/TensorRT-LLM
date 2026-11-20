@@ -38,7 +38,7 @@ def _entry_files() -> list[Path]:
     )
 
 
-def test_entry_discovery_covers_both_catalogs_and_owned_ops(tmp_path, monkeypatch):
+def test_entry_discovery_covers_shared_and_owned_ops(tmp_path, monkeypatch):
     root = tmp_path / "modeling_v2"
     entries = {
         root / "catalog/attention/shared.py",
@@ -158,10 +158,13 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
         sources = llm_sources
         if entry.is_relative_to(vg):
             owner = entry.parent.relative_to(vg)
-            if owner.parts[0] == "models":
+            if owner.parts[0] == "catalog":
+                mirror = _UNIT_ROOT.parent / "visual_gen" / owner / f"test_{entry.name}"
+                sources = [mirror.read_text()] if mirror.is_file() else []
+            else:
                 owner = Path(*owner.parts[: owner.parts.index("ops")])
-            test_dir = _UNIT_ROOT.parent / "visual_gen" / owner
-            sources = [t.read_text() for t in test_dir.rglob("test_*.py")]
+                test_dir = _UNIT_ROOT.parent / "visual_gen" / owner
+                sources = [t.read_text() for t in test_dir.rglob("test_*.py")]
         if not any(
             entry.stem in src and (".CELLS" in src or _DRIVES_TARGET_CELLS.search(src))
             for src in sources
@@ -186,12 +189,13 @@ def _target_cells_tests() -> list[Path]:
 @pytest.mark.parametrize(
     "test", _target_cells_tests(), ids=lambda p: str(p.relative_to(_UNIT_ROOT))
 )
-def test_target_cells_feed_entries_the_target_calls(test, monkeypatch):
+def test_target_cells_feed_entries_the_target_calls(test):
     """An entry test's `TARGET_CELLS` hold the shapes each target calls the entry with.
 
-    Tests under each area mirror catalog entries, including nested component tests.
-    LLM keys name target directories under `models/`. VisualGen keys use
-    `visual_gen/<family>/<target>` and can reach the entry through family components.
+    The test sits under `<area>/`, including component subdirectories such as
+    `moe/ops/`, and mirrors `catalog/<area>/<entry>.py`. Each key is a target
+    directory under `models/`, and that target's code imports the entry: a cell
+    for an entry the target never calls certifies nothing it runs.
     """
     area = test.relative_to(_UNIT_ROOT).parts[0]
     entry = test.stem.removeprefix("test_modeling_v2_")
@@ -211,23 +215,6 @@ def test_target_cells_feed_entries_the_target_calls(test, monkeypatch):
             targets = [ast.literal_eval(k) for k in node.value.keys]
     assert targets, f"{test.name}: TARGET_CELLS is not a dict literal keyed by target directory"
     for target in targets:
-        if target.startswith("visual_gen/"):
-            repo = _ROOT.parents[2]
-            monkeypatch.syspath_prepend(str(repo / "jenkins/scripts/cbts"))
-            from cbts.rules.visual_gen import VisualGenFamilyScope
-
-            _, family, target_name = target.split("/")
-            scope = VisualGenFamilyScope(repo, _ROOT.parent / "visual_gen/models" / family)
-            assert scope.targets and target_name in scope.targets, (
-                f"Unknown VisualGen target {target}"
-            )
-            assert scope.graph.complete, f"Cannot parse {family}'s imports"
-            module = f"tensorrt_llm._torch.modeling_v2.catalog.{area}.{entry}"
-            importers, _ = scope.graph.importers(module)
-            assert any(path.parts[0] == target_name for path in importers), (
-                f"{test.name}: {target} never imports {area}/{entry}"
-            )
-            continue
         target_dir = _ROOT / "models" / target
         assert target_dir.is_dir(), f"{test.name}: {target!r} is not a directory under models/"
         used = "".join(

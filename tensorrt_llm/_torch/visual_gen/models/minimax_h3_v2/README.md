@@ -48,29 +48,39 @@ Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation f
 
 ### Choose the sharing scope
 
-**Only fully model-independent operations belong in a catalog.** Count independent VisualGen families when choosing between target, family and VisualGen catalog ownership. A new catalog entry needs callers that use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
+The VisualGen catalog is for **Modeling V2**. Add a model-independent operation when its data contract, reference and tested configurations are precise enough for another V2 family to use unchanged. The first migrated family can introduce it. V1 pipelines keep their existing paths. Each family starts using a catalog entry when its V2 implementation calls it.
 
-| Scope of the change | Place it here | H3 example |
+| Scope of the change | Place it here | Example |
 | --- | --- | --- |
-| One target | The target directory, including its local operations or kernels | Base Ref2VA conditioning and its TP text encoder, or FastH3's trained schedule |
-| Sibling H3 targets | The H3 family | Packed rows, transformer blocks, attention modules and H3 Ulysses Q/K/V exchange and receive layouts |
-| A model-independent operation used unchanged by independent VisualGen callers | The [VisualGen catalog](../../catalog/) | H3 and other VisualGen callers share FA4 attention, FlashInfer prefill, CuTe FMHA and fine block-sparse attention over explicit KV tile indices. |
-| An existing model-independent operation used by VisualGen and LLM callers | Its entry in the [Modeling V2 catalog](../../../modeling_v2/catalog/) | Import `thop_attention` and `cublas_mm` directly. |
-| Runtime services | The existing VisualGen runtime | Checkpoint discovery, process groups, executor and lifecycle interfaces |
+| One checkpoint target | The target directory | Base H3's text-only TP encoder, or FastH3's trained schedule |
+| Model-specific computation shared by sibling targets | The family directory | Packed rows, H3 attention components, learned VSA gates and Ulysses scheduling |
+| A reusable model-independent computation | The [VisualGen V2 catalog](../../catalog/attention/) | Attention over explicit valid KV lengths or preselected KV tiles |
+| An existing kernel, library primitive or runtime interface | Its existing owner | PyTorch SDPA, process groups and compatible GEMM primitives |
 
-**Attention.** The [block-sparse attention op](../../catalog/attention/block_sparse_attention.py) takes head-major Q/K/V, selected KV tile indices, route counts, valid KV tile lengths and an optional scale. It returns attention output and logsumexp. [H3](ops/vsa.py) builds mixed-modality routes and applies its learned gate. The [VisualGen VSA backend](../../attention/backends/sparse/vsa/backend.py) supplies its predictor's routes and chooses its fallback. Both call the same operation unchanged. Keep the gated attention component in the family so the base target can also load a checkpoint with gate weights and explicit VSA configuration. Each family owns its attention module and projections.
+### How large is a catalog operation?
 
-**Communication.** The base and FastH3 targets share the [H3 Ulysses wrappers](ops/ulysses.py). They encode how H3 exchanges sequence shards for head shards and converts asynchronous receive buffers to the layout its attention expects. The [H3 parallel module](parallel/ulysses.py) owns the V, Q, K projection order, streams and barriers. Other families can call the same native kernels from their own wrappers.
+Use **one testable tensor computation, collective or explicit state update** as the unit of sharing. An entry may launch one kernel or several. The [LLM catalog](../../../modeling_v2/catalog/) illustrates the range.
 
-Both the H3 Ulysses wrappers and the block-sparse attention op use the [Modeling V2 `OpWrapper` contract](../../../modeling_v2/README.md#writing-operations) to define a reference and test cases. Mirror each operation's tests at the scope that owns it.
+| LLM example | Contract | VisualGen implication |
+| --- | --- | --- |
+| [RMSNorm](../../../modeling_v2/catalog/norm/flashinfer_rmsnorm.py) | Given activations, weights and epsilon, return the normalized activations. | A single kernel can be an entry when V2 families use it unchanged. |
+| [Reduce-scatter](../../../modeling_v2/catalog/comm/reducescatter.py) | Reduce contributions and return the local slice for an explicit group. The implementation can dispatch by communicator. | Share the collective when layouts agree. Each family decides where it runs and what work overlaps it. |
+| [MLA RoPE and KV append](../../../modeling_v2/catalog/attention/mla_rope_append_paged_kv_assign_q.py) | Rotate new tokens and write specified rows to an explicit KV pool. The reference describes the resulting buffer contents. | Several steps can be one operation when independent callers need the same outputs and mutations. |
 
-### Reuse an existing backend implementation
+For a proposed entry, write its reference using only the arguments at the call site. Expose the numerical inputs and any observable buffer mutations. If reuse requires the caller's checkpoint, layer identity, token packing or denoising step, keep that decision in the model.
 
-Place the V2 operation contract in the [narrowest scope that uses it](../../../modeling_v2/README.md#writing-operations). One target or family owns its local operations. A fully model-independent computation used unchanged across families belongs in the catalog. A kernel library or backend supplies the implementation underneath that contract.
+| VisualGen V2 entry | Catalog computes | H3 supplies or owns |
+| --- | --- | --- |
+| [FA4](../../catalog/attention/flash_attention_4.py) | Attention output and logsumexp from Q/K/V, scale, causal mode and optional valid KV lengths | Convert trailing-padding masks to prefix lengths and restore the model's output dtype |
+| [FlashInfer prefill](../../catalog/attention/flashinfer_prefill.py) | Select a compatible provider kernel and compute prefill with explicit quantization formats, mask and runner | Create the runner for the loaded instance and pass its plan cache and the selected precision |
+| [CuTe FMHA](../../catalog/attention/cute_fmha.py) | Full attention on equal-head BSHD tensors, including quantization and a numerical skip-softmax threshold | Choose the recipe, resolve the threshold for the step and handle padding or dense fallback |
+| [Fine block-sparse attention](../../catalog/attention/block_sparse_attention.py) | Evaluate attention on explicit KV tile indices, counts and valid tile lengths | Construct text/video/audio routes and combine the result with coarse attention using the learned gate |
 
-- **Kernel invocation.** [FA4](../../catalog/attention/flash_attention_4.py) accepts Q/K/V, scale, a causal flag and valid KV lengths, and returns output and logsumexp. H3 converts its trailing-padding mask to lengths. [CuTe FMHA](../../catalog/attention/cute_fmha.py) owns quantization and the kernel launch. The caller resolves any step-dependent skip-softmax threshold. Test each shared op against its reference for the layouts, dtypes and execution modes its callers use.
-- **Stateful execution.** The H3 [dense attention component](components/dense_attention.py) holds its runner and passes execution state explicitly to [FlashInfer prefill](../../catalog/attention/flashinfer_prefill.py). The op selects a compatible implementation and the runner manages its plans and workspace. Keep persistent per-instance state with the component. Use an existing supported kernel or runner method directly when it already provides the execution interface, as with cuDNN's [`run_dense`](../../attention/backends/cudnn.py).
-- **Model policy.** Keep checkpoint interpretation, masks, gates and per-step choices in the family or target, including fallbacks and weight loading. For example, H3 chooses which denoising steps call the [SOL predictor](../../attention/backends/sparse/sol/predictor.py). Prefer a supported execution interface when reusing an existing kernel or runner. Apply the [V1 dependency rule](../../../modeling_v2/README.md#modeling-v1-code) to model classes, layers and complete attention backends.
+The [H3 attention component](components/dense_attention.py) adapts model inputs to these contracts. The [gated VSA computation](ops/vsa.py) serves both base checkpoints with gate weights and explicit VSA configuration and the FastH3 target.
+
+**H3 communication.** [H3 parallel code](parallel/ulysses.py) owns the V, Q, K projection order, streams and barriers. The [Ulysses ops](ops/ulysses.py) exchange Q/K/V or convert receive buffers to H3 attention layouts. Models can call the same native communication kernel with different schedules and layouts.
+
+Use the [Modeling V2 operation contract](../../../modeling_v2/README.md#writing-operations) at target, family and catalog scope. Pass execution state explicitly, put model-scoped runner lifetimes with the component, and test each supported layout and dtype against a reference. Use lower-level kernel or library interfaces in forward, fallback and loading paths, in line with the [V1 dependency rule](../../../modeling_v2/README.md#modeling-v1-code).
 
 ## File map
 
@@ -98,6 +108,8 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [components/trtllm_attention.py](components/trtllm_attention.py) | Pack H3 Q/K/V and run TRTLLM attention with the model's masks and sparse routes. |
 | [components/trtllm_attention_prims.py](components/trtllm_attention_prims.py) | Maintain contiguous attention plans and quantization state for an H3 instance. |
 | [components/transformer.py](components/transformer.py) | Assemble the token refiner, DiT blocks and joint audio/video outputs. |
+| [components/cudnn_runner.py](components/cudnn_runner.py) | Build dense cuDNN plans for H3. |
+| [components/skip_softmax_threshold.py](components/skip_softmax_threshold.py) | Resolve the current threshold for H3 CuTe attention. |
 | [components/attention.py](components/attention.py) | Build H3 projections, per-head normalization, three-axis RoPE and dense or gated attention. |
 | [components/linear.py](components/linear.py) | Own rank-local projection parameters and dispatch their GEMM. |
 | [components/projection_weights.py](components/projection_weights.py) | Partition, pack and quantize checkpoint tensors and scales for those projections. |
@@ -112,6 +124,8 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 
 | Operations and kernels | Responsibility |
 | --- | --- |
+| [ops/uncached_attention.py](ops/uncached_attention.py) | Issue uncached TRTLLM attention for packed H3 rows. |
+| [kernels/sol_attention.py](kernels/sol_attention.py) | Launch SOL attention or invoke the supplied dense fallback. |
 | [ops/ulysses.py](ops/ulysses.py) | Exchange Q/K/V for synchronous H3 attention and convert asynchronous receive buffers into its attention layout. |
 | [ops/activation.py](ops/activation.py) | Define the H3 SwiGLU operation. |
 | [ops/adaln.py](ops/adaln.py) | Define adaptive normalization/modulation and its gated residual variant. |
@@ -125,8 +139,8 @@ Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops s
 
 ## Test a change
 
-Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). Mirror VisualGen catalog entries under [visual_gen/catalog/ in the unit tests](../../../../../tests/unittest/_torch/visual_gen/catalog/), and compare each operation with its reference on the declared cells. Register each new test by file or directory in the [CI test lists](../../../../../tests/integration/test_lists/test-db/) for the required hardware and rank count. A target's quality case can also run on an [owned QA schedule](../../../../../tests/integration/test_lists/qa/). Change-based test selection operates on registered entries.
+Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). Mirror [family operations](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/ops/) and [catalog entries](../../../../../tests/unittest/_torch/visual_gen/catalog/attention/) at their respective scopes. Compare outputs and buffer mutations against each operation’s reference on its declared cells. Register each new test by file or directory in the [CI test lists](../../../../../tests/integration/test_lists/test-db/) for the required hardware and rank count. A target's quality case can also run on an [owned QA schedule](../../../../../tests/integration/test_lists/qa/). Change-based test selection operates on registered entries.
 
-A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A VisualGen catalog change also exercises its consuming model and backend paths.
+A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A catalog change runs its mirrored contract tests and the V2 targets that import the operation. V1 paths retain their existing tests.
 
 For V1/V2 comparisons, use the same checkpoint revision, seed, inputs, precision, backend, topology and explicit step count. Use 50 points on both sides for the base-H3 quality reference and test omitted defaults separately. Before retiring V1 and the opt-in switch, qualify generated video and audio, supported parallel paths, warmed latency and peak memory against V1 on representative deployments.

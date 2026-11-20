@@ -222,8 +222,16 @@ class _CuDNNProblemShape:
 # ============================================================================
 
 
-class CuDNNSdpaRunner:
-    """Build, cache and execute cuDNN SDPA graphs on the calling CUDA stream."""
+class CuDNNAttention(AttentionBackend):
+    """cuDNN SDPA backend for visual generation.
+
+    Runs unquantized (bf16/fp16), per-tensor FP8, or block-scaled MXFP8 attention
+    through cuDNN's fused ``sdpa`` / ``sdpa_fp8`` / ``sdpa_mxfp8`` nodes. The quantization
+    dtype comes from ``quant_attention_config``; ``None`` means unquantized.
+
+    The compiled-graph cache is process-wide and shared by every instance.
+    cuDNN handles and cached graphs are isolated by CUDA device.
+    """
 
     _cudnn_lib_version = None
     _cudnn_handles: ClassVar[Dict[int, Any]] = {}
@@ -588,188 +596,6 @@ class CuDNNSdpaRunner:
             outputs={"o": o_t},
         )
 
-    @classmethod
-    @torch.compiler.disable
-    def _softmax_scales(cls, quant_dtype: str | None, device: torch.device) -> Any:
-        """Get the per-device cache for quantization-dtype-specific constants.
-
-        - quant_dtype="fp8": (scale_s, descale_s, scale_o) for FP8 attention.
-          Softmax output lies in [0, 1], so it is scaled by 448 to fill the FP8 range before Bmm2.
-        """
-        key = (
-            device.index if device.index is not None else torch.cuda.current_device(),
-            quant_dtype,
-        )
-        with cls._cache_lock:
-            scales = cls._scales_cache.get(key)
-            if scales is None:
-                if quant_dtype == "fp8":
-                    scale_s = torch.full((1, 1, 1, 1), 448.0, dtype=torch.float32, device=device)
-                    scale_o = torch.ones(1, 1, 1, 1, dtype=torch.float32, device=device)
-                    scales = (scale_s, scale_s.reciprocal(), scale_o)
-                    cls._scales_cache[key] = scales
-                else:
-                    # Unquantized and MXFP8 attention don't need device-side constants.
-                    pass
-            return scales
-
-    def _validate_inputs(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
-        for name, tensor in (("q", q), ("k", k), ("v", v)):
-            if tensor.dim() != 4:
-                raise ValueError(
-                    f"cuDNN backend expects a 4D [B, S, H, D] {name}; got {tuple(tensor.shape)}."
-                )
-        if k.shape[:3] != v.shape[:3]:
-            raise ValueError(f"K/V shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}.")
-        if q.shape[0] != k.shape[0]:
-            raise ValueError(f"Batch size mismatch: q={q.shape[0]} vs k={k.shape[0]}.")
-        if q.shape[3] != k.shape[3]:
-            raise ValueError(f"Q/K head_dim mismatch: {q.shape[3]} vs {k.shape[3]}.")
-        if q.shape[3] != self.head_dim:
-            raise ValueError(
-                f"cuDNN backend was configured with head_dim={self.head_dim}, "
-                f"but received head_dim={q.shape[3]}."
-            )
-        if q.shape[2] != self.num_heads:
-            raise ValueError(
-                f"cuDNN backend was configured with num_heads={self.num_heads}, "
-                f"but received num_heads={q.shape[2]}."
-            )
-        if q.shape[2] % k.shape[2] != 0:
-            raise ValueError(
-                f"num_heads={q.shape[2]} must be a multiple of num_kv_heads={k.shape[2]} for GQA."
-            )
-        # cuDNN's FP8 and MXFP8 SDPA engines support head_dim <= 128.
-        if self.quant_dtype is not None and max(q.shape[3], v.shape[3]) > 128:
-            raise ValueError(
-                f"cuDNN quantized SDPA supports head_dim <= 128; got qk={q.shape[3]}, "
-                f"v={v.shape[3]}. Drop quant_attention_config to run unquantized."
-            )
-        if self.quant_dtype == "mxfp8" and q.shape[3] % 32 != 0:
-            raise ValueError(
-                f"cuDNN MXFP8 requires head_dim to be a multiple of 32; got {q.shape[3]}."
-            )
-
-    def run_dense(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        is_causal: bool,
-        with_lse: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        self._validate_inputs(q, k, v)
-        b, s_q, h_q, d_qk = q.shape
-        _, s_kv, h_kv, d_v = v.shape
-        device = q.device
-        out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
-
-        # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
-        # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
-        # BSHD bytes are fed to the kernel untouched -- no transpose copy anywhere.
-        buffers: Dict[str, torch.Tensor] = {}
-        if self.quant_dtype is None:
-            buffers.update(
-                q=q.contiguous().transpose(1, 2),
-                k=k.contiguous().transpose(1, 2),
-                v=v.contiguous().transpose(1, 2),
-            )
-        elif self.quant_dtype == "fp8":
-            if d_qk == d_v and is_fused_qkv(q, k, v):
-                # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
-                # handling of same-layout buffers.
-                qkv_q, descale = _quantize_fp8(as_fused_qkv(q, k, v))
-                q_q, k_q, v_q = (
-                    t.unflatten(-1, (h, d_qk))
-                    for t, h in zip(
-                        qkv_q.split([h_q * d_qk, h_kv * d_qk, h_kv * d_qk], dim=-1),
-                        (h_q, h_kv, h_kv),
-                    )
-                )
-                descale_q = descale_k = descale_v = descale
-            else:
-                q_q, descale_q = _quantize_fp8(q)
-                k_q, descale_k = _quantize_fp8(k)
-                v_q, descale_v = _quantize_fp8(v)
-            scale_s, descale_s, scale_o = self._softmax_scales(self.quant_dtype, device)
-            buffers.update(
-                q=q_q.transpose(1, 2),
-                k=k_q.transpose(1, 2),
-                v=v_q.transpose(1, 2),
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_s=descale_s,
-                scale_s=scale_s,
-                scale_o=scale_o,
-            )
-        else:  # mxfp8
-            # The MXFP8 quantizers pad along S and emit their own HND buffers, so they
-            # take the [B, H, S, D] view and do the layout change as part of the pack.
-            q_q, descale_q = _quantize_mxfp8_qk(q.transpose(1, 2))
-            k_q, descale_k = _quantize_mxfp8_qk(k.transpose(1, 2))
-            v_q, descale_v = _quantize_mxfp8_v(v.transpose(1, 2))
-            buffers.update(
-                q=q_q, k=k_q, v=v_q, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
-            )
-
-        shape = _CuDNNProblemShape(
-            b=b,
-            h_q=h_q,
-            h_kv=h_kv,
-            s_q=s_q,
-            s_kv=s_kv,
-            d_qk=d_qk,
-            d_v=d_v,
-            q_strides=tuple(buffers["q"].stride()),
-            k_strides=tuple(buffers["k"].stride()),
-            v_strides=tuple(buffers["v"].stride()),
-            # O is written straight into an NHD buffer, likewise via strides.
-            o_strides=(s_q * h_q * d_v, d_v, h_q * d_v, 1),
-        )
-        bundle = self._get_or_build_graph(
-            self.quant_dtype,
-            shape,
-            is_causal=is_causal,
-            sm_scale=self.scale,
-            out_dtype=out_dtype,
-            with_lse=with_lse,
-            device=device,
-        )
-
-        output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
-        tensor_map = {bundle.inputs[name]: tensor for name, tensor in buffers.items()}
-        tensor_map[bundle.outputs["o"]] = output.transpose(1, 2)
-
-        stats: Optional[torch.Tensor] = None
-        if with_lse:
-            stats = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device=device)
-            tensor_map[bundle.outputs["stats"]] = stats
-        for amax_name in ("amax_s", "amax_o"):
-            if amax_name in bundle.outputs:
-                tensor_map[bundle.outputs[amax_name]] = torch.empty(
-                    1, 1, 1, 1, dtype=torch.float32, device=device
-                )
-
-        self._execute_graph(bundle, tensor_map, device)
-
-        # Stats is packed [B, H, S, 1]; other backends expose LSE as [B, S, H].
-        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
-        return output, lse
-
-
-class CuDNNAttention(CuDNNSdpaRunner, AttentionBackend):
-    """cuDNN SDPA backend for visual generation.
-
-    Runs unquantized (bf16/fp16), per-tensor FP8, or block-scaled MXFP8 attention
-    through cuDNN's fused ``sdpa`` / ``sdpa_fp8`` / ``sdpa_mxfp8`` nodes. The quantization
-    dtype comes from ``quant_attention_config``; ``None`` means unquantized.
-
-    The compiled-graph cache is process-wide and shared by every instance.
-    cuDNN handles and cached graphs are isolated by CUDA device.
-    """
-
     def _run_paged(
         self,
         q: torch.Tensor,
@@ -885,6 +711,176 @@ class CuDNNAttention(CuDNNSdpaRunner, AttentionBackend):
     # Forward
     # ------------------------------------------------------------------
 
+    @classmethod
+    @torch.compiler.disable
+    def _softmax_scales(cls, quant_dtype: str | None, device: torch.device) -> Any:
+        """Get the per-device cache for quantization-dtype-specific constants.
+
+        - quant_dtype="fp8": (scale_s, descale_s, scale_o) for FP8 attention.
+          Softmax output lies in [0, 1], so it is scaled by 448 to fill the FP8 range before Bmm2.
+        """
+        key = (
+            device.index if device.index is not None else torch.cuda.current_device(),
+            quant_dtype,
+        )
+        with cls._cache_lock:
+            scales = cls._scales_cache.get(key)
+            if scales is None:
+                if quant_dtype == "fp8":
+                    scale_s = torch.full((1, 1, 1, 1), 448.0, dtype=torch.float32, device=device)
+                    scale_o = torch.ones(1, 1, 1, 1, dtype=torch.float32, device=device)
+                    scales = (scale_s, scale_s.reciprocal(), scale_o)
+                    cls._scales_cache[key] = scales
+                else:
+                    # Unquantized and MXFP8 attention don't need device-side constants.
+                    pass
+            return scales
+
+    def _validate_inputs(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+        for name, tensor in (("q", q), ("k", k), ("v", v)):
+            if tensor.dim() != 4:
+                raise ValueError(
+                    f"cuDNN backend expects a 4D [B, S, H, D] {name}; got {tuple(tensor.shape)}."
+                )
+        if k.shape[:3] != v.shape[:3]:
+            raise ValueError(f"K/V shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}.")
+        if q.shape[0] != k.shape[0]:
+            raise ValueError(f"Batch size mismatch: q={q.shape[0]} vs k={k.shape[0]}.")
+        if q.shape[3] != k.shape[3]:
+            raise ValueError(f"Q/K head_dim mismatch: {q.shape[3]} vs {k.shape[3]}.")
+        if q.shape[3] != self.head_dim:
+            raise ValueError(
+                f"cuDNN backend was configured with head_dim={self.head_dim}, "
+                f"but received head_dim={q.shape[3]}."
+            )
+        if q.shape[2] != self.num_heads:
+            raise ValueError(
+                f"cuDNN backend was configured with num_heads={self.num_heads}, "
+                f"but received num_heads={q.shape[2]}."
+            )
+        if q.shape[2] % k.shape[2] != 0:
+            raise ValueError(
+                f"num_heads={q.shape[2]} must be a multiple of num_kv_heads={k.shape[2]} for GQA."
+            )
+        # cuDNN's FP8 and MXFP8 SDPA engines support head_dim <= 128.
+        if self.quant_dtype is not None and max(q.shape[3], v.shape[3]) > 128:
+            raise ValueError(
+                f"cuDNN quantized SDPA supports head_dim <= 128; got qk={q.shape[3]}, "
+                f"v={v.shape[3]}. Drop quant_attention_config to run unquantized."
+            )
+        if self.quant_dtype == "mxfp8" and q.shape[3] % 32 != 0:
+            raise ValueError(
+                f"cuDNN MXFP8 requires head_dim to be a multiple of 32; got {q.shape[3]}."
+            )
+
+    def _run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        is_causal: bool,
+        with_lse: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        self._validate_inputs(q, k, v)
+        b, s_q, h_q, d_qk = q.shape
+        _, s_kv, h_kv, d_v = v.shape
+        device = q.device
+        out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
+
+        # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
+        # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
+        # BSHD bytes are fed to the kernel untouched -- no transpose copy anywhere.
+        buffers: Dict[str, torch.Tensor] = {}
+        if self.quant_dtype is None:
+            buffers.update(
+                q=q.contiguous().transpose(1, 2),
+                k=k.contiguous().transpose(1, 2),
+                v=v.contiguous().transpose(1, 2),
+            )
+        elif self.quant_dtype == "fp8":
+            if d_qk == d_v and is_fused_qkv(q, k, v):
+                # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
+                # handling of same-layout buffers.
+                qkv_q, descale = _quantize_fp8(as_fused_qkv(q, k, v))
+                q_q, k_q, v_q = (
+                    t.unflatten(-1, (h, d_qk))
+                    for t, h in zip(
+                        qkv_q.split([h_q * d_qk, h_kv * d_qk, h_kv * d_qk], dim=-1),
+                        (h_q, h_kv, h_kv),
+                    )
+                )
+                descale_q = descale_k = descale_v = descale
+            else:
+                q_q, descale_q = _quantize_fp8(q)
+                k_q, descale_k = _quantize_fp8(k)
+                v_q, descale_v = _quantize_fp8(v)
+            scale_s, descale_s, scale_o = self._softmax_scales(self.quant_dtype, device)
+            buffers.update(
+                q=q_q.transpose(1, 2),
+                k=k_q.transpose(1, 2),
+                v=v_q.transpose(1, 2),
+                descale_q=descale_q,
+                descale_k=descale_k,
+                descale_v=descale_v,
+                descale_s=descale_s,
+                scale_s=scale_s,
+                scale_o=scale_o,
+            )
+        else:  # mxfp8
+            # The MXFP8 quantizers pad along S and emit their own HND buffers, so they
+            # take the [B, H, S, D] view and do the layout change as part of the pack.
+            q_q, descale_q = _quantize_mxfp8_qk(q.transpose(1, 2))
+            k_q, descale_k = _quantize_mxfp8_qk(k.transpose(1, 2))
+            v_q, descale_v = _quantize_mxfp8_v(v.transpose(1, 2))
+            buffers.update(
+                q=q_q, k=k_q, v=v_q, descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
+            )
+
+        shape = _CuDNNProblemShape(
+            b=b,
+            h_q=h_q,
+            h_kv=h_kv,
+            s_q=s_q,
+            s_kv=s_kv,
+            d_qk=d_qk,
+            d_v=d_v,
+            q_strides=tuple(buffers["q"].stride()),
+            k_strides=tuple(buffers["k"].stride()),
+            v_strides=tuple(buffers["v"].stride()),
+            # O is written straight into an NHD buffer, likewise via strides.
+            o_strides=(s_q * h_q * d_v, d_v, h_q * d_v, 1),
+        )
+        bundle = self._get_or_build_graph(
+            self.quant_dtype,
+            shape,
+            is_causal=is_causal,
+            sm_scale=self.scale,
+            out_dtype=out_dtype,
+            with_lse=with_lse,
+            device=device,
+        )
+
+        output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
+        tensor_map = {bundle.inputs[name]: tensor for name, tensor in buffers.items()}
+        tensor_map[bundle.outputs["o"]] = output.transpose(1, 2)
+
+        stats: Optional[torch.Tensor] = None
+        if with_lse:
+            stats = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device=device)
+            tensor_map[bundle.outputs["stats"]] = stats
+        for amax_name in ("amax_s", "amax_o"):
+            if amax_name in bundle.outputs:
+                tensor_map[bundle.outputs[amax_name]] = torch.empty(
+                    1, 1, 1, 1, dtype=torch.float32, device=device
+                )
+
+        self._execute_graph(bundle, tensor_map, device)
+
+        # Stats is packed [B, H, S, 1]; other backends expose LSE as [B, S, H].
+        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
+        return output, lse
+
     def forward(
         self,
         q: torch.Tensor,
@@ -917,7 +913,7 @@ class CuDNNAttention(CuDNNSdpaRunner, AttentionBackend):
         """
         if kv is not None:
             return self._run_paged(q, k, v, kv, attention_mask, key_padding_mask)
-        output, _ = self.run_dense(
+        output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
         return output
@@ -939,7 +935,7 @@ class CuDNNAttention(CuDNNSdpaRunner, AttentionBackend):
         """
         if kwargs.get("kv") is not None:
             raise NotImplementedError("forward_with_lse does not support a K/V cache.")
-        output, lse = self.run_dense(
+        output, lse = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
         )
         assert lse is not None, "cuDNN graph was built with stats but returned none."

@@ -10,9 +10,10 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")

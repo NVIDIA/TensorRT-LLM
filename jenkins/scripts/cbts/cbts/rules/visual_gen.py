@@ -70,6 +70,8 @@ _VG_SRC_PREFIXES: tuple[str, ...] = (
 _VG_SCHEMA_PATH = "tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json"
 _CATALOG = "tensorrt_llm/_torch/modeling_v2/catalog/"
 _VG_CATALOG = "tensorrt_llm/_torch/visual_gen/catalog/"
+_VG_CATALOG_PACKAGE = "tensorrt_llm._torch.visual_gen.catalog"
+_VG_CATALOG_UNIT = "unittest/_torch/visual_gen/catalog"
 _CATALOG_CONTRACT_TEST = "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"
 _SCHEMA_TEST_TARGET = "unittest/llmapi/test_trtllm_serve_config_schemas.py"
 
@@ -135,7 +137,7 @@ def _is_vg_claim(path: str) -> bool:
     referenced by `tests/unittest/_torch/visual_gen/`), so edits to
     them must still force VG stages.
     """
-    if path in (_VG_SCHEMA_PATH, _CATALOG + "_op.py"):
+    if path == _VG_SCHEMA_PATH:
         return True
     if not path.startswith(_VG_SRC_PREFIXES):
         return False
@@ -157,6 +159,10 @@ _VG_UNIT = "unittest/_torch/visual_gen/models"
 _VG_QUALITY = "visual_gen"
 
 
+def _catalog_module(path: str) -> str:
+    return _module_name(PurePosixPath(path).relative_to("tensorrt_llm"), "tensorrt_llm")
+
+
 class VisualGenFamilyScope:
     """Source dependencies and mirrored test paths for a routed VisualGen family."""
 
@@ -166,7 +172,10 @@ class VisualGenFamilyScope:
         self.unit = f"{_VG_UNIT}/{self.family}"
         self.quality = f"{_VG_QUALITY}/{self.family}"
         self.unit_root = root / "tests" / self.unit
-        self.catalog = root / _CATALOG
+        self.catalog_roots = {
+            f"{PACKAGE}.catalog": root / _CATALOG,
+            _VG_CATALOG_PACKAGE: root / _VG_CATALOG,
+        }
         self.package = f"tensorrt_llm._torch.visual_gen.models.{self.family}"
         tree = _parse(family / "pipeline_registry.py")
         self.targets = routed_targets(tree, function_name="route") if tree else None
@@ -174,7 +183,11 @@ class VisualGenFamilyScope:
     @cached_property
     def graph(self) -> _ImportGraph:
         return _ImportGraph(
-            self.source, self.unit_root, _parse, package=self.package, catalog_root=self.catalog
+            self.source,
+            self.unit_root,
+            _parse,
+            package=self.package,
+            catalog_roots=self.catalog_roots,
         )
 
     def _target_tests(self, target: str) -> set[str]:
@@ -182,11 +195,11 @@ class VisualGenFamilyScope:
 
     def select(self, path: str) -> set[str]:
         whole = {self.unit, self.quality}
-        if path.startswith(_CATALOG):
-            rel = PurePosixPath(path.removeprefix(_CATALOG))
-            if rel.name == "_op.py" or rel.suffix != ".py" or not self.targets:
+        catalog = path.startswith((_CATALOG, _VG_CATALOG))
+        if catalog:
+            if path == _CATALOG + "_op.py" or not path.endswith(".py") or not self.targets:
                 return whole
-            module = _module_name(PurePosixPath("catalog") / rel, PACKAGE)
+            module = _catalog_module(path)
             prefixes = set()
         else:
             rel = PurePosixPath(path.removeprefix(f"{_MODELS}{self.family}/"))
@@ -207,9 +220,7 @@ class VisualGenFamilyScope:
             if src.parts[0] in self.targets:
                 prefixes |= self._target_tests(src.parts[0])
         prefixes.update(f"{self.unit}/{test}" for test in tests)
-        if not path.startswith(_CATALOG) and not any(
-            p.startswith(self.quality + "/") for p in prefixes
-        ):
+        if not catalog and not any(p.startswith(self.quality + "/") for p in prefixes):
             return whole
         return prefixes
 
@@ -221,6 +232,7 @@ class VisualGenRule(Rule):
     def __init__(
         self, yaml_index: YAMLIndex, stages: dict[str, Stage], repo_root: Optional[Path] = None
     ) -> None:
+        self.root = repo_root
         self.families = (
             {
                 f"{_MODELS}{routing.parent.name}/": VisualGenFamilyScope(repo_root, routing.parent)
@@ -232,24 +244,58 @@ class VisualGenRule(Rule):
         self.yaml_index = yaml_index
         self._stages_by_yaml = stages_by_yaml_stem(stages)
 
+    @cached_property
+    def catalog_graph(self) -> _ImportGraph:
+        assert self.root is not None
+        return _ImportGraph(
+            self.root / _VG_CATALOG,
+            self.root / "tests" / _VG_CATALOG_UNIT,
+            _parse,
+            package=_VG_CATALOG_PACKAGE,
+            catalog_roots={f"{PACKAGE}.catalog": self.root / _CATALOG},
+        )
+
+    def _catalog_tests(self, path: str) -> set[str]:
+        if not path.endswith(".py") or not self.catalog_graph.complete:
+            return {_VG_CATALOG_UNIT}
+        _, tests = self.catalog_graph.importers(_catalog_module(path))
+        if path.startswith(_VG_CATALOG):
+            rel = PurePosixPath(path.removeprefix(_VG_CATALOG))
+            if not rel.name.startswith("_"):
+                tests.add(rel.with_name(f"test_{rel.name}"))
+        return {f"{_VG_CATALOG_UNIT}/{test}" for test in tests}
+
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        claimed = {f for f in pr.changed_files if _is_vg_claim(f)}
+        claimed: set[str] = set()
         selected: set[str] = set()
         all_vg = False
-        for path in claimed:
-            family = next(
-                (scope for prefix, scope in self.families.items() if path.startswith(prefix)), None
-            )
-            if family is None:
-                all_vg = True
-                break
-            selected |= family.select(path)
         for path in pr.changed_files:
-            if path.startswith(_CATALOG) and not is_docs_path(path):
-                consumers = set().union(*(scope.select(path) for scope in self.families.values()))
-                if consumers:
+            if path.startswith((_VG_CATALOG, _CATALOG)) and not is_docs_path(path):
+                if self.root is None:
+                    if path.startswith(_VG_CATALOG):
+                        return RuleResult(
+                            handled_files={path},
+                            affected_stages=set(),
+                            scope=None,
+                            reason="visualgen: repository unavailable for catalog consumer selection",
+                        )
+                    continue
+                consumers = self._catalog_tests(path)
+                for scope in self.families.values():
+                    consumers |= scope.select(path)
+                if consumers or path.startswith(_VG_CATALOG):
                     selected |= consumers
                     claimed.add(path)
+            elif _is_vg_claim(path):
+                claimed.add(path)
+                family = next(
+                    (scope for prefix, scope in self.families.items() if path.startswith(prefix)),
+                    None,
+                )
+                if family is None:
+                    all_vg = True
+                else:
+                    selected |= family.select(path)
         if not claimed:
             return None
 
@@ -260,7 +306,8 @@ class VisualGenRule(Rule):
         if _VG_SCHEMA_PATH in claimed:
             required_checks[_SCHEMA_TEST_TARGET] = "schema"
         if any(
-            path.startswith(_VG_CATALOG) or (path.startswith(_MODELS) and "/ops/" in path)
+            path.startswith(_VG_CATALOG)
+            or (path.startswith(tuple(self.families)) and "/ops/" in path)
             for path in claimed
         ):
             required_checks[_CATALOG_CONTRACT_TEST] = "catalog contract"

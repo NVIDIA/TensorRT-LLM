@@ -17,9 +17,10 @@ import pytest
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.modules.vae import ParallelVaeAttentionBlock
+
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")

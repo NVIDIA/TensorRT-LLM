@@ -3,13 +3,15 @@
 
 """Real NCCL coverage of H3 TP, Ulysses padding and distributed spatial VAE tiles."""
 
+import os
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from diffusers import AutoencoderKLMiniMaxH3
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -28,6 +30,33 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.parallel.vae import (
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
+
+
+def _run_rank(rank, world_size, rendezvous, check, args, kwargs):
+    os.environ.update(RANK=str(rank), WORLD_SIZE=str(world_size))
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        check(rank, world_size, *args, **kwargs)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.fixture
+def run_h3_ranks(tmp_path, monkeypatch):
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    rendezvous = (tmp_path / "rendezvous").as_uri()
+
+    def launch(world_size, check, *args, **kwargs):
+        mp.spawn(_run_rank, args=(world_size, rendezvous, check, args, kwargs), nprocs=world_size)
+
+    return launch
 
 
 def _make_model_config(
@@ -192,20 +221,14 @@ def _logic_h3_ulysses_and_parallel_vae(
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
 @pytest.mark.parametrize("async_ulysses", [False, True], ids=["nccl", "async"])
 @pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER"])
-def test_h3_ulysses_and_parallel_vae(backend: str, async_ulysses: bool) -> None:
+def test_h3_ulysses_and_parallel_vae(backend: str, async_ulysses: bool, run_h3_ranks) -> None:
     if backend == "TRTLLM" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("TRTLLM H3 requires SM100 or SM103")
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
     if torch.cuda.device_count() < 2:
         pytest.skip(f"Test requires 2 GPUs, only {torch.cuda.device_count()} available")
-    run_distributed(
-        2,
-        _logic_h3_ulysses_and_parallel_vae,
-        backend,
-        async_ulysses,
-        preload=("tensorrt_llm",),
-    )
+    run_h3_ranks(2, _logic_h3_ulysses_and_parallel_vae, backend, async_ulysses)
 
 
 def _logic_h3_partial_vae_groups(rank: int, world_size: int) -> None:
@@ -257,15 +280,15 @@ def _logic_h3_partial_vae_groups(rank: int, world_size: int) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four CUDA GPUs")
-def test_h3_partial_vae_groups() -> None:
+def test_h3_partial_vae_groups(run_h3_ranks) -> None:
     if torch.cuda.device_count() < 4:
         pytest.skip(f"Test requires 4 GPUs, only {torch.cuda.device_count()} available")
-    run_distributed(4, _logic_h3_partial_vae_groups, preload=("tensorrt_llm",))
+    run_h3_ranks(4, _logic_h3_partial_vae_groups)
 
 
 @pytest.mark.parametrize("tp_size,ulysses_size", [(2, 1), (4, 1), (2, 2)])
 @pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER"])
-def test_h3_tensor_parallel(tp_size: int, ulysses_size: int, backend: str) -> None:
+def test_h3_tensor_parallel(tp_size: int, ulysses_size: int, backend: str, run_h3_ranks) -> None:
     world_size = tp_size * ulysses_size
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} CUDA GPUs")
@@ -273,11 +296,10 @@ def test_h3_tensor_parallel(tp_size: int, ulysses_size: int, backend: str) -> No
         pytest.skip("TRTLLM H3 requires SM100 or SM103")
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
-    run_distributed(
+    run_h3_ranks(
         world_size,
         _logic_h3_ulysses_and_parallel_vae,
         backend,
         tp_size=tp_size,
         ulysses_size=ulysses_size,
-        preload=("tensorrt_llm",),
     )

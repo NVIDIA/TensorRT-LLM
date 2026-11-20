@@ -292,7 +292,7 @@ still force VG stages.
 
 A VisualGen model family with a `pipeline_registry.py` selects its routed target suites and mirrored family unit tests. A family router or native family change runs the family. Changes under the Modeling V2 catalog also select the VisualGen targets that transitively import the entry.
 
-Changes under `_torch/visual_gen/catalog/` and changes to the shared `OpWrapper` base select the VisualGen test set, including the mirrored operation tests and consumers reached through runtime backend selection. VisualGen catalog changes also run the shared CPU catalog-contract checks.
+Changes under `_torch/visual_gen/catalog/` select the mirrored operation tests, the routed targets that import the operation directly or through helpers, and the CPU operation-contract checks. Changes to a routed family or target’s `ops/` also run the CPU contract checks. Changes to the shared `OpWrapper` base select every routed VisualGen family and its catalog consumers.
 
 VisualGen has no `condition.terms.backend` of its own; VG entries
 live in `backend: pytorch` and `backend: tensorrt` blocks. A block

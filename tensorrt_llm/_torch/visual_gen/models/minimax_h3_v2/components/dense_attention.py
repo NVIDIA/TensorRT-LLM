@@ -6,13 +6,13 @@ import math
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention.layout import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 
 def _cute_output(q, k, v, scale, *, recipe=None, threshold=None):
-    from tensorrt_llm._torch.visual_gen.catalog.attention.cute_fmha import cute_fmha
+    from ....catalog.attention.cute_fmha import cute_fmha
 
     dtype = q.dtype
     if dtype not in (torch.float16, torch.bfloat16):
@@ -43,34 +43,30 @@ class H3DenseAttention:
         self.sparse_params = sparse_params
         self.sol = None
         if backend == "CUDNN":
-            from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNSdpaRunner
+            from .cudnn_runner import CuDNNSdpaRunner
 
+            if config.attention_metadata_state is None:
+                config.attention_metadata_state = {}
             self.runner = CuDNNSdpaRunner(
                 num_heads=num_heads,
                 head_dim=head_dim,
                 dtype=config.torch_dtype,
                 quant_attention_config=self.recipe,
+                attention_metadata_state=config.attention_metadata_state,
             )
         elif backend == "FLASHINFER":
-            from tensorrt_llm._torch.visual_gen.attention.flashinfer_runner import (
-                FlashInferPrefillRunner,
-            )
+            from ....catalog.attention.flashinfer_prefill import FlashInferPrefillRunner
 
             if config.attention_metadata_state is None:
                 raise ValueError("FLASHINFER requires shared attention metadata state.")
             self.runner = FlashInferPrefillRunner(
                 num_heads=num_heads,
                 head_dim=head_dim,
-                quant_attention_config=self.recipe,
-                attention_metadata_state=config.attention_metadata_state,
+                plan_cache=config.attention_metadata_state,
             )
         elif backend == "CUTEDSL" and getattr(sparse_params, "algorithm", None) == "sol_attn":
-            from tensorrt_llm._torch.visual_gen.catalog.attention.cute_fmha import (
-                is_cute_fmha_supported,
-            )
-            from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn_backend import (
-                run_sol_attn_bthd,
-            )
+            from ....catalog.attention._cute_fmha_kernel import is_cute_fmha_supported
+            from ..kernels.sol_attention import run_sol_attn_bthd
 
             self.sol = run_sol_attn_bthd
             self.sol_params = sparse_params
@@ -130,39 +126,42 @@ class H3DenseAttention:
             mask = key_padding_mask[:, None, None, :] if key_padding_mask is not None else None
             return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
         if self.backend == "FA4":
-            from tensorrt_llm._torch.visual_gen.catalog.attention.flash_attention_4 import (
-                flash_attention_4,
-            )
+            from ....catalog.attention.flash_attention_4 import flash_attention_4
 
             lengths = (
                 key_padding_mask.sum(dim=1).to(torch.int32)
                 if key_padding_mask is not None
                 else None
             )
-            return flash_attention_4(
-                q, k, v, softmax_scale=self.scale, causal=False, seqused_k=lengths
-            )[0]
+            dtype = q.dtype
+            if dtype not in (torch.float16, torch.bfloat16):
+                q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
+            output, _ = flash_attention_4(q, k, v, softmax_scale=self.scale, seqused_k=lengths)
+            return output.to(dtype)
         if self.backend == "FLASHINFER":
-            from tensorrt_llm._torch.visual_gen.catalog.attention.flashinfer_prefill import (
-                flashinfer_prefill,
-            )
+            from ....catalog.attention.flashinfer_prefill import flashinfer_prefill
 
-            return flashinfer_prefill(
-                q, k, v, runner=self.runner, key_padding_mask=key_padding_mask
-            )[0]
+            output, _ = flashinfer_prefill(
+                q,
+                k,
+                v,
+                runner=self.runner,
+                qk_dtype=self.recipe.qk_dtype if self.recipe is not None else None,
+                v_dtype=self.recipe.v_dtype if self.recipe is not None else None,
+                key_padding_mask=key_padding_mask,
+            )
+            return output
         if key_padding_mask is not None:
             raise NotImplementedError(f"{self.backend} requires an unpadded H3 sequence")
         if self.backend == "CUTEDSL":
-            from tensorrt_llm._torch.visual_gen.attention.skip_softmax_threshold import (
-                resolve_skip_softmax_threshold_scale_factor,
-            )
+            from .skip_softmax_threshold import resolve_skip_softmax_threshold_scale_factor
 
             threshold = resolve_skip_softmax_threshold_scale_factor(
                 None, self.sparse_params, timestep
             )
             return _cute_output(q, k, v, self.scale, recipe=self.recipe, threshold=threshold)
         if self.backend == "CUDNN":
-            return self.runner.run_dense(q, k, v, is_causal=False, with_lse=False)[0]
+            return self.runner.run_dense(q, k, v)
         raise ValueError(f"Unsupported H3 attention backend {self.backend}")
 
 

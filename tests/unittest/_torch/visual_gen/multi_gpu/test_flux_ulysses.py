@@ -20,7 +20,6 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -29,6 +28,8 @@ from tensorrt_llm._torch.visual_gen.config import (
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig
+
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")

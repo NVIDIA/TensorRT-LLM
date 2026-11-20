@@ -69,7 +69,7 @@ def build_h3_vsa_metadata(segments, sparsity, device):
 
 def _cutedsl_fine(q, k, v, selected, metadata):
     from ....catalog.attention.block_sparse_attention import block_sparse_attention
-    from ....cute_dsl_kernels.blackwell.video_sparse_attention.interface import is_cute_supported
+    from ....cute_dsl_kernels.blackwell.video_sparse_attention import is_cute_supported
 
     if not is_cute_supported(q) or q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError(

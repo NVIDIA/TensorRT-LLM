@@ -4,6 +4,7 @@
 
 import importlib
 import math
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -87,26 +88,148 @@ def test_flashinfer_backend_is_registered() -> None:
     assert get_visual_gen_attention_backend("FLASHINFER") is FlashInferAttention
 
 
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "batch_size",
+        "query_length",
+        "key_value_length",
+        "num_kv_heads",
+        "attention_mask",
+        "use_padding",
+    ),
+    (
+        pytest.param(
+            torch.bfloat16, 1, 47, 47, 4, PredefinedAttentionMask.FULL, False, id="bf16_self"
+        ),
+        pytest.param(
+            torch.bfloat16,
+            2,
+            47,
+            47,
+            4,
+            PredefinedAttentionMask.FULL,
+            True,
+            id="bf16_self_padding",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            2,
+            47,
+            53,
+            4,
+            PredefinedAttentionMask.FULL,
+            True,
+            id="bf16_cross_padding",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            2,
+            47,
+            47,
+            2,
+            PredefinedAttentionMask.CAUSAL,
+            False,
+            id="bf16_causal_gqa",
+        ),
+        pytest.param(
+            torch.float16, 2, 47, 47, 4, PredefinedAttentionMask.FULL, False, id="fp16_self"
+        ),
+    ),
+)
 @pytest.mark.usefixtures("require_flashinfer_cuda")
-def test_static_global_scale_keeps_captured_padding_plan_after_replan() -> None:
+def test_flashinfer_attention_matches_sdpa(
+    dtype: torch.dtype,
+    batch_size: int,
+    query_length: int,
+    key_value_length: int,
+    num_kv_heads: int,
+    attention_mask: PredefinedAttentionMask,
+    use_padding: bool,
+) -> None:
     torch.manual_seed(0)
-    q, k, v = [torch.randn(2, 17, 2, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
-    mask = torch.ones(2, 17, device="cuda", dtype=torch.bool)
-    mask[0, -4:] = False
-    backend = FlashInferAttention(
-        num_heads=2, head_dim=64, attention_metadata_state={"_ltx23_static_global_scale": 1.0}
+    q = torch.randn((batch_size, query_length, 4, 64), device="cuda", dtype=dtype) * 0.2
+    k = (
+        torch.randn(
+            (batch_size, key_value_length, num_kv_heads, 64),
+            device="cuda",
+            dtype=dtype,
+        )
+        * 0.2
     )
-    original, original_lse = backend.forward_with_lse(q, k, v, key_padding_mask=mask)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured, captured_lse = backend.forward_with_lse(q, k, v, key_padding_mask=mask)
+    v = torch.randn_like(k)
+    key_padding_mask = None
+    if use_padding:
+        key_padding_mask = torch.ones(
+            (batch_size, key_value_length), device="cuda", dtype=torch.bool
+        )
+        key_padding_mask[0, -4:] = False
+        if batch_size > 1:
+            key_padding_mask[1, -2:] = False
+    attention = FlashInferAttention(num_heads=4, num_kv_heads=num_kv_heads, head_dim=64)
 
-    mask[0, -4:] = True
-    updated, _ = backend.forward_with_lse(q, k, v, key_padding_mask=mask)
-    torch.testing.assert_close(updated, _reference_attention(q, k, v), rtol=3e-2, atol=3e-2)
-    graph.replay()
-    torch.testing.assert_close(captured, original, rtol=0, atol=0)
-    torch.testing.assert_close(captured_lse, original_lse, rtol=0, atol=0)
+    output, lse = attention.forward_with_lse(
+        q,
+        k,
+        v,
+        attention_mask=attention_mask,
+        key_padding_mask=key_padding_mask,
+    )
+    reference = _reference_attention(
+        q,
+        k,
+        v,
+        is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+        key_padding_mask=key_padding_mask,
+    )
+
+    torch.testing.assert_close(output, reference, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(
+        lse,
+        _reference_lse(
+            q,
+            k,
+            is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            key_padding_mask=key_padding_mask,
+        ),
+        rtol=0,
+        atol=6e-2,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("capability", "expected_runner"),
+    (
+        pytest.param((10, 0), "batch", id="sm100"),
+        pytest.param((10, 3), "batch", id="sm103"),
+        pytest.param((12, 0), "single", id="sm120"),
+    ),
+)
+def test_flashinfer_unquantized_batch_size_one_dispatches_by_architecture(
+    capability: tuple[int, int],
+    expected_runner: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.empty((1, 4, 2, 64), dtype=torch.bfloat16)
+    attention = FlashInferAttention(num_heads=2, head_dim=64)
+    single_prefill = Mock(return_value=(q, torch.empty(0)))
+    batch_prefill = Mock(return_value=(q, torch.empty(0)))
+
+    def get_device_capability(_device: object = None) -> tuple[int, int]:
+        return capability
+
+    monkeypatch.setattr(attention, "_validate_inputs", Mock())
+    monkeypatch.setattr(attention, "_run_single_prefill", single_prefill)
+    monkeypatch.setattr(attention, "_run_batch_prefill", batch_prefill)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_device_capability)
+
+    attention.forward_with_lse(q, q, q)
+
+    expected = single_prefill if expected_runner == "single" else batch_prefill
+    unexpected = batch_prefill if expected_runner == "single" else single_prefill
+    expected.assert_called_once()
+    unexpected.assert_not_called()
 
 
 @pytest.mark.usefixtures("require_flashinfer_cuda")

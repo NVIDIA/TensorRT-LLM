@@ -21,7 +21,6 @@ os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -38,6 +37,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+from ._worker_pool import run_distributed
 
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support

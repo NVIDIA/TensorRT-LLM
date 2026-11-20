@@ -27,8 +27,7 @@ def test_flash_attention_4(cell):
     kwargs = dict(softmax_scale=0.09375, causal=s["causal"], seqused_k=lengths)
     op = fa4.flash_attention_4
     op.is_valid(q, k, v, **kwargs)
-    run = torch.compile(op, backend="eager") if s["dtype"] == torch.float32 else op
-    out, lse = run(q, k, v, **kwargs)
+    out, lse = op(q, k, v, **kwargs)
     reference, reference_lse = op.reference(q, k, v, **kwargs)
     torch.testing.assert_close(out, reference, rtol=1e-2, atol=5e-3)
     torch.testing.assert_close(lse, reference_lse, rtol=1e-3, atol=1e-3)
@@ -39,7 +38,7 @@ def test_missing_fa4_preserves_import_error(monkeypatch):
     cause = ImportError("missing FA4 dependency")
     monkeypatch.setattr(fa4, "_flash_attn_fwd", None)
     monkeypatch.setattr(fa4, "_flash_attn_fwd_import_error", cause)
-    q = torch.zeros(1, 4, 1, 64)
+    q = torch.zeros(1, 4, 1, 64, dtype=torch.bfloat16)
     with pytest.raises(ImportError, match="FlashAttention 4 is not available") as error:
         fa4.flash_attention_4(q, q, q, softmax_scale=0.125)
     assert error.value.__cause__ is cause
@@ -47,7 +46,7 @@ def test_missing_fa4_preserves_import_error(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_valid_key_length_fits_kv():
-    q = torch.zeros(1, 4, 1, 64)
+    q = torch.zeros(1, 4, 1, 64, dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match="valid key lengths"):
         fa4.flash_attention_4.is_valid(
             q, q, q, softmax_scale=0.125, seqused_k=torch.tensor([5], dtype=torch.int32)

@@ -9,7 +9,6 @@ import pytest
 import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLMiniMaxH3
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -26,6 +25,8 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 imp
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
+
+from ._worker_pool import run_distributed
 
 
 def _make_model_config(

@@ -6,28 +6,15 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch.visual_gen.attention import flashinfer_runner
-from tensorrt_llm._torch.visual_gen.attention.flashinfer_runner import FlashInferPrefillRunner
+from tensorrt_llm._torch.visual_gen.catalog.attention import _flashinfer_runtime
 from tensorrt_llm._torch.visual_gen.catalog.attention import flashinfer_prefill as prefill_module
-from tensorrt_llm._torch.visual_gen.catalog.attention.flashinfer_prefill import flashinfer_prefill
-from tensorrt_llm.visual_gen.args import QuantAttentionConfig
-
-TARGET_CELLS = {
-    "visual_gen/minimax_h3_v2/default_pipeline": (
-        Cell(
-            "short H3 text-refiner prefix",
-            dict(dtype=torch.bfloat16, batch=1, q=12, kv=12, heads=56, dim=128, padding=True),
-        ),
-    )
-}
-
-
-@pytest.mark.parametrize(
-    "cell",
-    [*flashinfer_prefill.CELLS, *TARGET_CELLS["visual_gen/minimax_h3_v2/default_pipeline"]],
-    ids=lambda c: c.why,
+from tensorrt_llm._torch.visual_gen.catalog.attention.flashinfer_prefill import (
+    FlashInferPrefillRunner,
+    flashinfer_prefill,
 )
+
+
+@pytest.mark.parametrize("cell", flashinfer_prefill.CELLS, ids=lambda cell: cell.why)
 def test_prefill_matches_reference(cell):
     spec = cell.spec
     batch, heads, dim = spec["batch"], spec.get("heads", 4), spec.get("dim", 64)
@@ -47,15 +34,15 @@ def test_prefill_matches_reference(cell):
         if batch > 1:
             mask[1, -2:] = False
     runner = FlashInferPrefillRunner(
-        num_heads=heads,
-        num_kv_heads=kv_heads,
-        head_dim=dim,
-        quant_attention_config=QuantAttentionConfig(qk_dtype=recipe, v_dtype="fp8")
-        if recipe
-        else None,
-        static_global_scale=spec.get("static_global_scale", False),
+        num_heads=heads, num_kv_heads=kv_heads, head_dim=dim, plan_cache={}
     )
-    kwargs = dict(runner=runner, is_causal=spec.get("causal", False), key_padding_mask=mask)
+    kwargs = dict(
+        runner=runner,
+        key_padding_mask=mask,
+        is_causal=spec.get("causal", False),
+        qk_dtype=recipe,
+        v_dtype="fp8" if recipe else None,
+    )
     flashinfer_prefill.is_valid(q, k, v, **kwargs)
     output, lse = flashinfer_prefill(q, k, v, **kwargs)
     expected, expected_lse = flashinfer_prefill.reference(q, k, v, **kwargs)
@@ -72,13 +59,11 @@ def test_prefill_matches_reference(cell):
 def test_quantized_prefill_rejects_key_padding_mask():
     q = torch.empty(1, 5, 2, 128, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(1, 5, device="cuda", dtype=torch.bool)
-    runner = FlashInferPrefillRunner(
-        num_heads=2,
-        head_dim=128,
-        quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8"),
-    )
+    runner = FlashInferPrefillRunner(num_heads=2, head_dim=128, plan_cache={})
     with pytest.raises(ValueError, match="quantized attention does not support key padding masks"):
-        flashinfer_prefill(q, q, q, runner=runner, key_padding_mask=mask)
+        flashinfer_prefill(
+            q, q, q, runner=runner, key_padding_mask=mask, qk_dtype="nvfp4", v_dtype="fp8"
+        )
 
 
 @pytest.mark.cpu_only
@@ -90,9 +75,11 @@ def test_batch_size_one_dispatches_by_architecture(monkeypatch, capability, expe
     calls = {name: Mock(return_value=(q, torch.empty(0))) for name in ("single", "batch")}
     monkeypatch.setattr(prefill_module, "_validate_inputs", Mock())
     for name, fn in calls.items():
-        monkeypatch.setattr(flashinfer_runner, f"run_{name}_prefill", fn)
+        monkeypatch.setattr(_flashinfer_runtime, f"run_{name}_prefill", fn)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
-    flashinfer_prefill(q, q, q, runner=FlashInferPrefillRunner(num_heads=2, head_dim=64))
+    flashinfer_prefill(
+        q, q, q, runner=FlashInferPrefillRunner(num_heads=2, head_dim=64, plan_cache={})
+    )
     assert {name: fn.call_count for name, fn in calls.items()} == {
         name: int(name == expected_runner) for name in calls
     }

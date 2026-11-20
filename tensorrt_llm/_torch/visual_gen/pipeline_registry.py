@@ -48,8 +48,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
-import torch.distributed as dist
-
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -183,45 +181,7 @@ class AutoPipeline:
     def resolve_class(
         config: "DiffusionPipelineConfig", checkpoint_dir: str
     ) -> Type["BasePipeline"]:
-        """Select an implementation on every worker before any constructor enters collectives."""
-        mapping = getattr(config, "visual_gen_mapping", None) or getattr(config, "mapping", None)
-        distributed = getattr(mapping, "world_size", 1) > 1 and dist.is_initialized()
-        if distributed:
-            error = None
-            pipeline_class = None
-            try:
-                pipeline_class = AutoPipeline._resolve_local_class(config, checkpoint_dir)
-            except Exception as exc:
-                # Every worker must enter the same collective, including a worker with a bad manifest.
-                error = exc
-            identity = (
-                f"{pipeline_class.__module__}.{pipeline_class.__qualname__}"
-                if pipeline_class is not None
-                else None
-            )
-            decisions = [None] * dist.get_world_size()
-            dist.all_gather_object(decisions, (identity, str(error) if error is not None else None))
-            if error is not None:
-                raise error
-            for rank, (selected, failure) in enumerate(decisions):
-                if failure is not None:
-                    raise RuntimeError(f"VisualGen routing failed on rank {rank}: {failure}")
-            if any(selected != identity for selected, _ in decisions):
-                raise RuntimeError(
-                    f"VisualGen pipeline selection differs across ranks: {decisions}"
-                )
-            assert pipeline_class is not None
-        else:
-            pipeline_class = AutoPipeline._resolve_local_class(config, checkpoint_dir)
-
-        target = f"{pipeline_class.__module__}.{pipeline_class.__qualname__}"
-        logger.info(f"AutoPipeline: Creating {target} from {checkpoint_dir}")
-        return pipeline_class
-
-    @staticmethod
-    def _resolve_local_class(
-        config: "DiffusionPipelineConfig", checkpoint_dir: str
-    ) -> Type["BasePipeline"]:
+        """Resolve the checkpoint family and its registered variant."""
         class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
         if class_name not in PIPELINE_REGISTRY:
             raise ValueError(
@@ -230,12 +190,17 @@ class AutoPipeline:
                 f"Checkpoint: {checkpoint_dir}"
             )
         entry = PIPELINE_REGISTRY[class_name]
-        AutoPipeline._validate_vae_quantization(config, class_name, entry)
         if entry.opt_in is not None:
-            env_var, resolver = entry.opt_in
-            if os.environ.get(env_var) == "1":
-                return resolver(config, checkpoint_dir)
-        return entry.pipeline_cls.resolve_variant(config)
+            from ._pipeline_opt_in import resolve_opt_in
+
+            target = resolve_opt_in(config, checkpoint_dir, class_name, entry, entry.opt_in)
+            if target is not None:
+                return target
+
+        AutoPipeline._validate_vae_quantization(config, class_name, entry)
+        pipeline_class = entry.pipeline_cls.resolve_variant(config)
+        logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
+        return pipeline_class
 
     @staticmethod
     def _validate_vae_quantization(

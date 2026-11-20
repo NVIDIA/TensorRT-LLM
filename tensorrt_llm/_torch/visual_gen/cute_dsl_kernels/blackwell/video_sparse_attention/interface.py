@@ -92,7 +92,7 @@ def block_sparse_attn_from_indices_cute(
     v: torch.Tensor,  # [B, H, S, D]
     q2k_idx: torch.Tensor,  # [B, H, num_q_blk, K]  int32
     q2k_num: torch.Tensor,  # [B, H, num_q_blk]     int32
-    variable_block_sizes: torch.Tensor,  # [num_kv_blk]  int32
+    variable_block_sizes: torch.Tensor,  # [num_q_blk]  int32
     sm_scale: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -111,10 +111,10 @@ def block_sparse_attn_from_indices_cute(
             f"cutlass-dsl is not importable: {_cute_import_error}"
         ) from _cute_import_error
 
-    num_kv_blk = variable_block_sizes.shape[0]
-    if num_kv_blk > _VideoSparseAttentionForward.MAX_INDICES:
+    num_q_blk = variable_block_sizes.shape[0]
+    if num_q_blk > _VideoSparseAttentionForward.MAX_INDICES:
         raise ValueError(
-            f"variable_block_sizes has {num_kv_blk} entries but the CuTe kernel "
+            f"variable_block_sizes has {num_q_blk} entries but the CuTe kernel "
             f"supports at most {_VideoSparseAttentionForward.MAX_INDICES} "
             "(SMEM-allocated sVariable_block_sizes buffer). Lower video "
             "resolution/length or fall back to dense SDPA."

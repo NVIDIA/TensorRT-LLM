@@ -33,13 +33,14 @@ from typing import Callable
 import pytest
 import torch
 import torch.nn.functional as F
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+from ._worker_pool import run_distributed
 
 ATTENTION_META_DICT = threading.local()
 ATTENTION_META_DICT.metadata = create_attention_metadata_state()

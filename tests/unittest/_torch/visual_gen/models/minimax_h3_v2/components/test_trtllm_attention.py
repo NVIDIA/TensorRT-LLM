@@ -9,6 +9,10 @@ from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAtten
 from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.components.trtllm_attention import (
     H3TrtllmAttention,
 )
+from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.uncached_attention import (
+    ContextBuffers,
+    uncached_attention,
+)
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 pytestmark = pytest.mark.skipif(
@@ -35,6 +39,37 @@ def test_h3_uneven_padded_prefix():
     )
     torch.testing.assert_close(actual[:, :valid].float(), expected, rtol=0.02, atol=0.02)
     assert torch.count_nonzero(actual[:, valid:]) == 0
+
+
+@pytest.mark.parametrize("cell", uncached_attention.CELLS)
+def test_h3_uncached_context_attention(cell):
+    batch, length = cell.spec["batch"], cell.spec["length"]
+    heads, dim = 56, 128
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    q, k, v = [
+        torch.randn(
+            batch, length, heads, dim, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(3)
+    ]
+    packed_qkv = torch.cat((q, k, v), dim=2).reshape(batch * length, -1)
+    buffers = ContextBuffers.for_shape(batch, length, q.device)
+    args = (packed_qkv, None, None, buffers, q.new_zeros((2,), dtype=torch.uint32))
+    kwargs = dict(
+        length=length,
+        num_heads=heads,
+        num_kv_heads=heads,
+        head_dim=dim,
+        layer_idx=0,
+        quant_mode=0,
+        prefill_threshold=None,
+        decode_threshold=None,
+        recipe=None,
+    )
+    uncached_attention.is_valid(*args, **kwargs)
+    actual = uncached_attention(*args, **kwargs)
+    expected = uncached_attention.reference(*args, **kwargs)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
 
 def test_h3_sage_key_smoothing():

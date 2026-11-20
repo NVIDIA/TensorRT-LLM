@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from test_common.visual_gen.h3_rollout import H3_V2
 
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
@@ -72,6 +73,30 @@ def test_rollout_selects_v1_and_v2_per_checkpoint(tmp_path, monkeypatch):
     mp.spawn(_check_rollout, args=(tmp_path,), nprocs=1)
 
 
+def test_family_without_opt_in_keeps_local_factory_path(tmp_path, monkeypatch):
+    from tensorrt_llm._torch.visual_gen.models.wan import WanPipeline
+
+    _checkpoint(tmp_path)
+    index = tmp_path / "modular_model_index.json"
+    index.write_text(
+        json.dumps(
+            {"_class_name": "WanPipeline", "transformer": ["diffusers", "WanTransformer3DModel"]}
+        )
+    )
+    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path))
+
+    class Mesh:
+        @property
+        def world_size(self):
+            pytest.fail("An unregistered rollout inspected the worker topology")
+
+    config.visual_gen_mapping = Mesh()
+    monkeypatch.setenv(H3_V2, "1")
+    monkeypatch.setattr(WanPipeline, "__init__", lambda self, cfg: torch.nn.Module.__init__(self))
+    with MetaInitMode():
+        assert type(AutoPipeline.from_config(config, str(tmp_path))) is WanPipeline
+
+
 def _check_rank_agreement(rank, root):
     from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.default_pipeline.pipeline import (
         MiniMaxH3Pipeline,
@@ -91,7 +116,16 @@ def _check_rank_agreement(rank, root):
         config = DiffusionPipelineConfig.from_pretrained(str(root / "base"))
         config.visual_gen_mapping = visual_mapping
         config.mapping = tp_mapping
-        assert AutoPipeline.resolve_class(config, str(root / "base")) is MiniMaxH3Pipeline
+
+        def construct(self, cfg):
+            torch.nn.Module.__init__(self)
+            self.weight = torch.nn.Parameter(torch.empty(1))
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(MiniMaxH3Pipeline, "__init__", construct)
+            with MetaInitMode():
+                pipeline = AutoPipeline.from_config(config, str(root / "base"))
+            assert type(pipeline) is MiniMaxH3Pipeline and pipeline.weight.is_meta
         with pytest.raises(
             ValueError if rank else RuntimeError, match="FastH3 VSA requires a single GPU"
         ):

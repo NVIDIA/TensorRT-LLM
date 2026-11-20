@@ -70,11 +70,11 @@ def _assert_projection_shards(
             torch.testing.assert_close(projection.weight, expected, rtol=0, atol=0)
 
 
-def _worker(rank: int, port: int, world_size: int) -> None:
+def _worker(rank: int, rendezvous: str, world_size: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=rendezvous,
         rank=rank,
         world_size=world_size,
         timeout=timedelta(seconds=180),
@@ -170,12 +170,10 @@ def _worker(rank: int, port: int, world_size: int) -> None:
 
 
 @pytest.mark.parametrize("world_size", [2, 4], ids=["tp2_world2", "tp2_world4"])
-def test_minimax_h3_text_encoder_tp(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
-    from test_common.visual_gen._visual_gen_dist_utils import spawn_with_retry
-
+def test_minimax_h3_text_encoder_tp(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, world_size: int
+) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} CUDA GPUs")
     monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
-    spawn_with_retry(
-        lambda port: mp.spawn(_worker, args=(port, world_size), nprocs=world_size, join=True)
-    )
+    mp.spawn(_worker, args=((tmp_path / "rendezvous").as_uri(), world_size), nprocs=world_size)

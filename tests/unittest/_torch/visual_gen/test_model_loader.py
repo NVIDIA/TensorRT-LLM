@@ -247,8 +247,8 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
         staticmethod(lambda checkpoint_dir, args=None, **kwargs: config),
     )
     monkeypatch.setattr(
-        "tensorrt_llm._torch.visual_gen.pipeline_loader.AutoPipeline.resolve_class",
-        lambda config, checkpoint_dir: FakePipeline,
+        "tensorrt_llm._torch.visual_gen.pipeline_loader.AutoPipeline.from_config",
+        lambda config, checkpoint_dir: FakePipeline(config),
     )
     monkeypatch.setattr(
         PipelineLoader,

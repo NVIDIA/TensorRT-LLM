@@ -475,7 +475,6 @@ class ThopAttention(OpWrapper):
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
         skip_correction_threshold: float = 0.0,
-        sage_attn_smooth_k: bool = False,
     ) -> torch.Tensor:
         """Writes `output` in place and returns it -- the op destroys its
         prior contents in rows `[:num_tokens]`, so a caller that wants them
@@ -581,7 +580,6 @@ class ThopAttention(OpWrapper):
             sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v,
             sage_attn_qk_int8=sage_attn_qk_int8,
-            sage_attn_smooth_k=sage_attn_smooth_k,
             num_contexts=num_contexts,
             num_ctx_tokens=num_ctx_tokens,
             trtllm_gen_jit_warmup=trtllm_gen_jit_warmup,

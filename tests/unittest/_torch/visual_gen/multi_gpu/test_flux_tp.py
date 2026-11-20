@@ -32,7 +32,6 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -47,6 +46,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ._worker_pool import run_distributed
 from .tp_shard_utils import (
     copy_tp_parameter,
     shard_dim1,

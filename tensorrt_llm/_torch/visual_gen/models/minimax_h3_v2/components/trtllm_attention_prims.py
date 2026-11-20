@@ -84,7 +84,7 @@ class H3PrimTS:
         return None
 
     def _block_sparse(self, q, k, v, routes):
-        from tensorrt_llm._torch.attention.backends.fmha.block_sparse_plan import BlockSparsePlan
+        from tensorrt_llm._torch.attention.backends.prims_ts import BlockSparseTSWrapper
         from tensorrt_llm._torch.attention.backends.prims_ts.sage import (
             SageAttentionConfig,
             SageAttentionParams,
@@ -114,32 +114,52 @@ class H3PrimTS:
         if routes is not None and capacity is None:
             capacity = (length + kv_block - 1) // kv_block
         plans = self.metadata_state.setdefault("h3_block_sparse_plans", {})
-        key = BlockSparsePlan(
+        geometry = (batch, length, length, heads, kv_heads, dim, q_block, kv_block)
+        profile = dict(
             device=q.device,
-            batch_size=batch,
-            seq_len_q=length,
-            kv_capacity=length,
-            num_heads=heads,
-            num_kv_heads=kv_heads,
-            head_dim=dim,
-            page_size=None,
-            q_block_size=q_block,
-            kv_block_size=kv_block,
             max_blocks_per_row=capacity,
-            mask_type="dense",
-            dtype=dtype,
-            qk_dtype=qk_dtype,
-            v_dtype=value_dtype,
+            q_data_type=qk_dtype,
+            k_data_type=qk_dtype,
+            v_data_type=value_dtype,
+            o_data_type=dtype,
             use_kv_valid_bits=valid_bits,
             sparse_format=sparse_format,
             use_proxy_routes=proxy,
-            sage=sage,
+            sage_config=sage,
             use_block_sparse=routes is not None,
         )
+        key = (geometry, tuple(profile.values()))
         if key not in plans:
-            if routes is None and key.unsupported_reason() is not None:
-                return None
-            plans[key] = key.plan()
+            if routes is None:
+                from tensorrt_llm._torch.attention.backends.prims_ts._block_sparse.config import (
+                    _validate_block_sparse_static_profile,
+                )
+
+                # Only an unsupported static profile can fall back to the native dense kernel.
+                try:
+                    _validate_block_sparse_static_profile(
+                        batch_size=batch,
+                        seq_len_q=length,
+                        seq_len_kv=length,
+                        num_qo_heads=heads,
+                        num_kv_heads=kv_heads,
+                        head_dim=dim,
+                        q_block_size=q_block,
+                        kv_block_size=kv_block,
+                        use_kv_valid_bits=False,
+                        mask_type="dense",
+                        q_dtype=qk_dtype,
+                        kv_dtype=qk_dtype,
+                        v_dtype=value_dtype,
+                        output_dtype=dtype,
+                        sage=sage,
+                        use_block_sparse=False,
+                    )
+                except (ValueError, NotImplementedError, OverflowError):
+                    return None
+            wrapper = BlockSparseTSWrapper()
+            wrapper.plan(*geometry, **profile)
+            plans[key] = wrapper
 
         sage_params = None
         if sage is not None:

@@ -362,9 +362,8 @@ class PipelineLoader:
         # - If quant_config specifies FP8, Linear layers have FP8 weight buffers
         # =====================================================================
         logger.info("Creating pipeline with MetaInitMode")
-        pipeline_class = AutoPipeline.resolve_class(config, checkpoint_dir)
         with MetaInitMode():
-            pipeline = pipeline_class(config)
+            pipeline = AutoPipeline.from_config(config, checkpoint_dir)
 
         if sleep_restore_mode is not None:
             if loading_stack is None:

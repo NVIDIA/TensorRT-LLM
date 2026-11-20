@@ -20,8 +20,9 @@ from pathlib import Path
 
 import pytest
 import torch.distributed as dist
-from test_common.visual_gen import _worker_pool as pool_mod
-from test_common.visual_gen._worker_pool import WorkerPoolError, run_distributed
+
+from . import _worker_pool as pool_mod
+from ._worker_pool import WorkerPoolError, run_distributed
 
 pytestmark = pytest.mark.cpu_only
 
@@ -215,7 +216,7 @@ def test_lifetime_test_gives_fresh_ranks(tmp_path, monkeypatch):
 
 
 def test_lifetime_module_reuses_within_a_module_and_drains_at_its_end(tmp_path, monkeypatch):
-    from test_common.visual_gen import pool_hooks
+    from . import conftest
 
     monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "module")
     p = str(tmp_path / "pid")
@@ -224,14 +225,14 @@ def test_lifetime_module_reuses_within_a_module_and_drains_at_its_end(tmp_path, 
     run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert _read_pids(p, 2) == first
     assert pool_mod._POOLS
-    pool_hooks.end_of_module()  # what the module-scoped fixture runs at teardown
+    conftest.end_of_module()  # what the module-scoped fixture runs at teardown
     assert not pool_mod._POOLS
     for pid in first:
         assert _pid_gone(pid)
     monkeypatch.setenv("TRTLLM_TEST_VISUALGEN_POOL_LIFETIME", "session")
     run_distributed(2, _write_pid, p, dist_backend="gloo", timeout=_TIMEOUT)
     assert pool_mod._POOLS
-    pool_hooks.end_of_module()
+    conftest.end_of_module()
     assert pool_mod._POOLS  # session lifetime: untouched at module end
 
 
@@ -306,7 +307,7 @@ def test_ranks_die_with_parent(tmp_path):
     p = str(tmp_path / "pid")
     script = f"""
 import signal, threading, time, os
-from test_common.visual_gen._worker_pool import run_distributed
+from multi_gpu._worker_pool import run_distributed
 from multi_gpu.test_worker_pool import _write_pid_then_hang
 t = threading.Thread(target=run_distributed, args=(2, _write_pid_then_hang, {p!r}),
                      kwargs=dict(dist_backend="gloo", timeout=3600), daemon=True)

@@ -16,11 +16,11 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     SparseParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
-from tensorrt_llm._torch.visual_gen.attention.layout import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
+from ..ops.uncached_attention import ContextBuffers, uncached_attention
 from .trtllm_attention_prims import H3PrimTS
 
 
@@ -111,117 +111,26 @@ class H3TrtllmAttention:
         cache = self.state.setdefault("h3_thop", {})
         key = (q.device, batch, length)
         if key not in cache:
-            lens = torch.full((batch,), length, dtype=torch.int32, device="cpu")
-            cache[key] = (
-                lens,
-                lens.to(q.device),
-                torch.zeros_like(lens),
-                torch.tensor([batch * length, 0], dtype=torch.int32, device="cpu"),
-                torch.empty(0, dtype=torch.int8, device=q.device),
-                torch.ones(1, dtype=torch.float32, device=q.device),
-            )
-        host_lens, device_lens, types, totals, workspace, kv_scale = cache[key]
+            cache[key] = ContextBuffers.for_shape(batch, length, q.device)
         if self.skip_stats is None or self.skip_stats.device != q.device:
             self.skip_stats = q.new_zeros((2,), dtype=torch.uint32)
         if self.print_stats:
             self.skip_stats.zero_()
-        out = q.new_empty((batch * length, self.num_heads * self.head_dim))
-        thop_attention(
-            q=q,
-            k=k,
-            v=v,
-            output=out,
-            output_sf=None,
-            workspace=workspace,
-            sequence_length=device_lens,
-            host_past_key_value_lengths=host_lens,
-            host_total_kv_lens=totals,
-            context_lengths=device_lens,
-            host_context_lengths=host_lens,
-            host_request_types=types,
-            max_context_q_len_override=None,
-            kv_cache_block_offsets=None,
-            host_kv_cache_pool_pointers=None,
-            host_kv_cache_pool_mapping=None,
-            cache_indirection=None,
-            kv_scale_orig_quant=kv_scale,
-            kv_scale_quant_orig=kv_scale,
-            out_scale=None,
-            rotary_inv_freq=None,
-            rotary_cos_sin=None,
-            latent_cache=None,
-            q_pe=None,
-            block_ids_per_seq=None,
-            attention_sinks=None,
-            is_fused_qkv=k is None,
-            update_kv_cache=True,
-            predicted_tokens_per_seq=1,
-            local_layer_idx=self.layer_idx,
+        out = uncached_attention(
+            q,
+            k,
+            v,
+            cache[key],
+            self.skip_stats,
+            length=length,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            head_size=self.head_dim,
-            tokens_per_block=None,
-            max_num_requests=batch,
-            max_context_length=length,
-            max_seq_len=length,
-            attention_window_size=length,
-            beam_width=1,
-            mask_type=0,
+            head_dim=self.head_dim,
+            layer_idx=self.layer_idx,
             quant_mode=self.quant_mode,
-            q_scaling=1.0,
-            position_embedding_type=0,
-            rope_dim=0,
-            rope_base=10000.0,
-            rope_scale_type=0,
-            rope_scale=1.0,
-            rope_short_m_scale=1.0,
-            rope_long_m_scale=1.0,
-            rope_max_positions=1024,
-            rope_original_max_positions=1024,
-            use_paged_context_fmha=False,
-            attention_input_type=0,
-            is_mla_enable=False,
-            chunked_prefill_buffer_batch_size=1,
-            q_lora_rank=None,
-            kv_lora_rank=None,
-            qk_nope_head_dim=None,
-            qk_rope_head_dim=None,
-            v_head_dim=self.head_dim,
-            rope_append=None,
-            mrope_rotary_cos_sin=None,
-            mrope_position_deltas=None,
-            helix_position_offsets=None,
-            helix_is_inactive_rank=None,
-            attention_chunk_size=None,
-            softmax_stats_tensor=None,
-            is_spec_decoding_enabled=False,
-            use_spec_decoding=False,
-            is_spec_dec_tree=False,
-            spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets=None,
-            spec_decoding_packed_mask=None,
-            spec_decoding_bl_tree_mask_offset=None,
-            spec_decoding_bl_tree_mask=None,
-            spec_bl_tree_first_sparse_mask_offset_kv=None,
-            sparse_kv_indices=None,
-            sparse_kv_offsets=None,
-            sparse_attn_indices=None,
-            sparse_attn_offsets=None,
-            sparse_attn_indices_block_size=0,
-            skip_softmax_threshold_scale_factor_prefill=sparse.threshold_scale_factor_prefill
-            if sparse
-            else None,
-            skip_softmax_threshold_scale_factor_decode=sparse.threshold_scale_factor_decode
-            if sparse
-            else None,
-            skip_softmax_stat=self.skip_stats,
-            sage_attn_num_elts_per_blk_q=self.recipe.q_block_size if self.recipe else 0,
-            sage_attn_num_elts_per_blk_k=self.recipe.k_block_size if self.recipe else 0,
-            sage_attn_num_elts_per_blk_v=self.recipe.v_block_size if self.recipe else 0,
-            sage_attn_qk_int8=self.recipe is not None and self.recipe.qk_dtype == "int8",
-            sage_attn_smooth_k=self.recipe is not None and self.recipe.smooth_k,
-            num_contexts=batch,
-            num_ctx_tokens=batch * length,
+            prefill_threshold=sparse.threshold_scale_factor_prefill if sparse else None,
+            decode_threshold=sparse.threshold_scale_factor_decode if sparse else None,
+            recipe=self.recipe,
         )
         if self.print_stats:
             total, skipped = self.skip_stats.tolist()

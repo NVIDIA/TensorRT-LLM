@@ -779,7 +779,7 @@ def test_cutedsl_strict_raises_on_ineligible_input(monkeypatch) -> None:
     monkeypatch.setenv("TRTLLM_SOL_ATTN_STRICT", "1")
     q = k = v = torch.randn(1, 4, 2, 128)  # CPU -> ineligible
     with pytest.raises(RuntimeError, match="cannot run the CuTe kernel"):
-        wrapper.run_sol_attn_bthd(q, k, v)
+        wrapper._run_sol_attn_bthd(q, k, v)
 
 
 @_CPU_ONLY
@@ -791,7 +791,7 @@ def test_cutedsl_ineligible_falls_back_to_dense_and_counts(monkeypatch) -> None:
     wrapper.reset_sol_attn_stats()
     q = k = v = torch.randn(1, 4, 2, 128)
 
-    out = wrapper.run_sol_attn_bthd(q, k, v)
+    out = wrapper._run_sol_attn_bthd(q, k, v)
 
     ref = torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)

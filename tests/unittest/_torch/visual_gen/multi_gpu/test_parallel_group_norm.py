@@ -17,9 +17,10 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.modules.vae import GroupNormParallel
+
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")
