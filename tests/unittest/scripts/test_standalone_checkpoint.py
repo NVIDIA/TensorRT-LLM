@@ -201,6 +201,89 @@ def test_capture_then_two_distinct_restores(capture, restore, peers: Mock, tmp_p
         ]
 
 
+def test_bundled_backend_does_not_need_an_external_executable(
+    coordinator: ModuleType, tmp_path: Path
+) -> None:
+    host = coordinator.Host()
+    assert host.command[3:] == [
+        Path(coordinator.__file__).with_name("docker_adapter.py"),
+        "--deployment",
+        coordinator.DEFAULT_DEPLOYMENT,
+    ]
+    config = tmp_path / "deployment.json"
+    assert coordinator.Host(deployment=config).command[-1] == config
+    with pytest.raises(ValueError, match="not both"):
+        coordinator.Host(ADAPTER, deployment=config)
+    with pytest.raises(ValueError, match="absolute"):
+        coordinator.Host(deployment=Path("relative.json"))
+
+
+@pytest.mark.parametrize("gate", ["no-journal", "unconfirmed", "wrong-container", "ok"])
+def test_fresh_request_requires_both_publication_records(
+    coordinator: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate: str
+) -> None:
+    attempt, target = "1" * 32, TARGETS[0]
+    journal = tmp_path / TEMPLATE / attempt
+    (tmp_path / TEMPLATE).mkdir(mode=0o700)
+    journal.mkdir(mode=0o700)
+    if gate != "no-journal":
+        coordinator._save(journal / "published.json", {"target": target})
+    host = Mock(bundled=True)
+    host.call.return_value = {
+        "published": gate != "unconfirmed",
+        "target": target,
+        "control_port": 8000,
+        "control_container": SOURCE if gate == "wrong-container" else target,
+    }
+    request = Mock(return_value=[31, 32])
+    monkeypatch.setattr(coordinator, "generate_tokens", request)
+    args = (tmp_path, TEMPLATE, target, host, "Qwen3", [7], 2, BUDGET)
+    if gate == "ok":
+        assert coordinator.generate(*args) == [31, 32]
+        request.assert_called_once_with(target, 8000, "Qwen3", [7], 2, ANY)
+    else:
+        with pytest.raises((ValueError, RuntimeError)):
+            coordinator.generate(*args)
+        request.assert_not_called()
+    if gate == "no-journal":
+        host.call.assert_not_called()
+    else:
+        host.call.assert_called_once_with("resolve", attempt, TEMPLATE, ANY, target=target)
+
+
+def test_bundled_engine_channel_uses_only_the_verified_container(
+    coordinator: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = Mock()
+    monkeypatch.setattr(coordinator, "EngineClient", engine)
+    host = coordinator.Host()
+    for invalid in ({}, {"control_container": TARGETS[0]}):
+        with pytest.raises(RuntimeError, match="owned container"):
+            host.engine({"control_port": 8000, **invalid}, SOURCE, KEY)
+    engine.assert_not_called()
+    host.engine({"control_port": 8000, "control_container": SOURCE}, SOURCE, KEY)
+    engine.assert_called_once_with(8000, KEY, container=SOURCE)
+
+
+def test_missing_deployment_rejects_capture_before_source_mutation(
+    coordinator: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Execute the shipped adapter process; no site driver or GPU is required for preflight."""
+    engine = Mock()
+    monkeypatch.setattr(coordinator, "EngineClient", engine)
+    missing = tmp_path / "deployment.json"
+    with pytest.raises(subprocess.CalledProcessError):
+        coordinator.capture(
+            tmp_path, TEMPLATE, SOURCE, PROBE, coordinator.Host(deployment=missing), KEY, BUDGET
+        )
+    engine.assert_not_called()
+    assert not (tmp_path / TEMPLATE).exists()
+    assert str(missing) in capfd.readouterr().err
+
+
 @pytest.mark.parametrize(
     "fault", ["stale-snapshot", "driver-not-terminated", "source-not-terminated"]
 )

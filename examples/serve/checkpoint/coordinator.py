@@ -16,9 +16,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from engine_client import EngineClient, validate_probe
+from engine_client import EngineClient, generate_tokens, validate_probe
 
 SNAPSHOT_REVISION = "4b1300a82c6676df020c201fa884cc602251e12e"
+DEFAULT_DEPLOYMENT = Path("/var/lib/trtllm-warp/deployment.json")
 
 
 def _remaining(deadline: float) -> float:
@@ -30,13 +31,36 @@ def _remaining(deadline: float) -> float:
 
 
 class Host:
-    """Invoke an operator-installed host adapter; do not inherit engine credentials."""
+    """Use the bundled Docker adapter unless an operator selects another backend."""
 
-    def __init__(self, executable: Path) -> None:
-        """Select a trusted absolute executable path, without a shell."""
-        if not executable.is_absolute():
-            raise ValueError("The host adapter must be an absolute path")
-        self.executable = executable
+    def __init__(self, executable: Path | None = None, *, deployment: Path | None = None) -> None:
+        """Select deployment configuration without passing engine credentials to the adapter."""
+        self.bundled = executable is None
+        if executable is not None:
+            if not executable.is_absolute() or deployment is not None:
+                raise ValueError("Use an absolute host adapter path or a deployment, not both")
+            self.command = [executable]
+        else:
+            config = deployment if deployment is not None else DEFAULT_DEPLOYMENT
+            if not config.is_absolute():
+                raise ValueError("Use an absolute deployment configuration path")
+            self.command = [
+                Path(sys.executable),
+                "-E",
+                "-s",
+                Path(__file__).resolve().with_name("docker_adapter.py"),
+                "--deployment",
+                config,
+            ]
+
+    def engine(self, result: dict, expected: str, key: str) -> EngineClient:
+        """Bind engine control to the host-verified instance, never a restored listener alone."""
+        port = _port(result)
+        if not self.bundled:
+            return EngineClient(port, key)
+        if not _digest(expected) or result.get("control_container") != expected:
+            raise RuntimeError("The private control channel does not match the owned container")
+        return EngineClient(port, key, container=expected)
 
     def call(
         self, action: str, attempt: str, template: str, deadline: float, **fields: Any
@@ -59,7 +83,7 @@ class Host:
         envelope = {"version": 1, "action": action, "attempt": attempt, "template": template}
         request = {**envelope, "deadline_monotonic": deadline, "input": fields}
         run = subprocess.run(
-            [self.executable],
+            self.command,
             input=json.dumps(request).encode(),
             stdout=subprocess.PIPE,
             env={"PATH": os.defpath},
@@ -206,7 +230,7 @@ def capture(
         bound = host.call("bind_source", attempt, template, deadline, source=source)
         if bound.get("source") != source:
             raise RuntimeError("Control endpoint does not belong to the source")
-        engine = EngineClient(_port(bound), key)
+        engine = host.engine(bound, source, key)
         evidence = engine.prepare(
             template, _remaining(deadline), probe, before_dispatch=before_dispatch, on_send=on_send
         )
@@ -219,7 +243,10 @@ def capture(
             k: evidence[k]
             for k in ("source_session_id", "template_id", "profile_digest", "cohort_digest")
         }
-        result = host.call("capture", attempt, template, deadline, source=source, identity=identity)
+        proof = {"status_headers": engine.status_headers()} if host.bundled else {}
+        result = host.call(
+            "capture", attempt, template, deadline, source=source, identity=identity, **proof
+        )
         _check_driver(result, "capture", attempt, template, source)
         digest = result.get("artifact_digest")
         if (
@@ -317,7 +344,7 @@ def restore(state: Path, template: str, host: Host, key: str, budget: float) -> 
                 "Host did not establish this isolated destination and restore result"
             )
         _check_driver(result, "restore", attempt, template, target)
-        engine = EngineClient(_port(result), key)
+        engine = host.engine(result, target, key)
         engine.validate_and_activate(
             identity, attempt, attempt, manifest["probe"], _remaining(deadline)
         )
@@ -325,7 +352,8 @@ def restore(state: Path, template: str, host: Host, key: str, budget: float) -> 
         _save(journal / "publishing.json", {"target": target})
         _remaining(deadline)
         publishing = True
-        result = host.call("publish", attempt, template, deadline, target=target)
+        proof = {"status_headers": engine.status_headers()} if host.bundled else {}
+        result = host.call("publish", attempt, template, deadline, target=target, **proof)
         if result.get("target") != target or result.get("published") is not True:
             raise RuntimeError("Host publication is unconfirmed")
         _save(journal / "published.json", {"target": target})
@@ -344,11 +372,50 @@ def restore(state: Path, template: str, host: Host, key: str, budget: float) -> 
             _sync_dir(directory)
 
 
+def generate(
+    state: Path,
+    template: str,
+    target: str,
+    host: Host,
+    model: str,
+    prompt_token_ids: list[int],
+    max_tokens: int,
+    budget: float,
+) -> list[int]:
+    """Send one fresh inference request via the bundled backend's published local route."""
+    directory, deadline = _start(state, template, budget)
+    if not host.bundled or not _digest(target):
+        raise ValueError("Generation requires the bundled adapter and a full destination ID")
+    _private_dir(directory)
+    for journal in directory.iterdir():
+        if not re.fullmatch(r"[0-9a-f]{32}", journal.name):
+            continue
+        _private_dir(journal)
+        published = journal / "published.json"
+        if not published.is_file() or json.loads(published.read_bytes()) != {"target": target}:
+            continue
+        route = host.call("resolve", journal.name, template, deadline, target=target)
+        if (
+            route.get("published") is not True
+            or route.get("target") != target
+            or route.get("control_container") != target
+        ):
+            raise RuntimeError("Host route does not match the published destination")
+        return generate_tokens(
+            target, _port(route), model, prompt_token_ids, max_tokens, _remaining(deadline)
+        )
+    raise ValueError("No confirmed publication for this destination")
+
+
 def main() -> None:
     """Run one opt-in CPU-side transaction; do not start a server or change normal startup."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", required=True, type=Path)
-    parser.add_argument("--host-adapter", required=True, type=Path)
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument(
+        "--deployment", type=Path, help=f"WARP host configuration (default: {DEFAULT_DEPLOYMENT})"
+    )
+    backend.add_argument("--host-adapter", type=Path, help="Override the bundled host adapter")
     parser.add_argument("--template", required=True)
     parser.add_argument("--budget", type=float, default=300)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -356,11 +423,34 @@ def main() -> None:
     source.add_argument("--source", required=True)
     source.add_argument("--probe", required=True, type=Path)
     commands.add_parser("restore")
+    inference = commands.add_parser(
+        "generate", help="Send a fresh request to a published local target"
+    )
+    inference.add_argument("--target", required=True)
+    inference.add_argument("--model", required=True)
+    inference.add_argument("--prompt-token-ids", required=True, type=int, nargs="+")
+    inference.add_argument("--max-tokens", type=int, default=4)
     args = parser.parse_args()
+    host = Host(args.host_adapter, deployment=args.deployment)
+    if args.command == "generate":
+        print(
+            json.dumps(
+                generate(
+                    args.state,
+                    args.template,
+                    args.target,
+                    host,
+                    args.model,
+                    args.prompt_token_ids,
+                    args.max_tokens,
+                    args.budget,
+                )
+            )
+        )
+        return
     key = os.environ.get("TRTLLM_RUNTIME_CONTROL_API_KEY")
     if not key:
         parser.error("Supply this endpoint's TRTLLM_RUNTIME_CONTROL_API_KEY")
-    host = Host(args.host_adapter)
     if args.command == "capture":
         capture(
             args.state,

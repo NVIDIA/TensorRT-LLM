@@ -25,6 +25,10 @@ import re
 import runpy
 import secrets
 import socket
+import struct
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -67,6 +71,7 @@ _CHECKS = {
     "serving": {"activation_committed"},
 }
 _MAX_BODY = 128 * 1024
+_EXEC_HELPER = Path(__file__).with_name("docker_transport.py")
 
 
 def _identifier(value: object) -> bool:
@@ -104,6 +109,179 @@ def _object(pairs: list[tuple[str, object]]) -> dict:
     if len(obj) != len(pairs):
         raise ValueError("Duplicate JSON key.")
     return obj
+
+
+def _json_response(raw: bytes) -> dict:
+    try:
+        obj = json.loads(raw, object_pairs_hook=_object)
+    except (ValueError, RecursionError):
+        raise RuntimeError("Invalid checkpoint JSON response.") from None
+    _require(isinstance(obj, dict), "Expected a checkpoint JSON object.")
+    return obj
+
+
+def _docker_endpoint(container: str, port: int) -> None:
+    if not _digest(container) or type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("Expected a full immutable container ID and loopback port.")
+    if sys.platform != "linux":
+        raise RuntimeError("Private checkpoint transport requires a local Linux Docker daemon.")
+
+
+def _receive(channel: socket.socket, size: int, deadline: float) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        channel.settimeout(_remaining(deadline))
+        chunk = channel.recv(size - len(data))
+        _require(bool(chunk), "Incomplete private checkpoint reply; outcome unknown.")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _docker_exchange(
+    container: str,
+    port: int,
+    path: str,
+    deadline: float,
+    request: Callable[[], tuple[dict[str, str], bytes]],
+    on_send: Callable[[], None] | None = None,
+) -> bytes:
+    """Exchange one frame with the attached exec. Never retry an uncertain request."""
+    _docker_endpoint(container, port)
+    helper = _EXEC_HELPER.read_text(encoding="ascii")
+    channel, child = socket.socketpair()
+    with channel, child, tempfile.TemporaryDirectory() as config:
+        cmd = [
+            "/usr/bin/docker",
+            "--host=unix:///var/run/docker.sock",
+            "--config",
+            config,
+            "exec",
+            "-i",
+            "--env",
+            "TRTLLM_RUNTIME_CONTROL_API_KEY=",
+            container,
+            "python3",
+            "-I",
+            "-S",
+            "-c",
+            helper,
+            str(port),
+            path,
+            str(_remaining(deadline)),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=child,
+            stdout=child,
+            stderr=subprocess.DEVNULL,
+            env={"PATH": "/usr/bin:/bin", "HOME": config},
+        )
+        child.close()
+        try:
+            channel.settimeout(_remaining(deadline))
+            _require(
+                channel.recv(1) == b"R", "Private exec did not confirm the checkpoint connection."
+            )
+            # The helper started its clock *before* this observation. No shared clock epoch
+            # is required, and a delayed request cannot acquire a fresh engine send budget.
+            ready_budget = _remaining(deadline)
+            headers, body = request()
+            frame = json.dumps([ready_budget, headers, body.decode("ascii")]).encode() + b"\n"
+            _require(len(frame) <= _MAX_BODY, "Oversized private checkpoint request.")
+            channel.settimeout(_remaining(deadline))
+            if on_send is not None:
+                on_send()
+            channel.sendall(frame)
+            channel.shutdown(socket.SHUT_WR)
+            status, length = struct.unpack("!HI", _receive(channel, 6, deadline))
+            _require(length <= _MAX_BODY, "Oversized private checkpoint reply.")
+            raw = _receive(channel, length, deadline)
+            channel.settimeout(_remaining(deadline))
+            _require(not channel.recv(1), "Unexpected private checkpoint output.")
+            _require(
+                proc.wait(timeout=_remaining(deadline)) == 0, "Docker exec failed; outcome unknown."
+            )
+            _remaining(deadline)
+            _require(status == 200, f"Checkpoint HTTP {status}.")
+            return raw
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("Checkpoint deadline expired.") from None
+        finally:
+            # Close stdin even on pre-dispatch failure. The independent helper alarm also
+            # covers daemon stalls or host death that prevent stdin EOF reaching the exec.
+            channel.close()
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=max(0, min(0.25, deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        raise RuntimeError("Could not confirm Docker CLI termination.") from None
+
+
+def generate_tokens(
+    container: str,
+    port: int,
+    model: str,
+    prompt_token_ids: list[int],
+    max_tokens: int,
+    budget: float,
+) -> list[int]:
+    """Request greedy token IDs from the published target, without a control credential.
+
+    Args:
+        container: Full ID returned by the coordinator after successful publication.
+            The caller must verify publication; possession of an ID is not authorization.
+        port: Engine's in-container loopback port.
+        model: Served model name.
+        prompt_token_ids: One tokenized prompt (up to 4096 tokens).
+        max_tokens: Exact number of completion tokens (1-64).
+        budget: Total timeout in seconds.
+    """
+    deadline = _deadline(budget)
+    if not (
+        _identifier(model)
+        and isinstance(prompt_token_ids, list)
+        and 1 <= len(prompt_token_ids) <= 4096
+        and all(type(t) is int and 0 <= t < 2**31 for t in prompt_token_ids)
+        and type(max_tokens) is int
+        and 1 <= max_tokens <= 64
+    ):
+        raise ValueError("Invalid completion probe.")
+    body = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt_token_ids,
+            "max_tokens": max_tokens,
+            "top_k": 1,
+            "ignore_eos": True,
+            "detokenize": False,
+            "stream": False,
+        }
+    ).encode()
+    raw = _docker_exchange(
+        container,
+        port,
+        "/v1/completions",
+        deadline,
+        lambda: ({"Content-Type": "application/json"}, body),
+    )
+    choices = _json_response(raw).get("choices")
+    _require(
+        isinstance(choices, list) and len(choices) == 1 and isinstance(choices[0], dict),
+        "Expected one completion.",
+    )
+    tokens = choices[0].get("token_ids")
+    _require(
+        isinstance(tokens, list)
+        and len(tokens) == max_tokens
+        and all(type(t) is int and 0 <= t < 2**31 for t in tokens),
+        "Invalid completion token IDs.",
+    )
+    _remaining(deadline)
+    return tokens
 
 
 def _check_result(result: dict, binding: dict, stage: str) -> dict:
@@ -189,21 +367,30 @@ def _check_probe_limits(probe: dict, limits: dict) -> None:
 
 
 class EngineClient:
-    """Signed, direct IPv4 loopback client for a single fixed-cohort TP1 worker."""
+    """Signed host or private-container loopback client for a single fixed-cohort TP1 worker."""
 
-    def __init__(self, port: int, key: str) -> None:
+    def __init__(self, port: int, key: str, *, container: str | None = None) -> None:
         """Bind an independently secured endpoint.
 
         Args:
             port: Local listener port, never a URL or proxy address.
             key: Current runtime-control HMAC key.
+            container: Full ID of an independently verified, network-isolated local Linux
+                container running the trusted fixed image. Omit for host loopback.
         """
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("Expected a loopback TCP port.")
         if not isinstance(key, str) or not key.strip():
             raise ValueError("Missing runtime-control key.")
+        if container is not None:
+            _docker_endpoint(container, port)
+        self._container = container
         self._port = port
         self._key = key
+
+    def status_headers(self) -> dict[str, str]:
+        """Sign one empty GET /checkpoint/status for the trusted adapter's private channel."""
+        return _sign(self._key, "GET", "/checkpoint/status", b"")
 
     def _exchange(
         self,
@@ -213,6 +400,19 @@ class EngineClient:
         on_send: Callable[[], None] | None = None,
     ) -> bytes:
         """Connect first, then build and send at most one request within the deadline."""
+        method = "GET" if post is None else "POST"
+
+        def request() -> tuple[dict[str, str], bytes]:
+            body = b"" if post is None else json.dumps(post(), allow_nan=False).encode()
+            # /ready is a public health and admission check, not an authenticated lifecycle route.
+            headers = {} if path == "/ready" else _sign(self._key, method, path, body)
+            if post is not None:
+                headers["Content-Type"] = "application/json"
+            return headers, body
+
+        if self._container is not None:
+            return _docker_exchange(self._container, self._port, path, deadline, request, on_send)
+
         conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=_remaining(deadline))
         conn.set_debuglevel(0)
         with closing(conn):
@@ -229,12 +429,7 @@ class EngineClient:
                     sock.shutdown(socket.SHUT_RDWR)
 
             _remaining(deadline)
-            method = "GET" if post is None else "POST"
-            body = b"" if post is None else json.dumps(post(), allow_nan=False).encode()
-            # /ready is a public health and admission check, not an authenticated lifecycle route.
-            headers = {} if path == "/ready" else _sign(self._key, method, path, body)
-            if post is not None:
-                headers["Content-Type"] = "application/json"
+            headers, body = request()
             timer = threading.Timer(_remaining(deadline), expire)
             timer.start()
             try:
@@ -264,13 +459,7 @@ class EngineClient:
         post: Callable[[], dict] | None = None,
         on_send: Callable[[], None] | None = None,
     ) -> dict:
-        raw = self._exchange(path, deadline, post, on_send)
-        try:
-            obj = json.loads(raw, object_pairs_hook=_object)
-        except (ValueError, RecursionError):
-            raise RuntimeError("Invalid checkpoint JSON response.") from None
-        _require(isinstance(obj, dict), "Expected a checkpoint JSON object.")
-        return obj
+        return _json_response(self._exchange(path, deadline, post, on_send))
 
     def _status(self, stage: str, deadline: float, *, restored: bool = False) -> tuple[dict, float]:
         start = time.monotonic()

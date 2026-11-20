@@ -19,4 +19,5 @@ configuration; Grafana/Prometheus deployment and inference settings remain separ
 
 The [experimental resident checkpoint coordinator](checkpoint/README.md) drives
 engine preparation, restore validation and traffic admission for one MPI rank.
-It requires a compatible engine and an independently authorized host adapter.
+The optional Docker deployment supplies the host adapter and uses Snapshot
+PageBroker on the GPU host. Normal serving does not use these components.
