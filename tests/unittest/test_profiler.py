@@ -79,7 +79,8 @@ def test_failed_metadata_keeps_named_scope(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.parametrize(
-    "case", json.loads(Path(__file__).with_name("profiler_selector_cases.json").read_text())
+    "case",
+    json.loads(Path(__file__).with_name("profiler_selector_cases.json").read_text())["cases"],
 )
 def test_selector_matches_shared_golden_table(
     case: dict[str, object], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -111,7 +112,7 @@ def test_selection_is_cached_at_module_initialization() -> None:
         "assert p['custom_region_enabled']('moe'); "
         "assert not p['custom_region_enabled']('kv')"
     )
-    subprocess.run([sys.executable, "-c", script], env=env, check=True)
+    subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=60)
 
 
 def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
@@ -131,6 +132,7 @@ def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
         env=env,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     assert completed.returncode == 0
     assert completed.stderr.count("Invalid TLLM_PROFILE_CUSTOM_REGIONS") == 1
@@ -139,6 +141,11 @@ def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
+        (
+            r"""TRTLLM1:8:workflow{"quoted'\u96ea":"slash\\line\n\t'\u96ea"""
+            r"""\ud83d\ude80","rank":-7,"ids":[]}""",
+            {"quoted'雪": "slash\\line\n\t'雪🚀", "rank": -7, "ids": []},
+        ),
         (
             "TRTLLM18:workflow{'quoted\\'key':'slash\\\\line\\n\\t\\'雪','rank':-7,'ids':[]}",
             {"quoted'key": "slash\\line\n\t'雪", "rank": -7, "ids": []},
