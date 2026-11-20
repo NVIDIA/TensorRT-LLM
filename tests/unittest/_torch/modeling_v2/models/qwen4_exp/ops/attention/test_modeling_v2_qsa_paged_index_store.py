@@ -251,7 +251,7 @@ def _pool_layout():
     is."""
     path = (
         Path(__file__).resolve().parents[2]
-        / "qwen3_8_flash_next_nvfp4__sm_103__default"
+        / "qwen3_8_flash_next_nvfp4__sm_10x__default"
         / "test_pool_layout.py"
     )
     spec = importlib.util.spec_from_file_location("_qsa_index_store_pool_layout", path)

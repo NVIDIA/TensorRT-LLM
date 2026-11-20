@@ -41,7 +41,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Largest row count one launch serves; every row re-reads the weight from registers.
 MAX_ROWS = 4
@@ -316,7 +317,7 @@ class Bf16GemvPdl(OpWrapper):
     and lets the kernel after it launch early as well.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # Every shape is a qwen3.8-flash-next-nvfp4 decode projection the target calls it at
     # (`_decode_projection`): one row at tp1, up to MAX_ROWS rows of a tp4/tep4 rank's o /

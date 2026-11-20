@@ -16,13 +16,14 @@ from collections.abc import Iterator
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_moe_renorm_cute_dsl import (  # noqa: E501
     fp4_moe_renorm_cute_dsl as op,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (  # noqa: E501
     renorm_moe_routing_op,
 )
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     weights as W,
 )
 
@@ -71,6 +72,14 @@ def _cute_dsl(experts, data, sf, logits, g2, spec):
     )
 
 
+needs_cute_dsl_moe = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not archs.fast_path("cute_dsl_moe", torch.cuda.get_device_capability()),
+    reason="the CuTe DSL MoE does not run on this GPU",
+)
+
+
+@needs_cute_dsl_moe
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying, many_expert_layer, cute_dsl_experts):  # noqa: F811
     certifying(op)

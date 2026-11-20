@@ -1,0 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Qwen3.8-Flash-Next-NVFP4 / sm_10x / default: tp1, tp2, tep2, dep2, tp4, tep4, dep4, and dep8
+across nodes."""

@@ -187,13 +187,13 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops TIMEOUT (30)
-  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default TIMEOUT (30)
   # GLM-5.3-Flash FP8 modeling_v2 target (sm_100 / sm_103): its operations. The 4-rank boundary matrix runs in
   # l0_dgx_b300.
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4 --ignore=unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/comm/test_modeling_v2_mhc_ar_boundary.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default TIMEOUT (30)
   # qwen4_exp FP8 target at tp1, pre-merge: gsm8k without speculation.
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_tp1_gsm8k TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_tp1_gsm8k TIMEOUT (60)
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
@@ -281,9 +281,9 @@ l0_b300:
   # engine with three drafts and IndexShare over bf16 KV, gsm8k and then 3k-6k-token pass
   # keys, the only prompts long enough to run the sparse attention path. The other engines
   # run post-merge (below).
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_gsm8k
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp1_gsm8k_mmmu_and_video
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_gsm8k_and_long_context
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_gsm8k
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp1_gsm8k_mmmu_and_video
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp3_gsm8k_and_long_context
 - condition:
     ranges:
       system_gpu_count:
@@ -310,6 +310,6 @@ l0_b300:
   # prefill CUDA graph replayed against eager greedy continuations at the bucket edges and
   # with context and generation rows in one batch. Its disaggregated engines run in
   # l0_gb300_multi_gpus.
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_cutedsl_fp8_kv_bf16_state
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp7_long_context_passkey
-  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_breakable_prefill_matches_eager
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp3_cutedsl_fp8_kv_bf16_state
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_mtp7_long_context_passkey
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_tp1_breakable_prefill_matches_eager

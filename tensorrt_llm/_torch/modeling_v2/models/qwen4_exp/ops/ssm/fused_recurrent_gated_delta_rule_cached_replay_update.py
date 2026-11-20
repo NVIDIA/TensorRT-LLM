@@ -21,7 +21,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     fused_recurrent_gated_delta_rule_cached_replay_update as _cached_replay_update,
 )
@@ -124,7 +125,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     nothing is read or written for them, their output rows included.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: path ("small": no work items, the kernel commits a wrap itself |
     # "all_layer": work items + use_all_layer_commit, the test then runs the
@@ -285,7 +286,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
       per-step window and the manager promotes it.
 
     The kernels are Triton, JIT-compiled on first call for the running device; the cells
-    ran that JIT path on sm_103. The launch is one V tile, `num_warps=4`, grid
+    ran that JIT path on sm_103 and sm_107. The launch is one V tile, `num_warps=4`, grid
     `(1, N * HV)`: the tuned mappings need HV = 2H or 4H and never engage at HV/H = 3
     (16 / 48 and 4 / 12 alike). The checkpoint's dtype is the kernel's `STATE_FP32`
     specialization and nothing else below N = 128: an fp32 checkpoint enters the history

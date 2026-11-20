@@ -24,7 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import ROW
 
 #: Rows a program covers.
@@ -120,7 +121,7 @@ class VerifyStepSetup(OpWrapper):
     planes are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP3, one request, 12 planes", spec=dict(batch=1, p=4, planes=12)),
         Cell(why="MTP3, 32 requests, 12 planes", spec=dict(batch=32, p=4, planes=12)),

@@ -42,7 +42,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 TILE_N = 16
 BLOCK_K = 128
@@ -1767,7 +1768,7 @@ class Fp8Gemv(OpWrapper):
     Fusion boundary: the projection; `fp8_gemv_conv1d` also fuses the GDN causal-conv step of
     decode rows, `fp8_gemv_conv1d_verify` the multi-token step of a verify step's rows."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         _gemv_cell("GDN in_proj, one decode row", 16480, 2560, 1),
@@ -1801,7 +1802,7 @@ class Fp8GemvConv1d(OpWrapper):
     paged state (SiLU; the state advanced in place). Returns the `[M, N]` projection row with
     the conv columns replaced by the conv output."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="STP decode: one row, live slot", spec=dict(slots=(37,))),
@@ -1890,7 +1891,7 @@ class Fp8GemvConv1dVerify(OpWrapper):
     z/a/b splits, the recurrence and the post-acceptance promotion of a snapshot are the
     caller's."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec keys: n, k (the in_proj), conv_dim, p (tokens per request), slots (one per
     # request; -1 the pad sentinel), snapshot_steps (the buffer's step depth), pool_slots,

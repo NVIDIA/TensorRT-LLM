@@ -37,7 +37,8 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: One decode row per launch: the forward runs only 1-row decode batches through the
 #: site's GEMV pair (`_HC_DECODE_GEMV_MAX_ROWS`).
@@ -422,7 +423,7 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
     after are not inside.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows (1), inject (True), moe (False: shared + gate_logits [T, 1] too), fold
     # (0: top-k of the finalize folded in, block_out then the permuted rows), drop

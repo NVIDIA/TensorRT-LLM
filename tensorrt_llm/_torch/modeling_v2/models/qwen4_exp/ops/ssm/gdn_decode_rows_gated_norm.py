@@ -37,7 +37,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_gated_norm_pdl import (
     _recurrence_reference,
 )
@@ -805,7 +806,7 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     read and write, the gated RMS norm. The projection and the conv are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows; k_heads / v_heads (default 16 / 48) and proj_width (their projection's);
     # state (default fp32 | "bf16"); pool (default a contiguous 461-slot pool |
@@ -890,7 +891,7 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     kernel. Batch-invariant: a row's output and state do not depend on the other rows.
 
     Source: the CuTe DSL kernel in this file, JIT-compiled (`cute.compile`) for the running
-    device at the first call per geometry; the cells ran that path on sm_103 (GB300).
+    device at the first call per geometry; the cells ran that path on sm_103 and sm_107.
 
     The default target (`DecodeTarget._gdn_block`, a decode step without verify rows): at
     tp4, tep4 and dep4 its routing admits a bf16 recurrent-state cache only, so the decode
@@ -1019,7 +1020,7 @@ class GdnDecodeRows(OpWrapper):
     write. Returns `out`.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(

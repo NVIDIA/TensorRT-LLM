@@ -17,7 +17,8 @@ import triton
 # tensorrt_llm._torch.custom_ops` alone, torch.ops.trtllm has no
 # `fused_sigmoid_mul_inplace` (measured).
 import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate as _gate_mod
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 def _launch(attention_output: torch.Tensor, gate: torch.Tensor) -> bool:
@@ -105,7 +106,7 @@ class FusedSigmoidMulInplace(OpWrapper):
     operands and everything downstream (the o projection). `gate` is read-only.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # The target at tp1: hidden 6144, the trunk's gate off the 14080-wide fused
@@ -177,7 +178,7 @@ class FusedSigmoidMulInplace(OpWrapper):
     the running device at the first call of each (hidden, head_dim, block)
     specialization, no autotuner: grid `(T, cdiv(hidden, block))`,
     `block = min(next_pow2(hidden), 1024 if T < 1024 else 2048)`, 4 warps. The
-    cells ran on sm_103. With `direct_launch=True` (the FP8 target), `_launch` makes
+    cells ran on sm_103 and sm_107. With `direct_launch=True` (the FP8 target), `_launch` makes
     that same launch itself where the preconditions below hold and skips only the
     custom-op dispatch (15 instead of 28 us of host time a call on GB300);
     otherwise the op is called and refuses the call. `_launch` is a copy of the
@@ -186,13 +187,13 @@ class FusedSigmoidMulInplace(OpWrapper):
 
     Call sites, each the attention output gate between the attention core and
     o_proj:
-      - The target at tp1 (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default`): the
+      - The target at tp1 (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default`): the
         trunk's gate as the 2-D window of the fused input projection row
         (14080 wide, the gate at column 7168, hidden 6144) at decode and
         prefill row counts; its MTP layer's gate as the strided second half of
         each head of a `[T, 24, 512]` q_proj.
       - The default target's trunk
-        (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default`):
+        (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default`):
         `DecodeTarget._attention_block` (decode, 1..128 rows at tp4 / tep4,
         1..32 at a dep4 rank), its MTP verify (up to 128 x 8 = 1024 rows, tep4,
         draft 7) and `PrefillTarget._attention_block` (one chunk of up to 8192

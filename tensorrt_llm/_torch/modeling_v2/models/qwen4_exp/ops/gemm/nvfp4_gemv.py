@@ -52,7 +52,8 @@ from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 from .fp8_gemv import (
     TILE_MAJOR_MAX_TILES,
@@ -711,7 +712,7 @@ class Nvfp4Gemv(OpWrapper):
 
     Fusion boundary: the projection."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec keys: n, k, m (rows). Every cell: x a column slice of a wider bf16 row (row stride
     # past K); the weight `quantize_nvfp4` of a random bf16 matrix with an outlier column and
@@ -799,7 +800,7 @@ class Nvfp4SplitGemv(OpWrapper):
     Fusion boundary: the projection; `Nvfp4SplitGemvConv1d` / `Nvfp4SplitGemvConv1dVerify`
     also fuse the GDN conv step."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec keys: n, k, m (rows). Every cell: x a column slice of a wider bf16 row; the weight
     # `quantize_nvfp4` of a random bf16 matrix with an outlier column and near-zero blocks.
@@ -842,7 +843,7 @@ class Nvfp4SplitGemvConv1d(OpWrapper):
     causal conv step against its paged state (SiLU; the state advanced in place). Returns the
     `[M, N]` projection with the conv columns replaced by the conv output."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec keys: slots (one per row; -1 the pad sentinel). Every cell: the GDN in_proj (16480 x
     # 2560, conv_dim 10240), a strided 64-slot pool, width 4, SiLU.
@@ -884,7 +885,7 @@ class Nvfp4SplitGemvConv1dVerify(OpWrapper):
 
     Fusion boundary: projection, conv, SiLU, snapshots and the pool advance."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec keys as `Fp8GemvConv1dVerify`'s.
     CELLS: tuple[Cell, ...] = fp8_gemv_conv1d_verify_op.CELLS

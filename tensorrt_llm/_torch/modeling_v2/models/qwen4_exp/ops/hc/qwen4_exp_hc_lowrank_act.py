@@ -4,7 +4,7 @@
 the rank-`R` bottleneck and the block-injection weights, from the first
 projection's fp32 logits, in one Triton row kernel.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at every
+Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`) at every
 layout.
 """
 
@@ -17,7 +17,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 @triton.jit
@@ -63,7 +64,7 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     `inject` is `None` exactly when `with_inject` is False.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16),
     # capture (False: eager; True: replayed from a captured CUDA graph over two steps' logits).
@@ -94,19 +95,19 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
             why="default stack-final mixer (no inject): one decode token",
             spec=dict(rows=1, inject=False, logits_width=352),
         ),
-        # The FP8 unified target's HC mixers in its captured graphs at 641..3071 rows (e.g. the
+        # The FP8 target's HC mixers in its captured graphs at 641..3071 rows (e.g. the
         # breakable prefill buckets): fewer rows run `qwen4_exp_hc_decode_tc_first`, more the
         # rstd form.
         Cell(
-            why="FP8 unified captured prefill HC mixer, 641 rows: 352-wide logits",
+            why="FP8 target captured prefill HC mixer, 641 rows: 352-wide logits",
             spec=dict(rows=641, logits_width=352, capture=True),
         ),
         Cell(
-            why="FP8 unified captured prefill HC mixer, 1024 rows: 352-wide logits",
+            why="FP8 target captured prefill HC mixer, 1024 rows: 352-wide logits",
             spec=dict(rows=1024, logits_width=352, capture=True),
         ),
         Cell(
-            why="FP8 unified captured prefill HC mixer, 3071 rows (the largest): 352-wide",
+            why="FP8 target captured prefill HC mixer, 3071 rows (the largest): 352-wide",
             spec=dict(rows=3071, logits_width=352, capture=True),
         ),
     )
@@ -127,7 +128,7 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     call, and a second step's logits replay bitwise their own eager call.
 
     Source: a Triton kernel JIT-compiled at first call for the running device;
-    the cells ran on sm_103. One program per row with an int64 row offset;
+    the cells ran on sm_103 and sm_107. One program per row with an int64 row offset;
     2^31 elements is 6.1e6 rows of 352, far past the envelope.
 
     Certified: bf16 outputs from fp32 logits 352 wide (the call site) at 1, 32,

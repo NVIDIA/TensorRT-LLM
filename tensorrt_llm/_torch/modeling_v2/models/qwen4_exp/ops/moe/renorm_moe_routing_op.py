@@ -3,7 +3,7 @@
 """Renormalized MoE routing: top-k over the raw router logits, then a softmax
 over just those k, in one trtllm call.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at
+Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`) at
 every layout."""
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 def _ckpt(tokens: int, output_dtype: torch.dtype = torch.bfloat16, capture: bool = False) -> dict:
@@ -50,7 +51,7 @@ class RenormMoeRoutingOp(OpWrapper):
     expert parallelism -- every column of the row is ranked.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # The trunk pre-routes the trtllm-gen FP4 runner with bf16 weights at every
     # member: tp4/tep4 route every row the rank holds; dep4 routes the
@@ -88,17 +89,17 @@ class RenormMoeRoutingOp(OpWrapper):
             why="coarse logits (3 values): ties decide most of the ranking",
             spec=dict(_ckpt(64), output_dtype=torch.float32, dist="coarse"),
         ),
-        # The FP8 unified target's routed experts in its captured decode graph (1..128 rows).
+        # The FP8 target's routed experts in its captured decode graph (1..128 rows).
         Cell(
-            why="FP8 unified captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
+            why="FP8 target captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
             spec=_ckpt(8, capture=True),
         ),
         Cell(
-            why="FP8 unified captured decode: 72 rows (batch 72)",
+            why="FP8 target captured decode: 72 rows (batch 72)",
             spec=_ckpt(72, capture=True),
         ),
         Cell(
-            why="FP8 unified captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
+            why="FP8 target captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
             "dep4 4 x 32 gathered)",
             spec=_ckpt(128, capture=True),
         ),

@@ -33,7 +33,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import warm_variants
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
@@ -779,7 +780,7 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     that consumes `normed` are not inside.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows, inject (True), moe (False: shared + gate_logits [T, 1] too), fold
     # (0: top-k of the finalize folded in), drop (False: some slots -1), site
@@ -915,7 +916,7 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     last before the switch). It releases dependents at its start as the Triton
     kernel does.
 
-    Certified on sm_103 (GB300), bf16, the checkpoint's 4 x 2560, PDL trigger
+    Certified on sm_103 and sm_107, bf16, the checkpoint's 4 x 2560, PDL trigger
     on (the default): the Triton kernel and the CuTe fold kernel are JIT-
     compiled at first call for the running GPU, and the cells ran that path.
       tp1: the injection at 128 rows (eight-warp form), the combine at 16384

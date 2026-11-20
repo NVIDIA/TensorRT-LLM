@@ -16,7 +16,8 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.fla.layernorm_gated import layernorm_fn as _layernorm_fn
 
 #: The vision tower's norm1 / norm2 / merger.norm: width 1152 with a bias, eps
@@ -39,7 +40,7 @@ class LayerNorm(OpWrapper):
     and RMS forms are different computations, not options of this entry.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: shape, dtype (weight and bias share it). Weight and bias are drawn
     # over the checkpoint's measured ranges.

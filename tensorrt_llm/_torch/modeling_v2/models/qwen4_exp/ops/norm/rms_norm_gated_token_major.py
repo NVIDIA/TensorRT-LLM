@@ -14,7 +14,8 @@ import triton
 # `import tensorrt_llm._torch.custom_ops` alone does not make
 # torch.ops.trtllm.rms_norm_gated_token_major resolve.
 import tensorrt_llm._torch.modules.mamba.layernorm_gated as _layernorm_gated
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: The checkpoint's GDN epilogue: 48 value heads of 128, `output_gate_type: sigmoid`.
 _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activation="sigmoid")
@@ -113,7 +114,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     owns both projections producing `x` and `z`, and every reshape.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -182,7 +183,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     output is freshly allocated and contiguous; no input is mutated.
 
     Both kernels are Triton, JIT-compiled at first call for the running GPU;
-    the cells ran that JIT path on sm_103 (GB300, 152 SMs).
+    the cells ran that JIT path on sm_103 and sm_107.
 
     Certified: bf16 `x` with the sigmoid gate over the in_proj column view of
     `z`, N = 128.

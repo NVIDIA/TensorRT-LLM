@@ -13,7 +13,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Block edge on every scale axis: 1x128 activations, 128x128 weights.
 BLOCK = 128
@@ -64,10 +65,11 @@ def _geom(hidden, inter, num_experts, top_k, offset=0, local=None):
 _CKPT = _geom(2560, 640, 512, 10)
 
 
-def _window(offset: int) -> dict:
-    """One rank's 128-expert window of the 512 (the qwen4 default target at tp4,
-    tep4 and dep4): the router still ranks all 512, so `num_experts` stays 512."""
-    return _geom(2560, 640, 512, 10, offset=offset, local=128)
+def _window(offset: int, local: int = 128) -> dict:
+    """One rank's `local`-expert window of the 512 (the qwen4 default target: 128 wide at
+    tp4, tep4 and dep4, 256 at tp2, tep2 and dep2, 64 at dep8): the router still ranks all
+    512, so `num_experts` stays 512."""
+    return _geom(2560, 640, 512, 10, offset=offset, local=local)
 
 
 class Fp8BlockScaleMoeRunner(OpWrapper):
@@ -101,7 +103,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     `output` is given (the result is then in `output`).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # The token column at the checkpoint geometry, the only one the draft layer
@@ -137,6 +139,41 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
         Cell(
             why="default: 8192 rows, a max_num_tokens context chunk; the last window (384)",
             spec=dict(tokens=8192, **_window(384)),
+        ),
+        # The two-rank layouts (tp2, tep2, dep2) run them as two 256-wide windows and dep8 as
+        # eight 64-wide ones, one per rank. Under attention DP (dep2, dep8) a call holds the
+        # group's gathered rows, so dep8's smallest is 8 x 1.
+        Cell(
+            why="tp2/tep2 MTP drafter decode: one token, rank 0's 256-expert window",
+            spec=dict(tokens=1, **_window(0, 256)),
+        ),
+        Cell(
+            why="tp2/tep2: 128 drafter rows; rank 1's 256-expert window",
+            spec=dict(tokens=128, **_window(256, 256)),
+        ),
+        Cell(
+            why="tp2/tep2: 1024 rows, the first draft over mtp7's 128 x 8 verify rows; window 0",
+            spec=dict(tokens=1024, **_window(0, 256)),
+        ),
+        Cell(
+            why="tp2/tep2/dep2: 8192 rows, a max_num_tokens context chunk; window 256",
+            spec=dict(tokens=8192, **_window(256, 256)),
+        ),
+        Cell(
+            why="dep8 MTP drafter decode: 8 x 1 gathered rows, rank 0's 64-expert window",
+            spec=dict(tokens=8, **_window(0, 64)),
+        ),
+        Cell(
+            why="dep8: 8 x 16 = 128 gathered drafter rows; rank 3's 64-expert window",
+            spec=dict(tokens=128, **_window(192, 64)),
+        ),
+        Cell(
+            why="dep8: 1024 rows, 8 x 128 gathered drafter rows; rank 5's 64-expert window",
+            spec=dict(tokens=1024, **_window(320, 64)),
+        ),
+        Cell(
+            why="dep8: 8192 rows, a chunk of the group's gathered context rows; window 448",
+            spec=dict(tokens=8192, **_window(448, 64)),
         ),
     )
 
@@ -181,7 +218,10 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     target's all-reduce or reduce-scatter adds -- sit at most 4.41 / 0.297 ulp
     from the 512-expert reference at 1, 128 and 1024 rows, and the sum with any
     one window left out fails the gate. Not bitwise to the 512-expert call (each window rounds its
-    partial to bf16): at most 1.97 / 0.187 ulp from it.
+    partial to bf16): at most 1.97 / 0.187 ulp from it. The two-rank layouts' 256-wide windows
+    (offsets 0 and 256) and dep8's 64-wide windows (offsets 0, 192, 320 and 448) are cells under
+    the same gate at the rows those layouts' MTP layers reach; the figures above are the
+    128-wide windows'.
 
     `num_experts` passed as the window's own count (128) puts windows 1..3 past
     the routing space: at small row counts the op answers all zeros with no
@@ -212,21 +252,23 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
 
     Hard limits
       T            whole stack certified at 1, 20 and 16384 (max_num_tokens of the
-                   tuned config); 128-expert windows at 1, 128, 1024 and 8192
-                   (the default target's max_num_tokens chunk). Chunk above
+                   tuned config); 128- and 256-expert windows at 1, 128, 1024 and
+                   8192 (the default target's max_num_tokens chunk), 64-expert
+                   windows at 8, 128, 1024 and 8192. Chunk above
                    them, not probed. Autotuner buckets stop at
                    `tune_max_num_tokens` (default 8192, which the target
                    leaves): past it a call runs the 8192 bucket's tactic; a
                    larger value makes the op append a bucket at that size
       top_k        <= 32 (raises past it); certified 10, the checkpoint's
       E, H, I      certified at the checkpoint's 512, 2560, 640
-      window       the whole stack, and 128 wide at offsets 0, 128, 256 and 384 of 512
+      window       the whole stack; 128 wide at offsets 0, 128, 256 and 384 of 512, 256
+                   wide at 0 and 256, 64 wide at 0, 192, 320 and 448
 
-    Not certified (measured, but not re-driven by the test): windows of other
-    widths (a 256-wide dep2 window, say) or offsets, a window past the routing
-    space's end, repeated or
+    Not certified (measured, but not re-driven by the test): a window past the
+    routing space's end, repeated or
     out-of-range ids, `gemm1_clamp_limit`, the inert arguments, `output=`, the
-    registered fake, the op's other loud rejections. Nor: CUDA-graph capture
+    registered fake, the op's other loud rejections. Nor: windows of other widths
+    or offsets (dep8's 64-wide windows at 64, 128, 256 and 384), CUDA-graph capture
     of the call (the cells run eager), the in-kernel routing path
     (`routing_logits` given), multi-rank execution (every window here runs on
     one device; the cross-rank sum is the collective's), geometries other than

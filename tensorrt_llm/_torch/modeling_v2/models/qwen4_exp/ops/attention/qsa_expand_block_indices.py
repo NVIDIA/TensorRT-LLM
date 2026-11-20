@@ -9,7 +9,8 @@ import torch
 # Tier-2 sourcing: a vendored Triton callable reached as ordinary Python. QSA's
 # kernel plane has no torch.ops surface.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's selection geometry: `indexer_compress_ratio` and
 #: `indexer_budget`, so `block_topk` 512 and an output 2051 wide.
@@ -81,7 +82,7 @@ class QsaExpandBlockIndices(OpWrapper):
     lengths are among the cells.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # ---- decode rows: the column-split launch below 128 rows, whole rows from 128
@@ -140,7 +141,7 @@ class QsaExpandBlockIndices(OpWrapper):
     metadata view reports contiguous and is accepted -- benign at one row.
 
     Source: a Triton kernel JIT-compiled on first call for the device it runs
-    on; the cells were driven through that JIT path on sm_103 (GB300).
+    on; the cells were driven through that JIT path on sm_103 and sm_107.
 
     Launch: one program per (row, 256 columns) below 128 rows, one per row
     from 128 up. No autotune. CUDA-graph capturable (captured at 1, 128, 256

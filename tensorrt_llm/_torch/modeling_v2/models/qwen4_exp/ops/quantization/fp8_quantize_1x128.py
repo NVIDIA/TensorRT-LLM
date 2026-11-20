@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Largest finite e4m3 magnitude.
 E4M3_MAX = 448.0
@@ -67,7 +68,7 @@ class Fp8Quantize1x128(OpWrapper):
     family) the compaction into `[NB, T]` are inside; no GEMM is fused.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: tokens, hidden, use_ue8m0, capture (False: eager; True: replayed from a captured
     # CUDA graph over two steps' activations).
@@ -93,17 +94,17 @@ class Fp8Quantize1x128(OpWrapper):
             why="8192 rows: the MTP layer over one max_num_tokens context chunk",
             spec=dict(tokens=8192, **_CKPT),
         ),
-        # The FP8 unified target's routed experts in its captured decode graph (1..128 rows).
+        # The FP8 target's routed experts in its captured decode graph (1..128 rows).
         Cell(
-            why="FP8 unified captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
+            why="FP8 target captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
             spec=dict(tokens=8, **_CKPT, capture=True),
         ),
         Cell(
-            why="FP8 unified captured decode: 72 rows (batch 72)",
+            why="FP8 target captured decode: 72 rows (batch 72)",
             spec=dict(tokens=72, **_CKPT, capture=True),
         ),
         Cell(
-            why="FP8 unified captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
+            why="FP8 target captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
             "dep4 4 x 32 gathered)",
             spec=dict(tokens=128, **_CKPT, capture=True),
         ),
