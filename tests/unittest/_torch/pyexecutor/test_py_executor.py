@@ -115,8 +115,12 @@ def _forward_step_executor(
 
 def _run_forward_step(executor, batch, new_tensors=None):
     with (
-        patch("torch.cuda.current_stream", return_value=Mock()),
-        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.current_cuda_stream", return_value=Mock()
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.CudaStreamScope", return_value=nullcontext()
+        ),
         patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
     ):
         return PyExecutor._forward_step(executor, batch, new_tensors)
@@ -1031,6 +1035,14 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
     with (
         patch("torch.cuda.current_stream", return_value=caller_stream),
         patch("torch.cuda.stream", return_value=nullcontext()),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.current_cuda_stream",
+            return_value=caller_stream,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.CudaStreamScope",
+            return_value=nullcontext(),
+        ),
         patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
     ):
         result = PyExecutor._forward_step(executor, batch)

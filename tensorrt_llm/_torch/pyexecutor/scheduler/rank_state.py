@@ -329,7 +329,6 @@ class RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
         prefix_field_count = 5
-        rank_state_fields = fields(cls)[:prefix_field_count]
         if not values:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > prefix_field_count and values[prefix_field_count] < 0:
@@ -357,7 +356,13 @@ class RankState:
                 f"RankState payload has {len(values)} fields, expected at most {max_field_count}"
             )
         rank_values = values[:prefix_field_count]
-        for field_info in rank_state_fields[len(rank_values) :]:
+        # Only a legacy payload misses prefix fields; fields() is slow per call.
+        missing_fields = (
+            fields(cls)[len(rank_values) : prefix_field_count]
+            if len(rank_values) < prefix_field_count
+            else ()
+        )
+        for field_info in missing_fields:
             if field_info.default is not MISSING:
                 rank_values.append(field_info.default)
             elif field_info.default_factory is not MISSING:
