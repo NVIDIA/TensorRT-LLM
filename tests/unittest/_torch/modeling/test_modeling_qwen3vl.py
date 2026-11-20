@@ -1123,8 +1123,8 @@ _QWEN_VL_ENCODERS = pytest.mark.parametrize(
 def _qwen_vl_item_grid_case(encoder_cls):
     """Return one request's processed data, a stub encoder and the expected grids.
 
-    The input processor puts each item's grid on its embedding handle, in
-    prompt order, and the encoder returns rows in the same order.
+    The input processor records each item's grid in prompt order (the runner
+    returns it as handle metadata), and the encoder returns rows in the same order.
     """
     # A landscape and a portrait image, so a swapped h and w shows.
     expected = [{"image_grid_thw": [1, 4, 6]}, {"image_grid_thw": [1, 6, 4]}]
@@ -1157,10 +1157,9 @@ def _qwen_vl_item_grid_case(encoder_cls):
         grid_devices.append(grid_thw.device.type)
         return pixel_values[::4]
 
-    # Skip the real vision tower; forward only needs the config and the ViT call.
+    # Skip the real vision tower; forward only needs the ViT call.
     encoder = encoder_cls.__new__(encoder_cls)
     torch.nn.Module.__init__(encoder)
-    encoder.model_config = SimpleNamespace(mm_encoder_only=True)
     encoder.visual = vit
     encoder.encode_batched = vit
     return data, lengths, expected, encoder, grid_devices
@@ -1176,7 +1175,7 @@ def _assert_rows_hold_item_grids(embedding, lengths, expected):
 
 @pytest.mark.cpu_only
 @_QWEN_VL_ENCODERS
-def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls):
+def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
     """Each item gets its grid, in prompt order, with its embedding rows.
 
     A caller that caches encoder outputs passes this grid back with the
