@@ -315,43 +315,17 @@ def dspark_markov_chain_logits_reference(base_logits: torch.Tensor,
 
 
 @triton.jit
-def _gumbel_scores_kernel(logits_ptr, temp_ptr, seed_ptr, out_ptr, width,
-                          vocab_offset, vocab_full, BLOCK: tl.constexpr):
+def _gumbel_scores_kernel(logits_ptr, temp_ptr, seed_ptr, out_ptr, vocab,
+                          BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    ok = cols < width
-    x = tl.load(logits_ptr + row * width + cols, mask=ok,
+    ok = cols < vocab
+    x = tl.load(logits_ptr + row * vocab + cols, mask=ok,
                 other=0.0).to(tl.float32)
-    u = tl.rand(tl.load(seed_ptr), row * vocab_full + vocab_offset + cols)
+    u = tl.rand(tl.load(seed_ptr), row * vocab + cols)
     u = tl.minimum(tl.maximum(u, 1e-12), 0.99999994)
     x = x / tl.load(temp_ptr + row) - tl.log(-tl.log(u))
-    tl.store(out_ptr + row * width + cols, x, mask=ok)
-
-
-def gumbel_scores_reference(logits: torch.Tensor,
-                            temperatures: torch.Tensor,
-                            seed: torch.Tensor,
-                            vocab_offset: int = 0,
-                            vocab_full: Optional[int] = None) -> torch.Tensor:
-    """``logits / T + G`` (fp32 [rows, width]) for ``logits`` [rows, width]
-    holding global vocab ids ``vocab_offset ..`` of a ``vocab_full``-wide
-    vocabulary, with the Gumbel noise ``TPKeyExchange.argmax_logits`` draws:
-    ``G = -log(-log(u))``, ``u = tl.rand(seed, row * vocab_full + id)``."""
-    rows, width = logits.shape
-    scores = torch.empty((rows, width),
-                         dtype=torch.float32,
-                         device=logits.device)
-    block = 1024
-    grid = (rows, triton.cdiv(width, block))
-    _gumbel_scores_kernel[grid](logits.contiguous(),
-                                temperatures,
-                                seed,
-                                scores,
-                                width,
-                                vocab_offset,
-                                width if vocab_full is None else vocab_full,
-                                BLOCK=block)
-    return scores
+    tl.store(out_ptr + row * vocab + cols, x, mask=ok)
 
 
 def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
@@ -361,7 +335,18 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
     Gumbel-max with the noise ``TPKeyExchange.argmax_logits`` draws:
     ``tl.rand(seed, row * vocab + token)`` for ``seed`` (int64 [1]). Rows below
     ``greedy_threshold`` take the argmax."""
-    scores = gumbel_scores_reference(logits, temperatures, seed)
+    rows, vocab = logits.shape
+    scores = torch.empty((rows, vocab),
+                         dtype=torch.float32,
+                         device=logits.device)
+    block = 1024
+    grid = (rows, triton.cdiv(vocab, block))
+    _gumbel_scores_kernel[grid](logits.contiguous(),
+                                temperatures,
+                                seed,
+                                scores,
+                                vocab,
+                                BLOCK=block)
     sampled = temperatures >= greedy_threshold
     return torch.where(sampled, scores.argmax(-1),
                        logits.float().argmax(-1)).to(torch.int32)

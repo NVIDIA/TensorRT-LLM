@@ -16,16 +16,15 @@
 
 The greedy target tokens of a TP worker come from this rank's vocab shard of
 the target logits: each rank reduces its shard to (value, global id) pairs and
-the ranks agree on the global argmax. The target tokens of temperature-only
-batches are drawn the same way by Gumbel-max: the noise of a vocab entry is
-keyed by its global id, so the global maximum of ``logits / T + G`` is a
-sample of ``softmax(logits / T)`` whatever the sharding. Here TP ranks are
-simulated on one GPU (every rank's pair buffer is computed, then summed as the
-all-reduce would; every rank's Gumbel-max winner is computed, then combined as
-the key exchange does), which checks the selected ids against the gathered
-logits, ties included, the sampled distribution against ``softmax(logits /
-T)``, and the host-side decision of when the worker takes the shard and when
-it keeps the gathered logits. The real exchanges over a TP group are covered by
+the ranks agree on the global argmax. Here TP ranks are simulated on one GPU
+(every rank's pair buffer is computed, then summed as the all-reduce would),
+which checks the selected ids against the gathered logits, ties included. The
+target tokens of temperature-only batches are drawn by Gumbel-max in the TP
+key exchange; here only the worker's decision of when it draws them on the
+shard (and when it keeps the gathered logits) and the launch it makes are
+checked. The real exchanges over a TP group, including the Gumbel-max draw
+against ``gumbel_max_reference`` bit for bit and its chi-square test against
+``softmax(logits / T)``, are covered by
 ``tests/unittest/_torch/multi_gpu/test_vocab_parallel_selection.py`` and
 ``tests/unittest/_torch/multi_gpu/test_ll_exchange.py``.
 """
@@ -35,7 +34,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _torch.helpers import chi_square, gumbel_max_reference, gumbel_scores_reference
 
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
@@ -792,100 +790,6 @@ class _RecordingKeyExchange:
             )
         )
         return torch.zeros(logits.shape[0], dtype=torch.int32, device=logits.device)
-
-
-def _simulated_sharded_draw(full, temperatures, seed, tp):
-    """The target tokens ``TPKeyExchange.argmax_logits`` draws over ``tp``
-    simulated ranks: every rank takes the first maximum of ``logits / T + G``
-    over its shard, with the noise of global id ``i`` keyed by
-    ``row * vocab + i``; the exchange keeps the largest value, the lowest global
-    id on ties. Rows below the greedy threshold take the plain argmax."""
-    rows, vocab = full.shape
-    width = vocab // tp
-    sampled = temperatures >= GREEDY_TEMPERATURE_THRESHOLD
-    best_value = torch.full((rows,), -float("inf"), device=full.device)
-    best_id = torch.zeros(rows, dtype=torch.int64, device=full.device)
-    for rank in range(tp):
-        local = _shard(full, tp, rank)
-        scores = gumbel_scores_reference(local, temperatures, seed, rank * width, vocab)
-        scores = torch.where(sampled[:, None], scores, local.float())
-        local_first = torch.argmax(scores, dim=-1)  # the first maximum
-        value = scores.gather(1, local_first[:, None]).squeeze(1)
-        take = value > best_value  # strict: a lower rank keeps a tie
-        best_id = torch.where(take, local_first + rank * width, best_id)
-        best_value = torch.where(take, value, best_value)
-    return best_id.to(torch.int32)
-
-
-@pytest.mark.parametrize("tp", [2, 4, 8])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_sharded_gumbel_draw_is_the_single_shard_draw(tp, dtype):
-    """The noise of a token does not depend on the sharding, so the winner
-    over the shards is the draw over the gathered vocab, bit for bit, also for
-    rows that stay greedy inside a sampled batch."""
-    rows, vocab = 96, 1000 * tp
-    gen = torch.Generator(device="cuda").manual_seed(tp)
-    full = (torch.randn(rows, vocab, device="cuda", generator=gen) * 3).to(dtype)
-    temps = torch.tensor([0.05, 0.7, 1.0, 30.0, 0.5 * GREEDY_TEMPERATURE_THRESHOLD], device="cuda")
-    temps = temps.repeat(rows // temps.numel() + 1)[:rows].contiguous()
-    for step in range(1, 4):
-        seed = torch.tensor([step], dtype=torch.int64, device="cuda")
-        expected = gumbel_max_reference(full, temps, seed, GREEDY_TEMPERATURE_THRESHOLD)
-        tokens = _simulated_sharded_draw(full, temps, seed, tp)
-        assert torch.equal(tokens, expected), step
-    greedy = temps < GREEDY_TEMPERATURE_THRESHOLD
-    assert torch.equal(tokens[greedy].long(), torch.argmax(full.float(), dim=-1)[greedy])
-
-
-def _near_ties(vocab: int, temperature: float, gen: torch.Generator) -> torch.Tensor:
-    """fp32 logits whose ``softmax(logits / T)`` spreads over a few tokens
-    even for a tiny ``T``: a handful of tokens within a few ``T`` of the
-    maximum, in different shards, the rest far below (and random)."""
-    logits = torch.randn(vocab, device="cuda", generator=gen) * 3
-    if temperature < 0.1:
-        logits = logits - 50.0
-        ids = torch.randperm(vocab, device="cuda", generator=gen)[:6]
-        logits[ids] = 10.0 - temperature * torch.tensor(
-            [0.0, 0.3, 0.7, 1.2, 2.0, 3.5], device="cuda"
-        )
-    return logits
-
-
-@pytest.mark.parametrize("tp", [2, 4, 8])
-@pytest.mark.parametrize(
-    "temperature", [2.0 * GREEDY_TEMPERATURE_THRESHOLD, 0.01, 0.6, 1.0, 3.0, 100.0]
-)
-def test_sharded_temperature_draws_follow_softmax(tp, temperature):
-    """Draws of the sharded Gumbel-max sampler pass a chi-square test against
-    ``softmax(logits / T)`` (z = 5), from a temperature just above the greedy
-    threshold to a nearly uniform one, and their total-variation distance from
-    it stays within the sampling error."""
-    vocab, rows, steps = 512 * tp, 4096, 32
-    gen = torch.Generator(device="cuda").manual_seed(int(1000 * temperature) + tp)
-    logits = _near_ties(vocab, temperature, gen)
-    full = logits.expand(rows, vocab).contiguous()
-    temps = torch.full((rows,), temperature, device="cuda")
-    counts = torch.zeros(vocab, dtype=torch.int64, device="cuda")
-    for step in range(steps):
-        seed = torch.tensor([7919 * step + tp], dtype=torch.int64, device="cuda")
-        # Every row draws its own noise: the rows are independent samples.
-        counts += torch.bincount(
-            _simulated_sharded_draw(full, temps, seed, tp).long(), minlength=vocab
-        )
-    probs = torch.softmax(logits.double() / temperature, dim=-1)
-    stat, crit = chi_square(counts.cpu(), probs.cpu())
-    assert stat < crit, (stat, crit)
-    # The test rejects a wrong sampler even where no token reaches 5 expected
-    # draws: one draw per token expected from the uniform distribution, all on one token.
-    one_token = torch.zeros(vocab, dtype=torch.int64)
-    one_token[0] = vocab
-    stat, crit = chi_square(one_token, torch.full((vocab,), 1.0 / vocab, dtype=torch.float64))
-    assert stat > crit, (stat, crit)
-    total = rows * steps
-    tv = 0.5 * float((counts.cpu().double() / total - probs.cpu()).abs().sum())
-    # E|count_i / n - p_i| <= sqrt(p_i (1 - p_i) / n), so E[TV] <= bound.
-    bound = 0.5 * float((probs.cpu() * (1 - probs.cpu()) / total).sqrt().sum())
-    assert tv < 1.5 * bound + 1e-3, (tv, bound)
 
 
 @pytest.fixture
