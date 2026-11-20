@@ -488,9 +488,39 @@ jobs:
           args2: ${{ fromJson(needs.Authorization.outputs.args).args2 }}
           args3: ${{ fromJson(needs.Authorization.outputs.args).args3 }}
 
+  # Pull requests from outside the NVIDIA organization must name the reviewed commit with
+  # `--commit <full SHA>`, and a given commit must be the pull request head. The job only
+  # runs scripts from the default branch and calls GitHub APIs; it never checks out or
+  # runs pull request code. It must not be skipped: "Start ci job" needs it.
+  Commit-check:
+    name: Commit check
+    needs: [Authorization]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout default branch scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Check the commit of the bot command
+        uses: actions/github-script@v8
+        env:
+          ORG_READ_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+        with:
+          script: |
+            const {run} = require('./.github/scripts/bot_commit_check.js');
+            await run({github, context, core, orgToken: process.env.ORG_READ_TOKEN});
+
   Job-trigger:
     name: Start ci job
-    needs: [Vulnerability-scan]
+    needs: [Vulnerability-scan, Commit-check]
     runs-on: blossom
     steps:
       - name: Start ci job
