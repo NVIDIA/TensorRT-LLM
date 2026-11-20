@@ -68,7 +68,7 @@ before they are classified.
 | `SpeculativeDecoding` | `speculative_config` | planned | Every target serves one mode, checked in `route`: one-model MTP-Eagle (DeepSeek R1, Qwen3.8-Flash-Next, the four GLM-5.2 targets, GLM-5.3-Flash mtp_fused), one-model Eagle3 (MiniMax-M3), SA/DFlash/DSpark (Kimi K3 moetp4ep4), MTP or SA (GLM-5.3-Flash default), none (GPT-OSS, Kimi K3 moetp16ep1). Dynamic trees, `draft_len_schedule` and two-model drafting are refused everywhere; GLM-5.2 sm103 tp8 requires MTP. The feature would carry the `SpeculativeDecodingMode` (`speculative_config.spec_dec_mode`), linearity and draft length so targets state these limits with `when`. |
 | `LoRA` | `enable_lora` / `lora_config` | planned | No target serves it. Qwen3.8-Flash-Next asserts and MiniMax-M3 raises at runtime; DeepSeek R1, GPT-OSS and GLM-5.2 sm103 tep4 ignore `lora_params` without a check. |
 | `BeamSearch` | `max_beam_width > 1` | planned | No target serves it. Qwen3.8-Flash-Next asserts width 1; DeepSeek R1 and GLM-5.2 sm103 tep4 assume width 1 without a check. |
-| `ReturnRoutedExperts` | `enable_return_routed_experts` | to verify | |
+| `ReturnRoutedExperts` | `enable_return_routed_experts` | planned | |
 | `GuidedDecoding` | `guided_decoding_backend` | planned | GLM-5.3-Flash mtp_fused refuses it in `route`. |
 | `ReturnGenerationLogits` | `gather_generation_logits` | planned | |
 
