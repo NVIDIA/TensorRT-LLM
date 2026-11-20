@@ -217,11 +217,13 @@ def test_single_chat_session_image_embeds(
 
     image_content = messages[0]["content"][1]
     assert image_content["type"] == "image_url"
-    # mRoPE needs the image grid; take it from the model's image processor.
+    # mRoPE needs the image grid. The encoder's handle has it; it must match
+    # the model's image processor.
+    image_grid_thw = mm_embed_handle["metadata"]["image_grid_thw"]
     image_processor = AutoProcessor.from_pretrained(
         get_model_path(model_name)).image_processor
     image = Image.open(image_content["image_url"]["url"]).convert("RGB")
-    image_grid_thw = image_processor(
+    assert image_grid_thw == image_processor(
         images=image, return_tensors="pt")["image_grid_thw"][0].tolist()
     image_content.clear()
     image_content["type"] = "image_embeds"
