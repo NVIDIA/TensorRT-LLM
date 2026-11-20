@@ -21,7 +21,12 @@ class Fp8PerTensorWeightQuantize(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
-        Cell("BF16 matrix", dict(shape=(17, 32), dtype=torch.bfloat16)),
+        Cell(
+            "aligned BF16 midpoint with a tail", dict(shape=(3, 3), dtype=torch.bfloat16, offset=0)
+        ),
+        Cell(
+            "unaligned contiguous BF16 midpoint", dict(shape=(3, 3), dtype=torch.bfloat16, offset=1)
+        ),
         Cell("rank-three FP32 weights", dict(shape=(2, 3, 7), dtype=torch.float32)),
         Cell("FP16 zero range", dict(shape=(3, 16), dtype=torch.float16, zero=True)),
     )
@@ -32,7 +37,12 @@ class Fp8PerTensorWeightQuantize(OpWrapper):
 
     def reference(self, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scale = _reference_scale(weight.float().abs().amax(), weight.dtype)
-        packed = (weight.float() / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8)
+        # The aligned BF16 kernel multiplies by a rounded FP32 reciprocal, including its scalar tail.
+        if weight.dtype == torch.bfloat16 and weight.data_ptr() % 16 == 0:
+            scaled = weight.float() * scale.reciprocal()
+        else:
+            scaled = weight.float() / scale
+        packed = scaled.clamp(-_FP8_MAX, _FP8_MAX).to(_FP8)
         return packed, scale.reshape([1] * weight.ndim)
 
 
