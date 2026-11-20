@@ -63,7 +63,8 @@ from ..runners import CuteDslFusedMoEMxfp8Runner
 class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     """``trtllm.cutedsl.fused_fc12.mxfp8``: FC1+FC2-fused CuteDSL MXFP8 MoE.
 
-    Takes the constructor arguments of ``CuteDslFusedMoEBase``.
+    Takes the same constructor arguments as ``CuteDslFusedMoEBase`` but does
+    not inherit from it: the construction is a copy of that grouped-GEMM root.
     """
 
     # The fused kernel takes per-tile expert ranges, so EP need not divide the
