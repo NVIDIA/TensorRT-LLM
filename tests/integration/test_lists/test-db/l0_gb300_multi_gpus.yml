@@ -98,6 +98,8 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  # Pre-merge runs it on DGX B200 only.
+  - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   # Muse Spark Open's fused expert finalize + TP4 all-reduce over CUDA IPC; each

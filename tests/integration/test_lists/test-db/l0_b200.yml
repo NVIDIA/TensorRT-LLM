@@ -252,8 +252,6 @@ l0_b200:
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
-  - unittest/_torch/moe/test_kimi_k3_mlp.py
-  - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/moe/test_workspace_cuda.py
   # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
   - unittest/_torch/moe/test_kimi_k3_route_sort.py
@@ -306,14 +304,14 @@ l0_b200:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
   - unittest/_torch/moe/test_trtllm_gen_bf16_moe_inplace_refit.py
+  # Pre-merge runs the SM-agnostic MoE checks on one GPU type each: the load balancer and
+  # the fused DeepGEMM helpers here; test_moe_routing.py, the test_cutlass_moe_* checks and
+  # test_kimi_k3_mlp.py on H100 (l0_h100), and post-merge here.
   - unittest/_torch/moe/test_moe_load_balancer.py
-  - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/test_moe_comm_timeout_guard.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
-  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
-  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
@@ -323,7 +321,9 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
-  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  # Four of the 16 cases, covering every value of each parameter, in one entry like the
+  # function entry they replace; the full set runs post-merge.
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[deepseekv3-relu2-8-fused_routing] unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[deepseekv3-swiglu-256-separated_routing] unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[renormalize-relu2-256-separated_routing] unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[renormalize-swiglu-8-fused_routing]
   - unittest/_torch/moe/test_moe_backend.py::test_moe_mxe2m1_weights_valid_dimensions
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_in_kernel_routing_256_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
@@ -331,15 +331,14 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass
-  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise
   # ------------- MoE: test_single_gpu (by backend) ---------------
+  # Pre-merge runs the kernels that SM100 and SM103 share on B300 (l0_b300), and
+  # post-merge here. B200 keeps what SM103 runs differently or skips: CUTLASS (NVFP4 picks
+  # the Ultra kernels on SM103), MegaMoE CuteDSL (K=96 variant on SM103) and TRTLLM
+  # W4A8_NVFP4_FP8 (sm100a cubins).
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   - unittest/_torch/moe/test_moe_module.py::test_a_tactic_builds_the_implementation_it_names
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
@@ -394,7 +393,6 @@ l0_b200:
   # Vocab-parallel token selection kernels on a single shard.
   - unittest/_torch/speculative/test_vocab_parallel.py
   - unittest/_torch/speculative/test_vocab_parallel_argmax.py
-  - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
@@ -774,3 +772,17 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
   # ---- non-quantized (quant=None) moved to post-merge ----
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
+  # SM100 runs of the MoE tests that pre-merge runs on B300 (shared sm_100f kernels) or
+  # H100 (SM-agnostic), and the cases pre-merge trims.
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM and not W4A8_NVFP4_FP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/kernels/parallel
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py
+  - unittest/_torch/moe/test_kimi_k3_mlp.py
+  - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
