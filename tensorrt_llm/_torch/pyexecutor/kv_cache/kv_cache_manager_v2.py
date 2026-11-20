@@ -6992,7 +6992,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and not getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
         )
 
-    def note_context_fork(self, req: LlmRequest, fork: int, reuse_depth: int) -> None:
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
         """Hook for recurrent-state managers; the attention-only base ignores the hint."""
 
     def _context_priority_callback(self, req: LlmRequest) -> PagePriorityCallback | None:

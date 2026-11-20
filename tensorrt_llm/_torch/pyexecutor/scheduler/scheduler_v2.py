@@ -2070,7 +2070,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             return tail_limit
         # Claiming the minimum stops the target's lookup there, hiding where the
         # prompt leaves the tree; the attention-only draft match still reaches it.
-        self.kv_cache_manager.note_context_fork(req, draft_match, target_match)
+        self.kv_cache_manager.note_context_fork(req, draft_match)
         common = min(draft_match, target_match)
         return common if tail_limit is None else min(common, tail_limit)
 

@@ -4766,6 +4766,7 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
     mgr.local_num_mamba_layers = 1
+    mgr.enable_joint_kv_cache_reuse = False
     mgr._iter_prefix_matched_tokens = 0
     mgr._iter_prefix_snapshot_lost_tokens = 0
     mgr._stats_life_cycle_metadata = MagicMock(
@@ -5160,6 +5161,7 @@ def _branch_snapshot_manager(
     mgr._context_fork_hints = {}
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
+    mgr.enable_joint_kv_cache_reuse = False
     mgr._pending_prefix_loss = {}
     mgr._prefix_matched_tokens_total = 0
     mgr._iter_prefix_matched_tokens = 0
@@ -5266,7 +5268,7 @@ def test_branch_snapshot_uses_a_paired_fork_hidden_by_the_claim():
     request = _fake_context_request(prompt_len=256, context_current_position=64)
     kv_cache = _fake_reuse_match(divergence=64, reused=64)
 
-    mgr.note_context_fork(request, 192, 64)
+    mgr.note_context_fork(request, 192)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=64)
 
     assert mgr._branch_snapshot_points == {1: 192}
@@ -5285,7 +5287,7 @@ def test_branch_snapshot_ignores_a_paired_fork_within_a_block_of_the_reuse():
     request = _fake_context_request(prompt_len=512, context_current_position=392)
     kv_cache = _fake_reuse_match(divergence=392, reused=392)
 
-    mgr.note_context_fork(request, 450, 392)
+    mgr.note_context_fork(request, 450)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=392)
 
     assert mgr._branch_snapshot_points == {}
@@ -5366,7 +5368,7 @@ def test_branch_snapshot_is_inert_when_the_flag_is_off():
     request = _fake_context_request(prompt_len=256)
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
-    mgr.note_context_fork(request, 192, 64)
+    mgr.note_context_fork(request, 192)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
     mgr.prepare_expect_snapshot_points([request])
 
@@ -6425,6 +6427,7 @@ def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft
     mgr._stream = None
     mgr._request_id_to_state_index = {}
     mgr._request_id_to_is_dummy = {}
+    mgr.enable_joint_kv_cache_reuse = False
     mgr._pending_prefix_loss = {}
     mgr._kda_replay.seed_on_resume = set()
     mgr._kda_replay.acceptance_pending = set()

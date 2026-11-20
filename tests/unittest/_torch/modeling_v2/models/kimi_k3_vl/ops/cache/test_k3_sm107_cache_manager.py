@@ -83,6 +83,7 @@ def _manager_stub(local_num_mamba_layers=1, alignment=64, cls=KimiK3Sm107Midchun
     mgr._branch_snapshot_points = {}
     mgr._context_fork_hints = {}
     mgr._waiter_snapshot_points = None
+    mgr.enable_joint_kv_cache_reuse = False
     mgr._pending_prefix_loss = {}
     mgr._prefix_matched_tokens_total = 0
     mgr._iter_prefix_matched_tokens = 0

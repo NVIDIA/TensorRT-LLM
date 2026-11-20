@@ -247,9 +247,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # overwrites the per-request list on every scheduler pass, so the point
         # has to be re-merged from here rather than stored only on the request.
         self._branch_snapshot_points: Dict[int, int] = {}
-        # Paired probe depths: the draft's attention match, which can pass this
-        # pool's capped claim, and this pool's own uncapped reuse depth.
-        self._context_fork_hints: Dict[int, Tuple[int, int]] = {}
+        # Fork depths a paired draft probe found past this pool's capped claim.
+        self._context_fork_hints: Dict[int, int] = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
         # Prefix matched for every admitted lookup, against which
@@ -1707,10 +1706,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
         """Snapshot where this request leaves the reuse tree, for its siblings."""
-        paired_probe = None
         if num_lookup_tokens is not None:
-            paired_probe = self._context_fork_hints.pop(req.py_request_id, None)
-            self._record_prefix_loss(req, kv_cache, paired_probe)
+            self._record_prefix_loss(req, kv_cache)
         if not self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
             return
         # Generation-only requests receive their prompt state from the context
@@ -1733,7 +1730,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         divergence = diagnostics._get_num_reusable_tokens_before_pruning()
         reused = kv_cache.num_committed_tokens
 
-        fork = None if paired_probe is None else paired_probe[0]
+        fork = self._context_fork_hints.pop(req.py_request_id, None)
         if fork is not None and fork - reused > self.tokens_per_block:
             # A paired claim stops the lookup at its depth, hiding a fork past
             # it. One within a block of the reuse is not worth a snapshot.
@@ -1765,15 +1762,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._apply_branch_snapshot_point(req, context_current_position=reused)
 
     @override
-    def note_context_fork(self, req: LlmRequest, fork: int, reuse_depth: int) -> None:
-        self._context_fork_hints[req.py_request_id] = (fork, reuse_depth)
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        if self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
+            self._context_fork_hints[req.py_request_id] = fork
 
-    def _record_prefix_loss(
-        self,
-        req: LlmRequest,
-        kv_cache: _KVCache,
-        paired_probe: Optional[Tuple[int, int]] = None,
-    ) -> None:
+    @property
+    def _counts_prefix_loss(self) -> bool:
+        """Whether this pool's own lookups show its prefix loss.
+
+        A target paired with a draft KV pool claims only the depth both pools
+        hold, so its lookup does not reach its own match.
+        """
+        return self.local_num_mamba_layers > 0 and not self.enable_joint_kv_cache_reuse
+
+    def _record_prefix_loss(self, req: LlmRequest, kv_cache: _KVCache) -> None:
         """Keep the attention-matched prefix and the parts lost to a missing
         snapshot and to evicted attention pages.
 
@@ -1781,7 +1783,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         an older snapshot of the same prefix still counts as a hit.
         """
         if (
-            self.local_num_mamba_layers == 0
+            not self._counts_prefix_loss
             or self.is_estimating_kv_cache
             or req.is_dummy
             or req.is_disagg_generation_init_state
@@ -1790,18 +1792,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
         matched = diagnostics._get_num_reusable_tokens_before_hybrid_pruning()
         page_lost = max(0, diagnostics._get_num_reusable_tokens_before_pruning() - matched)
-        reused = kv_cache.num_committed_tokens
-        if paired_probe is not None:
-            # A paired claim stops the lookup at the common depth. Judge it by the
-            # uncapped probes, so a shallower draft match is not snapshot loss.
-            fork, reuse_depth = paired_probe
-            matched = max(matched, fork, reuse_depth)
-            reused = max(reused, reuse_depth)
-        self._pending_prefix_loss[req.py_request_id] = (
-            matched,
-            max(0, matched - reused),
-            page_lost,
-        )
+        lost = max(0, matched - kv_cache.num_committed_tokens)
+        self._pending_prefix_loss[req.py_request_id] = (matched, lost, page_lost)
 
     def _commit_prefix_loss(self, request_id: int) -> None:
         """Count a request's last lookup with the batch holding its first chunk."""
@@ -1905,7 +1897,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         report = super().get_iteration_stats()
         if report is None:
             return None
-        if self.local_num_mamba_layers > 0:
+        if self._counts_prefix_loss:
             report.prefix_matched_tokens = self._iter_prefix_matched_tokens
             report.prefix_snapshot_lost_tokens = self._iter_prefix_snapshot_lost_tokens
             self._iter_prefix_matched_tokens = 0

@@ -55,6 +55,7 @@ def _manager(
     manager.enable_stats = False
     manager._request_stats_enabled_ids = set()
     manager.local_num_mamba_layers = 1
+    manager.enable_joint_kv_cache_reuse = False
     manager.is_estimating_kv_cache = False
     manager.mapping = SimpleNamespace(rank=rank)
     manager.kv_cache_config = KvCacheConfig(
@@ -122,28 +123,18 @@ def test_counts_a_refused_admission_once() -> None:
     assert manager._page_pruned_tokens_total == 6_000
 
 
-@pytest.mark.parametrize(
-    ("draft_match", "target_match", "matched", "lost"),
-    [
-        # Attention matched through 192, the target's last snapshot is at 64.
-        (192, 64, 192, 128),
-        # The draft matched only 64; the target's snapshot at 192 is not lost.
-        (64, 192, 192, 0),
-    ],
-)
-def test_measures_a_paired_claim_against_the_uncapped_probes(
-    draft_match: int, target_match: int, matched: int, lost: int
-) -> None:
+def test_skips_a_target_paired_with_a_draft_pool() -> None:
     manager = _manager()
+    manager.enable_joint_kv_cache_reuse = True
     request = _fake_request()
-    common = min(draft_match, target_match)
-    manager.note_context_fork(request, draft_match, target_match)
-    # The claim stops the lookup at the common depth, which it fully reuses.
-    manager._record_branch_snapshot_point(request, _fake_kv_cache(common, common), common)
+    # The claim stops at the depth both pools hold, so the target's own match is unknown.
+    manager._record_branch_snapshot_point(request, _fake_kv_cache(64, 64, 192), 64)
     _commit(manager, request)
-    assert manager._context_fork_hints == {}
-    assert manager._iter_prefix_matched_tokens == matched
-    assert manager._iter_prefix_snapshot_lost_tokens == lost
+    assert manager._pending_prefix_loss == {}
+    assert manager._prefix_matched_tokens_total == 0
+    assert manager._snapshot_pruned_tokens_total == 0
+    assert manager._page_pruned_tokens_total == 0
+    assert not manager._counts_prefix_loss
 
 
 def test_skips_resumed_dummy_disagg_and_estimation_lookups() -> None:

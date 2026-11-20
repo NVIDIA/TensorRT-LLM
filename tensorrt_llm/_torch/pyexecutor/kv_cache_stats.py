@@ -145,7 +145,9 @@ class KVCacheV2IterationStatsReport:
     connector_cached_tokens: int | None = None
     # Hybrid recurrent models: prefix tokens that matched in the attention cache for requests
     # admitted during this iteration, and how many of them were recomputed because no recurrent
-    # state snapshot covered them. None for models without recurrent layers.
+    # state snapshot covered them. None for models without recurrent layers, and for a target
+    # paired with a draft KV pool (one-model MTP/Eagle3 with block reuse), whose lookups stop at
+    # the depth both pools hold.
     prefix_matched_tokens: int | None = None
     prefix_snapshot_lost_tokens: int | None = None
 
