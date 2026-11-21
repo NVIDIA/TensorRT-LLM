@@ -87,6 +87,7 @@ from typing import Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -601,6 +602,25 @@ def _mbarrier_arrive_remote(local_mbar, peer, *, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
+
+
+@cute.jit
+def _mbarrier_wait_cluster_acquire(mbar_addr: Int32, parity: Int32):
+    """Wait for ``parity`` of the local mbarrier at ``mbar_addr`` and acquire the peers' stores.
+
+    The mailbox barriers are completed by peer CTAs (``cp.async.bulk`` / ``st.async`` with
+    ``mbarrier::complete_tx``), which is a release at cluster scope. The default wait acquires
+    at CTA scope only and does not synchronize with it (PTX ISA, ``mbarrier.try_wait`` scope).
+    A relaxed cluster-scope wait followed by an acquire fence restricted to ``shared::cluster``
+    is the PTX ISA acquire pattern for this case; unlike an ``.acquire.cluster`` wait it does
+    not make ptxas invalidate L1 on every poll.
+    """
+    mbar = cute.make_ptr(Int64, mbar_addr, cute.AddressSpace.smem, assumed_align=8)
+    while not prims.mbarrier_try_wait_parity(
+        mbar, parity, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 def _s2t_partition_sf(sSF: cute.Tensor, tSF: cute.Tensor):
@@ -1656,7 +1676,9 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
                     )
-                cute.arch.mbarrier_wait(mbox_full, 0)
+                # The peers' bulk copies complete mbox_full with a cluster-scope release:
+                # wait, then acquire at cluster scope before reading their partials.
+                _mbarrier_wait_cluster_acquire(mbar_addr, 0)
                 for c in cutlass.range_constexpr(nchunks):
                     _, col0 = tTR_cAcc[4 * c]
                     if col0 < m:
@@ -2789,7 +2811,9 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         storage.mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
                     )
-                cute.arch.mbarrier_wait(storage.mbox_full, 0)
+                # The peers' st.async stores complete mbox_full with a cluster-scope release:
+                # wait, then acquire at cluster scope before reading their partials.
+                _mbarrier_wait_cluster_acquire(mbar_addr, 0)
                 for i in cutlass.range_constexpr(self.chunks_cap):
                     if i < my_chunks:
                         acc = [rOwn[i * 4 + v] for v in range(4)]
