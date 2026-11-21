@@ -258,13 +258,6 @@ and other unintended behavior. As such, we recommend using distinct
 `TRTLLM_CACHE_DIR` caches for different models, and invalidating them anytime 
 a component in the software stack changes.
 
-Autotuner cache entries are keyed by a fingerprint of the code their candidate runners
-depend on (the Python definitions they reach, the native libraries for C++ kernels, and
-the versions of the kernel packages they use), so a change to that code re-tunes only
-the affected runners. Set `TLLM_AUTOTUNER_CACHE_KEY=none` to leave the fingerprint out
-of the keys, for example to reuse one cache across builds in A/B runs; the default is
-`code`.
-
 TensorRT-LLM can also keep the results of `cute.compile`, which the CuTe DSL does not cache,
 so that later processes and ranks load the CuTe DSL kernels they need instead of compiling
 them again. Set `TRTLLM_CUTE_DSL_CACHE_DIR` to a directory before importing TensorRT-LLM to
