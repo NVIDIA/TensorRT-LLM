@@ -2665,6 +2665,49 @@ def test_code_fingerprint_tells_factory_built_runner_classes_apart(fp_modules):
         runners.Narrow)) == cached[0]
 
 
+# One factory whose runners differ only in the implementation they capture.
+_CLOSURE_RUNNERS = """
+    from fp_base import Base
+
+
+    def narrow():
+        return [0]
+
+
+    def wide():
+        return [0, 1]
+
+
+    def factory(impl):
+        class Runner(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return impl()
+
+        return Runner
+    """
+
+
+def test_code_fingerprint_follows_captured_implementations(fp_modules):
+    runners = fp_modules.load("fp_runners", _CLOSURE_RUNNERS)
+    narrow = runners.factory(runners.narrow)
+    wide = runners.factory(runners.wide)
+    fp_modules.fingerprints()
+    cached = [autotuner._code_fingerprint(k) for k in (narrow, wide)]
+    walked = [autotuner._FingerprintWalk(k).digest() for k in (narrow, wide)]
+    assert cached == walked and cached[0] != cached[1]
+    pair = autotuner._candidates_fingerprint((narrow, wide))
+    assert autotuner._key_fingerprint(narrow,
+                                      pair) != autotuner._key_fingerprint(
+                                          wide, pair)
+    # Built again around the same implementation, it is the same runner.
+    assert autotuner._code_fingerprint(runners.factory(
+        runners.narrow)) == cached[0]
+    # An edit to the captured implementation re-keys only its runner.
+    fp_modules.edit("fp_runners", "return [0, 1]", "return [0, 1, 2]")
+    assert _changed(cached, fp_modules.fingerprints(narrow,
+                                                    wide)) == [False, True]
+
+
 def test_candidates_fingerprint_keys_same_named_runners_apart(fp_modules):
     runners = fp_modules.load("fp_runners", _FACTORY_RUNNERS)
     narrow = runners.factory(runners.Narrow)
@@ -2867,10 +2910,16 @@ def test_ranks_that_fingerprint_differently_raise(fp_modules):
         agree(lambda obj: [edited, edited])
 
 
-def test_search_cache_keeps_same_named_candidates_apart(fp_modules):
-    runners = fp_modules.load("fp_runners", _FACTORY_RUNNERS)
-    narrow = runners.factory(runners.Narrow)()
-    wide = runners.factory(runners.Wide)()
+@pytest.mark.parametrize("source,narrow_impl,wide_impl", [
+    (_FACTORY_RUNNERS, "Narrow", "Wide"),
+    (_CLOSURE_RUNNERS, "narrow", "wide"),
+],
+                         ids=["bases", "captured"])
+def test_search_cache_keeps_same_named_candidates_apart(fp_modules, source,
+                                                        narrow_impl, wide_impl):
+    runners = fp_modules.load("fp_runners", source)
+    narrow = runners.factory(getattr(runners, narrow_impl))()
+    wide = runners.factory(getattr(runners, wide_impl))()
     candidates = [narrow, wide]
     cache = autotuner.AutoTuner().profiling_cache
     cache.cache = {

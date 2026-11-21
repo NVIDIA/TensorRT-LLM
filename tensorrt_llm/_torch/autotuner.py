@@ -938,6 +938,60 @@ def _closure_functions(fn) -> List[Callable]:
     return functions
 
 
+def _captured(fn):
+    """(variable, value) for each cell of `fn`'s closure: what a function a
+    factory builds captures from it. The `__class__` cell of a method that
+    calls super() is its own class, and is left out."""
+    code = getattr(fn, "__code__", None)
+    for var, cell in zip(code.co_freevars if code else (),
+                         getattr(fn, "__closure__", None) or ()):
+        if var == "__class__":
+            continue
+        try:
+            yield var, cell.cell_contents
+        except ValueError:  # An empty cell.
+            continue
+
+
+def _captured_definitions(fn):
+    """(name, object) for the definitions `fn` captures (functions, classes,
+    modules, and kernel objects that name their own definition), which a
+    factory can vary from one built function to the next. Captured plain
+    values are not counted, as a class attribute's value is not."""
+    for var, value in _captured(fn):
+        if (inspect.isfunction(value) or inspect.isclass(value)
+                or inspect.ismodule(value) or isinstance(value, partial)):
+            yield f"{fn.__module__}.{fn.__qualname__}.<closure>.{var}", value
+        elif callable(value):
+            own_module = _attribute(value, "__module__")
+            own_name = _attribute(value, "__qualname__")
+            if isinstance(own_module, str) and isinstance(own_name, str):
+                yield f"{own_module}.{own_name}", value
+
+
+def _function_identity(fn, depth: int = 0) -> Tuple:
+    """A function's code and the identities of the definitions it captures:
+    what tells apart functions one factory builds."""
+    try:
+        fn = inspect.unwrap(fn)
+    except ValueError:
+        pass
+    captured = []
+    if depth < 4:
+        for var, value in _captured(fn):
+            if inspect.isclass(value):
+                captured.append((var, _class_identity(value)))
+            elif inspect.ismodule(value):
+                captured.append((var, value.__name__))
+            elif callable(value):
+                identity = _function_identity(value, depth + 1)
+                if identity[0] is None:  # A kernel object: its own name.
+                    identity = (_attribute(value, "__module__"),
+                                _attribute(value, "__qualname__"))
+                captured.append((var, identity))
+    return getattr(fn, "__code__", None), tuple(captured)
+
+
 def _function_refs(fn) -> Tuple[Tuple[str, Any], ...]:
     """What `fn` loads by name, looked up in its globals now."""
     return tuple(_code_refs(_scan_code(fn.__code__), fn.__globals__))
@@ -1226,6 +1280,7 @@ class _FingerprintWalk:
             _resolve_loads(index.eager.get(obj.__qualname__, ()), globals_))
         if inspect.isfunction(obj):
             self.todo.extend(_function_refs(obj))
+            self.todo.extend(_captured_definitions(obj))
             return
         self.todo.extend((f"{module}.{obj.__qualname__}.{k}", v)
                          for k, v in vars(obj).items())
@@ -1329,9 +1384,10 @@ def _class_identity(cls: type) -> Tuple:
     """What tells runner classes apart for the fingerprint caches. A class of
     a module counts by its name. A class a function builds (`<locals>` in
     its name) can be built again, alike or not: it also counts by what the
-    walk follows in it, its bases and the classes and code of its namespace,
-    so classes one factory builds alike share a fingerprint (walked once),
-    and classes it builds on different bases do not."""
+    walk follows in it, its bases and the classes and code of its namespace
+    with what that code captures, so classes one factory builds alike share
+    a fingerprint (walked once), and classes it builds on different bases or
+    around different captured implementations do not."""
     if "<locals>" not in cls.__qualname__:
         return _class_name(cls)
     identity = _LOCAL_CLASS_IDENTITIES.get(cls)
@@ -1347,12 +1403,9 @@ def _class_identity(cls: type) -> Tuple:
                 if inspect.isclass(value):
                     members.append((key, _class_identity(value)))
                 elif callable(value):
-                    try:
-                        code = getattr(inspect.unwrap(value), "__code__", None)
-                    except ValueError:
-                        code = None
-                    if code is not None:
-                        members.append((key, code))
+                    identity = _function_identity(value)
+                    if identity[0] is not None:
+                        members.append((key, identity))
         identity = _LOCAL_CLASS_IDENTITIES[cls] = (*_class_name(cls),
                                                    tuple(
                                                        map(
