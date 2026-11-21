@@ -144,20 +144,25 @@ def _report_observed_child_failure(return_code: int, component: str,
 def _apply_effective_telemetry_config(llm_args: dict,
                                       *,
                                       telemetry: bool,
-                                      component: str = "server") -> None:
-    """Apply a parsed config opt-out before later setup can fail."""
+                                      component: str = "server") -> dict:
+    """Apply a parsed config opt-out before later setup can fail.
+
+    Returns the mapping to use; never modifies ``llm_args``. The caller
+    rebinds its name to the result.
+    """
     telemetry_config = llm_args.get("telemetry_config")
     if telemetry_config is not None:
         if not telemetry:
             telemetry_config = telemetry_config.model_copy(
                 update={"disabled": True})
-            llm_args["telemetry_config"] = telemetry_config
+            llm_args = {**llm_args, "telemetry_config": telemetry_config}
         apply_usage_session_config(
             telemetry_config,
             default_usage_context="cli_serve",
             component=component,
             lifecycle_phase="config_validation",
         )
+    return llm_args
 
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
@@ -557,7 +562,7 @@ def _reserve_multi_frontend_port(host: str, port: int,
 
 @contextlib.contextmanager
 def _provision_kv_cache_pool(llm_args: dict,
-                             owns_engine: bool = True) -> Iterator[None]:
+                             owns_engine: bool = True) -> Iterator[dict]:
     """Bring up the shared cache this server joins, for its lifetime.
 
     A connector backed by a cluster-wide pool needs that pool reachable before
@@ -568,9 +573,12 @@ def _provision_kv_cache_pool(llm_args: dict,
     Only the process that owns the engine does this. An attached frontend
     re-execs this command line but shares the launcher's executor, so it would
     otherwise render a second client config over the first.
+
+    Yields the mapping to pass to the LLM constructor; never modifies
+    ``llm_args``. The caller binds the yielded mapping (``as llm_args``).
     """
     if not owns_engine:
-        yield
+        yield llm_args
         return
 
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
@@ -582,10 +590,10 @@ def _provision_kv_cache_pool(llm_args: dict,
         # before the LLM constructor would coerce it. The validated model is
         # handed on so it is not parsed twice.
         connector_config = KvCacheConnectorConfig(**connector_config)
-        llm_args["kv_connector_config"] = connector_config
+        llm_args = {**llm_args, "kv_connector_config": connector_config}
 
     with maybe_provision_pool(connector_config):
-        yield
+        yield llm_args
 
 
 def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
@@ -628,15 +636,18 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
 def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
                                          port: int, grpc: bool,
                                          report_addr: Optional[str],
-                                         enable_sleep_mode: bool) -> None:
+                                         enable_sleep_mode: bool) -> dict:
     """Fall back to one frontend where the default count cannot run.
 
     An explicit count (CLI, --config YAML or --set) is left alone, so the
     guard that owns the conflict still rejects it.
+
+    Returns the mapping to use; never modifies ``llm_args``. The caller
+    rebinds its name to the result.
     """
     num_frontends = llm_args.get("num_serve_frontends", 1)
     if requested or num_frontends <= 1:
-        return
+        return llm_args
     if grpc:
         # OpenEngine supports several frontends, but only when asked to.
         reason = "--grpc"
@@ -649,12 +660,12 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     elif enable_sleep_mode:
         reason = "--enable_sleep_mode"
     else:
-        return
+        return llm_args
     logger.info(
         f"num_serve_frontends defaults to {num_frontends} for the OpenAI HTTP "
         f"server only; running 1 frontend because of {reason}. Pass "
         "--num_serve_frontends explicitly to override.")
-    llm_args["num_serve_frontends"] = 1
+    return {**llm_args, "num_serve_frontends": 1}
 
 
 def _bool_setting(value: object) -> bool:
@@ -798,6 +809,9 @@ def launch_server(
         enable_runtime_control_endpoints: bool = False,
         runtime_control_api_key: Optional[str] = None) -> None:
 
+    # Never write into the caller's mapping; every edit below is on this copy.
+    llm_args = dict(llm_args)
+
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
@@ -819,6 +833,10 @@ def launch_server(
                                 internal_disagg_auth_key.encode("utf-8"))
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    if not multi_frontend_enabled:
+        # Entry points that disable multi-frontend mode must not hand the knob
+        # to the LLM constructor, which rejects unknown keys.
+        llm_args.pop("num_serve_frontends", None)
     _check_context_only_settings(llm_args,
                                  warn=not multi_frontend.is_attached_frontend)
     # An attached frontend gets the launcher's socket from its spawn env; the
@@ -898,8 +916,8 @@ def launch_server(
                 _diagnose_port_in_use) as
               (affinity_socket, attached_affinity_sockets),
               _provision_kv_cache_pool(
-                  llm_args,
-                  owns_engine=not multi_frontend.is_attached_frontend)):
+                  llm_args, owns_engine=not multi_frontend.is_attached_frontend)
+              as llm_args):
             if backend == 'pytorch':
                 llm_args.pop("build_config", None)
                 llm = PyTorchLLM(**llm_args)
@@ -982,6 +1000,8 @@ def launch_mm_encoder_server(
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
 ) -> None:
+    # Never write into the caller's mapping; every edit below is on this copy.
+    encoder_args = dict(encoder_args)
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
@@ -1180,6 +1200,8 @@ def launch_embedding_server(
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ) -> None:
+    # Never write into the caller's mapping; every edit below is on this copy.
+    llm_args = dict(llm_args)
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     # encode_only is forced on below; drop any value coming from --config to avoid
@@ -1229,6 +1251,8 @@ def launch_rerank_server(
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ) -> None:
+    # Never write into the caller's mapping; every edit below is on this copy.
+    llm_args = dict(llm_args)
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     llm_args.pop("encode_only", None)
@@ -1983,9 +2007,9 @@ def serve(
         # even when an explicit convenience flag targets the same nested field.
         llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
         if enable_sleep_mode and llm_args.get("sleep_config") is None:
-            llm_args["sleep_config"] = SleepConfig()
+            llm_args = {**llm_args, "sleep_config": SleepConfig()}
 
-        _resolve_default_num_serve_frontends(
+        llm_args = _resolve_default_num_serve_frontends(
             llm_args,
             requested=("num_serve_frontends" in explicit_cli_keys
                        or "num_serve_frontends" in llm_args_extra_dict),
@@ -1994,7 +2018,8 @@ def serve(
             report_addr=report_addr,
             enable_sleep_mode=enable_sleep_mode)
 
-        _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        llm_args = _apply_effective_telemetry_config(llm_args,
+                                                     telemetry=telemetry)
         # Preserve requested settings for failures before entering the LLM constructor.
         try:
             from tensorrt_llm.usage.usage_lib import _capture_startup_context
@@ -2007,7 +2032,8 @@ def serve(
 
         # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
         # but disagg_cluster_uri takes precedence over cluster uri in config file
-        disagg_cluster_config = llm_args.pop("disagg_cluster", None)
+        disagg_cluster_config = llm_args.get("disagg_cluster")
+        llm_args = {k: v for k, v in llm_args.items() if k != "disagg_cluster"}
         if disagg_cluster_config:
             disagg_cluster_config = extract_disagg_cluster_config(
                 disagg_cluster_config, disagg_cluster_uri)
@@ -2082,9 +2108,9 @@ def serve(
                 from tensorrt_llm.grpc.smg.server import launch_smg_server
 
                 _check_context_only_settings(llm_args, warn=True)
-                launch_smg_server(host,
-                                  port,
-                                  llm_args,
+                launch_smg_server(host=host,
+                                  port=port,
+                                  llm_args=llm_args,
                                   served_model_name=served_model_name)
             else:
                 try:
@@ -2104,11 +2130,11 @@ def serve(
                 with _provision_kv_cache_pool(
                         llm_args,
                         owns_engine=not grpc_multi_frontend.is_attached_frontend
-                ):
+                ) as llm_args:
                     launch_grpc_server(
-                        host,
-                        port,
-                        llm_args,
+                        host=host,
+                        port=port,
+                        llm_args=llm_args,
                         served_model_name=served_model_name,
                         report_failure=_report_observed_child_failure,
                         enable_load_metrics=openengine_enable_load_metrics,
@@ -2119,16 +2145,16 @@ def serve(
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
-                host,
-                port,
-                llm_args,
-                tool_parser,
-                middleware,
-                chat_template,
-                metadata_server_cfg,
-                server_role,
-                disagg_cluster_config,
-                multimodal_server_config,
+                host=host,
+                port=port,
+                llm_args=llm_args,
+                tool_parser=tool_parser,
+                middleware=middleware,
+                chat_template=chat_template,
+                metadata_server_cfg=metadata_server_cfg,
+                server_role=server_role,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
@@ -2147,12 +2173,12 @@ def serve(
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host,
-                                 port,
-                                 model,
-                                 parsed_visual_gen_args,
-                                 metadata_server_cfg,
-                                 middleware,
+        launch_visual_gen_server(host=host,
+                                 port=port,
+                                 model=model,
+                                 visual_gen_args=parsed_visual_gen_args,
+                                 metadata_server_cfg=metadata_server_cfg,
+                                 middleware=middleware,
                                  media_load_workers=num_media_load_workers)
 
     # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
@@ -2321,16 +2347,17 @@ def serve_encoder(
     encoder_args = update_llm_args_with_extra_dict(
         llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-    _apply_effective_telemetry_config(encoder_args, telemetry=telemetry)
+    encoder_args = _apply_effective_telemetry_config(encoder_args,
+                                                     telemetry=telemetry)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
     launch_mm_encoder_server(
-        host,
-        port,
-        encoder_args,
-        metadata_server_cfg,
+        host=host,
+        port=port,
+        encoder_args=encoder_args,
+        metadata_server_cfg=metadata_server_cfg,
         allow_request_chat_template=allow_request_chat_template)
 
 
@@ -2375,7 +2402,7 @@ def _prepare_encode_only_llm_args(
     )
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
-    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+    llm_args = _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
     effective_tp = llm_args.get("tensor_parallel_size") or 1
     effective_pp = llm_args.get("pipeline_parallel_size") or 1
@@ -2493,8 +2520,12 @@ def serve_embedding(
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    launch_embedding_server(host, port, llm_args, max_queue_delay,
-                            max_queue_size, metadata_server_cfg)
+    launch_embedding_server(host=host,
+                            port=port,
+                            llm_args=llm_args,
+                            max_queue_delay=max_queue_delay,
+                            max_queue_size=max_queue_size,
+                            metadata_server_cfg=metadata_server_cfg)
 
 
 @click.command("rerank")
@@ -3388,7 +3419,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         llm_args = _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         # Ignore the non-LLM args
-        llm_args.pop("router", None)
+        llm_args = {k: v for k, v in llm_args.items() if k != "router"}
         _launch_disaggregated_server(config_file, llm_args)
         return
 

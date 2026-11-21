@@ -49,6 +49,9 @@ def launch_smg_server(
         served_model_name: Model name returned by discovery RPCs. Defaults to
             the model path.
     """
+    # Never write into the caller's mapping; the nested serve_grpc_async()
+    # below edits this copy (or the mapping the pool provisioning yields).
+    llm_args = dict(llm_args)
     _warn_if_python_protobuf()
     try:
         from grpc_reflection.v1alpha import reflection
@@ -133,7 +136,7 @@ def launch_smg_server(
     # server.
     from tensorrt_llm.commands.serve import _provision_kv_cache_pool
 
-    with _provision_kv_cache_pool(llm_args):
+    with _provision_kv_cache_pool(llm_args) as llm_args:
         uvloop.run(serve_grpc_async())
 
 

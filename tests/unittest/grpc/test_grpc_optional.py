@@ -336,7 +336,7 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     monkeypatch.setattr(
         serve_module,
         "_apply_effective_telemetry_config",
-        lambda *_args, **_kwargs: None,
+        lambda llm_args, **_kwargs: llm_args,
     )
     monkeypatch.setattr(
         serve_module,

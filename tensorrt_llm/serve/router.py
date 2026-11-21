@@ -2952,7 +2952,7 @@ def create_router(
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
-    extra_args = router_config.args if router_config else {}
+    extra_args = router_config.args.copy() if router_config else {}
     if extra_args.get("max_requests_per_server") is not None:
         if router_class is not LoadBalancingRouter:
             raise ValueError("max_requests_per_server needs the load_balancing "
