@@ -7,8 +7,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (
     beam_nope_query_scale as op,
 )
 
@@ -50,11 +50,15 @@ def test_scale_against_float64() -> None:
     """The fp32 scale is within four fp32 units of the float64 expression at every position, so
     the bf16 result differs from a float64-scaled one only where the product sits within that
     distance of a bf16 rounding boundary."""
-    positions = torch.arange(129, device="cuda")
-    q = torch.ones(129, 1, 1, dtype=torch.float32, device="cuda")
+    positions = torch.tensor([0, 128, 2047, 65535, 131071], device="cuda")
+    q = torch.ones(positions.numel(), 1, 1, dtype=torch.float32, device="cuda")
     scale32 = op(q, positions).view(-1)
     scale64 = torch.exp(0.1 * torch.log1p((positions.double() + 1) / 2048))
     assert float(((scale32.double() - scale64).abs() / scale64).max()) <= 4 * 2.0**-23
+    # Analytic BF16 goldens for unit queries at positions 2047, 65535 and 131071:
+    # round(2**0.1), round(33**0.1), round(65**0.1). Independent of op.reference.
+    expected = torch.tensor([1.0703125, 1.421875, 1.515625], dtype=torch.bfloat16, device="cuda")
+    torch.testing.assert_close(op(q.bfloat16(), positions)[2:, 0, 0], expected, rtol=0, atol=0)
 
 
 def test_scale_is_visible_at_nonzero_positions() -> None:

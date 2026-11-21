@@ -4,27 +4,30 @@
 """The contract: every check a run must pass, compiled from the resolved task spec.
 
 The contract is the run's definition of "done". It names each check by unit,
-gate and member, with a tier that says when it runs:
+gate and member, with a tier:
 
-- ``inner``: after every change to the target (boot, accuracy, and the serve
+- ``inner``: what shows a unit runs and scores (boot, accuracy, and the serve
   gate where the spec turns it on or can derive it);
 - ``proof``: what proves a feature is on (acceptance, the disaggregated-serving
   test), and the checks of each configuration variant (``spec/variants.py``);
-- ``delivery``: once, on the tree being delivered (the
-  serve gate at one rank).
+- ``delivery``: once every other required check has passed (the serve gate
+  at one rank). Its pass stands like any other, and it runs again when a task
+  that claims it lands.
 
-Verdicts are appended to ``contract_status.jsonl`` as gates return, keyed by
-unit. Delivery evaluates the contract: every required check's latest verdict
-must have passed, on the target as it is now. A verdict recorded against an
-earlier state of the target (its ``marker``), or with other ``inputs``
-(:func:`check_inputs`), is stale and counts as missing. Checks that carry one
-``equivalence`` key (:func:`equivalence_key`) share a pass on the target as it
-is now.
+A check runs when the task that claims it lands. Verdicts are appended to
+``contract_status.jsonl`` as gates return, keyed by unit. Delivery evaluates
+the contract (:func:`evaluate`): every required check's latest verdict must
+have passed. A check that passed stands, whatever landed after it. A verdict
+that failed counts on the state of the target it measured (its ``marker``):
+once the target has changed the check is missing, and runs again. A verdict
+recorded with other ``inputs`` (:func:`check_inputs`) is dropped. A check
+passes by its own verdict only. Before delivery one check has passed on the
+final tree (:func:`confirmed`).
 
-The first state of the target on which the first unit's boot and accuracy
-hold at the member its accuracy runs at is where the bring-up was delivered
-(:func:`bringup_checks`). The first on which every required check holds is
-where correctness was delivered. Both are appended to ``correctness.jsonl``.
+The first state of the target on which the first unit's bring-up checks hold
+(:func:`bringup_checks`) is where the bring-up was delivered. The first on
+which every required check has passed and the tree is confirmed is where
+correctness was delivered. Both are appended to ``correctness.jsonl``.
 """
 
 from __future__ import annotations
@@ -39,14 +42,11 @@ import yaml
 
 from ...checks import check_config, disagg, serve
 from ...checks.accuracy import resolve_discriminators
-from ...checks.boot import resolve_boot_spec
 from ...checks.check_config import (
     load_llm_api_options,
     order_members_by_cost,
     resolve_llm_api_options,
-    resolve_max_draft_len,
     resolve_runtime,
-    speculation_flags,
 )
 from ...infra.files import write_text_atomic
 from ...spec import variants as variants_mod
@@ -73,8 +73,8 @@ STATUS_FILENAME = "contract_status.jsonl"
 #: One line per milestone: each state of the target the contract first held on,
 #: and the bring-up; the last of each tier is where it stands.
 MILESTONE_FILENAME = "correctness.jsonl"
-#: A milestone's tier: the first unit's boot and accuracy at its accuracy
-#: member, or every required check.
+#: A milestone's tier: the first unit's checks at its narrowest accuracy member
+#: (its benchmark, and its boot where it owes one), or every required check.
 MILESTONE_BRINGUP = "bringup"
 MILESTONE_CORRECTNESS = "correctness"
 
@@ -88,9 +88,6 @@ class Check:
     member: str
     tier: str
     required: bool = True
-    #: Checks with the same non-empty key measure the same engine on the same
-    #: workload against the same criterion; see :func:`equivalence_key`.
-    equivalence: str = field(default="", compare=False)
     #: What the check reads from outside the checkout, as a digest; see :func:`check_inputs`.
     inputs: str = field(default="", compare=False)
     #: The check whose verdict on the same target this one needs first: the unit's
@@ -107,6 +104,11 @@ class Contract:
     checks: tuple[Check, ...]
     #: Why a unit or variant owes less than every check at every member, one line each.
     notes: tuple[str, ...] = ()
+    #: The key of the check that confirms the final tree when none of its kind
+    #: has passed on it (:func:`confirmed`): the benchmark of the last unit that
+    #: owes one, at its cheapest member, else the last variant's that does; the
+    #: last boot where the run owes no benchmark at all.
+    confirm: str = ""
 
     def required(self) -> tuple[Check, ...]:
         return tuple(c for c in self.checks if c.required)
@@ -117,16 +119,14 @@ class Contract:
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "checks": [
-                {
-                    k: v
-                    for k, v in asdict(c).items()
-                    if k not in ("equivalence", "inputs", "after") or v
-                }
+                {k: v for k, v in asdict(c).items() if k not in ("inputs", "after") or v}
                 for c in self.checks
             ]
         }
         if self.notes:
             out["notes"] = list(self.notes)
+        if self.confirm:
+            out["confirm"] = self.confirm
         return out
 
     def render(self) -> str:
@@ -139,13 +139,6 @@ class Contract:
         if self.notes:
             lines += ["", *(f"- {note}" for note in self.notes)]
         return "\n".join(lines)
-
-
-#: Accuracy-block keys only other gates read. Every other key, one added
-#: later included, is part of an accuracy check's equivalence.
-_NOT_ACCURACY_INPUTS = frozenset(
-    {"boot", "acceptance", "disagg", "envelope", "serve", "benchmark_members"}
-)
 
 
 def _per_unit(key: str) -> Callable[[Mapping[str, Any], str], Any]:
@@ -166,7 +159,7 @@ def _options(accuracy: Mapping[str, Any], unit: str) -> Any:
 
 
 #: The accuracy-block keys the accuracy gate reads through a resolver, and
-#: that resolver; the rest are compared as written (see `_as_written`).
+#: that resolver.
 _ACCURACY_RESOLVERS: dict[str, Callable[[Mapping[str, Any], str], Any]] = {
     "llm_api_options": _options,
     "discriminators": resolve_discriminators,
@@ -175,79 +168,6 @@ _ACCURACY_RESOLVERS: dict[str, Callable[[Mapping[str, Any], str], Any]] = {
         for key in ("benchmark", "benchmark_args", "reference_yaml", "model_key", "samples")
     },
 }
-
-
-def _as_written(value: Any, unit: str) -> list[Any]:
-    """``value`` as it applies to ``unit``, without assuming how it falls back.
-
-    A mapping's own entry for ``unit`` when it has one; otherwise the value
-    itself, which every unit without an entry shares whatever the fallback is.
-    """
-    if isinstance(value, Mapping) and unit in value:
-        return ["unit", value[unit]]
-    return ["run", value]
-
-
-def _without_timeout(block: Any) -> Any:
-    """``block`` with its ``timeout``, and each unit entry's, left out."""
-    if not isinstance(block, Mapping):
-        return block
-    return {
-        key: _without_timeout(value) if isinstance(value, Mapping) else value
-        for key, value in block.items()
-        if key != "timeout"
-    }
-
-
-def equivalence_key(
-    task_data: Mapping[str, Any], unit: str, gate: str, member: str, features: Sequence[str]
-) -> str:
-    """What decides a boot, accuracy or acceptance check's verdict, as one key; ``""`` for any other gate.
-
-    Two checks with one key run one command line on the same tree and judge
-    its output by one criterion, so a pass of either is a pass of both. Built
-    from the spec and the content of the options file, never its path, and
-    conservatively: where this cannot see how a value falls back, the keys
-    differ rather than agree.
-    """
-    accuracy = task_data.get("accuracy") or {}
-    if gate == "boot":
-        try:
-            workload = asdict(resolve_boot_spec(task_data, unit, features))
-        except (OSError, TypeError, ValueError):
-            return ""
-        # Where the workload was declared is named in the verdict, not judged by it.
-        workload.pop("source", None)
-        inputs = {
-            "runtime": resolve_runtime(task_data, unit),
-            "speculation": speculation_flags(features),
-            "llm_api_options": _options(accuracy, unit),
-            "workload": workload,
-            "boundaries": accuracy.get("envelope"),
-        }
-    elif gate == "acceptance":
-        inputs = {
-            "runtime": resolve_runtime(task_data, unit),
-            "speculation": speculation_flags(
-                features, max_draft_len=resolve_max_draft_len(accuracy, unit)
-            ),
-            "llm_api_options": _options(accuracy, unit),
-            # How long a leg may run is not what it is judged by.
-            "acceptance": _as_written(_without_timeout(accuracy.get("acceptance")), unit),
-        }
-    elif gate.startswith("accuracy["):
-        inputs = {
-            key: (
-                _ACCURACY_RESOLVERS[key](accuracy, unit)
-                if key in _ACCURACY_RESOLVERS
-                else _as_written(accuracy[key], unit)
-            )
-            for key in sorted(set(accuracy) - _NOT_ACCURACY_INPUTS)
-        }
-    else:
-        return ""
-    payload = json.dumps({"gate": gate, "member": member, **inputs}, sort_keys=True, default=str)
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
 #: File digests by ``(path, size, mtime)``: an input is read once per change.
@@ -386,13 +306,16 @@ def relative_to(base: str, gate: str, member: str, owned: Collection[str]) -> st
 def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     """Every check the run's units and delivery owe, in the order they run.
 
-    A unit's boot, accuracy and acceptance checks carry their
-    :func:`equivalence_key`; a configuration variant's do not, so a variant
-    never shares a verdict. Every check carries its :func:`check_inputs`.
+    Every check carries its :func:`check_inputs`.
+
+    A unit or variant owes no boot at a member where its benchmark or its
+    acceptance gate loads the same engine, unless the boot observes what those
+    do not (:func:`_boot_observes`): a check that starts the engine and
+    scores it has shown that it starts.
 
     Each unit owes what its profile (``task_schema.profile_of``) asks:
     ``smoke`` its boot alone, ``bringup`` its checks at its cheapest member,
-    ``certified`` its boot boundaries and the serve gate. ``disagg`` owes its
+    ``certified`` the serve gate and each variant's benchmark at every member. ``disagg`` owes its
     disaggregated-serving test alone, once (``checks/disagg.py``): its boot and
     accuracy would run one aggregated engine, which the units before it prove.
     A storage or scheduling variant (one with no acceptance gate) boots at
@@ -407,6 +330,10 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     lean = profile_of(task_data) in (PROFILE_SMOKE, PROFILE_BRINGUP)
     checks: list[Check] = []
     notes: list[str] = []
+    # What confirms the final tree: the last unit's benchmark, else the last variant's, else
+    # (boots alone) the last boot.
+    confirm = variant_confirm = boot_alone = ""
+    reuses = {kv.name for kv in check_config.launch_kv_caches(task_data) if kv.reuse}
     for index, unit in enumerate(units):
         level = profile_of(task_data, unit)
         members = order_members_by_cost(members_for(task_data, unit, world_size))
@@ -421,9 +348,8 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
 
         def add(gate: str, tier: str, at=members, unit=unit, features=features) -> None:
             for m in at:
-                same = equivalence_key(task_data, unit, gate, m, features)
                 inputs = check_inputs(task_data, unit, gate, m, features)
-                checks.append(Check(unit, gate, m, tier, equivalence=same, inputs=inputs))
+                checks.append(Check(unit, gate, m, tier, inputs=inputs))
 
         if unit == DISAGG_FEATURE:
             # The test sets its own engines' layout on one node: it runs once, at the
@@ -435,18 +361,32 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
                 f"({why}); its boot and accuracy would run one aggregated engine"
             )
             continue
-        add("boot", TIER_INNER)
         if level == PROFILE_SMOKE:
+            add("boot", TIER_INNER)
             notes.append(f"{unit}: the smoke profile owes its boot alone")
+            boot_alone = Check(unit, "boot", members[0], TIER_INNER).key if members else boot_alone
             continue
         benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
-        add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmark_members(task_data, unit, members))
+        benchmarked = benchmark_members(task_data, unit, members)
+        drafts = bool(SPECULATORS & implemented)
+        loaded = set(members) if drafts else set(benchmarked)
+        if _boot_observes(unit in reuses, drafts, "multimodal" in implemented):
+            loaded = set()
+        add("boot", TIER_INNER, at=[m for m in members if m not in loaded])
+        if loaded:
+            notes.append(
+                f"{unit}: no boot at {', '.join(m for m in members if m in loaded)}; a stronger "
+                "check loads the same engine there"
+            )
+        add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmarked)
+        if benchmarked:
+            confirm = Check(unit, f"accuracy[{benchmark}]", benchmarked[0], TIER_INNER).key
         if serving:
             add(serve.GATE_NAME, TIER_INNER, at=[serve.serve_member(members)])
         # Speculative decoding preserves the output distribution by construction, so a
         # draft path that computes the wrong thing passes boot and accuracy and shows
         # only as speed: per-prompt acceptance is the detector.
-        if SPECULATORS & implemented:
+        if drafts:
             add("acceptance", TIER_PROOF)
     for name in () if lean else variants_mod.variants(task_data):
         level = profile_of(task_data, name)
@@ -474,14 +414,26 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         relative = variants_mod.anchor_state(task_data, name) == variants_mod.ANCHOR_RELATIVE
         if relative and "accuracy" in gates:
             notes.append(f"{name}: its anchor is {base}'s own score at the same member and target")
+        scored = members if "accuracy" in gates else []
+        if scored and not named and level != PROFILE_CERTIFIED and len(scored) > 1:
+            member, why = benchmark_member(spec, members)
+            scored = [member]
+            notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
+        loaded = set(members) if "acceptance" in gates else set(scored)
+        if check_config.sets_chunking(task_data, name) or _boot_observes(
+            name in reuses, "acceptance" in gates, "multimodal" in built
+        ):
+            loaded = set()
         for gate in gates:
             at = members
-            if gate == "boot" and "acceptance" not in gates:
-                at = [*members, *(m for m in everywhere if m not in members)]
-            elif gate == "accuracy" and not named and level != PROFILE_CERTIFIED and len(at) > 1:
-                member, why = benchmark_member(spec, members)
-                at = [member]
-                notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
+            if gate == "boot":
+                if "acceptance" not in gates:
+                    at = [*members, *(m for m in everywhere if m not in members)]
+                at = [m for m in at if m not in loaded]
+            elif gate == "accuracy":
+                at = scored
+                if scored:
+                    variant_confirm = Check(name, gate_names[gate], scored[0], TIER_PROOF).key
             owned = {c.key for c in checks}
             checks.extend(
                 Check(
@@ -506,7 +458,19 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         if single is not None:
             inputs = check_inputs(task_data, last, serve.GATE_NAME, single, last_features)
             checks.append(Check(last, serve.GATE_NAME, single, TIER_DELIVERY, inputs=inputs))
-    return Contract(checks=tuple(checks), notes=tuple(notes))
+    return Contract(
+        checks=tuple(checks), notes=tuple(notes), confirm=confirm or variant_confirm or boot_alone
+    )
+
+
+def _boot_observes(reuses: bool, drafts: bool, multimodal: bool) -> bool:
+    """Whether a boot observes what a benchmark or an acceptance load of the same engine does not.
+
+    The reuse probe, which the acceptance gate runs too and the benchmark does
+    not; and an image prompt. (A variant that sets chunked prefill also owes
+    the boot's split prompt: ``check_config.sets_chunking``.)
+    """
+    return multimodal or (reuses and not drafts)
 
 
 def write_contract(workspace: Path, contract: Contract) -> Path:
@@ -648,9 +612,6 @@ class Evaluation:
     passed: tuple[Check, ...]
     failed: tuple[tuple[Check, Verdict], ...]
     missing: tuple[Check, ...]
-    #: Passed checks with no verdict of their own: each, and the equivalent
-    #: check whose pass it holds by.
-    shared: tuple[tuple[Check, Check], ...] = ()
 
     @property
     def holds(self) -> bool:
@@ -662,7 +623,6 @@ class Evaluation:
         ]
         lines += [f"- {'VOID' if v.void else 'FAILED'} {c.key}: {v.detail}" for c, v in self.failed]
         lines += [f"- MISSING {c.key}" for c in self.missing]
-        lines += [f"- SHARED {c.key}: holds by the pass of {s.key}" for c, s in self.shared]
         return "\n".join(lines)
 
 
@@ -674,16 +634,12 @@ def evaluate(
 ) -> Evaluation:
     """Each required check against its latest verdict.
 
-    With ``marker``, a verdict recorded against another state of the target is
-    stale and the check counts as missing, unless ``holds`` says it holds there
-    still (what it read of the tree is unchanged: :attr:`Verdict.reads`); so is
-    one whose :attr:`Verdict.inputs` are not the check's (one without inputs
-    counts as the check's). With an established ``marker``, a check with no
-    verdict of its own passes when an equivalent check (the same
-    :attr:`Check.equivalence`) passed on this state of the target. A check's own
-    verdict always wins over an equivalent's, so a check that failed here stays
-    failed, and two verdicts recorded where the marker was not established are
-    never taken to be about one tree.
+    A check that passed stands, whatever the target has become since. With
+    ``marker``, the target's state now, a verdict that failed or is void counts
+    on the state it measured only (or where ``holds`` says what it read of the
+    tree is unchanged: :attr:`Verdict.reads`): once the target has changed, the
+    check is missing and runs again. A verdict whose :attr:`Verdict.inputs` are
+    not the check's is dropped too (one without inputs counts as the check's).
     """
     latest = (
         verdicts.latest()
@@ -691,37 +647,99 @@ def evaluate(
         else {f"{v.unit}:{v.gate}@{v.member}": v for v in verdicts}
     )
     if marker is not None:
-        latest = {
-            k: v
-            for k, v in latest.items()
-            if v.marker == marker or (marker and holds is not None and holds(v))
-        }
+        latest = {k: v for k, v in latest.items() if v.passed or _here(v, marker, holds)}
     checks = {c.key: c for c in contract.checks}
     latest = {
         k: v
         for k, v in latest.items()
         if not v.inputs or k not in checks or not checks[k].inputs or v.inputs == checks[k].inputs
     }
-    holders: dict[str, Check] = {}
-    if marker:
-        for check in contract.checks:
-            verdict = latest.get(check.key)
-            if check.equivalence and verdict is not None and verdict.passed:
-                holders.setdefault(check.equivalence, check)
-    passed, failed, missing, shared = [], [], [], []
+    passed, failed, missing = [], [], []
     for check in contract.required():
         verdict = latest.get(check.key)
-        holder = holders.get(check.equivalence) if check.equivalence else None
-        if verdict is None and holder is not None:
-            passed.append(check)
-            shared.append((check, holder))
-        elif verdict is None:
+        if verdict is None:
             missing.append(check)
         elif verdict.passed:
             passed.append(check)
         else:
             failed.append((check, verdict))
-    return Evaluation(tuple(passed), tuple(failed), tuple(missing), tuple(shared))
+    return Evaluation(tuple(passed), tuple(failed), tuple(missing))
+
+
+def _here(verdict: Verdict, marker: str, holds: Callable[[Verdict], bool] | None) -> bool:
+    """Whether ``verdict`` is about the target at ``marker``."""
+    return verdict.marker == marker or bool(marker and holds is not None and holds(verdict))
+
+
+def passed_here(
+    contract: Contract,
+    status: ContractStatus,
+    check: Check,
+    marker: str,
+    holds: Callable[[Verdict], bool] | None = None,
+) -> bool:
+    """Whether ``check`` passed on the target at ``marker``, by its own verdict."""
+    verdict = status.latest().get(check.key)
+    if verdict is None or not _here(verdict, marker, holds):
+        return False
+    same_inputs = not verdict.inputs or not check.inputs or verdict.inputs == check.inputs
+    return same_inputs and verdict.passed
+
+
+def _scores(gate: str) -> bool:
+    """Whether ``gate`` judges the engine's answers by a score: a benchmark, or the disaggregated-serving test."""
+    return gate.startswith("accuracy[") or gate == disagg.GATE_NAME
+
+
+def confirmed(
+    contract: Contract,
+    status: ContractStatus,
+    marker: str,
+    holds: Callable[[Verdict], bool] | None = None,
+) -> bool:
+    """Whether the target at ``marker`` was measured: a check that can see what a late change breaks passed here.
+
+    The checks that passed earlier stand (:func:`evaluate`); this is the one
+    measurement the final tree owes before delivery. Where the confirmation
+    check (:attr:`Contract.confirm`) is a benchmark, any check that scores the
+    engine's answers counts, the last landing's own included; one that only
+    shows the engine answering (a boot, a serve, the acceptance of drafts)
+    does not say it still scores. Where the run owes boots alone, any required
+    check counts. A contract that names no confirmation check owes none.
+    """
+    if not contract.confirm:
+        return True
+    named = next((c for c in contract.checks if c.key == contract.confirm), None)
+    scored = named is not None and _scores(named.gate)
+    return any(
+        passed_here(contract, status, check, marker, holds)
+        for check in contract.required()
+        if not scored or _scores(check.gate)
+    )
+
+
+def measured_where(
+    evaluation: Evaluation,
+    status: ContractStatus,
+    marker: str,
+    since: Callable[[str], str] = lambda tree: "",
+) -> str:
+    """A table of where each passed check was measured, for the delivery report.
+
+    A pass stands whatever landed after it (:func:`evaluate`), so the report
+    says which commit each check measured (:attr:`Verdict.tree_state`) and,
+    through ``since``, how many commits the target has taken on top of it.
+    """
+    latest = status.latest()
+    lines = ["| check | measured at | commits since |", "|---|---|---|"]
+    for check in evaluation.passed:
+        verdict = latest.get(check.key)
+        if verdict is None:
+            continue
+        tree = verdict.tree_state or "unknown"
+        after = "0, the final tree" if verdict.marker == marker else since(verdict.tree_state)
+        lines.append(f"| {check.key} | {tree} | {after or 'unknown'} |")
+    return "\n".join(lines)
 
 
 def verdict_on(
@@ -732,11 +750,7 @@ def verdict_on(
 ) -> Verdict | None:
     """``key``'s latest verdict if it is about the target at ``marker``, as :func:`evaluate` reads it."""
     verdict = status.latest().get(key)
-    if verdict is None:
-        return None
-    if verdict.marker == marker or (marker and holds is not None and holds(verdict)):
-        return verdict
-    return None
+    return verdict if verdict is not None and _here(verdict, marker, holds) else None
 
 
 def measured_commit(
@@ -744,16 +758,13 @@ def measured_commit(
 ) -> str | None:
     """The one commit every check of ``checks`` that passed on ``marker`` imported; ``None``.
 
-    Each passed check counts by its own verdict, or by its equivalent's where
-    it holds by that (:attr:`Evaluation.shared`). ``None`` when one of them
-    names no commit, or two name different ones: a milestone names a commit
-    only where its checks say which.
+    ``None`` when one of them names no commit, or two name different ones: a
+    milestone names a commit only where its checks say which.
     """
     latest = status.latest()
-    holder = {check.key: by.key for check, by in evaluation.shared}
     commits: set[str] = set()
     for check in checks:
-        verdict = latest.get(holder.get(check.key, check.key))
+        verdict = latest.get(check.key)
         if (
             verdict is None
             or not verdict.passed
@@ -769,8 +780,9 @@ def measured_commit(
 class Milestone:
     """A tier delivered on one commit of the target.
 
-    ``correctness``: every required check held there. ``bringup``: the first
-    unit's boot and accuracy held at its narrowest member (:func:`bringup_checks`).
+    ``correctness``: every required check passed. ``bringup``: the first unit's
+    benchmark, and its boot where it owes one, passed at its narrowest member
+    (:func:`bringup_checks`).
     ``marker`` is the state of the target the checks measured, and ``sha`` the
     commit that holds exactly that state.
     """
@@ -863,9 +875,10 @@ def standing(evaluation: Evaluation, workspace: Path, marker: str | None = None)
 
 
 def bringup_checks(contract: Contract) -> tuple[Check, ...]:
-    """The checks whose passes deliver the bring-up: the first unit's boot and accuracy at its accuracy member.
+    """The checks whose passes deliver the bring-up: the first unit's benchmark at one member.
 
-    Where its accuracy runs at several members, the narrowest of them.
+    Its boot there too, where it owes one. Where its benchmark runs at several
+    members, the narrowest of them.
 
     Empty for a contract with no such checks.
     """
@@ -886,20 +899,8 @@ def bringup_checks(contract: Contract) -> tuple[Check, ...]:
     return tuple(c for c in own if c.member == narrowest)
 
 
-def core_checks(contract: Contract, core: str | None = None) -> tuple[Check, ...]:
-    """The core's required checks (``core``, else the first unit's): what a campaign waits for.
-
-    A campaign tunes the core. The features' and the variants' checks do not
-    hold it back; they go on beside it, and delivery still owes every one.
-    """
-    if not contract.checks:
-        return ()
-    unit = core or contract.checks[0].unit
-    return tuple(c for c in contract.required() if c.unit == unit)
-
-
 def bringup_holds(contract: Contract, evaluation: Evaluation) -> bool:
-    """Whether every bring-up check passed in ``evaluation`` (its own verdict or an equivalent's)."""
+    """Whether every bring-up check passed in ``evaluation``."""
     owed = bringup_checks(contract)
     passed = {c.key for c in evaluation.passed}
     return bool(owed) and all(c.key in passed for c in owed)
@@ -967,14 +968,12 @@ __all__ = [
     "benchmark_members",
     "bringup_checks",
     "bringup_holds",
-    "core_checks",
     "bringup_milestone",
     "cell_name",
     "cells",
     "cells_holding",
     "check_inputs",
     "compile_contract",
-    "equivalence_key",
     "evaluate",
     "latest_milestone",
     "load_cells",

@@ -5,7 +5,8 @@
 
 This module tests:
 - Request merging functions (merge_requests, merge_helix_requests)
-- Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
+- Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request,
+  drain_queued_items)
 - Rank-0 clock piggyback in RequestBroadcaster
 
 """
@@ -13,21 +14,28 @@ This module tests:
 import datetime
 import gc
 import pickle
+import sys
 import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+import cloudpickle
 import numpy as np
 import pytest
 import torch
+from mpi4py import MPI
 
-from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    ExecutorRequestQueue,
+    RequestQueueItem,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest, PythonRequestInputs
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
+    drain_queued_items,
     executor_request_to_llm_request,
     get_from_waiting_queue,
     merge_helix_requests,
@@ -46,10 +54,13 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemPartition,
 )
 from tensorrt_llm.llmapi.llm_args import CpConfig
-from tensorrt_llm.mapping import CpType
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.sampling_params import LogprobMode
 
 pytestmark = pytest.mark.cpu_only
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 
 def test_multimodal_payload_broadcast_and_children_keep_the_same_contract():
@@ -569,6 +580,39 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
 
 
+def test_long_prompt_admitted_through_int32_array_equals_list_path() -> None:
+    """A 128K-token generation-only prompt reaches the LlmRequest through the
+    owned int32 array exactly as through a token list."""
+    prompt = [(i * 7919) % 129280 for i in range(128 * 1024)]
+    executor_request = trtllm.Request(
+        input_token_ids=prompt,
+        max_tokens=16,
+        type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=trtllm.ContextPhaseParams([100], 1, None, None, None, None),
+    )
+
+    tokens = executor_request.get_input_token_ids_array()
+    assert tokens.dtype == np.int32 and tokens.flags["C_CONTIGUOUS"]
+    tokens[0] += 1  # The array owns a copy; the request keeps its prompt.
+    assert executor_request.input_token_ids[0] == prompt[0]
+
+    from_array = executor_request_to_llm_request(
+        1, executor_request, child_req_ids=[], exclude_last_generation_logits=False
+    )
+    from_list = executor_request_to_llm_request(
+        2,
+        executor_request,
+        child_req_ids=[],
+        exclude_last_generation_logits=False,
+        input_token_ids=executor_request.input_token_ids,
+    )
+
+    assert from_array.get_tokens(0) == prompt
+    assert from_list.get_tokens(0) == prompt
+    assert from_array.prompt_len == from_list.prompt_len == len(prompt)
+    assert from_array.is_disagg_generation_init_state
+
+
 _I32_PROMPT = [7, 0, 2**31 - 1, 3, 151_643]
 
 
@@ -942,7 +986,16 @@ class _SingleRoundDist:
     back on the root, ``received`` stands for what a non-root rank gets.
     """
 
-    def __init__(self, rank, *, world_size=2, has_pp=False, supports=True, received=None):
+    def __init__(
+        self,
+        rank,
+        *,
+        world_size=2,
+        has_pp=False,
+        supports=True,
+        received=None,
+        received_header=None,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.tp_size = world_size
@@ -955,7 +1008,10 @@ class _SingleRoundDist:
         self.is_last_pp_rank = True
         self.supports_single_round_broadcast = supports
         self._received = received
+        self._received_header = received_header
         self.calls = []
+        # Collectives the single-round transport spends: the size word, plus the payload when there is one.
+        self.collectives = 0
 
     def tp_cp_broadcast(self, obj, root=0, **kwargs):
         self.calls.append(("tp_cp_broadcast", obj))
@@ -969,7 +1025,15 @@ class _SingleRoundDist:
 
     def broadcast_or_none(self, obj, root=0):
         self.calls.append(("broadcast_or_none", obj))
-        return obj if self.rank == root else self._received
+        received = obj if self.rank == root else self._received
+        self.collectives += 1 + (received is not None)
+        return received
+
+    def broadcast_or_none_with_header(self, obj, header, root=0):
+        self.calls.append(("broadcast_or_none_with_header", obj, list(header)))
+        received = obj if self.rank == root else self._received
+        self.collectives += 1 + (received is not None)
+        return (list(header) if self.rank == root else self._received_header), received
 
     def broadcast(self, obj, root=0, prefer_cpu=False):
         self.calls.append(("broadcast", obj, prefer_cpu))
@@ -1022,6 +1086,46 @@ def test_single_round_non_root_receives_payload_or_nothing():
 
     dist = _SingleRoundDist(rank=1, received=None)
     assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == []
+
+
+def test_single_round_with_a_synchronized_clock_keeps_one_collective_per_empty_iteration():
+    """waiting_queue_max_wait_s (sync_clock) on a single-round transport: rank 0's clock and aux ride in the size
+    word's header, so an empty iteration still costs one collective and one with requests two."""
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock(), sync_clock=True)
+    broadcaster.aux = 0.25
+    with patch("tensorrt_llm._torch.pyexecutor.request_utils.time.monotonic", return_value=12.5):
+        assert broadcaster.broadcast([]) == []
+    assert dist.collectives == 1
+    assert dist.calls == [("broadcast_or_none_with_header", None, [12_500_000, 250_000])]
+    assert (broadcaster.rank0_now, broadcaster.rank0_aux) == (12.5, 0.25)
+
+    items = [_make_broadcast_item(3)]
+    assert broadcaster.broadcast(items) == items
+    assert dist.collectives == 3
+
+    # A non-root rank reads the clock from the header, with or without requests.
+    peer = _SingleRoundDist(rank=1, received=None, received_header=[7_000_000, -1])
+    broadcaster = RequestBroadcaster(peer, MagicMock(), sync_clock=True)
+    assert broadcaster.broadcast([]) == []
+    assert (broadcaster.rank0_now, broadcaster.rank0_aux, peer.collectives) == (7.0, None, 1)
+
+
+def test_the_generic_header_broadcast_rides_with_the_payload_flag():
+    """Transports without a single round send the header with the "anything?" flag: no extra round."""
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+
+    calls = []
+    fake = SimpleNamespace(
+        broadcast_int64=lambda values, root=0: calls.append(("int64", list(values)))
+        or np.asarray(values),
+        broadcast=lambda obj, root=0: calls.append(("object", obj)) or obj,
+    )
+    assert Distributed.broadcast_or_none_with_header(fake, None, [5, -1]) == ([5, -1], None)
+    assert calls == [("int64", [0, 5, -1])]
+    calls.clear()
+    assert Distributed.broadcast_or_none_with_header(fake, ["r"], [6, 2]) == ([6, 2], ["r"])
+    assert calls == [("int64", [1, 6, 2]), ("object", ["r"])]
 
 
 @pytest.mark.parametrize(
@@ -1205,6 +1309,40 @@ def test_merge_helix_requests_empty_ranks():
         # total_input_len_cp is always the full prompt length.
         assert llm_request.total_input_len_cp == len(input_tokens)
         assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
+
+
+@pytest.mark.parametrize(
+    ("stop_words", "prompt_tail"),
+    [
+        pytest.param([[11, 12, 99], [7]], [11, 12], id="multi_token_stop_word"),
+        pytest.param([[99], [7]], [], id="single_token_stop_words"),
+        pytest.param(None, [], id="no_stop_words"),
+    ],
+)
+def test_merge_helix_requests_keeps_the_prompt_tail_on_every_rank(stop_words, prompt_tail) -> None:
+    """A multi-token stop word that the first generated token completes can
+    span prompt tokens a rank's slice does not hold, so every rank, including
+    an empty one, keeps the tail it can span."""
+    input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    request_item = RequestQueueItem(
+        id=1,
+        request=trtllm.Request(
+            input_token_ids=input_tokens,
+            max_tokens=4,
+            stop_words=stop_words,
+        ),
+    )
+
+    for rank in range(4):
+        (llm_request,) = merge_helix_requests(
+            [request_item],
+            cp_rank=rank,
+            cp_size=4,
+            tokens_per_block=4,
+            exclude_last_generation_logits=False,
+        )
+
+        assert llm_request.py_helix_prompt_tail == prompt_tail
 
 
 def test_merge_helix_requests_empty_ranks_with_padding():
@@ -1469,7 +1607,7 @@ def test_get_from_waiting_queue():
     # Add items to waiting queue
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     # Get 3 items
     result = get_from_waiting_queue(
@@ -1498,7 +1636,7 @@ def test_get_from_waiting_queue_edge_cases(
     waiting_queue = FCFSWaitingQueue()
     if queue_size > 0:
         items = [RequestQueueItem(i, Mock()) for i in range(queue_size)]
-        waiting_queue.extend(items)
+        waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue, request_count, enable_attention_dp=False, max_num_active_requests=16
@@ -1513,7 +1651,7 @@ def test_get_from_waiting_queue_with_attention_dp(
 ):
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue,
@@ -1543,7 +1681,7 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     )  # No scheduling params
 
     waiting_queue = FCFSWaitingQueue()
-    waiting_queue.extend([req1, req2, req3])
+    waiting_queue.add_requests([req1, req2, req3])
 
     # Set rank 0 to full capacity to test filtering
     all_ranks_num_active_requests[0] = 8
@@ -1560,6 +1698,31 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req2 in result
     assert req3 in result
     assert req1 not in result
+
+
+def test_drain_takes_waiting_then_incoming_items_and_skips_shutdown():
+    dist = Mock(rank=0)
+    request_queue = ExecutorRequestQueue(
+        dist, max_batch_size=4, enable_iter_perf_stats=False, batch_wait_timeout_ms=0
+    )
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests([RequestQueueItem(1), RequestQueueItem(2)])
+    request_queue.request_queue.put(RequestQueueItem(3))
+    request_queue.enqueue_cancel_request(1)
+    request_queue.enqueue_shutdown_request()
+    request_queue.request_queue.put(RequestQueueItem(4))
+
+    drained = list(drain_queued_items(waiting_queue, request_queue))
+
+    assert [(item.id, item.is_canceled_request) for item in drained] == [
+        (1, False),
+        (2, False),
+        (3, False),
+        (1, True),
+        (4, False),
+    ]
+    assert not waiting_queue
+    assert request_queue.get_request_queue().empty()
 
 
 def test_can_process_attention_dp_request(attention_dp_config):
@@ -1687,7 +1850,7 @@ def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
 
 class TestBroadcasterClock:
     """RequestBroadcaster(sync_clock=True): rank 0's clock and aux ride along
-    with the request count."""
+    with the request count, or in the single-round envelope."""
 
     def _dist(self, rank, world_size=2):
         dist = Mock()
@@ -1712,17 +1875,39 @@ class TestBroadcasterClock:
         assert list(values) == [0]
         assert b.rank0_now is None
 
-    def test_sync_clock_keeps_the_count_probe(self):
-        """The single-round broadcast has no room for the clock."""
-        for sync_clock, probes in ((False, 0), (True, 1)):
+    def test_sync_clock_rides_the_single_round(self):
+        """With the single-round transport, the clock and aux travel in the size word's header: one call, no count
+        probe, and no payload on an empty iteration."""
+        items = [_make_broadcast_item(3)]
+        for received, want in (
+            (([1_000_000, 170_000], None), []),
+            (([2_000_000, -1], items), items),
+        ):
             dist = self._dist(rank=1)
             dist.supports_single_round_broadcast = True
-            dist.broadcast_or_none = Mock(return_value=None)
-            dist.broadcast_int64 = Mock(return_value=[0, 1_000_000, -1])
-            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=sync_clock)
-            assert b.broadcast([]) == []
-            assert dist.broadcast_int64.call_count == probes
-            assert dist.broadcast_or_none.call_count == 1 - probes
+            dist.broadcast_or_none_with_header = Mock(return_value=received)
+            dist.broadcast_int64 = Mock()
+            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
+            b.aux = 9.0  # ignored off rank 0
+            assert b.broadcast([]) == want
+            dist.broadcast_int64.assert_not_called()
+            assert dist.broadcast_or_none_with_header.call_count == 1
+            assert dist.broadcast_or_none_with_header.call_args.args[0] is None
+            header = received[0]
+            assert b.rank0_now == pytest.approx(header[0] / 1e6)
+            assert b.rank0_aux == (None if header[1] < 0 else pytest.approx(0.17))
+
+    def test_sync_clock_single_round_root_sends_clock_every_iteration(self):
+        items = [_make_broadcast_item(1)]
+        for new_requests, payload in (([], None), (items, items)):
+            dist = _SingleRoundDist(rank=0)
+            b = RequestBroadcaster(dist, MagicMock(), sync_clock=True)
+            b.aux = 0.25
+            assert b.broadcast(new_requests) == new_requests
+            assert len(dist.calls) == 1
+            kind, sent, (now_us, aux_us) = dist.calls[0]
+            assert kind == "broadcast_or_none_with_header" and aux_us == 250_000 and sent == payload
+            assert b.rank0_now == pytest.approx(now_us / 1e6) and b.rank0_aux == pytest.approx(0.25)
 
     def test_default_probe_pp_forwards_count(self):
         dist = self._dist(rank=4, world_size=8)
@@ -1901,3 +2086,107 @@ def test_broadcaster_transports_complete_envelopes(
     translated = executor_request_to_llm_request(42, restored[0].request, [], False)
     assert translated.py_logprobs_mode == LogprobMode.PROCESSED
     assert translated.py_original_end_id is None
+
+
+def _owner_prompt_fetch_rank(prompts_to_owners: bool) -> list:
+    """One rank of the attention-DP fetch: broadcast, wait/route, deliver prompts, merge."""
+    from contextlib import nullcontext
+
+    from tensorrt_llm._torch.distributed import MPIDist
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
+    from tensorrt_llm.scheduling_params import SchedulingParams
+
+    num_ranks = MPI.COMM_WORLD.Get_size()
+    mapping = Mapping(
+        world_size=num_ranks,
+        rank=MPI.COMM_WORLD.Get_rank(),
+        tp_size=num_ranks,
+        enable_attention_dp=True,
+    )
+    dist = MPIDist(mapping)
+    router = DefaultADPRouter(dist)
+    assert not router.reads_prompt_tokens
+    broadcaster = RequestBroadcaster(
+        dist, SimpleNamespace(pause=nullcontext), prompts_to_owners=prompts_to_owners
+    )
+    items = []
+    if dist.rank == 0:
+        for request_id, prompt in _owner_prompts().items():
+            request = trtllm.Request(
+                input_token_ids=np.asarray(prompt, dtype=np.int32),
+                max_tokens=8,
+                type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+                context_phase_params=trtllm.ContextPhaseParams(
+                    [7], request_id, None, None, None, None
+                ),
+            )
+            request.py_conversation_params = None
+            # The last request may only run on rank 1, which is full in the first pass.
+            request.py_scheduling_params = (
+                SchedulingParams(attention_dp_rank=1, attention_dp_relax=False)
+                if request_id == max(_owner_prompts())
+                else None
+            )
+            items.append(RequestQueueItem(request_id, request))
+    received = broadcaster.broadcast(items)
+    if dist.rank != 0 and prompts_to_owners:
+        assert all(item.request.num_input_tokens == 1 for item in received)
+    waiting = FCFSWaitingQueue()
+    waiting.add_requests(received)
+
+    max_active = 4
+    active = [0, max_active, 0, 0]
+    owned = []
+    for _ in range(2):
+        new = get_from_waiting_queue(waiting, len(waiting), True, max_active, list(active), router)
+        states = [
+            RankState(rank=r, num_active_requests=active[r], num_active_tokens=0)
+            for r in range(num_ranks)
+        ]
+        assignments, _ = router.route_requests(states, new, max_active)
+        broadcaster.deliver_prompts(assignments)
+        if prompts_to_owners and dist.rank != 0:
+            for rank, assigned in assignments.items():
+                assert all(
+                    (item.prompt_token_ids is not None) == (rank == dist.rank) for item in assigned
+                )
+            assert all(item.prompt_token_ids is None for item in waiting)
+        for rank, assigned in assignments.items():
+            active[rank] += len(assigned)
+        owned += merge_requests(
+            assignments[dist.rank],
+            cp_config={},
+            cp_rank=0,
+            cp_size=1,
+            exclude_last_generation_logits=False,
+            is_disagg=True,
+        )
+        active[1] -= 1  # Rank 1 frees a slot for the waiting request.
+    assert not waiting
+    return dist.rank, sorted(
+        (req.py_request_id, req.get_tokens(0), req.prompt_len) for req in owned
+    )
+
+
+def _owner_prompts() -> dict:
+    return {
+        100 + i: [(i * 7919 + j * 104729) % 129280 for j in range(5000 + 3000 * i)]
+        for i in range(6)
+    }
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_owner_prompt_delivery_matches_full_broadcast(mpi_pool_executor) -> None:
+    """Under attention DP each owner gets exactly the prompts the full broadcast gives it,
+    also for a request that waits a pass for its rank, and no other rank gets them."""
+    full = dict(mpi_pool_executor.starmap(_owner_prompt_fetch_rank, [(False,)] * 4))
+    delivered = dict(mpi_pool_executor.starmap(_owner_prompt_fetch_rank, [(True,)] * 4))
+    assert delivered == full
+    full = [full[rank] for rank in range(4)]
+    prompts = _owner_prompts()
+    assert sorted(request_id for rank in full for request_id, _, _ in rank) == sorted(prompts)
+    assert all(full), "every rank owns a request"
+    assert [request_id for request_id, _, _ in full[1]] == [max(prompts)]
+    for rank in full:
+        for request_id, tokens, prompt_len in rank:
+            assert tokens == prompts[request_id] and prompt_len == len(tokens)

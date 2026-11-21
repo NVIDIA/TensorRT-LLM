@@ -11,7 +11,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (  # noqa: E501
     qwen4_exp_post_inject as op,
 )
 

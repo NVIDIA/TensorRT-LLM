@@ -52,8 +52,12 @@ class DecoderRunnerConfig(RunnerConfig):
     mm_encoder_cache_enabled: bool
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
+    # The one-engine worker samples greedy and temperature-only target rows from vocabulary shards.
+    samples_from_vocab_shards: bool
     # The model takes the one-engine speculative fast paths
     # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths); False for a config
     # built without it. Keyword-only, so subclasses may still add required fields.
     spec_decode_fast_paths: bool = field(default=False, kw_only=True)
     watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)
+    # The executor serves disaggregated (a cache transceiver is configured).
+    is_disagg: bool = field(kw_only=True)
