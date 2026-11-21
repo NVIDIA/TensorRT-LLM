@@ -95,6 +95,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     moe_group.add_argument("--moe-ep-size", type=int, default=1)
     moe_group.add_argument("--moe-disable-finalize-fusion", action="store_true")
+    parser.add_argument(
+        "--model-kwargs",
+        type=json.loads,
+        help="JSON object of checkpoint config overrides that every role of a row shares",
+    )
     eval_group = parser.add_argument_group(
         "eval", "Run an accuracy evaluator on the loaded model instead of the token probe"
     )
@@ -173,6 +178,8 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
                 "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=args.eval_kv_fraction),
             }
         )
+    if args.model_kwargs:
+        kwargs["model_kwargs"] = args.model_kwargs
     if args.moe_ep_size != 1:
         kwargs["moe_expert_parallel_size"] = args.moe_ep_size
     # Collect every `MoeConfig` field first and build the config once, so one

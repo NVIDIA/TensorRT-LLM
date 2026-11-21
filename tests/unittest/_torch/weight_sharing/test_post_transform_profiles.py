@@ -779,6 +779,133 @@ def test_unconstrained_moe_layer_layout_admits_every_layout(
     )
 
 
+class _DsaIndexer(nn.Module):
+    def __init__(self, projection_dtype: torch.dtype | None) -> None:
+        super().__init__()
+        if projection_dtype is not None:
+            self.wk = SimpleNamespace(dtype=projection_dtype)
+            self.weights_proj = SimpleNamespace(dtype=projection_dtype)
+
+
+class _SparseAttention(nn.Module):
+    """An attention module with sparse-attention parameters, as MLA has."""
+
+    def __init__(self, algorithm: str, indexer: nn.Module | None) -> None:
+        super().__init__()
+        self.sparse_params = SimpleNamespace(algorithm=algorithm)
+        self.indexer = indexer
+
+
+def _model_with_attention(*attentions: nn.Module) -> nn.Module:
+    model = nn.Module()
+    model.layers = nn.ModuleList(attentions)
+    return model
+
+
+def _dsa(projection_dtype: torch.dtype | None = torch.float32) -> nn.Module:
+    return _SparseAttention("dsa", _DsaIndexer(projection_dtype))
+
+
+def _shared_dsa() -> nn.Module:
+    return _SparseAttention("dsa", None)
+
+
+@pytest.mark.parametrize(
+    "attentions, expected",
+    [
+        pytest.param((_dsa(), _dsa()), (False, "float32"), id="indexer-in-every-layer"),
+        pytest.param(
+            (_dsa(torch.bfloat16), _dsa(torch.bfloat16)),
+            (False, "bfloat16"),
+            id="bf16-projections",
+        ),
+        pytest.param((_dsa(), _shared_dsa(), _dsa()), (True, "float32"), id="shared-layer"),
+        pytest.param(
+            (_dsa(torch.float32), _dsa(torch.bfloat16)), (False, None), id="mixed-projections"
+        ),
+        pytest.param((_dsa(None),), (False, None), id="projection-free-indexer"),
+        pytest.param((_shared_dsa(),), (True, None), id="no-indexer"),
+        pytest.param(
+            (_SparseAttention("deepseek_v4", _DsaIndexer(torch.float32)),),
+            (None, None),
+            id="other-sparse-algorithm",
+        ),
+        pytest.param((), (None, None), id="dense-attention"),
+    ],
+)
+def test_runtime_config_realizes_dsa_indexers_from_model(
+    attentions: tuple[nn.Module, ...], expected: tuple[bool | None, str | None]
+) -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(), model=_model_with_attention(*attentions)
+    )
+
+    assert (
+        runtime_config.dsa_indexer_sharing,
+        runtime_config.dsa_indexer_projection_dtype,
+    ) == expected
+
+
+def test_runtime_config_leaves_dsa_indexers_unrealized_without_model() -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(SimpleNamespace())
+
+    assert runtime_config.dsa_indexer_sharing is None
+    assert runtime_config.dsa_indexer_projection_dtype is None
+    assert _runtime_config().dsa_indexer_sharing is None
+    assert _runtime_config().dsa_indexer_projection_dtype is None
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_dimensions",
+    [
+        pytest.param({"dsa_indexer_sharing": True}, {"dsa_indexer_sharing"}, id="shared-layers"),
+        pytest.param(
+            {"dsa_indexer_projection_dtype": "bfloat16"},
+            {"dsa_indexer_projection_dtype"},
+            id="bf16-projections",
+        ),
+        pytest.param(
+            {"dsa_indexer_sharing": None, "dsa_indexer_projection_dtype": None},
+            {"dsa_indexer_sharing", "dsa_indexer_projection_dtype"},
+            id="no-dsa",
+        ),
+    ],
+)
+def test_dsa_indexer_constraints_reject_other_indexer_layouts(
+    overrides: dict[str, object], expected_dimensions: set[str]
+) -> None:
+    constraints = PostTransformRuntimeConstraints(
+        dsa_indexer_sharing=frozenset({False}),
+        dsa_indexer_projection_dtypes=frozenset({"float32"}),
+    )
+    qualified = {"dsa_indexer_sharing": False, "dsa_indexer_projection_dtype": "float32"}
+
+    assert constraints.unsupported_dimensions(_runtime_config(**qualified)) == frozenset()
+    assert constraints.unsupported_dimensions(
+        _runtime_config(**{**qualified, **overrides})
+    ) == frozenset(expected_dimensions)
+
+
+@pytest.mark.parametrize(
+    "dsa_indexer_sharing, dsa_indexer_projection_dtype",
+    [(None, None), (False, "float32"), (True, "bfloat16")],
+)
+def test_unconstrained_dsa_indexers_admit_every_layout(
+    dsa_indexer_sharing: bool | None, dsa_indexer_projection_dtype: str | None
+) -> None:
+    constraints = PostTransformRuntimeConstraints(dtypes=frozenset({"bfloat16"}))
+
+    assert (
+        constraints.unsupported_dimensions(
+            _runtime_config(
+                dsa_indexer_sharing=dsa_indexer_sharing,
+                dsa_indexer_projection_dtype=dsa_indexer_projection_dtype,
+            )
+        )
+        == frozenset()
+    )
+
+
 def test_rows_pinned_to_different_sm_versions_do_not_overlap() -> None:
     sm90 = PostTransformRuntimeConstraints(sm_versions=frozenset({90}))
     sm100 = PostTransformRuntimeConstraints(sm_versions=frozenset({100, 103}))
