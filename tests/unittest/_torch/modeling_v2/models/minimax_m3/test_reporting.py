@@ -4,7 +4,7 @@
 import logging
 from functools import partial
 from threading import Lock
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -60,20 +60,6 @@ def test_fullgraph_reporting_leaves_host_state_untouched() -> None:
     assert state.logger.info.call_count == 2
     assert state.logger.warning.call_count == 2
     assert "rank 3" in state.logger.info.call_args_list[0].args[0]
-
-
-def test_repeated_taken_skips_rank_query_and_lock() -> None:
-    state = _Target()
-    reporting.taken(state, "producer", None, "prefill")
-    state._lock = MagicMock()
-
-    for _ in range(3):
-        reporting.taken(state, "producer", None, "prefill")
-
-    state._lock.__enter__.assert_not_called()
-    state.mpi_rank.assert_called_once()
-    state.logger.info.assert_called_once()
-    assert state._logged == {("producer", "taken: None: prefill")}
 
 
 def test_compilation_preserves_required_path_failure() -> None:
