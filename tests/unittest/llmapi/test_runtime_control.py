@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm.executor.utils import EngineDeadError
 from tensorrt_llm.llmapi import RuntimeMemoryStatus, SleepConfig
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.runtime_control_auth import (
@@ -36,6 +37,32 @@ from tensorrt_llm.serve.runtime_control_auth import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["release", "resume"])
+@pytest.mark.parametrize(
+    "error,status_code",
+    [
+        (ValueError("invalid tag"), 400),
+        (RuntimeError("Ray sleep/wakeup is in progress: admission transition 'parking'."), 409),
+        (EngineDeadError(ValueError("capacity failed after dispatch")), 500),
+    ],
+)
+async def test_legacy_rl_memory_routes_normalize_failures(
+    method: str, error: Exception, status_code: int
+) -> None:
+    """Keep legacy RL error responses consistent with authenticated controls.
+
+    Args:
+        method: Release or resume API to exercise.
+        error: Failure returned by the runtime operation.
+        status_code: HTTP status required by the runtime control contract.
+    """
+    server = _make_server(asynchronous=True)
+    getattr(server.generator, method).side_effect = error
+    response = await getattr(server, f"{method}_memory")(SimpleNamespace(tags=["kv_cache"]))
+    assert response.status_code == status_code
 
 
 def _make_server(*, asynchronous: bool = False, replay_cache_capacity: int = 4096) -> OpenAIServer:

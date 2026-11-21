@@ -80,7 +80,7 @@ class AsyncLLM(LLM):
             not in (ExecutorMemoryType.INIT_KV_CACHE, ExecutorMemoryType.INIT_EXTRA_RESOURCES)
         ]
         normalized = self._normalize_runtime_memory_tags(tags, default_tags=default_tags)
-        await self.collective_rpc("sleep", args=([tag.value for tag in normalized],))
+        await self._executor.sleep_async([tag.value for tag in normalized])
 
     async def resume(
         self,
@@ -118,6 +118,8 @@ class AsyncLLM(LLM):
         target_ranks: int | list[int] | None = None,
     ) -> list[Any]:
         """Execute an asynchronous RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
+
+        Use :meth:`release` for group-wide sleep coordination.
 
         Args:
             method (str): The name of the worker method to execute.

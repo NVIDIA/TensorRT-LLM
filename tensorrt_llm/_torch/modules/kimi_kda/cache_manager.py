@@ -1417,6 +1417,12 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return region.request_indices(request_ids)
 
     @override
+    def _restore_memory_bindings(self) -> None:
+        super()._restore_memory_bindings()
+        if self._kda_replay_region is not None and self.local_num_mamba_layers:
+            self._kda_replay_region.restore_indices(self.kv_cache_map)
+
+    @override
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if self._kda_replay_region is None:
             super()._reset_context_mamba_slots(num_contexts)

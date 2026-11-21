@@ -532,7 +532,7 @@ class TestLlmArgsWiring:
             sleep_config=SleepConfig() if sleep else None,
             scheduler_config=SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
         )
-        if percentile == "90" and use_v2 is not False and not sleep:
+        if percentile == "90" and use_v2 is not False:
             with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
                 args._validate_dflash_ctx_budget(memory_budget_bytes=1_600_000_000)
         else:

@@ -16,6 +16,8 @@
  */
 
 #include "kv_cache_manager_v2/batch.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include "kv_cache_manager_v2/batchedPageCopy.h"
 
@@ -176,6 +178,10 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
     // Everything above is staged on the Batch's stream. A consumer reading this Batch from
     // another stream has nothing ordering it against that, so the state is made visible here.
     cuCheck(cuStreamSynchronize(cudaStream()));
+    auto const apiLock = mManager->lockExclusive();
+    TLLM_CHECK_WITH_INFO(mManager->mMemoryState == KvCacheManager::MemoryState::kActive,
+        "Cannot create a Batch while cache memory is released");
+    mManager->mLivingBatches.insert(this);
 }
 
 void Batch::_allocateCopyDesc()
@@ -398,6 +404,7 @@ SparseStepScratch const& Batch::sparseStepScratch(LifeCycleId lcId) const
 
 void Batch::setCudaStream(CUstream stream)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     if (stream == cudaStream())
     {
         return;
@@ -423,16 +430,47 @@ Batch::~Batch()
     // _drain() waits on the upload stream, and the device and pinned buffers are freed with
     // cuMemFree and cuMemFreeHost: all of it needs the manager's context current.
     CudaContextScope const context(mManager->cudaContext());
-    // Both buffers are about to go, and transfers on the upload stream still name them.
-    _drain();
+    // Priority callbacks may own Python objects. Drop the last cache references
+    // only after the API lock is released and the GIL is reacquired.
+    std::vector<std::shared_ptr<KvCache>> retainedCaches;
     KVCM2_POISON_ON_EXCEPT(
-        [this]
+        [this, &retainedCaches]
         {
+            OptionalGilRelease const gilRelease;
+            auto const apiLock = mManager->lockExclusive();
+            retainedCaches.assign(mRows.begin(), mRows.end());
+            mManager->mLivingBatches.erase(this);
+            // Both buffers are about to go, and transfers on the upload stream still name them.
+            _drain();
             for (auto const& kvCache : mRows)
             {
                 if (kvCache != nullptr)
                 {
-                    removeKvCache(*kvCache);
+                    if (mSleeping)
+                    {
+                        if (mManager->hasSparseCache())
+                        {
+                            auto const row = *kvCache->mBatchRow;
+                            TLLM_CHECK_WITH_INFO(kvCache->historyLength() == mFlushedHistory[row],
+                                "A sleeping sparse KvCache leaving row %d has unflushed history", row.value());
+                        }
+                        // Suspended members no longer borrow the staging buffers. Their
+                        // arena is unmapped, so normal removal must not clear its lease.
+                        kvCache->mBatch = nullptr;
+                        kvCache->mBatchRow = std::nullopt;
+                        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
+                        {
+                            kvCache->setBasePageIndexBuf(kDefaultBeamIndex, lc, nullptr, 0);
+                            if (mMaxScratchSlots > 0)
+                            {
+                                kvCache->setScratchSlotBuf(lc, nullptr, 0);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        removeKvCache(*kvCache);
+                    }
                 }
             }
         });
@@ -447,6 +485,99 @@ Batch::~Batch()
     mIndexTableDescs.reset();
     mIndexTableMemory.reset();
     mStaging = StaticHostMem{};
+}
+
+void Batch::_suspendForSleep()
+{
+    waitPublished();
+    cuCheck(cuStreamSynchronize(cudaStream()));
+    mSleeping = true;
+    for (auto const& cache : mRows)
+    {
+        if (cache == nullptr)
+        {
+            continue;
+        }
+        // Suspend unbinds the staging rows but leaves this Batch's owning references
+        // and lease permutation intact. No normal removal/reset may discard dirty cells.
+        cache->mBatch = nullptr;
+        auto restoreOwner = FuncGuard([&] { cache->mBatch = this; });
+        cache->suspend();
+        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
+        {
+            if (mMaxScratchSlots > 0)
+            {
+                cache->setScratchSlotBuf(lc, nullptr, 0);
+            }
+        }
+    }
+}
+
+void Batch::_prepareMemoryRelease(bool discard)
+{
+    waitPublished();
+    cuCheck(cuStreamSynchronize(cudaStream()));
+    for (auto& arena : mSparseArenas)
+    {
+        arena.prepareMemoryRelease(discard);
+    }
+}
+
+void Batch::_cancelMemoryRelease() noexcept
+{
+    for (auto& arena : mSparseArenas)
+    {
+        arena.cancelMemoryRelease();
+    }
+}
+
+void Batch::_releaseMemory(bool discard)
+{
+    for (auto& arena : mSparseArenas)
+    {
+        arena.releaseMemory(discard);
+    }
+}
+
+void Batch::_materializeMemory(bool zero)
+{
+    for (auto& arena : mSparseArenas)
+    {
+        arena.materializeMemory(zero);
+    }
+}
+
+void Batch::_resumeAfterSleep()
+{
+    if (!mSleeping)
+    {
+        return;
+    }
+    for (BatchRow row{0}; row < mRows.size(); ++row)
+    {
+        auto const& cache = mRows[row];
+        if (cache == nullptr)
+        {
+            continue;
+        }
+        cache->mBatch = nullptr;
+        auto restoreOwner = FuncGuard([&] { cache->mBatch = this; });
+        TLLM_CHECK_WITH_INFO(cache->isActive() || cache->resume(cudaStream()), "Could not restore a Batch member");
+        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
+        {
+            cache->setBasePageIndexBuf(kDefaultBeamIndex, lc, _stagingRow(lc, row), mMaxBlocksPerSeq);
+            if (mMaxScratchSlots > 0)
+            {
+                cache->setScratchSlotBuf(lc, _scratchSlotRow(lc, row), mMaxScratchSlots);
+            }
+        }
+    }
+    mSleeping = false;
+    auto restoreSleeping = FuncGuard([&] { mSleeping = true; });
+    publish();
+    waitPublished();
+    cuCheck(cuStreamSynchronize(cudaStream()));
+    restoreSleeping.cancel();
 }
 
 size_t Batch::_rowElements() const noexcept
@@ -601,6 +732,7 @@ int Batch::flushedHistory(BatchRow row) const
 
 void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     TLLM_CHECK_WITH_INFO(
         newHistoryLengths.size() == mRows.stdSize(), "Batch::flushSparseUnits: one history length per row");
     // A history past the row's capacity names units the row never wrote, so there is no cell
@@ -1205,6 +1337,7 @@ int32_t* Batch::_scratchSlotRow(LifeCycleId lifeCycleId, BatchRow row) const
 
 BatchRow Batch::addKvCache(KvCache& kvCache, std::optional<BatchRow> requestedRow)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     if (kvCache.mBatch != nullptr)
     {
         throw LogicError("A KvCache belongs to at most one Batch");
@@ -1295,6 +1428,7 @@ std::shared_ptr<KvCache> Batch::removeKvCache(BatchRow row)
 
 std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     if (kvCache.mBatch != this)
     {
         throw LogicError("KvCache is not a member of this Batch");
@@ -1352,6 +1486,7 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
 
 void Batch::move(BatchRow dstRow, BatchRow srcRow)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     TLLM_CHECK_WITH_INFO(dstRow >= 0 && dstRow < mMaxBatchSize && srcRow >= 0 && srcRow < mMaxBatchSize,
         "Batch::move: row is beyond max_batch_size");
     // Checked before anything is touched, so a rejected move leaves the batch as it was.
@@ -1423,6 +1558,7 @@ void Batch::_detach(KvCache& kvCache) noexcept
 std::vector<uint8_t> Batch::resize(
     std::vector<std::optional<int>> const& capacities, std::vector<std::optional<int>> const& historyLengths)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     TLLM_CHECK_WITH_INFO(capacities.size() == mRows.stdSize() && historyLengths.size() == mRows.stdSize(),
         "Batch::resize: one capacity and history length per row");
 
@@ -1478,6 +1614,7 @@ std::vector<uint8_t> Batch::resize(
 
 void Batch::publish()
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     // A step's work-list counters start here, all of them at once: per layer and per
     // direction they are independent, and one clear at the head of a step keeps a
     // non-kernel node out from between every resolve and whatever ran before it.
@@ -1676,6 +1813,7 @@ std::optional<BatchRow> Batch::rowOf(KvCache const& kvCache) const
 void Batch::prepareSparseWriteIndices(
     std::vector<BufferId> const& buffers, int32_t* out, std::optional<CUstream> streamOpt)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(out != nullptr, "prepareSparseWriteIndices: out must be a device pointer");
 
@@ -1871,6 +2009,7 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
 void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
     std::optional<CUstream> streamOpt)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(selected != nullptr, "resolveSparseSelection: selected must be a device pointer");
 
@@ -1910,6 +2049,7 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
 void Batch::fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
     int32_t* out, std::optional<CUstream> streamOpt)
 {
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Batch memory is released");
     CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(
         selected != nullptr && out != nullptr, "fetchResolvedPages: selected and out must be device pointers");
