@@ -172,6 +172,10 @@ class MuseSparkToolParser(BaseToolParser):
 
     def _reset_streaming_state(self) -> None:
         self._buffer = ""
+        # Whitespace deltas that arrived while the buffer was held and ended in
+        # whitespace. They belong after `_buffer`; see parse_streaming_increment.
+        self._held_whitespace: List[str] = []
+        self._holds_whitespace_run = False
         self._in_tool_block = False
         self._in_reasoning_block = False
         self._block_text = ""
@@ -368,6 +372,18 @@ class MuseSparkToolParser(BaseToolParser):
 
     # ------------------------------------------------------------- streaming
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        if self._holds_whitespace_run and new_text.isspace():
+            # Outside tool and reasoning blocks, a held buffer that ends in
+            # whitespace is all whitespace, ` to=NAME` and whitespace, or a
+            # `<|start|>` header with no `<|message|>` yet. More whitespace
+            # leaves it held, so the delta is set aside unscanned: rescanning
+            # the held run on every delta takes time quadratic in its length.
+            self._held_whitespace.append(new_text)
+            return StreamingParseResult()
+        self._holds_whitespace_run = False
+        if self._held_whitespace:
+            self._buffer += "".join(self._held_whitespace)
+            self._held_whitespace = []
         self._buffer += new_text
         content_parts: List[str] = []
         calls: List[ToolCallItem] = []
@@ -450,6 +466,16 @@ class MuseSparkToolParser(BaseToolParser):
                 break
 
             normal_text = "".join(self._clean(p) for p in content_parts)
+            # `$` in _HEADER_PREFIX_RE also matches before a final newline, so
+            # `t\n` is held as a header prefix and `t\n\n` is not: a held
+            # buffer that ends in one newline after other text is excluded.
+            end = self._buffer[-2:]
+            self._holds_whitespace_run = (
+                not self._in_tool_block
+                and not self._in_reasoning_block
+                and end[-1:].isspace()
+                and (end.isspace() or end[-1] != "\n")
+            )
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:  # pragma: no cover - defensive, mirrors upstream
             logger.error(f"Error in MuseSpark parse_streaming_increment: {e}")
@@ -595,6 +621,9 @@ class MuseSparkToolParser(BaseToolParser):
         """
         calls: List[ToolCallItem] = []
         normal_text = ""
+        self._buffer += "".join(self._held_whitespace)
+        self._held_whitespace = []
+        self._holds_whitespace_run = False
         if self._in_tool_block:
             self._block_text += self._buffer
             self._buffer = ""
