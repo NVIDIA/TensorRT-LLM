@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation import diagnostics
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
@@ -281,6 +282,54 @@ def test_deadline_hard_kill_bypasses_blocking_diagnostic_helpers(
     log.assert_not_called()
 
 
+def test_worker_fatal_dispatches_containment_before_qualification_capture_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real synchronous capture cannot block the worker's once-only fatal callback."""
+    from tensorrt_llm._torch.disaggregation import transceiver
+
+    entered, release, killed = (threading.Event() for _ in range(3))
+    capture_threads: list[threading.Thread] = []
+    records = []
+
+    def blocked_capture(record: diagnostics.DiagnosticRecord) -> None:
+        records.append(record)
+        capture_threads.append(threading.current_thread())
+        entered.set()
+        assert release.wait(timeout=5), "test did not release diagnostic capture"
+
+    worker = object.__new__(transfer_mod.TransferWorker)
+    worker._config = SimpleNamespace(quiescence_fatal_callback=_fail_unproven_kv_transfer)
+    worker._rank_info = SimpleNamespace(
+        instance_name="gen", instance_rank=0, tp_rank=0, pp_rank=0, cp_rank=0, dp_rank=0
+    )
+    event = QuiescenceFatalEvent(12, "receive", "cancelled", 1.0, 2.0, 2.0)
+    kill = Mock(side_effect=lambda **_: killed.set())
+    critical = Mock()
+    monkeypatch.setattr(transceiver.logger, "critical", critical)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(hang_detector, "propagate_hard_kill", kill)
+    diagnostics.install_qualification_observers(blocked_capture)
+    thread = threading.Thread(target=worker._on_quiescence_fatal, args=(event,), daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(timeout=1), "fatal diagnostic capture did not start"
+        critical.assert_called_once()
+        assert killed.wait(timeout=2), "capture blocked containment dispatch"
+        assert not release.is_set()
+        kill.assert_called_once_with(diagnostics=False, communicator=None)
+        assert records[0]["event"] == "retirement_fatal"
+        assert records[0]["local_request_id"] == 12
+    finally:
+        release.set()
+        thread.join(timeout=2)
+        for writer in capture_threads:
+            writer.join(timeout=2)
+        diagnostics.install_qualification_observers(None)
+        assert not thread.is_alive()
+        assert not any(writer.is_alive() for writer in capture_threads)
+
+
 @pytest.mark.parametrize("exposure", ["never_exposed", "settled_before_grace", "unresolved"])
 def test_peer_loss_fails_closed_only_for_unsettled_exposure(exposure: str) -> None:
     """Peer loss is not a broadcast kill; each world evaluates its own claims.
@@ -485,12 +534,28 @@ def cannot_terminate(**_kwargs):
 hang_detector.propagate_hard_kill = cannot_terminate
 now = [1.0]
 watchdog = RetirementWatchdog(transceiver._fail_unproven_transfer, clock=lambda: now[0])
-owner = watchdog.create_owner(12, "send", 1.0)
-assert owner.expose(object())
-owner.request_drain("test cancellation")
-now[0] = 2.0
-watchdog.start()
+owner = None
+if sys.argv[2] == "deadline":
+    owner = watchdog.create_owner(12, "send", 1.0)
+    assert owner.expose(object())
+    owner.request_drain("test cancellation")
+    now[0] = 2.0
+    watchdog.start()
+else:
+    if sys.argv[2] == "stopped-handoff":
+        watchdog.start()
+        watchdog.stop()
+    else:
+        watchdog.request_shutdown()
+    watchdog.fail_closed(12, "receive", "test ownership handoff refused")
 assert notified.wait(5), "fatal callback never ran"
+assert watchdog.fatal is not None
+try:
+    watchdog.create_owner(13, "receive", 1.0)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("fatal root retention reopened admission")
 # If the fatal thread exits, the old implementation becomes collectable. The
 # live thread must own its callback/root graph after the caller drops everything.
 watchdog._thread.join(timeout=1)
@@ -513,11 +578,12 @@ def _standalone_process_env() -> dict[str, str]:
 
 
 @pytest.mark.parametrize("kill_result", ["return", "raise"])
+@pytest.mark.parametrize("failure", ["deadline", "handoff", "stopped-handoff"])
 @pytest.mark.timeout(360)
-def test_fatal_watchdog_retains_complete_transceiver_roots(kill_result: str) -> None:
+def test_fatal_watchdog_retains_complete_transceiver_roots(kill_result: str, failure: str) -> None:
     """Fatal root retention survives GC without leaking fatal threads into pytest."""
     result = subprocess.run(
-        [sys.executable, "-c", _FATAL_ROOTS_SCRIPT, kill_result],
+        [sys.executable, "-c", _FATAL_ROOTS_SCRIPT, kill_result, failure],
         env={**_standalone_process_env(), "TLLM_DISABLE_MPI": "1"},
         capture_output=True,
         text=True,
@@ -563,6 +629,7 @@ def _shutdown_transceiver() -> tuple[KvCacheTransceiverV2, transfer_mod.RxSessio
     worker._receiver = receiver
     worker._registered_mem = []
     instance = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
+    instance._init_receive_cancellation_state()
     instance._transfer_worker = worker
     instance._send_sessions = {}
     instance._send_reqs = {}

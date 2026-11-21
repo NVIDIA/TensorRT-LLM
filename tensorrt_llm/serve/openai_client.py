@@ -44,8 +44,11 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
+    build_context_cancellation_headers,
     build_internal_disagg_auth_headers,
     build_subagent_affinity_headers,
+    context_cancellation_reservation_payload,
+    context_cancellation_submission_payload,
     request_requires_internal_disagg_auth,
 )
 from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
@@ -156,6 +159,14 @@ class RelayedChatCompletionResponse(ChatCompletionResponse):
 
 
 class OpenAIClient(ABC):
+    async def reserve_context_cancellation(self, server: str, request_id: int) -> str:
+        """Reserve one CTX submission identity on the selected worker."""
+        raise NotImplementedError("Context cancellation requires the native HTTP client")
+
+    async def cancel_context_cancellation(self, server: str, token: str) -> str:
+        """Close a reservation or queue cancellation; never report physical retirement."""
+        raise NotImplementedError("Context cancellation requires the native HTTP client")
+
     async def send_request(
         self,
         request: UCompletionRequest,
@@ -347,7 +358,108 @@ class OpenAIHttpClient(OpenAIClient):
             headers.update(
                 build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
             )
+        payload = context_cancellation_submission_payload(request)
+        if payload is not None:
+            if self._role != ServerRole.CONTEXT or not self._no_retry:
+                raise ValueError("Context cancellation requires a no-retry context client")
+            headers.update(
+                build_context_cancellation_headers(
+                    self._internal_disagg_auth_key, "submit", payload
+                )
+            )
         return headers
+
+    async def _context_cancellation_control(
+        self, server: str, action: str, payload: dict[str, str | int]
+    ) -> dict:
+        """Send one authenticated control message outside routing/load accounting.
+
+        Args:
+            server: Selected context worker's shared HTTP address.
+            action: Reserve or cancel endpoint suffix.
+            payload: Exact identity fields to authenticate and send.
+
+        Returns:
+            The worker's JSON control response, without interpreting retirement.
+        """
+        if self._role != ServerRole.CONTEXT or not self._no_retry:
+            raise ValueError("Context cancellation requires a no-retry context client")
+        headers = build_context_cancellation_headers(
+            self._internal_disagg_auth_key, action, payload
+        )
+        url = f"{_server_base_url(server)}/internal/context-cancellation/{action}"
+        async with self._session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
+        ) as response:
+            if response.status >= 300:
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"Context cancellation {action} failed: {response.reason}",
+                    headers=response.headers,
+                )
+            result = await response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Context worker returned a non-object control response")
+            return result
+
+    async def reserve_context_cancellation(self, server: str, request_id: int) -> str:
+        """Reserve an exact worker identity without admitting model work.
+
+        Args:
+            server: Already selected context worker, shared across its HTTP frontends.
+            request_id: The request's context-first pairing identity.
+
+        Returns:
+            Opaque, single-use submission and cancellation token.
+        """
+        payload = context_cancellation_reservation_payload(request_id)
+        # Redelivery addresses a lost control reply, never model submission.
+        # Both attempts retain one signed identity and the original worker.
+        deadline = asyncio.get_running_loop().time() + 10.0
+        for attempt in range(2):
+            try:
+                result = await asyncio.wait_for(
+                    self._context_cancellation_control(server, "reserve", payload),
+                    timeout=min(5.0, max(0.0, deadline - asyncio.get_running_loop().time())),
+                )
+                break
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                asyncio.TimeoutError,
+            ):
+                if attempt == 1:
+                    raise
+            except aiohttp.ClientResponseError as error:
+                if error.status != 503 or attempt == 1:
+                    raise
+        token = result.get("token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("Context worker returned no cancellation reservation")
+        return token
+
+    async def cancel_context_cancellation(self, server: str, token: str) -> str:
+        """Submit idempotent cancellation without retrying a generation request.
+
+        Args:
+            server: Worker that issued the token.
+            token: Opaque identity retained across context HTTP completion.
+
+        Returns:
+            ``not_submitted`` if pending admission was removed, otherwise ``queued``.
+            Neither result reports physical quiescence.
+        """
+        result = await self._context_cancellation_control(server, "cancel", {"token": token})
+        status = result.get("status")
+        if status not in ("not_submitted", "queued"):
+            raise ValueError("Context worker returned an invalid cancellation status")
+        return status
 
     async def post_json(
         self,
@@ -566,7 +678,7 @@ class OpenAIHttpClient(OpenAIClient):
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
             response_started = False
-            streaming_status_rejected = False
+            terminal_status_rejected = False
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
@@ -574,6 +686,7 @@ class OpenAIHttpClient(OpenAIClient):
                     url,
                     data=body,
                     headers=headers,
+                    allow_redirects=False,
                 ) as http_response:
                     response_started = True
                     response_clock = AdjustedSteadyClock()
@@ -605,11 +718,13 @@ class OpenAIHttpClient(OpenAIClient):
                                 role,
                                 response_metrics,
                             )
-                    if http_response.status >= 400:
+                    if http_response.status >= 300:
+                        # Redirect rejection is terminal even if reading its
+                        # diagnostics fails. Never replay it at another worker.
+                        terminal_status_rejected = is_stream or http_response.status < 400
                         if is_stream:
                             # Preserve no-replay semantics even if reading the
                             # rejected response's diagnostics fails.
-                            streaming_status_rejected = True
                             # Error diagnostics must not buffer an unbounded worker response.
                             error_prefix = bytearray()
                             while len(error_prefix) < 2048:
@@ -668,7 +783,7 @@ class OpenAIHttpClient(OpenAIClient):
                     url, fallback_url = fallback_url, None
                     affinity_refusals = 1
                     continue
-                if streaming_status_rejected:
+                if terminal_status_rejected:
                     raise
                 # A 4xx from the worker is the request's own fault (malformed
                 # body, context length exceeded, ...) and will fail the same way

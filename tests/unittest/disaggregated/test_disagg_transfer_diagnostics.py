@@ -31,10 +31,96 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture(autouse=True)
 def _isolate_diagnostic_sink(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    diagnostics.install_qualification_observers(None)
     diagnostics._reset_diagnostic_sink_for_tests()
     monkeypatch.delenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID", raising=False)
     yield
+    diagnostics.install_qualification_observers(None)
     diagnostics._reset_diagnostic_sink_for_tests()
+
+
+def test_qualification_capture_replaces_lossy_sink_and_keeps_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    sink = MagicMock(side_effect=AssertionError("qualification must not use lossy sink"))
+    monkeypatch.setattr(diagnostics, "_get_sink", sink)
+    records = []
+    diagnostics.install_qualification_observers(records.append)
+    for event in ("request_resources_released", "qualification_checkpoint"):
+        diagnostics.emit_event(event, side="gen", request_id=17, rank=0)
+    assert [record["capture_sequence"] for record in records] == [1, 2]
+    assert [record["capture_errors"] for record in records] == [0, 0]
+    assert records[0]["process_uuid"] == records[1]["process_uuid"]
+    sink.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["write", "prepare", "submitted"])
+def test_qualification_latches_errors_without_changing_request_progress(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    records = []
+
+    def capture(record: diagnostics.DiagnosticRecord) -> None:
+        if failure == "write" and record["event"] == "discarded":
+            raise OSError("test output failed")
+        records.append(record)
+
+    def submitted(*_args: object) -> None:
+        raise RuntimeError("test observer failed")
+
+    diagnostics.install_qualification_observers(capture, submitted)
+    if failure == "write":
+        diagnostics.emit_event("discarded", side="ctx", request_id=17)
+    elif failure == "prepare":
+        with diagnostics.suppress_diagnostic_errors():
+            raise ValueError("test field preparation failed")
+    else:
+        diagnostics.observe_backend_submitted(17, 0, 1, 2)
+    diagnostics.emit_event("qualification_checkpoint", side="ctx", request_id=None)
+    assert len(records) == 1
+    assert records[0]["capture_errors"] == 1
+    assert records[0]["capture_sequence"] == (2 if failure == "write" else 1)
+
+
+def test_submitted_hold_does_not_block_other_threads_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    entered, release = threading.Event(), threading.Event()
+    observed, records = [], []
+
+    def submitted(*identity: object) -> None:
+        observed.append(identity)
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("observer test did not release")
+
+    diagnostics.install_qualification_observers(records.append, submitted)
+    thread = threading.Thread(target=lambda: diagnostics.observe_backend_submitted(17, 0, 3, 2))
+    thread.start()
+    try:
+        assert entered.wait(1)
+        diagnostics.emit_event("logical_cancellation_accepted", side="gen", request_id=17)
+        assert len(records) == 1
+        assert observed == [(17, 0, 3, 2)]
+    finally:
+        release.set()
+        thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert records[0]["capture_errors"] == 0
+    diagnostics.install_qualification_observers(None)
+    assert not diagnostics.SUBMISSION_OBSERVER_ENABLED
+
+
+def test_qualification_capture_requires_explicit_enabled_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
+    with pytest.raises(ValueError, match="enabled diagnostics"):
+        diagnostics.install_qualification_observers(lambda _record: None)
+    diagnostics.observe_backend_submitted(None, 0, 0, None)
 
 
 def test_suppress_diagnostic_errors_does_not_interrupt_request_progress() -> None:

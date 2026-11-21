@@ -65,6 +65,7 @@ def _disagg_request(
 
 def _diagnostic_transceiver() -> KvCacheTransceiverV2:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._mapping = SimpleNamespace(rank=4, tp_rank=1, pp_rank=0, cp_rank=0, cp_size=1)
     transceiver._instance_name = "diagnostic-test"
     transceiver._dp_rank = 2
@@ -453,6 +454,8 @@ def test_gen_timeout_start_and_observation_share_request_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _disagg_request(21, 2021)
+    request.is_generation_only_request = True
+    request.is_context_only_request = False
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
     request.py_kv_transfer_start_time = None
     request.py_kv_transfer_timed_out = False
@@ -1369,6 +1372,7 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     request = _disagg_request(5, request_id)
     request.set_kv_cache_size = Mock()
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._ever_had_recv_session = True
     transceiver._gen_idle_agreed = False
     transceiver._gen_need_sync = False
@@ -1485,13 +1489,89 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
 
     executor._free_request_resources(request)
 
-    failing_emit.assert_called_once()
+    assert failing_emit.call_count == 2
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert request.py_request_id not in executor._prefetched_request_ids
     executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
     for engine in (executor.model_engine, executor.draft_model_engine):
         engine.model.release_request_state.assert_called_once_with(request.py_request_id)
+
+
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_resource_release_event_follows_successful_manager_cleanup(
+    monkeypatch: pytest.MonkeyPatch, release_fails: bool
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    request = SimpleNamespace(
+        is_context_only_request=False,
+        py_request_id=51,
+        request_id=51,
+        py_disaggregated_params=SimpleNamespace(disagg_request_id=5051),
+        py_kv_transfer_timed_out=False,
+        state=SimpleNamespace(name="GENERATION_COMPLETE"),
+    )
+    manager = Mock(spec=KVCacheManagerV2)
+    manager.kv_cache_map = {51: object()}
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = manager
+    executor.sampler = SimpleNamespace(release_request=Mock())
+    executor.enable_attention_dp = False
+    executor._prefetched_request_ids = {51}
+    executor._disagg_coordinator = SimpleNamespace(forget_request=Mock())
+    executor.model_engine = SimpleNamespace(model=None)
+    executor.draft_model_engine = None
+    executor.global_rank = 0
+    executor.dist = SimpleNamespace(rank=0, tp_rank=0, pp_rank=0, cp_rank=0)
+    executor.async_transfer_manager = SimpleNamespace(requests_in_transfer=lambda: {})
+
+    def release(_request: object) -> None:
+        if release_fails:
+            raise RuntimeError("manager did not release")
+        manager.kv_cache_map.pop(51)
+
+    executor.resource_manager = SimpleNamespace(free_resources=release)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = Mock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    if release_fails:
+        with pytest.raises(RuntimeError, match="did not release"):
+            executor._free_request_resources(request)
+        assert [call.args[0] for call in emit.call_args_list] == [
+            "request_resource_release_started"
+        ]
+    else:
+        executor._free_request_resources(request)
+        assert [call.args[0] for call in emit.call_args_list] == [
+            "request_resource_release_started",
+            "request_resources_released",
+        ]
+        assert emit.call_args.args == ("request_resources_released",)
+        assert emit.call_args.kwargs["was_owned"] is True
+        assert emit.call_args.kwargs["kv_owned"] is False
+        assert emit.call_args.kwargs["transfer_owned"] is False
+
+
+def test_response_diagnostics_preserve_duplicates_and_ignore_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = object.__new__(PyExecutor)
+    executor.global_rank = 0
+    response = SimpleNamespace(
+        error_msg=None,
+        result=SimpleNamespace(
+            is_final=True,
+            get_result=lambda: SimpleNamespace(finish_reasons=[SimpleNamespace(name="CANCELLED")]),
+        ),
+    )
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = Mock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    executor._emit_response_diagnostics([(51, None), (51, response), (51, response)])
+    assert emit.call_count == 2
+    assert all(call.kwargs["local_request_id"] == 51 for call in emit.call_args_list)
+    assert all(call.kwargs["finish_reasons"] == "CANCELLED" for call in emit.call_args_list)
 
 
 def test_source_unpin_continues_when_diagnostic_inspection_fails(
