@@ -3464,6 +3464,10 @@ class OpenAIServer(_VideoRoutesMixin):
             except Exception:
                 logger.error(traceback.format_exc())
                 raise
+            finally:
+                # A client that disconnects closes this generator before the
+                # final result is post-processed.
+                get_harmony_adapter().cleanup_stream_state(str(promise.id))
 
         input_started = _start_input_processing()
         try:
@@ -3577,9 +3581,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Handle streaming
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
-                                         media_type="text/event-stream")
+                return ClosingStreamingResponse(
+                    content=create_streaming_generator(promise,
+                                                       postproc_params),
+                    media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
@@ -3668,12 +3673,17 @@ class OpenAIServer(_VideoRoutesMixin):
             for initial_response in initial_responses:
                 yield initial_response
 
-            async for res in promise:
-                pp_results = res.outputs[
-                    0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        res, args)
-                for pp_res in pp_results:
-                    yield pp_res
+            try:
+                async for res in promise:
+                    pp_results = res.outputs[
+                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                            res, args)
+                    for pp_res in pp_results:
+                        yield pp_res
+            finally:
+                # A client that disconnects closes this generator before the
+                # final result is post-processed.
+                streaming_processor.cleanup_stream_state()
             await self._extract_metrics(res, raw_request)
 
         input_started = _start_input_processing()

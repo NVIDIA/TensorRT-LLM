@@ -3337,6 +3337,11 @@ class ResponsesStreamingProcessor:
 
         return [self._send_event(event) for event in event_generator]
 
+    def cleanup_stream_state(self) -> None:
+        """Drop this stream's Harmony parser state; a repeated call does nothing."""
+        if self.use_harmony:
+            get_harmony_adapter().cleanup_stream_state(self.stream_request_id)
+
     def get_stream_failed_events(
             self,
             cause: str,
