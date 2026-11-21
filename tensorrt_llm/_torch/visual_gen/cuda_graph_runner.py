@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    Set,
     Tuple,
     TypeAlias,
 )
@@ -449,6 +450,8 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
         # Output buffers of all block graphs of the model, by data pointer.
         self._block_outputs = block_outputs
         self._forward_context = forward_context
+        # Keys first seen after capture closed (after warmup), which run eagerly; logged once.
+        self._eager_keys: Set[KeyType] = set()
 
     def _get_extra_key(self, *args, **kwargs) -> KeyType:
         call = self._forward_context.current()  # keys evaluated once per model.forward call
@@ -588,6 +591,19 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
 
             if key not in self.graphs:
                 if not self.allow_capture:
+                    # Not during multi-rank warmup tuning, which runs before any capture.
+                    if self.graphs and key not in self._eager_keys:
+                        self._eager_keys.add(key)
+                        shapes = {path: shape for path, shape, *_ in tensor_key}
+                        graph_keys = self._last_resolved_extra_keys
+                        logger.warning_once(
+                            f"{self.name} and every block with the same inputs run without "
+                            "CUDA graphs: block graphs are captured only during warmup, which "
+                            f"did not cover inputs {shapes}"
+                            + (f" with graph keys {graph_keys}" if graph_keys else "")
+                            + ".",
+                            key=("block CUDA graph not captured", key),
+                        )
                     # Publish the call's graph keys as a replay would, so state a block keeps
                     # for captured graphs (VC-Attention's per-shape grouping) stays in use.
                     with resolved_extra_keys_scope(self._last_resolved_extra_keys):
