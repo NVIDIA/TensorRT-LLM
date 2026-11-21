@@ -7,6 +7,7 @@ agreement, the cross-rank page-id match and its fatal cases) need a TP group and
 microbench."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -24,6 +25,33 @@ def _single_rank_provider():
     return sc, sc.ShardColdPageProvider(
         Mapping(world_size=1, rank=0, tp_size=1), abort_on_error=False
     )
+
+
+def test_watchdog_times_each_pending_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    sc, provider = _single_rank_provider()
+    transport = provider._get_transport()
+    provider.close()  # Drive watchdog ticks synchronously with a virtual clock.
+    now = 0.0
+    monkeypatch.setattr(sc, "time", SimpleNamespace(monotonic=lambda: now))
+    first, second = Mock(), Mock()
+    first.query.return_value = second.query.return_value = False
+    transport.watch(first, (1, 1))
+    now = 400.0
+    transport.watch(second, (2, 3))
+    first.query.return_value = True
+
+    def tick() -> None:
+        transport._stop = Mock()
+        transport._stop.wait.side_effect = [False, True]
+        transport._watch()
+
+    now = 601.0
+    tick()
+    assert transport.poisoned is None
+    now = 1001.0
+    tick()
+    assert transport.poisoned is not None
+    assert "decode (seq, pages) (2, 3) not complete after 600 s" in transport.poisoned
 
 
 def test_codec_round_trip_single_rank() -> None:
@@ -84,6 +112,8 @@ def _round_trip(sc, provider) -> None:
     provider.decode_cold_pages(
         state, 0, cold.data_ptr(), dec.ctypes.data, len(hot_dst), stream.cuda_stream
     )
+    # An encode must never re-record the event that the watchdog uses to time this decode.
+    assert all(provider._last_done is not event for event in provider._events)
     stream.synchronize()
     provider._poll_match(blocking=True)
     d, s = torch.tensor(hot_dst, device="cuda"), torch.tensor(hot_src, device="cuda")

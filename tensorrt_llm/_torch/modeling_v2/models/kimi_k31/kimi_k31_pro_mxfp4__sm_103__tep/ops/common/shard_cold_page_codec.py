@@ -42,6 +42,7 @@ import os
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Any, Optional, Sequence
 
@@ -161,7 +162,7 @@ class _Transport:
         self.nccl_comm = self.nccl.init_rank(self.world_size, uid, self.rank)
         self._send = np.zeros(3, dtype=np.uint64)
         self._recv = np.zeros((self.world_size, 3), dtype=np.uint64)
-        self._oldest = None
+        self._pending_decode: deque[tuple[torch.cuda.Event, float, tuple[int, int]]] = deque()
         self._in_call = None
         self.on_tick = None
         self._stop = threading.Event()
@@ -231,12 +232,19 @@ class _Transport:
             raise RuntimeError(self.poisoned)
         self.nccl.all_gather_inplace(staging, count, self.rank, self.nccl_comm, stream)
 
-    def watch(self, event, what) -> None:
-        """Track the oldest decode call whose GPU work has not completed: one not complete after the NCCL timeout
-        is fatal. The watchdog thread also runs ``on_tick`` every 0.25 s."""
-        oldest = self._oldest
-        if oldest is None or oldest[0].query():
-            self._oldest = (event, time.monotonic(), what)
+    def watch(self, event: torch.cuda.Event, what: tuple[int, int]) -> None:
+        """Enqueue the single recording that marks this decode's completion."""
+        self._pending_decode.append((event, time.monotonic(), what))
+
+    def _oldest_pending_decode(self) -> tuple[torch.cuda.Event, float, tuple[int, int]] | None:
+        # Submissions only append. The watchdog is the sole consumer, so the head stays
+        # valid across the CUDA query even if a decode is submitted on another thread.
+        while self._pending_decode:
+            oldest = self._pending_decode[0]
+            if not oldest[0].query():
+                return oldest
+            self._pending_decode.popleft()
+        return None
 
     def begin_call(self, what) -> None:
         """Mark a call's collectives as in flight: one still in flight after the NCCL timeout is fatal (a peer that
@@ -271,13 +279,13 @@ class _Transport:
                     f"{in_call[1]} still inside its collectives after {self.nccl_timeout_s:.0f} s"
                 )
                 continue
-            oldest = self._oldest
-            if oldest is not None and not oldest[0].query():
-                if time.monotonic() - oldest[1] > self.nccl_timeout_s:
-                    self._fatal(
-                        f"decode (seq, pages) {oldest[2]} not complete after {self.nccl_timeout_s:.0f} s"
-                    )
-                    continue
+            now = time.monotonic()
+            oldest = self._oldest_pending_decode()
+            if oldest is not None and now - oldest[1] > self.nccl_timeout_s:
+                self._fatal(
+                    f"decode (seq, pages) {oldest[2]} not complete after {self.nccl_timeout_s:.0f} s"
+                )
+                continue
             if self.on_tick is not None:
                 try:
                     self.on_tick()
@@ -561,7 +569,8 @@ class ShardColdPageProvider:
                         idx_q_stride=n,
                         max_segment_bytes=plan.max_slice,
                     )
-            event = self._next_event()
+            # The watchdog deadline belongs to this recording, even after the encode ring wraps.
+            event = torch.cuda.Event()
             event.record()
             self._match_pending = (event, seq)
             transport.watch(event, (seq, num_pages))
@@ -732,7 +741,7 @@ class ShardColdPageProvider:
         self._last_stream = stream
 
     def _next_event(self) -> torch.cuda.Event:
-        """Events are recycled round-robin: a re-recorded event marks a later point on the stream, a conservative
+        """Encode events are recycled round-robin: a re-recorded event marks a later point on the stream, a conservative
         stand-in wherever the earlier point was still referenced."""
         self._event_next = (self._event_next + 1) % len(self._events)
         return self._events[self._event_next]
