@@ -25,9 +25,9 @@ from fastapi.testclient import TestClient
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
+from tensorrt_llm.serve.middleware.user_middleware import _apply_fastapi_middlewares
 
 from .yaml_validation_harness import (
     assert_no_default_valued_leaves,
