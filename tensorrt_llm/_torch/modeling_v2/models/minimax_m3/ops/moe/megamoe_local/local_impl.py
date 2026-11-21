@@ -24,6 +24,12 @@
   the tail (ROUTEQ_SPLIT_TAIL). ROUTE_BESIDE_SHARED stages the seat on the aux stream beside a serial shared expert.
 * the pad mask (``set_pad_mask``): the rows a model marks as padding route to no expert, with ids -1 and weights 0.
 * the shared-expert placement (``impl_delta.SharedExpertPlanMixin``).
+* the runner (``local_runner.local_runner_class``): the M3.1 default tactics of ``local_plan.DEFAULT_TACTICS``
+  (``TRTLLM_M31_DISABLE_MEGAMOE_HINT8=1``, ``TRTLLM_M31_DISABLE_CTX_MOE_T16K=1``) and the gather-index padding fill
+  (``TRTLLM_M31_DISABLE_MEGAMOE_GATHER_FILL=1``), for every launch and workspace probe of the backend.
+* FASTLAUNCH: an eager launch whose buffers, weights, stream and bucket repeat an earlier one's relaunches that
+  launch's compiled kernel with its recorded arguments, rebuilding only the output view
+  (``TRTLLM_M31_DISABLE_MEGAMOE_FASTLAUNCH=1`` sends every launch through the op).
 
 Importing this module registers it (``register``): its identity, and a rank immediately ahead of the stock leaf in the
 ``MEGAMOE_CUTEDSL`` family, so every layer it declines resolves to stock; ``TRTLLM_M31_DISABLE_MEGAMOE_LOCAL=1``
@@ -36,6 +42,7 @@ reduce, which the tail reduce does not read.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import os
@@ -48,6 +55,7 @@ from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEligibility,
+    MoEFusedRouteQuant,
     MoEProblem,
     MoERejectReason,
     MoEStaticCapability,
@@ -63,8 +71,16 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
 from tensorrt_llm.logger import logger
 
 from ....native import family_ops
+from . import local_runner
 from .impl_delta import SharedExpertPlanMixin
-from .local_plan import DISABLE_ENV, lever_enabled, megamoe_local_requested, vd_static_rejection
+from .local_plan import (
+    DISABLE_ENV,
+    FASTLAUNCH_DISABLE_ENV,
+    lever_enabled,
+    megamoe_local_requested,
+    switch_set,
+    vd_static_rejection,
+)
 
 __all__ = [
     "MegaMoECuteDslLocal",
@@ -80,6 +96,8 @@ ROUTEQ_SPLIT_TAIL_MIN_CELLS = 4096
 #: Rows from which the route-quant seat is the routing launch plus FlashInfer's NVFP4 quantizer writing the stage; the
 #: single fused launch is faster below it.
 ROUTEQ_PORT_MIN_ROWS = 2048
+#: Recorded launches a backend keeps for FASTLAUNCH; reaching it clears them (a key per bucket and stream).
+FASTLAUNCH_MAX_ENTRIES = 64
 #: Why no launch leaves its top-k reduce to the caller on this runtime.
 TAIL_RUNTIME_DECLINE = (
     "the generation-phase kernel stores its pre-reduced plane bit-inverted for its own top-k reduce, "
@@ -277,6 +295,12 @@ class TrtllmCutedslMegaMoeLocalNvfp4Impl(SharedExpertPlanMixin, TrtllmCutedslMeg
         # Per bucket, the rows the latest seat staged. Bookkeeping for callers that stage the seat themselves (the
         # dep2ctx boundary); the stock staging resets the whole padded tail on every call and does not read it.
         self._last_staged_T: Dict[int, int] = {}
+        self._fast_launch_enabled = megamoe_local_requested(os.environ) and not switch_set(
+            os.environ, FASTLAUNCH_DISABLE_ENV
+        )
+        # FASTLAUNCH: launch key -> local_runner.RecordedLaunch; per bucket, whether it reduces in the kernel.
+        self._fast_launches: Dict[Tuple, local_runner.RecordedLaunch] = {}
+        self._in_kernel_reduce_buckets: Dict[int, bool] = {}
 
     def _supports_load_balancer(self) -> bool:
         return False
@@ -343,6 +367,194 @@ class TrtllmCutedslMegaMoeLocalNvfp4Impl(SharedExpertPlanMixin, TrtllmCutedslMeg
         finally:
             # A mask the launch did not stage must not reach the next step.
             self._pad_mask = None
+
+    # ------------------------------------------------------------------
+    # Runner: M3.1 default tactics and gather-index fill; FASTLAUNCH
+    # ------------------------------------------------------------------
+    @contextlib.contextmanager
+    def _local_runner(self):
+        """The op and its workspace probe build ``local_runner.local_runner_class()`` on this thread within the
+        block; the thread's previous selection is restored on exit."""
+        runner_class = local_runner.local_runner_class()
+        if runner_class is None:
+            yield
+            return
+        from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+            set_active_megamoe_runner_class,
+        )
+
+        previous = set_active_megamoe_runner_class(runner_class)
+        try:
+            yield
+        finally:
+            set_active_megamoe_runner_class(previous)
+
+    def _alloc_symm_provider(self):
+        # New providers replace the launch buffers the recorded launches were made on.
+        fast_launches = self.__dict__.get("_fast_launches")
+        if fast_launches:
+            fast_launches.clear()
+        with self._local_runner():
+            return super()._alloc_symm_provider()
+
+    def _ensure_local_staging(self, **kwargs):
+        with self._local_runner():
+            return super()._ensure_local_staging(**kwargs)
+
+    def _fast_launch_key(
+        self,
+        *,
+        activation: torch.Tensor,
+        activation_sf: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        weight_view,
+        combine_output: torch.Tensor,
+        shared_workspace: torch.Tensor,
+        world_size: int,
+        local_rank: int,
+        top_k: int,
+        hidden: int,
+        peer_offsets: List[int],
+        output_dtype: torch.dtype,
+        launch_max_T: int,
+        replica_plan=None,
+        staged_inputs: bool = False,
+        **_,
+    ) -> Optional[Tuple]:
+        """What identifies a launch FASTLAUNCH may replay, or None when it must go through the op.
+
+        Only eager launches outside tuning on this backend's own staged buffers qualify: their tensors persist
+        across calls, so a recorded launch's arguments stay valid. A launch with a replica plan, a fused shared
+        expert or the in-kernel reduce (which zeroes the output first) always goes through the op.
+        """
+        if (
+            not self._fast_launch_enabled
+            or not staged_inputs
+            or replica_plan is not None
+            or self._shared_expert is not None
+            or self.tactic_autotune
+        ):
+            return None
+        in_kernel_reduce = self._in_kernel_reduce_buckets.get(launch_max_T)
+        if in_kernel_reduce is None:
+            in_kernel_reduce = self._in_kernel_reduce_buckets[launch_max_T] = (
+                self._use_in_kernel_fc2_reduce(launch_max_T)
+            )
+        if (
+            in_kernel_reduce
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or AutoTuner.get().is_tuning_mode
+        ):
+            return None
+        return (
+            launch_max_T,
+            top_k,
+            hidden,
+            world_size,
+            local_rank,
+            output_dtype,
+            self.compute_slot_count,
+            torch._C._cuda_getCurrentRawStream(torch._C._cuda_getDevice()),
+            tuple(peer_offsets),
+            tuple(activation.shape),
+            activation.data_ptr(),
+            activation_sf.data_ptr(),
+            topk_idx.data_ptr(),
+            topk_weights.data_ptr(),
+            tuple(combine_output.shape),
+            combine_output.data_ptr(),
+            shared_workspace.data_ptr(),
+            weight_view.fc1_weight.data_ptr(),
+            weight_view.fc1_weight_sf.data_ptr(),
+            weight_view.fc2_weight.data_ptr(),
+            weight_view.fc2_weight_sf.data_ptr(),
+            weight_view.fc31_alpha.data_ptr(),
+            weight_view.fc2_alpha.data_ptr(),
+            weight_view.fc1_norm_const.data_ptr(),
+        )
+
+    def _fast_relaunch(
+        self,
+        launch: local_runner.RecordedLaunch,
+        *,
+        combine_output: torch.Tensor,
+        num_tokens: int,
+        hidden: int,
+        output_dtype: torch.dtype,
+        launch_max_T: int,
+    ) -> torch.Tensor:
+        """Relaunch ``launch`` with the output view the op builds for ``num_tokens``; returns what the op path
+        returns."""
+        from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+        view = (
+            combine_output[: min(num_tokens, combine_output.shape[0])]
+            if num_tokens > 0
+            else combine_output
+        )
+        output_activation = view.reshape(view.shape[0], hidden)
+        provider = self._symm_providers.get(launch_max_T)
+        launch_kwargs = dict(launch.launch_kwargs)
+        launch_kwargs["output_activation"] = (
+            megamoe_op._to_cute_slot(provider.cute_views, "output_activation", output_activation)
+            if provider is not None
+            else megamoe_op._cute_launch_helpers()[0](output_activation)
+        )
+        launch.compiled(**launch_kwargs)
+        if num_tokens == 0:
+            return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
+        return combine_output[:num_tokens].squeeze(1).to(output_dtype)
+
+    def _launch_megamoe_kernel(self, **kwargs) -> torch.Tensor:
+        """The stock launch under the M3.1 runner; with FASTLAUNCH, a repeat of a recorded eager launch relaunches
+        it directly while ``local_runner.recording_live`` holds (same workspace allocations, no fence since)."""
+        key = self._fast_launch_key(**kwargs)
+        if key is not None:
+            launch = self._fast_launches.get(key)
+            if launch is not None:
+                if local_runner.recording_live(launch):
+                    return self._fast_relaunch(
+                        launch,
+                        combine_output=kwargs["combine_output"],
+                        num_tokens=kwargs["num_tokens"],
+                        hidden=kwargs["hidden"],
+                        output_dtype=kwargs["output_dtype"],
+                        launch_max_T=kwargs["launch_max_T"],
+                    )
+                del self._fast_launches[key]
+            local_runner.record_next_launch()
+        recorded = None
+        try:
+            with self._local_runner():
+                output = super()._launch_megamoe_kernel(**kwargs)
+        finally:
+            if key is not None:
+                recorded = local_runner.take_recorded_launch()
+        if recorded is not None and "output_activation" in recorded.launch_kwargs:
+            if len(self._fast_launches) >= FASTLAUNCH_MAX_ENTRIES:
+                self._fast_launches.clear()
+            self._fast_launches[key] = dataclasses.replace(
+                recorded,
+                keepalive=tuple(
+                    kwargs[name]
+                    for name in (
+                        "activation",
+                        "activation_sf",
+                        "topk_idx",
+                        "topk_weights",
+                        "combine_output",
+                        "shared_workspace",
+                    )
+                ),
+            )
+            logger.info_once(
+                f"MegaMoECuteDslLocal: repeated eager launches relaunch their recorded kernel "
+                f"({FASTLAUNCH_DISABLE_ENV}=1 turns it off).",
+                key="megamoe_local_fastlaunch",
+            )
+        return output
 
     # ------------------------------------------------------------------
     # ROUTEQ: the fused route-quantize seat
@@ -418,6 +630,13 @@ class TrtllmCutedslMegaMoeLocalNvfp4Impl(SharedExpertPlanMixin, TrtllmCutedslMeg
         return None
 
     def try_fused_route_quant(
+        self, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> Optional[MoEFusedRouteQuant]:
+        """The route-quant seat (``_route_quant_seat``) in the scheduler's fused route+quant contract."""
+        staged = self._route_quant_seat(x, router_logits)
+        return None if staged is None else MoEFusedRouteQuant(*staged)
+
+    def _route_quant_seat(
         self, x: torch.Tensor, router_logits: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Route, quantize and stage in one launch, straight into the bucket's kernel buffers.
@@ -558,7 +777,7 @@ class TrtllmCutedslMegaMoeLocalNvfp4Impl(SharedExpertPlanMixin, TrtllmCutedslMeg
         hint = self._active_launch_max_tokens
         self._active_launch_max_tokens = chunk_max_tokens
         try:
-            result = self.try_fused_route_quant(x, router_logits)
+            result = self._route_quant_seat(x, router_logits)
         finally:
             self._active_launch_max_tokens = hint
         if result is not None:

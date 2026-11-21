@@ -640,6 +640,60 @@ def test_create_materializes_exact_tree_and_remote_mismatch_is_fatal(tmp_path: P
     assert "skip-remote-unavailable" not in f"{remote_check.stdout}\n{remote_check.stderr}".lower()
 
 
+def test_unselected_links_and_submodules_do_not_block_selection(tmp_path: Path) -> None:
+    upstream, _ = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    source = upstream / _SOURCE
+    (source / "notes").symlink_to("kernel.py")
+    _git(
+        upstream,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{'1' * 40},{_SOURCE}/third_party/cutlass",
+    )
+    _git(upstream, "add", f"{_SOURCE}/notes")
+    _git(upstream, "commit", "-m", "add an unselected link and submodule")
+    commit = _git(upstream, "rev-parse", "HEAD")
+    entries = _git(
+        upstream, "ls-tree", "-r", commit, "--", f"{_SOURCE}/notes", f"{_SOURCE}/third_party"
+    )
+    modes = {line.split("\t")[1]: line.split()[0] for line in entries.splitlines()}
+    assert modes == {f"{_SOURCE}/notes": "120000", f"{_SOURCE}/third_party/cutlass": "160000"}, (
+        entries
+    )
+
+    def create(name: str, include: str) -> subprocess.CompletedProcess[str]:
+        return _vendor(
+            consumer,
+            lock,
+            "create",
+            name,
+            "--url",
+            upstream.as_uri(),
+            "--branch",
+            "main",
+            "--commit",
+            commit,
+            "--source",
+            _SOURCE,
+            "--destination",
+            f"src/{name}",
+            "--include",
+            include,
+            "--repo",
+            upstream,
+            check=False,
+        )
+
+    consumer, lock = _make_consumer(tmp_path)
+    selected = create("selected", _INCLUDE)
+    assert selected.returncode == 0, selected.stderr
+    assert (consumer / "src/selected/kernel.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert not (consumer / "src/selected/notes").exists()
+    assert not (consumer / "src/selected/third_party").exists()
+    _assert_failure(create("everything", "**/*"), "links or special files")
+
+
 def test_git_subprocesses_ignore_ambient_repository_environment(tmp_path: Path) -> None:
     upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -743,6 +797,8 @@ def test_patched_adoption_preserves_raw_crlf_with_selected_text_attribute(
     consumer, lock = _make_consumer(tmp_path)
     destination = consumer / _DESTINATION
     shutil.copytree(upstream / _SOURCE, destination)
+    # Sync writes files with git's modes; pin the copy's mode so the umask does not matter.
+    (destination / ".gitattributes").chmod(0o644)
     destination_value = destination / "value.txt"
     destination_value.write_bytes(b"downstream\r\n")
     destination_value.chmod(0o755)

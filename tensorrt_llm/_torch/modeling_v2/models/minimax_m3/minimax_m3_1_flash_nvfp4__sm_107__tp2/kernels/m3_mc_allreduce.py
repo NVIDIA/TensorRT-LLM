@@ -52,8 +52,8 @@ AR_OPTS_BY_BUCKET = {16: 15, 48: 15}
 # The MoE-finalize all-reduce, per bucket.
 AR_FIN_OPTS_BY_BUCKET = {8: 7, 16: 15, 48: 15}
 # The buckets past 8 tokens whose drafter form (option 16 | the bucket's 15 = 31) the build instantiates on the
-# 8-CTA cluster kernel (mcAllreduceNormTp4.cu: isMinimaxM3Sm107Tp4McAllreduceNormSupported); ``drafter_wide`` callers
-# reach them (the drafter's DRAFT_AR_NORM_CLUSTER form at 9..32 rows).
+# 8-CTA cluster kernel (csrc/m3/sm107Tp4McAllreduceNorm.cu: isMinimaxM3Sm107Tp4McAllreduceNormSupported);
+# ``drafter_wide`` callers reach them (the drafter's DRAFT_AR_NORM_CLUSTER form at 9..32 rows).
 DRAFTER_WIDE_BUCKETS = (16, 48)
 
 
@@ -64,8 +64,8 @@ _OPT_ONESHOT_CLUSTER = 32
 _OPT_ROW_CARVEOUT = 64
 
 # Option 128: the drafter boundary (option 16) on the 8-CTA cluster kernel instead of the world-4 row kernel (routing
-# only; mcAllreduceNormTp4.cu invoke). Exact-class to the row kernel's FlashInfer order: the RMS statistic is the
-# cluster's sum (modeling.DRAFT_MC_AR_CLUSTER).
+# only; csrc/m3/sm107Tp4McAllreduceNorm.cu invoke). Exact-class to the row kernel's FlashInfer order: the RMS statistic
+# is the cluster's sum (modeling.DRAFT_MC_AR_CLUSTER).
 _OPT_DRAFTER_CLUSTER = 128
 
 # Option 2 is also the safe ordering of the cluster RMS exchange: its stores into peer CTAs' shared memory follow a

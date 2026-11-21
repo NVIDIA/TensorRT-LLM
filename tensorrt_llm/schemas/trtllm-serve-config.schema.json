@@ -3811,6 +3811,13 @@
           "title": "Enable Block Reuse",
           "type": "boolean"
         },
+        "enable_disagg_completion_reservation": {
+          "default": false,
+          "description": "Reserve the GPU KV cache pages each admitted request needs to finish on a disaggregated server. Applies only to KV cache manager v2 on a disaggregated server with no cache tier below GPU (host_cache_size=0 and no disk tier), beam width 1, a single pipeline stage and full attention on every layer; elsewhere it is ignored, and KV cache manager v2 logs a warning. A request is then admitted only while the completion bound of every admitted request still fits: a generation request through its output limit and, under a KV connector without source reservations, a context request the connector may serve through the end of its prompt. The bounds are logical; no page is allocated early. A KV connector can request the same through its worker's requires_completion_reservation declaration.",
+          "status": "prototype",
+          "title": "Enable Disagg Completion Reservation",
+          "type": "boolean"
+        },
         "enable_kv_pool_rebalance": {
           "default": false,
           "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla' and with CSA2 sparse attention.",
@@ -4202,6 +4209,12 @@
           "default": null,
           "description": "The class name of the worker within the module.",
           "title": "Connector Worker Class"
+        },
+        "context_only": {
+          "default": false,
+          "description": "Declares a server that only runs context phases, i.e. a disaggregated context server. A connector that transfers KV is then allowed with speculative decoding: drafts are verified, and rejected, only on the generation server, so the page lists this connector tracks never shrink. A generation request that reaches the connector fails the server.",
+          "title": "Context Only",
+          "type": "boolean"
         },
         "control_grace_sec": {
           "default": 60.0,
@@ -4991,7 +5004,7 @@
         },
         "fuse_qkv_index_projection": {
           "default": false,
-          "description": "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q is sharded with the KV heads and index-K is replicated. MSA batches also use a horizontal norm/RoPE/cache-insertion producer for prefill, mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 or NVFP4 main KV cache.",
+          "description": "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q is sharded with the KV heads and index-K is replicated. MSA batches also use a horizontal norm/RoPE/cache-insertion producer for prefill, mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path requires the MSA implementation, indexer_kv_dtype='fp8' or 'nvfp4', and an FP8 or NVFP4 main KV cache.",
           "status": "prototype",
           "title": "Fuse Qkv Index Projection",
           "type": "boolean"
@@ -5009,10 +5022,11 @@
         },
         "indexer_kv_dtype": {
           "default": "bf16",
-          "description": "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses unscaled E4M3 values with FP32 score accumulation and is supported only by the MSA implementation.",
+          "description": "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses unscaled E4M3 values with FP32 score accumulation and is supported only by the MSA implementation. 'nvfp4' stores index-K as packed NVFP4 pages (E2M1 with E4M3 16-element scales, no global scale; 72 bytes per token instead of 128) with E4M3 index-Q: decode scores the pages directly, prefill dequantizes them to E4M3 first. It is not exact against 'fp8' (it changes which blocks are selected). It is supported only by the MiniMax-M3.1-Flash Modeling V2 targets on the MSA implementation; TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1 falls back to 'fp8'.",
           "enum": [
             "bf16",
-            "fp8"
+            "fp8",
+            "nvfp4"
           ],
           "status": "prototype",
           "title": "Indexer Kv Dtype",

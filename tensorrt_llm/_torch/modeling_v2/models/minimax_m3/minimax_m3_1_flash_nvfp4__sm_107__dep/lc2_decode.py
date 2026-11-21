@@ -3,7 +3,7 @@
 """DEP_LC2: the sparse layers' generation decode attention as one LC2 launch at the attention-DP geometry.
 
 Attention DP keeps all 4 KV heads of the model on every rank. ``family_ops().minimax_m3_sm107_tp2_sparse_decode_lc``
-(cpp/tensorrt_llm/thop/minimaxM3/minimaxM3Sm107Tp2SparseDecodeLc2Op.cpp; its kernels take the KV-head count from the
+(csrc/m3/sm107Tp2SparseDecodeLc2Op.cpp; its kernels take the KV-head count from the
 cache view) replaces the in-tree Triton producer + merge (``minimax_m3_sparse_attn_decode``) through each layer's
 ``MsaDecodeFmha.sparse_decode_hook``: the split grid at 33..448 rows and the 16-CTA cluster below that, the log-domain
 recurrence, the MXFP8 o_proj hand-off when ``merge_mxfp8`` reserved its buffers (DEP_MERGE_MXFP8), no pre-wait staging

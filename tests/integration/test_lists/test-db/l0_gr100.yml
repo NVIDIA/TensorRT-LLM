@@ -15,6 +15,8 @@ l0_gr100:
   tests:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   # MiniMax-M3 family code shared with MiniMax-M3.1-Flash.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_step_hooks_gpu.py
+  - unittest/_torch/modeling_v2/test_m31_pins_gpu.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/dspark
@@ -87,6 +89,7 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_fsel_topk_gpu.py --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_served_class.py --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m3_dispatch.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m31_tailbk.py --import-mode=importlib
   # MiniMax-M3.1-Flash sm_107 tp4 target: one entry per op directory plus its top-level GPU tests. Its helpers
   # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 4 ranks.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/attention --import-mode=importlib
@@ -117,7 +120,11 @@ l0_gr100:
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_prefill_linear_matches_reference
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_o_b_loaded_tactic_graph
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
+  - unittest/_torch/attention/test_prims_ts_worktile_scope.py
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
+  - unittest/_torch/kernels/parallel/test_fp8_quantize.py::test_mxfp8_quantize_16elt_matches_8elt
+  - unittest/_torch/kernels/parallel/test_mxfp8_quantize_sf0.py
+  - unittest/_torch/kernels/parallel/test_noaux_tc_fp32_weight.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py
   # CuteDSL MoE locality-domain split (NVFP4/BF16 grouped GEMM): module lifecycle and forward.
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_locality_domain_correctness_rubin
@@ -134,6 +141,7 @@ l0_gr100:
   - unittest/_torch/kernels/parallel/test_kimi_k3_router_logits.py
   - unittest/_torch/kernels/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_forward_nvfp4_matches_gemm_then_fp4_quantize
   - unittest/_torch/moe/test_kimi_k3_route_sort.py
+  - unittest/_torch/moe/test_moe_op_backend_fi_fp4_quant.py
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[1-CUTEDSL_FC12]
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[8-CUTEDSL_FC12]
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[64-CUTEDSL_FC12]

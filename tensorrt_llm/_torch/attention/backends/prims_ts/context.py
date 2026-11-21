@@ -35,6 +35,7 @@ now; unlike the decode APIs, their ``@flashinfer_experimental_api`` decorators d
 register trace templates.
 """
 
+from ._worktile_scope import with_scalar_work_tile_info
 from dataclasses import dataclass, field, replace
 import functools
 import itertools
@@ -2031,6 +2032,7 @@ def _paged_context_compile_spec(
 
 
 @functools.cache
+@with_scalar_work_tile_info
 def _get_compiled_context(
     compile_spec: _ContextCompileSpec,
 ):
@@ -2425,6 +2427,7 @@ def _get_compiled_context(
 
 
 @functools.cache
+@with_scalar_work_tile_info
 def _get_compiled_paged_context(
     compile_spec: _PagedContextCompileSpec,
 ):

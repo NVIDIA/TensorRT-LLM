@@ -627,15 +627,23 @@ def test_scheduler_allocation_failure_suspends_under_agg_helix_with_host_tier() 
 
 def _host_tier_preempt_scheduler(preempted: list) -> SimpleNamespace:
     """Agg helix scheduler with a host tier, where every request holds pages."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+        KVCacheV2Scheduler,
+        _CtxPreemptionStats,
+    )
+
     sched = SimpleNamespace(
+        _ctx_preempt_stats=_CtxPreemptionStats(),
         has_cp_helix=True,
         enable_recompute_pause=True,
+        _ctx_preempt_least_progress=False,
         kv_cache_manager=SimpleNamespace(
             has_cache_tier_below_gpu=True,
             is_request_active=lambda request_id: True,
         ),
     )
     sched._is_recompute_pause_candidate = lambda req, inflight_request_ids: True
+    sched._prefill_progress = KVCacheV2Scheduler._prefill_progress
     sched._preempt_or_defer = lambda victim, recompute_paused: preempted.append(victim) or True
     return sched
 
@@ -658,6 +666,8 @@ def _preempt_req(request_id: int, in_generation: bool) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
         request_id=request_id,
+        context_current_position=0,
+        prepopulated_prompt_len=0,
         is_generation_in_progress_state=in_generation,
         state=LlmRequestState.GENERATION_IN_PROGRESS
         if in_generation

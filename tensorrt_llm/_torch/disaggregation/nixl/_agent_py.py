@@ -181,6 +181,10 @@ class NixlTransferAgent(BaseTransferAgent):
             raise RuntimeError("nixl get_xfer_descs returned None for remote descriptors")
         return self.agent.check_remote_metadata(name, descs)
 
+    def set_scatter_order_stream(self, stream_handle: int) -> bool:
+        """No transfer-agent bounce here, so there are no receive scatters to order."""
+        return False
+
     def notify_sync_message(self, name: str, sync_message: str):
         raise NotImplementedError
 

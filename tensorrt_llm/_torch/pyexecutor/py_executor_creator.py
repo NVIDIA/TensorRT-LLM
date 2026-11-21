@@ -1297,12 +1297,16 @@ def _create_py_executor(
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
         # about pages appended since the last report, so it would keep
-        # addressing a slot another request now owns.
+        # addressing a slot another request now owns. Drafts are rejected only
+        # in generation steps, which a context-only server never runs.
         if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
+                and v2_selection is True
+                and not kv_connector_config.context_only):
             raise NotImplementedError(
                 "KV connector is not supported with speculative decoding. "
-                "Disable speculative decoding to run a connector.")
+                "Disable speculative decoding, or declare "
+                "kv_connector_config.context_only on a disaggregated context "
+                "server.")
 
         # V1 registers a single pool. V2 checks its resolved layer groups
         # during executor initialization.
@@ -1361,7 +1365,8 @@ def _create_py_executor(
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker,
                 connector_scheduler,
-                enable_attention_dp=mapping.enable_attention_dp)
+                enable_attention_dp=mapping.enable_attention_dp,
+                context_only=kv_connector_config.context_only)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")

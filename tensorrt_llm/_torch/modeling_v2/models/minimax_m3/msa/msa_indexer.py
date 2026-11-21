@@ -700,14 +700,14 @@ def _group_max_reduce(
 
 
 # The proxy writes every valid block and selection masks the rest. Reusing the
-# step buffer avoids allocating and filling it at each sparse layer. A model
-# opt-in (RuntimeHooks.proxy_ms_reuse), armed by the executor
-# (arm_proxy_ms_reuse); kill switch TRTLLM_M31_DISABLE_PROXY_MS_REUSE=1.
+# step buffer avoids allocating and filling it at each sparse layer. Armed by
+# the M3.1 targets when they build their MSA attention (arm_proxy_ms_reuse);
+# kill switch TRTLLM_M31_DISABLE_PROXY_MS_REUSE=1.
 _PROXY_MS_REUSE = False
 
 
 def arm_proxy_ms_reuse() -> None:
-    """Reuse the step's proxy max-score buffer in this process (RuntimeHooks.proxy_ms_reuse), unless killed."""
+    """Reuse the step's proxy max-score buffer in this process, unless killed."""
     global _PROXY_MS_REUSE
     _PROXY_MS_REUSE = os.environ.get("TRTLLM_M31_DISABLE_PROXY_MS_REUSE", "0") != "1"
 

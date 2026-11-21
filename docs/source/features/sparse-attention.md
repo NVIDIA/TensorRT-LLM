@@ -426,7 +426,8 @@ Two implementations are available:
   default. Selecting it logs a recommendation to use `msa`. It does not support
   NVFP4 KV cache.
 - `msa` is the recommended implementation and requires an SM100-family GPU (SM100 or
-  SM103), the `fmha_sm100` package, and `sparse_block_size=128`.
+  SM103; SM107 for the MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3`
+  family), the `fmha_sm100` package, and `sparse_block_size=128`.
 
 ```yaml
 sparse_attention_config:
@@ -452,8 +453,9 @@ Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
 within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
 caches with an FP8 indexer. The MiniMax-M3.1-Flash targets of the Modeling V2
-`minimax_m3` family also accept a standalone DSpark drafter; see the
-deployment guide.
+`minimax_m3` family also accept `indexer_kv_dtype: nvfp4` (packed NVFP4 index
+keys) with `fuse_qkv_index_projection: true`, and a standalone DSpark drafter;
+see the deployment guide.
 
 The sparse path has no dense fallback and does not support KV-cache reuse.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree

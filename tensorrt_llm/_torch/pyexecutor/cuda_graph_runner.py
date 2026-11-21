@@ -146,6 +146,8 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # The long-context family (CUDAGraphRunnerConfig.long_family_min_total_tokens).
+    long_family: bool = False
     # The one-engine temperature-only sampling variant (vocabulary-sharded
     # Gumbel-max target sampling); False unless that variant was captured, so
     # the stock keys are unchanged otherwise.
@@ -271,6 +273,10 @@ class CUDAGraphRunnerConfig:
     # sparse attention config when it asks for the split, else from the model's
     # runtime hooks.
     short_long_seq_len_threshold: Optional[int] = None
+    # Summed total sequence length at or above which a generation batch replays
+    # the long-context graph family (MsaRuntimePolicy.long_family_min_total_tokens);
+    # None captures no such family.
+    long_family_min_total_tokens: Optional[int] = None
     # Give the graph metadata a buffer pool of its own instead of the
     # process-wide one, so no other engine writes its metadata buffers (an
     # engine that skips unchanged uploads into them relies on that).
@@ -308,6 +314,8 @@ class CUDAGraphRunner:
     WARMUP_STEPS = 1
     # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
     _configured_seq_len_threshold: Optional[int] = None
+    # CUDAGraphRunnerConfig.long_family_min_total_tokens, when the config set one.
+    long_family_min_total_tokens: Optional[int] = None
     # Resolves a graph shape (batch size, draft length) to the ceilings of the
     # KV regimes its decode graphs are keyed by (ascending, the page-table
     # capacity last); set by the decoder's graph component once the KV cache
@@ -337,6 +345,7 @@ class CUDAGraphRunner:
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
         self._configured_seq_len_threshold = config.short_long_seq_len_threshold
+        self.long_family_min_total_tokens = config.long_family_min_total_tokens
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
@@ -629,7 +638,8 @@ class CUDAGraphRunner:
         self,
         batch: ScheduledRequests,
         new_tensors_device: Optional[SampleStateTensors] = None,
-        promoted_context_request_ids: frozenset[int] = frozenset()
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        total_seq_lens: Optional[List[int]] = None,
     ) -> bool:
         """Select the sparse-attention graph family for the execution view.
 
@@ -647,8 +657,11 @@ class CUDAGraphRunner:
             # Determine the sequence length mode.
             from ..speculative import get_num_extra_kv_tokens
             num_extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
-            max_seq_len = self._max_total_seq_len(batch, new_tensors_device,
-                                                  promoted_context_request_ids)
+            if total_seq_lens is None:
+                max_seq_len = self._max_total_seq_len(
+                    batch, new_tensors_device, promoted_context_request_ids)
+            else:
+                max_seq_len = max(total_seq_lens, default=0)
             if max_seq_len <= self.short_long_seq_len_threshold - num_extra_kv_tokens:
                 short_seq_len_mode = True
             else:
@@ -658,6 +671,15 @@ class CUDAGraphRunner:
             # use the default sequence length mode.
             short_seq_len_mode = False
         return short_seq_len_mode
+
+    def _get_long_family(self, total_seq_lens: Optional[List[int]],
+                         short_seq_len_mode: bool) -> bool:
+        """Whether the batch replays the long-context family: its summed total sequence length reaches
+        ``long_family_min_total_tokens`` (never a short-family batch)."""
+        threshold = self.long_family_min_total_tokens
+        if threshold is None or short_seq_len_mode or not total_seq_lens:
+            return False
+        return sum(total_seq_lens) >= threshold
 
     def get_graph_key(
         self,
@@ -678,8 +700,18 @@ class CUDAGraphRunner:
 
         # Promoted IDs correct the sequence length observed by sparse
         # short/long graph selection.
+        # With a long-context family the lengths are collected once and shared
+        # with the short/long selection; otherwise that selection reads them.
+        total_seq_lens = None
+        if self.long_family_min_total_tokens is not None:
+            total_seq_lens = self._total_seq_lens(batch, new_tensors_device,
+                                                  promoted_context_request_ids)
         short_seq_len_mode = self._get_seq_len_mode(
-            batch, new_tensors_device, promoted_context_request_ids)
+            batch,
+            new_tensors_device,
+            promoted_context_request_ids,
+            total_seq_lens=total_seq_lens)
+        long_family = self._get_long_family(total_seq_lens, short_seq_len_mode)
 
         # Spec one-engine sampler has two code paths (argmax fast-path vs
         # advanced sampling kernel). Include this in the key so we capture
@@ -738,6 +770,7 @@ class CUDAGraphRunner:
                        num_encoder_tokens=num_encoder_tokens,
                        peft_cache_data_type=peft_cache_data_type,
                        use_lora_graph=use_lora_graph,
+                       long_family=long_family,
                        temperature_only=temperature_only,
                        ragged_verify_bucket=self._ragged_verify_bucket(batch),
                        kv_regime=kv_regime,

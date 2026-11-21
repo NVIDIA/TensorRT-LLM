@@ -98,6 +98,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
         runner._packed_split_for_batch.return_value = None
+        runner._get_long_family.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -110,7 +111,13 @@ class GraphKeyTestCase(unittest.TestCase):
             promoted_context_request_ids=promoted_ids,
         )
 
-        runner._get_seq_len_mode.assert_called_once_with(batch, None, promoted_ids)
+        runner._total_seq_lens.assert_called_once_with(batch, None, promoted_ids)
+        runner._get_seq_len_mode.assert_called_once_with(
+            batch,
+            None,
+            promoted_ids,
+            total_seq_lens=runner._total_seq_lens.return_value,
+        )
         self.assertEqual(
             key, KeyType(batch_size=1, draft_len=0, short_seq_len_mode=True, num_encoder_tokens=0)
         )
@@ -124,6 +131,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
         runner._packed_split_for_batch.return_value = None
+        runner._get_long_family.return_value = False
         context = _make_request_stub(1)
         context.encoder_output_len = 7
         context.py_skip_cross_kv_projection = False
@@ -150,6 +158,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
         runner._packed_split_for_batch.return_value = None
+        runner._get_long_family.return_value = False
         first_context = _make_request_stub(1)
         first_context.encoder_output_len = 7
         first_context.py_skip_cross_kv_projection = False
@@ -195,6 +204,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
         runner._packed_split_for_batch.return_value = None
+        runner._get_long_family.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -268,6 +278,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
         runner._packed_split_for_batch.return_value = None
+        runner._get_long_family.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -518,6 +529,7 @@ def test_encoder_decoder_fixed_slots_restore_source_order() -> None:
 def _decoder_runner(
     *,
     short_long_seq_len_threshold: int | None = None,
+    long_family_min_total_tokens: int | None = None,
     sparse_attention_config: BaseSparseAttentionConfig | None = None,
     private_metadata_buffers: bool = False,
 ) -> CUDAGraphRunner:
@@ -539,6 +551,7 @@ def _decoder_runner(
         dist=None,
         sparse_attention_config=sparse_attention_config,
         short_long_seq_len_threshold=short_long_seq_len_threshold,
+        long_family_min_total_tokens=long_family_min_total_tokens,
         private_metadata_buffers=private_metadata_buffers,
     )
     return CUDAGraphRunner(config)
@@ -637,6 +650,41 @@ def test_seq_len_mode_is_long_without_a_threshold() -> None:
     runner = _decoder_runner()
 
     assert runner._get_seq_len_mode(_generation_batch(1)) is False
+
+
+def test_total_seq_lens_feed_the_seq_len_mode() -> None:
+    runner = _decoder_runner(short_long_seq_len_threshold=2_048)
+    batch = _generation_batch(100, 2_049)
+
+    assert runner._total_seq_lens(batch) == [100, 2_049]
+    assert runner._get_seq_len_mode(batch, total_seq_lens=[100, 200]) is True
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "long_family"),
+    [((100,), False), ((3_000, 999), False), ((3_000, 1_000), True), ((4_000,), True)],
+)
+def test_long_family_starts_at_the_summed_length(num_tokens, long_family) -> None:
+    runner = _decoder_runner(long_family_min_total_tokens=4_000)
+    batch = _generation_batch(*num_tokens)
+
+    assert runner._get_long_family(runner._total_seq_lens(batch), False) is long_family
+
+
+def test_long_family_is_off_without_a_threshold_and_for_a_short_family_batch() -> None:
+    assert _decoder_runner()._get_long_family([10_000], False) is False
+    runner = _decoder_runner(long_family_min_total_tokens=100)
+    assert runner._get_long_family([10_000], True) is False
+    assert runner._get_long_family([], False) is False
+    assert runner._get_long_family(None, False) is False
+
+
+def test_the_graph_key_carries_the_long_family() -> None:
+    runner = _decoder_runner(long_family_min_total_tokens=1_000)
+
+    assert runner.get_graph_key(_generation_batch(100)).long_family is False
+    assert runner.get_graph_key(_generation_batch(600, 600)).long_family is True
+    assert _decoder_runner().get_graph_key(_generation_batch(600, 600)).long_family is False
 
 
 class SparseGraphKeyTestCase(unittest.TestCase):

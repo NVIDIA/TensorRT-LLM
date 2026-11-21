@@ -33,6 +33,8 @@ class TestModelingV2MiniMaxM31FlashNvfp4Sm107Dep(_MiniMaxM31Target):
         enable_attention_dp=True,
         moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
     )
+    # The DEP sparse decode takes at most 448 query rows per rank: 48 requests x 8 DSpark rows.
+    MAX_BATCH_SIZE = 48
 
     @skip_not_sm107
     @pytest.mark.skip_less_device(8)

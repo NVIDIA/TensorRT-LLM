@@ -407,6 +407,11 @@ if(BUILD_PYT)
   add_subdirectory(thop)
   # modeling_v2 family libraries: torch-op libraries loaded on demand.
   add_subdirectory(modeling_v2)
+  # The opt-in ahead-of-time MSA modules (BUILD_MSA_AOT) ship in the wheel, so
+  # they build with the library the wheel targets build.
+  if(TARGET msa_fmha_sm100_aot)
+    add_dependencies(${SHARED_TARGET} msa_fmha_sm100_aot)
+  endif()
 endif()
 
 add_subdirectory(nanobind)

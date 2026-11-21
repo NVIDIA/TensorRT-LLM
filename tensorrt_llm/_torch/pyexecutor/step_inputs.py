@@ -49,6 +49,10 @@ wait, so per-step device flags can be tagged with it instead of being cleared be
 With ``prologue_op`` (``RuntimeHooks.pack_prologue_op``, on top of ``early_copy``) the prologue is the model's one
 launch, ``prologue_op(gdev, epoch, MAX_DESC)``, in place of the two scatter launches and the header fill: it writes the
 same bytes, zeroes the same header and increments the epoch the same once per replay (and once at warm-up).
+
+With ``cpp_scatter`` (``RuntimeHooks.pack_cpp_scatter``) the pack launches no Triton kernel: every eager flush takes
+the native serial scatter (``trtllm::step_inputs_scatter``, the same bytes), and the in-graph prologue is kept only
+with the model's ``prologue_op`` (otherwise the pack is issued eagerly before the replay).
 """
 
 from __future__ import annotations
@@ -58,66 +62,27 @@ from contextvars import ContextVar
 from typing import Callable, Iterator, Optional
 
 import torch
-import triton
-import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 
-
-# One compiled variant for every descriptor offset: specializing ``first`` (== 1, divisible by 16) would compile a
-# new kernel when a step's pack first holds a new number of copies, after the warm-up.
-@triton.jit(do_not_specialize=["first"])
-def _parallel_scatter_kernel(
-    stage_u8, stage_i64, first, DEVICE_SRC: tl.constexpr, BLOCK: tl.constexpr
-):
-    """Program i writes copy ``first + i`` ([dst, src, bytes] descriptors after the 2-word header). ``src`` is an offset
-    into the staged buffer for a host copy, a device address for a device copy (``DEVICE_SRC``)."""
-    d = 2 + 3 * (first + tl.program_id(0))
-    dst = tl.load(stage_i64 + d).to(tl.pointer_type(tl.uint8))
-    src_word = tl.load(stage_i64 + d + 1)
-    if DEVICE_SRC:
-        src = src_word.to(tl.pointer_type(tl.uint8))
-    else:
-        src = stage_u8 + src_word
-    nbytes = tl.load(stage_i64 + d + 2)
-    for start in range(0, nbytes, BLOCK):
-        o = start + tl.arange(0, BLOCK)
-        tl.store(dst + o, tl.load(src + o, mask=o < nbytes), mask=o < nbytes)
+# The Triton scatter kernels live in step_inputs_triton and are imported on first use, so a pack that never takes a
+# Triton path (cpp_scatter) never imports Triton. The two names stay importable from this module (PEP 562).
+_TRITON_KERNELS = None
 
 
-@triton.jit
-def _graph_scatter_kernel(
-    stage_u8,
-    stage_i64,
-    epoch,
-    DEVICE_SRC: tl.constexpr,
-    BLOCK: tl.constexpr,
-    BUMP_EPOCH: tl.constexpr,
-):
-    """Descriptor slot i of the host copies (``DEVICE_SRC`` False) or of the device copies, with the counts read from
-    the staged header; a slot past its count writes nothing. ``BUMP_EPOCH``: program 0 also increments ``epoch[0]``."""
-    i = tl.program_id(0)
-    if BUMP_EPOCH:
-        if i == 0:
-            tl.store(epoch, tl.load(epoch) + 1)
-    num_h2d = tl.load(stage_i64)
-    if DEVICE_SRC:
-        count = tl.load(stage_i64 + 1)
-        d = 2 + 3 * (num_h2d + i)
-    else:
-        count = num_h2d
-        d = 2 + 3 * i
-    if i < count:
-        dst = tl.load(stage_i64 + d).to(tl.pointer_type(tl.uint8))
-        src_word = tl.load(stage_i64 + d + 1)
-        if DEVICE_SRC:
-            src = src_word.to(tl.pointer_type(tl.uint8))
-        else:
-            src = stage_u8 + src_word
-        nbytes = tl.load(stage_i64 + d + 2)
-        for start in range(0, nbytes, BLOCK):
-            o = start + tl.arange(0, BLOCK)
-            tl.store(dst + o, tl.load(src + o, mask=o < nbytes), mask=o < nbytes)
+def _triton():
+    global _TRITON_KERNELS
+    if _TRITON_KERNELS is None:
+        from tensorrt_llm._torch.pyexecutor import step_inputs_triton
+
+        _TRITON_KERNELS = step_inputs_triton
+    return _TRITON_KERNELS
+
+
+def __getattr__(name: str):
+    if name in ("_parallel_scatter_kernel", "_graph_scatter_kernel"):
+        return getattr(_triton(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _disjoint(ranges: list[tuple[int, int]]) -> bool:
@@ -163,6 +128,14 @@ class StepInputPack:
     ALIGN = 16
     # The pinned window a graph's prologue copies (in_graph): the header, the descriptors and up to ~10 KB of data.
     GRAPH_WINDOW = 1 << 14
+    # Class-level default: a pack built without __init__ takes the Triton scatters where they apply.
+    cpp_scatter = False
+    # Engagement counters of this pack (one per engine and rank): packs the replay's prologue issued, packs issued
+    # eagerly before a prologue graph (over the window or not order-free), and side-stream window uploads
+    # (early_copy).
+    graph_windows = 0
+    eager_fallbacks = 0
+    early_uploads = 0
 
     def __init__(
         self,
@@ -172,12 +145,18 @@ class StepInputPack:
         early_copy: bool = False,
         step_epoch: bool = False,
         prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None,
+        cpp_scatter: bool = False,
     ) -> None:
         self.parallel_scatter = parallel_scatter
+        # No Triton launch: every eager flush takes the native serial scatter, and the in-graph prologue runs only as
+        # the model's prologue_op (without one the pack is issued eagerly before the replay).
+        self.cpp_scatter = cpp_scatter
         self.in_graph = in_graph and parallel_scatter
         self.early_copy = early_copy and self.in_graph
         # The model's one-launch prologue (see the module docstring); None: the scatter launches and the header fill.
         self.prologue_op = prologue_op if self.early_copy else None
+        if cpp_scatter and self.prologue_op is None:
+            self.in_graph = self.early_copy = False
         # The step epoch (see the module docstring); None without step_epoch.
         self.epoch: Optional[torch.Tensor] = (
             torch.zeros(1, dtype=torch.int64, device=device)
@@ -217,10 +196,11 @@ class StepInputPack:
         self.staged: list[torch.Tensor] = []
         self._graph_staged: list[torch.Tensor] = []
         self.used = self.data_start
-        if parallel_scatter:
+        # (in_graph implies parallel_scatter; the native scatter compiles nothing.)
+        if parallel_scatter and not cpp_scatter:
             self._warm_up(device)
-            if self.in_graph:
-                self._warm_up_graph_kernel()
+        if self.in_graph:
+            self._warm_up_graph_kernel()
 
     def _warm_up(self, device: torch.device) -> None:
         """Compile the parallel scatter now, not on a serving step's flush."""
@@ -245,7 +225,7 @@ class StepInputPack:
         stage_i64 = window.view(torch.int64)
         for device_src in (False, True):
             bump = self.epoch is not None and not device_src
-            _graph_scatter_kernel[(self.MAX_DESC,)](
+            _triton()._graph_scatter_kernel[(self.MAX_DESC,)](
                 window,
                 stage_i64,
                 self.epoch if bump else stage_i64,
@@ -352,6 +332,14 @@ class StepInputPack:
             return True
         return False
 
+    def _count(self, in_window: bool) -> None:
+        """Count one in-graph flush (and its early upload)."""
+        if in_window:
+            self.graph_windows += 1
+            self.early_uploads += int(self.early_copy)
+        else:
+            self.eager_fallbacks += 1
+
     def flush(self, in_graph: bool = False) -> None:
         """Issue the pack. ``in_graph``: the next replay is of a graph captured with ``capture_prologue``."""
         if not self.open:
@@ -363,10 +351,12 @@ class StepInputPack:
             if self._fill_graph_window():
                 if self.early_copy:
                     self._upload_window(self.used)
+                self._count(in_window=True)
                 self._graph_staged.extend(self.staged)
                 self._clear()
                 return
             self.quiesce_graph_window()
+            self._count(in_window=False)
         if not self.h2d and not self.d2d:
             return
         host = self.host[self.parity]
@@ -376,14 +366,14 @@ class StepInputPack:
         host[: 8 * len(desc)].view(torch.int64).copy_(torch.tensor(desc, dtype=torch.int64))
         # Descriptors and data in one upload; the gap between them is unused padding.
         self.dev[: self.used].copy_(host[: self.used], non_blocking=True)
-        if self.parallel_scatter and _parallel_ok(self.h2d, self.d2d):
+        if self.parallel_scatter and not self.cpp_scatter and _parallel_ok(self.h2d, self.d2d):
             stage_i64 = self.dev.view(torch.int64)
             if self.h2d:
-                _parallel_scatter_kernel[(len(self.h2d),)](
+                _triton()._parallel_scatter_kernel[(len(self.h2d),)](
                     self.dev, stage_i64, 0, DEVICE_SRC=False, BLOCK=256, num_warps=2
                 )
             if self.d2d:
-                _parallel_scatter_kernel[(len(self.d2d),)](
+                _triton()._parallel_scatter_kernel[(len(self.d2d),)](
                     self.dev, stage_i64, len(self.h2d), DEVICE_SRC=True, BLOCK=256, num_warps=2
                 )
         else:

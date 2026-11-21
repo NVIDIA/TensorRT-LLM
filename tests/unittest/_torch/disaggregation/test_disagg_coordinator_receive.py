@@ -546,6 +546,51 @@ def test_without_deferral_no_fence_is_taken_and_receives_start_at_admission() ->
     assert h.transceiver.call_log[0] == "request_and_receive_async:1"
 
 
+class _DraftReadyEvent:
+    """Draft pool readiness event stub: waiting on an unready one is a test failure."""
+
+    def __init__(self, ready: bool) -> None:
+        self.ready = ready
+
+    def query(self) -> bool:
+        return self.ready
+
+    def synchronize(self) -> None:
+        assert self.ready, "a nonblocking pass must not wait on an unready draft event"
+
+
+def test_nonblocking_pass_leaves_a_request_whose_draft_pool_is_not_ready() -> None:
+    """wait_all=False posts only the requests whose target and draft pools are both ready."""
+    events = {1: _DraftReadyEvent(True), 2: _DraftReadyEvent(False)}
+
+    def draft_done(req):
+        event = events.get(req.py_request_id)
+        return event is None or event.query()
+
+    draft = SimpleNamespace(
+        _disagg_draft_kv_receive=True,
+        disagg_receive_ready_done=draft_done,
+        take_disagg_receive_ready=lambda req: events.pop(req.py_request_id, None),
+    )
+    h = CoordinatorHarness(is_kv_manager_v2=True, draft_kv_cache_manager=draft)
+    h.kv_cache_manager.disagg_receive_ready_done = lambda req: True
+    h.kv_cache_manager.wait_disagg_receive_ready = Mock()
+    first, second = _gen_init(h, 1), _gen_init(h, 2)
+    h.coordinator._deferred_gen_receives = [first, second]
+
+    h.coordinator.start_deferred_gen_receives(wait_all=False)
+
+    assert "request_and_receive_async:1" in h.transceiver.call_log
+    assert "request_and_receive_async:2" not in h.transceiver.call_log
+    assert h.coordinator._deferred_gen_receives == [second]
+
+    events[2].ready = True
+    h.coordinator.start_deferred_gen_receives(wait_all=True)
+
+    assert h.transceiver.call_log.count("request_and_receive_async:2") == 1
+    assert h.coordinator._deferred_gen_receives == []
+
+
 # -- receive completion -------------------------------------------------------
 
 _COMPLETE = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
@@ -646,6 +691,41 @@ def test_try_finish_gen_receive_hands_a_completed_request_to_generation() -> Non
     assert req.py_kv_transfer_timed_out is False
 
 
+def test_a_deferred_reuse_commit_runs_only_when_committed() -> None:
+    """With defer_commit the request is handed to generation at once, but its
+    blocks are committed for reuse only by commit_deferred_gen_receives, once:
+    the flush empties the list."""
+    h = CoordinatorHarness()
+    req = _GenRequest(1, py_kv_transfer_start_time=5.0, py_kv_transfer_timed_out=True)
+
+    assert h.coordinator.try_finish_gen_receive(req, defer_commit=True) is True
+
+    assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert req.context_current_position == req.prompt_len
+    assert (req.py_kv_transfer_start_time, req.py_kv_transfer_timed_out) == (None, False)
+    assert h.transceiver.call_log == []
+    h.coordinator.commit_deferred_gen_receives()
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+    h.coordinator.commit_deferred_gen_receives()
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+
+
+def test_a_deferred_reuse_commit_skips_requests_that_left_their_prompt_end() -> None:
+    """A deferred request that finished, or moved past its prompt end, before
+    the flush gets no commit (that only keeps its blocks out of the reuse
+    tree); the others are committed in finish order."""
+    h = CoordinatorHarness()
+    kept, finished, moved, later = (_GenRequest(rid) for rid in (1, 2, 3, 4))
+    for req in (kept, finished, moved, later):
+        assert h.coordinator.try_finish_gen_receive(req, defer_commit=True) is True
+    finished.state = LlmRequestState.GENERATION_COMPLETE
+    moved.context_current_position = moved.prompt_len + 3
+
+    h.coordinator.commit_deferred_gen_receives()
+
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1", "commit_blocks_for_reuse:4"]
+
+
 @pytest.mark.parametrize(
     "state",
     [
@@ -700,8 +780,8 @@ def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyEx
 
     finish = coordinator.try_finish_gen_receive
 
-    def finish_and_record(req):
-        finished = finish(req)
+    def finish_and_record(req, **kwargs):
+        finished = finish(req, **kwargs)
         events.append(("finish", req.py_request_id, finished))
         return finished
 
@@ -752,6 +832,41 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
     assert receiving.new_tokens == []
     assert h.transceiver.call_log == ["commit_blocks_for_reuse:1", "commit_blocks_for_reuse:2"]
     executor._handle_errors.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "rejection, ctx_drafts, expected, onehot",
+    [
+        (False, None, [0, 0, 0], False),  # no context drafts: dummies
+        (False, [5], [5, 0, 0], False),  # a narrower context server: padded
+        (False, [5, 6, 7], [5, 6, 7], False),  # kept
+        (True, [5, 6, 7], [0, 0, 0], True),  # rejection: dummies on the one-hot row
+        (True, None, [0, 0, 0], True),
+    ],
+)
+def test_receive_tail_sets_the_first_draft_tokens(rejection, ctx_drafts, expected, onehot) -> None:
+    """The first step's draft tokens of a received request, through the receive tail: the
+    context server's drafts padded to this server's width, or dummies verified against the
+    one-hot placeholder row under rejection sampling (no proposal row exists on this server)."""
+    h = CoordinatorHarness()
+    events = []
+    executor = _executor_over(h.coordinator, events)
+    executor.enable_spec_decode = True
+    executor.model_engine = SimpleNamespace(
+        spec_config=SimpleNamespace(use_rejection_sampling=rejection), max_total_draft_tokens=3
+    )
+    request = _GenRequest(
+        1,
+        events=events,
+        context_phase_params=SimpleNamespace(first_gen_tokens=[41], draft_tokens=ctx_drafts),
+    )
+    _received(h, request)
+
+    executor._prepare_disagg_gen_transmission_complete(_batch(request))
+
+    assert request.py_draft_tokens == expected
+    assert getattr(request, "py_needs_onehot_draft_probs", False) is onehot
+    assert request.new_tokens == [(41, 0)]
 
 
 @pytest.mark.parametrize("coordinator_kind", ["real", "noop"])

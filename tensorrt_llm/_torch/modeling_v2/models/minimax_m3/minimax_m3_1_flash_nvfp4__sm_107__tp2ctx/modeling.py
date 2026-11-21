@@ -115,6 +115,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.utils import (
     AuxStreamType,
@@ -131,7 +132,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .. import cute_aot, runtime_hooks_compat
+from .. import cute_aot
 from ..kernels import m31_moe_finalize_out as _m31_finalize_out
 from ..msa import engine as _msa_engine
 from ..ops import swiglu_rows_plan
@@ -846,26 +847,6 @@ def _bcg_note(item: str, x: Any) -> None:
         f"[M3.1 tp2ctx] TP2CTX_ITEMS_IN_BCG captured {item} (rows {rows}) "
         f"input {getattr(x, 'dtype', type(x).__name__)} {shape}"
     )
-
-
-def _nccl_window_probe(mapping) -> None:
-    """The NCCL_SYMMETRIC window route probe (AR1 fallback without torch.distributed), once per rank after weight
-    load: kind 2 = an NCCL window buffer. Collective over the TP group (every CTX rank runs setup_aliases);
-    never raises."""
-    try:
-        from tensorrt_llm.bindings.internal.thop import BufferKind
-
-        _, kind = torch.ops.trtllm.allocate_output(
-            torch.empty(8, 6144, dtype=torch.bfloat16, device="cuda"),
-            int(BufferKind.NCCL_WINDOW),
-            list(mapping.tp_group),
-        )
-        logger.info(
-            f"[M3.1 tp2ctx] NCCL_WINDOW_PROBE kind={kind} (2 = window) "
-            f"tlnccl_sym_zero_copy={os.environ.get('TLLM_NCCL_SYMMETRIC_ZERO_COPY', '1')}"
-        )
-    except Exception as e:  # a probe: never fail serving
-        logger.info(f"[M3.1 tp2ctx] NCCL_WINDOW_PROBE failed: {type(e).__name__}: {str(e)[:160]}")
 
 
 # TP2CTX_A1_IN_BCG (rides TP2CTX_ITEMS_IN_BCG): inside a breakable prefill capture the QKV-index
@@ -5153,7 +5134,6 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
                 layer.next_layer_layernorm = layers[idx + 1].input_layernorm
             layer._normq_feeds_mxfp8 = idx != num_layers - 1
         if getattr(self, "_m31_probe_mapping", None) is not None:
-            _nccl_window_probe(self._m31_probe_mapping)
             _sp_init(self._m31_probe_mapping)
             self._m31_probe_mapping = None
         # TP2CTX_NORMQ consumers: every MXFP8 linear takes a published activation for its own input.
@@ -5303,20 +5283,26 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx(MiniMaxM3ForCausalLM):
     # splits on steps whose longest query span exceeds 128 rows (MSA maxscore_qo_tile: the same score table bits; the
     # OnlyScore proxy modes are native on SM107). Kill switch TRTLLM_M31_DISABLE_TP2CTX_PROXY_Q128=1. The late-compile
     # detector arms after warmup, as on the generation targets: the server marks ready and logs any compile after it.
-    # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
-    runtime_hooks = runtime_hooks_compat.build(
-        dict(
-            sparse_attention=_msa_engine.sparse_attention_classes(),
-            disagg_draft_kv=True,
-            late_compile_detect=True,
-            ctx_batch_wait_skip=True,
-            gpu_timestamps=True,
-        ),
-        msa=dict(
+    runtime_hooks = RuntimeHooks(
+        sparse_attention=_msa_engine.sparse_attention_classes(),
+        disagg_draft_kv=True,
+        late_compile_detect=True,
+        ctx_batch_wait_skip=True,
+        postlaunch_admission=True,
+        gpu_timestamps=True,
+        # Context worker: store-aware first-chunk ranking with context fill, context-only
+        # preemption with the least-progress victim, and the drafter's host-side context
+        # allocation and index_fill one-hot rows.
+        ctx_store_aware_ranking=True,
+        ctx_only_preemption=True,
+        context_onehot_index_fill=True,
+        dflash_host_ctx_alloc=True,
+        draft_kv_reserve_guard=True,
+        bounce_scatter_on_order_stream=True,
+        msa=MsaRuntimePolicy(
             prefill_proxy_qo_tile=None if m31_disabled("TP2CTX_PROXY_Q128") else 128,
             prefill_proxy_kv_splits=None if m31_disabled("TP2CTX_PROXY_Q128") else 4,
         ),
-        target=__name__,
     )
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
@@ -5341,7 +5327,7 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx(MiniMaxM3ForCausalLM):
             f"[M3.1 tp2ctx] DIST_PROBE torch.distributed initialized={_dist_on} "
             f"backend={_dist.get_backend() if _dist_on else None} world={_dist.get_world_size() if _dist_on else None}"
         )
-        # The NCCL window probe runs after weight load (setup_aliases): __init__ runs on the meta device.
+        # _sp_init runs after weight load (setup_aliases): __init__ runs on the meta device.
         self._m31_probe_mapping = model_config.mapping
 
     def load_weights(

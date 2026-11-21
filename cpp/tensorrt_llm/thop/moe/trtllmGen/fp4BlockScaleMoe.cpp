@@ -625,6 +625,13 @@ public:
         return *runner;
     }
 
+    //! The kernel names of tactic (tileN, config) as getValidConfigs returns it (the non-fine-grained runner of that
+    //! tile): a stable name for tactic caches.
+    [[nodiscard]] std::string getConfigName(int64_t tileN, int64_t config)
+    {
+        return getRunner(static_cast<int32_t>(tileN), /* useFineGrained */ false).getConfigName(config);
+    }
+
     // Tuned over the non-fine-grained tile set only: the fine-grained kernels are never profiled,
     // so they reuse the tuned tile with their own default config.
     [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
@@ -1116,6 +1123,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
+        .def("get_config_name", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getConfigName)
         .def("run_moe", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::run)
         .def("run_moe_routing_tables", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runRoutingTables)
         .def("run_moe_prerouted", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runPrerouted)

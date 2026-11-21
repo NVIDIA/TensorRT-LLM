@@ -124,6 +124,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     get_current_replay_token,
     is_in_breakable_cuda_graph,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.utils import (
     AuxStreamType,
@@ -140,7 +141,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .. import cute_aot, runtime_hooks_compat
+from .. import cute_aot
 from ..msa import engine as _msa_engine
 from ..ops import swiglu_rows_plan
 from ..ops.moe.megamoe_local.local_impl import MegaMoEDeferredTopkReduce, _route_quant_key
@@ -979,13 +980,9 @@ _BCG_PAD_MASK = not large_prefill_graphs_disabled("DEP2CTX_BCG_PAD_MASK")
 # that model's prefill graphs); a layer without a guard keeps the stock projection. Rides on
 # DEP2CTX_A1_IN_BCG and DEP2CTX_ITEMS_IN_BCG (either switch restores the stock projection under capture). Kill switch
 # TRTLLM_M31_DISABLE_DEP2CTX_A1_FUSED_IN_BCG=1.
-# Only the engine's release of the prefill graphs (RuntimeHooks.prefill_graphs_released) resets the guard, so on an
-# engine without that hook the item stays off and the stock projection runs: a recapture on a new KV pool (after
-# KV-cache estimation) would otherwise meet the released graphs' notes.
-_A1_FUSED_IN_BCG_REQUESTED = not large_prefill_graphs_disabled("DEP2CTX_A1_FUSED_IN_BCG")
-_A1_FUSED_IN_BCG = _A1_FUSED_IN_BCG_REQUESTED and runtime_hooks_compat.has_hook(
-    "prefill_graphs_released"
-)
+# The engine's release of the prefill graphs (RuntimeHooks.prefill_graphs_released) resets the guard, so a recapture on
+# a new KV pool (after KV-cache estimation) does not meet the released graphs' notes.
+_A1_FUSED_IN_BCG = not large_prefill_graphs_disabled("DEP2CTX_A1_FUSED_IN_BCG")
 _BCG_PTRS_WHAT = "[M3.1 dep2ctx] DEP2CTX_A1_FUSED_IN_BCG"
 
 # The GPU architecture this target is written for (SM107).
@@ -5458,28 +5455,37 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx(MiniMaxM3ForCausalLM):
     # the OnlyScore proxy modes are native on SM107). Kill switch TRTLLM_M31_DISABLE_DEP2CTX_PROXY_Q128=1. The
     # late-compile detector arms after warmup, as on the generation targets: the server marks ready and logs any
     # compile after it.
-    # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
-    runtime_hooks = runtime_hooks_compat.build(
-        dict(
-            sparse_attention=_msa_engine.sparse_attention_classes(),
-            disagg_draft_kv=True,
-            ctx_batch_wait_skip=True,
-            gpu_timestamps=True,
-            # The windowed draft pool's sizing and resize fixes.
-            draft_pool_fixes=True,
-            late_compile_detect=True,
-            # DEP2CTX_BCG_LARGE: the breakable prefill buckets above 4096; the kill switch caps the list at 4096.
-            prefill_capture_extra_num_tokens=_ppr.DEP2CTX_BCG_GRID if _BCG_LARGE else (),
-            prefill_capture_extra_min_top=_BCG_BASE_MAX,
-            prefill_capture_max_num_tokens=None if _BCG_LARGE else _BCG_BASE_MAX,
-            # DEP2CTX_A1_FUSED_IN_BCG: the pointer guard's notes end with the graphs that baked them.
-            prefill_graphs_released=_bcg_graphs_released if _A1_FUSED_IN_BCG else None,
-        ),
-        msa=dict(
+    runtime_hooks = RuntimeHooks(
+        sparse_attention=_msa_engine.sparse_attention_classes(),
+        disagg_draft_kv=True,
+        ctx_batch_wait_skip=True,
+        postlaunch_admission=True,
+        gpu_timestamps=True,
+        # The windowed draft pool's sizing and resize fixes.
+        draft_pool_fixes=True,
+        # Context worker: store-aware first-chunk ranking with context fill, context-only
+        # preemption with the least-progress victim, and the drafter's host-side context
+        # allocation and index_fill one-hot rows.
+        ctx_store_aware_ranking=True,
+        ctx_only_preemption=True,
+        context_onehot_index_fill=True,
+        dflash_host_ctx_alloc=True,
+        draft_kv_reserve_guard=True,
+        bounce_scatter_on_order_stream=True,
+        # Attention-DP context worker: the store lease touch and fabric KV writes to the DEP peers.
+        store_lease_touch=True,
+        kv_fabric_write=True,
+        late_compile_detect=True,
+        # DEP2CTX_BCG_LARGE: the breakable prefill buckets above 4096; the kill switch caps the list at 4096.
+        prefill_capture_extra_num_tokens=_ppr.DEP2CTX_BCG_GRID if _BCG_LARGE else (),
+        prefill_capture_extra_min_top=_BCG_BASE_MAX,
+        prefill_capture_max_num_tokens=None if _BCG_LARGE else _BCG_BASE_MAX,
+        # DEP2CTX_A1_FUSED_IN_BCG: the pointer guard's notes end with the graphs that baked them.
+        prefill_graphs_released=_bcg_graphs_released if _A1_FUSED_IN_BCG else None,
+        msa=MsaRuntimePolicy(
             prefill_proxy_qo_tile=None if m31_disabled("DEP2CTX_PROXY_Q128") else 128,
             prefill_proxy_kv_splits=None if m31_disabled("DEP2CTX_PROXY_Q128") else 4,
         ),
-        target=__name__,
     )
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
@@ -5495,12 +5501,6 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx(MiniMaxM3ForCausalLM):
             )
         # The CuTe DSL kernels' exported objects (TRTLLM_M31_CUTE_AOT_DIR) serve this process from here on.
         cute_aot.arm()
-        if _A1_FUSED_IN_BCG_REQUESTED and not _A1_FUSED_IN_BCG:
-            logger.info_once(
-                f"{_BCG_PTRS_WHAT} not taken: this engine does not release prefill graphs to the model; stock "
-                "projection under capture",
-                key="dep2ctx_a1_fused_in_bcg",
-            )
         super().__init__(model_config)
         # DEP2CTX_TSEL (#20629 TILE_SELECT): the prefill top-16 select as the tile select, on every layer's MSA indexer.
         _tsel.register(self)

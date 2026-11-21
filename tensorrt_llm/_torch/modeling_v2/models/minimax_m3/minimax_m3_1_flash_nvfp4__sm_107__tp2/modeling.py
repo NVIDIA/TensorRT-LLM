@@ -157,6 +157,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as _sampler_flashinfer
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.speculative import interface as _spec_interface
@@ -173,7 +174,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .. import cute_aot, m31_capture_fork, m31_decode_fsel, runtime_hooks_compat
+from .. import cute_aot, m31_capture_fork, m31_decode_fsel, m31_pins
 from ..kernels import m3_index_score as _index_score_kernel
 from ..kernels import m3_index_score_t2sc as _index_score_t2sc_kernel
 from ..kernels import m3_nnt_fold, m3_spec_tail
@@ -200,6 +201,7 @@ from ..ops.attention.m31_qkv_insert import m3_qkv_insert
 from ..ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm
 from ..ops.comm.m3_mc_finalize_allreduce_norm import m3_mc_finalize_allreduce_norm
 from ..ops.comm.m31_allreduce import m3_allreduce
+from ..ops.dspark import dflash_merge as _dflash_merge
 from ..ops.embedding.m31_embedding import m3_embedding
 from ..ops.gemm.m3_draft_lowm import ROWS as DRAFT_LOWM_TACTIC_ROWS
 from ..ops.gemm.m3_draft_lowm import m3_draft_lowm
@@ -331,6 +333,17 @@ PUSH_GEMM_N, PUSH_GEMM_K = (
     6144,
     4096,
 )  # capacity: fixed: the TP2 o_proj shape the epilogue is built for
+# DENSE16A: on decode-graph steps of DENSE16A_MIN_ROWS..DENSE16A_MAX_ROWS rows, the multicast attention boundary of a
+# dense-MLP layer (all-reduce + residual + RMSNorm, pushed into by the o_proj or not) also writes the MXFP8 of the norm
+# (the op's ``quant`` copy: trtllm::mxfp8_quantize(normed, True) bytes, rows and swizzled scales), handed to the dense
+# gate_up through _D16_MX. The gate_up's stock path at these rows is the pinned generic quantize
+# (m3_mxfp8_pinned_quantize, the same mxfp8_quantize bytes) + the pinned GEMM; it runs that GEMM on the boundary's
+# bytes instead of quantizing, so the output is bitwise the stock chain's. Kill switch TRTLLM_M31_DISABLE_DENSE16A=1.
+DENSE16A = not m31_disabled("DENSE16A")
+DENSE16A_MIN_ROWS = (
+    9  # capacity: fixed: past the dense gate_up GEMV's bf16 rows (MX_GEMV_BF16_MAX_TOKENS 8)
+)
+DENSE16A_MAX_ROWS = 16  # capacity: fixed: the 16-token boundary bucket
 # Native CUDA ops for the SwiGLU-OAI activation and the MoE finalize, bit for bit the Triton kernels they replace on
 # every band. NATIVE_SWIGLU: mv2_minimax_m3::minimax_m31_swiglu_oai_vec (16-byte vectors, the in-tree swigluOai pair
 # sequence verbatim); kill switch TRTLLM_M31_DISABLE_NATIVE_SWIGLU=1. NATIVE_FINALIZE:
@@ -1034,7 +1047,13 @@ N1_MAX_ROWS = (
 # instead of at its exit (0, the kill value); wider steps keep the exit. The release still follows the select's own
 # grid wait, which the sparse decode's pre-wait q / length / block-table reads rely on.
 SELECT_LONG_TRIGGER_PHASE = 1  # capacity: fixed: a trigger phase, not a size
-SELECT_LONG_TRIGGER_MAX_ROWS = 8  # capacity: fixed: measured trigger crossover
+SELECT_LONG_TRIGGER_MAX_ROWS = int(
+    os.environ.get("TRTLLM_M31_KNOB_SELECT_LONG_TRIGGER_MAX_ROWS", "").strip() or 16
+)  # capacity: knob: the served trigger crossover (0..448 rows)
+if not 0 <= SELECT_LONG_TRIGGER_MAX_ROWS <= 448:
+    raise ValueError(
+        f"TRTLLM_M31_KNOB_SELECT_LONG_TRIGGER_MAX_ROWS={SELECT_LONG_TRIGGER_MAX_ROWS}: expected 0..448 rows"
+    )
 # The long-row select ranks a row's candidates on warp 0 when they number at most 64 (a 64-key bitonic network; the
 # other warps exit) and reads the row's valid count before its grid wait; the picks are the same. Kill: False (the
 # all-thread rank). Off on this target: next to the early-launched sparse decode the warp-0 tail does not pay.
@@ -1686,17 +1705,6 @@ STEP_PACK_SPEC_RNG_UPLOADS = True
 # The spec step's small uploads: the accepted-draft counts ride the step-input pack, and the sampler's slot ids stay in
 # a device buffer re-uploaded only when they change (a pageable upload every step otherwise).
 STEP_SPEC_SMALL_H2D = True
-# SKIP_ACCEPTED_UPLOAD (RuntimeHooks.skip_accepted_draft_upload): the step's per-request accepted-draft
-# counts are no longer uploaded and spec_metadata.num_accepted_draft_tokens is None. Nothing on this target reads that
-# tensor (modeling.py, dspark.py, dspark_markov_worker.py, drafter_mxfp8.py, kernels/, ops/; the in-tree DFlash / DSpark
-# workers and the Eagle3 path: tests/unittest/_torch/executor/test_skip_accepted_draft_upload.py scans for readers).
-# Kill switch: TRTLLM_M31_DISABLE_SKIP_ACCEPTED_UPLOAD=1 (the stock per-step upload, packed under spec_small_h2d).
-STEP_SKIP_ACCEPTED_UPLOAD = not m31_disabled("SKIP_ACCEPTED_UPLOAD")
-# BATCH_CHANGED_ONLY (RuntimeHooks.spec_batch_map_changed_only): the standalone DSpark (DFlash)
-# drafter's batch_indices and batch-to-slot map are uploaded only when they change (both constant in steady decode);
-# the buffers hold the same values as with the stock every-step copies. Kill switch:
-# TRTLLM_M31_DISABLE_BATCH_CHANGED_ONLY=1 (both copied every step).
-STEP_BATCH_CHANGED_ONLY = not m31_disabled("BATCH_CHANGED_ONLY")
 STEP_SPEC_FOLD = True
 # The forward of a decode-only step stores its outputs into the spec sampler's store and stages the next step's inputs
 # at its tail (one launch inside the step graph), so neither the sampler's store nor the next step's gathers run
@@ -1725,9 +1733,6 @@ MERGE_MXFP8_HANDOFF = True
 MSA_KV_UPDATE = True
 MSA_SKIP_UNCHANGED_BLOCK_OFFSETS = True
 MSA_REUSE_POOL_VIEWS = True
-# Step-input preparation fills the MSA block-id table by slice-copying each request's page-index view (MSA
-# RuntimeHooks.block_ids_from_views) instead of building a Python list of the whole padded row; the table is the same.
-MSA_BLOCK_IDS_FROM_VIEWS = True
 # The prefill indexer proxy can use tile 128 and a row/KV-size split ladder. The planner's tile is retained at
 # <=128 rows; larger spans require maxscore_qo_tile support. Both routes are on by default;
 # TRTLLM_M31_DISABLE_AGG_PROXY_Q128 / _AGG_PROXY_SPLITS turn them off.
@@ -2360,6 +2365,8 @@ def _linear(
         if TP2W_S2_TAIL and (mode.decode_graph or not mode.tuned_quantize_gemm)
         else None
     )
+    # DENSE16A: the dense attention boundary's MXFP8 norm of x (decode graphs only).
+    d16 = _D16_MX.take(x) if DENSE16A and _D16_MX.pending is not None else None
     if not mode.decode_graph:
         prequant = _CTXNORMQ_MX.take(x) if CTXNORMQ and not mode.tuned_quantize_gemm else None
         if prequant is not None:
@@ -2427,6 +2434,24 @@ def _linear(
             logger.info(
                 f"[M3.1 agg] TP2W_S2_TAIL consumed n={cnt}: [{n}, {k}] GEMM on the fused tail's MXFP8 ({rows} rows)"
             )
+        return output, False
+    if (
+        d16 is not None
+        and s2 is None
+        and push_mx is None
+        and prequant is None
+        and MX_TAC_TP4
+        and core.mxfp8.quant_method.tune_mxfp8_backends
+        and linear_path(n, k, rows, False, low_m_gemm) == GENERIC_GEMM_PATH
+    ):
+        # The stock bf16 branch below is the pinned MX-TAC quantize + GEMM: the same GEMM on the boundary's bytes.
+        output = m3_mxfp8_pinned_gemm(
+            d16[0], d16[1], w, s, torch.bfloat16, MXFP8_DECODE_GEMM_TACTIC
+        )
+        _note_mx_tac("bf16", n, k, rows)
+        m3_report.work(
+            "DENSE16A", f"[{n}, {k}] GEMM on the attention boundary's MXFP8 ({rows} rows)"
+        )
         return output, False
     if prequant is None and x.dtype != torch.bfloat16:
         path = GENERIC_GEMM_PATH
@@ -5925,6 +5950,8 @@ class PrefillTarget:
 # dense gate_up).
 _PUSH_GEMM_MX = m3_prequant.PrequantSlot()
 _PUSH_GEMM_STATE: dict = {}
+# DENSE16A: a dense layer's attention boundary MXFP8 norm for its gate_up's pinned generic GEMM.
+_D16_MX = m3_prequant.PrequantSlot()
 
 
 class PushGemmTarget:
@@ -6532,6 +6559,14 @@ class DecodeTarget:
             i, position_ids, hidden, step, armed if push_gemm is None else push_gemm
         )
         post_norm = core.w[f"l{i}_post_norm"]
+        # DENSE16A: a dense layer's multicast attention boundary (pushed into or not) also writes the norm's MXFP8.
+        d16 = (
+            DENSE16A
+            and plan.attn_mc_ar
+            and decode_graph
+            and i not in core.moe_layers
+            and DENSE16A_MIN_ROWS <= num_tokens <= DENSE16A_MAX_ROWS
+        )
         if push_gemm is not None and attn_pushed:
             hidden, residual = self._push_gemm_boundary(push_gemm, residual, post_norm)
         elif armed is not None and attn_pushed:
@@ -6540,7 +6575,7 @@ class DecodeTarget:
                 _note_wide_push(core, num_tokens, armed[4])
             if ATTN_PUSH16_MIN_TOKENS <= num_tokens <= 16:
                 _attn_push16_taken(num_tokens)
-            hidden, residual = self._prepushed(i, hidden, residual, post_norm, False, AR_PUSH_MODE)
+            hidden, residual = self._prepushed(i, hidden, residual, post_norm, d16, AR_PUSH_MODE)
         else:
             if armed is not None and num_tokens > ATTN_PUSH_BASE_TOKENS:
                 # TP2WIDE_PUSH: the o_proj's input decides whether its GEMV runs (a bf16 input past the bf16 GEMV's
@@ -6556,7 +6591,13 @@ class DecodeTarget:
                     num_tokens,
                     "the o_proj did not push its rows into the armed boundary all-reduce",
                 )
-            hidden, residual = self._boundary(plan.attn_mc_ar, hidden, residual, post_norm)
+            hidden, residual = self._boundary(
+                plan.attn_mc_ar, hidden, residual, post_norm, quant=d16
+            )
+        if d16:
+            mx = m3_prequant.SLOT.take(hidden)
+            if mx is not None:
+                _D16_MX.publish(hidden, *mx)
 
         norm_w = _next_norm(core, i)
         if i not in core.moe_layers:
@@ -8949,20 +8990,9 @@ def _build_speculation(shell, model_config: ModelConfig):
 # --------------------------------------------------------------------------------------------------------------------
 
 
-# TRTLLM_M31_DISABLE_HOSTTAIL=1 turns off the six items of the sm_103 targets' HOSTTAIL bundle together (HOST_D2H_SIDE,
-# SMALL_H2D, BATCH_CHANGED_ONLY, SKIP_ACCEPTED_UPLOAD, PHILOX_PACK, KV_LENS_ONCE below), as there.
+# TRTLLM_M31_DISABLE_HOSTTAIL=1 turns off the host-side items HOST_D2H_SIDE, SMALL_H2D, PHILOX_PACK and KV_LENS_ONCE
+# below together.
 _HOSTTAIL_OFF = m31_disabled("HOSTTAIL")
-# SKIP_ACCEPTED_UPLOAD (RuntimeHooks.skip_accepted_draft_upload): the step's per-request accepted-draft
-# counts are no longer uploaded and spec_metadata.num_accepted_draft_tokens is None. Nothing on this target reads that
-# tensor (modeling.py, dspark.py, dspark_markov_worker.py, drafter_mxfp8.py, kernels/, ops/; the in-tree DFlash / DSpark
-# workers and the Eagle3 path: tests/unittest/_torch/executor/test_skip_accepted_draft_upload.py scans for readers).
-# Kill switch: TRTLLM_M31_DISABLE_SKIP_ACCEPTED_UPLOAD=1 (the stock per-step upload, packed under spec_small_h2d).
-STEP_SKIP_ACCEPTED_UPLOAD = not (_HOSTTAIL_OFF or m31_disabled("SKIP_ACCEPTED_UPLOAD"))
-# BATCH_CHANGED_ONLY (RuntimeHooks.spec_batch_map_changed_only): the standalone DSpark (DFlash)
-# drafter's batch_indices and batch-to-slot map are uploaded only when they change (both constant in steady decode);
-# the buffers hold the same values as with the stock every-step copies. Kill switch:
-# TRTLLM_M31_DISABLE_BATCH_CHANGED_ONLY=1 (both copied every step).
-STEP_BATCH_CHANGED_ONLY = not (_HOSTTAIL_OFF or m31_disabled("BATCH_CHANGED_ONLY"))
 # The rest of the step loop's host-side items, each default on with its own kill switch; every one is exact (the same
 # values reach the device, only the copies' stream, size, grouping or timing change):
 # * HOST_D2H_SIDE (RuntimeHooks.sampler_d2h_side_stream): the spec sampler's store copies to the host on a side
@@ -9030,7 +9060,7 @@ def _counted_pack_prologue(*args, **kwargs):
 TAILBK = not (m31_disabled("TAIL_BOOKKEEP") or m31_disabled("HOST_CAPTURE_TAIL"))
 
 
-def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.RuntimeHooks:
+def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
     """The step-loop hooks this target opts into (each behind its constant above).
 
     * ``pack_step_inputs``: a decode step's small input copies go out as one upload and one scatter at the graph
@@ -9048,12 +9078,8 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
       or stay on the device.
     * ``sampler_d2h_side_stream`` / ``iteration_timing_one_event``: the sampler's store copies and the iteration timing
       leave the main stream.
-    * ``skip_accepted_draft_upload`` / ``spec_batch_map_changed_only`` (kill switches ``SKIP_ACCEPTED_UPLOAD`` /
-      ``BATCH_CHANGED_ONLY``, ``STEP_SKIP_ACCEPTED_UPLOAD`` / ``STEP_BATCH_CHANGED_ONLY``): no per-step upload of the
-      accepted-draft counts (no reader here), and the drafter's batch_indices / batch-to-slot map uploaded only on
-      change.
     * MSA: identity selections for short sequences (and short/long graph families), the one-launch KV-length update,
-      unchanged block-table copies skipped, pool views built once, block-id tables copied from the page-index views.
+      unchanged block-table copies skipped, pool views built once.
     """
     logger.info(
         "[M31_TP2_TAILBK] shared B1 S1 A1 and worker R1 Z1 armed"
@@ -9068,8 +9094,6 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
         "SMALL_H2D": STEP_SMALL_H2D,
         "PHILOX_PACK": STEP_PHILOX_PACK,
         "KV_LENS_ONCE": STEP_KV_LENS_ONCE,
-        "BATCH_CHANGED_ONLY": STEP_BATCH_CHANGED_ONLY,
-        "SKIP_ACCEPTED_UPLOAD": STEP_SKIP_ACCEPTED_UPLOAD,
         "PACK_PSCATTER": STEP_PACK_PSCATTER,
         "PACK_IN_GRAPH": STEP_PACK_IN_GRAPH,
         "PACK_EARLY_COPY": STEP_PACK_EARLY_COPY,
@@ -9085,53 +9109,55 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
         f"[M3 sm107 tp2] rank {mpi_rank()}: step-loop items armed (shared runtime does the work): "
         + " ".join(f"{k}={'on' if v else 'off'}" for k, v in armed.items())
     )
-    # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
-    return runtime_hooks_compat.build(
-        dict(
-            sparse_attention=_msa_engine.sparse_attention_classes(),
-            fp8_saturating_casts=True,
-            ctx_batch_wait_skip=True,
-            gpu_timestamps=True,
-            msa_kv_cache_fixes=True,
-            draft_pool_fixes=True,
-            persist_flashinfer_mxfp8_tactics=True,
-            disagg_draft_kv=True,
-            first_content_emit_iters=FIRST_CONTENT_EMIT_ITERS,
-            mxfp8_pinned_tactics=True,
-            late_compile_detect=True,
-            pack_step_inputs=STEP_PACK_INPUTS,
-            pack_parallel_scatter=STEP_PACK_PSCATTER,
-            pack_in_graph=STEP_PACK_IN_GRAPH,
-            pack_early_copy=STEP_PACK_EARLY_COPY,
-            pack_step_epoch=STEP_PACK_EPOCH,
-            pack_prologue_op=_counted_pack_prologue if STEP_PACK_CPP_PROLOGUE else None,
-            pack_cpp_scatter=STEP_PACK_CPP_SCATTER,
-            skip_unchanged_h2d=STEP_SKIP_UNCHANGED_H2D,
-            h2d_changed_span=STEP_H2D_CHANGED_SPAN,
-            kv_lens_update_once=STEP_KV_LENS_ONCE,
-            spec_offsets_op=m3_spec_offsets if STEP_SPEC_OFFSETS_ONE_LAUNCH else None,
-            loop_on_execution_stream=STEP_LOOP_ON_EXECUTION_STREAM,
-            merge_tuned_tactics_across_ranks=STEP_MERGE_TUNED_TACTICS,
-            skip_greedy_rng_upload=STEP_SKIP_GREEDY_RNG_UPLOAD,
-            pack_spec_rng_uploads=STEP_PHILOX_PACK,
-            spec_small_h2d=STEP_SMALL_H2D,
-            skip_accepted_draft_upload=STEP_SKIP_ACCEPTED_UPLOAD,
-            spec_batch_map_changed_only=STEP_BATCH_CHANGED_ONLY,
-            spec_slot_ids_changed_only=SLOT_IDS_CHANGED,
-            spec_step_fold=spec_fold,
-            sampler_d2h_side_stream=STEP_HOST_D2H_SIDE,
-            skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
-            patch_unchanged_draft_block_offsets=STEP_BLOCKOFF_PATCH,
-            spec_tail_bookkeep=TAILBK,
-            iteration_timing_one_event=STEP_ONE_TIMING_EVENT,
-        ),
-        msa=dict(
-            forward_staging=True,
+    return RuntimeHooks(
+        sparse_attention=_msa_engine.sparse_attention_classes(),
+        ctx_batch_wait_skip=True,
+        postlaunch_admission=True,
+        gpu_timestamps=True,
+        draft_pool_fixes=True,
+        draft_kv_reserve_guard=True,
+        context_onehot_index_fill=True,
+        dflash_host_ctx_alloc=True,
+        # Generation worker: one request's KV prefetched while the batch decodes, and each admitted request's
+        # decode headroom reserved (no tier below GPU).
+        disagg_gen_prefetch_requests=1,
+        disagg_gen_completion_reservation=True,
+        bounce_scatter_on_order_stream=True,
+        persist_flashinfer_mxfp8_tactics=True,
+        # Bundled name-keyed tactic pins (m31_pins); kill: TRTLLM_M31_DISABLE_BUNDLED_PINS=1.
+        install_tactic_pins=lambda rank: m31_pins.install("tp2", rank),
+        disagg_draft_kv=True,
+        first_content_emit_iters=FIRST_CONTENT_EMIT_ITERS,
+        mxfp8_pinned_tactics=True,
+        late_compile_detect=True,
+        pack_step_inputs=STEP_PACK_INPUTS,
+        pack_parallel_scatter=STEP_PACK_PSCATTER,
+        pack_in_graph=STEP_PACK_IN_GRAPH,
+        pack_early_copy=STEP_PACK_EARLY_COPY,
+        pack_step_epoch=STEP_PACK_EPOCH,
+        pack_prologue_op=_counted_pack_prologue if STEP_PACK_CPP_PROLOGUE else None,
+        pack_cpp_scatter=STEP_PACK_CPP_SCATTER,
+        skip_unchanged_h2d=STEP_SKIP_UNCHANGED_H2D,
+        h2d_changed_span=STEP_H2D_CHANGED_SPAN,
+        kv_lens_update_once=STEP_KV_LENS_ONCE,
+        spec_offsets_op=m3_spec_offsets if STEP_SPEC_OFFSETS_ONE_LAUNCH else None,
+        loop_on_execution_stream=STEP_LOOP_ON_EXECUTION_STREAM,
+        merge_tuned_tactics_across_ranks=STEP_MERGE_TUNED_TACTICS,
+        skip_greedy_rng_upload=STEP_SKIP_GREEDY_RNG_UPLOAD,
+        pack_spec_rng_uploads=STEP_PHILOX_PACK,
+        spec_small_h2d=STEP_SMALL_H2D,
+        spec_slot_ids_changed_only=SLOT_IDS_CHANGED,
+        spec_step_fold=spec_fold,
+        sampler_d2h_side_stream=STEP_HOST_D2H_SIDE,
+        skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
+        patch_unchanged_draft_block_offsets=STEP_BLOCKOFF_PATCH,
+        spec_tail_bookkeep=TAILBK,
+        iteration_timing_one_event=STEP_ONE_TIMING_EVENT,
+        msa=MsaRuntimePolicy(
             short_sequence_identity=MSA_SHORT_SEQUENCE_IDENTITY,
             kv_update=_msa_kv_update_kernel.msa_kv_update if MSA_KV_UPDATE else None,
             skip_unchanged_block_offsets=MSA_SKIP_UNCHANGED_BLOCK_OFFSETS,
             reuse_pool_views=MSA_REUSE_POOL_VIEWS,
-            block_ids_from_views=MSA_BLOCK_IDS_FROM_VIEWS,
             prefill_proxy_qo_tile=128 if MSA_PROXY_Q128 else None,
             prefill_proxy_kv_splits=4 if MSA_PROXY_Q128 else None,
             prefill_proxy_kv_splits_by_rows=(
@@ -9145,7 +9171,6 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
                 else None
             ),
         ),
-        target=__name__,
     )
 
 
@@ -9389,6 +9414,8 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2(
                     self.spec_worker.bind_tail_fold(spec_fold)
         self._spec_fold = spec_fold
         self.runtime_hooks = _runtime_hooks(spec_fold)
+        # The drafter's non-causal block merge as one CUDA launch (kill: TRTLLM_M31_DISABLE_NATIVE_DFLASH_MERGE=1).
+        self._dflash_merge = _dflash_merge.install()
         _install_topp_det()
         _install_softmax_mc()
         _install_rej_mc()

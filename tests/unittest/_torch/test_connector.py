@@ -334,6 +334,59 @@ def test_scheduler_output_keeps_deltas_while_the_allocation_lives():
     assert again.cached_requests[0].new_block_ids == []
 
 
+def test_context_only_scheduler_output_refuses_a_generation_request():
+    """A connector declared context_only (a disaggregated context server, which
+    never runs a generation step) fails loudly when a generation request
+    reaches it instead of tracking a page list that drafts may shrink."""
+    worker = MagicMock()
+    worker.capacity_only = False
+    manager = KvCacheConnectorManager(worker,
+                                      _FlatOnlyScheduler(),
+                                      context_only=True)
+    assert manager.context_only is True
+    assert manager.scheduler_output_manager.context_only is True
+    assert KvCacheConnectorManager(worker,
+                                   _FlatOnlyScheduler()).context_only is False
+
+    req = MagicMock()
+    req.request_id = 11
+    req.is_dummy_request = False
+    batch = ScheduledRequests()
+    batch.generation_requests = [req]
+    with pytest.raises(RuntimeError, match="context_only"):
+        manager.scheduler_output_manager.build_scheduler_output(
+            batch, AsyncRequests(dict(), dict()), MagicMock())
+
+    # Context requests pass as before.
+    ctx = MagicMock()
+    ctx.request_id = 12
+    ctx.state = LlmRequestState.CONTEXT_INIT
+    ctx.get_tokens.return_value = list(range(32))
+    ctx.context_current_position = 0
+    ctx.context_remaining_length = 32
+    ctx.context_chunk_size = 32
+    ctx.kv_cache_retention_config = None
+    ctx.cache_salt = None
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    kv_cache_manager.get_priority_by_block_id.return_value = 0
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [ctx]
+    out = manager.scheduler_output_manager.build_scheduler_output(
+        batch, AsyncRequests(dict(), dict()), kv_cache_manager)
+    assert len(out.new_requests) == 1
+
+
+def test_context_only_connector_config_field():
+    from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+
+    config = KvCacheConnectorConfig(connector="lmcache")
+    assert config.context_only is False
+    assert KvCacheConnectorConfig(connector="lmcache",
+                                  context_only=True).context_only is True
+
+
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
     """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
     NUM_DRAFT_TOKENS = 3

@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
+from tensorrt_llm._torch.speculative.interface import OneModelSamplingParams, SpecMetadata
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
@@ -29,6 +29,8 @@ def _meta(pack_rng_uploads: bool) -> SpecMetadata:
         max_num_requests=4, max_draft_len=MAX_DRAFT_LEN, max_total_draft_tokens=MAX_DRAFT_LEN
     )
     meta.pack_rng_uploads = pack_rng_uploads
+    # A sampled batch: an all-greedy one uploads nothing.
+    meta.is_all_greedy_sample = False
     return meta
 
 
@@ -38,6 +40,17 @@ def _request(slot: int, seed: Optional[int]) -> types.SimpleNamespace:
         py_decoding_iter=0,
         py_request_id=slot,
         sampling_config=types.SimpleNamespace(seed=seed),
+        # The normalized parameters LlmRequest caches; only the seed is read here.
+        py_spec_sampling_params=OneModelSamplingParams(
+            temperature=0.7,
+            top_k=torch.iinfo(torch.int32).max,
+            top_p=0.9,
+            min_p=0.0,
+            is_greedy=False,
+            # top_p=0.9 is not temperature-only sampling.
+            is_temperature_only=False,
+            seed=seed,
+        ),
     )
 
 
@@ -59,6 +72,7 @@ def test_packed_uploads_land_at_the_flush_with_the_plain_values():
     plain = _meta(pack_rng_uploads=False)
     _populate(plain)
     expected = _rng_state(plain)
+    assert expected["seeds"].any()
 
     packed = _meta(pack_rng_uploads=True)
     pack = StepInputPack(torch.device("cuda", torch.cuda.current_device()))
@@ -79,11 +93,15 @@ def test_without_an_open_pack_the_uploads_are_plain_copies():
     plain = _meta(pack_rng_uploads=False)
     _populate(plain)
     expected = _rng_state(plain)
+    assert expected["seeds"].any()
 
     packed = _meta(pack_rng_uploads=True)
     _populate(packed)
 
-    for name, tensor in _rng_state(packed).items():
+    actual = _rng_state(packed)
+    # The seeded request is batch row 0.
+    assert actual["request_seeds"][0].item() == 1234
+    for name, tensor in actual.items():
         assert torch.equal(tensor, expected[name]), name
 
 

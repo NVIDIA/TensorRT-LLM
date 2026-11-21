@@ -327,11 +327,13 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
                 "enabled",
                 "is_warmup_only",
                 "short_long_seq_len_threshold",
+                "long_family_min_total_tokens",
                 "set_capture_sample_type",
             ],
             enabled=True,
             is_warmup_only=False,
             short_long_seq_len_threshold=None,
+            long_family_min_total_tokens=None,
         ),
     )
     resource_manager = Mock()
@@ -379,7 +381,10 @@ def test_generation_capture_runs_one_pass_per_kv_regime() -> None:
     runner = decoder_graphs(
         decoder_config(max_seq_len=20000),
         cuda_graph_runner=Mock(
-            enabled=True, is_warmup_only=False, short_long_seq_len_threshold=None
+            enabled=True,
+            is_warmup_only=False,
+            short_long_seq_len_threshold=None,
+            long_family_min_total_tokens=None,
         ),
     )
     resource_manager = Mock()
@@ -424,11 +429,52 @@ def test_generation_capture_runs_one_pass_per_kv_regime() -> None:
 
 
 @pytest.mark.cpu_only
+def test_a_long_family_boundary_above_max_seq_len_is_cleared() -> None:
+    """Above the per-rank max length the longest warmup serves every batch: no long family."""
+    runner = decoder_graphs(
+        decoder_config(max_seq_len=20000),
+        cuda_graph_runner=Mock(
+            enabled=True,
+            is_warmup_only=False,
+            short_long_seq_len_threshold=None,
+            long_family_min_total_tokens=30000,
+        ),
+    )
+    warmup_lengths = []
+
+    def create_request(resources, batch_size, draft_len, max_seq_len, **kwargs):
+        warmup_lengths.append(max_seq_len)
+        return ScheduledRequests()
+
+    with (
+        patch.object(runner, "_kv_regime_resolver", return_value=None),
+        patch.object(runner, "_get_graphs_to_capture", return_value=[(1, 0)]),
+        patch.object(
+            runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
+        ),
+        patch.object(
+            runner._dummy_requests,
+            "release_batch_context",
+            side_effect=lambda request, resources: contextlib.nullcontext(request),
+        ),
+        patch.object(runner, "_forward_warmup", Mock()),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        runner._capture_generation_cuda_graphs(Mock())
+
+    assert warmup_lengths == [20000]
+    assert runner.cuda_graph_runner.long_family_min_total_tokens is None
+
+
+@pytest.mark.cpu_only
 def test_generation_capture_runs_one_pass_per_packed_split_variant() -> None:
     runner = decoder_graphs(
         decoder_config(max_seq_len=20000),
         cuda_graph_runner=Mock(
-            enabled=True, is_warmup_only=False, short_long_seq_len_threshold=None
+            enabled=True,
+            is_warmup_only=False,
+            short_long_seq_len_threshold=None,
+            long_family_min_total_tokens=None,
         ),
     )
     resource_manager = Mock()
@@ -482,7 +528,7 @@ def test_packed_split_resolver_resolves_only_for_the_fp4_mla_packed_decode(monke
     monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
     mla_layer = Mock(spec=MLA)
     mla_layer.num_heads_tp = 128
-    model = Mock()
+    model = Mock(runtime_hooks=None)  # declares no runtime hooks
     model.modules.return_value = [torch.nn.Identity(), mla_layer, mla_layer]
     runner = decoder_graphs(decoder_config(), model=model)
     fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
@@ -566,7 +612,7 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
 
     mla_layer = Mock(spec=MLA)
     mla_layer.num_heads_tp = 128
-    model = Mock()
+    model = Mock(runtime_hooks=None)  # declares no runtime hooks
     model.modules.return_value = [torch.nn.Identity(), mla_layer, mla_layer]
     runner = decoder_graphs(decoder_config(), model=model)
     fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
@@ -635,7 +681,7 @@ def test_kv_regime_resolver_resolves_each_graph_shape_once() -> None:
 
     mla_layer = Mock(spec=MLA)
     mla_layer.num_heads_tp = 128
-    model = Mock()
+    model = Mock(runtime_hooks=None)  # declares no runtime hooks
     model.modules.return_value = [mla_layer]
     runner = decoder_graphs(decoder_config(), model=model)
     fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])

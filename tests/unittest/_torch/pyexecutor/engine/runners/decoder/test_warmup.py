@@ -53,7 +53,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInp
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
@@ -719,6 +719,82 @@ def test_attention_warmup_covers_enabled_request_phases(
     assert not runner._trtllm_gen_jit_warmup
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pins", [None, "set"], ids=["without_pins", "with_pins"])
+def test_autotuner_warmup_installs_the_model_tactic_pins_once(
+    monkeypatch: pytest.MonkeyPatch, pins: str | None
+) -> None:
+    """RuntimeHooks.install_tactic_pins runs once per warmup object, with the rank, before the first tuning pass."""
+    order = []
+    install = Mock(side_effect=lambda rank: order.append(("pins", rank)))
+    hooks = RuntimeHooks(install_tactic_pins=install) if pins else DEFAULT_RUNTIME_HOOKS
+    engine = SimpleNamespace(
+        _config=SimpleNamespace(
+            enable_autotuner=True,
+            torch_compile_enabled=False,
+            torch_compile_prefill_only=False,
+            max_num_tokens=16,
+            max_batch_size=16,
+            max_seq_len=2,
+            original_max_draft_len=0,
+            max_total_draft_tokens=0,
+            is_spec_decode=False,
+            max_draft_len=0,
+            spec_config=None,
+        ),
+        _completed_autotuner_warmup_num_tokens=None,
+        _tactic_pins_installed=False,
+        _warmup_timer=_WarmupTimer(rank=0),
+        model=SimpleNamespace(modules=lambda: [], runtime_hooks=hooks),
+        mapping=SimpleNamespace(tp_size=1, rank=3, has_pp=lambda: False),
+        dist=object(),
+        guided_decoder=None,
+        _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=False),
+        _dummy_requests=SimpleNamespace(
+            create_warmup_request=Mock(return_value=object()),
+            release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
+        ),
+        _agreement=SimpleNamespace(
+            agree_flag=Mock(return_value=False),
+            should_run_warmup_batch=Mock(return_value=True),
+        ),
+        _release_megamoe_profiling_scratch=Mock(),
+        _forward_warmup=Mock(side_effect=lambda *args, **kwargs: order.append("forward")),
+    )
+    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    resources = SimpleNamespace(
+        get_resource_manager=lambda key: (
+            cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
+        )
+    )
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    monkeypatch.setattr(
+        decoder_warmup_module.AutoTuner, "get", Mock(return_value=Mock(profiling_cache={}))
+    )
+    monkeypatch.setattr(
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", Mock())
+
+    DecoderWarmup._run_autotuner_warmup(engine, resources)
+    engine._completed_autotuner_warmup_num_tokens = None
+    DecoderWarmup._run_autotuner_warmup(engine, resources)
+
+    if pins:
+        # Once, with the rank, before every tuning forward (the native and the FlashInfer MXFP8 passes alike).
+        install.assert_called_once_with(3)
+        assert order[0] == ("pins", 3) and "forward" in order[1:]
+        assert ("pins", 3) not in order[1:]
+        assert engine._tactic_pins_installed is True
+    else:
+        assert engine._tactic_pins_installed is False
+        assert "forward" in order
+    # A new warmup object starts without the pins, so each engine's warmup installs them once.
+    assert DecoderWarmup._tactic_pins_installed is False
+
+
 def _context_only_warmup_requests(context_only: bool) -> Mock:
     """Dummy requests that, like the real factory, build no generation rows on a context-only cache."""
     requests = Mock()
@@ -1368,7 +1444,7 @@ class TestWarmupCleanup(unittest.TestCase):
         calls = []
 
         @contextlib.contextmanager
-        def flashinfer_autotune() -> Iterator[None]:
+        def flashinfer_autotune(*args, **kwargs) -> Iterator[None]:
             calls.append("flashinfer_autotune_enter")
             yield
             calls.append("flashinfer_autotune_exit")
@@ -1427,7 +1503,7 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.append("trtllm_autotune_exit")
 
         @contextlib.contextmanager
-        def flashinfer_autotune() -> Iterator[None]:
+        def flashinfer_autotune(*args, **kwargs) -> Iterator[None]:
             calls.append("flashinfer_autotune_enter")
             yield
             calls.append("flashinfer_autotune_exit")
@@ -1562,7 +1638,7 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.append("autotune_exit")
 
         @contextlib.contextmanager
-        def flashinfer_autotune() -> Iterator[None]:
+        def flashinfer_autotune(*args, **kwargs) -> Iterator[None]:
             calls.append("flashinfer_autotune_enter")
             yield
             calls.append("flashinfer_autotune_exit")

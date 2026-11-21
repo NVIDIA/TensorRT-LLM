@@ -24,7 +24,8 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
-ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments)
+ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments,
+    BounceConfig::StreamPriority priority)
     : mDeviceId(deviceId)
 {
     TLLM_CHECK_WITH_INFO(count > 0, "ExecPool: count must be > 0");
@@ -33,10 +34,18 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
     // Gather/scatter copies sit on the KV-transfer critical path but share the GPU with model
     // kernels (prefill/decode). At default priority a copy kernel queues behind those (measured
     // ~260us avg, >1ms tail, vs ~65us of actual copy time). Greatest priority lets its blocks be
-    // scheduled as soon as any SM frees up, without preempting running work.
+    // scheduled as soon as any SM frees up, without preempting running work. The priority class is
+    // configurable (copy_stream_priority) for deployments where copy blocks must not jump ahead of
+    // model kernels.
     int leastPriority = 0;
     int greatestPriority = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+    switch (priority)
+    {
+    case BounceConfig::StreamPriority::kGreatest: mStreamPriority = greatestPriority; break;
+    case BounceConfig::StreamPriority::kLeast: mStreamPriority = leastPriority; break;
+    case BounceConfig::StreamPriority::kDefault: mStreamPriority = 0; break;
+    }
     mCtxs.resize(count);
     // A mid-loop TLLM_CUDA_CHECK throw would skip the destructor (the object is not fully
     // constructed), leaking every stream/event/buffer allocated so far -> clean up and rethrow.
@@ -60,7 +69,7 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
             {
                 TLLM_CUDA_CHECK(cudaHostGetDevicePointer(&c.hostPinnedDev, c.hostPinned, 0));
             }
-            TLLM_CUDA_CHECK(cudaStreamCreateWithPriority(&c.stream, cudaStreamNonBlocking, greatestPriority));
+            TLLM_CUDA_CHECK(cudaStreamCreateWithPriority(&c.stream, cudaStreamNonBlocking, mStreamPriority));
             TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&c.event, cudaEventDisableTiming));
             mFree.push_back(i);
         }

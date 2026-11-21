@@ -8,11 +8,6 @@ Target packages register these implementations when imported after routing.
 import torch
 
 
-@torch.library.register_fake("trtllm::minimax_m3_mxfp8_low_m_gemm")
-def _(x, w, wsf, warps, cluster_k, row_tiles, pdl):
-    return x.new_empty((x.shape[0], w.shape[0]))
-
-
 @torch.library.register_fake("trtllm::minimax_m3_router_gemv")
 def _(x, w, rows, pdl):
     return x.new_empty((x.shape[0], w.shape[0]), dtype=torch.float32)
@@ -64,39 +59,8 @@ def _(
     ]
 
 
-@torch.library.register_fake("trtllm::minimax_m3_mc_allreduce_norm")
-def _(
-    x,
-    x2,
-    residual,
-    norm_w,
-    eps,
-    ws_uc,
-    ws_mc_ptr,
-    flags,
-    rank,
-    world,
-    cluster,
-    pdl,
-    perm,
-    scales,
-    maxt,
-    quant,
-    prepushed,
-    opts,
-):
-    outputs = [torch.empty_like(residual), torch.empty_like(residual)]
-    if quant:
-        m, h = residual.shape
-        outputs += [
-            residual.new_empty((m, h), dtype=torch.float8_e4m3fn),
-            residual.new_empty(((m + 127) // 128 * 128 * (h // 32),), dtype=torch.uint8),
-        ]
-    return outputs
-
-
-# The MiniMax-M3 sm_107 TP2 / TP4 / TP8 decode ops: one producer and one all-reduce + norm op per TP width (Q and
-# index-Q heads per rank from the kernels' producerPw{2,4,8}.h), and the dense QK-norm + RoPE ops.
+# The MiniMax-M3 sm_107 TP2 / TP4 / TP8 decode ops: one producer op per TP width (Q and index-Q heads per rank from
+# the kernels' producerPw{2,4,8}.h), and the dense QK-norm + RoPE ops.
 def _register_minimax_m3_sm107_fakes(tp: int, heads_q: int, heads_index: int) -> None:
     @torch.library.register_fake(f"trtllm::minimax_m3_sm107_tp{tp}_producer_pw")
     def _(
@@ -123,40 +87,6 @@ def _register_minimax_m3_sm107_fakes(tp: int, heads_q: int, heads_index: int) ->
             packed.new_empty((num_tokens, heads_q, 128), dtype=torch.float8_e4m3fn),
             packed.new_empty((num_tokens, heads_index, 128), dtype=torch.float8_e4m3fn),
         ]
-
-    @torch.library.register_fake(f"trtllm::minimax_m3_sm107_tp{tp}_mc_allreduce_norm")
-    def _(
-        x,
-        x2,
-        residual,
-        norm_w,
-        eps,
-        ws_uc,
-        ws_mc_ptr,
-        flags,
-        rank,
-        world,
-        cluster,
-        pdl,
-        perm,
-        scales,
-        maxt,
-        quant,
-        prepushed,
-        opts,
-        cap_out=None,
-        cap_w=None,
-        cap_eps=0.0,
-    ):
-        # [normed, updated residual] (+ [E4M3 rows, swizzled scale bytes] with quant); cap_out is written in place.
-        outputs = [torch.empty_like(residual), torch.empty_like(residual)]
-        if quant:
-            m, h = residual.shape
-            outputs += [
-                residual.new_empty((m, h), dtype=torch.float8_e4m3fn),
-                residual.new_empty(((m + 127) // 128 * 128 * (h // 32),), dtype=torch.uint8),
-            ]
-        return outputs
 
 
 for _tp, _heads_q, _heads_index in ((2, 32, 2), (4, 16, 1), (8, 8, 1)):

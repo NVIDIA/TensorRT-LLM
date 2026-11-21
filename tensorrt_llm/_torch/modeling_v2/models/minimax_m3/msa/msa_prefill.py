@@ -542,12 +542,12 @@ def _combine_takes(fn, name: str) -> bool:
 
 _TP2CTX_BF16X_STATE: dict = {"taken": 0, "skip": {}, "e4m3x_taken": 0}
 
-# The BF16X / E4M3X fork is a model opt-in (RuntimeHooks.msa_prefill_fork), armed by the executor (arm_prefill_fork).
+# The BF16X / E4M3X fork is armed by the M3.1 targets when they build their MSA attention (arm_prefill_fork).
 _PREFILL_FORK_ARMED = False
 
 
 def arm_prefill_fork() -> None:
-    """Let the MSA NVFP4 sparse prefill take the BF16X / E4M3X fork in this process (RuntimeHooks.msa_prefill_fork)."""
+    """Let the MSA NVFP4 sparse prefill take the BF16X / E4M3X fork in this process."""
     global _PREFILL_FORK_ARMED
     _PREFILL_FORK_ARMED = True
 

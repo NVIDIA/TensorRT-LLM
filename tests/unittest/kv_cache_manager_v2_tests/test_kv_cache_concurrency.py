@@ -517,6 +517,51 @@ def test_many_threads_probe_reuse_concurrently() -> None:
         manager.shutdown()
 
 
+def test_gil_fast_path_resize_and_probe_with_priority_callback_antagonist() -> None:
+    """resize() and probe_reuse() keep the GIL when the API lock is free and release it otherwise.
+
+    The antagonist holds the lock while it reacquires the GIL for its priority callback, so the main
+    thread meets both a free lock (fast path, GIL kept) and a held one (GIL released before waiting).
+    Neither may deadlock, and the probe must answer the same depth on either path.
+    """
+    manager = KVCacheManager(_make_config())
+    source = None
+    try:
+        tokens_per_block = manager.tokens_per_block
+        # Far above the antagonist's ever-growing token ids, so its commits never extend this prefix.
+        tokens = list(range(1 << 30, (1 << 30) + tokens_per_block * 4))
+        stream = CudaStream(torch.cuda.Stream().cuda_stream)
+        source = manager.create_kv_cache(None, [])
+        assert source.resume(stream)
+        assert source.resize(len(tokens))
+        source.commit(tokens, is_end=True)
+        source.suspend()
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        antagonist.start()
+        try:
+            _await_antagonist(antagonist, hits)
+            cache = manager.create_kv_cache(None, [])
+            assert cache.resume(stream)
+            depths = set()
+            for _ in range(500):
+                assert cache.resize(tokens_per_block * 4)
+                assert cache.resize(tokens_per_block * 2)
+                depths.add(manager.probe_reuse(None, tokens))
+            cache.suspend()
+            cache.close()
+        finally:
+            stop.set()
+            _join(antagonist)
+        assert depths == {len(tokens)}
+        assert hits["n"] > 0, "priority callback never ran; test proves nothing"
+    finally:
+        if source is not None:
+            source.close()
+        manager.shutdown()
+
+
 def test_priority_callback_under_the_lock_does_not_deadlock_stats_queries() -> None:
     """The exact GIL/API-lock inversion.
 

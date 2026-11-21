@@ -83,7 +83,7 @@ def _creator(model, monkeypatch, resolved=_Resolved):
         lambda self, cls, model_config, kv_cache_config: cls,
     )
     monkeypatch.setattr(_util, "is_hybrid_linear", lambda config: False)
-    model.model_config = SimpleNamespace(pretrained_config=object())
+    model.model_config = SimpleNamespace(pretrained_config=object(), sparse_attention_config=None)
     creator = object.__new__(_util.KvCacheCreator)
     creator._model_engine = SimpleNamespace(model=model)
     creator._kv_cache_config = SimpleNamespace(enable_block_reuse=False)

@@ -293,51 +293,9 @@ def _m31_speculation_mismatch(spec_config: Optional[Any]) -> Optional[str]:
     return None
 
 
-def _m31_drafter_window(spec_config: Any) -> Optional[int]:
-    """The DSpark drafter's attention window as its ``config.json`` declares it, or None for full attention.
-
-    A window from ``dflash_config`` (``use_swa`` with ``swa_window_size``) or from ``sliding_window`` (unless
-    ``use_sliding_window`` is false or ``layer_types`` names no sliding layer) counts.
-    """
-    path = getattr(spec_config, "speculative_model", None)
-    if path is None:
-        return None
-    try:
-        with open(Path(path) / "config.json") as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return None
-    text = cfg.get("text_config") or {}
-
-    def field(name):
-        return text.get(name, cfg.get(name))
-
-    def positive_int(value) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-    dflash = field("dflash_config")
-    if (
-        isinstance(dflash, dict)
-        and dflash.get("use_swa")
-        and positive_int(dflash.get("swa_window_size"))
-    ):
-        return dflash["swa_window_size"]
-    window = field("sliding_window")
-    layer_types = field("layer_types")
-    if field("use_sliding_window") is False or not positive_int(window):
-        return None
-    if layer_types and not any("sliding" in str(layer_type).lower() for layer_type in layer_types):
-        return None
-    return window
-
-
-def _m31_disagg_generation(llm_args: TorchLlmArgs) -> bool:
-    """Whether this worker is a disaggregated generation worker: the generation role, or a KV cache transceiver
-    without the context role."""
-    role = os.environ.get("TRTLLM_DISAGG_ROLE", "").strip().lower()
-    if role.startswith(("generation", "gen")):
-        return True
-    return llm_args.cache_transceiver_config is not None and not role.startswith(("context", "ctx"))
+# The engine's MSA KV pool zero-initialization switch ("1" = on, the default). The M3.1 targets read page tails no
+# request has written, so they decline a process that turns it off.
+_KV_POOL_ZERO_INIT_ENV = "TRTLLM_M3_KV_POOL_ZERO_INIT"
 
 
 def _m31_refused(
@@ -349,8 +307,6 @@ def _m31_refused(
 ) -> List[str]:
     """What the MiniMax-M3.1-Flash targets do not run for this deployment of the M3.1 checkpoint; empty when one is
     admitted (``topology`` names it)."""
-    from .runtime_hooks_compat import missing_defaults
-
     refused = []
     speculation_miss = _m31_speculation_mismatch(spec_config)
     if speculation_miss is not None:
@@ -361,29 +317,11 @@ def _m31_refused(
         refused.append("a KV cache other than FP8 or NVFP4")
     if topology is None:
         refused.append("a parallel layout no target runs")
-    if spec_config is not None and speculation_miss is None:
-        window = _m31_drafter_window(spec_config)
-        max_seq_len = getattr(llm_args, "max_seq_len", None)
-        windowed = window is not None and (max_seq_len is None or window < max_seq_len)
-        if (
-            windowed
-            and llm_args.enable_chunked_prefill
-            and llm_args.kv_cache_config.host_cache_size in (None, 0)
-        ):
-            refused.append(
-                f"a DSpark drafter with a {window}-token window, chunked prefill and no host KV cache, whose "
-                "separate draft pool needs a history-first resize this engine does not have"
-            )
-        if (
-            windowed
-            and topology in ("tp2", "tp4", "tp8", "dep")
-            and _m31_disagg_generation(llm_args)
-        ):
-            refused.append(
-                f"a disaggregated generation worker with a {window}-token DSpark draft window, which this engine "
-                "does not carry from the context worker"
-            )
-    refused.extend(missing_defaults())
+    zero_init = os.environ.get(_KV_POOL_ZERO_INIT_ENV, "1")
+    if zero_init != "1":
+        refused.append(
+            f"{_KV_POOL_ZERO_INIT_ENV}={zero_init} (the MSA KV pool must be zero-initialized)"
+        )
     return refused
 
 

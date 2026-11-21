@@ -30,6 +30,7 @@ from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
 )
 
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+from .bounce_knobs import effective_agent_bounce_params
 
 
 class BindingsNixlTransferStatus(TransferStatus):
@@ -131,6 +132,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
 
         # Bounce config stays OUT of backend_params: backend_params is forwarded verbatim to the
         # NIXL backend plugin, while the bounce knobs ride their own BaseAgentConfig fields.
+        agent_bounce_params = effective_agent_bounce_params(agent_bounce_params)
         config = BaseAgentConfig(
             name,
             use_prog_thread,
@@ -141,7 +143,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             rank=rank,
             world_size=world_size,
             agent_buffer_size_mb=agent_buffer_size_mb,
-            bounce_params=agent_bounce_params or {},
+            bounce_params=agent_bounce_params,
         )
         self._cpp_agent = CppNixlTransferAgent(config)
         self.name = name
@@ -150,7 +152,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             f"use_prog_thread={use_prog_thread} num_threads={num_threads} "
             f"enable_telemetry={enable_telemetry} backend_params={backend_params} "
             f"agent_buffer_size_mb={agent_buffer_size_mb} "
-            f"agent_bounce_params={agent_bounce_params or {}} "
+            f"agent_bounce_params={agent_bounce_params} "
             f"UCX_TLS={os.environ.get('UCX_TLS', '<unset>')} "
             f"UCX_LOG_LEVEL={os.environ.get('UCX_LOG_LEVEL', '<unset>')}"
         )
@@ -192,6 +194,14 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     def bounce_enabled(self) -> bool:
         """Whether the NIXL bounce v2 fast path is active on this agent."""
         return self._cpp_agent.bounce_enabled
+
+    def set_scatter_order_stream(self, stream_handle: int) -> bool:
+        """Order bounce receive scatters on the CUDA stream ``stream_handle`` (0 = private streams).
+
+        Returns whether the stream is in effect (False when bounce is inactive, the
+        ``scatter_on_order_stream`` knob is off, or the stream is on another device).
+        """
+        return bool(self._cpp_agent.set_scatter_order_stream(int(stream_handle)))
 
     @property
     def bounce_submit_count(self) -> int:

@@ -30,7 +30,11 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import mxfp8_gemm_autotuned
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
+    FlashInferMXFP8GemmRunner,
+    mxfp8_gemm_autotuned,
+)
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import (
     mxfp8_cute_pinned_tactics as _pin,
 )
@@ -118,6 +122,13 @@ def buffers(rows: int, device: torch.device) -> Optional[Tuple[torch.Tensor, tor
     return full[0][:rows], full[1][: scale_bytes(rows)]
 
 
+def _dispatch_scope_active(name: str) -> bool:
+    """Whether the linear layer's MXFP8 dispatch scope ``name`` (``_MXFP8_NATIVE_DISPATCH_ACTIVE`` /
+    ``_MXFP8_CUTE_DSL_DISPATCH_ACTIVE``) is entered; False on a runtime without the scope."""
+    active = getattr(_linear, name, None)
+    return active is not None and active.get()
+
+
 class DepMergeMxfp8LinearMethod(MXFP8LinearMethod):
     """MXFP8LinearMethod that runs its GEMM on the decode's MXFP8 hand-off when its input is the published LC2 output
     (the operands the stock apply would quantize, bit for bit); every other call is the stock apply. The GEMM half
@@ -155,8 +166,11 @@ class DepMergeMxfp8LinearMethod(MXFP8LinearMethod):
         )
         if output is not None:
             return output if bias is None else output + bias
-        if self.uses_mxfp8_backend_autotune:
-            # Profiling is controlled by flashinfer_mxfp8_autotune.
+        native_scope = _dispatch_scope_active("_MXFP8_NATIVE_DISPATCH_ACTIVE")
+        cute_dsl_scope = _dispatch_scope_active("_MXFP8_CUTE_DSL_DISPATCH_ACTIVE")
+        if self.uses_mxfp8_backend_autotune and not native_scope and not cute_dsl_scope:
+            # Profiling is controlled by flashinfer_mxfp8_autotune; the native and CuTe DSL dispatch scopes keep their
+            # own GEMM.
             output = mxfp8_gemm_autotuned(
                 act_e4m3,
                 act_sf,
@@ -166,9 +180,20 @@ class DepMergeMxfp8LinearMethod(MXFP8LinearMethod):
                 module.mxfp8_allowed_backends,
             )
         else:
+            cute_dsl_dispatch = (
+                self.backend == "auto" and not is_torch_compiling() and cute_dsl_scope
+            )
+            if cute_dsl_dispatch and not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+                logger.warning_once(
+                    "FlashInfer's CuTe DSL MXFP8 GEMM is unavailable; "
+                    "mxfp8_cute_dsl_dispatch runs the native GEMM.",
+                    key="mxfp8_cute_dsl_dispatch_unavailable",
+                )
             use_flashinfer = self.backend == "flashinfer" or (
                 self.backend == "auto"
                 and not is_torch_compiling()
+                and not native_scope
+                and not cute_dsl_scope
                 and (
                     _linear._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
                     or (
@@ -177,7 +202,12 @@ class DepMergeMxfp8LinearMethod(MXFP8LinearMethod):
                     )
                 )
             )
-            if use_flashinfer:
+            if cute_dsl_dispatch and IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+                output = FlashInferMXFP8GemmRunner(module.dtype).forward(
+                    [act_e4m3, act_sf, module.weight, module.weight_scale],
+                    tactic=FlashInferMXFP8GemmRunner.CUTE_DSL,
+                )
+            elif use_flashinfer:
                 flashinfer_mxfp8 = self._flashinfer_mxfp8
                 assert flashinfer_mxfp8 is not None
                 output = flashinfer_mxfp8(

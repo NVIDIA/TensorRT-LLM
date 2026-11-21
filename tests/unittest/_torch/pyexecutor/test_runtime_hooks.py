@@ -72,8 +72,23 @@ def test_every_field_defaults_to_off():
             assert all(
                 getattr(value, item.name) in (False, None) for item in dataclasses.fields(value)
             )
+        elif field.name == "prefill_capture_extra_num_tokens":
+            assert value == ()
         else:
             assert value in (False, None), field.name
+
+
+@pytest.mark.parametrize(
+    "hooks, skips",
+    [
+        (RuntimeHooks(), False),
+        (RuntimeHooks(skip_unchanged_draft_block_offsets=True), True),
+        (RuntimeHooks(patch_unchanged_draft_block_offsets=True), False),
+    ],
+    ids=["default", "draft_block_offset_skip", "patch_alone"],
+)
+def test_the_draft_block_offset_skip_asks_for_private_metadata_buffers(hooks, skips):
+    assert hooks.skips_unchanged_metadata_uploads is skips
 
 
 def test_hooks_declared_as_none_mean_the_default():
@@ -290,7 +305,9 @@ def test_overlap_loop_scope_stays_off_with_side_streams(monkeypatch, name, value
 # ---------------------------------------------------------------------------------------------
 
 _SEAM_CONSUMERS = (
+    "pyexecutor/engine/runners/decoder/graphs.py",
     "pyexecutor/engine/runners/decoder/inputs.py",
+    "pyexecutor/engine/runners/decoder/warmup.py",
     "pyexecutor/py_executor.py",
 )
 
@@ -303,6 +320,8 @@ _SEAM_ATTRS = {
     "decode_prologue": None,
     "first_content_emit_iters": 1,
     "_late_compile_detect": False,
+    # The CUDA graph runner's copy of MsaRuntimePolicy.long_family_min_total_tokens.
+    "long_family_min_total_tokens": None,
 }
 # Locals the call sites hold a hook (or a decision on one) in.
 _SEAM_LOCALS = ("prologue",)

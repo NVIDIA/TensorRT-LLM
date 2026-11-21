@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DEP_MARKOV_GLUE: the DSpark ancestral draft loop's per-position glue (``DSparkWorker._sample_block_ancestrally``)
+"""DEP_MARKOV_GLUE: the DSpark ancestral draft loop's per-position glue (``DSparkWorker._sample_block_draft_tokens``)
 in three launches a position, through the ancestral glue override (``speculative/dspark.set_ancestral_glue_override``).
 
 Around the Markov w2 GEMV and the sampler, each of the K draft positions runs the stock lines
