@@ -317,6 +317,8 @@ class _PrimsTSSparseCore:
         if is_decode:
             if seq_lens is None:
                 raise ValueError("QSA PrimTS decode needs per-request seq_lens")
+            if request_indices is not None or query_positions is not None:
+                raise ValueError("QSA PrimTS decode derives request metadata from seq_lens")
             num_requests = seq_lens.numel()
             if rows % num_requests:
                 raise ValueError(
@@ -333,6 +335,8 @@ class _PrimsTSSparseCore:
         else:
             if request_indices is None or query_positions is None:
                 raise ValueError("QSA PrimTS prefill needs request_indices and query_positions")
+            if seq_lens is not None:
+                raise ValueError("QSA PrimTS prefill takes per-row metadata, not seq_lens")
             request_indices = request_indices.to(torch.int32).contiguous()
             padded_rows = -(-rows // _PREFILL_ROW_BUCKET) * _PREFILL_ROW_BUCKET
             if padded_rows != rows:

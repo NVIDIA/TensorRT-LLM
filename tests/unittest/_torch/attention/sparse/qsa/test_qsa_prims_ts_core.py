@@ -373,6 +373,85 @@ def test_repeat_runs_skip_wrapper_validation() -> None:
         torch.testing.assert_close(out.float(), reference(case).float(), atol=2e-2, rtol=2e-2)
 
 
+def test_warm_plan_revalidates_on_binding_and_failure() -> None:
+    _requires_prims_ts()
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+    )
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
+        [36, 92], seed=80
+    )
+
+    def run(
+        k: torch.Tensor, v: torch.Tensor, positions_dtype: torch.dtype = torch.int32
+    ) -> torch.Tensor:
+        return prims_ts_sparse_gqa(
+            q,
+            k,
+            v,
+            block_table,
+            block_ids,
+            request_indices,
+            positions.to(positions_dtype),
+            **kwargs,
+        )
+
+    validated = []
+    fail_next = []
+    wrapper_cls = fi_metadata.QTokenKvBlockSparsePagedTSWrapper
+    original = wrapper_cls.run
+
+    def recorded(self, *args, validate: bool = True, **kw) -> torch.Tensor:
+        validated.append(validate)
+        result = original(self, *args, validate=validate, **kw)
+        if fail_next:
+            fail_next.pop()
+            raise RuntimeError("injected launch failure")
+        return result
+
+    wrapper_cls.run = recorded
+    try:
+        core = prims_ts_core._PrimsTSSparseCore()
+        with mock.patch.object(prims_ts_core, "_CORE", core):
+            run(k_cache, v_cache)
+            run(k_cache, v_cache)
+            # Mixed metadata is rejected before the ABI comparison, without a launch.
+            with pytest.raises(ValueError, match="seq_lens"):
+                prims_ts_sparse_gqa(
+                    q,
+                    k_cache,
+                    v_cache,
+                    block_table,
+                    block_ids,
+                    request_indices,
+                    positions,
+                    seq_lens=torch.ones(2, dtype=torch.int32, device=q.device),
+                    **kwargs,
+                )
+            launches = len(validated)
+            # Same storage, different page geometry: the ABI changes and the wrapper rejects it.
+            pages = k_cache.shape[0]
+            with pytest.raises((ValueError, RuntimeError)):
+                run(
+                    k_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
+                    v_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
+                )
+            assert validated[launches:] == [True]
+            # A failed launch after a validated ABI change drops the plan's ABI.
+            fail_next.append(True)
+            with pytest.raises(RuntimeError, match="injected"):
+                run(k_cache, v_cache, torch.int64)
+            launches = len(validated)
+            run(k_cache, v_cache)
+            run(k_cache, v_cache)
+            assert validated[launches:] == [True, False]
+    finally:
+        wrapper_cls.run = original
+    torch.cuda.synchronize()
+
+
 def test_auto_gates_small_decode_batches() -> None:
     _requires_prims_ts()
     from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
