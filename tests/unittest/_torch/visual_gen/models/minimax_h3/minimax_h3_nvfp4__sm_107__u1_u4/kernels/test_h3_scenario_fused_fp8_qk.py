@@ -106,10 +106,22 @@ def _reference(qkv, wq, wk, cos, sin, mode, valid_len=None):
     return codes, torch.stack(descales)
 
 
-def _run(qkv, wq, wk, cos, sin, mode, ulysses, valid_len=None):
+def _run(qkv, wq, wk, cos, sin, mode, ulysses, valid_len=None, rope_halves_equal=False):
     static = fq.qk_static_descale(D, qkv.device) if mode == "qkstatic" else None
     outs, descale = fq._qk_norm_rope_fp8_impl(
-        qkv, wq, wk, cos, sin, static, EPS, H, D, 0, valid_len, ulysses
+        qkv,
+        wq,
+        wk,
+        cos,
+        sin,
+        static,
+        EPS,
+        H,
+        D,
+        0,
+        valid_len,
+        ulysses,
+        rope_halves_equal=rope_halves_equal,
     )
     if ulysses > 1:
         # Send buffer [U, S, 3, H / U, D] -> the three plain [1, S, H * D] tensors.
@@ -149,6 +161,21 @@ def test_cast_matches_reference(monkeypatch, rows, mode, kernel, ulysses):
         descale,
         ref_descale,
     )
+
+
+@pytest.mark.parametrize("kernel", tuple(KERNELS))
+@pytest.mark.parametrize("mode", ("dynamic", "qkstatic"))
+@pytest.mark.parametrize("rows", ROWS)
+def test_equal_rope_halves_option_keeps_the_codes(monkeypatch, rows, mode, kernel):
+    """``rope_halves_equal`` skips loading the table's second half; ``_inputs`` repeats the angles."""
+    _pin(monkeypatch, mode, kernel)
+    qkv, wq, wk, cos, sin = _inputs(rows, seed=rows)
+    half = cos.shape[-1] // 2
+    assert torch.equal(cos[:, :half], cos[:, half:]) and torch.equal(sin[:, :half], sin[:, half:])
+    ref_codes, ref_descale = _reference(qkv, wq, wk, cos, sin, mode)
+    codes, descale = _run(qkv, wq, wk, cos, sin, mode, 0, rope_halves_equal=True)
+    _assert_codes(codes, ref_codes, f"halves-equal/{mode}/{kernel}")
+    assert torch.equal(descale.view(torch.int32), ref_descale.view(torch.int32))
 
 
 @pytest.mark.parametrize(

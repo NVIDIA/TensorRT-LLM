@@ -49,6 +49,7 @@ def qk_norm_rope(
         layer_idx,
         valid_len,
         0,
+        # MiniMaxH3RotaryPosEmbed repeats its frequencies: cos and sin are cat((f, f)).
         rope_halves_equal=True,
     )
     return outputs[0], outputs[1], outputs[2], scales
@@ -310,27 +311,31 @@ class Fp8Transformer(ScenarioTransformer):
             [block.attn.to_out[0].input_scale.detach().reshape(1) for block in blocks]
         )
         _, _, factors, self.fp8_kernel_qualification = prepare(scales, kernel_cache)
-        for index, block in enumerate(blocks):
-            block.attn.qkv_proj.quant_method = Fp8QkvMethod()
-            # The kernel's tile order replaces the checkpoint's row order in place of a second copy.
-            gate_up = block.ff.gate_up_proj
-            gate_up.weight.data = gate_up_swiglu.pack_weight(gate_up.weight)
-            gate_up.quant_method = PackedGateUpMethod()
-            for name, linear in [("qkv", block.attn.qkv_proj), ("gate_up", block.ff.gate_up_proj)]:
-                # FP32 division on the host is correctly rounded, as the kernels' div.rn is.
-                inverse = torch.reciprocal(linear.input_scale.detach().cpu()).to(device)
-                block.register_buffer(f"_fp8_{name}_reciprocal", inverse, persistent=False)
-            block.register_buffer(
-                "_fp8_output_quant_factor", factors[index : index + 1], persistent=False
-            )
+        # Everything that can fail runs before the weights change, so a failed load leaves the
+        # checkpoint layout in place.
         gate_up_swiglu._get_compiled(device.index)
         table_dtype = blocks[0].adaln_proj.linear.dtype
         for width, gate in (
             (7168, projection_residual.ATTENTION_OUTPUT_GATE),
             (14336, projection_residual.DOWN_GATE),
         ):
+            # The dtypes the blocks pass (token tags are int64); other dtypes take the unfused path.
             projection_residual.compile_kernel(
                 device.index, 5376, width, gate, table_dtype, torch.int64
+            )
+        for index, block in enumerate(blocks):
+            block.attn.qkv_proj.quant_method = Fp8QkvMethod()
+            gate_up = block.ff.gate_up_proj
+            if not isinstance(gate_up.quant_method, PackedGateUpMethod):
+                # The kernel's tile order replaces the checkpoint's row order, with no second copy.
+                gate_up.weight.data = gate_up_swiglu.pack_weight(gate_up.weight)
+                gate_up.quant_method = PackedGateUpMethod()
+            for name, linear in [("qkv", block.attn.qkv_proj), ("gate_up", block.ff.gate_up_proj)]:
+                # FP32 division on the host is correctly rounded, as the kernels' div.rn is.
+                inverse = torch.reciprocal(linear.input_scale.detach().cpu()).to(device)
+                block.register_buffer(f"_fp8_{name}_reciprocal", inverse, persistent=False)
+            block.register_buffer(
+                "_fp8_output_quant_factor", factors[index : index + 1], persistent=False
             )
         self.fp8_conditioning_cache = ConditioningCache(self)
         torch.cuda.synchronize(device)

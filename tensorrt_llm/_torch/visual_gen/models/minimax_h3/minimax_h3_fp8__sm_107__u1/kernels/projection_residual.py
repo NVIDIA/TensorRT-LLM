@@ -798,12 +798,13 @@ def block_shared_memory_bytes(device_index):
 def compile_kernel(device_index, n, k, gate_column, modulation_dtype, index_dtype):
     """The compiled kernel for one projection shape; row counts are symbolic, so one build serves
     every sequence length and every number of modulation rows."""
-    tile_n = CONFIG["tile_n"]
-    assert n % tile_n == 0 and k % 128 == 0
     key = (device_index, n, k, gate_column, modulation_dtype, index_dtype)
     if key not in _compiled:
+        tile_n = CONFIG["tile_n"]
         cn = CONFIG["cluster_shape_mn"][1]
-        assert (n // tile_n) % cn == 0 and ((n // tile_n) // cn) % CONFIG["swizzle_size"] == 0
+        tiles = n // tile_n
+        if n % tile_n or k % 128 or tiles % cn or (tiles // cn) % CONFIG["swizzle_size"]:
+            raise ValueError(f"the FP8 projection kernel does not tile a [{n}, {k}] weight")
         capacity = block_shared_memory_bytes(device_index)
         needed = (256 + tile_n // 2) * CONFIG["mma_tile_k"] * CONFIG["num_ab_stage"] + 4096
         if capacity < needed:
@@ -848,21 +849,25 @@ def compile_kernel(device_index, n, k, gate_column, modulation_dtype, index_dtyp
     return _compiled[key]
 
 
-def supports(a, w, x, mod, idx):
-    """Whether these tensors meet the compiled kernel's dtype, layout and alignment contract."""
+def supports(a, w, x, mod, idx, gate_column):
+    """Whether a kernel compiled by ``compile_kernel`` serves these tensors as they are.
+
+    Nothing is compiled here: a shape, gate or dtype without a compiled kernel, or a tensor
+    outside the kernel's layout and alignment contract, takes the caller's unfused path."""
+    if not (a.is_cuda and a.ndim == w.ndim == mod.ndim == 2):
+        return False
     m, n = a.shape[0], w.shape[0]
+    key = (a.device.index, n, a.shape[1], gate_column, mod.dtype, idx.dtype)
     return (
-        a.ndim == w.ndim == 2
+        key in _compiled
         and m > 0
         and a.shape[1] == w.shape[1]
         and a.dtype == w.dtype == torch.float8_e4m3fn
         and x.dtype == torch.bfloat16
         and x.numel() == m * n
-        and mod.ndim == 2
         and mod.shape[1] == 6 * n
-        and mod.dtype in (torch.bfloat16, torch.float32)
         and idx.numel() == m
-        and idx.dtype in (torch.int32, torch.int64)
+        and all(t.device == a.device for t in (w, x, mod, idx))
         and all(t.is_contiguous() for t in (a, w, x, mod, idx))
         and all(t.data_ptr() % 256 == 0 for t in (a, w, x))
         and mod.data_ptr() % 32 == 0
@@ -876,7 +881,7 @@ def run(a, w, sa, sw, x, mod, idx, gate_column):
     m, k = a.shape
     n = w.shape[0]
     out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
-    compile_kernel(a.device.index, n, k, gate_column, mod.dtype, idx.dtype)(
+    _compiled[(a.device.index, n, k, gate_column, mod.dtype, idx.dtype)](
         a, w, sa.reshape(1), sw.reshape(1), (x.view(m, n), mod, idx), out
     )
     return out

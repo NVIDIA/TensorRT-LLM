@@ -189,29 +189,19 @@ def prepare(
     This preparation runs before request timing and is repeated for each new process.
 
     Returns ``(quant, cast, factors, proof)``. ``quant`` and ``cast`` are None when the kernels
-    cannot be built or checked here (a build tool is missing, Python runs with ``-O`` so the
-    qualification asserts are off, or the build or the qualification fails); the reason is logged
-    and the callers use the installed operators.
+    cannot be built and checked in this process: a build tool is missing, or Python runs with
+    ``-O`` so the qualification asserts are off. The reason is logged and the callers use the
+    installed operators. With the tools present, a failing build or a kernel that does not match
+    the installed operators raises.
     """
-    reason = None
-    if not __debug__:
-        reason = "Python runs with -O, which disables the qualification asserts"
-    else:
+    if __debug__:
         missing = missing_build_tools()
-        if missing:
-            reason = "not found: " + ", ".join(missing)
+        reason = "not found: " + ", ".join(missing) if missing else None
+    else:
+        reason = "Python runs with -O, which disables the qualification asserts"
     if reason is None:
-        try:
-            with torch.cuda.device(scales.device):
-                return _prepare(scales, cache)
-        except (
-            AssertionError,
-            ImportError,
-            OSError,
-            RuntimeError,
-            subprocess.SubprocessError,
-        ) as e:
-            reason = f"{type(e).__name__}: {e}".strip()
+        with torch.cuda.device(scales.device):
+            return _prepare(scales, cache)
     logger.warning(
         "MiniMax-H3 static FP8: the optional conversion kernels are not used "
         f"({reason}); the installed operators run instead, with identical results"

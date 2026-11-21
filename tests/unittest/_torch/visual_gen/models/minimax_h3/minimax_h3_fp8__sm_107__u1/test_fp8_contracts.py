@@ -311,11 +311,11 @@ class RoutingContracts(unittest.TestCase):
         config = ModuleType(module + ".config")
 
         def unavailable():
-            raise RuntimeError("the conversion kernels are built at load and need nvcc")
+            raise RuntimeError("this process already runs the scenario with other settings")
 
         config.select = unavailable
         with patch.dict(sys.modules, {module + ".config": config}):
-            with self.assertRaisesRegex(namespace["NoScenario"], "need nvcc"):
+            with self.assertRaisesRegex(namespace["NoScenario"], "other settings"):
                 namespace["route_fp8_sm_107_u1"](_config())
             cfg = _config()
             cfg.extra_attrs["visual_gen_scenario"] = "auto"
@@ -1098,17 +1098,50 @@ class LifecycleContracts(unittest.TestCase):
                     },
                 )
                 scales = SimpleNamespace(device=target)
-                result = namespace["prepare"](scales, Path("cache"))
-                self.assertEqual(state["current"], 0)
                 if failure:
-                    # a failed build or qualification keeps the installed operators
-                    self.assertEqual(result[:3], (None, None, "reciprocal"))
-                    self.assertIn("inner context probe", result[3]["reason"])
-                    self.assertEqual(namespace["_MODULES"], {1: (None, None)})
-                    self.assertEqual(len(state["calls"]), 2)
-                else:
-                    self.assertEqual(result, "result")
+                    # with the tools present, a failed build or qualification is an error
+                    with self.assertRaisesRegex(RuntimeError, "inner context"):
+                        namespace["prepare"](scales, Path("cache"))
+                    self.assertEqual(namespace["_MODULES"], {})
                     self.assertEqual(state["calls"], [Path("cache")])
+                else:
+                    self.assertEqual(namespace["prepare"](scales, Path("cache")), "result")
+                    self.assertEqual(state["calls"], [Path("cache")])
+                self.assertEqual(state["current"], 0)
+
+    def test_initialize_compiles_before_packing_and_packs_once(self):
+        source = (FP8 / "modeling.py").read_text()
+        body = source[source.index("def _initialize_fp8") :]
+        self.assertLess(body.index("compile_kernel("), body.index("pack_weight("))
+        self.assertLess(body.index("_get_compiled("), body.index("pack_weight("))
+        self.assertLess(body.index("prepare(scales"), body.index("pack_weight("))
+        self.assertLess(
+            body.index("if not isinstance(gate_up.quant_method, PackedGateUpMethod)"),
+            body.index("pack_weight("),
+        )
+
+    def test_missing_build_tools_keep_installed_operators_without_building(self):
+        warnings = []
+        namespace = _source_definitions(
+            FP8 / "kernels/conversion.py",
+            {"prepare"},
+            {
+                "torch": SimpleNamespace(reciprocal=lambda scales: "reciprocal"),
+                "missing_build_tools": lambda: ["ninja", "cuobjdump"],
+                "logger": SimpleNamespace(warning=warnings.append),
+                "_MODULES": {},
+                "_prepare": lambda scales, cache: self.fail("built without the tools"),
+            },
+        )
+        scales = SimpleNamespace(device=SimpleNamespace(type="cuda", index=1))
+        result = namespace["prepare"](scales, Path("cache"))
+        self.assertEqual(result[:3], (None, None, "reciprocal"))
+        self.assertEqual(
+            result[3], {"unary_qualified": False, "reason": "not found: ninja, cuobjdump"}
+        )
+        self.assertEqual(namespace["_MODULES"], {1: (None, None)})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("not found: ninja, cuobjdump", warnings[0])
 
     def test_prepare_queries_scales_device_before_numerical_work(self):
         target, queries = object(), []

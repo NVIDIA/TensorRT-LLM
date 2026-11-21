@@ -40,7 +40,7 @@ def _cublas_scaled_mm(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.ops.trtllm.cublas_cublas_scaled_mm(
+    return torch.ops.trtllm.cublas_scaled_mm(
         activation,
         weight.t(),
         scale_a=input_scale,
@@ -89,7 +89,9 @@ def down(
     modulation: torch.Tensor,
     indices: torch.Tensor,
 ) -> torch.Tensor:
-    if projection_residual.supports(activation, weight, hidden, modulation, indices):
+    if projection_residual.supports(
+        activation, weight, hidden, modulation, indices, projection_residual.DOWN_GATE
+    ):
         return projection_residual.run(
             activation,
             weight,
@@ -165,7 +167,9 @@ def attention_projection(
     else:
         activation = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(raw, input_scale)[0]
     activation = activation.reshape(-1, 7168)
-    if projection_residual.supports(activation, weight, hidden, modulation, indices):
+    if projection_residual.supports(
+        activation, weight, hidden, modulation, indices, projection_residual.ATTENTION_OUTPUT_GATE
+    ):
         residual = projection_residual.run(
             activation,
             weight,
