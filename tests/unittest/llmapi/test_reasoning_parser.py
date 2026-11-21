@@ -214,6 +214,65 @@ def test_kimi_k2_reasoning_parser(text: str, content: str,
     assert result.reasoning_content == reasoning_context
 
 
+@pytest.mark.parametrize("chat_template_kwargs", [None, {"thinking": True}])
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The token limit stopped the output inside the reasoning block.
+        "The user wants the weather. I should call get_weather and",
+        f"{R1_START}reasoning that never closes",
+        # Complete outputs, as controls.
+        f"reasoning{R1_END}answer",
+        f"reasoning{TOOL_START}tool_call_data",
+    ])
+def test_kimi_k25_parse_matches_streaming(text: str,
+                                          chat_template_kwargs) -> None:
+    """Kimi-K2.5 in thinking mode: parse() splits the output as streaming does.
+
+    The template prefills `<think>`, so an output without an end marker is
+    reasoning cut off by the token limit and belongs in `reasoning_content`.
+    """
+    whole = ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k25", chat_template_kwargs).parse(text)
+
+    streaming = ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k25", chat_template_kwargs)
+    results = [
+        streaming.parse_delta(text[i:i + 3]) for i in range(0, len(text), 3)
+    ]
+    results.append(streaming.finish())
+
+    assert whole.content == "".join(r.content for r in results)
+    assert whole.reasoning_content == "".join(r.reasoning_content
+                                              for r in results)
+
+
+def test_kimi_k25_truncated_reasoning_is_reasoning() -> None:
+    """Reasoning cut off by the token limit is not returned as content."""
+    text = "The user wants the weather. I should call get_weather and"
+
+    result = ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k25", {
+            "thinking": True
+        }).parse(text)
+
+    assert result.content == ""
+    assert result.reasoning_content == text
+
+
+def test_kimi_k25_instant_mode_output_is_content() -> None:
+    """With thinking=False the template closes the block, so all is content."""
+    text = "It is sunny in Paris."
+
+    result = ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k25", {
+            "thinking": False
+        }).parse(text)
+
+    assert result.content == text
+    assert result.reasoning_content == ""
+
+
 @pytest.mark.parametrize(
     ("delta_texts", "content", "reasoning_context"),
     [

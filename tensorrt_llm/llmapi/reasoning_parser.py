@@ -1119,19 +1119,13 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
             reasoning_content = text[:tool_idx]
             content = text[tool_idx:]
         else:
-            # No end marker found.
-            if self.reasoning_at_start:
-                # reasoning_at_start=True but no </think>: this is
-                # instant mode (thinking=False) where the model output
-                # has no thinking tags — treat everything as content.
-                reasoning_content = ""
-                content = text
-            else:
-                # reasoning_at_start=False and we already stripped
-                # <think>: text is incomplete reasoning (e.g. truncated
-                # output) — treat everything as reasoning.
-                reasoning_content = text
-                content = ""
+            # No end marker: the output stopped inside the reasoning block
+            # (e.g. at max_tokens), so all of it is reasoning, as
+            # `parse_delta` streams it. Instant mode (`thinking=False`) never
+            # gets here, because `__init__` then sets `reasoning_at_start`
+            # to False and an output without `<think>` returned above.
+            reasoning_content = text
+            content = ""
 
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)
