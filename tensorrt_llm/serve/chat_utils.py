@@ -367,6 +367,9 @@ def _normalize_tool_call_arguments(index: int,
     if arguments is None:
         item["function"]["arguments"] = {}
     elif isinstance(arguments, str):
+        if not arguments.strip():
+            item["function"]["arguments"] = {}
+            return item
         try:
             arguments = json.loads(arguments)
         except json.JSONDecodeError as e:
