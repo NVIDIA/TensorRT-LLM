@@ -249,6 +249,7 @@ def _logic_gather_rows(rank: int, world_size: int, extents: list[int]):
     shard.set_extents(extents)
     channels, scale = 16, 3
     counts = [e * scale for e in extents]
+    buffers = {}
     for step in range(3):
         parts = [
             torch.full((n, channels), 100 * step + r, dtype=torch.bfloat16, device="cuda")

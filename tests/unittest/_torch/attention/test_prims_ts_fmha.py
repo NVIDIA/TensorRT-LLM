@@ -2936,6 +2936,7 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
         tokens_per_block=32,
     )
     workspace = torch.empty(0, dtype=torch.uint8)
+    q = forward_args = None
     for index, (batch, query_width) in enumerate(((2, 1), (2, 6), (4, 8), (2, 1))):
         metadata.num_generations = batch
         metadata.max_num_requests = 4 * (index + 1)
@@ -2956,6 +2957,7 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     assert all(call.kwargs["validate"] is False for call in workspace_size.call_args_list)
     assert all(call.kwargs["cp_world"] == 1 for call in workspace_size.call_args_list)
     assert all(call.kwargs["cp_interleave_size"] == 1 for call in workspace_size.call_args_list)
+    assert q is not None and forward_args is not None
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
     assert workspace_size.call_count == 3

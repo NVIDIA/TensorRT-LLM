@@ -611,7 +611,7 @@ def test_buffered_events_receive_vocab_size(
             Distributed,
             "get",
             mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-                lambda mapping: distributed
+                staticmethod(lambda mapping: distributed)
             ),
         ),
         patch.object(
@@ -1957,7 +1957,7 @@ def test_kv_cache_manager_init_status_sync_uses_world_max() -> None:
         Distributed,
         "get",
         mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-            lambda mapping: dist
+            staticmethod(lambda mapping: dist)
         ),
     ):
         status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.OK, (mapping))
@@ -2396,7 +2396,7 @@ def test_agg_helix_gpu_only_init_syncs_status_across_ranks(peer_failed: bool) ->
             Distributed,
             "get",
             mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-                lambda mapping: dist
+                staticmethod(lambda mapping: dist)
             ),
         ),
         patch(f"{module}._sync_kv_cache_manager_init_status", return_value=status) as sync,
@@ -4357,7 +4357,7 @@ def test_helix_retention_uses_rank_local_ranges(
         Distributed,
         "get",
         mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-            lambda mapping: dist
+            staticmethod(lambda mapping: dist)
         ),
     )
     manager = KVCacheManagerV2(
@@ -4421,7 +4421,7 @@ def test_agg_helix_retention_uses_global_ranges(
         Distributed,
         "get",
         mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-            lambda mapping: dist
+            staticmethod(lambda mapping: dist)
         ),
     )
     manager = KVCacheManagerV2(
@@ -6158,7 +6158,7 @@ def test_offload_sizing_fails_on_every_rank_before_the_token_sync(
             Distributed,
             "get",
             mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-                lambda mapping: dist
+                staticmethod(lambda mapping: dist)
             ),
         ),
         pytest.raises(error, match=match),
@@ -6195,7 +6195,7 @@ def test_host_history_budget_is_the_smallest_ranks() -> None:
         Distributed,
         "get",
         mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-            lambda mapping: dist
+            staticmethod(lambda mapping: dist)
         ),
     ):
         config = _native_config_with_sparse_arena(
@@ -6333,7 +6333,7 @@ def test_host_tier_keeps_its_size_when_a_rank_cannot_grow_it() -> None:
             "get",
             mock_target(
                 "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:Distributed.get"
-            )(lambda mapping: dist),
+            )(staticmethod(lambda mapping: dist)),
         ),
         patch.object(
             KVCacheManagerV2,
@@ -6520,7 +6520,7 @@ def test_raise_on_every_rank_agrees_across_ranks(
         Distributed,
         "get",
         mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-            lambda mapping: dist
+            staticmethod(lambda mapping: dist)
         ),
     ):
         if raised is None:
@@ -6699,7 +6699,7 @@ def test_sparse_ordinal_overflow_fails_startup_on_every_rank(local_overflow: boo
             Distributed,
             "get",
             mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-                lambda mapping: dist
+                staticmethod(lambda mapping: dist)
             ),
         ),
         patch.object(
@@ -6891,7 +6891,7 @@ def test_sparse_offload_setup_judges_requests_by_the_smallest_host_pool(
             "get",
             mock_target(
                 "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:Distributed.get"
-            )(lambda mapping: dist),
+            )(staticmethod(lambda mapping: dist)),
         ),
         patch.object(
             KVCacheManagerV2,
@@ -7194,7 +7194,7 @@ def test_sparse_kv_offload_config_check_fails_on_every_rank(monkeypatch) -> None
             Distributed,
             "get",
             mock_target("tensorrt_llm._torch.distributed.communicator:Distributed.get")(
-                lambda mapping: dist
+                staticmethod(lambda mapping: dist)
             ),
         ),
         pytest.raises(RuntimeError, match="config check failed on another rank"),

@@ -389,6 +389,7 @@ def test_decode_all_batches_modes_and_devices_share_maximum_workspace(
     assert len(planners.allocations) == 2
     expected_sizes = {torch.device("cuda:0"): 127 * 6 + 1024, torch.device("cuda:1"): 127 * 6}
     workspaces = {}
+    call = workspace = None
     for call in calls:
         device, workspace = call.kwargs["device"], call.kwargs["workspace_buffer"]
         assert workspace.numel() == expected_sizes[device]

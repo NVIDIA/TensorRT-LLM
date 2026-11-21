@@ -85,7 +85,9 @@ differently; this is an interface check, not a behavioral equivalence test.
 
 Method targets use the signature accessed through the class: ordinary methods
 include their receiver, while classmethods and staticmethods expose their bound
-call signatures. Use `@mock_target("production.client:Client.send", bound=True)`
+call signatures. Preserve `classmethod` or `staticmethod` on the replacement
+when the target uses that descriptor. Use
+`@mock_target("production.client:Client.send", bound=True)`
 for a replacement assigned directly to an instance, where Python does not insert
 `self`. The checker resolves the declaring method from source; registering the
 entire owning class is not required to compare an individual method.
@@ -147,6 +149,8 @@ The checker follows direct assignments, simple aliases, literal `setattr`, field
 deletions and `if`/`else` joins. A field written on only one branch is not definitely
 initialized after the join. An unresolved mutation helper prevents a
 successful verification; it is not assumed to initialize or preserve fields.
+This includes calls that capture the instance and mutations through an alias
+whose identity depends on a container or a branch.
 The checkpoint describes that program point only, not later mutations.
 An instance checkpoint can also be used inline, for example
 `consume(verify_instance(state, "production.client:Client"))`; the checker

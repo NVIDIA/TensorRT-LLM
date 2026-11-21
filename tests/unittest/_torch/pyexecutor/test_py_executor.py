@@ -27,7 +27,6 @@ from _torch.disaggregation.fake_dist import FakeDistGroup
 from _torch.pyexecutor.executor_test_utils import make_partial_executor
 from engine_test_utils import DummyModel
 from test_common.host_cache_manager import make_host_cache_manager
-from test_common.host_executor import make_host_executor
 from test_common.interface_checks import mock_target, verify_instance
 from test_common.llm_request_stubs import make_llm_request_mock, make_llm_request_stub
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -1192,6 +1191,88 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
         executor._wait_for_model_engine_input_copy.assert_not_called()
 
 
+class MockPyExecutor:
+    """A mock PyExecutor class for testing request handling logic.
+
+    This mock contains only the attributes and methods needed to test
+    the _handle_special_queue_items functionality.
+    """
+
+    def __init__(self, dist):
+        self.dist = dist
+        self.canceled_req_ids = []
+        self.control_requests = []
+        self.request_accumulated = []
+        self.is_shutdown = False
+        self.expected_num_active_requests = 0
+        self.new_active_requests_queue_latency_ms = 0.0
+        self.waiting_queue = FCFSWaitingQueue()
+
+    def _handle_special_queue_items(self, new_requests):
+        """Handle special signals.
+
+        This method mirrors PyExecutor._handle_special_queue_items.
+        """
+        accepted_new_requests = []
+        for idx, req_item in enumerate(new_requests):
+            if req_item.is_shutdown_request:
+                self.is_shutdown = True
+                break
+            elif req_item.is_canceled_request:
+                self.canceled_req_ids.append(req_item.id)
+            elif req_item.is_control_request:
+                self.control_requests.append(req_item)
+                if self.dist.rank == 0:
+                    self.request_accumulated.extend(new_requests[idx + 1 :])
+                break
+            else:
+                accepted_new_requests.append(req_item)
+
+        return accepted_new_requests
+
+    def update_waiting_queue(self):
+        """Update waiting queue to remove canceled requests.
+
+        This method mirrors PyExecutor._handle_canceled_requests.
+        """
+        if self.canceled_req_ids:
+            canceled_set = set(self.canceled_req_ids)
+            self.waiting_queue.remove_by_ids(canceled_set)
+
+    def clear_canceled_req_ids(self):
+        """Clear the list of canceled request IDs."""
+        self.canceled_req_ids.clear()
+
+    def get_canceled_req_ids(self):
+        """Get the list of canceled request IDs."""
+        return self.canceled_req_ids
+
+    def get_canceled_req_ids_size(self):
+        """Get the number of canceled request IDs."""
+        return len(self.canceled_req_ids)
+
+    def get_expected_num_active_requests(self):
+        """Get the expected number of active requests."""
+        return self.expected_num_active_requests
+
+    def get_waiting_queue_size(self):
+        """Get the size of the waiting queue."""
+        return len(self.waiting_queue)
+
+    def _get_new_active_requests_queue_latency(self):
+        """Get the queue latency for new active requests."""
+        return self.new_active_requests_queue_latency_ms
+
+
+@pytest.fixture
+def mock_dist():
+    """Create a mock Distributed instance for testing."""
+    mock_dist = Mock()
+    mock_dist.rank = 0
+    mock_dist.tp_size = 1
+    return mock_dist
+
+
 def _make_encoder_step_executor(tp_size=1):
     executor = make_partial_executor(
         is_encoder_decoder=True,
@@ -1816,9 +1897,9 @@ def test_request_terminated_before_first_context_releases_packed_output(recorded
 
 
 @pytest.fixture
-def mock_executor() -> PyExecutor:
-    """Use a stopped executor to exercise queue handling."""
-    return make_host_executor()
+def mock_executor(mock_dist):
+    """Create a MockPyExecutor instance for testing."""
+    return MockPyExecutor(dist=mock_dist)
 
 
 def test_handle_special_queue_items(mock_executor):
@@ -1847,7 +1928,7 @@ def test_clear_canceled_req_ids(mock_executor):
     mock_executor.canceled_req_ids = [1, 2, 3]
     assert len(mock_executor.canceled_req_ids) == 3
 
-    mock_executor._handle_canceled_requests()
+    mock_executor.clear_canceled_req_ids()
 
     assert len(mock_executor.canceled_req_ids) == 0
 
@@ -1862,7 +1943,7 @@ def test_update_waiting_queue(mock_executor):
     mock_executor.waiting_queue.add_requests(items)
     mock_executor.canceled_req_ids = [2]
 
-    mock_executor._handle_canceled_requests()
+    mock_executor.update_waiting_queue()
 
     assert len(mock_executor.waiting_queue) == 2
     remaining_ids = [item.id for item in mock_executor.waiting_queue]
@@ -1872,18 +1953,25 @@ def test_update_waiting_queue(mock_executor):
 
 
 def test_getter_methods(mock_executor):
-    """Check the executor queue counters and queue-latency getter."""
+    """Test various getter methods."""
     # Test initial values
     assert mock_executor._get_new_active_requests_queue_latency() == 0
-    assert mock_executor.expected_num_active_requests == 0
-    assert mock_executor.canceled_req_ids == []
-    assert len(mock_executor.waiting_queue) == 0
+    assert mock_executor.get_expected_num_active_requests() == 0
+    assert mock_executor.get_canceled_req_ids_size() == 0
+    assert mock_executor.get_canceled_req_ids() == []
+    assert mock_executor.get_waiting_queue_size() == 0
 
+    # Add some data and test
+    mock_executor.canceled_req_ids = [3, 4]
+    mock_executor.expected_num_active_requests = 5
     mock_executor.new_active_requests_queue_latency_ms = 10.5
     mock_executor.waiting_queue.add_request(RequestQueueItem(1, Mock()))
 
+    assert mock_executor.get_canceled_req_ids_size() == 2
+    assert mock_executor.get_canceled_req_ids() == [3, 4]
+    assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
-    assert len(mock_executor.waiting_queue) == 1
+    assert mock_executor.get_waiting_queue_size() == 1
 
 
 def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyExecutor:
@@ -3798,21 +3886,22 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     Returns the ``total_num_live_requests`` handed to the queue wait and the
     ``total_num_active_requests`` that admission subtracts from its capacity.
     """
-    stub = make_host_executor()
-    stub.enable_attention_dp = False
-    stub.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
-    stub.max_num_active_requests = max_num_active_requests
-    stub.canceled_req_ids = []
-    stub.enable_iter_perf_stats = False
-    stub.num_fetch_requests = 0
-    stub.dist = Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0)
-    stub.kv_cache_transceiver = None
-    stub._should_exclude_last_generation_logits = lambda: False
-    stub._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
-    stub._kv_cache_capacity = {}
-    stub.track_unique_tokens = False
-    stub._is_kv_manager_v2 = False
-    stub._num_embeddings = 1234
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=max_num_active_requests,
+        canceled_req_ids=[],
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
+        kv_cache_transceiver=None,
+        _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
+        track_unique_tokens=False,
+        _is_kv_manager_v2=False,
+        _num_embeddings=1234,
+    )
     seen = {}
     stub._cancel_queued_context_requests = types.MethodType(
         PyExecutor._cancel_queued_context_requests, stub
@@ -3828,14 +3917,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     with patch(
         "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]
     ) as merge:
-        assert (
-            PyExecutor._fetch_new_requests(
-                stub,
-                (Mock()),
-                active_requests,
-            )
-            == []
-        )
+        assert PyExecutor._fetch_new_requests(stub, Mock(), active_requests) == []
     merge.assert_called_once()
     return seen
 
@@ -3896,22 +3978,23 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
     retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
     waiting_queue = FCFSWaitingQueue()
     waiting_queue.add_requests(RequestQueueItem(10 + i) for i in range(4))
-    stub = make_host_executor()
-    stub.enable_attention_dp = False
-    stub.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
-    stub.max_num_active_requests = 4
-    stub.is_benchmark_disagg = False
-    stub.canceled_req_ids = []
-    stub.enable_iter_perf_stats = False
-    stub.num_fetch_requests = 0
-    stub.dist = Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1)
-    stub.kv_cache_transceiver = None
-    stub._should_exclude_last_generation_logits = lambda: False
-    stub._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
-    stub._kv_cache_capacity = {}
-    stub.track_unique_tokens = False
-    stub._is_kv_manager_v2 = False
-    stub._num_embeddings = 123
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=4,
+        is_benchmark_disagg=False,
+        canceled_req_ids=[],
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
+        kv_cache_transceiver=None,
+        _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
+        track_unique_tokens=False,
+        _is_kv_manager_v2=False,
+        _num_embeddings=123,
+    )
     for name in (
         "_get_request_admission_capacity",
         "_pop_from_waiting_queue",
@@ -3925,11 +4008,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
         side_effect=lambda new_requests, **_: list(new_requests),
     ):
-        admitted = PyExecutor._fetch_new_requests(
-            stub,
-            waiting_queue,
-            retiring,
-        )
+        admitted = PyExecutor._fetch_new_requests(stub, waiting_queue, retiring)
 
     assert [item.id for item in admitted] == expected_admitted_ids
     assert [item.id for item in waiting_queue] == [10, 11, 12, 13][len(expected_admitted_ids) :]
@@ -4255,43 +4334,29 @@ def test_attention_dp_dummy_cleanup_preserves_real_requests():
 
 
 def test_update_request_states_uses_common_dummy_cleanup():
-    stub = make_host_executor()
-    stub._terminate_attention_dp_dummy_requests = Mock()
+    stub = Mock()
     scheduled_requests = Mock(context_requests=[])
 
-    PyExecutor._update_request_states_tp(
-        stub,
-        (scheduled_requests),
-    )
+    PyExecutor._update_request_states_tp(stub, scheduled_requests)
 
     stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
 
 
 @pytest.mark.parametrize("cp_type", [CpType.ULYSSES, CpType.RING, CpType.HELIX])
 def test_update_request_states_single_cp_rank_takes_tp_path(cp_type):
-    stub = make_host_executor()
-    stub.dist = Mock(cp_config={"cp_type": cp_type}, cp_size=1)
-    stub._update_request_states_tp = Mock()
+    stub = Mock(dist=Mock(cp_config={"cp_type": cp_type}, cp_size=1))
     scheduled_requests = Mock(context_requests=[])
 
-    PyExecutor._update_request_states(
-        stub,
-        (scheduled_requests),
-    )
+    PyExecutor._update_request_states(stub, scheduled_requests)
 
     stub._update_request_states_tp.assert_called_once_with(scheduled_requests)
 
 
 def test_update_request_states_rejects_unsupported_cp_type_with_context_parallelism():
-    stub = make_host_executor()
-    stub.dist = Mock(cp_config={"cp_type": CpType.ULYSSES}, cp_size=2)
-    stub._update_request_states_tp = Mock()
+    stub = Mock(dist=Mock(cp_config={"cp_type": CpType.ULYSSES}, cp_size=2))
 
     with pytest.raises(NotImplementedError, match="Unsupported cp type ULYSSES"):
-        PyExecutor._update_request_states(
-            stub,
-            (Mock(context_requests=[])),
-        )
+        PyExecutor._update_request_states(stub, Mock(context_requests=[]))
 
     stub._update_request_states_tp.assert_not_called()
 

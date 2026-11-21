@@ -45,12 +45,23 @@ class Incomplete(ValueError):
     """Available source cannot establish the complete interface."""
 
 
-def statements(node: ast.AST) -> Iterator[ast.AST]:
+def statements(node: ast.AST, *, after_children: bool = False) -> Iterator[ast.AST]:
     """Visit a lexical scope without borrowing declarations from nested scopes."""
-    yield node
+    if not after_children:
+        yield node
     for child in ast.iter_child_nodes(node):
         if not isinstance(child, DEFINITIONS + (ast.Lambda,)):
-            yield from statements(child)
+            yield from statements(child, after_children=after_children)
+    if after_children:
+        yield node
+
+
+def loaded_names(node: ast.AST) -> set[str]:
+    return {
+        item.id
+        for item in statements(node)
+        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+    }
 
 
 def assignment_leaves(
@@ -183,6 +194,9 @@ class Shape:
 class Value:
     state: State | None = None
     kind: str = UNKNOWN
+    # Allocation sites survive branch copies and identify possible aliases.
+    origins: frozenset[int] = frozenset()
+    captures: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -386,9 +400,7 @@ class Sources:
             return self.dotted(name)
         return self.definition(source.module + ":" + name)
 
-    def callable(
-        self, definition: Definition, *, bound: bool = False, keep_binding: bool = False
-    ) -> Member:
+    def callable(self, definition: Definition, *, bound: bool = False) -> Member:
         """Read a function or a method as accessed through its class or instance."""
         source, node = definition.source, definition.node
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -415,8 +427,10 @@ class Sources:
             raise Incomplete("bound=True requires an instance method")
         if binding == "method" and not bound:
             member = callable_members(owner.body, source, True, keep_receiver=True)[node.name]
-        if not keep_binding:
-            for sig in member.signatures:
+        for sig in member.signatures:
+            if sig["binding"] == "method":
+                # An ordinary function installed on a class binds as an
+                # instance method. Static and class methods need descriptors.
                 sig["binding"] = "function"
         return member
 
@@ -612,9 +626,10 @@ def callable_members(
         if in_class and isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
-                if isinstance(target, ast.Name):
-                    result.pop(target.id, None)
-                    overload_names.discard(target.id)
+                for leaf, _ in assignment_leaves(target, node.value):
+                    if isinstance(leaf, ast.Name):
+                        result.pop(leaf.id, None)
+                        overload_names.discard(leaf.id)
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         decorators = [source.qualified(d) for d in node.decorator_list]
@@ -884,7 +899,10 @@ def _extend_class_shape(
     for item in runtime_body:
         if isinstance(item, (ast.Assign, ast.AnnAssign)):
             targets = item.targets if isinstance(item, ast.Assign) else [item.target]
-            for target in targets:
+            assignments = (
+                pair for target in targets for pair in assignment_leaves(target, item.value)
+            )
+            for target, value in assignments:
                 if isinstance(target, ast.Name):
                     if target.id in declared_callables:
                         # The last binding for this name is a callable.
@@ -912,16 +930,16 @@ def _extend_class_shape(
                         members_only
                         and plain_dataclass
                         and not classvar
-                        and isinstance(item.value, ast.Call)
-                        and source.qualified(item.value.func) == "dataclasses.field"
+                        and isinstance(value, ast.Call)
+                        and source.qualified(value.func) == "dataclasses.field"
                     ):
                         # A factory runs in __init__; object.__new__ does not run it.
                         has_default = any(
                             k.arg == "default"
                             and source.qualified(k.value) != "dataclasses.MISSING"
-                            for k in item.value.keywords
+                            for k in value.keywords
                         )
-                        if item.value.args or any(k.arg is None for k in item.value.keywords):
+                        if value.args or any(k.arg is None for k in value.keywords):
                             shape.unknown.append("Dynamic dataclass field options")
                     shape.members[target.id] = Member(
                         "class-attribute" if classvar else "attribute",
@@ -1249,14 +1267,72 @@ class Analyzer:
             raise Incomplete("bound must be a literal boolean")
         return value.value
 
+    def deferred_function(self, node: ast.AST) -> Value:
+        captures = loaded_names(node).difference(self.source.bindings(node))
+        return Value(captures=frozenset(captures))
+
+    def referenced_origins(self, node: ast.AST, env: dict[str, Value]) -> frozenset[int]:
+        """Resolve captured names at the point where a function may run."""
+        names = loaded_names(node)
+        seen: set[str] = set()
+        origins: set[int] = set()
+        while names:
+            name = names.pop()
+            seen.add(name)
+            value = env.get(name)
+            if value is not None:
+                origins.update(value.origins)
+                names.update(value.captures - seen)
+        return frozenset(origins)
+
+    @staticmethod
+    def invalidate_origins(
+        origins: frozenset[int],
+        env: dict[str, Value],
+        reason: str,
+        *,
+        except_state: State | None = None,
+    ) -> None:
+        if not origins:
+            return
+        seen: set[int] = set()
+        values = list(env.values())
+        while values:
+            value = values.pop()
+            state = value.state
+            if state is None or id(state) in seen:
+                continue
+            seen.add(id(state))
+            values.extend(state.fields.values())
+            if state is not except_state and not value.origins.isdisjoint(origins):
+                if reason not in state.unknown:
+                    state.unknown.append(reason)
+
+    def mutation_owner(self, value: Value, env: dict[str, Value], line: int) -> State | None:
+        self.invalidate_origins(
+            value.origins,
+            env,
+            f"Mutation through a possible alias at line {line}",
+            except_state=value.state,
+        )
+        return value.state
+
     def expression(self, node: ast.AST | None, env: dict[str, Value]) -> Value:
         if isinstance(node, ast.Name):
             return env.get(node.id, Value())
         if isinstance(node, ast.Attribute):
-            owner = self.expression(node.value, env).state
-            return owner.fields.get(node.attr, Value()) if owner is not None else Value()
+            owner = self.expression(node.value, env)
+            if owner.state is not None and node.attr in owner.state.fields:
+                return owner.state.fields[node.attr]
+            return Value(origins=owner.origins)
+        if isinstance(node, ast.Lambda):
+            return self.deferred_function(node)
+        if isinstance(node, (ast.IfExp, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Subscript)):
+            # These expressions can carry an instance without defining its exact identity.
+            return Value(origins=self.referenced_origins(node, env))
         if isinstance(node, ast.Call):
             name = self.source.qualified(node.func)
+            origin = frozenset({id(node)})
             if name == MARKERS + ".verify_instance" and node.args:
                 if id(node) not in self.handled:
                     self.instance_registration(node, env)
@@ -1272,7 +1348,7 @@ class Analyzer:
                         state.unknown.append("Dynamic namespace unpacking")
                     else:
                         state.fields[keyword.arg] = self.expression(keyword.value, env)
-                return Value(state, name)
+                return Value(state, name, origin)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "__new__" and node.args:
                 try:
                     owner = self.source.qualified(node.func.value)
@@ -1296,7 +1372,9 @@ class Analyzer:
                             allocator.kind in {"callable", "property"} or allocator.default
                         ):
                             raise Incomplete(f"Cannot establish the return type of {owner}.__new__")
-                    return Value(State(definition=definition), self.source.qualified(node.args[0]))
+                    return Value(
+                        State(definition=definition), self.source.qualified(node.args[0]), origin
+                    )
                 except Incomplete as error:
                     return Value(State(unknown=[str(error)]))
             if name.startswith("unittest.mock.") or name == "types.ModuleType":
@@ -1305,6 +1383,7 @@ class Analyzer:
                 return Value(
                     State(unknown=[DYNAMIC_MOCK_MEMBERS]),
                     name,
+                    origin,
                 )
         return Value()
 
@@ -1492,23 +1571,7 @@ class Analyzer:
                 errors = [issue("target-kind", "Lambda mock targets a class", call.lineno)]
             else:
                 bound = self.bound_replacement(marker)
-                expected = self.sources.callable(real, bound=bound, keep_binding=True)
-                bindings = {sig["binding"] for sig in expected.signatures}
-                if binding != "function" and (bound or bindings != {binding}):
-                    expected_binding = "function" if bound else ", ".join(sorted(bindings))
-                    self.result(
-                        target,
-                        call.lineno,
-                        "replacement",
-                        [
-                            issue(
-                                "signature",
-                                f"Expected {expected_binding} binding, got {binding}",
-                                call.lineno,
-                            )
-                        ],
-                    )
-                    return True
+                expected = self.sources.callable(real, bound=bound)
                 function = ast.FunctionDef(
                     name="_mock_lambda",
                     args=replacement.args,
@@ -1519,11 +1582,7 @@ class Analyzer:
                 )
                 ast.copy_location(function, replacement)
                 ast.fix_missing_locations(function)
-                sig = signature(function, binding)
-                sig["binding"] = "function"
-                actual = Member("callable", signatures=[sig])
-                for expected_signature in expected.signatures:
-                    expected_signature["binding"] = "function"
+                actual = Member("callable", signatures=[signature(function, binding)])
                 errors = compare_member(function.name, expected, actual, call.lineno)
             self.result(target, call.lineno, "replacement", errors)
         except (Incomplete, OSError, SyntaxError, UnicodeError) as error:
@@ -1667,53 +1726,59 @@ class Analyzer:
         if isinstance(target, ast.Name):
             env[target.id] = value
         elif isinstance(target, ast.Attribute):
-            owner = self.expression(target.value, env).state
+            owner = self.mutation_owner(self.expression(target.value, env), env, target.lineno)
             if owner is not None:
                 owner.fields[target.attr] = value
+        elif isinstance(target, ast.Subscript):
+            self.invalidate_origins(
+                self.expression(target.value, env).origins,
+                env,
+                f"Unresolved subscript assignment at line {target.lineno}",
+            )
 
     def effects(self, expression: ast.AST, env: dict[str, Value]) -> None:
-        """Invalidate tracked instances passed to calls whose effects are not modeled."""
+        """Apply effects and checkpoints in evaluation order within an expression."""
         if isinstance(expression, ast.Lambda):
             return
-        nodes = list(statements(expression))
+        nodes = list(statements(expression, after_children=True))
         assignments = [node for node in nodes if isinstance(node, ast.NamedExpr)]
-        if assignments:
-            # Track a single alias in an eager expression, where its source value is known.
-            track_alias = len(assignments) == 1 and not any(
-                isinstance(node, (ast.Assert, ast.BoolOp, ast.Call, ast.IfExp, ast.comprehension))
-                or (isinstance(node, ast.Compare) and len(node.comparators) > 1)
-                for node in nodes
-            )
-            for assignment in assignments:
-                value = self.expression(assignment.value, env) if track_alias else Value()
-                self.assignment(assignment.target, value, env)
-        for call in nodes:
-            if (
-                isinstance(call, ast.Call)
-                and self.source.qualified(call.func) == MARKERS + ".verify_instance"
-                and id(call) not in self.handled
-            ):
-                self.instance_registration(call, env)
-        for call in nodes:
-            if not isinstance(call, ast.Call):
+        # Track a single alias in an eager expression with a known source value.
+        track_alias = len(assignments) == 1 and not any(
+            isinstance(node, (ast.Assert, ast.BoolOp, ast.Call, ast.IfExp, ast.comprehension))
+            or (isinstance(node, ast.Compare) and len(node.comparators) > 1)
+            for node in nodes
+        )
+        for node in nodes:
+            if isinstance(node, ast.NamedExpr):
+                value = self.expression(node.value, env) if track_alias else Value()
+                self.assignment(node.target, value, env)
+            if not isinstance(node, ast.Call):
                 continue
-            name = self.source.qualified(call.func)
-            if name in {
-                MARKERS + ".verify_instance",
-                MARKERS + ".mock_target",
-            } or (
-                name == "types.SimpleNamespace" and not self.uses_rebound_names(call, [call.func])
+            name = self.source.qualified(node.func)
+            if name == MARKERS + ".verify_instance":
+                if id(node) not in self.handled:
+                    self.instance_registration(node, env)
+            elif name == MARKERS + ".mock_target" or (
+                name == "types.SimpleNamespace" and not self.uses_rebound_names(node, [node.func])
             ):
                 continue
-            arguments = [*call.args, *(kw.value for kw in call.keywords)]
-            if isinstance(call.func, ast.Attribute):
-                arguments.append(call.func.value)
-            for argument in arguments:
-                for node in ast.walk(argument):
-                    if isinstance(node, ast.Name):
-                        state = env.get(node.id, Value()).state
-                        if state is not None:
-                            state.unknown.append(f"Unresolved call effects at line {call.lineno}")
+            elif (
+                name == "setattr"
+                and len(node.args) == 3
+                and not node.keywords
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                and not self.uses_rebound_names(node, [node.func])
+            ):
+                owner = self.mutation_owner(self.expression(node.args[0], env), env, node.lineno)
+                if owner is not None:
+                    owner.fields[node.args[1].value] = self.expression(node.args[2], env)
+            else:
+                self.invalidate_origins(
+                    self.referenced_origins(node, env),
+                    env,
+                    f"Unresolved call effects at line {node.lineno}",
+                )
 
     def block(self, body: list[ast.stmt], env: dict[str, Value]) -> bool:
         """Track statements and report whether execution can reach the end of the block."""
@@ -1755,11 +1820,6 @@ class Analyzer:
                                     raise Incomplete(
                                         "Register the owning class for method comparison"
                                     )
-                                # Compare descriptors through class access, just like
-                                # the target method. Classmethod receivers are implicit.
-                                for sig in actual.signatures:
-                                    if sig["binding"] in {"classmethod", "staticmethod"}:
-                                        sig["binding"] = "function"
                                 errors = compare_member(
                                     statement.name,
                                     expected,
@@ -1774,9 +1834,20 @@ class Analyzer:
                                 "definition",
                                 [issue("unverified-interface", str(error), decorator.lineno, True)],
                             )
-                # Function bodies run later, when captured objects may have changed.
-                nested = copy.deepcopy(env) if isinstance(statement, ast.ClassDef) else {}
-                self.block(statement.body, nested)
+                if isinstance(statement, ast.ClassDef):
+                    # Class bodies execute eagerly in their own namespace and
+                    # can mutate objects from the enclosing scope.
+                    self.invalidate_origins(
+                        self.referenced_origins(statement, env),
+                        env,
+                        f"Unresolved class-body effects at line {statement.lineno}",
+                    )
+                    self.block(statement.body, copy.deepcopy(env))
+                    env[statement.name] = Value()
+                else:
+                    # A deferred body cannot use instance state from definition time.
+                    self.block(statement.body, {})
+                    env[statement.name] = self.deferred_function(statement)
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 if isinstance(statement, ast.AnnAssign) and statement.value is None:
                     continue
@@ -1801,21 +1872,7 @@ class Analyzer:
                 for target, supplied in assignments:
                     self.assignment(target, supplied, env)
             elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
-                call = statement.value
-                name = self.source.qualified(call.func)
-                if name == MARKERS + ".verify_instance":
-                    self.instance_registration(call, env)
-                elif (
-                    name == "setattr"
-                    and len(call.args) == 3
-                    and isinstance(call.args[1], ast.Constant)
-                    and isinstance(call.args[1].value, str)
-                ):
-                    owner = self.expression(call.args[0], env).state
-                    if owner:
-                        owner.fields[call.args[1].value] = self.expression(call.args[2], env)
-                else:
-                    self.effects(call, env)
+                self.effects(statement.value, env)
             elif isinstance(statement, ast.If):
                 self.effects(statement.test, env)
                 left, right = copy.deepcopy(env), copy.deepcopy(env)
@@ -1830,6 +1887,7 @@ class Analyzer:
                 merged = {}
                 for name in env.keys() | left.keys() | right.keys():
                     a, b = left.get(name, Value()), right.get(name, Value())
+                    value = Value(origins=a.origins | b.origins, captures=a.captures | b.captures)
                     if a.state is not None and b.state is not None:
                         key = (id(a.state), id(b.state))
                         if key in merged:
@@ -1842,24 +1900,39 @@ class Analyzer:
                             | a.state.possible
                             | b.state.possible
                         )
-                        state.unknown = a.state.unknown + b.state.unknown
+                        state.unknown = list(dict.fromkeys(a.state.unknown + b.state.unknown))
                         if a.kind != b.kind or a.state.definition != b.state.definition:
                             state.unknown.append("Branches construct different instance classes")
                         for field_name in a.state.fields.keys() & b.state.fields.keys():
                             av, bv = a.state.fields[field_name], b.state.fields[field_name]
-                            state.fields[field_name] = av if av is bv else Value()
-                        env[name] = Value(state, a.kind if a.kind == b.kind else UNKNOWN)
-                        merged[key] = env[name]
-                    else:
-                        env[name] = Value()
+                            state.fields[field_name] = (
+                                av
+                                if av is bv
+                                else Value(
+                                    origins=av.origins | bv.origins,
+                                    captures=av.captures | bv.captures,
+                                )
+                            )
+                        value.state = state
+                        value.kind = a.kind if a.kind == b.kind else UNKNOWN
+                        merged[key] = value
+                    env[name] = value
             elif isinstance(statement, ast.Delete):
                 for target in statement.targets:
                     if isinstance(target, ast.Attribute):
-                        state = self.expression(target.value, env).state
+                        state = self.mutation_owner(
+                            self.expression(target.value, env), env, statement.lineno
+                        )
                         if state:
                             state.fields.pop(target.attr, None)
                     elif isinstance(target, ast.Name):
                         env.pop(target.id, None)
+                    elif isinstance(target, ast.Subscript):
+                        self.invalidate_origins(
+                            self.expression(target.value, env).origins,
+                            env,
+                            f"Unresolved subscript deletion at line {statement.lineno}",
+                        )
             elif isinstance(
                 statement,
                 (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith, ast.Match),
