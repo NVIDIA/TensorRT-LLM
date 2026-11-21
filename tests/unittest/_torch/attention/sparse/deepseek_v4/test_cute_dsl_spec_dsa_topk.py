@@ -15,9 +15,10 @@
 """specDSA multi-CTA exact top-512 (``topk_multicta_op``, CuTe DSL, SM100) against ``torch.topk``.
 
 The kernel selects the exact top-512 of every row of the fp32 indexer logits with one cluster of 4 to 8 CTAs per row
-(8 / 6 / 5 / 4 CTAs for 1-15 / 16 / 17-24 / 25-26 rows). Its fast path guesses a threshold from sampled logits and
-certifies it by a count; a row where the guess does not hold, and every row of at most 8192 positions (no sample), takes
-an exact radix select inside the kernel. The checks of every row are the contract of the top-K stage: all 512 positions
+(8 / 6 / 5 / 4 CTAs for 1-15 / 16 / 17-24 / 25-26 rows). Its fast path guesses a threshold from sampled logits (none for
+a row of at most 8192 positions: every value is a candidate) and certifies it by a count; a row where the certificate
+does not hold takes an exact radix select inside the kernel. The checks of every row are the contract of the top-K
+stage: all 512 positions
 are in [0, n) and distinct, their values are the multiset ``torch.topk`` returns (which of several equal values at the
 512th rank is taken is not specified), and a row of at most 512 positions is ``0 .. n - 1`` followed by -1. The part of
 a logits row beyond its length holds garbage (1e30 by default; also +-inf and NaN), so a read past the length shows as

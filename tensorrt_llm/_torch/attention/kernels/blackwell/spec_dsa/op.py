@@ -14,7 +14,7 @@
 # limitations under the License.
 """specDSA: fused decode sparse attention of a DeepSeek DSA model on B200 (SM100), any batch size from 1 to 1,024.
 
-One decode step of a CSA layer: FP8 paged-MQA indexer logits over the compressed indexer K cache, exact top-K
+One decode step of a CSA layer: FP8 or MXFP4 paged-MQA indexer logits over the compressed indexer K cache, exact top-K
 selection, mapping of the selected positions to compressed-KV rows, and the sparse MLA attention over those rows, the
 sliding window and the attention sink. One call replaces the four kernels of the unfused chain. The megakernel guesses
 the top-K threshold from a sample of the row's own logits (the sampling ladder of the GVR V2 top-K) and checks it with a
@@ -22,10 +22,10 @@ count certificate; a row where the guess does not hold takes an exact fallback. 
 they learn a floor from the candidates already admitted in the row and select the exact top-K from the ones kept. The
 selection is exact in both.
 
-The kernels are specialized for a ``SpecDsaConfig`` (``config.py``). The default and, today, only spec is
-``DS_V4_FLASH`` (top-512 over a 64 x 128 FP8 indexer, 64 attention heads over 512-byte E4M3 KV rows, a 128-row window).
-A config without kernels is refused with ``NotImplementedError`` (``is_supported`` and ``config.supported_spec`` tell
-beforehand) and its caller keeps the existing kernels.
+The kernels are specialized for a ``SpecDsaConfig`` (``config.py``). The default spec is ``DS_V4_FLASH`` (top-512 over a
+64 x 128 FP8 indexer, 64 attention heads over 512-byte E4M3 KV rows, a 128-row window); ``DS_V4_FLASH_FP4`` is the same
+model with the MXFP4 indexer K cache. A config without kernels is refused with ``NotImplementedError``
+(``is_supported`` and ``config.supported_spec`` tell beforehand) and its caller keeps the existing kernels.
 
 Two implementations sit behind one interface; ``implementation_for`` names the one a batch size uses:
 
@@ -33,7 +33,8 @@ Two implementations sit behind one interface; ``implementation_for`` names the o
   that streams the indexer K cache once and does the selection and the attention on dedicated CTAs while the others
   keep streaming; compiled per batch size.
 - ``large_batch`` (``large_batch.py`` / ``large_batch_op.py``, more rows): a persistent indexer kernel and an attention
-  kernel launched behind it with programmatic dependent launch; one compile serves every batch size.
+  kernel launched behind it with programmatic dependent launch; one compile per knob range (``large_batch_op``)
+  serves every batch size in the range.
 
 Per step, ``prepare`` does the host work (descriptors or CTA schedule from the lengths, the sinks) and ``run`` launches
 on the current stream; the launch can be captured in a CUDA graph and replayed while ``prepare`` refreshes the state in

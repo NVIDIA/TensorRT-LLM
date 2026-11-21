@@ -73,14 +73,16 @@ __all__ = [
 
 # Largest batch size for which ``run_hybrid`` launches the tail attention programmatically by default: its clusters
 # start while the multi-CTA top-K ranks its crossing bin and hide their prologue (nsys, 1M-token captures: 0.5 to 1.8 us
-# at 9 to 24 rows). At 25 and 26 rows the 26 clusters that fit one wave are all but full: the early launch is equal
-# at 25 rows and costs ~3 us at 26 rows, the plain launches are used.
+# at 9 to 24 rows). At 25 and 26 rows the 26 clusters that fit one wave are all but full: the early launch costs 1.3 us
+# at 25 rows and 2.9 us at 26 rows (nsys: plain 97.9 and 102.7 us, programmatic 99.2 and 105.6 us), the plain launches
+# are used.
 PDL_MAX_BATCH = 24
 
 # Largest batch size for which ``run_hybrid`` also polls the entries of the multi-CTA top-K by default (``poll``): above
 # it the clusters of the two kernels are far over one wave (120 + 120 CTAs at 24 rows on 148 SMs), the tail attention
 # starts as the top-K CTAs exit and the marks of the protocol cost what the early start of the first rows wins (nsys,
-# 1M-token captures, 3 to 8 passes: -0.2 to -1.1 us at 5 to 23 rows; flat at 24: mean -0.02 us, -0.4 to +0.3 per pass).
+# 1M-token captures, 3 to 8 passes: -1.1 to 0.0 us per size at 5 to 23 rows; flat at 24: mean -0.02 us, -0.4 to +0.3
+# per pass).
 POLL_MAX_BATCH = 23
 assert POLL_MAX_BATCH <= PDL_MAX_BATCH
 

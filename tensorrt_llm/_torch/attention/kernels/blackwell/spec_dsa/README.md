@@ -32,7 +32,7 @@ differ between models live and how to add a model.
 
 - Megakernel: one cooperative launch per step, up to `megakernel_max_batch` rows.
 - Large-batch kernels: a persistent indexer kernel and an attention kernel behind it (programmatic dependent launch),
-  every batch size up to `max_batch`; one compile serves all of them.
+  every batch size up to `max_batch`; one compile per knob range (`large_batch_op`) serves every batch size in it.
 
 - Tail attention (decomposed hybrid): the production indexer kernel and the production top-K kernel, then one kernel
   that replaces the local-to-global mapping, the sparse MLA and its reduction kernel of the unfused chain. A cluster of

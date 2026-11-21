@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""specDSA megakernel, host side: fused DeepSeek-V4-Flash decode for 1 to 47 rows on B200 (SM100, 148 SMs).
+"""specDSA megakernel, host side: fused DeepSeek-V4-Flash decode for 1 to ``megakernel_max_batch`` rows (47 for the FP8
+spec, 20 for the FP4 spec) on B200 (SM100, 148 SMs).
 
-One cooperative launch streams each row's FP8 indexer K cache once, computes the indexer logits, selects the exact
-top-512 compressed positions (sampled threshold with a count certificate and exact fallbacks), maps them to
+One cooperative launch streams each row's indexer K cache (FP8 or MXFP4) once, computes the indexer logits, selects the
+exact top-512 compressed positions (sampled threshold with a count certificate and exact fallbacks), maps them to
 compressed-KV rows and runs the sparse MLA attention over them plus the 128-row sliding window and the attention sink.
 
 ``prepare`` builds the per-step state (split descriptors from the indexer block table and lengths, window positions,

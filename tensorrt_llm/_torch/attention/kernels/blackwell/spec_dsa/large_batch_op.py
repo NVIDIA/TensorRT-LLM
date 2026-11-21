@@ -14,12 +14,12 @@
 # limitations under the License.
 """specDSA large-batch kernels, host side: DeepSeek-V4-Flash decode for many rows on B200 (SM100, 148 SMs).
 
-Two launches per call, back to back on the current stream. The first streams each row's FP8 indexer K cache once,
-computes the indexer logits and selects the exact top-512 compressed positions in the stream (a floor learned from the
-candidates already admitted in the row segment, the exact top-512 of the ones kept, exact fallbacks when too many are
-kept), maps them to compressed-KV rows and publishes finished rows to a ready queue. The
-second, started with programmatic dependent launch, runs the sparse MLA attention over the selected rows plus the
-128-row sliding window and the attention sink, claiming rows from the queue as they complete.
+Two launches per call, back to back on the current stream. The first streams each row's indexer K cache (FP8 or MXFP4)
+once, computes the indexer logits and selects the exact top-512 compressed positions in the stream (a floor learned
+from the candidates already admitted in the row segment, the exact top-512 of the ones kept, exact fallbacks when too
+many are kept), maps them to compressed-KV rows and publishes finished rows to a ready queue. The second, started with
+programmatic dependent launch, runs the sparse MLA attention over the selected rows plus the 128-row sliding window and
+the attention sink, claiming rows from the queue as they complete.
 
 ``prepare`` builds the per-step state (the CTA schedule from the compressed lengths, the expanded sinks);
 ``run`` launches both kernels and writes ``topk`` (int32 compressed positions) and ``out`` (bf16). The kernels are
@@ -151,9 +151,9 @@ _KNOBS = {
 # (eight stages with those knobs are 3 - 4 % slower at 47 - 64 rows). At 512 rows and more the SM clock sits at about
 # 1.4 GHz (power cap) and the stream is bound by the ~290 SM cycles a math warp spends per 128-position tile
 # (hand-offs, the 64-head epilogue, floor read, compare, loop control), more than the HBM time of a tile (184 ns): the
-# loop-control, lockstep and floor-read knobs take instructions off that chain (a 16 times rarer floor read from 192
-# rows), and from 768 rows the selector warps sleep 3 us between polls and the K stages are eight again (in the nsys
-# protocol six stages are better at 384 - 767 rows, eight at 768 and more).
+# loop-control, lockstep and floor-read knobs take instructions off that chain (a 4 times rarer floor read from 192
+# rows: every 16th tile instead of every 4th), and from 768 rows the selector warps sleep 3 us between polls and the K
+# stages are eight again (in the nsys protocol six stages are better at 384 - 767 rows, eight at 768 and more).
 _VARIANTS = {
     DS_V4_FLASH_FP4.kernel_key: (
         (
@@ -266,10 +266,10 @@ def _not_compiled(e: dict) -> bool:
 
 
 def precompile(device: torch.device, config: SpecDsaConfig | None = None) -> None:
-    """Compile both kernels for ``device`` (the indexer kernel takes about a minute).
+    """Compile both kernels for ``device`` (the indexer kernel takes about a minute per knob range).
 
-    The compiled kernels serve every batch size. Must run outside CUDA-graph capture; ``run`` compiles on first use
-    otherwise.
+    The compiled kernels serve every batch size (a knob range of the indexer kernel is a compile of its own). Must run
+    outside CUDA-graph capture; ``run`` compiles on first use otherwise.
     """
     lb, _ = _kernel_modules()
     e = _engine(device, config)

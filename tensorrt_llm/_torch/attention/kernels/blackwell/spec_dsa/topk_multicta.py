@@ -39,8 +39,9 @@ with addresses that do not depend on the row length:
 
 Every CTA of the cluster checks the certificate of this fast path from the same all-gathered data: at least 512
 candidates, no list overflow, at most 512 members in B*. When it fails (the sample threshold was too high, massive
-ties, rows of at most 8192 positions, which have no sample) the whole cluster runs an exact 4-level radix select over
-the row instead (8-bit digits, one 256-bin all-gather per level, a write pass with a tie quota per CTA).
+ties) the whole cluster runs an exact 4-level radix select over the row instead (8-bit digits, one 256-bin all-gather
+per level, a write pass with a tie quota per CTA). A row of at most 8192 positions has no sample: every value is a
+candidate and the same certificate decides (a row of at most 512 positions is the identity followed by -1).
 
 A CTA holds ~170 KB of shared memory, so the clusters of a launch have to co-reside in one wave on the 148 SMs
 (clusters of 8 / 6 / 5 / 4 CTAs: 15 / 22 / 26 / 33 per B200); ``topk_multicta_op`` picks ``g`` from the batch size (1

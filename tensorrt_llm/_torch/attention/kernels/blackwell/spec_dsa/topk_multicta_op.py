@@ -20,13 +20,13 @@ valid up to ``ctx_lens[r]``) with one cluster of CTAs per row (``topk_multicta.p
 by -1 for a row of ``n <= 512`` positions, as the production top-K does. The result is exact for every input (its
 values are the 512 largest of the row; which positions that share the 512th value are taken is not specified): a row
 whose sampled threshold does not certify the fast path takes an in-kernel exact fallback (a radix select over the
-row), and rows of at most 8192 positions, which have no sample, always do.
+row). A row of at most 8192 positions has no sample: every value is a candidate and the same certificate decides.
 
 Dispatch. Rows of 16,384 positions or more (``MIN_PROFITABLE_ROW_LEN``, 64K tokens at the compression ratio 4) take
 the fast path, and the kernel is faster than the production top-K behind the same logits kernel (B200, FP4 indexer,
 1M-token captures: 0.8 to 2.8 us of the 9 to 26 row hybrid, +1.3 to +3.5 % of its step; one top-K call +0.8 to +3.7
 us in 20 of 21 cases of BS 12 / 16 / 24 x 7 lengths, -0.3 us in one). Below that length the sample has few windows
-(one per 896 positions) or none (rows of at most 8192 positions always take the radix path), and the kernel is not
+(one per 896 positions) or none (rows of at most 8192 positions: every value is a candidate), and the kernel is not
 reliably faster: at BS 24 it is 2 to 4 us slower for rows up to 12K positions, at BS 12 to 16 it is up to 1 us slower
 for 8193 to 12K positions and 0.6 to 2.5 us faster for rows of at most 8192. A row that takes the fallback costs ~6
 us more (rare on real logits: none of 630 captured rows) and a batch is as slow as its slowest row, so
