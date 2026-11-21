@@ -43,7 +43,7 @@ then compare fixed continuations across whole/chunked prefill, cold/warm prefix
 caches, unrelated intervening requests, and eager/CUDA graph execution. Cache
 hits and actual context calls are checked so these paths cannot silently go
 untested. Default-path tests use a tolerance specific to that small checkpoint.
-On SM100/SM103, deterministic-mode tests select the TRTLLM attention backend and
+On SM100, deterministic-mode tests select the TRTLLM attention backend and
 require exact score equality across chunking and CUDA graphs. The executor
 disables prefix reuse under `FORCE_DETERMINISTIC=1`; actual prefix hits are
 covered separately by the default-mode tests.

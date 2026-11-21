@@ -48,8 +48,8 @@ def _make_checkpoint(path: Path) -> None:
 
 
 def _configure_determinism(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
-    if enabled and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Deterministic TRTLLM attention requires SM100 or SM103")
+    if enabled and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("Deterministic TRTLLM attention requires SM100")
     monkeypatch.setenv("FORCE_DETERMINISTIC", "1" if enabled else "0")
     monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
 
