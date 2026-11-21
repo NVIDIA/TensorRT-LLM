@@ -1417,6 +1417,7 @@ def test_layer_group_helpers_describe_split_ssm_layers() -> None:
         manager.tokens_per_block = TOKENS_PER_BLOCK
         manager.kv_cache_manager_py_config = config
         manager.impl = impl
+        manager.__dict__.pop("_layer_ids_by_group", None)
         manager._layer_group_life_cycles = None
 
         attention = impl.get_layer_group_id(LayerId(0))
@@ -1471,6 +1472,7 @@ def test_event_window_sizes_filter_attention_without_backend_internals(
             [BufferId(LayerId(i), Role.KEY)] for i in ([0, 1] if attention_first else [1, 0])
         ]
     )
+    manager.__dict__.pop("_layer_ids_by_group", None)
 
     attention_group_id = 0 if attention_first else 1
     window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
@@ -7970,10 +7972,10 @@ def _make_window_crossing_manager() -> KVCacheManagerV2:
 
 
 def test_window_crossing_logs_once_with_capacity_and_blocks(monkeypatch) -> None:
+    manager = _make_window_crossing_manager()
     fake_logger = _FakeLogger()
     monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
 
-    manager = _make_window_crossing_manager()
     kv_cache = _FakeWindowedKVCache({0: [7, 8, 9]})
     request = SimpleNamespace(py_request_id=42)
 
@@ -8006,10 +8008,10 @@ def test_window_crossing_logs_once_with_capacity_and_blocks(monkeypatch) -> None
 def test_window_crossing_is_silent_without_a_crossing(
     monkeypatch, pre_capacity: int, new_capacity: int
 ) -> None:
+    manager = _make_window_crossing_manager()
     fake_logger = _FakeLogger()
     monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
 
-    manager = _make_window_crossing_manager()
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1),
         _FakeWindowedKVCache({0: [1]}),
@@ -8039,6 +8041,7 @@ def test_window_crossing_does_not_query_the_logger_without_a_crossing(
     stack, so consulting it before the integer crossing test puts that cost
     on every request of every iteration.
     """
+    manager = _make_window_crossing_manager()
     fake_logger = _FakeLogger()
     calls: list[None] = []
 
@@ -8049,7 +8052,6 @@ def test_window_crossing_does_not_query_the_logger_without_a_crossing(
     fake_logger.is_debug_enabled = counting_is_debug_enabled
     monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
 
-    manager = _make_window_crossing_manager()
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1),
         _FakeWindowedKVCache({0: [1]}),
@@ -8073,10 +8075,10 @@ def test_window_crossing_follows_the_logger_severity_order(monkeypatch, level, e
     guard that compares the level to the literal ``"debug"`` suppresses the
     line for users who did enable it.
     """
+    manager = _make_window_crossing_manager()
     fake_logger = _FakeLogger(level=level)
     monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
 
-    manager = _make_window_crossing_manager()
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1), _FakeWindowedKVCache({0: [1]}), 2047, 2049, "context"
     )
@@ -8124,6 +8126,7 @@ def test_window_crossing_honours_per_module_log_levels(
 
 def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
     """Diagnostics must never turn a working run into a failing one."""
+    manager = _make_window_crossing_manager()
     fake_logger = _FakeLogger()
     monkeypatch.setattr(kv_cache_v2_module, "logger", (fake_logger))
 
@@ -8131,7 +8134,6 @@ def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
         def get_base_page_indices(self, layer_group_id, beam_id=DEFAULT_BEAM_INDEX):
             raise KeyError("no base buffer")
 
-    manager = _make_window_crossing_manager()
     manager._log_window_crossing(
         SimpleNamespace(py_request_id=1), _BrokenKVCache(), 2047, 2049, "context"
     )
@@ -8274,7 +8276,6 @@ def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(
         assert manager._generation_kv_capacity_headroom == max_draft_len + 1 + block_width
         if disagg:
             request.py_draft_tokens = []
-            request.context_phase_params = None
             assert manager.prepare_disagg_gen_init(request)
             request.state = LlmRequestState.GENERATION_IN_PROGRESS
         else:
