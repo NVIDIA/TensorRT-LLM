@@ -390,11 +390,20 @@ def test_megakernel_knob_tables():
             x: v for x, v in fp8[b].items() if x not in small
         }, b
         assert all(fp4[b][x] == v for x, v in small.items()), b
+    thr = {"lbin": True, "tpoll1": True}
     assert megakernel_op._FP4_SMALL == {
-        1: {"early": True, "tearly": True},
-        2: {"dpf": True, "drot": 37},
-        3: {"dpf": True, "drot": 37},
-        4: {"dpf": True, "drot": 37},
+        1: {
+            "early": True,
+            "tearly": True,
+            "lpoll": True,
+            "lfence": True,
+            "cls4": True,
+            "fwarm": True,
+            **thr,
+        },
+        2: {"dpf": True, "drot": 37, **thr},
+        3: {"dpf": True, "drot": 37, **thr},
+        4: {"dpf": True, "drot": 37, **thr},
     }
     for b in range(5, 21):
         k = fp4[b]

@@ -615,6 +615,71 @@ def test_fp4_matches_reference(specs, attn):
     assert int(op.error_bits(state).max()) == 0, "kernel error bits set"
 
 
+# The FP4 threshold knobs of ``megakernel_op._FP4_SMALL`` (lpoll, lfence, lbin, tpoll1) change how the threshold lead
+# polls the sampled board, finds the three rank bins and how the stream CTAs poll the threshold line, not what is
+# published: the bins come from a histogram instead of the bitwise key search and must give the same line bit for bit
+# (including the [SMIN, SMAX] range of the key search, which leaves out the first warp's top-1 keys of one sign).
+_T_KNOBS = ("lpoll", "lfence", "lbin", "tpoll1")
+_PLAIN_ENGINES: dict = {}
+T_LINE_CASES = [
+    pytest.param([{"n": 262127}], id="b1-max"),
+    pytest.param([{"n": 8000, "ties": 9}], id="b1-ties"),
+    pytest.param([{"n": 512}], id="b1-select-all"),
+    pytest.param([{"n": 131071}, {"n": 65543, "ties": 7}], id="b2-ties"),
+    pytest.param(
+        [{"n": 262127}, {"n": 700, "ties": 5}, {"n": 98309, "flat": True}], id="b3-short-ties-flat"
+    ),
+    pytest.param(_fp4_rows(4, short=(1,), flat=(3,)), id="b4-short-flat"),
+]
+
+
+@pytest.mark.parametrize("specs", T_LINE_CASES)
+def test_fp4_threshold_line_does_not_depend_on_the_threshold_knobs(specs, monkeypatch):
+    from . import test_cute_dsl_spec_dsa_large_batch as H
+
+    op, mk = _op(), _mk()
+    batch = len(specs)
+    inp, _ = H._make_case(batch, specs, seed=300 + batch, attn="realistic", idx="fp4")
+
+    def run_once():
+        state = op.prepare(
+            inp["ctx_lens"].cpu(), inp["kv_lens"].cpu(), inp["idx_block_table"], config=H.SPEC_FP4
+        )
+        topk, out = H._new_outputs(batch)
+        op.run(
+            state,
+            inp["q_idx"],
+            inp["w_idx"],
+            inp["k_cache"],
+            inp["idx_block_table"],
+            inp["ctx_lens"],
+            inp["q_att"],
+            inp["swa_pool"],
+            inp["bt_swa"],
+            inp["c_pool"],
+            inp["bt_c"],
+            inp["sinks"],
+            topk,
+            out,
+            softmax_scale=SM_SCALE,
+            q_scale=inp["q_scale"],
+        )
+        torch.cuda.synchronize()
+        assert int(op.error_bits(state).max()) == 0, "kernel error bits set"
+        line = state.ws64.view(batch, mk.WS_WORDS)[:, mk.W_TLINE : mk.W_TLINE + 4] & 0xFFFFFFFF
+        return line.cpu(), [sorted(topk[r].tolist()) for r in range(batch)]
+
+    knobs = op._KNOBS[H.SPEC_FP4.kernel_key]
+    shipped_line, shipped_sets = run_once()
+    monkeypatch.setitem(knobs, batch, {**knobs[batch], **dict.fromkeys(_T_KNOBS, False)})
+    monkeypatch.setattr(op, "_engines", _PLAIN_ENGINES)
+    plain_line, plain_sets = run_once()
+    assert torch.equal(shipped_line, plain_line), (shipped_line, plain_line)
+    if not any(sp.get("ties") or sp.get("flat") for sp in specs):
+        # with planted ties the tied rows enter the set in arrival order: only the threshold line is compared there
+        assert shipped_sets == plain_sets
+
+
 def test_fp4_requires_query_scales():
     from . import test_cute_dsl_spec_dsa_large_batch as H
 

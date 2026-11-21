@@ -137,12 +137,26 @@ _FP4_SHARED = dict(team4=True, nteams=4, rs24_dry=False, b1l_upub=3, drot=37, tc
 # boundaries decide): the K tiles' TMA descriptors are prefetched at entry and the row lengths are loaded before the
 # barrier setup (early / tearly) at one row; from two rows on the next row's descriptor is loaded one row ahead (dpf)
 # and the split ranges rotate over the stream CTAs from row to row (drot), as the shared-team sets from five rows on
-# already do.
+# already do. The threshold chain (board poll of the T lead, rank bins, T poll of the stream CTAs, classification of the
+# buffered tiles) is shortened by _FP4_THRESHOLD: the rank bins come from a histogram instead of a key search and the
+# stream CTAs read the threshold line in one round trip (lbin, tpoll1: the same threshold line bit for bit); at one row
+# the T lead also starts polling the board without the two fences of the start (lpoll, lfence), the followers' dry pass
+# of the threshold code starts at once and covers the T stores (fwarm) and the classification loads four tiles at a
+# time (cls4).
+_FP4_THRESHOLD = dict(lbin=True, tpoll1=True)
 _FP4_SMALL = {
-    1: dict(early=True, tearly=True),
-    2: dict(dpf=True, drot=37),
-    3: dict(dpf=True, drot=37),
-    4: dict(dpf=True, drot=37),
+    1: dict(
+        early=True,
+        tearly=True,
+        lpoll=True,
+        lfence=True,
+        cls4=True,
+        fwarm=True,
+        **_FP4_THRESHOLD,
+    ),
+    2: dict(dpf=True, drot=37, **_FP4_THRESHOLD),
+    3: dict(dpf=True, drot=37, **_FP4_THRESHOLD),
+    4: dict(dpf=True, drot=37, **_FP4_THRESHOLD),
 }
 _FP4_OVERRIDES = {**_FP4_SMALL, **{b: _FP4_SHARED for b in range(5, 33)}}
 

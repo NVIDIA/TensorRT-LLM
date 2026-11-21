@@ -732,7 +732,8 @@ W_ERRB = 33
 W_ABORT = 34
 W_FOL = 36
 W_RC = 48
-assert W_FOL + NTEAM <= W_RC
+W_TLINE_DRY = 44  # free words: the followers' dry T stores (fwarm)
+assert W_FOL + NTEAM <= W_TLINE_DRY and W_TLINE_DRY + 4 <= W_RC
 W_CNT = 64
 WS_WORDS = 1024
 NSTAMP = 128
@@ -912,6 +913,41 @@ def ld_relaxed_v2u64(addr, *, loc=None, ip=None):
     return (
         Uint64(_llvm.extractvalue(_T.i64(), r, [0], loc=loc, ip=ip)),
         Uint64(_llvm.extractvalue(_T.i64(), r, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def ld_relaxed_v2u64_p(addr, pred, *, loc=None, ip=None):
+    # predicated ld.relaxed.gpu.v2.u64 without a branch (zeros where pred == 0)
+    from cutlass._mlir.dialects import llvm as _llvm
+    from cutlass.cutlass_dsl import T as _T
+
+    st = _llvm.StructType.get_literal([_T.i64(), _T.i64()])
+    r = L._asm(
+        st,
+        [L._v(addr, loc, ip), L._v(pred, loc, ip)],
+        "{\n\t.reg .pred p;\n\tsetp.ne.u32 p, $3, 0;\n\tmov.u64 $0, 0;\n\tmov.u64 $1, 0;\n"
+        "\t@p ld.relaxed.gpu.global.v2.u64 {$0, $1}, [$2];\n}",
+        "=l,=l,l,r",
+        loc,
+        ip,
+    )
+    return (
+        Uint64(_llvm.extractvalue(_T.i64(), r, [0], loc=loc, ip=ip)),
+        Uint64(_llvm.extractvalue(_T.i64(), r, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def red_shared_add_u32(saddr, val, *, loc=None, ip=None):
+    # fire-and-forget shared-memory add (32-bit shared address)
+    L._asm(
+        None,
+        [L._v(saddr, loc, ip), L._v(val, loc, ip)],
+        "red.shared.add.u32 [$0], $1;",
+        "r,r",
+        loc,
+        ip,
     )
 
 
@@ -1299,6 +1335,12 @@ class SpecDsaMegakernel:
         ring_w12: bool = False,
         team4: bool = False,
         tcta: int = 0,
+        lpoll: bool = False,
+        lfence: bool = False,
+        lbin: bool = False,
+        tpoll1: bool = False,
+        cls4: bool = False,
+        fwarm: bool = False,
         config: SpecDsaConfig | None = None,
     ):
         self.fp4 = config is not None and config.index_k_dtype == "fp4"
@@ -1319,6 +1361,20 @@ class SpecDsaMegakernel:
         # wait and then run a few us behind the other stream CTAs for the rest of the launch (needs the shared-team T
         # server layout: tsz01 / tsz2 / tsz / tszall)
         self.tcta = int(tcta)
+        # The threshold chain (FP4 sets of 1 to 4 rows, ``megakernel_op._FP4_SMALL``; the published threshold line is
+        # unchanged, bit for bit): lpoll: the T lead re-loads only the board pairs not yet valid; lfence: it starts
+        # polling at once and its release fence (histogram clear) runs while the first poll loads are in flight;
+        # lbin: the rank bins come from a 256-bin histogram instead of the bitwise key search; tpoll1: the stream CTAs
+        # read the threshold line in one round trip; cls4: the buffered tiles are classified with the loads of four
+        # tiles first; fwarm: the followers' dry pass of the threshold code does not wait for the board and covers the
+        # T stores
+        self.lpoll = bool(lpoll)
+        self.lfence = bool(lfence)
+        assert self.lpoll or not self.lfence, "lfence moves a fence into the lpoll loop"
+        self.lbin = bool(lbin)
+        self.tpoll1 = bool(tpoll1)
+        self.cls4 = bool(cls4)
+        self.fwarm = bool(fwarm)
         self.nohoist = bool(nohoist)
         self.rs24 = bool(rs24)
         self.rs24_t4split = bool(rs24_t4split)
@@ -4542,6 +4598,10 @@ class SpecDsaMegakernel:
         hv0 = Uint64(0)
         mv0 = Uint64(0)
         while st_ == Int32(0):
+            if cutlass.const_expr(self.tpoll1):
+                # HIC / SMAX before the acquire of T in program order: the three loads of an iteration overlap
+                hv0 = L.ld_relaxed_u64(self._w(ws, W_TLINE + 1))
+                mv0 = L.ld_relaxed_u64(self._w(ws, W_TLINE + 3))
             wt = L.ld_acquire_u64(self._w(ws, W_TLINE))
             if cutlass.const_expr(self.tl1r):
                 # HIC / SMAX in the same round trip (relaxed, after the acquire of T in program order)
@@ -4556,7 +4616,10 @@ class SpecDsaMegakernel:
             if chk != Int32(0):
                 av = L.ld_relaxed_u64(self._w(ws, W_ABORT))
             it_ = it_ + Int32(1)
-            if Uint32(wt >> Uint64(32)) == tg:
+            okt_ = Uint32(wt >> Uint64(32)) == tg
+            if cutlass.const_expr(self.tpoll1):
+                okt_ = okt_ and Uint32(hv0 >> Uint64(32)) == tg and Uint32(mv0 >> Uint64(32)) == tg
+            if okt_:
                 st_ = Int32(1)
                 tv = Uint32(wt & Uint64(4294967295))
             elif chk != Int32(0):
@@ -4574,7 +4637,7 @@ class SpecDsaMegakernel:
             # orders all producer atomics after the clear.
             hv = hv0
             mv = mv0
-            if cutlass.const_expr(not self.tl1r):
+            if cutlass.const_expr(not self.tl1r and not self.tpoll1):
                 hv = L.ld_relaxed_u64(self._w(ws, W_TLINE + 1))
                 mv = L.ld_relaxed_u64(self._w(ws, W_TLINE + 3))
             # HIC / SMAX are tagged words of the same T line, stored just before T: wait for this launch's tags
@@ -4605,22 +4668,55 @@ class SpecDsaMegakernel:
     def _classify_tasks(self, ci, last, ordw, t_lo, n, m, sLog, sSub, wsub, cnt1, Tv):
         lm = Int32(cute.arch.lanemask_lt())
         kT = L.fkey(Tv)
-        while ci <= last:
-            tl = ordw >> Int32(4) * ci & Int32(15)
-            p = tl * Int32(TILE) + m
-            x = sLog[p]
-            gpos = t_lo + p
-            ok = Int32(0)
-            if gpos < n:
-                if L.fkey(x) >= kT:
-                    ok = Int32(1)
-            bm = Int32(cute.arch.vote_ballot_sync(ok != Int32(0)))
-            if ok != Int32(0):
-                sSub[wsub + cnt1 + Int32(cute.arch.popc(bm & lm))] = Int64(
-                    Uint64(Uint32(gpos)) << Uint64(32) | Uint64(L.u32_of_f32(x))
-                )
-            cnt1 = cnt1 + Int32(cute.arch.popc(bm))
-            ci = ci + Int32(1)
+        if cutlass.const_expr(self.cls4):
+            # up to 4 tiles per round, all loads first (the tile count is uniform over the group)
+            while ci <= last:
+                xs_ = []
+                gs_ = []
+                for u_ in cutlass.range_constexpr(4):
+                    cu_ = ci + Int32(u_)
+                    pu_ = (ordw >> Int32(4) * cu_ & Int32(15)) * Int32(TILE) + m
+                    xu_ = Float32(0.0)
+                    if cu_ <= last:
+                        xu_ = sLog[pu_]
+                    xs_.append(xu_)
+                    gs_.append(t_lo + pu_)
+                bms_ = []
+                oks_ = []
+                for u_ in cutlass.range_constexpr(4):
+                    ok_ = Int32(0)
+                    bm_ = Int32(0)
+                    if ci + Int32(u_) <= last:
+                        if gs_[u_] < n:
+                            if L.fkey(xs_[u_]) >= kT:
+                                ok_ = Int32(1)
+                        bm_ = Int32(cute.arch.vote_ballot_sync(ok_ != Int32(0)))
+                    oks_.append(ok_)
+                    bms_.append(bm_)
+                for u_ in cutlass.range_constexpr(4):
+                    if oks_[u_] != Int32(0):
+                        sSub[wsub + cnt1 + Int32(cute.arch.popc(bms_[u_] & lm))] = Int64(
+                            Uint64(Uint32(gs_[u_])) << Uint64(32) | Uint64(L.u32_of_f32(xs_[u_]))
+                        )
+                    cnt1 = cnt1 + Int32(cute.arch.popc(bms_[u_]))
+                ci = cutlass.min(ci + Int32(4), last + Int32(1))
+        else:
+            while ci <= last:
+                tl = ordw >> Int32(4) * ci & Int32(15)
+                p = tl * Int32(TILE) + m
+                x = sLog[p]
+                gpos = t_lo + p
+                ok = Int32(0)
+                if gpos < n:
+                    if L.fkey(x) >= kT:
+                        ok = Int32(1)
+                bm = Int32(cute.arch.vote_ballot_sync(ok != Int32(0)))
+                if ok != Int32(0):
+                    sSub[wsub + cnt1 + Int32(cute.arch.popc(bm & lm))] = Int64(
+                        Uint64(Uint32(gpos)) << Uint64(32) | Uint64(L.u32_of_f32(x))
+                    )
+                cnt1 = cnt1 + Int32(cute.arch.popc(bm))
+                ci = ci + Int32(1)
         return (ci, cnt1)
 
     @cute.jit
@@ -7613,7 +7709,12 @@ class SpecDsaMegakernel:
                 L.st_g_u32(
                     mHist.iterator.toint() + Int64(ctid + Int32(j * NT)) * Int64(4), Uint32(0)
                 )
-            L.fence_acq_rel_gpu()
+            if cutlass.const_expr(not self.lfence):
+                L.fence_acq_rel_gpu()
+        if cutlass.const_expr(self.lbin):
+            # the 256-bin histogram of the rank selection (the key scratch of the old path), ready after the barrier
+            s_keys[ctid] = Uint32(0)
+            s_keys[ctid + Int32(NT)] = Uint32(0)
         if ctid == Int32(0):
             self._stamp(mStamps, cta, 68)
             gg_ = self._gen_from(gw1, gw2, gw3)
@@ -7624,7 +7725,8 @@ class SpecDsaMegakernel:
             if ctid == Int32(0):
                 # Release of the histogram clear (cumulative over the clearing threads, ordered by the barrier
                 # above): every later store of this thread, the T word included, is ordered after it.
-                L.fence_acq_rel_gpu()
+                if cutlass.const_expr(not self.lfence):
+                    L.fence_acq_rel_gpu()
         gen = Uint64(Uint32(misc[5 + mo])) << Uint64(32) | Uint64(Uint32(misc[4 + mo]))
         tg = self._tag32(gen)
         t64 = gen + Uint64(1)
@@ -7648,32 +7750,87 @@ class SpecDsaMegakernel:
             # dry pass without board loads (warms this code in the SM's instruction cache)
             if dry_ != Int32(0):
                 okp = Int32(1)
-        tdl = self._deadline()
-        while okp == Int32(0):
-            wsr = []
-            for r_ in cutlass.range_constexpr(RMAX):
-                q2 = ctid + cutlass.min(Int32(r_), nmine - Int32(1)) * Int32(NT)
-                wsr.append(ld_relaxed_v2u64(bbase + Int64(q2) * Int64(16)))
-            av = L.ld_relaxed_u64(self._w(ws, W_ABORT))
-            okp = Int32(1)
-            for r_ in cutlass.range_constexpr(RMAX):
-                if Int32(r_) < nmine:
-                    samples[2 * r_] = L.f32_of_u32(Uint32(wsr[r_][0]))
-                    samples[2 * r_ + 1] = L.f32_of_u32(Uint32(wsr[r_][1]))
-                    if (
-                        Uint32(wsr[r_][0] >> Uint64(32)) != tg
-                        or Uint32(wsr[r_][1] >> Uint64(32)) != tg
-                    ):
-                        okp = Int32(0)
+        if cutlass.const_expr(self.fwarm):
             if d != Int32(0):
                 okp = Int32(1)
-            if okp == Int32(0):
-                if av == t64:
-                    ab = Int32(1)
+        tdl = self._deadline()
+        if cutlass.const_expr(self.lpoll):
+            # re-load only the pairs not yet seen valid (bit r of vm_ set while pair r is pending)
+            vm_ = Int32(0)
+            if nmine > Int32(0):
+                vm_ = (Int32(1) << nmine) - Int32(1)
+            first_ = Int32(1)
+            while okp == Int32(0):
+                wsr = []
+                for r_ in cutlass.range_constexpr(RMAX):
+                    q2 = ctid + cutlass.min(Int32(r_), nmine - Int32(1)) * Int32(NT)
+                    wsr.append(
+                        ld_relaxed_v2u64_p(
+                            bbase + Int64(q2) * Int64(16), (vm_ >> Int32(r_)) & Int32(1)
+                        )
+                    )
+                av = L.ld_relaxed_u64(self._w(ws, W_ABORT))
+                if cutlass.const_expr(self.lfence):
+                    if first_ != Int32(0):
+                        if d == Int32(0):
+                            if ctid == Int32(0):
+                                # cumulative release of the histogram clear (ordered after the barrier above) while
+                                # the first poll loads are in flight
+                                L.fence_acq_rel_gpu()
+                first_ = Int32(0)
+                for r_ in cutlass.range_constexpr(RMAX):
+                    if (vm_ >> Int32(r_)) & Int32(1) != Int32(0):
+                        if (
+                            Uint32(wsr[r_][0] >> Uint64(32)) == tg
+                            and Uint32(wsr[r_][1] >> Uint64(32)) == tg
+                        ):
+                            samples[2 * r_] = L.f32_of_u32(Uint32(wsr[r_][0]))
+                            samples[2 * r_ + 1] = L.f32_of_u32(Uint32(wsr[r_][1]))
+                            vm_ = vm_ ^ Int32(1 << r_)
+                okp = Int32(0)
+                if vm_ == Int32(0):
                     okp = Int32(1)
-                elif Int64(L.gtimer()) > tdl:
-                    ab = Int32(2)
+                if d != Int32(0):
                     okp = Int32(1)
+                if okp == Int32(0):
+                    if av == t64:
+                        ab = Int32(1)
+                        okp = Int32(1)
+                    elif Int64(L.gtimer()) > tdl:
+                        ab = Int32(2)
+                        okp = Int32(1)
+            if cutlass.const_expr(self.lfence):
+                if first_ != Int32(0):
+                    # no poll iteration ran (a row without samples): the release fence of the clear is still due
+                    if d == Int32(0):
+                        if ctid == Int32(0):
+                            L.fence_acq_rel_gpu()
+        else:
+            while okp == Int32(0):
+                wsr = []
+                for r_ in cutlass.range_constexpr(RMAX):
+                    q2 = ctid + cutlass.min(Int32(r_), nmine - Int32(1)) * Int32(NT)
+                    wsr.append(ld_relaxed_v2u64(bbase + Int64(q2) * Int64(16)))
+                av = L.ld_relaxed_u64(self._w(ws, W_ABORT))
+                okp = Int32(1)
+                for r_ in cutlass.range_constexpr(RMAX):
+                    if Int32(r_) < nmine:
+                        samples[2 * r_] = L.f32_of_u32(Uint32(wsr[r_][0]))
+                        samples[2 * r_ + 1] = L.f32_of_u32(Uint32(wsr[r_][1]))
+                        if (
+                            Uint32(wsr[r_][0] >> Uint64(32)) != tg
+                            or Uint32(wsr[r_][1] >> Uint64(32)) != tg
+                        ):
+                            okp = Int32(0)
+                if d != Int32(0):
+                    okp = Int32(1)
+                if okp == Int32(0):
+                    if av == t64:
+                        ab = Int32(1)
+                        okp = Int32(1)
+                    elif Int64(L.gtimer()) > tdl:
+                        ab = Int32(2)
+                        okp = Int32(1)
         if ab == Int32(2):
             self._raise_abort(ws, gen, Int32(E_TIMEOUT))
         smn = Float32(float("inf"))
@@ -7692,80 +7849,159 @@ class SpecDsaMegakernel:
                     smx2 = cute.arch.fmax(smx2, cute.arch.fmin(smx, pair_hi))
                     smx2 = cute.arch.fmax(smx2, pair_lo)
                     smx = cute.arch.fmax(smx, pair_hi)
-        s_keys[ctid] = L.fkey(smx)
-        s_keys[ctid + Int32(NT)] = L.fkey(smx2)
-        s_mins[ctid] = L.fkey(smn)
-        wab = cute.arch.warp_redux_sync(Uint32(ab), "or")
-        if lane == Int32(0):
-            s_red[Int32(40) + wid] = wab
-        L.bar(BAR_SMX, NT)
-        ab = Int32(s_red[40] | s_red[41] | s_red[42] | s_red[43])
-        if ctid == Int32(0):
-            self._stamp(mStamps, cta, ST_M_BOARD)
-            self._stamp(mStamps, cta, 21)
-        nkeys = Int32(2) * cutlass.min(nq, Int32(NT))
-        if wid < Int32(3):
-            rank = Int32(TGT)
-            if wid == Int32(1):
-                rank = Int32(TGT2)
-            elif wid == Int32(2):
-                rank = Int32(TGT * Int32(2))
-            selected = Uint32(L.fkey(Float32(float("-inf"))))
-            if ab == Int32(0) and rank > Int32(0) and rank <= nkeys:
-                keys = cute.make_rmem_tensor((8,), Uint32)
-                lo = Uint32(4294967295)
-                hi = Uint32(0)
-                for j in cutlass.range_constexpr(8):
-                    shared_key = Uint32(s_keys[lane + Int32(j * 32)])
-                    keys[j] = shared_key
-                    lo = Uint32(cutlass.min(lo, shared_key))
-                    hi = Uint32(cutlass.max(hi, shared_key))
-                lo = Uint32(L.warp_min_u32(lo))
-                hi = Uint32(L.warp_max_u32(hi))
-                steps = Int32(0)
-                # Each pivot removes a differing key bit. Count the whole
-                # array at every pass, so rank remains a global rank.
-                while lo < hi and steps < Int32(32):
-                    bit = Uint32(Uint32(31) - cute.arch.clz(lo ^ hi))
-                    pivot = Uint32((hi >> bit) << bit)
-                    nabove = Int32(0)
-                    above_min = Uint32(4294967295)
-                    below_max = Uint32(0)
-                    for j in cutlass.range_constexpr(8):
-                        radix_key = Uint32(keys[j])
-                        if radix_key >= pivot:
-                            nabove = nabove + Int32(1)
-                            above_min = Uint32(cutlass.min(above_min, radix_key))
-                        else:
-                            below_max = Uint32(cutlass.max(below_max, radix_key))
-                    nabove = Int32(cute.arch.warp_redux_sync(nabove, "add"))
-                    above_min = Uint32(L.warp_min_u32(above_min))
-                    below_max = Uint32(L.warp_max_u32(below_max))
-                    if nabove >= rank:
-                        lo = Uint32(above_min)
-                    else:
-                        hi = Uint32(below_max)
-                    steps = steps + Int32(1)
-                selected = Uint32(lo)
+        if cutlass.const_expr(self.lbin):
+            # Histogram rank selection: a key's bin is monotone in the key, so the bin of the rank-r key is the
+            # largest bin with at least r keys at or above it (the key search finds the key, then bins it the same way).
+            kmx_ = Uint32(L.fkey(smx))
+            kmn_ = Uint32(L.fkey(smn))
+            # SMIN / SMAX exactly as the key search computes them (warp 3's fold over s_keys / s_mins[lane + 32 j]): its
+            # first step (j = 0, the threads of warp 0) compares against the constant init 0 / 0xFFFFFFFF as a SIGNED
+            # integer, so warp 0's top-1 key counts only if it is below 2^31 (a negative float) and its min key only if
+            # it is at least 2^31 (a non-negative float); the later steps and the warp reduction are unsigned. Kept so
+            # that the T line stays bit-identical (the range [SMIN, SMAX] sets the bins).
+            if wid == Int32(0):
+                kmx_ = Uint32(cutlass.select_(kmx_ < Uint32(2147483648), kmx_, Uint32(0)))
+                kmn_ = Uint32(cutlass.select_(kmn_ >= Uint32(2147483648), kmn_, Uint32(4294967295)))
+            wmx_ = Uint32(cute.arch.warp_redux_sync(kmx_, "max"))
+            wmn_ = Uint32(cute.arch.warp_redux_sync(kmn_, "min"))
+            wab = cute.arch.warp_redux_sync(Uint32(ab), "or")
             if lane == Int32(0):
-                s_res[wid] = selected
+                s_red[wid] = wmx_
+                s_red[Int32(4) + wid] = wmn_
+                s_red[Int32(40) + wid] = wab
+            L.bar(BAR_SMX, NT)
+            ab = Int32(s_red[40] | s_red[41] | s_red[42] | s_red[43])
+            if ctid == Int32(0):
+                self._stamp(mStamps, cta, ST_M_BOARD)
+                self._stamp(mStamps, cta, 21)
+            nkeys = Int32(2) * cutlass.min(nq, Int32(NT))
+            gmx_ = Uint32(s_red[0])
+            gmn_ = Uint32(s_red[4])
+            for w_ in cutlass.range_constexpr(1, 4):
+                v1_ = Uint32(s_red[w_])
+                v2_ = Uint32(s_red[4 + w_])
+                gmx_ = Uint32(cutlass.select_(v1_ > gmx_, v1_, gmx_))
+                gmn_ = Uint32(cutlass.select_(v2_ < gmn_, v2_, gmn_))
+            SMIN = L.invkey(gmn_)
+            SMAX = L.invkey(gmx_)
+            wv0_ = (SMAX - SMIN) * Float32(1.0 / 256.0)
+            sc0_ = cutlass.select_(wv0_ > Float32(0.0), cute.arch.rcp_approx(wv0_), Float32(0.0))
+            # bin of a key: trunc(clamp((x - SMIN) * sc, 0, 255)) == clamp(trunc(.), 0, 255) of the old path
+            fa_ = cute.arch.fmin(cute.arch.fmax((smx - SMIN) * sc0_, Float32(0.0)), Float32(255.0))
+            fb_ = cute.arch.fmin(cute.arch.fmax((smx2 - SMIN) * sc0_, Float32(0.0)), Float32(255.0))
+            kaddr_ = Int32(s_keys.iterator.toint())
+            red_shared_add_u32(kaddr_ + L.f2s_rz(fa_) * Int32(4), Uint32(1))
+            red_shared_add_u32(kaddr_ + L.f2s_rz(fb_) * Int32(4), Uint32(1))
+            L.bar(BAR_SMX, NT)
+            # every warp resolves the three ranks: lane i owns the bins 255 - 8 i .. 248 - 8 i (descending), warp
+            # inclusive scan of the 8-bin sums = cumulative count from the top
+            bs_ = Int32(248) - lane * Int32(8)
+            c_ = []
+            for j_ in cutlass.range_constexpr(8):
+                c_.append(Int32(s_keys[bs_ + Int32(j_)]))
+            tot_ = ((c_[0] + c_[1]) + (c_[2] + c_[3])) + ((c_[4] + c_[5]) + (c_[6] + c_[7]))
+            incl_ = L.warp_incl_scan_add(tot_, lane)
+            excl_ = incl_ - tot_
+            rbins_ = []
+            rks_ = [Int32(TGT), Int32(TGT2), Int32(TGT) * Int32(2)]
+            for ri_ in cutlass.range_constexpr(3):
+                rk_ = rks_[ri_]
+                bm_ = Uint32(cute.arch.vote_ballot_sync(incl_ >= rk_))
+                lsb_ = bm_ & (Uint32(0) - bm_)
+                ls_ = (Int32(31) - Int32(cute.arch.clz(lsb_))) & Int32(31)
+                run_ = excl_
+                fnd_ = Int32(0)
+                bsel_ = Int32(0)
+                for jj_ in cutlass.range_constexpr(8):
+                    j_ = 7 - jj_
+                    run_ = run_ + c_[j_]
+                    hit_ = cutlass.select_(
+                        run_ >= rk_, cutlass.select_(fnd_ == Int32(0), Int32(1), Int32(0)), Int32(0)
+                    )
+                    bsel_ = cutlass.select_(hit_ != Int32(0), bs_ + Int32(j_), bsel_)
+                    fnd_ = fnd_ | hit_
+                rbins_.append(cute.arch.shuffle_sync(bsel_, ls_))
+            rb0_ = rbins_[0]
+            rb1_ = rbins_[1]
+            rb2_ = rbins_[2]
+            if ctid == Int32(0):
+                self._stamp(mStamps, cta, 22)
+                self._stamp(mStamps, cta, 23)
         else:
-            vmin = Uint32(4294967295)
-            vmax = Uint32(0)
-            for j in cutlass.range_constexpr(4):
-                vmin = Uint32(cutlass.min(vmin, Uint32(s_mins[lane + Int32(j * 32)])))
-                vmax = Uint32(cutlass.max(vmax, Uint32(s_keys[lane + Int32(j * 32)])))
-            vmin = Uint32(L.warp_min_u32(vmin))
-            vmax = Uint32(L.warp_max_u32(vmax))
+            s_keys[ctid] = L.fkey(smx)
+            s_keys[ctid + Int32(NT)] = L.fkey(smx2)
+            s_mins[ctid] = L.fkey(smn)
+            wab = cute.arch.warp_redux_sync(Uint32(ab), "or")
             if lane == Int32(0):
-                s_res[3] = vmin
-                s_res[4] = vmax
-        L.bar(BAR_SMX, NT)
-        if ctid == Int32(0):
-            self._stamp(mStamps, cta, 22)
-            self._stamp(mStamps, cta, 23)
-        SMIN = L.invkey(Uint32(s_res[3]))
-        SMAX = L.invkey(Uint32(s_res[4]))
+                s_red[Int32(40) + wid] = wab
+            L.bar(BAR_SMX, NT)
+            ab = Int32(s_red[40] | s_red[41] | s_red[42] | s_red[43])
+            if ctid == Int32(0):
+                self._stamp(mStamps, cta, ST_M_BOARD)
+                self._stamp(mStamps, cta, 21)
+            nkeys = Int32(2) * cutlass.min(nq, Int32(NT))
+            if wid < Int32(3):
+                rank = Int32(TGT)
+                if wid == Int32(1):
+                    rank = Int32(TGT2)
+                elif wid == Int32(2):
+                    rank = Int32(TGT * Int32(2))
+                selected = Uint32(L.fkey(Float32(float("-inf"))))
+                if ab == Int32(0) and rank > Int32(0) and rank <= nkeys:
+                    keys = cute.make_rmem_tensor((8,), Uint32)
+                    lo = Uint32(4294967295)
+                    hi = Uint32(0)
+                    for j in cutlass.range_constexpr(8):
+                        shared_key = Uint32(s_keys[lane + Int32(j * 32)])
+                        keys[j] = shared_key
+                        lo = Uint32(cutlass.min(lo, shared_key))
+                        hi = Uint32(cutlass.max(hi, shared_key))
+                    lo = Uint32(L.warp_min_u32(lo))
+                    hi = Uint32(L.warp_max_u32(hi))
+                    steps = Int32(0)
+                    # Each pivot removes a differing key bit. Count the whole
+                    # array at every pass, so rank remains a global rank.
+                    while lo < hi and steps < Int32(32):
+                        bit = Uint32(Uint32(31) - cute.arch.clz(lo ^ hi))
+                        pivot = Uint32((hi >> bit) << bit)
+                        nabove = Int32(0)
+                        above_min = Uint32(4294967295)
+                        below_max = Uint32(0)
+                        for j in cutlass.range_constexpr(8):
+                            radix_key = Uint32(keys[j])
+                            if radix_key >= pivot:
+                                nabove = nabove + Int32(1)
+                                above_min = Uint32(cutlass.min(above_min, radix_key))
+                            else:
+                                below_max = Uint32(cutlass.max(below_max, radix_key))
+                        nabove = Int32(cute.arch.warp_redux_sync(nabove, "add"))
+                        above_min = Uint32(L.warp_min_u32(above_min))
+                        below_max = Uint32(L.warp_max_u32(below_max))
+                        if nabove >= rank:
+                            lo = Uint32(above_min)
+                        else:
+                            hi = Uint32(below_max)
+                        steps = steps + Int32(1)
+                    selected = Uint32(lo)
+                if lane == Int32(0):
+                    s_res[wid] = selected
+            else:
+                vmin = Uint32(4294967295)
+                vmax = Uint32(0)
+                for j in cutlass.range_constexpr(4):
+                    vmin = Uint32(cutlass.min(vmin, Uint32(s_mins[lane + Int32(j * 32)])))
+                    vmax = Uint32(cutlass.max(vmax, Uint32(s_keys[lane + Int32(j * 32)])))
+                vmin = Uint32(L.warp_min_u32(vmin))
+                vmax = Uint32(L.warp_max_u32(vmax))
+                if lane == Int32(0):
+                    s_res[3] = vmin
+                    s_res[4] = vmax
+            L.bar(BAR_SMX, NT)
+            if ctid == Int32(0):
+                self._stamp(mStamps, cta, 22)
+                self._stamp(mStamps, cta, 23)
+            SMIN = L.invkey(Uint32(s_res[3]))
+            SMAX = L.invkey(Uint32(s_res[4]))
         GMIN = Float32(L.SENT_LO)
         T = Float32(NEG_INF)
         HIC = Float32(NEG_INF)
@@ -7788,14 +8024,23 @@ class SpecDsaMegakernel:
             # Monotone binning commutes with order statistics. Reconstruct
             # the same 256-bin proposal; all-logit certification is unchanged.
             if tot0 >= TGT:
-                b1v = L.f2s_rz((L.invkey(Uint32(s_res[0])) - SMIN) * sc_s)
-                b1v = cutlass.max(Int32(0), cutlass.min(Int32(255), b1v))
+                if cutlass.const_expr(self.lbin):
+                    b1v = rb0_
+                else:
+                    b1v = L.f2s_rz((L.invkey(Uint32(s_res[0])) - SMIN) * sc_s)
+                    b1v = cutlass.max(Int32(0), cutlass.min(Int32(255), b1v))
             if tot0 >= TGT2:
-                b2v = L.f2s_rz((L.invkey(Uint32(s_res[1])) - SMIN) * sc_s)
-                b2v = cutlass.max(Int32(0), cutlass.min(Int32(255), b2v))
+                if cutlass.const_expr(self.lbin):
+                    b2v = rb1_
+                else:
+                    b2v = L.f2s_rz((L.invkey(Uint32(s_res[1])) - SMIN) * sc_s)
+                    b2v = cutlass.max(Int32(0), cutlass.min(Int32(255), b2v))
             if tot0 >= TGT * Int32(2):
-                b3v = L.f2s_rz((L.invkey(Uint32(s_res[2])) - SMIN) * sc_s)
-                b3v = cutlass.max(Int32(0), cutlass.min(Int32(255), b3v))
+                if cutlass.const_expr(self.lbin):
+                    b3v = rb2_
+                else:
+                    b3v = L.f2s_rz((L.invkey(Uint32(s_res[2])) - SMIN) * sc_s)
+                    b3v = cutlass.max(Int32(0), cutlass.min(Int32(255), b3v))
         if sok != Int32(0):
             if tot0 >= TGT:
                 T = L._fmaf(Float32(b1v), wv, SMIN)
@@ -7817,7 +8062,8 @@ class SpecDsaMegakernel:
                         t3c = L._fmaf(Float32(b3v), wv, SMIN)
                         if t3c < T:
                             T3 = t3c
-        L.bar(BAR_SMX, NT)
+        if cutlass.const_expr(not self.lbin):
+            L.bar(BAR_SMX, NT)
         if ctid == Int32(0):
             if ab != Int32(0):
                 misc[8 + mo] = Int32(2139095040)
@@ -7837,7 +8083,19 @@ class SpecDsaMegakernel:
                 if cutlass.const_expr(self.debug):
                     if mCtl[1] == Int32(1):
                         skip_t = Int32(1)
-                if skip_t == Int32(0):
+                if cutlass.const_expr(self.fwarm):
+                    skip_t = Int32(0)
+                    if cutlass.const_expr(self.debug):
+                        if mCtl[1] == Int32(1):
+                            skip_t = Int32(1)
+                    tw_ = cutlass.select_(d == Int32(0), Int32(W_TLINE), Int32(W_TLINE_DRY))
+                    if skip_t == Int32(0):
+                        tgl = Uint64(tg) << Uint64(32)
+                        st_rlx_u64(self._w(ws, tw_ + Int32(1)), tgl | Uint64(L.u32_of_f32(HIC)))
+                        st_rlx_u64(self._w(ws, tw_ + Int32(2)), tgl | Uint64(L.u32_of_f32(T3)))
+                        st_rlx_u64(self._w(ws, tw_ + Int32(3)), tgl | Uint64(L.u32_of_f32(SMAX)))
+                        st_rlx_u64(self._w(ws, tw_), tgl | Uint64(L.u32_of_f32(T)))
+                elif skip_t == Int32(0):
                     tgl = Uint64(tg) << Uint64(32)
                     st_rlx_u64(self._w(ws, W_TLINE + 1), tgl | Uint64(L.u32_of_f32(HIC)))
                     st_rlx_u64(self._w(ws, W_TLINE + 2), tgl | Uint64(L.u32_of_f32(T3)))
