@@ -72,7 +72,7 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
     worker = DFlashWorker(config, Mapping())
     draft_model = _FakeDraftModel()
     worker.set_draft_model(draft_model)
-    spec_metadata = SimpleNamespace(max_num_requests=2, num_seq_slots=2)
+    spec_metadata = SimpleNamespace(max_num_requests=2, num_seq_slots=2, max_generation_batch=2)
     attn_metadata = SimpleNamespace(max_seq_len=64)
 
     worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
@@ -90,12 +90,13 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
     ]
 
 
-def test_context_cache_spans_full_seq_slot_pool_on_graph_bucket(monkeypatch):
-    """The ctx cache is sized by num_seq_slots, not a narrowed graph bucket."""
+def test_context_cache_spans_engine_batch_on_graph_bucket(monkeypatch):
+    """The ctx cache is sized by the engine batch: not a narrowed graph bucket,
+    and not a 2x seq-slot pool (worker slots are freed every step)."""
     worker = _make_worker(monkeypatch)
     draft_model = _FakeDraftModel()
     worker.set_draft_model(draft_model)
-    spec_metadata = SimpleNamespace(max_num_requests=1, num_seq_slots=4)
+    spec_metadata = SimpleNamespace(max_num_requests=1, num_seq_slots=8, max_generation_batch=4)
     attn_metadata = SimpleNamespace(max_seq_len=64)
 
     worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
