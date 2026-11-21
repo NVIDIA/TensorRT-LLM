@@ -44,8 +44,10 @@ the row instead (8-bit digits, one 256-bin all-gather per level, a write pass wi
 
 A CTA holds ~170 KB of shared memory, so the clusters of a launch have to co-reside in one wave on the 148 SMs
 (clusters of 8 / 6 / 5 / 4 CTAs: 15 / 22 / 26 / 33 per B200); ``topk_multicta_op`` picks ``g`` from the batch size (1
-to 26 rows). The launch is a plain stream-ordered launch: the production kernels around it never trigger a dependent
-launch early, so the programmatic-launch attribute only costs time.
+to 26 rows). The launch is a plain stream-ordered launch. With ``trigger`` every CTA lets the dependent grid launch
+(``griddepcontrol.launch_dependents``) as soon as its stream phase is done, which is what the tail attention launched
+with the programmatic attribute (``tail_op``, ``pdl``) needs to run its prologue while this kernel ranks the crossing
+bin; the production kernels around it never trigger a dependent launch early.
 """
 
 from __future__ import annotations
@@ -481,18 +483,21 @@ class TopkMultiCta:
         g: CTAs (the cluster) per row, one of ``SUPPORTED_CLUSTER_SIZES``; another value raises ValueError.
         force_fallback: take the exact radix path on every row (a test hook: it is a different kernel, the default one
             takes it only when the certificate of the fast path fails).
+        trigger: launch the dependent grid once the stream phase of the CTA is done (programmatic dependent launch).
+            A CTA that takes another path (a short row) triggers when it exits.
 
     The compiled function takes, in order: ``logits`` float32 [B, npad] (unit column stride, row stride a multiple of
     128, 16-byte aligned base), ``ctx`` int32 [B] (valid length of each row) and ``out`` int32 [B, 512].
     """
 
-    def __init__(self, g: int, force_fallback: bool = False):
+    def __init__(self, g: int, force_fallback: bool = False, trigger: bool = False):
         if g not in SUPPORTED_CLUSTER_SIZES:
             raise ValueError(
                 f"cluster size {g} not supported (built and validated for {SUPPORTED_CLUSTER_SIZES})"
             )
         self.g = g
         self.force_fallback = force_fallback
+        self.trigger = trigger
 
     @cute.jit
     def __call__(
@@ -706,6 +711,8 @@ class TopkMultiCta:
                     ring, kb + Int32(NBUF), slot_b, rowbase, nchunk, d, warp, lane, G, U, NW
                 )
                 kb = kb + Int32(1)
+            if cutlass.const_expr(self.trigger):
+                cute.arch.griddepcontrol_launch_dependents()
             # histogram of the warp's own candidates (32 entries per step)
             lsth = sb + Int32(OFF_LST) + warp * Int32(LCAPW * 8)
             cwh = _umin(wcnt, Int32(LCAPW))
