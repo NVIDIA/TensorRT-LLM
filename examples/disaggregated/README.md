@@ -277,36 +277,70 @@ generation_servers:
       - "localhost:8003"
 ```
 
-Native Python RankInfo authentication is optional. When `internal_request_auth_key`
+Native Python transfer authentication is optional. When `internal_request_auth_key`
 is configured, HTTP/gRPC serving forwards it to the native transfer workers;
 communicating peers must use the same key. The MPI launcher reads it from the
 disaggregated serving config; separately launched servers read their own configs.
-Without a key, workers warn and retain unauthenticated RankInfo exchange.
-No key is generated automatically, and configured peers never downgrade to an
-unauthenticated exchange.
+Without a key, workers warn and keep the unauthenticated control plane.
+No key is generated automatically, and configured peers never downgrade to
+unauthenticated messages. The key must be at least 16 bytes; 32 random bytes are
+recommended (for example `openssl rand -hex 32`). A native transfer worker that is
+given a shorter key fails at startup with an error that names
+`internal_request_auth_key`.
+
+With a key, every control message sent through the native Python messenger between
+context and generation workers (RankInfo exchange and reply, peer registration,
+KV data requests, KV/aux transfer results, cancels, session-quiesced notices)
+carries an HMAC-SHA256 tag derived from the key.
+Workers drop messages that are unsigned, signed with another key, altered, or
+addressed to another worker, and keep serving. Authentication relies on the shared
+key only: every worker that holds the key is trusted. KV data itself moves over
+NIXL/UCX and is not covered. The control channel of the KV-cache bounce buffer
+(in use when `cache_transceiver_config.kv_cache_bounce_size_mb` is above 0) and the
+C++ transceiver (`cache_transceiver_config.transceiver_runtime: CPP`) do not use
+the key; their control messages carry no tag.
+
+Each signed message also carries a per-socket sequence number. A receiver accepts
+a message only when its number is higher than the last one it accepted from that
+socket, so a repeated message is dropped; so is a message that arrives after a
+later one, which can happen when a connection is re-established. A receiving
+socket keeps the last number of up to 4096 sending sockets in memory. Once it
+holds 4096 and accepts a message from one more sending socket, it forgets the
+number of the socket it has least recently accepted a message from, and the next
+message from that socket is accepted with any number. A newly opened socket (each
+RankInfo exchange opens one) and a restarted worker start with none, so the first
+message they get from a sending socket is accepted with any number.
 
 Upgrade communicating context and generation workers together before enabling
 native authentication. Existing deployments that already set
 `internal_request_auth_key` for HTTP hand-off signing enable native authentication
-on upgrade as well. Set the same key on all communicating context/generation
-workers, or leave it unset on all of them; mixed configurations fail KV transfers.
-Older generation workers cannot decode the authenticated challenge.
+on upgrade as well. Native transfer workers accepted a key shorter than 16 bytes
+before and now fail at startup with it, so replace such a key before upgrading.
+Set the same key on all communicating context/generation workers, or leave it
+unset on all of them; mixed configurations fail at the first RankInfo exchange with
+an error that names `internal_request_auth_key`, either because the reply fails
+verification or because the exchange times out. The exchange times out when the
+context worker has a key and the generation worker has a different key or none.
+Every request that needs that context worker then waits for the full RankInfo
+deadline described below before it fails, and the generation worker does not make
+progress on its other requests during that wait. Older workers without native
+authentication cannot talk to workers that have a key.
 
 For gRPC, `internal_request_auth_key` is now accepted and forwarded to native
 transfer workers; previously the serving command rejected this field in gRPC mode.
 The RankInfo exchange uses the configured KV transfer timeout as one deadline for
 both replies (60 seconds for direct callers without a transfer timeout).
 The server retains at most 4096 pending challenges, each valid for 10 seconds.
-An unauthenticated client can still exhaust this cache using fresh identities and
-cause legitimate requests to fail with "server busy"; the bound and expiry limit
-resource use but do not prevent sustained denial of service.
+With a key configured, only signed requests reach this cache, so clients without
+the key cannot exhaust it.
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
-server config and in each context/generation worker config. The proxy signs internal
-generation requests with this key, and generation workers reject request-supplied
-disaggregated metadata such as `ctx_info_endpoint` or `encoded_opaque_state` when
-the internal handoff does not carry a valid signature.
+server config and in each context/generation worker config; native transfer workers
+require at least 16 bytes (see above). The proxy signs internal generation requests
+with this key, and generation workers reject request-supplied disaggregated metadata
+such as `ctx_info_endpoint` or `encoded_opaque_state` when the internal handoff does
+not carry a valid signature.
 
 
 #### Sending requests to the disaggregated server

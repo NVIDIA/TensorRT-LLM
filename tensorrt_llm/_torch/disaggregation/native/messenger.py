@@ -1,6 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import hashlib
+import hmac
+import os
+import struct
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from threading import Event, Lock, Thread
-from typing import Callable, Optional
+from typing import Callable, Mapping, NamedTuple, Optional
 
 import zmq
 
@@ -72,7 +81,221 @@ def decode_message(
     return tuple(m.decode(encoding, errors=err_mode) for m in message)
 
 
+class FrameAuthenticationError(PermissionError):
+    """A signed control message was not accepted or could not be sent.
+
+    Raised on receive when a message fails verification, and by a signed
+    ROUTER's ``send()`` when no verified message came from the routing id.
+    """
+
+
+class SignedHeader(NamedTuple):
+    key_id: int
+    flow: int
+    seq: int
+    stream_id: bytes
+    sender_id: bytes
+
+
+class FrameSigner:
+    """HMAC-SHA256 authentication for multipart control messages.
+
+    A signed message is the payload frames followed by a header frame and a
+    32-byte MAC frame: ``[*payload, header, mac]``. The MAC covers, each with a
+    4-byte length prefix so frame boundaries cannot be shifted: the caller's
+    context string, the header (key id, flow, seq, stream id, sender id), the
+    recipient id, and every payload frame. ROUTER identity frames are added and
+    consumed by ZMQ, never seen by the peer, and are therefore not signed.
+
+    The signer holds only key material and the context string, so one instance
+    can be shared by every socket of a component. Identities and flow are
+    supplied per message by ``ZMQMessenger``.
+
+    Args:
+        keys: Accepted keys by key id (0-255). Verification accepts any of
+            them, so a rotation can roll out "accept new" before "send new".
+        active_key_id: Key id used for signing; must be present in ``keys``.
+        context: Domain-separation string chosen by the caller. Two protocols
+            sharing a key must use different contexts, otherwise a frame valid
+            in one verifies in the other.
+    """
+
+    MAC_SIZE = 32
+    STREAM_ID_SIZE = 16
+    MIN_KEY_SIZE = 16
+    # Flow is the socket direction, not a role: requests travel DEALER to
+    # ROUTER and replies ROUTER to DEALER. Together with sender and recipient
+    # ids it makes a message signed for one direction fail in the other.
+    FLOW_TO_ROUTER = 0
+    FLOW_TO_DEALER = 1
+
+    _VERSION = 1
+    _HEADER = struct.Struct("!BBBQ16sH")
+    _LEN = struct.Struct("!I")
+
+    def __init__(self, keys: Mapping[int, bytes], active_key_id: int, context: bytes) -> None:
+        if not keys:
+            raise ValueError("FrameSigner requires at least one key")
+        for key_id, key in keys.items():
+            if not 0 <= key_id <= 255:
+                raise ValueError(f"Key id {key_id} is outside 0-255")
+            if not isinstance(key, bytes) or len(key) < self.MIN_KEY_SIZE:
+                raise ValueError(
+                    f"Key {key_id} must be bytes of at least {self.MIN_KEY_SIZE} bytes"
+                )
+        if active_key_id not in keys:
+            raise ValueError(f"Active key id {active_key_id} is not among the accepted keys")
+        if not context:
+            raise ValueError("FrameSigner requires a non-empty context")
+        self._active_key_id = active_key_id
+        self._context = bytes(context)
+        # One HMAC state per key with the context already absorbed: each
+        # message continues from a copy instead of re-keying the hash.
+        self._mac_bases = {key_id: self._new_mac_base(key) for key_id, key in keys.items()}
+
+    def __repr__(self) -> str:
+        return (
+            f"FrameSigner(key_ids={sorted(self._mac_bases)}, "
+            f"active_key_id={self._active_key_id}, context={self._context!r})"
+        )
+
+    def sign(
+        self,
+        frames: list[bytes],
+        *,
+        sender_id: bytes,
+        recipient_id: bytes,
+        flow: int,
+        seq: int,
+        stream_id: bytes,
+    ) -> list[bytes]:
+        """Return the ``[header, mac]`` frames to append to ``frames``.
+
+        Args:
+            frames: Payload frames of the message, in the order they are sent.
+            sender_id: Id of the sending component. It is sent in the header,
+                which the MAC covers.
+            recipient_id: Id of the component the message is for. It is covered
+                by the MAC and not sent; the verifier supplies its own id.
+            flow: ``FLOW_TO_ROUTER`` or ``FLOW_TO_DEALER``.
+            seq: Number of the message within ``stream_id``. ``ZMQMessenger``
+                passes a per-socket counter that starts at 1.
+            stream_id: ``STREAM_ID_SIZE`` bytes that identify the sending
+                socket. ``ZMQMessenger`` passes a random value drawn once per
+                socket.
+        """
+        if len(stream_id) != self.STREAM_ID_SIZE:
+            raise ValueError(f"stream_id must be {self.STREAM_ID_SIZE} bytes")
+        header = (
+            self._HEADER.pack(
+                self._VERSION, self._active_key_id, flow, seq, stream_id, len(sender_id)
+            )
+            + sender_id
+        )
+        mac = self._mac(self._active_key_id, header, recipient_id, frames)
+        return [header, mac]
+
+    def verify(
+        self, frames: list[bytes], *, recipient_id: bytes, flow: int
+    ) -> tuple[list[bytes], SignedHeader]:
+        """Verify ``[*payload, header, mac]`` and return the payload and header.
+
+        Args:
+            frames: The received message without any ROUTER routing id frame.
+            recipient_id: Id of the verifying component. The MAC matches only
+                when the signer passed the same value.
+            flow: The flow this socket receives on, ``FLOW_TO_ROUTER`` or
+                ``FLOW_TO_DEALER``.
+
+        Raises:
+            FrameAuthenticationError: The message is malformed, has no payload
+                frame, uses an unknown key id, was sent on the other flow or to
+                another recipient, has a frame of 4 GiB or more, or its MAC
+                does not match.
+        """
+        if len(frames) < 3:
+            raise FrameAuthenticationError("Message carries no payload or no authentication frames")
+        payload, header, mac = frames[:-2], frames[-2], frames[-1]
+        # Cheap structural checks first; the MAC is computed only for
+        # well-formed headers that name a known key.
+        if len(mac) != self.MAC_SIZE or len(header) < self._HEADER.size:
+            raise FrameAuthenticationError("Malformed authentication frames")
+        version, key_id, msg_flow, seq, stream_id, sender_len = self._HEADER.unpack_from(header)
+        if version != self._VERSION or len(header) != self._HEADER.size + sender_len:
+            raise FrameAuthenticationError("Malformed authentication header")
+        if msg_flow != flow:
+            raise FrameAuthenticationError("Message was sent on the other flow")
+        if key_id not in self._mac_bases:
+            raise FrameAuthenticationError(f"Unknown key id {key_id}")
+        try:
+            expected_mac = self._mac(key_id, header, recipient_id, payload)
+        except struct.error as e:
+            # The length of each MAC input is packed into 4 bytes.
+            raise FrameAuthenticationError("Frame is too large to authenticate") from e
+        if not hmac.compare_digest(mac, expected_mac):
+            raise FrameAuthenticationError("MAC mismatch")
+        sender_id = header[self._HEADER.size :]
+        return list(payload), SignedHeader(key_id, msg_flow, seq, stream_id, sender_id)
+
+    def _new_mac_base(self, key: bytes) -> hmac.HMAC:
+        base = hmac.new(key, digestmod=hashlib.sha256)
+        base.update(self._LEN.pack(len(self._context)))
+        base.update(self._context)
+        return base
+
+    def _mac(self, key_id: int, header: bytes, recipient_id: bytes, frames: list[bytes]) -> bytes:
+        mac = self._mac_bases[key_id].copy()
+        for part in (header, recipient_id, *frames):
+            mac.update(self._LEN.pack(len(part)))
+            mac.update(part)
+        return mac.digest()
+
+
 class ZMQMessenger(MessengerInterface):
+    """ZMQ socket wrapper used by the native transfer control plane.
+
+    Messages are unauthenticated unless a ``signer`` is supplied. Passing
+    ``signer=None`` is an explicit opt-out: messages are then sent and accepted
+    without authentication.
+
+    With a signer, only ROUTER and DEALER modes are supported. Every outgoing
+    message gets ``[header, mac]`` appended, and every incoming message is
+    verified and stripped before it reaches ``receive()`` callers or the
+    listener callback, so handlers see the same frames as without a signer.
+
+    Message ordering. Each signed socket draws a random 16-byte stream id
+    and numbers its messages from 1. The receiving socket remembers the last
+    seq accepted per (sender id, stream id) and accepts a message only when
+    its seq is larger, so a message is accepted at most once while that state
+    is kept. A gap (lost message) is accepted. A message that arrives after a
+    later one of the same stream is dropped; this can happen when a
+    connection is re-established while earlier messages are still unread at
+    the receiver. A restarted peer draws a new stream id and starts again at
+    1. Senders hold a lock around seq assignment and the socket write, so
+    threads sharing a socket cannot reorder their own messages.
+
+    Args:
+        mode: One of ``SOCKET_MODES``.
+        endpoint: Bind address for ROUTER/REP, connect address for DEALER/REQ.
+            A signed DEALER must connect with exactly the id of the ROUTER,
+            which is the string the ROUTER reports as ``endpoint`` unless it
+            was given ``identity``: the MAC covers this string, so another
+            spelling of the same address does not verify.
+        signer: Message authenticator, or None to send and accept plain frames.
+        identity: This component's id in signed messages. A ROUTER defaults to
+            its bound endpoint. A signed DEALER must be given the endpoint of
+            its owner's ROUTER, which is how peers address replies to it.
+    """
+
+    # Bounds on routing ids remembered for replies and on replay state.
+    # Entries are added only after a MAC verifies, so messages that fail
+    # verification do not add any. Evicting the replay state of a long-idle
+    # peer socket forgets its last seq, so its earlier messages would be
+    # accepted again; messages without a valid MAC are still rejected.
+    _MAX_PEER_IDS = 4096
+    _MAX_REPLAY_STATE = 4096
+    _AUTH_WARNING_INTERVAL_S = 10.0
+
     SOCKET_MODES = {
         "ROUTER": zmq.ROUTER,  # Handles multiple connections and routes messages by address.
         "DEALER": zmq.DEALER,  # Load balances outgoing messages and receives replies fairly.
@@ -80,11 +303,23 @@ class ZMQMessenger(MessengerInterface):
         "REP": zmq.REP,  # Receives requests and sends replies (synchronous).
     }
 
-    def __init__(self, mode: str, endpoint: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        mode: str,
+        endpoint: Optional[str] = None,
+        *,
+        signer: Optional[FrameSigner],
+        identity: Optional[str] = None,
+    ) -> None:
         if mode not in self.SOCKET_MODES:
             raise ValueError(
                 f"Invalid mode '{mode}'. Allowed modes are {list(self.SOCKET_MODES.keys())}"
             )
+        if signer is not None:
+            if mode not in ("ROUTER", "DEALER"):
+                raise ValueError("Signed messaging supports only ROUTER and DEALER modes")
+            if mode == "DEALER" and not identity:
+                raise ValueError("A signed DEALER requires the identity of its owner")
         self._context = zmq.Context()
         self._mode = mode
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
@@ -107,7 +342,27 @@ class ZMQMessenger(MessengerInterface):
             self._socket.connect(endpoint)
             self._endpoint = endpoint
 
-        logger.info(f"Initialized ZMQMessenger(mode={mode}, endpoint={self._endpoint})")
+        self._signer = signer
+        self._identity = (identity or self._endpoint).encode("utf-8")
+        self._peer_ids: "OrderedDict[bytes, bytes]" = OrderedDict()
+        self._peer_ids_lock = Lock()
+        # Messages the listener dropped because verification failed, repeated
+        # or out-of-order ones included. receive() callers are not counted.
+        self.auth_failures = 0
+        self._last_auth_warning = float("-inf")
+        self._send_lock = Lock()
+        self._stream_id = os.urandom(FrameSigner.STREAM_ID_SIZE)
+        self._next_seq = 1
+        self._last_seq: "OrderedDict[tuple[bytes, bytes], int]" = OrderedDict()
+        self._last_seq_lock = Lock()
+        # Repeated or out-of-order messages, counted for the listener and for
+        # receive() callers alike.
+        self.replays_rejected = 0
+
+        logger.info(
+            f"Initialized ZMQMessenger(mode={mode}, endpoint={self._endpoint}, "
+            f"signed={signer is not None})"
+        )
 
     def _initialize_control_sockets(self) -> None:
         self._control_socket = self._context.socket(zmq.PAIR)
@@ -120,15 +375,113 @@ class ZMQMessenger(MessengerInterface):
         pass
 
     def send(self, messages: list[bytes], recipient: Optional[bytes] = None) -> None:
-        if recipient:
-            self._socket.send_multipart([recipient] + messages)
+        if self._signer is None:
+            if recipient:
+                self._socket.send_multipart([recipient] + messages)
+            else:
+                self._socket.send_multipart(messages)
+            return
+        if self._mode == "ROUTER":
+            # The routing id comes either as `recipient` or as the first frame.
+            if recipient:
+                routing_id, payload = recipient, list(messages)
+            else:
+                routing_id, payload = messages[0], list(messages[1:])
+            with self._peer_ids_lock:
+                peer_id = self._peer_ids.get(routing_id)
+            if peer_id is None:
+                # Replies go only to peers that already authenticated to us.
+                raise FrameAuthenticationError("No authenticated peer for this routing id")
+            self._send_signed([routing_id], payload, peer_id, FrameSigner.FLOW_TO_DEALER)
         else:
-            self._socket.send_multipart(messages)
+            payload = ([recipient] if recipient else []) + list(messages)
+            self._send_signed(
+                [], payload, self._endpoint.encode("utf-8"), FrameSigner.FLOW_TO_ROUTER
+            )
+
+    def _send_signed(
+        self, envelope: list[bytes], payload: list[bytes], recipient_id: bytes, flow: int
+    ) -> None:
+        # Taking the seq and writing to the socket must be one step: if two
+        # threads interleaved them, the larger seq could reach the peer first
+        # and the smaller one would then be dropped.
+        with self._send_lock:
+            seq = self._next_seq
+            self._next_seq += 1
+            auth = self._signer.sign(
+                payload,
+                sender_id=self._identity,
+                recipient_id=recipient_id,
+                flow=flow,
+                seq=seq,
+                stream_id=self._stream_id,
+            )
+            self._socket.send_multipart([*envelope, *payload, *auth])
 
     def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
+        """Receive one message; with a signer, verify and strip its auth frames.
+
+        Raises:
+            TimeoutError: No message arrived within ``timeout_ms``.
+            FrameAuthenticationError: The message failed verification.
+        """
         if timeout_ms is not None and not self._socket.poll(timeout_ms, zmq.POLLIN):
             raise TimeoutError("Timed out waiting for a peer response")
-        return self._socket.recv_multipart()
+        frames = self._socket.recv_multipart()
+        if self._signer is None:
+            return frames
+        return self._verify(frames)
+
+    def _verify(self, frames: list[bytes]) -> list[bytes]:
+        if self._mode == "ROUTER":
+            routing_id = frames[0]
+            payload, header = self._signer.verify(
+                frames[1:], recipient_id=self._identity, flow=FrameSigner.FLOW_TO_ROUTER
+            )
+            self._check_replay(header)
+            with self._peer_ids_lock:
+                self._peer_ids[routing_id] = header.sender_id
+                self._peer_ids.move_to_end(routing_id)
+                while len(self._peer_ids) > self._MAX_PEER_IDS:
+                    self._peer_ids.popitem(last=False)
+            return [routing_id, *payload]
+        payload, header = self._signer.verify(
+            frames, recipient_id=self._identity, flow=FrameSigner.FLOW_TO_DEALER
+        )
+        # A DEALER talks to exactly one ROUTER: the reply must come from it.
+        if header.sender_id != self._endpoint.encode("utf-8"):
+            raise FrameAuthenticationError("Reply was not sent by the connected peer")
+        self._check_replay(header)
+        return payload
+
+    def _check_replay(self, header: SignedHeader) -> None:
+        # Runs only after the MAC verified, so the state below is keyed by
+        # authenticated (sender id, stream id) pairs.
+        key = (header.sender_id, header.stream_id)
+        with self._last_seq_lock:
+            last = self._last_seq.get(key)
+            if last is None or header.seq > last:
+                self._last_seq[key] = header.seq
+                self._last_seq.move_to_end(key)
+                while len(self._last_seq) > self._MAX_REPLAY_STATE:
+                    self._last_seq.popitem(last=False)
+                return
+            self.replays_rejected += 1
+        raise FrameAuthenticationError(
+            f"Repeated or out-of-order message (seq {header.seq}, last {last})"
+        )
+
+    def _record_auth_failure(self, error: FrameAuthenticationError) -> None:
+        # Drop the message and keep listening: one rejected message must not
+        # stop the listener. Never log frame contents or keys.
+        self.auth_failures += 1
+        now = time.monotonic()
+        if now - self._last_auth_warning >= self._AUTH_WARNING_INTERVAL_S:
+            self._last_auth_warning = now
+            logger.warning(
+                f"Dropped control message on {self._endpoint}: {error} "
+                f"(total dropped: {self.auth_failures})"
+            )
 
     def start_listener(
         self,
@@ -161,7 +514,11 @@ class ZMQMessenger(MessengerInterface):
                     if self._control_socket in events:
                         self._stop_event.set()
                     elif self._socket in events:
-                        messages = self.receive()
+                        try:
+                            messages = self.receive()
+                        except FrameAuthenticationError as e:
+                            self._record_auth_failure(e)
+                            continue
                         persist = on_message(messages)
                         if persist is False:
                             self._stop_event.set()
