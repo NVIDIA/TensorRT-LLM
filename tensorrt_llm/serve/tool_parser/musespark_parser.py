@@ -133,9 +133,14 @@ class MuseSparkToolParser(BaseToolParser):
     EOS = "<|end_of_text|>"
     STRUCTURAL_TOKENS = (START, MESSAGE, EOM, EOT, EOS)
 
-    _HEADER_RE = re.compile(r"(?:<\|start\|>assistant)?(\s+to=(" + _NAME + r"))<\|message\|>")
+    # A header's whitespace begins where a whitespace run begins. A match that
+    # starts inside a run also matches from the start of the run, and trying
+    # every start in a long run takes time quadratic in its length.
+    _HEADER_RE = re.compile(
+        r"(?:<\|start\|>assistant)?(?<!\s)(\s+to=(" + _NAME + r"))<\|message\|>"
+    )
     # Header still growing at the end of the buffer (no <|message|> yet).
-    _HEADER_TAIL_RE = re.compile(r"(?:<\|start\|>assistant\s+|\s+)to=" + _NAME + r"\s*$")
+    _HEADER_TAIL_RE = re.compile(r"(?:<\|start\|>assistant\s+|(?<!\s)\s+)to=" + _NAME + r"\s*$")
     # Both paths anchor on the opening tag; the closer is found by search, so a
     # truncated invoke is still seen. See _iter_invokes.
     _INVOKE_START_RE = re.compile(r"<atem:invoke\s+name=(?:\"|')?(" + _NAME + r")(?:\"|')?[^>]*>")
@@ -167,6 +172,10 @@ class MuseSparkToolParser(BaseToolParser):
 
     def _reset_streaming_state(self) -> None:
         self._buffer = ""
+        # Whitespace deltas that arrived while the buffer was held and ended in
+        # whitespace. They belong after `_buffer`; see parse_streaming_increment.
+        self._held_whitespace: List[str] = []
+        self._holds_whitespace_run = False
         self._in_tool_block = False
         self._in_reasoning_block = False
         self._block_text = ""
@@ -363,6 +372,18 @@ class MuseSparkToolParser(BaseToolParser):
 
     # ------------------------------------------------------------- streaming
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        if self._holds_whitespace_run and new_text.isspace():
+            # Outside tool and reasoning blocks, a held buffer that ends in
+            # whitespace is all whitespace, ` to=NAME` and whitespace, or a
+            # `<|start|>` header with no `<|message|>` yet. More whitespace
+            # leaves it held, so the delta is set aside unscanned: rescanning
+            # the held run on every delta takes time quadratic in its length.
+            self._held_whitespace.append(new_text)
+            return StreamingParseResult()
+        self._holds_whitespace_run = False
+        if self._held_whitespace:
+            self._buffer += "".join(self._held_whitespace)
+            self._held_whitespace = []
         self._buffer += new_text
         content_parts: List[str] = []
         calls: List[ToolCallItem] = []
@@ -445,6 +466,16 @@ class MuseSparkToolParser(BaseToolParser):
                 break
 
             normal_text = "".join(self._clean(p) for p in content_parts)
+            # `$` in _HEADER_PREFIX_RE also matches before a final newline, so
+            # `t\n` is held as a header prefix and `t\n\n` is not: a held
+            # buffer that ends in one newline after other text is excluded.
+            end = self._buffer[-2:]
+            self._holds_whitespace_run = (
+                not self._in_tool_block
+                and not self._in_reasoning_block
+                and end[-1:].isspace()
+                and (end.isspace() or end[-1] != "\n")
+            )
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:  # pragma: no cover - defensive, mirrors upstream
             logger.error(f"Error in MuseSpark parse_streaming_increment: {e}")
@@ -507,9 +538,17 @@ class MuseSparkToolParser(BaseToolParser):
         """
         hold = max(cls._partial_suffix_len(safe, tok) for tok in cls.STRUCTURAL_TOKENS)
         for n in range(len(safe), hold, -1):
+            if n < len(safe) and safe[-n].isspace() and safe[-n - 1].isspace():
+                # A suffix that starts inside a whitespace run matches only if
+                # the longer one starting a character earlier did.
+                continue
             suffix = safe[-n:]
             core = suffix[: len(suffix) - cls._partial_suffix_len(suffix, cls.MESSAGE)]
-            if "<|start|>assistant".startswith(core) or cls._HEADER_PREFIX_RE.match(core):
+            if (
+                core.isspace()
+                or "<|start|>assistant".startswith(core)
+                or cls._HEADER_PREFIX_RE.match(core)
+            ):
                 return n
         return hold
 
@@ -582,6 +621,9 @@ class MuseSparkToolParser(BaseToolParser):
         """
         calls: List[ToolCallItem] = []
         normal_text = ""
+        self._buffer += "".join(self._held_whitespace)
+        self._held_whitespace = []
+        self._holds_whitespace_run = False
         if self._in_tool_block:
             self._block_text += self._buffer
             self._buffer = ""
