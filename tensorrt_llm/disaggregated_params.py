@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-import numpy as np
-
 from tensorrt_llm.bindings import executor as tllme
 
 if TYPE_CHECKING:
@@ -169,7 +167,7 @@ class DisaggregatedParams:
                 assert len(self.multimodal_embedding_handles) > 0, (
                     "multimodal_embedding_handles must be provided"
                 )
-                vals = np.random.randint(
-                    np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
-                ).tolist()
-                self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
+                # Defer the import because inputs and executor import these parameters.
+                from tensorrt_llm.inputs.multimodal import random_mm_hashes
+
+                self.multimodal_hashes = random_mm_hashes(len(self.multimodal_embedding_handles))
