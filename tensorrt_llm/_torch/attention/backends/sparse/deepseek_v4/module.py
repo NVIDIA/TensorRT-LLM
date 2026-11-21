@@ -393,7 +393,7 @@ def _run_dsv4_o_lora_bmms(
         projected_output.copy_(self.o_b_proj(o_lora_bmm_output.flatten(1)))
 
 
-def supports_dsv4_epilogue_fusion(self) -> bool:
+def supports_dsv4_epilogue_fusion(self: MLA) -> bool:
     """Whether this layer can fuse the sparse attention output epilogue."""
     if self._disable_dsv4_epilogue_fusion:
         return False

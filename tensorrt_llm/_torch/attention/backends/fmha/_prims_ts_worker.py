@@ -9,9 +9,11 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from importlib.machinery import ModuleSpec
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 _BACKENDS = "tensorrt_llm._torch.attention.backends"
@@ -21,7 +23,9 @@ _VENDOR = f"{_BACKENDS}.prims_ts"
 class _VendorPackages:
     """Resolve PrimTS and its JIT helper without running TensorRT-LLM initialization."""
 
-    def find_spec(self, fullname: str, path=None, target=None) -> ModuleSpec | None:
+    def find_spec(
+        self, fullname: str, path: Sequence[str] | None = None, target: ModuleType | None = None
+    ) -> ModuleSpec | None:
         if fullname == _VENDOR:
             locations = [str(Path(__file__).resolve().parents[1] / "prims_ts")]
         elif fullname == _BACKENDS:
@@ -49,10 +53,14 @@ def _plan(payload: dict[str, Any]) -> None:
     torch.cuda.set_device(device)
     from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
-    kwargs = payload["plan_kwargs"]
+    kwargs = payload["plan_kwargs"].copy()
     kwargs["q_dtype"] = getattr(torch, kwargs["q_dtype"])
     wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(device, payload["rows"], payload["heads"], **kwargs)
+    try:
+        wrapper.plan(device, payload["rows"], payload["heads"], **kwargs)
+    except Exception as error:
+        # Native compilation failures need the specialization that triggered them.
+        raise RuntimeError(f"PrimTS worker could not compile {payload!r}: {error}") from error
     if not wrapper.is_kernel_cached():
         raise RuntimeError(f"PrimTS worker did not persist its kernel for {payload!r}")
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Parallel CuTe DSL kernel builds for the PrimTS attention backends."""
+"""CuTe DSL cache operations for PrimTS with the pinned FlashInfer 0.7.3 runtime."""
 
 import json
 import os
@@ -12,9 +12,13 @@ from threading import RLock
 from typing import Any, TextIO
 
 from filelock import FileLock
+from flashinfer.jit import cute_dsl_core
 from flashinfer.jit.core import get_tmpdir, logger
 from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl as _FlashInferJitSpecCuteDsl
 from flashinfer.jit.cute_dsl_core import _hash_source_files, _read_meta, cute_dsl_cache_disabled
+
+# FlashInfer 0.7.3 hashes the explicitly selected source files.
+cute_dsl_strict_cache_key = getattr(cute_dsl_core, "cute_dsl_strict_cache_key", lambda: False)
 
 # CuTe DSL compiler options are process-global, even for distinct kernels.
 _compile_lock = RLock()
@@ -127,14 +131,17 @@ def build_and_load_cute_dsl_kernel(
     kernel_name: str,
     compile_fn: Callable[[], Any],
     extra_key_files: Sequence[str] = (),
+    *,
+    source_sha256: str | None = None,
 ) -> Any:
     if cute_dsl_cache_disabled():
         return _compile_in_process(compile_fn)
-    try:
-        source_hash = _hash_source_files(tuple(extra_key_files))
-    except (OSError, TypeError, SyntaxError, ValueError) as error:
-        logger.warning(
-            f"Cannot hash sources for {module_name}/{kernel_name}: {error}. Bypassing cache."
-        )
-        return _compile_in_process(compile_fn)
-    return JitSpecCuteDsl(module_name, kernel_name, compile_fn, source_hash).build_and_load()
+    if source_sha256 is None:
+        try:
+            source_sha256 = _hash_source_files(tuple(extra_key_files))
+        except (OSError, TypeError, SyntaxError, ValueError) as error:
+            logger.warning(
+                f"Cannot hash sources for {module_name}/{kernel_name}: {error}. Bypassing cache."
+            )
+            return _compile_in_process(compile_fn)
+    return JitSpecCuteDsl(module_name, kernel_name, compile_fn, source_sha256).build_and_load()

@@ -55,7 +55,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -83,6 +83,7 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+    from tensorrt_llm._torch.attention.mla import MLA
 
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
@@ -134,7 +135,7 @@ def _plan_kernel_variants(
     workspace = torch.empty(max(sizes.values()), device=device, dtype=torch.uint8)
     wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
     # A disk lookup is useful only if at least two misses could start a pool.
-    check_cache = prims_ts_precompile.worker_count(2, local_ranks=local_ranks) > 1
+    can_fan_out = prims_ts_precompile.pool_enabled(local_ranks=local_ranks)
     variants = []
     payloads = []
     seen = set()
@@ -145,7 +146,7 @@ def _plan_kernel_variants(
             continue
         seen.add(spec)
         variants.append(rows)
-        if check_cache and not wrapper.is_kernel_cached():
+        if can_fan_out and not wrapper.is_kernel_cached():
             device_index = device.index if device.index is not None else torch.cuda.current_device()
             payloads.append(
                 prims_ts_precompile.encode_payload(device_index, rows, heads, plan_kwargs)
@@ -412,6 +413,47 @@ class PrimsTSSparseMlaFmha(Fmha):
         if ratio <= 1:
             return 0
         return int(metadata.max_compressed_indices[ratio])
+
+    def _plan_profile(
+        self,
+        metadata: "DeepseekV4TrtllmAttentionMetadata",
+        device: torch.device,
+        is_fp8: bool,
+        has_sinks: bool,
+        fused_groups: Optional[int],
+    ) -> _PlanProfile:
+        return _PlanProfile(
+            self,
+            device,
+            self._extra_capacity(metadata),
+            torch.float8_e4m3fn if is_fp8 else torch.bfloat16,
+            has_sinks,
+            fused_groups,
+        )
+
+    def warmup_profile(
+        self, layer: "MLA", metadata: "DeepseekV4TrtllmAttentionMetadata"
+    ) -> Optional[_PlanProfile]:
+        """Return the generation profile for a local MLA layer eligible for PrimTS."""
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
+            supports_dsv4_epilogue_fusion,
+        )
+
+        if layer.o_a_proj is None or metadata.beam_width != 1 or layer.mapping.has_cp_helix():
+            return None
+        is_fp8 = self._is_fp8_cache(metadata)
+        if not is_fp8 and layer.dtype != torch.bfloat16:
+            return None
+        fused = supports_dsv4_epilogue_fusion(layer)
+        if not fused and layer.dtype != torch.bfloat16:
+            return None  # The unfused kernel only writes BF16 output.
+        return self._plan_profile(
+            metadata,
+            metadata.token_positions_cuda.device,
+            is_fp8,
+            getattr(self.attn, "attn_sink", None) is not None,
+            layer.n_local_groups if fused else None,
+        )
 
     def _pool_view(
         self,
@@ -698,7 +740,6 @@ class PrimsTSSparseMlaFmha(Fmha):
         end = start + rows
         ratio = int(attn.compress_ratio)
         window = int(attn.sparse_attention_config.window_size)
-        extra = self._extra_capacity(metadata)
         is_fp8 = self._is_fp8_cache(metadata)
         fused = bool(forward_args.enable_dsv4_epilogue_fusion)
         groups = int(output.shape[0]) if fused else None
@@ -725,15 +766,9 @@ class PrimsTSSparseMlaFmha(Fmha):
         output_scale = kv_scale
 
         sinks = self._sinks(forward_args)
-        profile = dict(
-            metadata=metadata,
-            device=q.device,
-            extra=extra,
-            q_dtype=query.dtype,
-            has_sinks=sinks is not None,
-            fused_groups=groups,
-        )
-        plan = self._get_plan(rows=rows, **profile)
+        profile = self._plan_profile(metadata, q.device, is_fp8, sinks is not None, groups)
+        plan = profile.load(metadata, rows)
+        extra = profile.extra
 
         # Storage-row indices straight from sparse_attn_predict: the window
         # slots address the SWA pool and the compressed slots address the
@@ -801,8 +836,7 @@ class PrimsTSSparseMlaFmha(Fmha):
         )
 
 
-@dataclass(frozen=True)
-class _WarmupProfile:
+class _PlanProfile(NamedTuple):
     library: PrimsTSSparseMlaFmha
     device: torch.device
     extra: int
@@ -815,8 +849,8 @@ class _WarmupProfile:
             self.extra, self.q_dtype, self.has_sinks, self.fused_groups
         )[0]
 
-    def load(self, metadata: "TrtllmAttentionMetadata", rows: int) -> None:
-        self.library._get_plan(
+    def load(self, metadata: "TrtllmAttentionMetadata", rows: int) -> _SparsePlan:
+        return self.library._get_plan(
             metadata=metadata,
             device=self.device,
             rows=rows,
@@ -828,7 +862,7 @@ class _WarmupProfile:
 
 
 def _warmup_profiles(
-    profiles: list[_WarmupProfile],
+    profiles: list[_PlanProfile],
     metadata: "TrtllmAttentionMetadata",
 ) -> None:
     """Precompile missing kernels in parallel and prepare all plans locally."""
@@ -878,41 +912,29 @@ def warmup_prims_ts_sparse_mla(
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
         DeepseekV4TrtllmAttention,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
-        supports_dsv4_epilogue_fusion,
-    )
     from tensorrt_llm._torch.attention.mla import MLA
+
+    from .fallback import FallbackFmha
 
     if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
         raise RuntimeError("PrimTS kernel warmup requires eager metadata outside graph capture")
+
     profiles = []
-    device = metadata.token_positions_cuda.device
-    is_fp8 = PrimsTSSparseMlaFmha._is_fp8_cache(metadata)
     for layer in model.modules():
         if not isinstance(layer, MLA) or not isinstance(layer.mqa, DeepseekV4TrtllmAttention):
             continue
-        if layer.o_a_proj is None:
-            continue
-        if not is_fp8 and layer.dtype != torch.bfloat16:
-            continue
         manager = layer.mqa._fmha_manager
-        if manager is None:
+        if manager is None or not any(True for _ in layer.parameters()):
             continue
         for library in manager.fmha_libs:
+            if isinstance(library, FallbackFmha):
+                # The fallback accepts the DeepSeek-V4 generation call on this layer.
+                break
             if isinstance(library, PrimsTSSparseMlaFmha):
-                fused = supports_dsv4_epilogue_fusion(layer)
-                if not fused and layer.dtype != torch.bfloat16:
-                    continue  # The unfused kernel only writes BF16 output.
-                profiles.append(
-                    _WarmupProfile(
-                        library=library,
-                        device=device,
-                        extra=library._extra_capacity(metadata),
-                        q_dtype=torch.float8_e4m3fn if is_fp8 else torch.bfloat16,
-                        has_sinks=getattr(layer.mqa, "attn_sink", None) is not None,
-                        fused_groups=layer.n_local_groups if fused else None,
-                    )
-                )
+                profile = library.warmup_profile(layer, metadata)
+                if profile is not None:
+                    profiles.append(profile)
+                break
     _warmup_profiles(profiles, metadata)
 
 

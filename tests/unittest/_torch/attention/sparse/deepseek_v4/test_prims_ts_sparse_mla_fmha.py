@@ -557,6 +557,11 @@ def test_reloaded_kernel_accepts_the_same_launch(monkeypatch):
         return wrapper, out
 
     wrapper, first = run_fresh_plan(pool)
+    for _ in range(2):
+        launch(wrapper, pool, first, validate=False)
+    # Reuse the bound views after a data update at the same address.
+    pool.neg_()
+    first.fill_(torch.nan)
     launch(wrapper, pool, first, validate=False)
     previous = first.clone()
     replacement_pool = -pool
@@ -884,6 +889,28 @@ def test_forward_sparse_mla_unified_prims_ts(monkeypatch, batch_name, kv_cache_d
             fallback_calls.append(1)
         return original_fallback(self, q, k, v, metadata, forward_args, *args, **kwargs)
 
+    if (library, batch_name, kv_cache_dtype) == ("prims_ts", "single_decode", "auto"):
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
+            warmup_prims_ts_sparse_mla,
+        )
+        from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+        from .. import test_sparse_mla_forward as unified
+
+        gen = unified.forward_generation_deepseek_v4_mla
+
+        def forward_after_warmup(mla, *, attn_metadata, **kwargs):
+            compiled = mla_decode._get_compiled_mla_decode
+            compiled.cache_clear()
+            warmup_prims_ts_sparse_mla(mla, attn_metadata)
+            warmed = compiled.cache_info()
+            assert warmed.currsize > 0
+            result = gen(mla, attn_metadata=attn_metadata, **kwargs)
+            assert compiled.cache_info().misses == warmed.misses
+            return result
+
+        monkeypatch.setattr(unified, "forward_generation_deepseek_v4_mla", forward_after_warmup)
+
     monkeypatch.setattr(PrimsTSSparseMlaFmha, "forward", counting_forward)
     monkeypatch.setattr(FallbackFmha, "forward", counting_fallback)
     _run_unified_sparse_mla_forward(batch_name, kv_cache_dtype, "deepseek_v4")
@@ -1091,26 +1118,40 @@ def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
         patch.setattr(builtins, "__import__", no_vendor_import)
         mod._warmup_profiles([], SimpleNamespace())
 
-    layers, owners = [], []
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.models.modeling_utils import remove_weights
+
+    layers = []
     for enabled, fused, sinks, dtype in (
-        (True, True, True, torch.bfloat16),
-        (True, False, False, torch.bfloat16),
-        (False, False, False, torch.bfloat16),
-        (True, False, False, torch.float16),
+        ("prims", True, True, torch.bfloat16),
+        ("prims", False, False, torch.bfloat16),
+        ("disabled", False, False, torch.bfloat16),
+        ("prims", False, False, torch.float16),
+        ("fallback_first", False, True, torch.bfloat16),
     ):
         attn = Mock(spec=DeepseekV4TrtllmAttention)
         attn.compress_ratio = 4
         attn.attn_sink = object() if sinks else None
-        attn._fmha_manager = SimpleNamespace(
-            fmha_libs=[PrimsTSSparseMlaFmha(attn)] if enabled else []
-        )
-        layer = Mock(spec=MLA)
+        libraries = [] if enabled == "disabled" else [PrimsTSSparseMlaFmha(attn)]
+        if enabled == "fallback_first":
+            libraries.insert(0, Mock(spec=FallbackFmha))
+        attn._fmha_manager = SimpleNamespace(fmha_libs=libraries)
+        layer = MLA.__new__(MLA)
+        torch.nn.Module.__init__(layer)
         layer.mqa, layer.dtype = attn, dtype
-        layer.o_a_proj = object()
+        layer.o_a_proj = torch.nn.Parameter(torch.empty(1))
         layer.n_local_groups, layer.fused = 8, fused
+        layer.mapping = SimpleNamespace(has_cp_helix=lambda: False)
         layers.append(layer)
-        owners.append(attn)  # FMHA keeps its attention owner weakly.
+    # PP keeps the backend on a remote stage's layer after stripping its parameters.
+    remote = MLA.__new__(MLA)
+    torch.nn.Module.__init__(remote)
+    remote.mqa, remote.o_a_proj = layers[0].mqa, layers[0].o_a_proj
+    remove_weights(remote)
+    assert not hasattr(remote, "o_a_proj")
+    layers.append(remote)
     metadata = SimpleNamespace(
+        beam_width=1,
         is_cuda_graph=False,
         token_positions_cuda=SimpleNamespace(device=torch.device("cuda", 0)),
         max_compressed_indices={4: 512},
@@ -1149,7 +1190,7 @@ def test_warmup_combines_profiles_and_loads_largest_workspace_first(monkeypatch)
     monkeypatch.setattr(pp, "precompile_payloads", lambda payloads, **kw: fanned.append(payloads))
     attn, profile, eager = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
-    profiles = [mod._WarmupProfile(lib, extra=extra, **profile) for extra in (32, 512, 32)]
+    profiles = [mod._PlanProfile(lib, extra=extra, **profile) for extra in (32, 512, 32)]
     mod._warmup_profiles(profiles, eager)
     assert len(fanned) == 1
     assert [(p["rows"], p["plan_kwargs"]["max_extra_topk"]) for p in fanned[0]] == [
@@ -1183,7 +1224,7 @@ def test_warmup_combines_profiles_and_loads_largest_workspace_first(monkeypatch)
         lambda device, rows, heads, **kw: 100000 if rows == 6 else rows * 64,
     )
     planned.clear()
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], eager)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=64, **profile)], eager)
     assert planned == [(6, 64), (20, 64), (15, 64)]
     assert eager.fmha_plan_caches[lib.WORKSPACE_CACHE_KEY]["buffer"].numel() == 100000
 
@@ -1208,7 +1249,7 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
         mapping=None,
         is_cuda_graph=False,
     )
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=512, **profile)], mtp)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], mtp)
     rows = [r for r, _ in planned]
     assert rows[0] == 4 * (1 + 5), rows
     assert rows == sorted(rows, reverse=True)
@@ -1224,11 +1265,10 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
         mapping=None,
         is_cuda_graph=False,
     )
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=512, **profile)], budget)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], budget)
     assert [r for r, _ in planned][0] == 10
 
-    # A later warmup with a larger capacity includes every signature beyond the
-    # old 128-row dense scan, including a non-power-of-two maximum.
+    # A larger capacity includes every reachable signature up to a non-power-of-two limit.
     planned.clear()
     larger = SimpleNamespace(
         **{
@@ -1238,7 +1278,7 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
             "fmha_plan_caches": {},
         }
     )
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=512, **profile)], larger)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], larger)
     assert [row for row, _ in planned] == [183, *range(175, 0, -8)]
 
     # A metadata class that does not declare the fields fails loudly.
@@ -1246,7 +1286,7 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
         fmha_plan_caches={}, max_num_tokens=10, max_num_requests=4, is_cuda_graph=False
     )
     with pytest.raises(AttributeError):
-        mod._warmup_profiles([mod._WarmupProfile(lib, extra=512, **profile)], renamed)
+        mod._warmup_profiles([mod._PlanProfile(lib, extra=512, **profile)], renamed)
 
 
 def test_index_contract_is_validated_once_per_process(monkeypatch) -> None:
@@ -1345,12 +1385,12 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     monkeypatch.setattr(pp, "run_precompile_workers", fake_workers)
     attn, profile, eager = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], eager)
     assert planned == [(20, 32), (15, 32), (7, 32)]
     # A later pass can also dispatch newly encountered variants before preparing its local plans.
     planned.clear()
     fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], fresh)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=64, **profile)], fresh)
     assert planned == [(20, 64), (15, 64), (7, 64)]
     assert (
         mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(20, 0, -1)) * 2
@@ -1371,7 +1411,7 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
         planned.clear()
         fanned.clear()
         fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
-        mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], fresh)
+        mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], fresh)
         assert planned == [(20, 32), (15, 32), (7, 32)]
         assert [[p["rows"] for p in ps] for ps, _ in fanned] == (
             [[20, 15]] if cached_bucket == 0 else []
@@ -1385,11 +1425,11 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "0")
     planned.clear()
     fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], fresh)
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], fresh)
     assert planned == [(20, 32), (15, 32), (7, 32)]
     monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
     with pytest.raises(OSError):
-        mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
+        mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], eager)
 
 
 def test_precompile_worker_count_follows_the_env(monkeypatch) -> None:
@@ -1540,6 +1580,7 @@ def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch
     import subprocess
     import time
     from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
 
     import psutil
 
@@ -1550,24 +1591,32 @@ def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch
     monkeypatch.setattr(pp, "__file__", str(tmp_path / "prims_ts_precompile.py"))
     worker = tmp_path / "_prims_ts_worker.py"
     worker.write_text(
-        "import json, os, subprocess, sys\n"
+        "import json, multiprocessing, os, signal, subprocess, sys\n"
         "from pathlib import Path\n"
         "assert 'OMPI_COMM_WORLD_RANK' not in os.environ and 'SLURM_PROCID' not in os.environ\n"
         "request = json.load(sys.stdin)\n"
         "assert request['sys_path'] and sys.argv[1] == '2'\n"
         "payload = request['payloads'][0]\n"
         "if payload:\n"
-        "    child = subprocess.Popen([sys.executable, '-c', payload['child']])\n"
-        "    Path(payload['pids']).write_text(f'{os.getpid()} {child.pid}')\n"
+        "    semaphore = multiprocessing.get_context('spawn').Semaphore()\n"
+        "    child = subprocess.Popen([sys.executable, '-c', payload['child']], stdout=subprocess.PIPE)\n"
+        "    assert child.stdout.readline() == b'ready\\n'\n"
+        "    Path(payload['pids']).write_text(f'{os.getpid()} {child.pid} {semaphore._semlock.name}')\n"
+        "    if 'failure' in payload:\n"
+        "        print(payload['failure'], flush=True)\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    print('waiting for child', flush=True)\n"
         "    child.wait()\n"
     )
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "inf")
     pp.run_precompile_workers([{}], 2)
-
     pid_file = tmp_path / "pids"
     release = tmp_path / "release"
     child = (
-        "import time\n"
+        "import signal, time\n"
         "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ready', flush=True)\n"
         f"while not Path({str(release)!r}).exists(): time.sleep(0.05)\n"
     )
 
@@ -1577,20 +1626,36 @@ def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch
         except psutil.NoSuchProcess:
             return False
 
-    monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "3")
+    def assert_pool_stopped():
+        supervisor, child_pid, semaphore_name = pid_file.read_text().split()
+        deadline = time.monotonic() + 3
+        while (
+            any(is_live(int(pid)) for pid in (supervisor, child_pid))
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert not is_live(int(supervisor))
+        assert not is_live(int(child_pid))
+        assert not (Path("/dev/shm") / f"sem.{semaphore_name.lstrip('/')}").exists()
+
+    payload = {"pids": str(pid_file), "child": child}
     with ThreadPoolExecutor(max_workers=1) as pool:
-        call = pool.submit(pp.run_precompile_workers, [{"pids": str(pid_file), "child": child}], 2)
         try:
-            with pytest.raises(subprocess.TimeoutExpired):
+            monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "2147484")
+            call = pool.submit(
+                pp.run_precompile_workers, [payload | {"failure": "test compile error"}], 2
+            )
+            with pytest.raises(RuntimeError, match="test compile error"):
                 call.result(timeout=15)
-            supervisor, child_pid = map(int, pid_file.read_text().split())
-            deadline = time.monotonic() + 3
-            while (
-                any(is_live(pid) for pid in (supervisor, child_pid)) and time.monotonic() < deadline
-            ):
-                time.sleep(0.05)
-            assert not is_live(supervisor)
-            assert not is_live(child_pid)
+            assert_pool_stopped()
+            pid_file.unlink()
+
+            monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "3")
+            call = pool.submit(pp.run_precompile_workers, [payload], 2)
+            with pytest.raises(subprocess.TimeoutExpired) as timed_out:
+                call.result(timeout=15)
+            assert b"waiting for child" in timed_out.value.output
+            assert_pool_stopped()
         finally:
             # Unblock both processes even if group termination regresses.
             release.touch()
