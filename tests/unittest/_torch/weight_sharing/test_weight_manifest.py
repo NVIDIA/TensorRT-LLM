@@ -718,10 +718,29 @@ def test_version_1_manifests_still_load_and_compare_with_version_2(tmp_path: Pat
     assert compare_weight_manifests(legacy, current).is_empty
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_chunk_checksums_are_equal_on_cuda_and_on_cpu() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("chunks_per_reduction", [1, 16])
+def test_chunk_checksums_do_not_depend_on_the_reduction_size(
+    monkeypatch: pytest.MonkeyPatch, chunks_per_reduction: int
+) -> None:
+    # A reduction of `chunks_per_reduction` 1 KiB chunks holds 8 bytes of int64 per byte.
+    monkeypatch.setattr(
+        weight_manifest_mod, "_CHECKSUM_REDUCTION_BYTES", chunks_per_reduction * 8 * 1024
+    )
     generator = torch.Generator().manual_seed(0)
-    # 41,500 bytes with 1 KiB chunks: several full chunks and a tail.
+    # 41,500 bytes: 40 full chunks over several reductions, and a tail.
+    tensor = torch.randint(0, 256, (41_500,), dtype=torch.uint8, generator=generator)
+
+    assert weight_manifest_mod.chunk_checksums(tensor, 1024) == _reference_chunk_checksums(
+        tensor, 1024
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_chunk_checksums_are_equal_on_cuda_and_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 41,500 bytes with 1 KiB chunks and 16 chunks per reduction: three reductions and a tail.
+    monkeypatch.setattr(weight_manifest_mod, "_CHECKSUM_REDUCTION_BYTES", 16 * 8 * 1024)
+    generator = torch.Generator().manual_seed(0)
     tensor = torch.randint(0, 256, (41_500,), dtype=torch.uint8, generator=generator)
     expected = _reference_chunk_checksums(tensor, 1024)
 
@@ -760,6 +779,19 @@ def test_describe_blames_the_hashed_host_copy_when_every_cuda_chunk_agrees(monke
         "every device chunk checksum agrees, so the device bytes most likely match "
         "and the hashed host copies differ"
     ) in report
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_describe_locates_a_changed_byte_under_a_cuda_default_device() -> None:
+    diff = compare_weight_manifests(
+        build_weight_manifest(_UInt8BufferModule([1, 2, 3, 4])),
+        build_weight_manifest(_UInt8BufferModule([1, 2, 7, 4])),
+    )
+
+    with torch.device("cuda"):
+        report = diff.describe("baseline", "donor")
+
+    assert "1 of 1 1 MiB chunks differ (bytes 0-4); byte 2 changed by +4" in report
 
 
 # --------------------------------------------------------------------------- #

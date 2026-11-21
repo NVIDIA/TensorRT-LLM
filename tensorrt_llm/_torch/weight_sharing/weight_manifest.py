@@ -518,7 +518,7 @@ def _single_byte_changes(
     if difference == 0:
         return []
     weights = _checksum_weights(chunk_bytes)[:chunk_length]
-    magnitude = torch.tensor(abs(difference), dtype=torch.int64)
+    magnitude = torch.tensor(abs(difference), dtype=torch.int64, device=weights.device)
     quotients = torch.div(magnitude, weights, rounding_mode="floor")
     matches = (quotients * weights == magnitude) & (quotients <= _MAX_BYTE_DELTA)
     sign = 1 if difference > 0 else -1

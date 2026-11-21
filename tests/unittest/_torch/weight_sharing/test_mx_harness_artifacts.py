@@ -359,6 +359,36 @@ def test_final_tier_failure_locates_a_changed_parameter_byte(tmp_path: Path) -> 
     assert "1 of 1 1 MiB chunks differ (bytes 0-32); byte 26 changed by -32" in str(failure.value)
 
 
+class _ScalarBuffersModule(nn.Module):
+    """`count` one-element buffers, `b00`, `b01`, ..., that all hold `value`."""
+
+    def __init__(self, count: int, value: float) -> None:
+        super().__init__()
+        for index in range(count):
+            self.register_buffer(f"b{index:02d}", torch.full((1,), value))
+
+
+def test_final_tier_note_lists_at_most_twenty_tensors(tmp_path: Path) -> None:
+    _write_role_manifests(
+        tmp_path,
+        {
+            "baseline": _ScalarBuffersModule(22, 1.0),
+            "donor": _ScalarBuffersModule(22, 0.0),
+            "receiver": _ScalarBuffersModule(22, 0.0),
+        },
+    )
+    manifests = collect_weight_manifests(tmp_path, _case())
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        assert_weight_manifests(_case(), manifests)
+
+    note = str(failure.value).split("\n roles that disagree with the others on rank 0:\n")[1]
+    assert note.splitlines() == [
+        *(f"  b{index:02d}: baseline differs from donor and receiver" for index in range(20)),
+        "  ... and 2 more",
+    ]
+
+
 def test_exempt_tensors_neither_fail_the_final_tier_nor_appear_in_the_note(
     tmp_path: Path,
 ) -> None:
