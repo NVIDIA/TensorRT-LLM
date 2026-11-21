@@ -24,6 +24,7 @@ from ..llmapi.utils import logger_debug
 from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
+from .utils import ErrorResponse
 
 
 class RpcWorkerMixin:
@@ -103,8 +104,6 @@ class RpcWorkerMixin:
         # here: the spawn bootstrap re-imports the Ray worker's __main__,
         # which deadlocks inside a Ray actor (verified empirically).
         self._postproc_pool = ProcessPoolExecutor(max_workers=num)
-
-        from .utils import ErrorResponse
 
         def _make_on_postproc_worker_done(shard: int):
             def _on_postproc_worker_done(fut) -> None:
@@ -232,8 +231,12 @@ class RpcWorkerMixin:
             actual_timeout = (
                 timeout if timeout is not None else getattr(self, "_fetch_timeout", 0.1)
             )
+            # Snapshot before waiting so the poll drains all responses flushed before shutdown.
+            loop_error = self.engine._event_loop_error if self.engine.is_shutdown else None
             responses = super().await_responses(timeout=actual_timeout)
             responses = self._await_response_helper.process_and_handle_responses(responses)
+            if loop_error is not None:
+                self._fail_pending_requests(loop_error)
             logger_debug(f"[worker] Fetched {len(responses)} responses", color="green")
 
         qsize = self._response_queue.qsize()
@@ -244,6 +247,17 @@ class RpcWorkerMixin:
             # The queue contains batches of responses, so extend the list
             all_responses.extend(self._response_queue.get())
         return all_responses
+
+    def _fail_pending_requests(self, error: BaseException) -> None:
+        client_ids = list(self._results)
+        if not client_ids:
+            return
+        error_msg = f"Event loop terminated with error: {error}"
+        errors = [ErrorResponse(client_id, error_msg, -1) for client_id in client_ids]
+        logger.error(f"Failing {len(errors)} pending request(s) after event-loop crash: {error}")
+        for client_id in client_ids:
+            self._pop_result(client_id)
+        self._response_queue.put(errors)
 
     async def fetch_responses_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_responses using asyncio.to_thread."""
