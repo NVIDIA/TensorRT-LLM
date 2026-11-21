@@ -10,6 +10,7 @@ import math
 import threading
 import time
 import uuid
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -17,6 +18,7 @@ import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.logger import logger
 
 from .encoder_output import (
     EncodedMediaRef,
@@ -26,6 +28,7 @@ from .encoder_output import (
     EncoderUnavailableError,
     _capture_encoder_decode_state,
     _config_digest,
+    _encoder_byte_limits,
     _encoder_input_params,
     _encoder_output_params,
     _input_digest,
@@ -36,8 +39,6 @@ from .encoder_output import (
 
 BACKEND = "trtllm-nixl-encoder-v1"
 _MAX_REFERENCE_BYTES = 64 * 1024
-_MAX_TENSOR_BYTES = 64 * 1024 * 1024
-_MAX_CACHE_BYTES = 256 * 1024 * 1024
 _MAX_RECEIVE_SLOTS = 8
 _MAX_TENSORS = 64
 _TTL_SECONDS = 300
@@ -83,6 +84,48 @@ def _native_agent(name):
     return NixlTransferAgent(name)
 
 
+def _free_staging(runtime, pointer: int, device: torch.device) -> None:
+    try:
+        with torch.cuda.device(device):
+            error = runtime.cudaFree(pointer)[0]
+        if int(error):
+            logger.error(f"encoder staging cudaFree failed: {error}")
+    except Exception as error:
+        logger.error(f"encoder staging cleanup failed: {error}")
+
+
+class _CudaStagingBuffer:
+    """One cudaMalloc allocation, independent of PyTorch expandable segments."""
+
+    def __init__(self, size: int, device: torch.device) -> None:
+        from cuda.bindings import runtime
+
+        with torch.cuda.device(device):
+            error, pointer = runtime.cudaMalloc(size)
+        if int(error):
+            raise RuntimeError(f"encoder staging cudaMalloc failed: {error}")
+        weakref.finalize(self, _free_staging, runtime, pointer, device)
+        self.__cuda_array_interface__ = {
+            "shape": (size,),
+            "typestr": "|u1",
+            "data": (int(pointer), False),
+            "version": 3,
+        }
+
+
+def _empty_staging(shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    if device.type != "cuda":
+        return torch.empty(shape, dtype=dtype, device=device)
+    owner = _CudaStagingBuffer(math.prod(shape) * dtype.itemsize, device)
+    return torch.as_tensor(owner, device=device).view(dtype).view(shape)
+
+
+def _copy_staging(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if device.type != "cuda":
+        return tensor.detach().to(device).contiguous().clone()
+    return _empty_staging(tensor.shape, tensor.dtype, device).copy_(tensor)
+
+
 def _descriptors(tensors, name):
     from tensorrt_llm._torch.disaggregation.base.agent import (
         MemoryDescs,
@@ -108,6 +151,8 @@ class _Export:
 
 
 class NixlEncoderCache:
+    """Native NIXL outputs with the same byte-budget settings as EncoderCache."""
+
     backend = BACKEND
 
     def __init__(
@@ -118,7 +163,12 @@ class NixlEncoderCache:
         device="cuda:0",
         agent_factory=_native_agent,
         request_transfer=None,
+        max_tensor_bytes=None,
+        max_cache_bytes=None,
     ):
+        self._max_tensor_bytes, self._max_cache_bytes = _encoder_byte_limits(
+            max_tensor_bytes, max_cache_bytes
+        )
         if (
             not isinstance(model_revision, str)
             or len(model_revision) not in (40, 64)
@@ -172,7 +222,7 @@ class NixlEncoderCache:
             self._quarantined_receive_bytes += total
             if (
                 self._quarantined_receive_slots >= _MAX_RECEIVE_SLOTS
-                or self._quarantined_receive_bytes >= _MAX_CACHE_BYTES
+                or self._quarantined_receive_bytes >= self._max_cache_bytes
             ):
                 self.failed = True
             _QUARANTINED.append((agent, tensors, registration))
@@ -198,7 +248,9 @@ class NixlEncoderCache:
         with self._operation():
             if not self.endpoint:
                 raise ValueError("encoder producer requires an advertised endpoint")
-            handles, mrope = take_encoder_exports(result.disaggregated_params)
+            handles, mrope = take_encoder_exports(
+                result.disaggregated_params, max_tensor_bytes=self._max_tensor_bytes
+            )
             pending = [*handles, *(h for h in mrope if h is not None)]
             tensors = []
             reserved = False
@@ -213,17 +265,17 @@ class NixlEncoderCache:
                     tensor = SharedTensorContainer.from_dict(handle).get_local_view()
                     pending.pop(0)
                     total += tensor.numel() * tensor.element_size()
-                    if total > _MAX_TENSOR_BYTES:
+                    if total > self._max_tensor_bytes:
                         raise ValueError("encoder output exceeds the tensor limit")
                     views.append(tensor)
                 with self._lock:
                     self._healthy()
                     self._collect()
-                    if self._used + total > _MAX_CACHE_BYTES:
+                    if self._used + total > self._max_cache_bytes:
                         raise EncoderCapacityError("encoder NIXL cache is full")
                     self._used += total
                     reserved = True
-                tensors = [view.detach().to(self.device).contiguous().clone() for view in views]
+                tensors = [_copy_staging(view, self.device) for view in views]
                 if self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
                 metadata = {
@@ -257,8 +309,7 @@ class NixlEncoderCache:
             finally:
                 _release(pending)
 
-    @staticmethod
-    def _reference(reference):
+    def _reference(self, reference):
         value = _decode(reference.opaque_state)
         if value.get("format") != BACKEND:
             raise ValueError("unsupported encoder transfer format")
@@ -274,7 +325,7 @@ class NixlEncoderCache:
         endpoint = value.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint or "://" in endpoint or "/" in endpoint:
             raise ValueError("invalid encoder endpoint")
-        NixlEncoderCache._tensor_metadata(value.get("metadata"))
+        self._tensor_metadata(value.get("metadata"))
         return value
 
     def discard(self, reference):
@@ -402,8 +453,7 @@ class NixlEncoderCache:
                 with self._lock:
                     self._claims.pop(identity, None)
 
-    @staticmethod
-    def _tensor_metadata(metadata):
+    def _tensor_metadata(self, metadata):
         count = _validate_handoff_metadata(metadata)
         specs = metadata.get("tensors")
         if not isinstance(specs, list) or not 0 < len(specs) <= _MAX_TENSORS:
@@ -429,7 +479,7 @@ class NixlEncoderCache:
                 raise ValueError("invalid encoder tensor shape or dtype")
             total += math.prod(shape) * dtype.itemsize
             shapes.append((shape, dtype))
-        if total > _MAX_TENSOR_BYTES:
+        if total > self._max_tensor_bytes:
             raise ValueError("encoder receive exceeds the memory limit")
         return shapes, total
 
@@ -437,7 +487,7 @@ class NixlEncoderCache:
         shapes, total = self._tensor_metadata(value.get("metadata"))
         with self._lock:
             self._healthy()
-            if self._used + total > _MAX_CACHE_BYTES:
+            if self._used + total > self._max_cache_bytes:
                 raise EncoderCapacityError("encoder receive cache is full")
             if self._receive_slots >= _MAX_RECEIVE_SLOTS:
                 raise EncoderCapacityError(
@@ -448,21 +498,17 @@ class NixlEncoderCache:
         tensors = []
         agent = None
         registration = None
-        registration_attempted = False
         registered = False
         attempted = False
         uncertain = False
         try:
-            tensors = [
-                torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in shapes
-            ]
+            tensors = [_empty_staging(shape, dtype, self.device) for shape, dtype in shapes]
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             # NIXL metadata includes all registrations; isolate overlapping receives.
             name = f"{self.name}-receive-{uuid.uuid4().hex}"
             agent = self._agent_factory(name)
             registration, _, descs = _descriptors(tensors, name)
-            registration_attempted = True
             agent.register_memory(registration)
             registered = True
             destination = _encode(
@@ -479,7 +525,7 @@ class NixlEncoderCache:
             self._request_transfer(value["endpoint"], reference, destination, _TIMEOUT_SECONDS + 10)
         except Exception as error:
             rejected = isinstance(error, EncoderTransferRejected)
-            uncertain = (attempted and not rejected) or (registration_attempted and not registered)
+            uncertain = attempted and not rejected
             raise
         finally:
             if uncertain:
@@ -523,7 +569,9 @@ class NixlEncoderCache:
         exports = []
         try:
             for tensor in tensors:
-                exports.append(SharedTensorContainer.from_tensor(tensor).dump_to_dict())
+                # CUDA IPC exports require storage owned by PyTorch's allocator.
+                exported = tensor.clone() if tensor.is_cuda else tensor
+                exports.append(SharedTensorContainer.from_tensor(exported).dump_to_dict())
             for handle, layout in zip(exports[:count], embedding_metadata):
                 if layout is not None:
                     handle["metadata"] = layout

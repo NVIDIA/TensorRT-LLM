@@ -29,10 +29,10 @@ pytestmark = pytest.mark.cpu_only
 @pytest.mark.parametrize("removed_before", ["stat", "unlink"])
 def test_collection_tolerates_a_concurrently_removed_file(tmp_path, monkeypatch, removed_before):
     cache = oe.EncoderCache(str(tmp_path))
-    claimed = tmp_path / "claimed.tmp"
+    claimed = cache.root / ("a" * 32 + "-" + "b" * 32 + ".tmp")
     claimed.write_bytes(b"expired")
     os.utime(claimed, (1, 1))
-    retained = tmp_path / "retained.safetensors"
+    retained = cache.root / ("c" * 32 + ".safetensors")
     retained.write_bytes(b"retained")
     expected_bytes = retained.stat().st_size
     original = getattr(Path, removed_before)
@@ -87,7 +87,7 @@ def test_shared_metadata_rejection_preserves_unclaimed_output(tmp_path, invalid)
     save_file(invalid_tensors, str(path), metadata={"handoff": json.dumps(metadata)})
     with pytest.raises(ValueError, match="encoder.*(metadata|hashes|layout)"):
         cache.prepare(ref, request(), llm, None)
-    assert path.exists() and not list(tmp_path.glob("*.tmp"))
+    assert path.exists() and not list(cache.root.glob("*.tmp"))
     save_file(tensors, str(path), metadata={"handoff": original})
     cache.prepare(ref, request(), llm, None)
     assert not path.exists()
@@ -193,8 +193,8 @@ def test_native_exports_roundtrip_once_with_metadata_and_mrope(tmp_path):
     assert all(torch.equal(actual, expected) for actual, expected in zip(seen["tensors"], tensors))
     with pytest.raises(ValueError, match="expired or was already consumed"):
         cache.prepare(ref, request(), llm, None)
-    assert not list(tmp_path.glob("*.safetensors"))
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(cache.root.glob("*.safetensors"))
+    assert not list(cache.root.glob("*.tmp"))
 
 
 def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
@@ -221,7 +221,7 @@ def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
     cache.prepare(ref, request(), llm, None)
     result, _ = native_result()
     ref = cache.publish(result, request(), llm)
-    path = next(tmp_path.glob("*.safetensors"))
+    path = next(cache.root.glob("*.safetensors"))
     os.utime(path, (1, 1))
     with pytest.raises(ValueError, match="expired"):
         cache.prepare(ref, request(), llm, None)
@@ -241,8 +241,8 @@ def test_lossy_prompt_decoding_preserves_the_handoff(tmp_path):
     llm.tokenizer.encode = lambda prompt, **kwargs: [1, 2]
     cache.prepare(ref, req, llm, None)
     assert seen["prompt"] == "decoded prompt"
-    assert not list(tmp_path.glob("*.safetensors"))
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(cache.root.glob("*.safetensors"))
+    assert not list(cache.root.glob("*.tmp"))
 
 
 def test_quota_counts_actual_serialized_bytes(tmp_path, monkeypatch):
@@ -250,17 +250,17 @@ def test_quota_counts_actual_serialized_bytes(tmp_path, monkeypatch):
     llm, _ = model()
     result, tensors = native_result()
     cache.publish(result, request(), llm)
-    path = next(tmp_path.glob("*.safetensors"))
+    path = next(cache.root.glob("*.safetensors"))
     with safe_open(str(path), framework="pt") as stored:
         estimated = sum(t.numel() * t.element_size() for t in tensors) + len(
             stored.metadata()["handoff"]
         )
-    monkeypatch.setattr(oe, "_MAX_CACHE_BYTES", path.stat().st_size + estimated)
+    monkeypatch.setattr(cache, "_max_cache_bytes", path.stat().st_size + estimated)
     result, _ = native_result()
     with pytest.raises(oe.EncoderCapacityError, match="cache is full"):
         cache.publish(result, request(), llm)
-    assert len(list(tmp_path.glob("*.safetensors"))) == 1
-    assert not list(tmp_path.glob("*.tmp"))
+    assert len(list(cache.root.glob("*.safetensors"))) == 1
+    assert not list(cache.root.glob("*.tmp"))
 
 
 def test_failed_shared_publication_reclaims_original_exports(tmp_path, monkeypatch):
@@ -302,7 +302,7 @@ def test_discard_is_idempotent_and_never_releases_a_claimed_handoff(tmp_path):
     ref = cache.publish(native_result()[0], request(), llm)
     assert cache.discard(ref)
     assert not cache.discard(ref)
-    assert not list(tmp_path.glob("*.safetensors"))
+    assert not list(cache.root.glob("*.safetensors"))
     with pytest.raises(ValueError, match="already consumed"):
         cache.prepare(ref, request(), llm, None)
 
@@ -310,15 +310,15 @@ def test_discard_is_idempotent_and_never_releases_a_claimed_handoff(tmp_path):
     preprocess = llm.preprocess
 
     def prepare_claimed(*args):
-        assert list(tmp_path.glob("*.tmp"))
+        assert list(cache.root.glob("*.tmp"))
         assert not cache.discard(ref)
-        assert list(tmp_path.glob("*.tmp"))
+        assert list(cache.root.glob("*.tmp"))
         return preprocess(*args)
 
     llm.preprocess = prepare_claimed
     cache.prepare(ref, request(), llm, None)
     assert not cache.discard(ref)
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(cache.root.glob("*.tmp"))
 
 
 def test_discard_rejects_foreign_and_malformed_references(tmp_path):
@@ -332,7 +332,7 @@ def test_discard_rejects_foreign_and_malformed_references(tmp_path):
         )
         with pytest.raises(ValueError):
             cache.discard(malformed)
-        assert len(list(tmp_path.glob("*.safetensors"))) == 1
+        assert len(list(cache.root.glob("*.safetensors"))) == 1
     assert cache.discard(ref)
 
 
@@ -353,7 +353,7 @@ def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeyp
                 cache.discard(malformed)
             else:
                 cache.prepare(malformed, request(), llm, None)
-    assert len(list(tmp_path.glob("*.safetensors"))) == 1
+    assert len(list(cache.root.glob("*.safetensors"))) == 1
     assert cache.discard(ref)
 
 
@@ -385,6 +385,132 @@ def test_native_envelope_rejection_preserves_unclaimed_output(tmp_path, invalid)
     ):
         with pytest.raises(ValueError):
             operation()
-        assert len(list(tmp_path.glob("*.safetensors"))) == 1
+        assert len(list(cache.root.glob("*.safetensors"))) == 1
     cache.prepare(reference, request(), llm, None)
-    assert not list(tmp_path.glob("*.safetensors"))
+    assert not list(cache.root.glob("*.safetensors"))
+
+
+@pytest.mark.parametrize("directory", ["", "   "])
+def test_empty_cache_path_does_not_use_working_directory(tmp_path, monkeypatch, directory):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="nonempty"):
+        oe.EncoderCache(directory)
+    assert not list(tmp_path.iterdir())
+
+
+def test_collection_only_removes_owned_files_in_private_subdirectory(tmp_path):
+    checkpoint = tmp_path / ("a" * 32 + ".safetensors")
+    checkpoint.write_bytes(b"checkpoint")
+    os.utime(checkpoint, (1, 1))
+    cache = oe.EncoderCache(tmp_path)
+    unrelated = [cache.root / "model-00001-of-00002.safetensors", cache.root / "other.tmp"]
+    expired = cache.root / ("b" * 32 + ".safetensors")
+    claimed = cache.root / ("b" * 32 + "-" + "c" * 32 + ".tmp")
+    for path in [*unrelated, expired, claimed]:
+        path.write_bytes(b"old")
+        os.utime(path, (1, 1))
+    link = cache.root / ("d" * 32 + ".safetensors")
+    link.symlink_to(checkpoint)
+    fresh = cache.root / ("e" * 32 + ".safetensors")
+    fresh.write_bytes(b"new")
+    assert cache._collect() == len(b"new")
+    assert checkpoint.read_bytes() == b"checkpoint" and link.is_symlink()
+    assert all(path.read_bytes() == b"old" for path in unrelated)
+    assert not expired.exists() and not claimed.exists() and fresh.is_file()
+    # Construction also collects, so re-opening must preserve unrelated files.
+    oe.EncoderCache(str(tmp_path))
+    assert checkpoint.exists() and all(path.exists() for path in unrelated)
+
+
+def test_cache_does_not_follow_a_symlinked_private_subdirectory(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / ".trtllm-encoder-cache-v1").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        oe.EncoderCache(str(tmp_path))
+    assert not list(external.iterdir())
+
+
+@pytest.mark.parametrize("backend", ["shared", "nixl"])
+def test_configured_tensor_budget_rejects_before_taking_exports(tmp_path, monkeypatch, backend):
+    from utils.native_encoder import _cache
+
+    monkeypatch.setenv("TRTLLM_ENCODER_MAX_TENSOR_BYTES", "1")
+    cache = oe.EncoderCache(str(tmp_path)) if backend == "shared" else _cache("encoder:1")
+    result, _ = native_result()
+    params = result.disaggregated_params
+    original = (
+        params.multimodal_embedding_handles,
+        params.mrope_position_ids_handle,
+        params.mrope_position_deltas_handle,
+    )
+    llm, _ = model()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                SharedTensorContainer,
+                "from_dict",
+                lambda *_: pytest.fail("oversized exports were imported"),
+            )
+            with pytest.raises(oe.EncoderCapacityError, match="tensor limit"):
+                cache.publish(result, request(), llm)
+        assert (
+            params.multimodal_embedding_handles,
+            params.mrope_position_ids_handle,
+            params.mrope_position_deltas_handle,
+        ) == original
+    finally:
+        assert oe.release_encoder_result(result)
+        if backend == "nixl":
+            cache.close()
+
+
+@pytest.mark.parametrize("backend", ["shared", "nixl"])
+@pytest.mark.parametrize("tensor,cache_bytes", [("0", "100"), ("bad", "100"), ("101", "100")])
+def test_invalid_native_cache_budgets_fail_at_construction(
+    tmp_path, monkeypatch, backend, tensor, cache_bytes
+):
+    from utils.native_encoder import _cache
+
+    monkeypatch.setenv("TRTLLM_ENCODER_MAX_TENSOR_BYTES", tensor)
+    monkeypatch.setenv("TRTLLM_ENCODER_MAX_CACHE_BYTES", cache_bytes)
+    with pytest.raises(ValueError):
+        if backend == "shared":
+            oe.EncoderCache(str(tmp_path))
+        else:
+            _cache("encoder:1")
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("backend", ["shared", "nixl"])
+def test_native_handoff_accepts_deepstack_output_larger_than_64_mib(tmp_path, backend):
+    from utils.native_encoder import _cache, _receive
+
+    producer = oe.EncoderCache(str(tmp_path)) if backend == "shared" else _cache("encoder:1")
+    consumer = (
+        producer
+        if backend == "shared"
+        else _cache(request_transfer=lambda _, ref, dest, timeout: producer.transfer(ref, dest))
+    )
+    tensor = torch.full((2304, 16384), 7, dtype=torch.bfloat16)
+    assert tensor.numel() * tensor.element_size() > 64 * 1024 * 1024
+    # Avoid requiring a large POSIX shared-memory mount for this CPU size case.
+    handle = SharedTensorContainer.from_tensor(tensor, local=True).dump_to_dict()
+    handle.update(tensor_size=list(tensor.shape), dtype=str(tensor.dtype))
+    params = DisaggregatedParams(multimodal_embedding_handles=[handle], multimodal_hashes=[[1] * 8])
+    result = SimpleNamespace(disaggregated_params=params)
+    llm, _ = model()
+    try:
+        ref = producer.publish(result, request(), llm)
+        if backend == "shared":
+            with safe_open(str(producer._path(ref)), framework="pt") as stored:
+                actual = stored.get_tensor("embedding_0")
+            assert producer.discard(ref)
+        else:
+            actual = _receive(consumer, ref)[0]
+        assert torch.equal(actual, tensor)
+    finally:
+        assert oe.release_encoder_result(result)
+        if backend == "nixl":
+            consumer.close()
+            producer.close()
