@@ -471,6 +471,15 @@ public:
         return _sparseCacheShape(lifeCycle).unitsPerPage;
     }
 
+    //! Tokens in one selection unit of this life cycle's sparse cache: tokens_per_block
+    //! divided by sparseCacheUnitsPerPage.
+    [[nodiscard]] int sparseCacheUnitTokens(LifeCycleId lifeCycle) const noexcept
+    {
+        return config().tokensPerBlock / sparseCacheUnitsPerPage(lifeCycle);
+    }
+
+    //! Whether this life cycle's sparse cache holds a growing unit before it is complete,
+    //! restoring its prefix on reservation and writing back appended tokens on flush.
     [[nodiscard]] bool sparseCacheIncludesPartialUnits(LifeCycleId lifeCycle) const noexcept
     {
         return _sparseCacheShape(lifeCycle).includePartialUnits;

@@ -1781,7 +1781,7 @@
         },
         "enable_kv_cache_offload": {
           "default": false,
-          "description": "Offload sparse attention history to host memory with KV cache manager V2. Requires single-token decode on a disaggregated generation worker; index keys and other resident caches remain on GPU.",
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager V2: the MLA latent cache for DeepSeek sparse attention, the ratio-4 compressed cache for DeepSeek-V4, or the sparse layers' main K/V for MiniMax-M3. Each decode step fetches the units the indexer selects into a per-request GPU cache; index keys, sliding-window and other resident caches remain on GPU. Requires single-token decode on a decode-only worker, such as the generation worker of a disaggregated deployment.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
           "type": "boolean"
@@ -1986,7 +1986,7 @@
         },
         "enable_kv_cache_offload": {
           "default": false,
-          "description": "Offload sparse attention history to host memory with KV cache manager V2. Requires single-token decode on a disaggregated generation worker; index keys and other resident caches remain on GPU.",
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager V2: the MLA latent cache for DeepSeek sparse attention, the ratio-4 compressed cache for DeepSeek-V4, or the sparse layers' main K/V for MiniMax-M3. Each decode step fetches the units the indexer selects into a per-request GPU cache; index keys, sliding-window and other resident caches remain on GPU. Requires single-token decode on a decode-only worker, such as the generation worker of a disaggregated deployment.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
           "type": "boolean"
@@ -4979,14 +4979,14 @@
         },
         "enable_kv_cache_offload": {
           "default": false,
-          "description": "Offload sparse attention history to host memory with KV cache manager V2. Requires single-token decode on a disaggregated generation worker; index keys and other resident caches remain on GPU.",
+          "description": "Offload the KV history sparse attention selects from to host memory with KV cache manager V2: the MLA latent cache for DeepSeek sparse attention, the ratio-4 compressed cache for DeepSeek-V4, or the sparse layers' main K/V for MiniMax-M3. Each decode step fetches the units the indexer selects into a per-request GPU cache; index keys, sliding-window and other resident caches remain on GPU. Requires single-token decode on a decode-only worker, such as the generation worker of a disaggregated deployment.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
           "type": "boolean"
         },
         "fuse_qkv_index_projection": {
           "default": false,
-          "description": "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q is sharded with the KV heads and index-K is replicated. MSA batches also use a horizontal norm/RoPE/cache-insertion producer for prefill, mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 or NVFP4 main KV cache.",
+          "description": "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q is sharded with the KV heads and index-K is replicated. MSA batches also use a horizontal norm/RoPE/cache-insertion producer for prefill, mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 or NVFP4 main KV cache. With enable_kv_cache_offload, layers with an NVFP4 main KV cache skip the producer and run the unfused norm, RoPE and cache writes.",
           "status": "prototype",
           "title": "Fuse Qkv Index Projection",
           "type": "boolean"

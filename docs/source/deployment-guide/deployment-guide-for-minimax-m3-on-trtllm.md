@@ -12,7 +12,7 @@ TensorRT LLM supports three checkpoint weight formats for MiniMax-M3:
 * **MXFP8** — weights are stored in MXFP8. The curated configuration uses BF16 KV cache and is the default for this guide.
 * **Mixed MXFP8/NVFP4** — MXFP8 base layers with NVFP4 routed experts. FP8 or NVFP4 KV cache is selected separately at runtime.
 
-The block-sparse attention path requires KV cache reuse to be disabled. The MSA backend supports linear Eagle3 with one shared GQA draft layer; see [Feature Support Notes](#feature-support-notes) for its constraints.
+On the block-sparse attention path, KV cache reuse is limited to received prompt blocks on MSA generation workers with KV cache manager V2; see [Feature Support Notes](#feature-support-notes). The MSA backend supports linear Eagle3 with one shared GQA draft layer; see the same notes for its constraints.
 
 This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Recommended Performance Settings](#recommended-performance-settings).
 

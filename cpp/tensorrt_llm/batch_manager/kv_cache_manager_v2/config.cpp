@@ -404,6 +404,24 @@ void KVCacheManagerConfig::validate() const
                 }
                 if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>, AttentionLayerConfig>)
                 {
+                    // Token-group write-back serves only a growing unit; a whole unit is
+                    // written back whole, so a granularity anywhere else would be ignored.
+                    for (auto const& buf : cfg.buffers)
+                    {
+                        int const grain = buf.sparseWriteBackGranularity;
+                        if (grain == 0)
+                        {
+                            continue;
+                        }
+                        TLLM_CHECK_WITH_INFO(cfg.sparseCache.has_value() && cfg.sparseCache->includePartialUnits,
+                            "KVCacheManagerConfig: layer %d buffer '%s' sets sparse_write_back_granularity=%d, "
+                            "which requires a sparse_cache with include_partial_units",
+                            cfg.layerId, buf.role.c_str(), grain);
+                        TLLM_CHECK_WITH_INFO(cfg.sparseCache->unitTokens % grain == 0,
+                            "KVCacheManagerConfig: layer %d buffer '%s' sets sparse_write_back_granularity=%d, "
+                            "which must divide the sparse_cache's unit_tokens=%d",
+                            cfg.layerId, buf.role.c_str(), grain, cfg.sparseCache->unitTokens);
+                    }
                     if (cfg.sparseCache.has_value())
                     {
                         cfg.sparseCache->validate(tokensPerBlock);

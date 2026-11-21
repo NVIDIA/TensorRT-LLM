@@ -50,6 +50,8 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_caches_unsupported_layout
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_checks_slot_capacity_after_plan_hit
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_cache_is_bounded
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_offload_packed_projection_fallback
+  - unittest/_torch/models/test_minimax_m3.py::test_compiled_offload_keeps_the_captured_producer_off
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
   - unittest/_torch/models/test_minimax_m3.py::test_registered_conditional_generation_text_forward
   # MiniMax-M3 VL checkpoint-backed processor parity (the CPU stage's -m cpu_only leaves these out)

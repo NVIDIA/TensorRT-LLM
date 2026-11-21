@@ -4220,6 +4220,66 @@ class TestSparseDataPath(unittest.TestCase):
                         cache.close()
                     manager.shutdown()
 
+    def test_partial_unit_settings_are_rejected_where_they_cannot_apply(self) -> None:
+        """Token-group write-back needs a growing unit, and its groups must tile the unit."""
+
+        def layer(
+            layer_id: int, *, grain: int, partial: bool, sparse: bool = True
+        ) -> AttentionLayerConfig:
+            return AttentionLayerConfig(
+                layer_id,
+                [
+                    BufferConfig(
+                        "key", self.BUF, is_sparse=sparse, sparse_write_back_granularity=grain
+                    ),
+                    BufferConfig("index", 256),
+                ],
+                sparse_cache=SparseCacheConfig(
+                    num_selected_blocks=self.SELECTED,
+                    max_cached_units=self.CELLS,
+                    unit_tokens=self.TPB,
+                    include_partial_units=partial,
+                )
+                if sparse
+                else None,
+            )
+
+        def create(*layers: AttentionLayerConfig) -> None:
+            manager = KVCacheManager(
+                KVCacheManagerConfig(
+                    tokens_per_block=self.TPB,
+                    cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                    constraints=[
+                        BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
+                    ],
+                    layers=list(layers),
+                )
+            )
+            manager.shutdown()
+
+        # Built inside the check: a binding may validate the buffer as it is constructed.
+        cases = {
+            "whole units are written back whole": (
+                lambda: [layer(0, grain=1, partial=False)],
+                "requires a sparse_cache with include_partial_units",
+            ),
+            "groups must tile the unit": (lambda: [layer(0, grain=3, partial=True)], "must divide"),
+            "negative": (lambda: [layer(0, grain=-1, partial=True)], "must be nonnegative"),
+            "dense buffer": (
+                lambda: [layer(0, grain=1, partial=False, sparse=False)],
+                "sparse buffer",
+            ),
+            "one arena, one setting": (
+                lambda: [layer(0, grain=1, partial=True), layer(1, grain=0, partial=False)],
+                "must declare the same sparse_cache",
+            ),
+        }
+        for case, (layers, message) in cases.items():
+            with self.subTest(case):
+                with self.assertRaisesRegex(Exception, message):
+                    create(*layers())
+        create(layer(0, grain=4, partial=True))
+
     @staticmethod
     def _pattern(size: int, seed: int) -> bytes:
         return bytes((i * seed + 13) % 251 for i in range(size))
@@ -4346,10 +4406,11 @@ class TestSparseDataPath(unittest.TestCase):
 class TestSparseWriteIndices(unittest.TestCase):
     """prepare_sparse_write_indices: the cell the model writes its new unit into.
 
-    The unit between the two watermarks has no host page yet, so nothing can be fetched for
-    it; what the model needs is only where to put it. These cover that the reported cell is
-    the one the write-back later reads, that asking twice does not move it, and that a fetch
-    running afterwards leaves it alone.
+    The unit between the two watermarks has no complete host page yet. With partial units its
+    host prefix is restored once, when it is reserved; otherwise nothing is fetched for it.
+    Either way the model needs where to put it. These cover that the reported cell is the one
+    the write-back later reads, that asking twice does not move it, and that a fetch running
+    afterwards leaves it alone.
     """
 
     TPB = 128
@@ -4469,7 +4530,63 @@ class TestSparseWriteIndices(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_partial_restore_preserves_pending_fetch_and_committed_prefix(self):
+    def test_preparing_a_growing_block_restores_its_host_prefix(self) -> None:
+        """Write preparation alone restores a newly reserved partial block's host bytes.
+
+        Nothing is fetched first, so the restore comes from preparation's own fixed list, and
+        it is not a selection miss.
+        """
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager(partial=True)
+        cache = None
+        try:
+            group = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            history = self.TPB + 9
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                self.assertTrue(cache.resize(history + 1, history))
+                pages = [int(x) for x in cache.get_base_page_indices(group)]
+                patterns = [self._pattern(self.BUF, seed) for seed in (17, 29)]
+                for page, pattern in zip(pages, patterns):
+                    ctypes.memmove(pool + page * stride, pattern, self.BUF)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=2,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_specs(),
+                )
+                batch.add_kv_cache(cache)
+                batch.publish()
+                arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+                out = torch.empty((2, 1), dtype=torch.int32, device="cuda")
+                torch.cuda.synchronize()
+                batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
+                torch.cuda.synchronize()
+                index = int(out[0, 0])
+                self.assertNotEqual(index, BAD_PAGE_INDEX, "the growing block is in flight")
+                self.assertEqual(int(out[1, 0]), BAD_PAGE_INDEX)
+                cell = (ctypes.c_ubyte * self.BUF)()
+                (error,) = cudart.cudaMemcpy(
+                    ctypes.addressof(cell),
+                    arena + index * self.BUF,
+                    self.BUF,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                )
+                self.assertEqual(int(error), 0)
+                self.assertEqual(bytes(cell), patterns[1], "the host prefix was not restored")
+                self.assertEqual(batch.peek_hit_miss_counter(), (0, 0))
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_partial_restore_preserves_pending_fetch_and_committed_prefix(self) -> None:
         """Write preparation may interleave with a fetch; partial commits see current bytes."""
         ctypes, cudart, torch = self._deps()
         manager = self._manager(partial=True)

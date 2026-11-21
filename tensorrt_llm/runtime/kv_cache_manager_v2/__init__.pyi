@@ -460,9 +460,12 @@ class SparseCacheConfig:
     """
 
     include_partial_units: bool = False
-    """Restore a growing block's host prefix on reservation and flush it after every token.
+    """Cache a growing block before its last token is written.
 
-    False for compressed units that are produced only when complete. Partial units
+    On reservation, the block's host prefix is restored into its cell; each flush writes
+    back only the tokens appended since the previous one, in the buffer's
+    ``sparse_write_back_granularity`` groups. False for compressed units that are produced
+    only when complete. Partial units
     require an independent selection per layer (``selection_id=None``).
     """
 

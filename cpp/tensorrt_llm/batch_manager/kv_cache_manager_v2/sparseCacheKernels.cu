@@ -279,9 +279,8 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
     }
 
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
-    int32_t const capacity = args.capacityTokens[row];
-    int32_t const capacityUnits = capacity / args.unitTokens
-        + static_cast<int32_t>(args.includePartialUnits && capacity % args.unitTokens != 0);
+    int32_t const capacityUnits
+        = sparseUnitsReached(args.capacityTokens[row], args.unitTokens, args.includePartialUnits);
     int32_t const inFlight = capacityUnits - historyUnits;
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= 1);
     // The same bound the resolve's probe index imposes, since this ordinal is resolved
@@ -344,7 +343,9 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
         entry[slot]
             = SparseEntry::pack(SparseEntry::usedByte(stepAge, matched != 0), static_cast<uint32_t>(historyUnits));
         args.inFlightSlot[row] = slot;
-        if (args.includePartialUnits && matched == 0 && args.historyTokens[row] % args.unitTokens != 0)
+        // A newly reserved growing unit restores the host prefix its history already reached.
+        if (matched == 0
+            && sparseUnitsReached(args.historyTokens[row], args.unitTokens, args.includePartialUnits) > historyUnits)
         {
             args.work.ordinal[row] = historyUnits;
             args.work.slot[row] = slot;
@@ -385,11 +386,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     bool const rebase = SparseEntry::rebaseDue(stepAge);
 
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
-    int32_t const capacity = args.capacityTokens[row];
-    int32_t const capacityUnits = capacity / args.unitTokens
-        + static_cast<int32_t>(args.includePartialUnits && capacity % args.unitTokens != 0);
-    int32_t const copyableUnits = historyUnits
-        + static_cast<int32_t>(args.includePartialUnits && args.historyTokens[row] % args.unitTokens != 0);
+    int32_t const capacityUnits
+        = sparseUnitsReached(args.capacityTokens[row], args.unitTokens, args.includePartialUnits);
+    int32_t const copyableUnits
+        = sparseUnitsReached(args.historyTokens[row], args.unitTokens, args.includePartialUnits);
     int32_t const inFlight = capacityUnits - historyUnits;
     // resize() rejects a gap wider than the cache can pin, so the check cannot fire.
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= args.maxInFlightUnits);
@@ -409,6 +409,8 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
     __shared__ int32_t numResolved;
+    // Misses of the write unit's restored prefix, which the hit/miss statistics leave out.
+    __shared__ int32_t numRestoreMisses;
     __shared__ int32_t copyBase;
     // The staleness at which the misses run out, and how many of the entries holding
     // exactly that staleness are wanted. A threshold past the histogram evicts nothing.
@@ -433,6 +435,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         numMiss = 0;
         numCopy = 0;
         numResolved = 0;
+        numRestoreMisses = 0;
         thresholdStaleness = kAgeBuckets;
         neededAtThreshold = 0;
         takenAtThreshold = 0;
@@ -523,6 +526,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             int32_t const j = atomicAdd(&numMiss, 1);
             missOrd[j] = ord;
             missIdx[j] = i;
+            if (i < inFlight && ord < copyableUnits)
+            {
+                atomicAdd(&numRestoreMisses, 1);
+            }
         }
     }
     if (resolvedMine > 0)
@@ -534,18 +541,12 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     // Claim this row's run in the compacted list now that the miss set is final, so the
     // eviction loop below can write straight into it. Copyable misses include a partial
     // host prefix when configured. Hit/miss statistics count only selected entries,
-    // excluding the write unit's restore.
+    // excluding the write unit's restore, and are added once per row.
     {
         int32_t mine = 0;
-        int32_t selectedMisses = 0;
         for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
             mine += missOrd[j] < copyableUnits ? 1 : 0;
-            selectedMisses += missOrd[j] < copyableUnits && missIdx[j] >= inFlight ? 1 : 0;
-        }
-        if (args.hitMiss != nullptr && selectedMisses > 0)
-        {
-            atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(selectedMisses));
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
@@ -553,12 +554,18 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         if (tid == 0)
         {
             copyBase = claimed > 0 ? atomicAdd(args.work.total, claimed) : 0;
-            // The list is sized for every row missing its whole selection, so a claim can
-            // only run past it if the caller sized it from a different width.
+            // The list is sized for every row missing its whole selection and, with partial
+            // units, the growing unit's prefix, so a claim can only run past it if the caller
+            // sized it from a different width.
             KVCM2_SPARSE_REQUIRE(copyBase + claimed <= args.work.capacity);
             if (args.hitMiss != nullptr)
             {
                 atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
+                int32_t const selectedMisses = claimed - numRestoreMisses;
+                if (selectedMisses > 0)
+                {
+                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(selectedMisses));
+                }
             }
         }
     }
@@ -782,10 +789,10 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     // before the kernel that fills them has run.
     gridDependencyWait();
 
-    // Nothing launched after this reads a cell, so a successor need not wait for the copy
-    // itself -- only for the block to have got this far. Releasing here is what keeps the
-    // index kernel that follows on the stream from being ordered behind a copy it does not
-    // depend on.
+    // Released before the copy: a PDL-enrolled successor may start once every block gets
+    // here. The out-index kernel that follows a fetch or a restore is launched without PDL,
+    // so it, and every later kernel that touches a cell -- attention over fetched units, or
+    // the writer appending to a restored partial unit -- is ordered after this grid completes.
     gridDependencyRelease();
 
     switch (desc.width)
@@ -1026,7 +1033,7 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
         "launchSparseUnitCopy: every device array must be provided");
     TLLM_CHECK_WITH_INFO(args.unitTokens > 0 && (args.fromTokens == nullptr) == (args.toTokens == nullptr),
         "launchSparseUnitCopy: partial write-back requires paired token bounds and positive unit size");
-    checkWorkList(args.work, "launchSparseUnitCopy", true);
+    checkWorkList(args.work, "launchSparseUnitCopy", /*allowFixed=*/true);
     TLLM_CHECK_WITH_INFO(args.work.numLists <= 1 || args.arena.bufferLayer != nullptr,
         "launchSparseUnitCopy: a per-layer work list needs the buffer-to-layer map");
 

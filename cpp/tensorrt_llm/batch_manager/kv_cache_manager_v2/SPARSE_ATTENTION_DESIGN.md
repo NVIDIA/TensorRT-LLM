@@ -18,8 +18,9 @@ attribute, so one layer may hold both sparse and dense buffers.
 sparse-specific -- see *Compression*.
 
 Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
-and speculative decoding — see *Supported scope*; and per-KV-head selection, which no
-per-`(request, layer)` resident set can express — see *Device-side cache*. Kernel fusion
+and speculative decoding — see *Supported scope*; and a resident set per KV head. A model
+whose heads select independently is served through the union of its heads' selections — see
+*Device-side cache*. Kernel fusion
 remains future work; so do multi-beam requests. `ISparseUnitGather` is retired — see
 *Extraction interface*.
 
@@ -230,8 +231,10 @@ were allocated by an earlier resize and published then.
 
 An entry holds either a fetched copy of a history page or the live, still-growing block.
 The first is read-only by construction — fetch only ever targets ordinals below the
-watermark — and the second is written by definition. So the two populations are
-distinguished by the ordinal alone:
+watermark — and the second is written by definition. With `include_partial_units`, the
+growing block also receives its host prefix once, when it is reserved, before the model
+appends to it — see *Writing the in-flight unit*. So the two populations are distinguished by the
+ordinal alone:
 
 ```
 unflushed  <=>  entry_ordinal >= history_length / unit_tokens
@@ -356,11 +359,13 @@ resident set, because a selection unit is the tokens it spans across all of them
 that names a `selection_id` widens the scope rather than narrowing it: the members of a
 selection share one resident set between them, one per `(request, selection)` — see
 *Selection groups*. Their cells stay per layer and mirror. An
-algorithm that lets different heads select different units is not expressible here, and this
-is a real exclusion rather than a hypothetical: Rocket's selection indices are
-`[num_kv_heads, total_tokens]` and MiniMax-M3's are `[tokens, num_kv_heads, topk]` — both
-choose per head. Serving them would need a resident set per `(request, layer, head)`, which
-multiplies the metadata and the reservation by the head count.
+algorithm whose heads select different units keeps this scope by selecting their union:
+MiniMax-M3's indices are `[tokens, num_kv_heads, topk]`, and `merge_head_selections`
+(`attention/backends/sparse/offload_kernels.py`) deduplicates each request's heads into one
+selection of up to `num_kv_heads * topk` units, which the cache is sized for. After the
+fetch, `build_sparse_block_table` publishes each selected unit's cell by its ordinal, so
+every head reads its own selection unchanged. A resident set per `(request, layer, head)`
+remains unsupported: it would multiply the metadata and the reservation by the head count.
 
 **Scope is per request.** Two requests sharing a prefix do not share a cached copy. That
 closes a soundness hole by construction: entries are reachable only through their own

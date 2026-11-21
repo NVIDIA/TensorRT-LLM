@@ -1113,7 +1113,9 @@ def _m3_llm_args(mode, kv_dtype):
 
 @pytest.mark.parametrize("tp", [4, 8])
 @pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
-def test_minimax_m3_sparse_offload_uses_builtin_model(monkeypatch, tp, kv_dtype):
+def test_minimax_m3_sparse_offload_uses_builtin_model(
+    monkeypatch: pytest.MonkeyPatch, tp: int, kv_dtype: str
+) -> None:
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)

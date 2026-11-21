@@ -53,6 +53,7 @@ from ..offload import (
     get_sparse_offload_metadata_layers,
     validate_sparse_offload_batch,
 )
+from ..offload_kernels import build_sparse_block_table, merge_head_selections
 from .common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
@@ -66,6 +67,7 @@ from .kernels.msa_utils import (
     per_token_valid_blocks,
     require_msa_module,
 )
+from .kernels.offload import prepare_write_slots
 from .kernels.trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
     uniform_subpages_per_slot,
@@ -188,6 +190,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # Graph-stable buffers; consumers slice to the live count at the call
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
+    # Sparse KV cache offload state, None without offload. Of the graph-stable
+    # buffers below, the write slots are filled when a layer's write is prepared,
+    # the selections, unit lengths and block table by fetch_sparse_blocks; the
+    # request indices are the identity, set once.
     sparse_offload_state: Optional[SparseOffloadState] = None
     msa_sparse_write_slots: Optional[torch.Tensor] = None
     msa_sparse_selected: Optional[torch.Tensor] = None
@@ -328,27 +334,36 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.msa_sparse_block_table.fill_(-1)
 
-    def fetch_sparse_blocks(self, layer_idx: int, topk: torch.Tensor) -> torch.Tensor:
-        """Fetch the union of per-head blocks and return their arena page table."""
-        from .kernels.offload import build_block_table, prepare_selection
+    def fetch_sparse_blocks(self, layer_idx: int, kv_block_indexes: torch.Tensor) -> torch.Tensor:
+        """Fetch the union of per-head blocks and return their arena page table.
 
+        ``kv_block_indexes`` is int32 ``[queries, local KV heads, topk]``, each head's
+        selected block ordinals with -1 for none. Returns int32
+        ``[queries, max_blocks_per_seq]``: the arena cell of each selected block at the
+        block's ordinal, which the sparse decode reads in place of a page table.
+        """
         state = self.sparse_offload_state
         if state is None or state.write_layer != layer_idx:
             raise RuntimeError("MiniMax-M3 sparse fetch requires this layer's completed KV write")
-        prepare_selection(
-            topk, self.msa_seq_lens_cuda, self.msa_sparse_selected, self.msa_sparse_unit_lengths
+        queries = kv_block_indexes.shape[0]
+        selected = self.msa_sparse_selected[:queries]
+        unit_lengths = self.msa_sparse_unit_lengths[:queries]
+        merge_head_selections(
+            kv_block_indexes,
+            self.msa_seq_lens_cuda,
+            selected,
+            unit_lengths,
+            unit_tokens=state.layers[layer_idx].unit_tokens,
         )
         self.kv_cache_manager.fetch_sparse_indices(
             state,
             layer_idx,
-            self.msa_sparse_selected,
-            self.msa_sparse_request_indices,
-            self.msa_sparse_unit_lengths,
+            selected,
+            self.msa_sparse_request_indices[:queries],
+            unit_lengths,
         )
-        build_block_table(
-            state, layer_idx, self.msa_sparse_selected[: topk.shape[0]], self.msa_sparse_block_table
-        )
-        return self.msa_sparse_block_table[: topk.shape[0]]
+        build_sparse_block_table(state, layer_idx, selected, self.msa_sparse_block_table)
+        return self.msa_sparse_block_table[:queries]
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -550,19 +565,35 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_buffers_ready = False
         if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
             return
-        self.msa_layer_cache_tensors = {
-            layer_idx: (
+        offload = getattr(kv_cache_manager, "_enable_kv_cache_offload", False)
+
+        def cache_views(layer_idx: int) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            nvfp4 = kv_cache_manager.is_nvfp4_layer(layer_idx)
+            if offload and kv_cache_manager.offloads_layer(layer_idx):
+                # Offloaded layers write their new tokens into arena cells.
+                arena = kv_cache_manager.get_sparse_arena_buffers
+                return (
+                    arena(layer_idx, "HND"),
+                    arena(layer_idx, "HND", scales=True) if nvfp4 else None,
+                )
+            return (
                 kv_cache_manager.get_buffers(layer_idx, kv_layout="HND"),
-                self.msa_idx_k_cache(layer_idx),
                 (
                     kv_cache_manager.get_block_scale_buffers(layer_idx, kv_layout="HND")
-                    if kv_cache_manager.is_nvfp4_layer(layer_idx)
+                    if nvfp4
                     else None
                 ),
             )
-            for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ())
-            if layer_idx in kv_cache_manager.layer_offsets
-        }
+
+        self.msa_layer_cache_tensors = {}
+        for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ()):
+            if layer_idx in kv_cache_manager.layer_offsets:
+                main, scales = cache_views(layer_idx)
+                self.msa_layer_cache_tensors[layer_idx] = (
+                    main,
+                    self.msa_idx_k_cache(layer_idx),
+                    scales,
+                )
         capture_graph = self.is_cuda_graph
         buffers = self.cuda_graph_buffers
         max_num_sequences = int(self.max_num_sequences)
@@ -1648,9 +1679,8 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         layer_idx = self.layer_idx
         manager = metadata.kv_cache_manager
         out_cache_loc = metadata.msa_out_cache_loc[: k.shape[0]]
-        if metadata.sparse_offload_state is not None and manager.offloads_layer(layer_idx):
-            from .kernels.offload import prepare_write_slots
-
+        offloaded = metadata.sparse_offload_state is not None and manager.offloads_layer(layer_idx)
+        if offloaded:
             manager.prepare_sparse_write_indices(metadata.sparse_offload_state, layer_idx)
             prepare_write_slots(
                 metadata.sparse_offload_state, layer_idx, metadata.msa_sparse_write_slots
@@ -1662,8 +1692,12 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         if getattr(manager, "is_nvfp4_layer", lambda _: False)(layer_idx):
             if kv_scale_orig_quant is None:
                 raise RuntimeError("NVFP4 cache writes require quantization scales")
-            buffers = manager.get_buffers(layer_idx, "HND")
-            scales = manager.get_block_scale_buffers(layer_idx, "HND")
+            if offloaded:
+                buffers = manager.get_sparse_arena_buffers(layer_idx, "HND")
+                scales = manager.get_sparse_arena_buffers(layer_idx, "HND", scales=True)
+            else:
+                buffers = manager.get_buffers(layer_idx, "HND")
+                scales = manager.get_block_scale_buffers(layer_idx, "HND")
             idx_cache = metadata.msa_idx_k_cache(layer_idx) if idx_k is not None else None
             if not fused_write_layer_caches_nvfp4(
                 buffers[:, 0],
@@ -1681,7 +1715,10 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                     "NVFP4 cache writes require CUDA HND cache views and FP32 scales"
                 )
             return
-        buffers = metadata.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+        if offloaded:
+            buffers = manager.get_sparse_arena_buffers(layer_idx, "HND")
+        else:
+            buffers = manager.get_buffers(layer_idx, kv_layout="HND")
         k_view, v_view = buffers[:, 0], buffers[:, 1]
         idx_cache = metadata.msa_idx_k_cache(layer_idx) if idx_k is not None else None
         num_tokens = int(k.shape[0])

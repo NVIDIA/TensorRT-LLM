@@ -611,12 +611,13 @@ def _register_fake():
         index_k_weight: torch.Tensor,
         rotary_cos_sin: torch.Tensor,
         position_ids: torch.Tensor,
-        index_out_cache_loc: Optional[torch.Tensor] = None
+        index_out_cache_loc: Optional[torch.Tensor] = None,
+        kv_cache_is_arena: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Infer main and index query shapes without mutating either cache."""
         del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
         del eps, q_weight, k_weight, index_q_weight, index_k_weight
-        del rotary_cos_sin, position_ids, index_out_cache_loc
+        del rotary_cos_sin, position_ids, index_out_cache_loc, kv_cache_is_arena
         num_tokens = packed.shape[0]
         return (packed.new_empty((num_tokens, num_heads_q, head_dim),
                                  dtype=torch.float8_e4m3fn),

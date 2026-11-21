@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Map M3's per-head block selections and token writes into sparse cache arenas."""
+"""Map M3's token writes into sparse cache arenas.
+
+The per-head selection merge and the ordinal-indexed arena block table are
+model-agnostic and live in ``sparse/offload_kernels.py``.
+"""
 
 import torch
 import triton
 import triton.language as tl
 
 from ...offload import SparseOffloadState
-from ...offload_kernels import SPARSE_ARENA_COVERAGE_MESSAGE, sparse_arena_rows
 
-__all__ = ["build_block_table", "prepare_selection", "prepare_write_slots"]
+__all__ = ["prepare_write_slots"]
 
 
 @triton.jit
@@ -36,7 +39,14 @@ def _write_slots_kernel(
 
 
 def prepare_write_slots(state: SparseOffloadState, layer_idx: int, out: torch.Tensor) -> None:
-    """Convert K arena pages to token slots in input order, masking graph padding."""
+    """Convert K arena pages to token slots in input order, masking graph padding.
+
+    ``out`` is CUDA int32 [N], one entry per input position: the arena cell of the
+    request's in-flight unit times ``unit_tokens`` plus the token's offset in it,
+    from the layer's int32 [B, buffers] write indices, or -1 for a padding position.
+    Slots are int32; the cache manager rejects an arena whose cells times
+    ``unit_tokens`` would overflow them.
+    """
     descriptor = state.layers[layer_idx]
     writes = state.write_indices[len(descriptor.buffer_ids)]
     _write_slots_kernel[(1,)](
@@ -51,134 +61,3 @@ def prepare_write_slots(state: SparseOffloadState, layer_idx: int, out: torch.Te
         out.numel(),
         triton.next_power_of_2(out.numel()),
     )
-
-
-@triton.jit(do_not_specialize=["stride_q", "stride_h", "stride_k"])
-def _selection_kernel(
-    topk,
-    lengths,
-    selected,
-    units,
-    stride_q,
-    stride_h,
-    stride_k,
-    TOPK: tl.constexpr,
-    WIDTH: tl.constexpr,
-    PAGE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    query = tl.program_id(0)
-    lane = tl.arange(0, BLOCK)
-    block = tl.load(
-        topk + query * stride_q + (lane // TOPK) * stride_h + (lane % TOPK) * stride_k,
-        lane < WIDTH,
-        other=-1,
-    )
-    # Keep the first occurrence across heads; all heads still read the original
-    # selection through the logical-block table filled after the fetch.
-    duplicate = (
-        tl.sum(
-            ((block[:, None] == block[None, :]) & (lane[:, None] > lane[None, :])).to(tl.int32),
-            axis=1,
-        )
-        > 0
-    )
-    tl.store(selected + query * WIDTH + lane, tl.where(duplicate, -1, block), lane < WIDTH)
-    length = tl.load(lengths + query)
-    tl.store(units + query, (length + PAGE - 1) // PAGE)
-
-
-def prepare_selection(
-    topk: torch.Tensor,
-    seq_lens: torch.Tensor,
-    selected: torch.Tensor,
-    units: torch.Tensor,
-) -> None:
-    """Deduplicate [queries, heads, topk] into fixed-width native request selections."""
-    width = topk.shape[1] * topk.shape[2]
-    if width != selected.shape[1] or topk.shape[0] > selected.shape[0]:
-        raise ValueError("MiniMax-M3 selection does not match the sparse cache capacity")
-    _selection_kernel[(topk.shape[0],)](
-        topk,
-        seq_lens,
-        selected,
-        units,
-        *topk.stride(),
-        topk.shape[2],
-        width,
-        128,
-        triton.next_power_of_2(width),
-    )
-
-
-@triton.jit
-def _block_table_kernel(
-    selected,
-    rows,
-    active,
-    history,
-    fetched,
-    writes,
-    table,
-    WIDTH: tl.constexpr,
-    FETCH_STRIDE: tl.constexpr,
-    WRITE_STRIDE: tl.constexpr,
-    SLOT: tl.constexpr,
-    COLUMNS: tl.constexpr,
-    PAGE: tl.constexpr,
-    BLOCK: tl.constexpr,
-    coverage,
-    CHECK_COVERAGE: tl.constexpr,
-):
-    query = tl.program_id(0)
-    row = tl.load(rows + query)
-    live = (query < tl.load(active)) & (row >= 0)
-    lane = tl.arange(0, BLOCK)
-    unit = tl.load(selected + query * WIDTH + lane, lane < WIDTH, other=-1)
-    history_units = tl.load(history + row, live, other=0) // PAGE
-    valid = live & (lane < WIDTH) & (unit >= 0) & (unit < COLUMNS) & (unit <= history_units)
-    page = sparse_arena_rows(
-        unit,
-        lane < WIDTH,
-        live,
-        tl.minimum(COLUMNS, history_units + 1),
-        history_units,
-        fetched + row * FETCH_STRIDE + SLOT * WIDTH,
-        1,
-        lane,
-        tl.load(writes + row * WRITE_STRIDE + SLOT, live, other=-1),
-        coverage,
-        CHECK_COVERAGE,
-    )
-    tl.store(table + query * COLUMNS + unit, page, valid)
-
-
-def build_block_table(
-    state: SparseOffloadState, layer_idx: int, selected: torch.Tensor, out: torch.Tensor
-) -> None:
-    """Publish fetched K pages and the growing block by original block ordinal."""
-    descriptor = state.layers[layer_idx]
-    count = len(descriptor.buffer_ids)
-    fetched, writes = state.fetched_indices[count], state.write_indices[count]
-    if state.coverage is not None:
-        state.coverage.fill_(1)
-    _block_table_kernel[(selected.shape[0],)](
-        selected,
-        state.batch_rows,
-        state.active_request_count,
-        state.history_lengths,
-        fetched,
-        writes,
-        out,
-        selected.shape[1],
-        fetched.stride(0),
-        writes.stride(0),
-        state.out_slots[layer_idx][descriptor.data_buffer_index],
-        out.shape[1],
-        descriptor.unit_tokens,
-        triton.next_power_of_2(selected.shape[1]),
-        state.coverage if state.coverage is not None else out,
-        CHECK_COVERAGE=state.coverage is not None,
-    )
-    if state.coverage is not None:
-        torch._assert_async(state.coverage, SPARSE_ARENA_COVERAGE_MESSAGE)

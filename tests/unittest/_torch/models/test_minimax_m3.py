@@ -697,13 +697,17 @@ def test_eagle_capture_precedes_next_layer_norm() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("horizontal_available", [True, False])
+@pytest.mark.parametrize("case", ["horizontal", "offload_fallback", "resident_declined"])
 def test_piecewise_attention_boundary_runs_horizontal_producer(
-    monkeypatch, horizontal_available
+    monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
+    """The packed boundary runs the producer; only an offloaded layer may fall back without it."""
+    horizontal_available = case == "horizontal"
+
     class FakeAttentionLayer:
         def __init__(self) -> None:
             self.producer_shapes = None
+            self.layer_idx = 3
             self.q_size, self.kv_size = 3, 1
             self.index_q_size = self.index_k_size = 1
 
@@ -730,6 +734,10 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(
 
     metadata = AttentionMetadata(max_num_requests=1, max_num_tokens=4)
     metadata._num_tokens = 2
+    if case == "offload_fallback":
+        # An offloaded layer the producer declines, such as one with an NVFP4 cache.
+        metadata.sparse_offload_state = object()
+        metadata.kv_cache_manager = SimpleNamespace(offloads_layer=lambda layer_idx: layer_idx == 3)
     layer = FakeAttentionLayer()
     monkeypatch.setattr(
         modeling_minimaxm3,
@@ -740,17 +748,24 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(
     position_ids = torch.arange(4, dtype=torch.int32).reshape(1, 4)
     output = torch.full((4, 3), -1.0)
 
-    modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
-        None,
-        None,
-        None,
-        None,
-        None,
-        packed,
-        position_ids,
-        "3",
-        output,
-    )
+    def run() -> None:
+        modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
+            None,
+            None,
+            None,
+            None,
+            None,
+            packed,
+            position_ids,
+            "3",
+            output,
+        )
+
+    if case == "resident_declined":
+        with pytest.raises(RuntimeError, match="fused horizontal producer is required"):
+            run()
+        return
+    run()
 
     assert layer.producer_shapes == ((2, 7), (1, 2), 2)
     torch.testing.assert_close(output[:2], packed[:2, :3])
@@ -2437,17 +2452,14 @@ def test_horizontal_producer_explicit_caches_match_manager(
     expected_arena[:, 0, :, 5].copy_(main[1, :, :, 1])
     expected_index = index.view(torch.uint8).clone()
     index.zero_()
-    manager.get_buffers.return_value = arena_view
+    manager.get_sparse_arena_buffers.return_value = arena_view
     prepared_slots = torch.tensor([257, 5, -1, -1], dtype=torch.int32, device="cuda")
 
     def prepare_slots(state, layer_idx, output):
         assert state is offload_state and layer_idx == 3
         output.copy_(prepared_slots)
 
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.offload.prepare_write_slots",
-        prepare_slots,
-    )
+    monkeypatch.setattr(modeling_minimaxm3, "prepare_write_slots", prepare_slots)
     resolutions = _count_plan_resolutions(monkeypatch, layer)
     offload_outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
         packed, positions, offload_metadata
@@ -2489,23 +2501,35 @@ def test_horizontal_producer_explicit_caches_match_manager(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 offload producer needs CUDA")
-@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
 @torch.inference_mode()
-def test_piecewise_offload_packed_projection_fallback(monkeypatch, kv_dtype):
-    """Compile the packed attention boundary with real norm/RoPE and index-cache writes."""
+def test_piecewise_offload_packed_projection_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compile the packed attention boundary with real norm/RoPE and index-cache writes.
+
+    An offloaded NVFP4 cache has no fused producer, so its packed projection takes this
+    fallback even with a cache manager present.
+    """
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
-    layer, _, index, _ = _make_horizontal_producer_layer(kv_dtype)
+    layer, _, index, _ = _make_horizontal_producer_layer("nvfp4")
     packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
     positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
+    manager.offloads_layer.return_value = True
     metadata = SimpleNamespace(
         num_tokens=2,
-        kv_cache_manager=None,
+        kv_cache_manager=manager,
         sparse_offload_state=object(),
         msa_idx_k_cache=lambda _: index,
         msa_out_cache_loc=torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda"),
     )
     assert layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(packed, positions, metadata) is None
+    # The offload guard declined before the producer looked up any cache view or slot.
+    for producer_call in (
+        manager.get_buffers,
+        manager.get_sparse_arena_buffers,
+        manager.prepare_sparse_write_indices,
+    ):
+        producer_call.assert_not_called()
     main, idx = packed[:2].split([8 * 128, 3 * 128], dim=-1)
     expected = layer._sparse_projection_norm_rope(positions[:2], None, metadata, main, idx)[0]
     expected_index = index.view(torch.uint8).clone()
@@ -2532,6 +2556,56 @@ def test_piecewise_offload_packed_projection_fallback(monkeypatch, kv_dtype):
     torch.testing.assert_close(actual[:2], expected.to(actual.dtype), rtol=0, atol=0)
     assert (actual[2:] == -1).all()
     torch.testing.assert_close(index.view(torch.uint8), expected_index, rtol=0, atol=0)
+
+
+class _PassThroughProjection(nn.Module):
+    """o_proj stand-in that returns the attention output unchanged."""
+
+    def forward(self, x: torch.Tensor, all_reduce_params: object = None) -> torch.Tensor:
+        return x
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 producer layer needs CUDA")
+@torch.inference_mode()
+def test_compiled_offload_keeps_the_captured_producer_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """While compiling, an offloaded layer routes its packed projection to the eager boundary.
+
+    The captured producer writes the paged cache views staged before compilation. An
+    offloaded layer writes its new tokens into sparse cache arena cells reserved each step.
+    """
+    layer, _, _, _ = _make_horizontal_producer_layer("fp8")
+    layer.register_to_config = True
+    layer.o_proj = _PassThroughProjection()
+    hidden = torch.randn((2, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(2, dtype=torch.int32, device="cuda")
+    # No staged cache views: the captured producer would read them.
+    metadata = SimpleNamespace(sparse_offload_state=object())
+    boundary_calls = []
+
+    def captured_producer(*args: object) -> None:
+        raise AssertionError("the captured producer must not write an offloaded layer")
+
+    def attention_boundary(*args: object) -> None:
+        boundary_calls.append(args)
+        args[-1].zero_()
+
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(torch.ops.trtllm, "minimax_m3_fused_sparse_qkv_producer", captured_producer)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "minimax_m3_qkv_index_proj",
+        lambda hidden_states, position_ids, layer_idx: layer.qkv_proj(hidden_states),
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3, "maybe_bcg_minimax_m3_attn_custom_op_inplace", attention_boundary
+    )
+    output = layer._sparse_forward(positions, hidden, metadata)
+    assert len(boundary_calls) == 1
+    packed, position_ids, layer_idx = boundary_calls[0][5:8]
+    assert packed is not None and position_ids is positions and layer_idx == layer.layer_idx_str
+    torch.testing.assert_close(packed, hidden, rtol=0, atol=0)
+    assert output.shape == (2, layer.num_heads * layer.head_dim)
 
 
 class _ReachedProducerLaunch(Exception):

@@ -284,7 +284,7 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(
     int64_t numHeadsKV, int64_t numHeadsIndex, int64_t headDim, int64_t rotaryDim, double eps,
     torch::Tensor const& qWeight, torch::Tensor const& kWeight, torch::Tensor const& indexQWeight,
     torch::Tensor const& indexKWeight, torch::Tensor const& rotaryCosSin, torch::Tensor const& positionIds,
-    std::optional<torch::Tensor> const& indexOutCacheLoc)
+    std::optional<torch::Tensor> const& indexOutCacheLoc, bool kvCacheIsArena)
 {
     constexpr int64_t kHeadDim = 128;
     constexpr int64_t kRotaryDim = 64;
@@ -310,7 +310,11 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(
     CHECK_INPUT(indexQWeight, torch::kBFloat16);
     CHECK_INPUT(indexKWeight, torch::kBFloat16);
     CHECK_INPUT(rotaryCosSin, torch::kFloat32);
-    checkMinimaxM3HndKVPool(kvCache, numHeadsKV, headDim, indexOutCacheLoc.has_value());
+    // A cell arena addresses main K/V by arena cell while index keys stay paged, so it
+    // needs its own index slot map. Separate index slots alone do not relax the page check.
+    TORCH_CHECK(!kvCacheIsArena || indexOutCacheLoc.has_value(),
+        "kv_cache_is_arena requires index_out_cache_loc for the paged index-K cache");
+    checkMinimaxM3HndKVPool(kvCache, numHeadsKV, headDim, kvCacheIsArena);
     TORCH_CHECK(kvCache.size(3) == kPageSize, "MiniMax-M3 horizontal producer requires page_size=128");
     TORCH_CHECK(indexKCache.is_cuda() && indexKCache.scalar_type() == at::ScalarType::Float8_e4m3fn,
         "Index-K cache must be CUDA torch.float8_e4m3fn");
@@ -498,7 +502,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(Tensor packed, Tensor(a!) kv_cache, Tensor(b!) "
         "index_k_cache, Tensor out_cache_loc, int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, "
         "int rotary_dim, float eps, Tensor q_weight, Tensor k_weight, Tensor index_q_weight, Tensor index_k_weight, "
-        "Tensor rotary_cos_sin, Tensor position_ids, Tensor? index_out_cache_loc=None) -> (Tensor, Tensor)");
+        "Tensor rotary_cos_sin, Tensor position_ids, Tensor? index_out_cache_loc=None, bool kv_cache_is_arena=False) "
+        "-> (Tensor, Tensor)");
     m.def(
         "minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(Tensor packed, Tensor(a!) kv_data_cache, Tensor(b!) "
         "kv_scale_cache, Tensor(c!) index_k_cache, Tensor out_cache_loc, Tensor kv_quant_scale, int num_heads_q, "

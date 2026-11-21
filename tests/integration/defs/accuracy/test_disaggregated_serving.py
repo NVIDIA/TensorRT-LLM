@@ -857,8 +857,8 @@ def _test_sparse_offload_long_context(
     # Keep prefill identical across paired runs. This profile tests reuse of
     # received decode KV; cached prefill would change the reference computation.
     ctx_server_config["kv_cache_config"]["enable_block_reuse"] = False
-    if block_reuse:
-        # Offload publishes received prompts only. Resident decode must use
+    if block_reuse and is_m3:
+        # M3 offload publishes received prompts only. Resident decode must use
         # the same policy so it cannot rebase generated KV onto prefill pages.
         gen_server_config["kv_cache_config"]["block_reuse_config"] = {
             "policy": "per_request"
@@ -974,6 +974,10 @@ def _test_sparse_offload_long_context(
                                               skip_special_tokens=True)
                 answer = evaluator._extract_answer(
                     evaluator._post_process(prediction))
+                if not is_m3 and forced_tokens is None:
+                    # M3 answer scores are informational; the other models must
+                    # still answer each document they read in full.
+                    assert answer is not None, f"No answer for {samples[index]['_id']}: {prediction}"
                 return {
                     "id":
                     samples[index]["_id"],

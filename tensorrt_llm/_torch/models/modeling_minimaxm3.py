@@ -56,6 +56,7 @@ from ..attention.backends.sparse.minimax_m3 import (
     _write_main_kv_slots_to_pool,
 )
 from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
+from ..attention.backends.sparse.minimax_m3.kernels.offload import prepare_write_slots
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
@@ -1079,8 +1080,10 @@ def minimax_m3_attn_custom_op_inplace(
     """Run MiniMax-M3 cache and attention work behind a compile boundary.
 
     The captured horizontal producer can populate both caches before this
-    boundary. The packed-projection fallback runs that producer here instead,
-    while separate projections leave their cache writes here. Slice padded
+    boundary. A packed projection runs that producer here instead, while
+    separate projections leave their cache writes here. A resident layer
+    requires the producer; an offloaded layer it declines, such as one with an
+    NVFP4 cache, runs the unfused norm, RoPE and cache writes. Slice padded
     inputs to live tokens before request-dependent cache and MSA work.
     """
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
@@ -1092,6 +1095,25 @@ def minimax_m3_attn_custom_op_inplace(
             attn_metadata,
         )
         if horizontal is None:
+            manager = attn_metadata.kv_cache_manager
+            if (
+                getattr(attn_metadata, "sparse_offload_state", None) is None
+                or manager is None
+                or not manager.offloads_layer(attn_layer.layer_idx)
+            ):
+                raise RuntimeError(
+                    "MiniMax-M3 fused horizontal producer is required inside the "
+                    f"piecewise attention boundary for layer {layer_idx}, but its "
+                    "runtime geometry or cache layout was unsupported."
+                )
+            # Only an offloaded layer may decline: an NVFP4 cache has no fused producer
+            # that writes the sparse cache arena.
+            logger.warning_once(
+                f"MiniMax-M3 layer {layer_idx}: the fused QKV producer declined this "
+                "offloaded layer's KV cache, so its packed projection runs the unfused "
+                "norm, RoPE and cache writes.",
+                key=f"minimax_m3_offload_producer_fallback_{layer_idx}",
+            )
             main_size = attn_layer.q_size + 2 * attn_layer.kv_size
             packed_qkv, packed_idx_qk = packed_qkv_index[:num_tokens].split(
                 [main_size, attn_layer.index_q_size + attn_layer.index_k_size], dim=-1
@@ -1595,26 +1617,32 @@ class MiniMaxM3Attention(Attention):
         ):
             return None
         kv_cache_manager = attn_metadata.kv_cache_manager
-        if cache_tensors is None:
-            if kv_cache_manager is None:
-                return None
-            buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
-            index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
-            scale_buffers = (
-                kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
-                if kv_cache_manager.is_nvfp4_layer(self.layer_idx)
-                else None
-            )
-            out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
-        else:
-            buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
-        if out_cache_loc is None:
-            return None
         offload = (
             offload_state is not None
             and kv_cache_manager is not None
             and kv_cache_manager.offloads_layer(self.layer_idx)
         )
+        if cache_tensors is None:
+            if kv_cache_manager is None:
+                return None
+            if offload:
+                # An offloaded layer writes its new tokens into sparse cache arena cells.
+                # NVFP4 offload returned above, so there is no scale arena to write.
+                buffers = kv_cache_manager.get_sparse_arena_buffers(self.layer_idx, "HND")
+                scale_buffers = None
+            else:
+                buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
+                scale_buffers = (
+                    kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
+                    if kv_cache_manager.is_nvfp4_layer(self.layer_idx)
+                    else None
+                )
+            index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+            out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        else:
+            buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
+        if out_cache_loc is None:
+            return None
         plan = self._fused_producer_plan(
             buffers, index_k_cache, scale_buffers, out_cache_loc, offload=offload
         )
@@ -1627,8 +1655,6 @@ class MiniMaxM3Attention(Attention):
         positions = position_ids.reshape(-1).contiguous().to(torch.int32)
         index_out_cache_loc = None
         if offload:
-            from ..attention.backends.sparse.minimax_m3.kernels.offload import prepare_write_slots
-
             index_out_cache_loc = out_cache_loc[:num_tokens]
             kv_cache_manager.prepare_sparse_write_indices(offload_state, self.layer_idx)
             prepare_write_slots(offload_state, self.layer_idx, attn_metadata.msa_sparse_write_slots)
@@ -1653,6 +1679,7 @@ class MiniMaxM3Attention(Attention):
                 *static_args,
                 positions,
                 index_out_cache_loc=index_out_cache_loc,
+                kv_cache_is_arena=offload,
             )
         return q.flatten(1), index_q.flatten(1)
 

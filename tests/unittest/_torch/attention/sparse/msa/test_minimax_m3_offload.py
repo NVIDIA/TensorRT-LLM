@@ -90,7 +90,9 @@ def _manager(
 
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.HALF, DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize("heads", [1, 2, 4])
-def test_m3_resident_and_offloaded_transfer_views_match(dtype, heads, monkeypatch):
+def test_m3_resident_and_offloaded_transfer_views_match(
+    dtype: DataType, heads: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Native transfer maps every dense, sparse and index pool in both directions."""
     monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "zero")
     resident = _manager(dtype, heads, 40 * PAGE, offload=False)
@@ -138,7 +140,71 @@ def test_m3_resident_and_offloaded_transfer_views_match(dtype, heads, monkeypatc
         resident.shutdown()
 
 
-def _host_pages(manager, layer: int, request_id: int, *, scales: bool = False):
+@pytest.mark.parametrize("dtype", [DataType.BF16, DataType.NVFP4])
+def test_m3_fresh_page_fill_leaves_offloaded_arenas_alone(
+    dtype: DataType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fresh-page diagnostic fills KV pages; an offloaded layer has none on the GPU.
+
+    Its arena cells hold other requests' fetched history, and host page IDs do not name them.
+    """
+    monkeypatch.setenv("TRTLLM_KV_FRESH_PAGE_FILL", "nan")
+    manager = _manager(dtype, 1, 8 * PAGE)
+    request = LlmRequest(
+        request_id=7,
+        max_new_tokens=4,
+        input_tokens=list(range(3 * PAGE + 5)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    try:
+        arenas = [manager.get_sparse_arena_buffers(layer, "HND") for layer in SPARSE_LAYERS]
+        if dtype == DataType.NVFP4:
+            arenas += [
+                manager.get_sparse_arena_buffers(layer, "HND", scales=True)
+                for layer in SPARSE_LAYERS
+            ]
+        for layer in SPARSE_LAYERS:
+            assert manager.get_buffers(layer) is None
+            assert manager.get_block_scale_buffers(layer) is None
+        for arena in arenas:
+            arena.view(torch.uint8).fill_(0x11)
+        assert manager.prepare_disagg_gen_init(request)
+        torch.cuda.synchronize()
+        if dtype == DataType.BF16:
+            # The resident dense layers' new pages took the fill.
+            assert manager._fresh_fill_announced
+        for arena in arenas:
+            assert (arena.view(torch.uint8) == 0x11).all()
+        manager.free_resources(request)
+    finally:
+        manager.shutdown()
+
+
+def test_m3_offload_rejects_arenas_past_int32_write_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Token write slots are int32 cell * page + offset, so the arena's cells are bounded."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import cache_manager
+
+    manager = _manager(DataType.FP8, 1, 8 * PAGE)
+    try:
+        cells = {
+            descriptor.arena_row_counts[descriptor.data_buffer_index]
+            for descriptor in manager.get_sparse_offload_descriptors().values()
+        }
+        manager._m3_offload_descriptors = None
+        # A bound one cell short of this arena stands in for a 2**31-slot arena.
+        monkeypatch.setattr(cache_manager, "_MAX_SPARSE_ARENA_TOKEN_SLOTS", (max(cells) - 1) * PAGE)
+        with pytest.raises(ValueError, match="int32"):
+            manager.get_sparse_offload_descriptors()
+        monkeypatch.setattr(cache_manager, "_MAX_SPARSE_ARENA_TOKEN_SLOTS", max(cells) * PAGE)
+        assert set(manager.get_sparse_offload_descriptors()) == set(SPARSE_LAYERS)
+    finally:
+        manager.shutdown()
+
+
+def _host_pages(
+    manager: MiniMaxM3KVCacheManagerV2, layer: int, request_id: int, *, scales: bool = False
+) -> list[torch.Tensor]:
     """Views of the same host pages a context worker transfers into."""
     geometry = manager._kv_scale_slot_geometry if scales else manager._kv_slot_geometry
     address, dtype, _, slot_stride, shape = geometry(layer, "HND")
@@ -155,7 +221,14 @@ def _host_pages(manager, layer: int, request_id: int, *, scales: bool = False):
     ]
 
 
-def _write(data, scales, slots, k, v, quant):
+def _write(
+    data: torch.Tensor,
+    scales: torch.Tensor | None,
+    slots: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    quant: torch.Tensor,
+) -> None:
     k, v = k.flatten(1), v.flatten(1)
     if scales is None:
         assert fused_write_layer_caches(data[:, 0], data[:, 1], None, slots, k, v, None)
@@ -165,7 +238,16 @@ def _write(data, scales, slots, k, v, quant):
         )
 
 
-def _attention(q, data, scales, topk, table, lengths, out, quant):
+def _attention(
+    q: torch.Tensor,
+    data: torch.Tensor,
+    scales: torch.Tensor | None,
+    topk: torch.Tensor,
+    table: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    quant: torch.Tensor,
+) -> None:
     extra = (
         {}
         if scales is None
@@ -193,7 +275,9 @@ def _attention(q, data, scales, topk, table, lengths, out, quant):
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize("heads", [1, 2, 4])
 @pytest.mark.parametrize("shorter_prefix", [False, True], ids=["same_prompt", "shorter_prefix"])
-def test_m3_offload_reuses_received_prompt(dtype, heads, shorter_prefix):
+def test_m3_offload_reuses_received_prompt(
+    dtype: DataType, heads: int, shorter_prefix: bool
+) -> None:
     """Reuse a received prompt or its shorter prefix, then decode across a partial page."""
     shared_blocks = 5
     prompt_len = (shared_blocks + 1) * PAGE - 1
@@ -348,8 +432,12 @@ def test_m3_offload_reuses_received_prompt(dtype, heads, shorter_prefix):
                     actual, expected = torch.empty_like(q), torch.empty_like(q)
                     _attention(
                         q,
-                        manager.get_buffers(layer, "HND"),
-                        manager.get_block_scale_buffers(layer, "HND") if nvfp4 else None,
+                        manager.get_sparse_arena_buffers(layer, "HND"),
+                        (
+                            manager.get_sparse_arena_buffers(layer, "HND", scales=True)
+                            if nvfp4
+                            else None
+                        ),
                         topk,
                         table,
                         metadata.msa_seq_lens_cuda[:1],
@@ -528,12 +616,15 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 )
                 table = metadata.fetch_sparse_blocks(layer, topk)
                 if not graph:
-                    arena = manager.get_buffers(layer, "HND").view(torch.uint8)
+                    arena = manager.get_sparse_arena_buffers(layer, "HND").view(torch.uint8)
                     for position, (rid, history) in enumerate(zip(ids, histories)):
                         units = topk[position].flatten().unique()
                         units = units[units >= 0].long()
                         physical = table[position, units].long()
-                        assert (physical >= 0).all(), (step, layer, rid)
+                        assert (physical >= 0).all(), (
+                            f"step={step}, layer={layer}, request={rid}: "
+                            f"selected {units.tolist()} reached pages {physical.tolist()}"
+                        )
                         valid = units[:, None] * PAGE + torch.arange(PAGE, device="cuda") <= history
                         mask = ~valid[:, None, None, :, None]
                         torch.testing.assert_close(
@@ -541,15 +632,15 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                             reference[rid, layer][0].view(torch.uint8)[units].masked_fill(mask, 0),
                             rtol=0,
                             atol=0,
-                            msg=(
+                            msg=lambda error: (
                                 f"step={step}, layer={layer}, request={rid}, "
-                                f"selected={units.tolist()}, pages={physical.tolist()}"
+                                f"selected={units.tolist()}, pages={physical.tolist()}: {error}"
                             ),
                         )
                 _attention(
                     q,
-                    manager.get_buffers(layer, "HND"),
-                    manager.get_block_scale_buffers(layer, "HND") if nvfp4 else None,
+                    manager.get_sparse_arena_buffers(layer, "HND"),
+                    manager.get_sparse_arena_buffers(layer, "HND", scales=True) if nvfp4 else None,
                     topk,
                     table,
                     metadata.msa_seq_lens_cuda,
@@ -576,10 +667,11 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 use_cache=True, num_cached_tokens_per_seq=histories
             )
             metadata.prepare()
-            # The fixed-width kernel test executes padded queries beyond metadata.num_seqs.
-            metadata.msa_seq_lens_cuda[len(ids) :].zero_()
+            # The fixed-width kernels run padded queries beyond metadata.num_seqs. Like
+            # CUDA-graph padding, each is a one-token request whose indexer selects block 0.
+            metadata.msa_seq_lens_cuda[len(ids) :].fill_(1)
             permuted |= state.batch_rows[: len(active)].tolist() != list(range(len(active)))
-            resident_table.fill_(-1)
+            resident_table.fill_(0)
             for position, request in enumerate(active):
                 resident_table[position].copy_(
                     torch.arange(max_blocks, device="cuda", dtype=torch.int32)
@@ -590,6 +682,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 torch.tensor([h + 1 for h in histories], device="cuda", dtype=torch.int32),
             )
             topk.fill_(-1)
+            topk[len(ids) :, :, 0] = 0
             for position, history in enumerate(histories):
                 for head in range(heads):
                     units = [
@@ -638,6 +731,8 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 captured.replay()
             torch.cuda.synchronize()
             assert (metadata.msa_sparse_write_slots[len(active) :] == -1).all()
+            # Padded queries are no Batch members, but attention reads their block 0.
+            assert (metadata.msa_sparse_block_table[len(active) : BATCH, 0] >= 0).all()
             for layer in SPARSE_LAYERS:
                 expected = torch.empty_like(q)
                 _attention(
@@ -651,8 +746,8 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                     quant,
                 )
                 torch.testing.assert_close(
-                    outputs[layer],
-                    expected,
+                    outputs[layer][: len(ids)],
+                    expected[: len(ids)],
                     rtol=0,
                     atol=0,
                     msg=lambda error: f"step={step}, layer={layer}, requests={ids}: {error}",
@@ -660,16 +755,27 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
             torch.cuda.synchronize()
             for rid, history in zip(ids, histories):
-                assert manager.kv_cache_map[rid].history_length == history + 1
+                assert manager.kv_cache_map[rid].history_length == history + 1, (
+                    f"step={step}, request={rid}: history "
+                    f"{manager.kv_cache_map[rid].history_length}, expected {history + 1}"
+                )
                 for layer in SPARSE_LAYERS:
                     data, scales = reference[rid, layer]
                     page = history // PAGE
                     valid = history % PAGE + 1
+
+                    def where(error: str, plane: str) -> str:
+                        return (
+                            f"step={step}, request={rid}, layer={layer}, page={page}, "
+                            f"{plane} written back to host: {error}"
+                        )
+
                     torch.testing.assert_close(
                         _host_pages(manager, layer, rid)[page][:, :, :valid].view(torch.uint8),
                         data[page, :, :, :valid].view(torch.uint8),
                         rtol=0,
                         atol=0,
+                        msg=lambda error: where(error, "K/V"),
                     )
                     if nvfp4:
                         host_scales = _host_pages(manager, layer, rid, scales=True)[page]
@@ -678,6 +784,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                             scales[page, 0, :, :valid],
                             rtol=0,
                             atol=0,
+                            msg=lambda error: where(error, "K scales"),
                         )
 
                         def unpack_v_scale(values):
@@ -692,6 +799,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                             unpack_v_scale(scales[page, 1])[:, :valid],
                             rtol=0,
                             atol=0,
+                            msg=lambda error: where(error, "V scales"),
                         )
         assert permuted
         for request in requests:
@@ -701,27 +809,34 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
 
 
 @pytest.mark.parametrize(
-    "seq_lens,seq_lens_kv,contexts,device,error",
+    "seq_lens,seq_lens_kv,contexts,device,error,message",
     [
-        ([1], [0], 0, "cpu", NotImplementedError),
-        ([2], [2], 0, "cpu", NotImplementedError),
-        ([1], [1], 1, "cpu", NotImplementedError),
-        ([1], [1], 0, "cuda", ValueError),
+        ([1], [0], 0, "cpu", NotImplementedError, "one query per request"),
+        ([2], [2], 0, "cpu", NotImplementedError, "one query per request"),
+        ([1], [1], 1, "cpu", NotImplementedError, "decode batches only"),
+        ([1], [1], 0, "cuda", ValueError, "host sequence lengths"),
     ],
 )
-def test_m3_offload_rejects_unsupported_rows(seq_lens, seq_lens_kv, contexts, device, error):
+def test_m3_offload_rejects_unsupported_rows(
+    seq_lens: list[int],
+    seq_lens_kv: list[int],
+    contexts: int,
+    device: str,
+    error: type[Exception],
+    message: str,
+) -> None:
     metadata = SimpleNamespace(
         sparse_offload_state=SimpleNamespace(prepared=True),
         num_contexts=contexts,
         seq_lens=torch.tensor(seq_lens, device=device),
         seq_lens_kv=torch.tensor(seq_lens_kv, device=device),
     )
-    with pytest.raises(error):
+    with pytest.raises(error, match=message):
         MiniMaxM3MsaSparseAttentionMetadata.prepare(metadata)
     assert not metadata.sparse_offload_state.prepared
 
 
-def test_m3_offload_rejects_metadata_topk_mismatch():
+def test_m3_offload_rejects_metadata_topk_mismatch() -> None:
     manager = _manager(DataType.FP8, 2, 40 * PAGE)
     try:
         metadata = SimpleNamespace(
@@ -738,10 +853,10 @@ def test_m3_offload_rejects_metadata_topk_mismatch():
         manager.shutdown()
 
 
-def test_m3_selection_reuses_compilation_across_batch_sizes():
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.offload import (
-        _selection_kernel,
-        prepare_selection,
+def test_m3_selection_reuses_compilation_across_batch_sizes() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import (
+        _merge_head_selections_kernel,
+        merge_head_selections,
     )
 
     selected = torch.empty((16, 2 * TOPK), dtype=torch.int32, device="cuda")
@@ -754,18 +869,46 @@ def test_m3_selection_reuses_compilation_across_batch_sizes():
             .reshape(2, queries, TOPK)
             .transpose(0, 1)
         )
-        prepare_selection(topk, lengths, selected, units)
+        merge_head_selections(topk, lengths, selected, units, unit_tokens=PAGE)
         expected = torch.full((queries, 2 * TOPK), -1, dtype=torch.int32, device="cuda")
         expected[:, :4] = torch.arange(4, dtype=torch.int32, device="cuda")
         torch.testing.assert_close(selected[:queries], expected)
         assert (units[:queries] == 4).all()
-        compiled.append(len(_selection_kernel.device_caches[torch.cuda.current_device()][0]))
+        compiled.append(
+            len(_merge_head_selections_kernel.device_caches[torch.cuda.current_device()][0])
+        )
     assert len(set(compiled)) == 1, compiled
 
 
-def test_m3_sparse_block_table_checks_coverage(monkeypatch):
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.offload import (
-        build_block_table,
+def test_m3_sparse_block_table_keeps_padding_in_the_arena() -> None:
+    """CUDA-graph padding queries read the cells their selections name, so each must exist."""
+    from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import (
+        build_sparse_block_table,
+    )
+
+    def device(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    state = SimpleNamespace(
+        layers={1: SimpleNamespace(buffer_ids=[1], unit_tokens=PAGE, data_buffer_index=0)},
+        fetched_indices={1: device([[[3, -1]], [[-1, -1]]])},
+        write_indices={1: device([[7], [-1]])},
+        batch_rows=device([0, -1]),
+        active_request_count=device([1]),
+        history_lengths=device([PAGE, 0]),
+        out_slots={1: [0]},
+        coverage=None,
+    )
+    out = device([[-1, -1], [-1, -1]])
+    build_sparse_block_table(state, 1, device([[0, 1], [0, -1]]), out)
+    # The live query reads its fetched history and its write cell; the padding query's
+    # selected block 0 names arena cell 0 instead of the -1 a reader would dereference.
+    torch.testing.assert_close(out, device([[3, 7], [0, -1]]))
+
+
+def test_m3_sparse_block_table_checks_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import (
+        build_sparse_block_table,
     )
 
     def device(values):
@@ -789,10 +932,10 @@ def test_m3_sparse_block_table_checks_coverage(monkeypatch):
     )
     out = device([[-1, -1]])
     selected = device([[0, 1]])
-    build_block_table(state, 1, selected, out)
+    build_sparse_block_table(state, 1, selected, out)
     assert checks == [0]
     torch.testing.assert_close(out, device([[-1, 7]]))
     fetched[0, 0, 0] = 3
-    build_block_table(state, 1, selected, out)
+    build_sparse_block_table(state, 1, selected, out)
     assert checks == [0, 1]
     torch.testing.assert_close(out, device([[3, 7]]))

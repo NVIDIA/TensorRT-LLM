@@ -1108,9 +1108,14 @@ class _SparseKvCacheOffloadConfigMixin(StrictBaseModel):
     enable_kv_cache_offload: bool = Field(
         default=False,
         description=
-        "Offload sparse attention history to host memory with KV cache "
-        "manager V2. Requires single-token decode on a disaggregated generation "
-        "worker; index keys and other resident caches remain on GPU.",
+        "Offload the KV history sparse attention selects from to host memory "
+        "with KV cache manager V2: the MLA latent cache for DeepSeek sparse "
+        "attention, the ratio-4 compressed cache for DeepSeek-V4, or the sparse "
+        "layers' main K/V for MiniMax-M3. Each decode step fetches the units the "
+        "indexer selects into a per-request GPU cache; index keys, sliding-window "
+        "and other resident caches remain on GPU. Requires single-token decode on "
+        "a decode-only worker, such as the generation worker of a disaggregated "
+        "deployment.",
         status="prototype",
     )
     kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
@@ -1121,7 +1126,7 @@ class _SparseKvCacheOffloadConfigMixin(StrictBaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_offload_sizing(self):
+    def _validate_offload_sizing(self) -> "_SparseKvCacheOffloadConfigMixin":
         if not self.enable_kv_cache_offload and self.kv_cache_offload_config != SparseKvCacheOffloadConfig(
         ):
             raise ValueError(
@@ -1346,7 +1351,9 @@ class MiniMaxM3SparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
         "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
         "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
         "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
-        "or NVFP4 main KV cache.",
+        "or NVFP4 main KV cache. With enable_kv_cache_offload, layers with an "
+        "NVFP4 main KV cache skip the producer and run the unfused norm, RoPE "
+        "and cache writes.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(
@@ -1613,8 +1620,8 @@ class DeepSeekSparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
         "it each step. Defaults to the model's HF config value.")
 
     @model_validator(mode="after")
-    def _validate_kv_cache_offload(self):
-        """Reject offload sizing without offload and a non-positive top-k.
+    def _validate_kv_cache_offload(self) -> "DeepSeekSparseAttentionConfig":
+        """Reject a non-positive top-k with offload; the shared mixin checks the sizing.
 
         ``index_topk`` may still be None here; the checkpoint fills it later.
         """

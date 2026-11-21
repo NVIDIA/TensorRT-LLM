@@ -147,7 +147,8 @@ struct SparseStepScratch
 //!
 //!     num_blocks     = historyLength / tokens_per_block     (valid page table entries)
 //!     history_units  = historyLength / unit_tokens          (selectable units)
-//!     capacity_units = capacity / unit_tokens               (the in-flight span's end)
+//!     capacity_units = capacity / unit_tokens               (the in-flight span's end,
+//!                      rounded up when the sparse cache includes partial units)
 //!
 //! Publishing the source rather than the three derived counts keeps one truth; the divisors
 //! are per-layer-group constants a kernel already has.

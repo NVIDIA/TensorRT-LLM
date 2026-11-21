@@ -74,7 +74,15 @@ void launchMinimaxM3Fp8QKNormRopeKVInsert(void const* qkv_input, void* q_output,
 
 // MiniMax-M3 sparse producer for the packed [Q|K|V|index-Q|index-K]
 // projection. It uses a precomputed FP32 RoPE table, emits compact FP8 Q and
-// index-Q, and inserts main K/V plus index-K into their paged FP8 HND caches.
+// index-Q, and inserts main K/V plus index-K into their FP8 HND caches.
+//
+// out_cache_loc names each token's main K/V slot (page * page_size + offset, -1 to
+// skip) among num_pages pages; index_out_cache_loc names its index-K slot among
+// num_index_pages pages. The caller passes the same map for both when the caches
+// share one page space. The main cache may instead be a sparse cache arena, where a
+// page is an arena cell and V sits at a fixed cell offset from K (kv_plane_stride);
+// its slots then differ from the paged index-K slots, so the maps are separate. The
+// strides alone describe either layout to the kernel.
 void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
     void* kv_cache, void* index_k_cache, int const* out_cache_loc, int const* index_out_cache_loc,
     int64_t kv_page_stride, int64_t kv_plane_stride, int64_t kv_head_stride, int64_t kv_token_stride,

@@ -102,24 +102,34 @@ class DecodeBatchGate:
             self._wave = wave
             self._opened = False
             self._waiting_since = None
-        assert len(request_lengths) == len(decoding_iters)
+        assert len(request_lengths) == len(decoding_iters), (
+            f"{len(request_lengths)} request lengths for {len(decoding_iters)} decode counters"
+        )
         if len(expected_lengths) < 2 or not request_lengths:
             return list(range(len(request_lengths)))
-        assert len(request_lengths) <= len(expected_lengths), "Unexpected requests in parity wave"
+        assert len(request_lengths) <= len(expected_lengths), (
+            f"Unexpected requests in parity wave {wave}: {request_lengths}; expected {expected_lengths}"
+        )
         assert all(length in expected_lengths for length in request_lengths), (
             f"Unexpected prompt lengths: {request_lengths}; expected {expected_lengths}"
         )
         if not self._opened:
             assert all(iteration <= 1 for iteration in decoding_iters), (
-                "Parity batch started decoding before all histories were ready"
+                "Parity batch started decoding before all histories were ready: "
+                f"decode iterations {decoding_iters} for lengths {request_lengths}"
             )
             if len(request_lengths) < len(expected_lengths):
                 now = time.monotonic()
                 if self._waiting_since is None:
                     self._waiting_since = now
-                assert now - self._waiting_since < 30, "Timed out waiting for the parity batch"
+                assert now - self._waiting_since < 30, (
+                    f"Timed out waiting for the parity batch of wave {wave}: "
+                    f"{request_lengths} of {expected_lengths}"
+                )
                 return []
-            assert sorted(request_lengths) == sorted(expected_lengths)
+            assert sorted(request_lengths) == sorted(expected_lengths), (
+                f"Parity wave {wave} lengths {request_lengths}; expected {expected_lengths}"
+            )
             self._opened = True
         return sorted(
             range(len(request_lengths)), key=lambda i: expected_lengths.index(request_lengths[i])
@@ -141,12 +151,13 @@ def assert_concurrent_decode(
     assert len(batched) >= min_batched_steps, f"Only {len(batched)} batched decode iterations"
     if require_retirement:
         assert 1 in active_counts[batched[-1] + 1 :], (
-            "Mixed-length wave did not decode after one request retired"
+            "Mixed-length wave did not decode after one request retired: "
+            f"active requests per step {active_counts}"
         )
     trace = [count for count in active_counts if count > 0]
     if expected_initial_batch_size is not None:
         assert trace[0] == expected_initial_batch_size, (
-            "Parity wave started with an incomplete batch"
+            f"Parity wave started with {trace[0]} of {expected_initial_batch_size} requests"
         )
     print(
         f"Concurrent decode evidence: {len(batched)} batched steps, retirement={require_retirement}"

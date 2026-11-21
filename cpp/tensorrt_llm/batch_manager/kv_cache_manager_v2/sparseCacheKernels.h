@@ -30,6 +30,18 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //! Written to an output slot that carries no selection, i.e. selection padding.
 inline constexpr int32_t kNoSparseSlot = -1;
 
+//! Units that `tokens` reach: every whole unit, plus the growing one when the sparse cache
+//! includes partial units.
+//!
+//! History rounds down, since a growing unit is not yet history; capacities, the copyable
+//! range and a flush's end round up through this. The kernels and the host share it so that
+//! device residency and host flushes agree.
+[[nodiscard]] constexpr int32_t sparseUnitsReached(
+    int32_t tokens, int32_t unitTokens, bool includePartialUnits) noexcept
+{
+    return tokens / unitTokens + static_cast<int32_t>(includePartialUnits && tokens % unitTokens != 0);
+}
+
 //! These kernels enforce their preconditions by trapping, not by reporting: a violation is
 //! a KVCM2 logic error, and the trap destroys the context, so no status could be read back.
 //! A debug build names the condition before halting.

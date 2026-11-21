@@ -379,7 +379,7 @@ def test_horizontal_producer_independent_offload_slots(num_kv_heads: int) -> Non
     index_cache = _index_cache(index_pages)
     operation = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert
 
-    def run(main, index, main_map, index_map=None):
+    def run(main, index, main_map, index_map=None, arena=False):
         return operation(
             packed,
             main,
@@ -395,13 +395,14 @@ def test_horizontal_producer_independent_offload_slots(num_kv_heads: int) -> Non
             rope,
             positions,
             index_out_cache_loc=index_map,
+            kv_cache_is_arena=arena,
         )
 
-    run(main_cache, index_cache, main_slots, index_slots)
+    run(main_cache, index_cache, main_slots, index_slots, arena=True)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        q, index_q = run(main_cache, index_cache, main_slots, index_slots)
+        q, index_q = run(main_cache, index_cache, main_slots, index_slots, arena=True)
 
     for replay in range(2):
         packed.copy_(torch.randn_like(packed))
@@ -425,4 +426,9 @@ def test_horizontal_producer_independent_offload_slots(num_kv_heads: int) -> Non
         assert torch.equal(index_cache.view(torch.uint8), reference_index.view(torch.uint8))
 
     with pytest.raises(RuntimeError, match="index_out_cache_loc"):
-        run(main_cache, index_cache, main_slots, index_slots[:1])
+        run(main_cache, index_cache, main_slots, index_slots[:1], arena=True)
+    # Separate index slots do not admit overlapping K/V planes; only the arena flag does.
+    with pytest.raises(RuntimeError, match="disjoint HND pages"):
+        run(main_cache, index_cache, main_slots, index_slots)
+    with pytest.raises(RuntimeError, match="kv_cache_is_arena requires index_out_cache_loc"):
+        run(main_cache, _index_cache(main_pages), main_slots, arena=True)

@@ -15,9 +15,14 @@ row, through a per-step map from each request's position to its Batch row.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+if TYPE_CHECKING:
+    from .offload import SparseOffloadState
 
 # Message of the opt-in device assertion on a merge's coverage flag.
 SPARSE_ARENA_COVERAGE_MESSAGE = (
@@ -452,3 +457,158 @@ def gather_sparse_batch_rows(
             BLOCK=block,
         )
     return out
+
+
+@triton.jit(do_not_specialize=["stride_q", "stride_h", "stride_k"])
+def _merge_head_selections_kernel(
+    topk,
+    lengths,
+    selected,
+    units,
+    stride_q,
+    stride_h,
+    stride_k,
+    TOPK: tl.constexpr,
+    WIDTH: tl.constexpr,
+    UNIT_TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    query = tl.program_id(0)
+    lane = tl.arange(0, BLOCK)
+    block = tl.load(
+        topk + query * stride_q + (lane // TOPK) * stride_h + (lane % TOPK) * stride_k,
+        lane < WIDTH,
+        other=-1,
+    )
+    # Keep the first occurrence across heads; all heads still read the original
+    # selection through the logical-block table filled after the fetch.
+    duplicate = (
+        tl.sum(
+            ((block[:, None] == block[None, :]) & (lane[:, None] > lane[None, :])).to(tl.int32),
+            axis=1,
+        )
+        > 0
+    )
+    tl.store(selected + query * WIDTH + lane, tl.where(duplicate, -1, block), lane < WIDTH)
+    length = tl.load(lengths + query)
+    tl.store(units + query, (length + UNIT_TOKENS - 1) // UNIT_TOKENS)
+
+
+def merge_head_selections(
+    kv_block_indexes: torch.Tensor,
+    seq_lens: torch.Tensor,
+    selected: torch.Tensor,
+    units: torch.Tensor,
+    *,
+    unit_tokens: int,
+) -> None:
+    """Deduplicate per-head selections into one fixed-width selection per query.
+
+    All tensors are CUDA int32. ``kv_block_indexes`` [Q, H, K] holds each KV
+    head's selected unit ordinals, -1 for none, for a model whose heads select
+    independently. ``selected`` [>= Q, H * K] receives each query's union in
+    head-major order, with later duplicates replaced by -1, and ``units`` [>= Q]
+    each query's selectable unit count: ``seq_lens`` [>= Q] in tokens, rounded up
+    to whole units. The kernel compiles once for every batch size.
+    """
+    width = kv_block_indexes.shape[1] * kv_block_indexes.shape[2]
+    if width != selected.shape[1] or kv_block_indexes.shape[0] > selected.shape[0]:
+        raise ValueError("Per-head selections do not match the sparse cache selection width")
+    _merge_head_selections_kernel[(kv_block_indexes.shape[0],)](
+        kv_block_indexes,
+        seq_lens,
+        selected,
+        units,
+        *kv_block_indexes.stride(),
+        kv_block_indexes.shape[2],
+        width,
+        unit_tokens,
+        triton.next_power_of_2(width),
+    )
+
+
+@triton.jit
+def _sparse_block_table_kernel(
+    selected,
+    rows,
+    active,
+    history,
+    fetched,
+    writes,
+    table,
+    WIDTH: tl.constexpr,
+    FETCH_STRIDE: tl.constexpr,
+    WRITE_STRIDE: tl.constexpr,
+    SLOT: tl.constexpr,
+    COLUMNS: tl.constexpr,
+    UNIT_TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    coverage,
+    CHECK_COVERAGE: tl.constexpr,
+):
+    query = tl.program_id(0)
+    row = tl.load(rows + query)
+    live = (query < tl.load(active)) & (row >= 0)
+    lane = tl.arange(0, BLOCK)
+    in_width = lane < WIDTH
+    unit = tl.load(selected + query * WIDTH + lane, in_width, other=-1)
+    in_table = in_width & (unit >= 0) & (unit < COLUMNS)
+    history_units = tl.load(history + row, live, other=0) // UNIT_TOKENS
+    valid = live & in_table & (unit <= history_units)
+    page = sparse_arena_rows(
+        unit,
+        in_width,
+        live,
+        tl.minimum(COLUMNS, history_units + 1),
+        history_units,
+        fetched + row * FETCH_STRIDE + SLOT * WIDTH,
+        1,
+        lane,
+        tl.load(writes + row * WRITE_STRIDE + SLOT, live, other=-1),
+        coverage,
+        CHECK_COVERAGE,
+    )
+    # A CUDA-graph padding query is no Batch member, yet attention still reads the
+    # units selected for it. Cell 0 keeps those reads inside the arena; the padded
+    # outputs are discarded.
+    padding = in_table & (live == 0)
+    tl.store(table + query * COLUMNS + unit, tl.where(valid, page, 0), valid | padding)
+
+
+def build_sparse_block_table(
+    state: SparseOffloadState, layer_idx: int, selected: torch.Tensor, out: torch.Tensor
+) -> None:
+    """Publish the arena cells of each query's selected units by unit ordinal.
+
+    Tensors are CUDA int32. ``selected`` [Q, W] holds each query's unit ordinals, -1 for none, as
+    ``merge_head_selections`` produces them. ``out`` [>= Q, C] receives, at
+    column ``unit``, the arena cell of the fetched history unit or of the unit
+    being written this step; columns not selected keep their contents. Padding
+    queries get cell 0 for their selected units, so a reader that does not mask
+    them stays in bounds. Cells index the layer's data buffer arena.
+    """
+    descriptor = state.layers[layer_idx]
+    count = len(descriptor.buffer_ids)
+    fetched, writes = state.fetched_indices[count], state.write_indices[count]
+    if state.coverage is not None:
+        state.coverage.fill_(1)
+    _sparse_block_table_kernel[(selected.shape[0],)](
+        selected,
+        state.batch_rows,
+        state.active_request_count,
+        state.history_lengths,
+        fetched,
+        writes,
+        out,
+        selected.shape[1],
+        fetched.stride(0),
+        writes.stride(0),
+        state.out_slots[layer_idx][descriptor.data_buffer_index],
+        out.shape[1],
+        descriptor.unit_tokens,
+        triton.next_power_of_2(selected.shape[1]),
+        state.coverage if state.coverage is not None else out,
+        CHECK_COVERAGE=state.coverage is not None,
+    )
+    if state.coverage is not None:
+        torch._assert_async(state.coverage, SPARSE_ARENA_COVERAGE_MESSAGE)

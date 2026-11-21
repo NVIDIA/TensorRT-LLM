@@ -1445,7 +1445,9 @@ def test_sparse_offload_indexer_default(
         ({"enable_kv_cache_offload": "invalid"}, False),
     ],
 )
-def test_minimax_m3_offload_schema_matches_validation(schemas, filename, values, valid):
+def test_minimax_m3_offload_schema_matches_validation(
+    schemas: dict[str, dict], filename: str, values: dict, valid: bool
+) -> None:
     from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
     sparse = {"algorithm": "minimax_m3", **values}
@@ -1469,7 +1471,13 @@ def test_minimax_m3_offload_schema_matches_validation(schemas, filename, values,
 )
 @pytest.mark.parametrize("enabled", [None, False, True])
 @pytest.mark.parametrize("sizing", [{}, {"gpu_cache_factor": 3.0}, {"host_history_size": 1 << 30}])
-def test_shared_sparse_offload_sizing_rule(schemas, filename, config_name, enabled, sizing):
+def test_shared_sparse_offload_sizing_rule(
+    schemas: dict[str, dict],
+    filename: str,
+    config_name: str,
+    enabled: bool | None,
+    sizing: dict,
+) -> None:
     from tensorrt_llm.llmapi import llm_args
 
     config_cls = getattr(llm_args, config_name)
