@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Aggregated MXFP4 serving on 4 GB300 trays in one NVLink domain. Launch one MPI rank per GPU.
+modeling_v2: require
+trust_remote_code: true
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+enable_attention_dp: true
+max_batch_size: 8
+max_seq_len: 1048576
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
+moe_config:
+  max_num_tokens: 32768
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: true
+  mamba_state_config:
+    additional_snapshot_offsets_from_end: [0]
+  free_gpu_memory_fraction: 0.5
+  avg_seq_len: 150000
+attention_dp_config:
+  kv_cache_routing_conversation_affinity: true
+  kv_cache_routing_new_conv_placement: least_tokens
+stream_interval: 100
+num_serve_frontends: 8
+num_postprocess_workers: 4
+speculative_config:
+  decoding_type: DFlash
+  speculative_model: RadixArk/Kimi-K3.1-Dflash2-Preview
+  max_draft_len: 4
+  use_rejection_sampling: true

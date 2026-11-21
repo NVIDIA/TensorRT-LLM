@@ -139,6 +139,8 @@ For aggregated DEP16, change these keys:
 | `attention_dp_config` | `kv_cache_routing_conversation_affinity: true`, `kv_cache_routing_new_conv_placement: least_tokens` |
 | `stream_interval`, `num_serve_frontends`, `num_postprocess_workers` | `100`, `8`, `4` |
 
+The GB300 DEP16 configuration with DFlash2 is available as **General deployment** in the [Recipe Selector](index.rst#recipe-selector).
+
 ### Launch the TensorRT LLM Server
 
 The server is launched through the `trtllm-llmapi-launch` wrapper, one rank per GPU; rank 0 serves HTTP. The example starts the TEP8 server on 2 trays; for DEP16 use `-N 4 --ntasks 16` and the DEP16 file. On Slurm clusters with topology segments, request the trays in one segment (for example `--segment=4`).

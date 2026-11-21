@@ -112,6 +112,13 @@ def _get_default_values_for_config(config_path: Path) -> dict:
     model = entry["model"]
     arch = entry["arch"]
     model_cls = get_registered_model_class(arch)
+    if model_cls is None and model == "moonshotai/Kimi-K3.1-Pro":
+        # The GB300 DEP16 recipe uses a modeling_v2-only architecture.
+        from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kimi_k31_pro_mxfp4__sm_103__dep.modeling import (
+            ModelingV2KimiK31ProMxfp4Sm103Dep,
+        )
+
+        model_cls = ModelingV2KimiK31ProMxfp4Sm103Dep
     if not model_cls or not hasattr(model_cls, "get_model_defaults"):
         return global_default
 

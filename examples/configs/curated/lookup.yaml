@@ -165,6 +165,11 @@
   config_path: examples/configs/curated/llama-4-scout.yaml
   scenario: Max Throughput
   gpu_compatibility: "Any"
+- model: moonshotai/Kimi-K3.1-Pro
+  arch: KimiK31ForConditionalGeneration
+  config_path: examples/configs/curated/kimi-k3.1-pro-dep16-dflash2.yaml
+  scenario: General deployment
+  gpu_compatibility: "GB300"
 - model: nvidia/Kimi-K2-Thinking-NVFP4
   arch: DeepseekV3ForCausalLM
   config_path: examples/configs/curated/kimi-k2-thinking.yaml

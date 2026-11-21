@@ -107,6 +107,7 @@ def mock_cuda_for_schema_validation(
     device_count: int = 8, compute_capability_major: int = 8, is_available: bool = True
 ) -> Iterator[None]:
     mock_props = mock.Mock()
+    mock_props.total_memory = 288 * 1024**3
     mock_props.major = compute_capability_major
 
     with mock.patch("torch.cuda.device_count", return_value=device_count):
