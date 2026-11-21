@@ -282,6 +282,7 @@ class DecoderCudaGraphs:
         # The one-engine sampling variants captured when cuda_graph_config.sampling_variants lists them.
         self._sampling_variants: frozenset[str] | None = None
         self._capturing_in_one_pass = False
+        self._lora_cache_handoff: Callable[[], None] | None = None
 
     def forward_discarded_warmup(
         self,
@@ -301,6 +302,8 @@ class DecoderCudaGraphs:
                 enable_spec_decode=enable_spec_decode,
                 runtime_draft_len=runtime_draft_len,
             )
+            if self._lora_cache_handoff is not None:
+                self._lora_cache_handoff()
 
     @property
     def force_lora_graph_for_capture(self) -> bool | None:
@@ -584,22 +587,34 @@ class DecoderCudaGraphs:
 
     @contextmanager
     def maybe_autotune_lora(self) -> Iterator[None]:
-        """Enable autotuning while warming up CUDA-graph LoRA kernels."""
+        """Enable LoRA tuning and hand its PP cache off after each warmup forward."""
         if not (self._config.enable_autotuner and self._lora.cuda_graph_manager is not None):
             yield
             return
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         with autotune(cache_path=cache_path):
-            try:
-                yield
-            finally:
-                # Complete the PP cache hand-off even on ranks without a
-                # CUDA-graph-only tunable op.
-                autotuner = AutoTuner.get()
+            autotuner = AutoTuner.get()
+            ran_forward = False
+
+            def handoff_cache() -> None:
+                nonlocal ran_forward
+                ran_forward = True
                 autotuner.cache_pp_recv()
                 autotuner.cache_pp_send()
                 autotuner.clean_pp_flag()
+
+            self._lora_cache_handoff = handoff_cache
+            try:
+                yield
+            finally:
+                self._lora_cache_handoff = None
+                try:
+                    if not ran_forward:
+                        autotuner.cache_pp_recv()
+                        autotuner.cache_pp_send()
+                finally:
+                    autotuner.clean_pp_flag()
 
     def use_lora_cuda_graph(self, scheduled_requests: ScheduledRequests) -> bool:
         """
