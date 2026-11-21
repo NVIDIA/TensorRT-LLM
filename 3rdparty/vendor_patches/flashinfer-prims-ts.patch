@@ -1,5 +1,5 @@
 diff --git a/_compile_cache.py b/_compile_cache.py
-index f2dc5fa15def5bbedd190461c8aeb497b995ae0a..aa7468497f62ea15c00579d4f15925a8aef00a69 100644
+index 99fc67c45b5b3065a645c03c964d65ffe4bbbd78..e1f23f418e3c8e1dfd203ae8f35d6c203db3eac6 100644
 --- a/_compile_cache.py
 +++ b/_compile_cache.py
 @@ -1,3 +1,4 @@
@@ -7,35 +7,38 @@ index f2dc5fa15def5bbedd190461c8aeb497b995ae0a..aa7468497f62ea15c00579d4f15925a8
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -97,11 +98,12 @@ def is_attention_kernel_cached(
+@@ -85,10 +86,9 @@ def _attention_kernel_identity(
+     kind: str, spec: object, options: str, extra: tuple
+ ) -> tuple[str, str] | None:
+     from flashinfer.jit.core import logger
+-    from flashinfer.jit.cute_dsl_core import (
+-        cute_dsl_cache_disabled,
+-        cute_dsl_strict_cache_key,
+-    )
++    from flashinfer.jit.cute_dsl_core import cute_dsl_cache_disabled
++
++    from tensorrt_llm._torch.attention.backends._cute_dsl_compat import cute_dsl_strict_cache_key
+ 
+     if cute_dsl_cache_disabled():
+         return None
+@@ -122,7 +122,7 @@ def is_attention_kernel_cached(
+     *,
      extra: tuple = (),
  ) -> bool:
-     from flashinfer.jit.cute_dsl_core import (
--        JitSpecCuteDsl,
-         _hash_source_files,
-         cute_dsl_cache_disabled,
-     )
+-    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl
++    from tensorrt_llm._torch.attention.backends._cute_dsl_compat import JitSpecCuteDsl
  
-+    from .._cute_dsl_compat import JitSpecCuteDsl
-+
-     if cute_dsl_cache_disabled():
-         return False
-     name = _attention_kernel_name(kind, spec, options, extra)
-@@ -127,11 +129,9 @@ def build_and_load_attention_kernel(
+     identity = _attention_kernel_identity(kind, spec, options, extra)
+     if identity is None:
+@@ -143,7 +143,7 @@ def build_and_load_attention_kernel(
      extra: tuple = (),
  ) -> Any:
      """Build or load under the caller's selected CUDA device context."""
 -    from ...jit.cute_dsl_core import (
--        _compile_in_process,
--        build_and_load_cute_dsl_kernel,
--        cute_dsl_cache_disabled,
--    )
-+    from flashinfer.jit.cute_dsl_core import cute_dsl_cache_disabled
-+
-+    from .._cute_dsl_compat import _compile_in_process, build_and_load_cute_dsl_kernel
- 
-     if cute_dsl_cache_disabled():
-         return _compile_in_process(compile_fn)
++    from tensorrt_llm._torch.attention.backends._cute_dsl_compat import (
+         _compile_in_process,
+         build_and_load_cute_dsl_kernel,
+     )
 diff --git a/block_sparse.py b/block_sparse.py
 index 4769d6b6a8c6009b22abf1850fb7f2df68216f8e..5ac63fcca05d8668e4367d0843c4c6d53e46175d 100644
 --- a/block_sparse.py

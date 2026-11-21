@@ -77,6 +77,18 @@ class AutotunerWarmupMode(Enum):
     GENERATION_ONLY = auto()
 
 
+def _gather_prewarm_errors(
+    dist: Distributed | None, mapping: Mapping, error: str | None = None
+) -> list[str | None]:
+    """Align the tensor and context parallel peers after local kernel preparation."""
+    if dist is not None:
+        if mapping.cp_size > 1:
+            return dist.tp_cp_allgather(error)
+        if mapping.tp_size > 1:
+            return dist.tp_allgather(error)
+    return [error]
+
+
 class WarmupAgreement:
     """Keeps every rank of a warmup forward on the same shapes and phases."""
 
@@ -962,11 +974,7 @@ class DecoderWarmup:
                     logger.warning(f"Throwaway Top-K prewarm skipped. {type(e).__name__}: {e}")
                     break
         torch.cuda.synchronize()
-        if self.dist is not None:
-            if self.mapping.cp_size > 1:
-                self.dist.tp_cp_allgather(1)
-            elif self.mapping.tp_size > 1:
-                self.dist.tp_allgather(1)
+        _gather_prewarm_errors(self.dist, self.mapping)
         if ready:
             logger.info(f"Throwaway Top-K prewarm complete ({time.perf_counter() - start:.1f} s)")
 
@@ -1047,11 +1055,7 @@ class DecoderWarmup:
         torch.cuda.synchronize()
         # Hold the TP (x CP) group, as the indexer-Q prewarm does, so these compiles add no skew
         # between the peers of the first collective.
-        if self.dist is not None:
-            if self.mapping.cp_size > 1:
-                self.dist.tp_cp_allgather(1)
-            elif self.mapping.tp_size > 1:
-                self.dist.tp_allgather(1)
+        _gather_prewarm_errors(self.dist, self.mapping)
         if compiled:
             logger.info(
                 f"Decode kernel prewarm complete ({compiled} kernels, "
@@ -1059,9 +1063,11 @@ class DecoderWarmup:
             )
 
     def _prewarm_prims_ts_sparse_mla(
-        self, resource_manager: ResourceManager, kv_cache_manager
+        self, resource_manager: ResourceManager, kv_cache_manager: KVCacheManager | KVCacheManagerV2
     ) -> None:
-        """Compile and load the enabled PrimTS profiles before any model forward."""
+        """Prepare sparse MLA before forward using the target KV cache manager and
+        any one-engine draft cache provided by the resource manager.
+        """
         from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
             warmup_prims_ts_sparse_mla,
         )
@@ -1073,23 +1079,23 @@ class DecoderWarmup:
             self._config.attention_backend.Metadata, DeepseekV4TrtllmAttentionMetadata
         ):
             return
-        if is_context_only_kv_cache(kv_cache_manager) or (
-            getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
-        ):
-            return
-        with torch.inference_mode():
-            metadata = self._metadata.setup_attention(
-                kv_cache_manager,
-                get_draft_kv_cache_manager(self._config.spec_config, resource_manager),
-            )
-            warmup_prims_ts_sparse_mla(self.model, metadata)
-        torch.cuda.synchronize()
-        # Compilation is local; align peers before the first collective-bearing forward.
-        if self.dist is not None:
-            if self.mapping.cp_size > 1:
-                self.dist.tp_cp_allgather(1)
-            elif self.mapping.tp_size > 1:
-                self.dist.tp_allgather(1)
+        try:
+            with torch.inference_mode():
+                metadata = self._metadata.setup_attention(
+                    kv_cache_manager,
+                    get_draft_kv_cache_manager(self._config.spec_config, resource_manager),
+                )
+                warmup_prims_ts_sparse_mla(self.model, metadata)
+            torch.cuda.synchronize()
+        except Exception as exc:
+            # A CUDA error can also break the communicator. Preserve the original
+            # failure for the executor's distributed warmup guard in that case.
+            with contextlib.suppress(Exception):
+                _gather_prewarm_errors(self.dist, self.mapping, f"{type(exc).__name__}: {exc}")
+            raise
+        for peer_error in _gather_prewarm_errors(self.dist, self.mapping):
+            if peer_error is not None:
+                raise RuntimeError(f"PrimTS sparse MLA warmup failed on a peer: {peer_error}")
 
     def _ensure_dsa_attn_metadata_for_warmup(self, resource_manager: ResourceManager) -> None:
         """Build the DSA attention metadata if no warmup forward created it, so

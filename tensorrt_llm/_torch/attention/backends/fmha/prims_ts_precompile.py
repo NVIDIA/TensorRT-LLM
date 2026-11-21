@@ -1,28 +1,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Compile representative PrimTS variants in a fresh, per-rank worker pool."""
+"""Compile representative PrimTS variants in a fresh, per-rank worker pool.
+
+`TLLM_PRIMTS_WARM_WORKERS` defaults to at most four workers per rank and
+sixteen per host. Zero or one selects local planning.
+`TLLM_PRIMTS_WARM_TIMEOUT` is the pool deadline in seconds (1800 by default,
++inf for an unlimited wait). `TLLM_PRIMTS_WARM_STRICT=1` propagates worker
+failures. By default the rank retries missing kernels during local planning.
+"""
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess  # nosec B404 - fixed interpreter and worker script
 import sys
+import tempfile
 import time
 from collections.abc import Sequence
-from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from tensorrt_llm.logger import logger
 
+if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
+
+_MIN_POOL_WORKERS = 2
 _MAX_DEFAULT_WORKERS = 4
+_DEFAULT_TIMEOUT = 1800
 _HOST_COMPILE_BUDGET = 16  # default workers of all ranks on one host, together
 _LOCAL_RANK_ENV = ("OMPI_COMM_WORLD_LOCAL_SIZE", "RAY_LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE")
 
 
-def local_rank_count(mapping) -> int:
+def local_rank_count(mapping: Mapping | None) -> int:
     """Ranks of this job on this host, without any MPI call.
 
     From the model's ``Mapping`` (``min(world_size, gpus_per_node)``) when the
@@ -81,6 +94,50 @@ def strict() -> bool:
     return os.environ.get("TLLM_PRIMTS_WARM_STRICT", "0") == "1"
 
 
+def pool_enabled(*, local_ranks: int) -> bool:
+    """Whether this rank can run a pool if enough cache misses are found."""
+    return worker_count(_MIN_POOL_WORKERS, local_ranks=local_ranks) >= _MIN_POOL_WORKERS
+
+
+def _worker_timeout() -> float | None:
+    raw = os.environ.get("TLLM_PRIMTS_WARM_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_TIMEOUT
+    try:
+        timeout = float(raw)
+        if timeout > 0:
+            return None if math.isinf(timeout) else timeout
+    except ValueError:
+        pass
+    logger.warning(
+        f"Ignoring TLLM_PRIMTS_WARM_TIMEOUT={raw!r}; expected positive seconds or inf "
+        f"(using {_DEFAULT_TIMEOUT} seconds)."
+    )
+    return _DEFAULT_TIMEOUT
+
+
+def _output_tail(log: BinaryIO) -> bytes:
+    size = log.seek(0, os.SEEK_END)
+    log.seek(max(0, size - 4096))
+    return log.read()
+
+
+def _wait_for_pool(proc: subprocess.Popen, timeout: float | None) -> int:
+    """Keep the supervisor's PID reserved until its process group has been cleaned up."""
+    from tensorrt_llm.llmapi._llmapi_process_guard import _child_finished
+
+    if timeout is not None:
+        deadline = time.monotonic() + timeout
+        while not _child_finished(proc.pid):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            time.sleep(min(0.05, remaining))
+    status = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+    assert status is not None
+    return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+
+
 def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) -> dict[str, Any]:
     """JSON-safe description of one ``BatchSparseMLADecodePagedTSWrapper.plan`` call."""
     kwargs = dict(plan_kwargs)
@@ -90,44 +147,57 @@ def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) 
 
 
 def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> None:
-    """Join a fresh pool before the rank measures free memory or loads its plans."""
+    """Run the encoded plans with up to ``workers`` compiler processes and join them."""
+    from tensorrt_llm.llmapi._llmapi_process_guard import _cleanup_group
     from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 
     env, _ = split_mpi_env()
     # Spawn re-imports __main__. Give the pool its own import-clean entry point
     # even when the application script imports TensorRT-LLM at module scope.
     script = Path(__file__).with_name("_prims_ts_worker.py")
-    timeout = float(os.environ.get("TLLM_PRIMTS_WARM_TIMEOUT", "1800"))
-    request = json.dumps(
-        {"parent_pid": os.getpid(), "sys_path": sys.path, "payloads": list(payloads)}
-    ).encode()
-    with subprocess.Popen(  # nosec B603 - fixed interpreter and script, no shell
-        [sys.executable, str(script), str(workers)],
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    ) as proc:
-        try:
-            output, _ = proc.communicate(request, timeout=timeout)
-        except BaseException:
-            # A Future timeout leaves running compiles alive. Stop the entire
-            # pool before the caller falls back to local planning.
-            with suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-            raise
-        if proc.returncode:
-            raise RuntimeError(
-                f"PrimTS worker pool exited with {proc.returncode}: "
-                f"{output[-4096:].decode(errors='replace')}"
-            )
+    timeout = _worker_timeout()
+    # File-backed I/O lets us enforce the full deadline without a pipe
+    # selector's signed 32-bit millisecond limit.
+    with (
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8") as request,
+        tempfile.TemporaryFile() as log,
+    ):
+        json.dump(
+            {"parent_pid": os.getpid(), "sys_path": sys.path, "payloads": list(payloads)}, request
+        )
+        request.seek(0)
+        with subprocess.Popen(  # nosec B603 - fixed interpreter and script, no shell
+            [sys.executable, str(script), str(workers)],
+            env=env,
+            stdin=request,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        ) as proc:
+            try:
+                returncode = _wait_for_pool(proc, timeout)
+                if returncode:
+                    raise RuntimeError(
+                        f"PrimTS worker pool exited with {returncode}:\n"
+                        f"{_output_tail(log).decode(errors='replace')}"
+                    )
+            except BaseException as error:
+                # Terminate all compilers and let the resource tracker unlink
+                # spawn semaphores before force-killing any remaining processes.
+                _cleanup_group(proc.pid, grace=1, signum=signal.SIGTERM)
+                if isinstance(error, subprocess.TimeoutExpired):
+                    error.output = _output_tail(log)
+                    if error.output:
+                        logger.warning(
+                            f"PrimTS worker output before timeout:\n{error.output.decode(errors='replace')}"
+                        )
+                raise
 
 
 def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int = 1) -> None:
+    """Precompile missing plans, sharing the host worker budget among ``local_ranks``."""
     workers = worker_count(len(payloads), local_ranks=local_ranks)
-    if workers <= 1:
+    if workers < _MIN_POOL_WORKERS:
         return
     start = time.perf_counter()
     try:
@@ -135,7 +205,9 @@ def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int 
     except (OSError, TypeError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         if strict():
             raise
-        logger.warning(f"PrimTS sparse MLA parallel precompile skipped: {error!r}")
+        logger.warning(
+            f"PrimTS worker precompile failed. Planning missing kernels locally.\n{error}"
+        )
         return
     logger.info(
         f"PrimTS sparse MLA precompiled {len(payloads)} kernel variants with {workers} workers "

@@ -76,8 +76,8 @@ _QK_DIM = _LATENT_DIM + _ROPE_DIM
 _RECORD_BYTES = 352
 _KV_CACHE_FORMAT = "nvfp4.fp8rope"
 # Process-level state shared by every library instance and metadata object: the static profiles
-# whose kernel variants were warmed and the index contracts validated with one eager launch.
-_WARMED_PROFILES: set = set()
+# whose eager warmup has been attempted and the index contracts validated with one launch.
+_ATTEMPTED_WARM_PROFILES: set = set()
 _VALIDATED_CONTRACTS: set = set()
 
 
@@ -435,35 +435,47 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
     def _warm_kernel_variants(
         self, *, metadata: "TrtllmAttentionMetadata", device: torch.device, topk: int
     ) -> None:
-        """Compile every kernel variant a step's row count can select, once per process.
+        """Try to compile the representative row counts once per process.
 
-        Runs on eager metadata only, never under capture; CUDA graph metadata objects replay
-        one row count each. Keeps one representative per compile signature and plans them
-        largest first so the shared workspace is allocated once at its final size.
+        DSA learns topk from the runtime index tensor in the first eager forward.
+        Each CUDA graph replays a fixed row count. Eager warmup plans the largest workspace
+        per compile signature first so the shared workspace grows only once.
         """
         if torch.cuda.is_current_stream_capturing() or getattr(metadata, "is_cuda_graph", False):
             return
         heads = int(self.attn.num_heads)
         profile_key = (str(device), heads, topk)
-        if profile_key in _WARMED_PROFILES:
+        if profile_key in _ATTEMPTED_WARM_PROFILES:
             return
+        from cutlass.base_dsl.common import DSLBaseError
+
         from . import prims_ts_precompile
 
         plan_kwargs = self._plan_kwargs(topk)
         max_rows = _max_warmup_rows(metadata)
         candidates = list(range(1, min(max_rows, self.WARM_ROW_SCAN) + 1))
         candidates += [r for r in self.WARM_ROW_TAIL if self.WARM_ROW_SCAN < r <= max_rows]
+        if not candidates:
+            return
         t_warm = time.perf_counter()
         local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
-        variants, payloads = _plan_kernel_variants(
-            device, heads, plan_kwargs, candidates, local_ranks=local_ranks
-        )
-        if payloads:
+        try:
+            variants, payloads = _plan_kernel_variants(
+                device, heads, plan_kwargs, candidates, local_ranks=local_ranks
+            )
             prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
-        for rows in variants:
-            self._get_plan(metadata=metadata, device=device, rows=rows, topk=topk)
-        if variants:
-            _WARMED_PROFILES.add(profile_key)
+            for rows in variants:
+                self._get_plan(metadata=metadata, device=device, rows=rows, topk=topk)
+        except (DSLBaseError, OSError, RuntimeError, ValueError) as error:
+            if prims_ts_precompile.strict():
+                raise
+            logger.warning(
+                f"PrimTS DSA precompile for {profile_key} was incomplete ({error}). "
+                "Remaining row counts will be planned on demand."
+            )
+            _ATTEMPTED_WARM_PROFILES.add(profile_key)
+            return
+        _ATTEMPTED_WARM_PROFILES.add(profile_key)
         logger.debug(
             f"PrimTS DSA sparse MLA warmed {len(variants)} kernel variants "
             f"(rows scanned up to {max_rows}): {(time.perf_counter() - t_warm) * 1e3:.0f} ms"
