@@ -65,6 +65,7 @@ def _disagg_request(
 
 def _diagnostic_transceiver() -> KvCacheTransceiverV2:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._mapping = SimpleNamespace(rank=4, tp_rank=1, pp_rank=0, cp_rank=0, cp_size=1)
     transceiver._instance_name = "diagnostic-test"
     transceiver._dp_rank = 2
@@ -453,6 +454,8 @@ def test_gen_timeout_start_and_observation_share_request_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _disagg_request(21, 2021)
+    request.is_generation_only_request = True
+    request.is_context_only_request = False
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
     request.py_kv_transfer_start_time = None
     request.py_kv_transfer_timed_out = False
@@ -1369,6 +1372,7 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     request = _disagg_request(5, request_id)
     request.set_kv_cache_size = Mock()
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._ever_had_recv_session = True
     transceiver._gen_idle_agreed = False
     transceiver._gen_need_sync = False

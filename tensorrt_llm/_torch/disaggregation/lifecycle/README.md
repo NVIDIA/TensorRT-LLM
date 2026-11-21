@@ -17,6 +17,31 @@ supported configuration.
 | Native containment | `RetirementWatchdog` latches a controller-wide fatal state, closes admission, and notifies containment once. | Preserve native's executor-fatal callback and keep sessions, manager loans, pools, and agents reachable. |
 | Logical outcome | Remains with the integration, outside this package. | Commit failure/cancellation once; bind a metadata-only timeout callback. Late physical completion must not replace that outcome. |
 
+`orchestration/cancellation.py` provides receive cancellation agreement without
+owning resources or calling a backend. Each binding supplies one prior-failure
+and access-ended vote per required participant. The first complete vote commits
+`CANCELLED` or `FAILED`; later votes can permit retirement but cannot rewrite the
+outcome. `PENDING` means agreement is not complete, and `NOT_HANDLED` means this
+binding did not accept the request. None of these values alone authorizes reuse.
+
+The coordinator exposes this semantic capability to the executor. Native still
+collects the evidence, closes real owners and supplies its existing collective;
+the executor alone applies the cancellation disposition to `LlmRequest.state`.
+After successful closure, the receive owner writes the request's optional
+cancellation outcome once for duplicate calls. It is not a second release vote.
+Native qualification remains restricted to the existing BF16 context-first gate.
+Another binding must demonstrate immutable participant identity, closed admission,
+strong resource roots, access-end evidence and symmetric progress before enabling
+the same capability. This helper does not qualify another layout or runtime.
+
+Peer cancellation intent uses the existing receive-progress exchange. The
+coordinator matches its immutable transfer ID to the local request and hands off
+any unpublished CUDA fence; a missing local record is not a safe vote. Pending
+handoffs keep publication closed and retry without resetting the retirement clock.
+Qualified group retirement must reach executor failure cleanup on the same poll
+across ranks; rank-local retry pacing must not delay an already-retired outcome.
+Requests outside this binding retain the legacy rank-aligned cancellation path.
+
 `timeout_s` is the mandatory transfer safety budget from first exposure, not the
 overall inference-request deadline. The optional `grace_s` override controls the
 non-resettable drain window; omitting it or passing `None` uses `timeout_s`, preserving
@@ -37,6 +62,19 @@ safe evidence, but does not establish quiescence or complete backend I/O.
 A backend error, elapsed time, logical failure, or empty report count is not
 quiescence. The existing native fatal policy is unchanged: retirement at or after
 fatal expiry remains prohibited even if DONE arrives later.
+
+The watchdog reports two fatal kinds. `deadline` means an existing owner still
+has unproven access at its fixed grace deadline. `ownership_handoff` means an
+already-admitted accessor cannot enter bounded retirement tracking. For example,
+an unpublished receive can still have a local CUDA writer when shutdown closes
+watchdog admission. Retaining its request and fence prevents reuse, but the
+unregistered record has no retirement clock; an unsafe TP vote alone cannot
+bound that wait, especially if watchdog progress has stopped. The binding must
+keep those roots and call `fail_closed()` rather than release them or wait
+indefinitely. This does not make ordinary shutdown fatal: owners registered
+before shutdown continue their existing drain. A separate local-wait alternative
+would need its own bounded progress, root retention, and access-end contract.
+Both fatal kinds preserve the first decision and notify containment only once.
 
 Future bindings may use qualified lease isolation or binding/domain quarantine
 instead of executor termination. The scope depends on the proven access boundary,
