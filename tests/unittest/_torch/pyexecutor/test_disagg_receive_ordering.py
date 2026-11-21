@@ -68,6 +68,7 @@ def _manager() -> Mock:
     manager.completion_admission_blocked = MethodType(
         KVCacheManagerV2.completion_admission_blocked, manager
     )
+    manager._completion_prompt_len = MethodType(KVCacheManagerV2._completion_prompt_len, manager)
     manager._disagg_completion_pool_counts = {}
     manager._disagg_completion_limits = {}
     manager.is_draft = False
