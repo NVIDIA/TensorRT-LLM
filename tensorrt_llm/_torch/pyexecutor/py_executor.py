@@ -3301,6 +3301,7 @@ class PyExecutor:
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
+            not self._has_pending_native_sends() and \
             not self.disagg.has_retiring_gen_receives and \
             not self._has_pending_context_retirement()
 
@@ -3329,6 +3330,14 @@ class PyExecutor:
         return (connector.has_pending_loads()
                 or (transfers is not None
                     and transfers.has_any_inflight_requests()))
+
+    def _has_pending_native_sends(self) -> bool:
+        # Native-only idle polling currently requires a single-rank worker.
+        if (getattr(self, "kv_connector_manager", None) is not None
+                or self.dist.world_size != 1):
+            return False
+        transfers = getattr(self, "async_transfer_manager", None)
+        return transfers is not None and transfers.has_any_inflight_requests()
 
     # ------------------------------------------------------------------
     # TLLM_EXECUTOR_STAGE_TIMING=1: coarse wall / thread-CPU stage timers of the
@@ -12981,6 +12990,14 @@ class PyExecutor:
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         self._release_multimodal_resources(request)
+        # Finished requests can remain in the last batch. Generation no longer
+        # needs the retained MRoPE delta, including its CUDA IPC storage.
+        if request.is_finished:
+            if getattr(request, "py_mrope_position_delta", None) is not None:
+                request.py_mrope_position_delta = None
+            mm_data = getattr(request, "py_multimodal_data", None)
+            if mm_data:
+                mm_data.clear()
         if getattr(request, "py_encoder_output", None) is not None:
             request.py_encoder_output = None
             request.py_encoder_output_ready_event = None

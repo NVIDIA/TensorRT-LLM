@@ -145,6 +145,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         but not yet promoted is caught, and the proxy polls MPI worker liveness.
         It also covers encode-only engines, where `_executor` is None.
         """
+        if getattr(self._inference, "_encoder_cleanup_failed", False):
+            return False
+        if getattr(getattr(self._inference, "_encoder_cache", None), "failed", False):
+            return False
         check = getattr(self._llm, "_check_health", None)
         if callable(check):
             try:
@@ -168,8 +172,12 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         info = server_pb2.ServerInfo(
             engine_name=_ENGINE_NAME,
             engine_version=str(trtllm_version),
-            # The same build serves either phase; the role is per request.
-            engine_role=server_pb2.ENGINE_ROLE_UNSPECIFIED,
+            # P/D phases remain per request; an encoder has a dedicated native role.
+            engine_role=(
+                server_pb2.ENGINE_ROLE_ENCODER
+                if getattr(self._inference, "encoder_role", "") == "encode"
+                else server_pb2.ENGINE_ROLE_UNSPECIFIED
+            ),
             instance_id=self._instance_id,
             supported_models=[self._model],
             schema_revision=SCHEMA_REVISION,
@@ -310,6 +318,16 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         # discovery-becomes-a-per-request-failure case this service exists to
         # avoid. Unset means "unknown", which is the honest claim.
 
+        if getattr(self._inference, "encoder_role", "") == "encode":
+            info.generation.CopyFrom(
+                model_pb2.GenerationCapabilities(
+                    prompt_logprobs=model_pb2.LogprobCapabilities(supported=False),
+                    output_logprobs=model_pb2.LogprobCapabilities(supported=False),
+                    guided_decoding=model_pb2.GuidedDecodingCapabilities(supported=False),
+                    max_num_sequences=1,
+                )
+            )
+            return info
         generation = model_pb2.GenerationCapabilities()
         # The bound is enforced per request, so it is known rather than unknown.
         logprobs = model_pb2.LogprobCapabilities(
@@ -478,6 +496,15 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     async def _run_inference_probe(self, model: str) -> lifecycle_pb2.HealthCheck:
         from tensorrt_llm.sampling_params import SamplingParams
 
+        if getattr(self._inference, "encoder_role", "") == "encode":
+            return lifecycle_pb2.HealthCheck(
+                name="inference_probe",
+                state=lifecycle_pb2.HEALTH_STATE_READY,
+                message=(
+                    "probe not applicable: encoder-only engine does not generate tokens; "
+                    "inference liveness was not tested"
+                ),
+            )
         if not token_ids_input_supported(self._llm):
             return lifecycle_pb2.HealthCheck(
                 name="inference_probe",

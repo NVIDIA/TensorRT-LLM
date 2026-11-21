@@ -12,6 +12,7 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 
 from tensorrt_llm.grpc.openengine import node  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    SCHEMA_RELEASE,
     generation_pb2,
     kv_pb2,
     openengine_pb2_grpc,
@@ -122,6 +123,7 @@ def test_startup_owns_actual_local_sources_once(monkeypatch):
         assert (executor._openengine_node_server is not None) == (rank == 1)
     assert len(calls) == 1
     assert calls[0][1] == sources[1:]
+    assert calls[0][0].schema_release == SCHEMA_RELEASE
 
 
 def test_startup_rejects_missing_attention_dp_publisher(monkeypatch):

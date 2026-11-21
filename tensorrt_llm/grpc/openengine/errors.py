@@ -3,6 +3,12 @@
 
 """Errors the OpenEngine adapter raises across its modules."""
 
+from tensorrt_llm._torch.disaggregation.encoder_output import (
+    EncoderCapacityError,
+    EncoderTransferRejected,
+    EncoderUnavailableError,
+)
+
 
 class UnsupportedFeatureError(ValueError):
     """Raised when OpenEngine requests a feature this adapter cannot map."""
@@ -10,6 +16,9 @@ class UnsupportedFeatureError(ValueError):
 
 class MediaUnavailableError(RuntimeError):
     """Raised when fetching remote request media fails transiently."""
+
+
+ENCODER_TRANSFER_REJECTED_METADATA = ("trtllm-encoder-write", "not-started")
 
 
 class AbortFailedError(RuntimeError):
@@ -22,6 +31,10 @@ class AbortFailedError(RuntimeError):
 
 __all__ = [
     "AbortFailedError",
+    "ENCODER_TRANSFER_REJECTED_METADATA",
+    "EncoderCapacityError",
+    "EncoderTransferRejected",
+    "EncoderUnavailableError",
     "MediaUnavailableError",
     "UnsupportedFeatureError",
 ]

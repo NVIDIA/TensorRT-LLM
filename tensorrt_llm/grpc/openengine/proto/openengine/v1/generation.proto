@@ -8,6 +8,7 @@ syntax = "proto3";
 package openengine.v1;
 
 import "google/protobuf/struct.proto";
+import "openengine/v1/encoded_media.proto";
 import "openengine/v1/error.proto";
 import "openengine/v1/kv.proto";
 
@@ -69,6 +70,13 @@ message GenerateRequest {
   // this field empty. Clients treat it as best-effort and never depend on it
   // for correctness. Carried as a Struct so JSON types survive the wire.
   google.protobuf.Struct extra = 12;
+
+  // Consume completed media encoding. Repeat the ordered media and any context
+  // supplied to Encode for validation. Successful consumption avoids re-encoding;
+  // local recovery on unavailable outputs is controlled by engine configuration.
+  // The native consumer validates reference compatibility. Not valid with
+  // kv.session; decode consumes the existing KV handoff instead.
+  EncodedMediaRef encoded_media = 13;
 }
 
 message SamplingParams {

@@ -1,0 +1,41 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+// All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Media encoding and release of completed, engine-owned outputs.
+
+syntax = "proto3";
+
+package openengine.v1;
+
+import "openengine/v1/encoded_media.proto";
+import "openengine/v1/generation.proto";
+
+message EncodeRequest {
+  string request_id = 1;
+  string model = 2;
+
+  // Optional context for prompt-dependent model-input preparation. Each native
+  // framework validates whether its configured encoder requires this context.
+  oneof input {
+    string prompt = 3;
+    TokenIds token_ids = 4;
+  }
+
+  // Nonempty, ordered media inputs. Context placeholders follow Generate rules.
+  repeated MediaItem media = 5;
+}
+
+message EncodeResponse {
+  string request_id = 1;
+  EncodedMediaRef encoded_media = 2;
+}
+
+message ReleaseEncodedMediaRequest {
+  // Sent to the original producer; never forwarded to an arbitrary encoder.
+  EncodedMediaRef encoded_media = 1;
+}
+
+// Success acknowledges idempotent release. An active transfer retains its
+// buffers until settlement; acknowledgment does not imply immediate reclamation.
+message ReleaseEncodedMediaResponse {}

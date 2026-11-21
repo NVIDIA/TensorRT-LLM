@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+// All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Engine-owned encoded-media references, independent of generation and KV state.
+
+syntax = "proto3";
+
+package openengine.v1;
+
+message EncodedMediaRef {
+  reserved 1;
+  reserved "reference_format";
+
+  // Engine-serialized reference, including any format/version and validation
+  // metadata. Clients forward these bytes unchanged; tensor contents stay external.
+  bytes opaque_state = 2;
+}

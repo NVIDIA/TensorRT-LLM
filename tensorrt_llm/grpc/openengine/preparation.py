@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 from google.protobuf import struct_pb2
 
+from tensorrt_llm._torch.disaggregation.encoder_output import _config_digest
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.llm import PreprocessedInputs
@@ -21,7 +22,8 @@ _DECODE_PREPARATION_KEY = "trtllm_decode_preparation"
 _MAX_DECODE_PREPARATION_BYTES = 2 * 1024 * 1024
 
 
-def _input_digest(request: Any) -> str:
+def _decode_input_digest(request: Any) -> str:
+    """Hash prepared-decode inputs using the version-1 protobuf representation."""
     digest = hashlib.sha256()
     kind = request.WhichOneof("input")
     data = request.prompt.encode() if kind == "prompt" else request.token_ids.SerializeToString()
@@ -29,20 +31,6 @@ def _input_digest(request: Any) -> str:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
-
-
-def _config_digest(llm: Any) -> str:
-    processor = llm.input_processor
-    config = processor.config.to_dict()
-    config.pop("_name_or_path", None)
-    image_processor = getattr(processor.processor, "image_processor", None)
-    identity = {
-        "model": config,
-        "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
-        "media_io": processor.get_preferred_media_io_kwargs(),
-        "image_processor": image_processor.to_dict() if image_processor is not None else None,
-    }
-    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _decode_preparation(
@@ -53,7 +41,7 @@ def _decode_preparation(
     payload = {
         "version": 1,
         "model_type": resolve_top_level_model_type(llm.input_processor.config),
-        "input_digest": _input_digest(request),
+        "input_digest": _decode_input_digest(request),
         "config_digest": _config_digest(llm),
         "state": capture["state"],
         "prompt_token_ids_u32le": base64.b64encode(
@@ -95,7 +83,7 @@ def _prepared_decode_from_request(request: Any, llm: Any) -> PreprocessedInputs 
         return None  # An unknown version retains the ordinary media preparation path.
     if payload.get("model_type") != resolve_top_level_model_type(llm.input_processor.config):
         raise ValueError("prepared decode metadata belongs to another model type")
-    if payload.get("input_digest") != _input_digest(request):
+    if payload.get("input_digest") != _decode_input_digest(request):
         raise ValueError("prepared decode metadata does not match the request inputs")
     if payload.get("config_digest") != _config_digest(llm):
         raise ValueError("prepared decode metadata belongs to another model configuration")

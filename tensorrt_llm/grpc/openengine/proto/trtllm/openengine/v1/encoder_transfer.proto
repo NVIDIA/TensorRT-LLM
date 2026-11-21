@@ -1,0 +1,20 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package trtllm.openengine.v1;
+
+// TensorRT-LLM peer transfer; separate from the portable OpenEngine services.
+service EncoderTransfer {
+  // Success means the native transfer completed. An uncertain outcome cannot
+  // safely be retried with the same single-use reference.
+  rpc Transfer(TransferEncoderCacheRequest) returns (TransferEncoderCacheResponse);
+}
+
+message TransferEncoderCacheRequest {
+  bytes reference = 1;
+  bytes destination = 2;
+}
+
+message TransferEncoderCacheResponse {}

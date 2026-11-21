@@ -40,6 +40,7 @@ class FakeServicerContext:
         self._metadata = [SimpleNamespace(key=key, value=value) for key, value in metadata]
         self.abort_code: grpc.StatusCode | None = None
         self.abort_details: str | None = None
+        self.trailing_metadata = ()
         self.done_callbacks: list[Any] = []
         self.is_cancelled = False
 
@@ -58,7 +59,8 @@ class FakeServicerContext:
     def add_done_callback(self, callback: Any) -> None:
         self.done_callbacks.append(callback)
 
-    async def abort(self, code: grpc.StatusCode, details: str) -> None:
+    async def abort(self, code: grpc.StatusCode, details: str, trailing_metadata=()) -> None:
         self.abort_code = code
         self.abort_details = details
+        self.trailing_metadata = trailing_metadata
         raise AbortError(code, details)
