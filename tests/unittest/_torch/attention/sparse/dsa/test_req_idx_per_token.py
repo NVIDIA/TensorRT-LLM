@@ -75,16 +75,16 @@ def test_prepare_for_indices_conversion_preserves_buffers() -> None:
     md._seq_lens = torch.tensor([2, 0, 1], dtype=torch.int32)
     md._num_tokens = 3
     md.host_req_idx_per_token = torch.full((5,), -1, dtype=torch.int32, pin_memory=True)
-    md.req_idx_per_token = torch.full((5,), -1, dtype=torch.int32, device="cuda")
+    md.req_idx_per_token = torch.full((5,), -2, dtype=torch.int32, device="cuda")
     host_ptr = md.host_req_idx_per_token.data_ptr()
-    expected = _host_reference(md._seq_lens).tolist() + [-1, -1]
+    expected = _host_reference(md._seq_lens).tolist()
 
     md.prepare_for_indices_conversion()
 
     assert md.host_req_idx_per_token.data_ptr() == host_ptr
     assert md.host_req_idx_per_token.is_pinned()
-    assert md.host_req_idx_per_token.tolist() == expected
-    assert md.req_idx_per_token.cpu().tolist() == expected
+    assert md.host_req_idx_per_token.tolist() == expected + [-1, -1]
+    assert md.req_idx_per_token.cpu().tolist() == expected + [-2, -2]
 
 
 def test_on_update_kv_lens_invalidates_base_mla_state() -> None:
