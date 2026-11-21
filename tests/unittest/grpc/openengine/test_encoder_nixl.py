@@ -11,7 +11,7 @@ import grpc
 import pytest
 import torch
 from conftest import AbortError, FakeServicerContext
-from test_control import _inference, _servicer
+from test_control import _inference
 from utils.native_encoder import _cache as _native_cache
 from utils.native_encoder import _receive, _receiver, _writes, model, native_result, request
 
@@ -21,6 +21,7 @@ from tensorrt_llm.grpc.openengine import encoder_nixl as rpc
 from tensorrt_llm.grpc.openengine.bindings import encoder_transfer_pb2, encoding_pb2
 from tensorrt_llm.grpc.openengine.encoder import portable_reference
 from tensorrt_llm.grpc.openengine.encoder_transfer import EncoderTransferServicer
+from tensorrt_llm.grpc.openengine.encoding import OpenEngineEncoderServicer
 from tensorrt_llm.grpc.openengine.errors import (
     ENCODER_TRANSFER_REJECTED_METADATA,
     EncoderTransferRejected,
@@ -300,7 +301,7 @@ async def test_release_rejects_deeply_nested_reference_without_changing_exports(
     )
     context = FakeServicerContext()
     with pytest.raises(AbortError):
-        await _servicer(inference=inference).ReleaseEncodedMedia(
+        await OpenEngineEncoderServicer(inference).ReleaseEncodedMedia(
             encoding_pb2.ReleaseEncodedMediaRequest(encoded_media=portable_reference(malformed)),
             context,
         )

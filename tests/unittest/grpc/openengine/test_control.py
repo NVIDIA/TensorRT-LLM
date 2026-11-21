@@ -4,7 +4,6 @@
 """Unit tests for the OpenEngine Control service."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 
@@ -15,7 +14,6 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
-    encoding_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -942,87 +940,3 @@ async def test_subscribe_kv_events_is_unimplemented(enabled):
             kv_pb2.SubscribeKvEventsRequest(), context
         )
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("role,has_discard", [("", True), ("consume", True), ("encode", False)])
-async def test_release_encoder_cache_requires_encode_cleanup_support(role, has_discard):
-    inference = _inference()
-    inference.encoder_role = role
-    inference._encoder_cache = SimpleNamespace(**({"discard": Mock()} if has_discard else {}))
-    context = FakeServicerContext()
-    with pytest.raises(AbortError):
-        await _servicer(inference=inference).ReleaseEncodedMedia(
-            encoding_pb2.ReleaseEncodedMediaRequest(encoded_media={}), context
-        )
-    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
-    if has_discard:
-        inference._encoder_cache.discard.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure,code",
-    [
-        (None, None),
-        (ValueError("invalid reference"), grpc.StatusCode.INVALID_ARGUMENT),
-        (RuntimeError("transport unhealthy"), grpc.StatusCode.UNAVAILABLE),
-        (OSError("cannot remove cached encoder output"), grpc.StatusCode.INTERNAL),
-    ],
-)
-async def test_release_encoder_cache_maps_native_outcome(failure, code):
-    inference = _inference()
-    inference.encoder_role = "encode"
-
-    def discard(reference):
-        assert reference.opaque_state == b"\x00\xffengine-owned"
-        if failure is not None:
-            raise failure
-        return False
-
-    inference._encoder_cache = SimpleNamespace(discard=discard)
-    context = FakeServicerContext()
-    call = _servicer(inference=inference).ReleaseEncodedMedia(
-        encoding_pb2.ReleaseEncodedMediaRequest(
-            encoded_media={"opaque_state": b"\x00\xffengine-owned"}
-        ),
-        context,
-    )
-    if code is not None:
-        with pytest.raises(AbortError):
-            await call
-        assert context.abort_code == code
-    else:
-        assert isinstance(await call, encoding_pb2.ReleaseEncodedMediaResponse)
-        assert inference.active_request_count() == 0
-
-
-@pytest.mark.asyncio
-async def test_release_encoder_cache_over_real_grpc(tmp_path):
-    from utils.native_encoder import model, native_result, request
-
-    from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
-    from tensorrt_llm.grpc.openengine.encoder import EncoderCache, portable_reference
-
-    cache = EncoderCache(str(tmp_path))
-    llm, _ = model()
-    reference = cache.publish(native_result()[0], request(), llm)
-    inference = _inference()
-    inference.encoder_role = "encode"
-    inference._encoder_cache = cache
-    server = grpc.aio.server()
-    openengine_pb2_grpc.add_ControlServicer_to_server(_servicer(inference=inference), server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    await server.start()
-    try:
-        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
-            stub = openengine_pb2_grpc.ControlStub(channel)
-            req = encoding_pb2.ReleaseEncodedMediaRequest(
-                encoded_media=portable_reference(reference)
-            )
-            for _ in range(2):
-                response = await stub.ReleaseEncodedMedia(req, timeout=2)
-                assert isinstance(response, encoding_pb2.ReleaseEncodedMediaResponse)
-        assert not list(tmp_path.glob("*.safetensors"))
-    finally:
-        await server.stop(0)

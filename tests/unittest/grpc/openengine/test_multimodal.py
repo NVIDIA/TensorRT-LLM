@@ -38,6 +38,7 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
 )
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
+from tensorrt_llm.grpc.openengine.encoding import OpenEngineEncoderServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.inputs import media_io  # noqa: E402
@@ -2646,15 +2647,23 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
         clients = []
         for llm in (encoder, consumer, decoder):
             server = grpc.aio.server()
-            openengine_pb2_grpc.add_InferenceServicer_to_server(
-                OpenEngineInferenceServicer(llm, "image-model"), server
-            )
+            inference = OpenEngineInferenceServicer(llm, "image-model")
+            openengine_pb2_grpc.add_InferenceServicer_to_server(inference, server)
+            if llm is encoder:
+                openengine_pb2_grpc.add_EncoderServicer_to_server(
+                    OpenEngineEncoderServicer(inference), server
+                )
             port = server.add_insecure_port("127.0.0.1:0")
             await server.start()
             servers.append(server)
             channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
             channels.append(channel)
-            clients.append(openengine_pb2_grpc.InferenceStub(channel))
+            stub = (
+                openengine_pb2_grpc.EncoderStub
+                if llm is encoder
+                else openengine_pb2_grpc.InferenceStub
+            )
+            clients.append(stub(channel))
         request = generation_pb2.GenerateRequest(
             request_id="e",
             model="image-model",

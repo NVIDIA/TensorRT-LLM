@@ -28,7 +28,6 @@ from .bindings import (
     MINIMUM_CLIENT_REVISION,
     SCHEMA_RELEASE,
     SCHEMA_REVISION,
-    encoding_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -38,7 +37,6 @@ from .bindings import (
 )
 from .capabilities import supported_guides, supports_image_routing
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
-from .encoder import native_reference
 from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
 from .request_mapping import conversation_affinity_enabled, token_ids_input_supported
@@ -564,35 +562,6 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             self._inference.untrack_request(probe_id, handle)
             if reservation is not None:
                 await asyncio.shield(reservation.release())
-
-    async def ReleaseEncodedMedia(self, request, context):
-        cache = getattr(self._inference, "_encoder_cache", None)
-        discard = getattr(cache, "discard", None)
-        if not callable(discard) or getattr(self._inference, "encoder_role", "") != "encode":
-            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder release is not enabled")
-        if not request.HasField("encoded_media"):
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "encoded_media is required")
-        task = asyncio.create_task(
-            asyncio.to_thread(discard, native_reference(request.encoded_media))
-        )
-        tasks = self._inference._encoder_cleanup_tasks
-        tasks.add(task)
-
-        def completed(done):
-            tasks.discard(done)
-            if not done.cancelled():
-                done.exception()
-
-        task.add_done_callback(completed)
-        try:
-            await asyncio.shield(task)
-        except ValueError as error:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
-        except RuntimeError as error:
-            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
-        except OSError as error:
-            await context.abort(grpc.StatusCode.INTERNAL, str(error))
-        return encoding_pb2.ReleaseEncodedMediaResponse()
 
     async def Abort(
         self,

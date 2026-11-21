@@ -316,11 +316,6 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 failed += 1
         return aborted, failed
 
-    async def Encode(self, request, context):
-        from .encoding import encode
-
-        return await encode(self, request, context)
-
     async def Generate(
         self,
         request: generation_pb2.GenerateRequest,

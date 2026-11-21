@@ -43,6 +43,7 @@ from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
 from .encoder_nixl import NixlEncoderCache
 from .encoder_transfer import EncoderTransferServicer
+from .encoding import OpenEngineEncoderServicer
 from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .metrics import MetricsDirectory, OpenEngineMetrics
 from .servicer import OpenEngineInferenceServicer
@@ -167,8 +168,12 @@ class OpenEngineServer:
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         self._inference = inference
+        if inference.encoder_role == "encode":
+            openengine_pb2_grpc.add_EncoderServicer_to_server(
+                OpenEngineEncoderServicer(inference), self._server
+            )
         # Control shares the inference servicer's in-flight request table so
-        # Abort and GetLoad see the same requests Generate is serving.
+        # Abort and GetLoad see active Generate and Encode requests.
         self._control = OpenEngineControlServicer(
             llm,
             model,

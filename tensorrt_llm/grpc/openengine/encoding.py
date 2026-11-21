@@ -12,9 +12,9 @@ from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .bindings import encoding_pb2, generation_pb2
+from .bindings import encoding_pb2, generation_pb2, openengine_pb2_grpc
 from .coordinator import CoordinationError, DuplicateRequestError, InvalidRequestIdError
-from .encoder import encoder_input, portable_reference, release_encoder_result
+from .encoder import encoder_input, native_reference, portable_reference, release_encoder_result
 from .errors import (
     EncoderCapacityError,
     EncoderUnavailableError,
@@ -35,6 +35,51 @@ from .servicer import (
     _PreprocessingWork,
 )
 from .streaming import ActiveRequest
+
+
+class OpenEngineEncoderServicer(openengine_pb2_grpc.EncoderServicer):
+    def __init__(self, inference: OpenEngineInferenceServicer) -> None:
+        self._inference = inference
+
+    async def Encode(
+        self,
+        request: encoding_pb2.EncodeRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> encoding_pb2.EncodeResponse:
+        return await encode(self._inference, request, context)
+
+    async def ReleaseEncodedMedia(
+        self,
+        request: encoding_pb2.ReleaseEncodedMediaRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> encoding_pb2.ReleaseEncodedMediaResponse:
+        cache = getattr(self._inference, "_encoder_cache", None)
+        discard = getattr(cache, "discard", None)
+        if not callable(discard) or getattr(self._inference, "encoder_role", "") != "encode":
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder release is not enabled")
+        if not request.HasField("encoded_media"):
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "encoded_media is required")
+        task = asyncio.create_task(
+            asyncio.to_thread(discard, native_reference(request.encoded_media))
+        )
+        tasks = self._inference._encoder_cleanup_tasks
+        tasks.add(task)
+
+        def completed(done):
+            tasks.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(completed)
+        try:
+            await asyncio.shield(task)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        except RuntimeError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+        except OSError as error:
+            await context.abort(grpc.StatusCode.INTERNAL, str(error))
+        return encoding_pb2.ReleaseEncodedMediaResponse()
 
 
 async def _prepare(owner, request, sampling, local_request):

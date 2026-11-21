@@ -26,12 +26,12 @@ vendors:
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     branch: krish/openengine-image-epd-protocol
-    commit: 59f1d5a7062629cf8c47031391a67a716b80b1ff
+    commit: 2a442e03912d6c98cdb81b73ab67e05b69d9ea75
     source: proto/openengine/v1
     destination: tensorrt_llm/grpc/openengine/proto/openengine/v1
     include:
     - '*.proto'
-    digest: sha256-tree-v1:4ce9e753a8e6502d3bc755e9d81af151b54216beb155bb15df4c367b3cb0fe87
+    digest: sha256-tree-v1:897cf5f5c3dca30423be29df993b8e92f50872569665edd66c37ce54233b7553
   sana-sol-attn:
     url: https://github.com/NVlabs/Sana.git
     branch: sol-engine

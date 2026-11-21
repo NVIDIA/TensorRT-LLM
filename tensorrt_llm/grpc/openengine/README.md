@@ -348,7 +348,7 @@ For disaggregated subagent context requests, configure `internal_request_auth_ke
 
 ## Image encoder handoff (experimental)
 
-Image E+PD and E+P+D use the unary `Inference.Encode` contract proposed in
+Image E+PD and E+P+D use the unary `Encoder.Encode` contract proposed in
 [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
 immutable source revision in the vendor lock. Both client and server need the
 matching bindings; this proposal is not in a published BSR release or runtime.
@@ -387,7 +387,7 @@ generation usage. Text-only requests can bypass E.
 
 Dedicated E workers advertise `ENGINE_ROLE_ENCODER`. There is no encoder-specific
 capability negotiation: explicitly configure compatible E/P builds and validate
-their existing schema-release identity. `Control.ReleaseEncodedMedia` releases an
+their existing schema-release identity. `Encoder.ReleaseEncodedMedia` releases an
 unused output at E; `Control.Abort` cancels active Encode or Generate work.
 TRT-LLM owns reference validation, transfer and lifetime independently of the
 public protobuf adapter. Dynamo forwards the reference unchanged.

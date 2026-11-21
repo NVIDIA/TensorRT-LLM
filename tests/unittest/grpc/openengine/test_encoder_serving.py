@@ -4,7 +4,9 @@
 import asyncio
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import grpc
 import pytest
 from conftest import AbortError, FakeServicerContext
 from test_control import MODEL, _inference, _servicer
@@ -17,6 +19,7 @@ from tensorrt_llm.grpc.openengine import encoding, servicer
 from tensorrt_llm.grpc.openengine.bindings import encoding_pb2, lifecycle_pb2, model_pb2, server_pb2
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer
+from tensorrt_llm.grpc.openengine.encoding import OpenEngineEncoderServicer
 from tensorrt_llm.grpc.openengine.errors import (
     EncoderCapacityError,
     EncoderUnavailableError,
@@ -328,7 +331,7 @@ async def test_cancelled_encode_reclaims_native_exports(encoder_inference, tmp_p
     context = FakeServicerContext()
     context.is_cancelled = True
     with pytest.raises(AbortError):
-        await inference.Encode(encode_request(), context)
+        await OpenEngineEncoderServicer(inference).Encode(encode_request(), context)
     assert context.abort_code == encoding.grpc.StatusCode.CANCELLED
     assert outcomes == [("encode", "cancelled")]
     assert handle.disaggregated_params.multimodal_embedding_handles is None
@@ -424,7 +427,7 @@ async def test_encode_export_release_failure_withdraws_readiness(
     context.is_cancelled = cancel_path != "late"
 
     async def consume():
-        return await inference.Encode(req, context)
+        return await OpenEngineEncoderServicer(inference).Encode(req, context)
 
     rpc = asyncio.create_task(consume())
     drain = None
@@ -455,7 +458,7 @@ async def test_encode_export_release_failure_withdraws_readiness(
         control = OpenEngineControlServicer(llm, "qwen", inference)
         assert not control._engine_is_healthy()
         with pytest.raises(AbortError, match="cleanup failed"):
-            await inference.Encode(req, FakeServicerContext())
+            await OpenEngineEncoderServicer(inference).Encode(req, FakeServicerContext())
         assert not inference.active_request_count() and not inference._encoder_cleanup_tasks
     finally:
         allow_release.set()
@@ -530,7 +533,7 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(
     req = encode_request()
 
     async def consume():
-        return await inference.Encode(req, FakeServicerContext())
+        return await OpenEngineEncoderServicer(inference).Encode(req, FakeServicerContext())
 
     rpc = asyncio.create_task(consume())
     try:
@@ -603,7 +606,9 @@ async def test_abandoned_publication_keeps_rpc_loop_live_and_cleanup_tracked(
 
     monkeypatch.setattr(cache, "publish", cancelled_publication)
     monkeypatch.setattr(cache, "discard", blocked_discard)
-    rpc = asyncio.create_task(inference.Encode(encode_request(), context))
+    rpc = asyncio.create_task(
+        OpenEngineEncoderServicer(inference).Encode(encode_request(), context)
+    )
     drain = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
@@ -650,11 +655,11 @@ async def test_unary_encode_validates_native_context_and_records_no_token_usage(
     context = FakeServicerContext(metadata=(("traceparent", "00-native-encoder-trace"),))
     if input_kind == "missing":
         with pytest.raises(AbortError, match="requires prompt or token IDs"):
-            await inference.Encode(req, context)
+            await OpenEngineEncoderServicer(inference).Encode(req, context)
         assert context.abort_code == encoding.grpc.StatusCode.INVALID_ARGUMENT
         assert outcomes == [("encode", "rejected")]
     else:
-        response = await inference.Encode(req, context)
+        response = await OpenEngineEncoderServicer(inference).Encode(req, context)
         assert response.request_id == req.request_id
         assert response.encoded_media.opaque_state
         assert outcomes == [("encode", "completed")]
@@ -707,7 +712,7 @@ async def test_encode_publication_errors_preserve_status_and_metrics(
     monkeypatch.setattr(inference._encoder_cache, "publish", publish)
     context = FakeServicerContext()
     with pytest.raises(AbortError):
-        await inference.Encode(encode_request(), context)
+        await OpenEngineEncoderServicer(inference).Encode(encode_request(), context)
     assert context.abort_code == status, context.abort_details
     assert outcomes == [("encode", outcome)]
     await inference.drain_encoder_cleanup()
@@ -789,3 +794,136 @@ def test_nixl_transport_does_not_construct_unused_shared_cache(monkeypatch, inva
         assert inference._encoder_cache is cache
         assert inference.encoder_role == "encode"
         assert not closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role,has_discard", [("", True), ("consume", True), ("encode", False)])
+async def test_release_encoder_cache_requires_encode_cleanup_support(role, has_discard):
+    inference = _inference()
+    inference.encoder_role = role
+    inference._encoder_cache = SimpleNamespace(**({"discard": Mock()} if has_discard else {}))
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await OpenEngineEncoderServicer(inference).ReleaseEncodedMedia(
+            encoding_pb2.ReleaseEncodedMediaRequest(encoded_media={}), context
+        )
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+    if has_discard:
+        inference._encoder_cache.discard.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,code",
+    [
+        (None, None),
+        (ValueError("invalid reference"), grpc.StatusCode.INVALID_ARGUMENT),
+        (RuntimeError("transport unhealthy"), grpc.StatusCode.UNAVAILABLE),
+        (OSError("cannot remove cached encoder output"), grpc.StatusCode.INTERNAL),
+    ],
+)
+async def test_release_encoder_cache_maps_native_outcome(failure, code):
+    inference = _inference()
+    inference.encoder_role = "encode"
+
+    def discard(reference):
+        assert reference.opaque_state == b"\x00\xffengine-owned"
+        if failure is not None:
+            raise failure
+        return False
+
+    inference._encoder_cache = SimpleNamespace(discard=discard)
+    context = FakeServicerContext()
+    call = OpenEngineEncoderServicer(inference).ReleaseEncodedMedia(
+        encoding_pb2.ReleaseEncodedMediaRequest(
+            encoded_media={"opaque_state": b"\x00\xffengine-owned"}
+        ),
+        context,
+    )
+    if code is not None:
+        with pytest.raises(AbortError):
+            await call
+        assert context.abort_code == code
+    else:
+        assert isinstance(await call, encoding_pb2.ReleaseEncodedMediaResponse)
+        assert inference.active_request_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_release_encoder_cache_over_real_grpc(tmp_path):
+    from utils.native_encoder import model, native_result, request
+
+    from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
+    from tensorrt_llm.grpc.openengine.encoder import EncoderCache, portable_reference
+
+    cache = EncoderCache(str(tmp_path))
+    llm, _ = model()
+    reference = cache.publish(native_result()[0], request(), llm)
+    inference = _inference()
+    inference.encoder_role = "encode"
+    inference._encoder_cache = cache
+    server = grpc.aio.server()
+    openengine_pb2_grpc.add_EncoderServicer_to_server(OpenEngineEncoderServicer(inference), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    try:
+        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+            stub = openengine_pb2_grpc.EncoderStub(channel)
+            req = encoding_pb2.ReleaseEncodedMediaRequest(
+                encoded_media=portable_reference(reference)
+            )
+            for _ in range(2):
+                response = await stub.ReleaseEncodedMedia(req, timeout=2)
+                assert isinstance(response, encoding_pb2.ReleaseEncodedMediaResponse)
+        assert not list(tmp_path.glob("*.safetensors"))
+    finally:
+        await server.stop(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort", [False, True])
+async def test_encoder_service_shares_control_abort_and_releases_outputs(
+    encoder_inference, monkeypatch, tmp_path, abort
+):
+    from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
+    from tensorrt_llm.grpc.openengine.server import OpenEngineServer
+
+    inference, _, _ = encoder_inference
+    entered = asyncio.Event()
+    if abort:
+
+        async def blocked_prepare(*args):
+            entered.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(encoding, "_prepare", blocked_prepare)
+    server = OpenEngineServer("127.0.0.1", 0, inference._llm, "qwen")
+    await server.start()
+    try:
+        async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+            encoder = openengine_pb2_grpc.EncoderStub(channel)
+            call = encoder.Encode(encode_request(), timeout=5)
+            if abort:
+                await asyncio.wait_for(entered.wait(), timeout=2)
+                response = await openengine_pb2_grpc.ControlStub(channel).Abort(
+                    lifecycle_pb2.AbortRequest(request_id="encode"), timeout=2
+                )
+                assert response.status == lifecycle_pb2.ABORT_STATUS_ABORTED
+                with pytest.raises(grpc.aio.AioRpcError) as error:
+                    await call
+                assert error.value.code() == grpc.StatusCode.CANCELLED
+            else:
+                response = await call
+                assert response.request_id == "encode" and response.encoded_media.opaque_state
+                assert list(tmp_path.glob("*.safetensors"))
+                for _ in range(2):
+                    await encoder.ReleaseEncodedMedia(
+                        encoding_pb2.ReleaseEncodedMediaRequest(
+                            encoded_media=response.encoded_media
+                        ),
+                        timeout=2,
+                    )
+                assert not list(tmp_path.glob("*.safetensors"))
+            assert not server._inference.active_request_count()
+    finally:
+        await server.stop(grace=0)

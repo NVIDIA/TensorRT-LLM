@@ -22,7 +22,7 @@
   ],
   "source": {
     "url": "https://github.com/ai-dynamo/openengine.git",
-    "commit": "59f1d5a7062629cf8c47031391a67a716b80b1ff",
+    "commit": "2a442e03912d6c98cdb81b73ab67e05b69d9ea75",
     "publication": "Proposed contract in ai-dynamo/openengine#35; upstream merge pending"
   }
 }
