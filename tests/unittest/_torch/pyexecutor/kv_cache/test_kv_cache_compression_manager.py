@@ -378,6 +378,16 @@ class TestFactory:
         )
 
 
+def _new_cache_creator() -> util_mod.KvCacheCreator:
+    creator = object.__new__(util_mod.KvCacheCreator)
+    creator._cache_transceiver_config = None
+    return verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
+
+
 class TestKvCacheCreatorLifecycle:
     def test_estimation_still_creates_triattention_manager(self) -> None:
         config = SimpleNamespace(algorithm="triattention")
@@ -386,13 +396,7 @@ class TestKvCacheCreatorLifecycle:
             provides_cold_page_codec=False,
             uses_iteration_lifecycle=True,
         )
-        creator = object.__new__(util_mod.KvCacheCreator)
-        creator._cache_transceiver_config = None
-        verify_instance(
-            creator,
-            "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
-            members=("_cache_transceiver_config", "_get_draft_cache_cost"),
-        )
+        creator = _new_cache_creator()
         creator._skip_est = False
         creator._max_seq_len = 1024
         creator._kv_cache_config = SimpleNamespace(
@@ -423,13 +427,7 @@ class TestKvCacheCreatorLifecycle:
         expected_manager.bind_kv_cache_managers.assert_not_called()
 
     def test_teardown_pops_and_shuts_down_compression_manager(self) -> None:
-        creator = object.__new__(util_mod.KvCacheCreator)
-        creator._cache_transceiver_config = None
-        verify_instance(
-            creator,
-            "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
-            members=("_cache_transceiver_config", "_get_draft_cache_cost"),
-        )
+        creator = _new_cache_creator()
         compression_manager = MagicMock()
         resources = {
             ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
@@ -493,13 +491,7 @@ def test_executor_binds_iteration_manager_after_extra_resource_registration() ->
 def test_build_routes_compression_manager_by_capabilities(
     provides_cold_page_codec: bool,
 ) -> None:
-    creator = object.__new__(util_mod.KvCacheCreator)
-    creator._cache_transceiver_config = None
-    verify_instance(
-        creator,
-        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
-        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
-    )
+    creator = _new_cache_creator()
     creator._skip_est = False
     creator._max_seq_len = 1024
     creator._kv_cache_config = SimpleNamespace(enable_block_reuse=False)

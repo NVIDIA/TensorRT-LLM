@@ -27,7 +27,8 @@ import numpy as np
 import pytest
 import torch
 from test_common.host_cache_manager import make_host_cache_manager
-from test_common.interface_checks import mock_target, verify_instance
+from test_common.interface_checks import mock_target
+from test_common.llm_request_stubs import make_llm_request_stub
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor._util import _get_num_storage_pool_groups
@@ -2702,9 +2703,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
 
 def _revert_context_request(request_id: int) -> SimpleNamespace:
-    request = SimpleNamespace(
-        kv_cache_retention_config=None,
-        py_lora_ckpt_source=None,
+    return make_llm_request_stub(
         py_request_id=request_id,
         py_ctx_pre_resize_cap=64,
         prompt_len=512,
@@ -2712,11 +2711,6 @@ def _revert_context_request(request_id: int) -> SimpleNamespace:
         context_chunk_size=192,
         estimated_reusable_tokens=128,
         set_prepopulated_prompt_len=Mock(),
-    )
-    return verify_instance(
-        request,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
 
 
@@ -3828,6 +3822,7 @@ def _make_context_request(
     use_conversation_params: bool = True,
     is_disagg_generation_init_state: bool = False,
     kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+    cache_salt: str | None = None,
 ) -> LlmRequest:
     request = LlmRequest(
         request_id=request_id,
@@ -3836,6 +3831,7 @@ def _make_context_request(
         sampling_config=SamplingConfig(1),
         is_streaming=False,
         kv_cache_retention_config=kv_cache_retention_config,
+        cache_salt=cache_salt,
     )
     request.state = (
         LlmRequestState.DISAGG_GENERATION_INIT
@@ -4825,11 +4821,11 @@ def test_per_conversation_policy_drop_extended_turns_keeps_unextended_branch(
     subagent_reuse: int,
 ) -> None:
     """A subagent that shares its parent's conversation id must not evict the parent."""
-    main = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    subagent_turn_1 = _ContextRequest(2, list(range(100, 108)), 8, "conv-1")
-    subagent_turn_2 = _ContextRequest(3, list(range(100, 112)), 12, "conv-1")
-    main_probe = _ContextRequest(4, list(range(8)), 8, "conv-2")
-    subagent_probe = _ContextRequest(5, list(range(100, 108)), 8, "conv-3")
+    main = _make_context_request(1, list(range(8)), "conv-1")
+    subagent_turn_1 = _make_context_request(2, list(range(100, 108)), "conv-1")
+    subagent_turn_2 = _make_context_request(3, list(range(100, 112)), "conv-1")
+    main_probe = _make_context_request(4, list(range(8)), "conv-2")
+    subagent_probe = _make_context_request(5, list(range(100, 108)), "conv-3")
 
     try:
         for request in (main, subagent_turn_1, subagent_turn_2):
@@ -4867,9 +4863,9 @@ def test_per_conversation_policy_drop_extended_turns_respects_reuse_scope(
     first_reuse: int,
 ) -> None:
     """Only a later turn in the same reuse scope can drop an earlier turn."""
-    first = _ContextRequest(1, list(range(8)), 8, "conv-1", cache_salt="a")
-    second = _ContextRequest(2, list(range(12)), 12, "conv-1", cache_salt=second_salt)
-    first_probe = _ContextRequest(3, list(range(8)), 8, "conv-2", cache_salt="a")
+    first = _make_context_request(1, list(range(8)), "conv-1", cache_salt="a")
+    second = _make_context_request(2, list(range(12)), "conv-1", cache_salt=second_salt)
+    first_probe = _make_context_request(3, list(range(8)), "conv-2", cache_salt="a")
 
     try:
         for request in (first, second):
@@ -4890,12 +4886,12 @@ def test_per_conversation_policy_drop_extended_turns_drops_every_extended_turn(
     manager: KVCacheManagerV2,
 ) -> None:
     """A turn that extends several retained turns drops all of them at once."""
-    main = _ContextRequest(1, list(range(500, 508)), 8, "conv-1")
-    longer = _ContextRequest(2, list(range(12)), 12, "conv-1")
-    shorter = _ContextRequest(3, list(range(8)), 8, "conv-1")
-    extending = _ContextRequest(4, list(range(16)), 16, "conv-1")
-    main_probe = _ContextRequest(5, list(range(500, 508)), 8, "conv-2")
-    shorter_probe = _ContextRequest(6, list(range(8)), 8, "conv-3")
+    main = _make_context_request(1, list(range(500, 508)), "conv-1")
+    longer = _make_context_request(2, list(range(12)), "conv-1")
+    shorter = _make_context_request(3, list(range(8)), "conv-1")
+    extending = _make_context_request(4, list(range(16)), "conv-1")
+    main_probe = _make_context_request(5, list(range(500, 508)), "conv-2")
+    shorter_probe = _make_context_request(6, list(range(8)), "conv-3")
 
     try:
         for request in (main, longer, shorter, extending):
@@ -4931,9 +4927,9 @@ def test_per_conversation_policy_extension_keeps_shared_window_page(
     turn ended in. The new turn is planned before the old one is dropped, so
     that page stays reusable at the new endpoint.
     """
-    turn = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    extension = _ContextRequest(2, list(range(9)), 9, "conv-1")
-    extension_probe = _ContextRequest(3, list(range(9)), 9, "conv-2")
+    turn = _make_context_request(1, list(range(8)), "conv-1")
+    extension = _make_context_request(2, list(range(9)), "conv-1")
+    extension_probe = _make_context_request(3, list(range(9)), "conv-2")
 
     try:
         for request in (turn, extension):
@@ -6750,20 +6746,13 @@ def _gen_init_manager(host_capacity_blocks: int | None) -> KVCacheManagerV2:
 
 
 def _gen_init_request(request_id: int, prompt_len: int, max_new_tokens: int):
-    request = SimpleNamespace(
-        kv_cache_retention_config=None,
-        py_lora_ckpt_source=None,
+    return make_llm_request_stub(
         py_request_id=request_id,
         prompt_len=prompt_len,
         orig_prompt_len=prompt_len,
         max_new_tokens=max_new_tokens,
         py_beam_width=1,
         try_get_encoder_output_len=lambda: None,
-    )
-    return verify_instance(
-        request,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
 
 

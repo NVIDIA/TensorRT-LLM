@@ -33,7 +33,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -347,22 +347,9 @@ def test_previous_model_batch_defers_cancellation_until_post_forward(executor: P
     """The logical-result path cannot free resources owned by an outstanding model batch."""
     request = _request()
     executor.active_requests.append(request)
-    executor.previous_batch = verify_instance(
-        SimpleNamespace(
-            scheduled_requests=SimpleNamespace(all_requests=lambda: [request]),
-            sample_state=None,
-            iter_start_time=0,
-            iter_stats=None,
-            iter_id=None,
-            scheduled_batch_stats=None,
-            gpu_forward_start_event=None,
-            gpu_forward_end_event=None,
-            gpu_forward_events_from_perf_pool=False,
-            guided_batch_id=None,
-            guided_failures=None,
-        ),
-        "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-        members_only=True,
+    executor.previous_batch = BatchState(
+        scheduled_requests=SimpleNamespace(all_requests=lambda: [request]),
+        sample_state=None,
     )
     executor.canceled_req_ids = [11]
 

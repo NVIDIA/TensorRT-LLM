@@ -670,7 +670,7 @@ def test_try_finish_gen_receive_declines_requests_that_did_not_complete(state) -
 
 
 def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyExecutor:
-    """Bare executor whose receive tail runs for real over ``coordinator``.
+    """Build an executor that runs the receive tail over ``coordinator``.
 
     Seq-slot preparation, sampler setup, each finish attempt and the
     first-token logprobs step append to ``events`` in call order; the two
@@ -876,7 +876,7 @@ class _ClosingRequest(_GenRequest):
 def _closing_executor(
     coordinator: DisaggTransferCoordinator, active, attention_dp=False, max_seq_len=64, cp_size=1
 ) -> PyExecutor:
-    """Bare executor over ``coordinator`` whose response and termination sinks are mocks."""
+    """Build an executor with mock response and termination sinks."""
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None

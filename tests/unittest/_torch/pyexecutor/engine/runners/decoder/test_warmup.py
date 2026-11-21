@@ -20,6 +20,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 from _torch.pyexecutor.engine.runners.decoder.utils import (
+    cpu_decoder_runner,
     decoder_config,
     decoder_graphs,
     decoder_warmup,
@@ -34,19 +35,15 @@ from test_common.interface_checks import mock_target
 
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs as graphs_module
-import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.models.modeling_utils import remove_weights
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
     AutotunerWarmupMode,
@@ -75,39 +72,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.config import DecoderRunnerConfig
-
-
-def _cpu_decoder_runner(config: DecoderRunnerConfig) -> DecoderRunner:
-    model = torch.nn.Identity()
-    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None))
-    buffers = SimpleNamespace(
-        input_ids_cuda=torch.zeros(2, dtype=torch.int32),
-        draft_tokens_cuda=None,
-        previous_pos_id_offsets_cuda=None,
-    )
-    with (
-        patch.object(DecoderInputBuffers, "for_config", return_value=buffers),
-        patch.object(
-            decoder_runner_module,
-            "CUDAGraphRunner",
-            return_value=Mock(enabled=False, is_warmup_only=False),
-        ),
-        patch.object(decoder_runner_module, "CutlassWorkspaceReclaimer"),
-    ):
-        return DecoderRunner(
-            model,
-            config,
-            model_caller=Mock(),
-            mapping=Mapping(),
-            dist=None,
-            moe_load_balancer=None,
-            sparse_attention_config=None,
-            attention_runtime_features=AttentionRuntimeFeatures(),
-            get_runtime_tokens_per_gen_step=lambda draft_len: draft_len + 1,
-            warmup_timer=_WarmupTimer(rank=0),
-            iter_states={},
-            metrics={},
-        )
 
 
 @contextlib.contextmanager
@@ -687,7 +651,7 @@ def test_attention_warmup_covers_enabled_request_phases(
     # Keep the production graph and JIT-flag scopes; only allocation and the
     # model forward are external boundaries of this host orchestration test.
     graphs = decoder_graphs(config, cuda_graph_runner=Mock(enabled=True, is_warmup_only=False))
-    runner = _cpu_decoder_runner(decoder_config())
+    runner, _ = cpu_decoder_runner(decoder_config())
 
     @mock_target(
         "tensorrt_llm._torch.pyexecutor.engine.runners.decoder:DecoderRunner.forward", bound=True
@@ -1982,7 +1946,7 @@ class TestSamplingWarmup(unittest.TestCase):
     def test_sampling_and_phase_metrics_without_kv_cache(self) -> None:
         """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         config = decoder_config(cuda_graph_batch_sizes=[1, 4])
-        runner = _cpu_decoder_runner(config)
+        runner, _ = cpu_decoder_runner(config)
         warmup = runner._warmup = decoder_warmup(
             config,
             model=SimpleNamespace(config=SimpleNamespace(vocab_size=128)),

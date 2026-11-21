@@ -158,7 +158,7 @@ def test_vanilla_indexer_q_projection_supports_fp8_qdq_weight():
         out_features=2,
     )
 
-    actual = DSAVanillaIndexer._wq_projection_reference(qr, (linear))
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
 
     qdq_qr = DSAVanillaIndexer._qdq_fp8(qr, input_scale)
     expected = torch.nn.functional.linear(qdq_qr, weight.float() * weight_scale)
@@ -183,7 +183,7 @@ def test_vanilla_indexer_q_projection_uses_linear_dtype_for_prequantized_input()
         dtype=torch.bfloat16,
     )
 
-    actual = DSAVanillaIndexer._wq_projection_reference(qr, (linear))
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
 
     expected = torch.nn.functional.linear(
         (qr.float() * input_scale).to(torch.bfloat16),
@@ -226,12 +226,12 @@ def test_vanilla_indexer_q_projection_supports_fp8_block_weight(
     monkeypatch.setattr(
         vanilla_mod,
         "get_sm_version",
-        (lambda: sm_version),
+        lambda: sm_version,
     )
     monkeypatch.setattr(
         linear_mod,
         "get_sm_version",
-        (lambda: sm_version),
+        lambda: sm_version,
     )
     monkeypatch.setattr(linear_mod, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_available)
     # Pick an amax where amax / 448.0 is not a power of two so UE8M0 vs
@@ -263,8 +263,8 @@ def test_vanilla_indexer_q_projection_supports_fp8_block_weight(
         disable_deep_gemm=disable_deep_gemm,
     )
 
-    assert DSAVanillaIndexer._fp8_block_scales_uses_ue8m0((linear)) is expected_ue8m0
-    actual = DSAVanillaIndexer._wq_projection_reference(qr, (linear))
+    assert DSAVanillaIndexer._fp8_block_scales_uses_ue8m0(linear) is expected_ue8m0
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
 
     qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=expected_ue8m0)
     other_qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=not expected_ue8m0)
@@ -327,7 +327,7 @@ def test_vanilla_indexer_fp8_block_qdq_matches_native_quantizer(monkeypatch, use
     monkeypatch.setattr(
         DSAVanillaIndexer,
         "_fp8_block_scales_uses_ue8m0",
-        (staticmethod(lambda linear: use_ue8m0)),
+        staticmethod(lambda linear: use_ue8m0),
     )
     weight = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
     weight_scale = torch.tensor([[0.25, 0.125], [0.5, 1.0]], dtype=torch.float32)
@@ -341,7 +341,7 @@ def test_vanilla_indexer_fp8_block_qdq_matches_native_quantizer(monkeypatch, use
         dtype=torch.bfloat16,
     )
 
-    actual = DSAVanillaIndexer._wq_projection_reference(qr, (linear))
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
 
     # The QDQ input is pinned to the native quantizer above, so the projection
     # check covers how _wq_projection_reference applies it and the weight scales.
@@ -398,7 +398,7 @@ def test_vanilla_indexer_q_projection_supports_nvfp4_weight():
     )
     qr = torch.arange(in_features, dtype=torch.float32).reshape(1, -1) / in_features
 
-    actual = DSAVanillaIndexer._wq_projection_reference(qr, (linear))
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
 
     real_scales = linear_scales.view(torch.float8_e4m3fn).float() * weight_scale_2
     dequant_weight = DSAVanillaIndexer.dequantize_fp4(packed_weight, real_scales, gran_k=16)
@@ -437,7 +437,7 @@ def test_vanilla_indexer_q_projection_supports_nvfp4_activation_qdq():
     )
     qr = torch.tensor([[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0] * 2], dtype=torch.float32)
 
-    actual = DSAVanillaIndexer._wq_projection_reference(qr, (linear))
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
 
     # The RNE E2M1 values sum to 20 per eight inputs; the dequantized weight
     # is all ones, so two repetitions produce 40.
@@ -498,7 +498,7 @@ def test_vanilla_generation_forward_respects_rope_and_cache_ownership(
             q,
             None,
             None,
-            (metadata),
+            metadata,
             forward_args=forward_args,
         )
 
@@ -532,7 +532,7 @@ def test_vanilla_fp4_cache_write_preserves_packed_scale_bytes():
     indexer._update_k_cache(
         packed_k,
         packed_scale,
-        (metadata),
+        metadata,
     )
 
     torch.testing.assert_close(cache[:4], packed_k.flatten())
@@ -555,7 +555,7 @@ def test_vanilla_local_topk_uses_trtllm_pool_coordinates():
 
     actual = DSAVanillaAttention._local_topk_to_global(
         local_topk,
-        (metadata),
+        metadata,
         layer_idx=1,
         is_generation=False,
     )
@@ -683,7 +683,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
             return_value=100,
         ),
     ):
-        DSAtrtllmAttentionMetadata.__post_init__((metadata))
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
 
     assert metadata.indexer_head_dim == 96
     assert metadata.compress_ratios == [1, 4, 128]
@@ -735,7 +735,7 @@ def test_cute_dsl_paged_mqa_logits_gate(requested, cute_dsl_available, sm_100f, 
         patch(f"{indexer_mod}.IS_CUTLASS_DSL_AVAILABLE", cute_dsl_available),
         patch(f"{indexer_mod}.is_sm_100f", return_value=sm_100f),
     ):
-        DSAtrtllmAttentionMetadata.__post_init__((metadata))
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
         indexer_decision = resolve_cute_dsl_paged_mqa_logits(
             sparse_config.to_sparse_params().use_cute_dsl_paged_mqa_logits
         )
@@ -902,7 +902,7 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
         ) as cute_dsl_radix,
     ):
         DSAtrtllmAttentionMetadata.warmup_cute_dsl_radix_topk(
-            (metadata),
+            metadata,
             next_n,
         )
 
@@ -959,7 +959,7 @@ def test_metadata_warmup_selfsampling_prefill_leg(
         patch(f"{ss_host}.warmup_varlen"),
     ):
         DSAtrtllmAttentionMetadata.warmup_selfsampling_topk(
-            (metadata),
+            metadata,
             next_n=1,
             batch_sizes=[8],
         )
@@ -1156,7 +1156,7 @@ def test_shared_topk_lifecycle(monkeypatch):
             backend,
             torch.empty((2, 1)),
             None,
-            (metadata),
+            metadata,
             AttentionForwardArgs(
                 attention_input_type=input_type,
                 sparse_backend_args=backend_args,
@@ -1573,7 +1573,7 @@ def test_transform_local_topk_uses_v2_page_mapping():
     ) as convert:
         actual, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices,
-            (metadata),
+            metadata,
             layer_idx=0,
         )
 
@@ -4116,7 +4116,7 @@ def test_packed_logits_elem_budget_clamp(
         max_num_tokens=max_num_tokens,
         kv_cache_manager=SimpleNamespace(max_seq_len=max_seq_len),
     )
-    assert dsa_indexer._packed_logits_elem_budget((metadata)) == expected
+    assert dsa_indexer._packed_logits_elem_budget(metadata) == expected
 
 
 @pytest.mark.parametrize("tp_size", [2, 3, 4, 8])

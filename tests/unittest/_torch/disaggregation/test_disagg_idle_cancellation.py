@@ -2001,6 +2001,12 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
     _assert_released_once(executor, cancelled)
 
 
+def _previous_generation_batch(request: LlmRequest) -> BatchState:
+    scheduled = ScheduledRequests()
+    scheduled.generation_requests = [request]
+    return BatchState(scheduled_requests=scheduled, sample_state=None)
+
+
 @pytest.mark.parametrize(
     ("multimodal_params", "mm_item_scheduling", "encoder_decoder"),
     [
@@ -2070,30 +2076,9 @@ def test_legacy_tp_cancel_reaches_multimodal_model_generation_work(
     for engine in engines:
         assert engine._cancelled_disagg_model_request_ids() == {1}
 
-    def make_previous_batch(request: LlmRequest) -> SimpleNamespace:
-        scheduled = ScheduledRequests()
-        scheduled.generation_requests = [request]
-        return verify_instance(
-            SimpleNamespace(
-                scheduled_requests=scheduled,
-                sample_state=None,
-                iter_start_time=0,
-                iter_stats=None,
-                iter_id=None,
-                scheduled_batch_stats=None,
-                gpu_forward_start_event=None,
-                gpu_forward_end_event=None,
-                gpu_forward_events_from_perf_pool=False,
-                guided_batch_id=None,
-                guided_failures=None,
-            ),
-            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-            members_only=True,
-        )
-
     # The previous model batch still owns the request: the vote must hold it.
     for rank, engine in enumerate(engines):
-        engine.previous_batch = make_previous_batch(requests[rank])
+        engine.previous_batch = _previous_generation_batch(requests[rank])
     group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
     assert all(not request.is_finished for request in requests)
     assert all(engine.canceled_req_ids == [1] for engine in engines)
@@ -2158,31 +2143,10 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
         engines.append(engine)
         requests.append(request)
 
-    def make_previous_batch(request: LlmRequest) -> SimpleNamespace:
-        scheduled = ScheduledRequests()
-        scheduled.generation_requests = [request]
-        return verify_instance(
-            SimpleNamespace(
-                scheduled_requests=scheduled,
-                sample_state=None,
-                iter_start_time=0,
-                iter_stats=None,
-                iter_id=None,
-                scheduled_batch_stats=None,
-                gpu_forward_start_event=None,
-                gpu_forward_end_event=None,
-                gpu_forward_events_from_perf_pool=False,
-                guided_batch_id=None,
-                guided_failures=None,
-            ),
-            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-            members_only=True,
-        )
-
     # A receive still referenced by a prior model batch cannot be closed by
     # the loop-head retry, even when local transport retirement reports ready.
     for rank, engine in enumerate(engines):
-        engine.previous_batch = make_previous_batch(requests[rank])
+        engine.previous_batch = _previous_generation_batch(requests[rank])
     group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
     assert all(not request.is_finished for request in requests)
     for engine in engines:

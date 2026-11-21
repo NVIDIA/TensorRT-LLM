@@ -8,12 +8,15 @@ from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
+import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.engine.lora import LoraParamBuilder
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.config import DecoderRunnerConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
@@ -30,6 +33,7 @@ from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, PrefillCudaGraphBacken
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from typing import Any
 
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
@@ -98,6 +102,51 @@ def decoder_config(**changes: Any) -> DecoderRunnerConfig:
             }
         )
     return replace(config, **changes)
+
+
+def cpu_decoder_runner(
+    config: DecoderRunnerConfig,
+    *,
+    model: torch.nn.Module | None = None,
+    backend: Mock | None = None,
+    get_runtime_tokens_per_gen_step: Callable[[int], int] | None = None,
+) -> tuple[DecoderRunner, torch.Tensor]:
+    """Build a decoder runner with host input buffers and a mock graph backend."""
+    if model is None:
+        model = torch.nn.Identity()
+        model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None))
+    if backend is None:
+        backend = Mock(enabled=False, is_warmup_only=False)
+    input_ids = torch.zeros(2, dtype=torch.int32)
+    buffers = SimpleNamespace(
+        input_ids_cuda=input_ids,
+        draft_tokens_cuda=None,
+        previous_pos_id_offsets_cuda=None,
+    )
+    with (
+        patch.object(DecoderInputBuffers, "for_config", return_value=buffers),
+        patch.object(decoder_runner_module, "CUDAGraphRunner", return_value=backend),
+        patch.object(decoder_runner_module, "CutlassWorkspaceReclaimer"),
+    ):
+        runner = DecoderRunner(
+            model,
+            config,
+            model_caller=Mock(),
+            mapping=Mapping(),
+            dist=None,
+            moe_load_balancer=None,
+            sparse_attention_config=None,
+            attention_runtime_features=AttentionRuntimeFeatures(),
+            get_runtime_tokens_per_gen_step=(
+                get_runtime_tokens_per_gen_step
+                if get_runtime_tokens_per_gen_step is not None
+                else lambda draft_len: draft_len + 1
+            ),
+            warmup_timer=_WarmupTimer(rank=0),
+            iter_states={},
+            metrics={},
+        )
+    return runner, input_ids
 
 
 def input_preparer(
