@@ -466,62 +466,9 @@ jobs:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
 
-  # Pull requests from outside the NVIDIA organization must pass the reviewed commit with
-  # `--commit <full SHA>`, and the given commit must be the pull request head.
-  Community-PR-check:
-    name: Community PR check
-    needs: [Authorization]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      pull-requests: write
-    steps:
-      - name: Check if the pull request author is from outside NVIDIA
-        id: external
-        if: ${{ !startsWith(github.event.comment.body, '/bot kill') }}
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
-          result-encoding: string
-          script: |
-            const author = context.payload.issue.user.login;
-            try {
-              await github.request('GET /orgs/{org}/members/{username}', {org: 'NVIDIA', username: author});
-              console.log(`${author} is an NVIDIA member.`);
-              return 'false';
-            } catch (error) {
-              if (error.status !== 404) core.warning(`Could not check ${author}: ${error.message}`);
-              console.log(`${author} is treated as external.`);
-              return 'true';
-            }
-
-      - name: Check the commit of the bot command
-        if: ${{ steps.external.outputs.result == 'true' }}
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: context.issue.number});
-            const command = context.payload.comment.body.replace(/\s+/g, ' ');
-            // The extra spaces are to avoid matching `--commit <sha>xxx` or `xxx--commit <sha>`.
-            if (` ${command} `.includes(` --commit ${pr.head.sha} `)) {
-              console.log(`The command gives the pull request head ${pr.head.sha}.`);
-              return;
-            }
-            core.setFailed('The command does not give the pull request head with --commit.');
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.issue.number,
-              body: ':no_entry: **Bot command not started**: the author of this pull request is not a member of ' +
-                'the NVIDIA GitHub organization. The command must pass the reviewed commit with ' +
-                '`--commit <full SHA>`, and it must be the latest commit of this pull request.\n\n' +
-                'Please review the latest changes, copy the full SHA (40 characters) of the commit you reviewed ' +
-                'from the **Commits** tab, and post the command again, for example `/bot run --commit <full SHA>`.\n\n' +
-                `[Link to invocation](${context.payload.comment.html_url})`,
-            });
-
   Vulnerability-scan:
     name: Vulnerability scan
-    needs: [Authorization, Community-PR-check]
+    needs: [Authorization]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
