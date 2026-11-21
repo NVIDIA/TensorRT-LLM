@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.interface import SpecMetadata, SpecWorkerBase
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="rejection buffers are CUDA tensors"
@@ -268,6 +269,8 @@ class _Worker(SpecWorkerBase):
 def _dispatch_meta(**over):
     base = dict(
         is_ragged_verify=False,
+        # The default mode, which the fused rejection-sampling kernels do not cover.
+        advanced_sampling_mode=AdvancedSamplingMode.FULL,
         use_rejection_sampling=True,
         is_all_greedy_sample=False,
         draft_probs_vocab_size=V,
