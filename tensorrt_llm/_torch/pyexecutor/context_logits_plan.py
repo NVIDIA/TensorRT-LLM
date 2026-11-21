@@ -21,7 +21,12 @@ if TYPE_CHECKING:
 
 
 def store_context_logits(
-    request: LlmRequest, logits: torch.Tensor, *, offset: int = 0, reusable: bool = False
+    request: LlmRequest,
+    logits: torch.Tensor,
+    *,
+    offset: int = 0,
+    reusable: bool = False,
+    retain_owned: bool = False,
 ) -> None:
     """Consume context rows from either projection path using one result contract.
 
@@ -35,6 +40,8 @@ def store_context_logits(
         offset: Row offset of ``logits`` within the current prefill chunk.
         reusable: ``logits`` is projection scratch that the caller overwrites
             next; host copies therefore complete before returning.
+        retain_owned: Store a view of the result buffer in the diff, so it
+            does not keep the whole logits batch alive.
     """
     if offset == 0 and request.prepopulated_prompt_len > 0:
         logger.warning(
@@ -43,7 +50,9 @@ def store_context_logits(
         )
     compact = request.py_prompt_logprobs is not None
     if request.py_context_logits_explicit or not compact:
-        request.py_result.append_context_logits(logits, reusable=reusable)
+        request.py_result.append_context_logits(
+            logits, reusable=reusable, retain_owned=retain_owned
+        )
     if not compact:
         return
     begin = request.context_current_position + offset + 1
@@ -144,7 +153,7 @@ class ContextLogitsPlan:
         kept = []
         for request, chunk in zip(contexts, chunks, strict=True):
             if request.py_return_context_logits:
-                store_context_logits(request, logits[chunk], reusable=True)
+                store_context_logits(request, logits[chunk], retain_owned=True)
             kept.append(logits[chunk.stop - 1 : chunk.stop])
         kept.append(logits[context_rows:])
         return torch.cat(kept)

@@ -9,6 +9,7 @@ import unittest
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -226,12 +227,28 @@ def test_encoder_replay_with_context_logits(bounded_projection: bool) -> None:
     head = SimpleNamespace(
         weight=torch.eye(6), output_dtype=None, num_embeddings=6, tp_size=1, mapping=None
     )
-    head.context_logits_workspace = ContextLogitsWorkspace(head) if bounded_projection else None
-    engine._context_logits_heads = (head,) if bounded_projection else ()
+    head.context_logits_workspace = ContextLogitsWorkspace(head)
+    engine._context_logits_heads = (head,)
+    processor_rows: list[torch.Tensor] = []
+
+    def process_logits(request_id, logits, token_ids, stream_ptr, client_id):
+        assert request_id == scoring.py_request_id
+        processor_rows.append(logits.clone())
+        logits.zero_()
+
+    if not bounded_projection:
+        scoring.py_orig_prompt_len = scoring.py_prompt_len
+        scoring.get_tokens = lambda beam: [1, 2]
+        scoring.py_logits_post_processors = [process_logits]
+        decode.get_beam_width_by_iter = lambda **kwargs: 1
+        engine._execute_logit_post_processors.side_effect = partial(
+            DecoderRunner._execute_logit_post_processors, engine
+        )
 
     def forward(*args, **kwargs) -> dict[str, torch.Tensor]:
         replay.py_ced_replay.consumed = True
         projected = project_context_logits(hidden, head)
+        assert (projected is not None) == bounded_projection
         return {"logits": hidden if projected is None else projected}
 
     # Input preparation can reorder the requests after the plan was created.
@@ -246,9 +263,18 @@ def test_encoder_replay_with_context_logits(bounded_projection: bool) -> None:
             ScheduledInputs(batch=batch, gather_context_logits=True), resource_manager=resources
         )
 
-    torch.testing.assert_close(outputs["logits"], hidden[[2, 4, 5]])
+    expected = hidden[[2, 4, 5]]
+    if not bounded_projection:
+        assert len(processor_rows) == 1
+        torch.testing.assert_close(processor_rows[0], hidden[4].view(1, 1, -1))
+        expected[1].zero_()
+    torch.testing.assert_close(outputs["logits"], expected)
     assert outputs["context_logits_handled"]
-    torch.testing.assert_close(scoring.py_result.context_logits, hidden[3:5])
+    stored = scoring.py_result.context_logits
+    assert stored is not None
+    torch.testing.assert_close(stored, hidden[3:5])
+    (diff_logits,) = scoring.py_result.get_diff().context_logits_list
+    assert diff_logits.data_ptr() == stored.data_ptr()
 
 
 @pytest.mark.cpu_only
