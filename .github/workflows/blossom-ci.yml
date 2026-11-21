@@ -14,6 +14,11 @@
 # limitations under the License.
 
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
+#
+# Do not add or change jobs, steps or other keys in this file. The Blossom runner compares it
+# with its template and rejects every /bot command when they differ. Only the `if` of the
+# Authorization job (command prefixes and user list) and the action versions may be changed.
+# A change cannot be tested in a pull request: this workflow always runs from the default branch.
 name: Blossom-CI
 on:
   issue_comment:
