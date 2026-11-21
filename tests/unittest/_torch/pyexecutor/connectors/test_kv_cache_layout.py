@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheLayout,
     KvCacheRegion,
     build_kv_cache_layout_v2,
+    has_state_layers,
     valid_page_slots,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -464,6 +465,14 @@ class TestBuildKvCacheLayoutV2(unittest.TestCase):
                 for ref in region.buffers
             ]
             self.assertCountEqual(set(in_regions), set(covered))
+        finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_attention_only_cache_has_no_state_layers(self):
+        mgr = KVCacheManagerV2(**_make_kwargs())
+        try:
+            self.assertFalse(has_state_layers(mgr))
         finally:
             mgr.shutdown()
             del mgr

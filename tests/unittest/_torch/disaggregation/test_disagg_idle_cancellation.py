@@ -597,7 +597,7 @@ def test_scheduler_excludes_cancelled_model_work_without_releasing_its_roots(
     healthy = _request(2)
     healthy.state = LlmRequestState.GENERATION_IN_PROGRESS
     executor.active_requests = [request, healthy]
-    executor.kv_cache_manager = SimpleNamespace()
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
     executor.inflight_req_ids = set()
     executor.scheduler = Mock()
     executor.scheduler.schedule_request.side_effect = _ReachedScheduler
@@ -715,7 +715,12 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
     executor.kv_cache_manager = Mock(
-        spec=["update_resources", "is_preemption_pending", "has_pending_preemption"]
+        spec=[
+            "update_resources",
+            "is_preemption_pending",
+            "has_pending_preemption",
+            "prepare_expect_snapshot_points",
+        ]
     )
     executor.kv_cache_manager.is_preemption_pending.return_value = False
     executor.kv_cache_manager.has_pending_preemption.return_value = False
@@ -867,7 +872,7 @@ def test_model_cancellation_keeps_unqualified_scheduler_paths_unchanged(
     request = _request(1)
     request.state = LlmRequestState.GENERATION_IN_PROGRESS
     executor.active_requests = [request]
-    executor.kv_cache_manager = SimpleNamespace()
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
     executor.inflight_req_ids = set()
     executor.scheduler = Mock()
     executor.scheduler.schedule_request.side_effect = _ReachedScheduler

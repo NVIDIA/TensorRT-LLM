@@ -163,6 +163,27 @@ The manager itself answers the rest:
 | `get_disagg_global_layer_ids()`, `get_disagg_pool_view_partition()` | Disaggregated transfer | The transfer IDs of a layer group's layers, and which layers of one pool form separate transfer views |
 | `on_state_transfer_complete(request_ids)` | `PyExecutor`, after a disaggregated transfer completes with speculative decoding enabled | A family manager rebuilds what was not transferred; Kimi K3 and GLM5Next seed their replay slots |
 
+### What shared runtime code asks
+
+The executor, the decoder runner and the KV connector setup ask the owner of a fact. They do not
+check for a recurrent manager class to learn it:
+
+| Hook | When | Use |
+|---|---|---|
+| `has_state_layers(manager)` in `pyexecutor/connectors/kv_cache_layout.py` | `PyExecutor`, when a KV connector is configured on a V2 cache | Whether the layout has an `SsmLayerConfig` layer. A connector has nothing to transfer for such a layer, so the setup is rejected |
+| `prepare_expect_snapshot_points(requests)` | `PyExecutor`, before it schedules the active requests | Fill `LlmRequest.expect_snapshot_points`. The hybrid managers set the snapshot points; the V2 manager moves them onto cache blocks and adds branch and waiter points |
+| `is_context_only_cache` | Decoder warmup, dummy requests and the executor | `True` when the cache serves context requests only. The KDA and FP4 MLA managers report their own flags |
+| `resets_recurrent_state_in_context` on the causal LM | The CUDA-graph runner, before it promotes a one-token context request into a decode graph | `True` when only the context forward resets the state of a fresh slot. `Qwen4ExpForCausalLM` reports it while PLE is active |
+
+`prepare_expect_snapshot_points` and `on_state_transfer_complete` are steps of
+`BaseResourceManager`, which does nothing in either. The default of such a step goes there and
+not on a KV cache manager base: `MambaHybridCacheManagerV2` derives from `KVCacheManagerV2`
+before the `MambaHybridCacheManager` mixin, so a default on the KV base would shadow the mixin's
+implementation. The executor calls both steps on the primary KV cache manager only.
+
+Decoder warmup and per-step metadata still check the manager class, and so does the connector
+setup of a V1 cache, which has no layout to ask.
+
 ## Adding a recurrent family
 
 1. Implement `get_recurrent_state_spec` on the model class. Declare one entry per target layer and

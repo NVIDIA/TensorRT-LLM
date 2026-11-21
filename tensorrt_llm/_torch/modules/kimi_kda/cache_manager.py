@@ -1084,6 +1084,11 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     # worker, which keeps no generation-only V scales or packed V.
     fp4_mla_context_only_cache = False
 
+    @property
+    @override
+    def is_context_only_cache(self) -> bool:
+        return self.kda_context_only is True or self.fp4_mla_context_only_cache is True
+
     @classmethod
     @override
     def accepts_appended_draft_layers(cls) -> bool:

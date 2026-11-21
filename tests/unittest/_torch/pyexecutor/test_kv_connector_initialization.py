@@ -22,19 +22,28 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     KvCacheConnectorSchedulerOutputRequest,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    CppMambaHybridCacheManager,
+    MambaCacheManager,
+    MixedMambaHybridCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, CacheTier, SsmLayerConfig
 
 pytestmark = pytest.mark.cpu_only
 
+RECURRENT_STATE_REJECTION = (
+    "KV Cache Connector is not supported with Mamba / hybrid "
+    "linear-attention models. Mamba layers carry SSM state "
+    "rather than per-token KV blocks, so the connector's "
+    "per-layer load/save hooks have nothing meaningful to "
+    "transfer for those layers."
+)
 
-@pytest.mark.parametrize("windows", [(None,), (64,), (64, None), (32, 64, None)])
-@pytest.mark.parametrize("capacity_only", [False, True])
-def test_v2_connector_registers_layer_groups(
-    monkeypatch: pytest.MonkeyPatch, windows: tuple[int | None, ...], capacity_only: bool
-) -> None:
+
+def _connector_executor(kv_cache_manager: Mock, *, capacity_only: bool = False) -> PyExecutor:
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = Mock(capacity_only=capacity_only, enable_attention_dp=False)
     executor.kv_cache_transceiver = None
@@ -43,12 +52,29 @@ def test_v2_connector_registers_layer_groups(
     executor.max_draft_len = 0
     executor.enable_attention_dp = False
     executor.llm_args = SimpleNamespace(kv_cache_config=None, scheduler_config=None)
-    executor.kv_cache_manager = Mock(spec=KVCacheManagerV2, enable_block_reuse=True)
-    executor.kv_cache_manager.impl = SimpleNamespace(
-        init_config=SimpleNamespace(cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)])
-    )
+    executor.kv_cache_manager = kv_cache_manager
     executor.model_engine = Mock()
     executor.model_engine.model.named_modules.return_value = []
+    return executor
+
+
+def _v2_cache(*layer_types: type, tier: CacheTier = CacheTier.GPU_MEM) -> Mock:
+    cache = Mock(spec=KVCacheManagerV2, enable_block_reuse=True)
+    cache.impl = SimpleNamespace(
+        init_config=SimpleNamespace(
+            cache_tiers=[SimpleNamespace(tier=tier)],
+            layers=[Mock(spec=layer_type) for layer_type in layer_types],
+        )
+    )
+    return cache
+
+
+@pytest.mark.parametrize("windows", [(None,), (64,), (64, None), (32, 64, None)])
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_v2_connector_registers_layer_groups(
+    monkeypatch: pytest.MonkeyPatch, windows: tuple[int | None, ...], capacity_only: bool
+) -> None:
+    executor = _connector_executor(_v2_cache(AttentionLayerConfig), capacity_only=capacity_only)
     layout = SimpleNamespace(groups=[SimpleNamespace(window_size=window) for window in windows])
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.py_executor.build_kv_cache_layout_v2",
@@ -63,6 +89,36 @@ def test_v2_connector_registers_layer_groups(
         windows[0] if len(windows) == 1 else None
     )
     connector.wait_for_initialization.assert_called_once()
+
+
+@pytest.mark.parametrize("tier", [CacheTier.GPU_MEM, CacheTier.HOST_MEM])
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_v2_connector_rejects_a_cache_with_state_layers(
+    tier: CacheTier, capacity_only: bool
+) -> None:
+    # The cache is a plain KVCacheManagerV2: its layout, not its class, is asked.
+    executor = _connector_executor(
+        _v2_cache(AttentionLayerConfig, SsmLayerConfig, tier=tier), capacity_only=capacity_only
+    )
+
+    with pytest.raises(NotImplementedError) as error:
+        executor._maybe_init_kv_connector_manager()
+
+    assert str(error.value) == RECURRENT_STATE_REJECTION
+    executor.kv_connector_manager.wait_for_initialization.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "manager_cls", [CppMambaHybridCacheManager, MixedMambaHybridCacheManager, MambaCacheManager]
+)
+def test_v1_connector_rejects_recurrent_managers(manager_cls: type) -> None:
+    executor = _connector_executor(Mock(spec=manager_cls, is_vswa=False))
+
+    with pytest.raises(NotImplementedError) as error:
+        executor._maybe_init_kv_connector_manager()
+
+    assert str(error.value) == RECURRENT_STATE_REJECTION
+    executor.kv_connector_manager.wait_for_initialization.assert_not_called()
 
 
 @pytest.mark.parametrize(

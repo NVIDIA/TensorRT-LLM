@@ -660,7 +660,7 @@ class DecoderModelForCausalLM(nn.Module,
     # True when a fresh cache slot's recurrent state is reset by the context
     # forward and not by the decode forward. The CUDA-graph runner then keeps
     # one-token context requests out of decode graphs.
-    resets_recurrent_state_in_context: ClassVar[bool] = False
+    resets_recurrent_state_in_context: bool = False
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
