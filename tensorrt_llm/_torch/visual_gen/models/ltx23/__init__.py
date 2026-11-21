@@ -4,8 +4,10 @@
 
 from .pipeline_ltx23 import LTX23Pipeline
 from .pipeline_ltx23_retake import LTX23RetakePipeline
+from .pipeline_ltx23_two_stages import LTX23TwoStagesPipeline
 
 __all__ = [
     "LTX23Pipeline",
     "LTX23RetakePipeline",
+    "LTX23TwoStagesPipeline",
 ]
