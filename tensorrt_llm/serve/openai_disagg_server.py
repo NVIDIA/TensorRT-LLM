@@ -565,7 +565,8 @@ class OpenAIDisaggServer:
                         stream = guard_responses_stream(stream,
                                                         stream_error_event)
                     if hold_headers_until_first_chunk:
-                        stream = await self._start_stream(stream, raw_req)
+                        stream = await self._start_stream(
+                            stream, raw_req, protected=protected_context)
                     self._perf_metrics_collector.total_responses.inc()
                     response_type = ClosingStreamingResponse if protected_context else StreamingResponse
                     return response_type(
@@ -588,7 +589,7 @@ class OpenAIDisaggServer:
     @staticmethod
     async def _start_stream(
             stream: AsyncGenerator[str | bytes, None],
-            raw_request: Request) -> AsyncGenerator[str | bytes, None]:
+            raw_request: Request, *, protected: bool = False) -> AsyncGenerator[str | bytes, None]:
         """Pull a relayed stream's first chunk before the response headers go out.
 
         A worker that fails before its first chunk then raises here and becomes an
@@ -599,6 +600,7 @@ class OpenAIDisaggServer:
         Args:
             stream: The relayed response stream from the disaggregated service.
             raw_request: The client request whose disconnect cancels the wait.
+            protected: Finish the owned stream cleanup even on a repeated cancellation.
 
         Returns:
             `stream` itself when it is already exhausted; otherwise a started
@@ -616,7 +618,18 @@ class OpenAIDisaggServer:
 
         first_chunk_task = asyncio.ensure_future(anext(stream))
         disconnect_task = asyncio.create_task(wait_for_disconnect())
+        listener_stopping = False
         handed_off = False
+
+        async def close_unhanded_stream() -> None:
+            if not first_chunk_task.done():
+                first_chunk_task.cancel()
+            if not listener_stopping and not disconnect_task.done():
+                disconnect_task.cancel()
+            # A generator cannot be closed while its first anext is running.
+            await asyncio.gather(first_chunk_task, disconnect_task, return_exceptions=True)
+            await stream.aclose()
+
         try:
             done, _ = await asyncio.wait(
                 (first_chunk_task, disconnect_task),
@@ -629,8 +642,13 @@ class OpenAIDisaggServer:
             except StopAsyncIteration:
                 return stream
 
+            listener_stopping = True
             disconnect_task.cancel()
-            await asyncio.gather(disconnect_task, return_exceptions=True)
+            stopped = asyncio.gather(disconnect_task, return_exceptions=True)
+            if protected:
+                await asyncio.shield(stopped)
+            else:
+                await stopped
 
             async def relay() -> AsyncGenerator[str | bytes, None]:
                 async with aclosing(stream):
@@ -645,14 +663,20 @@ class OpenAIDisaggServer:
             return relayed
         finally:
             if not handed_off:
-                for task in (first_chunk_task, disconnect_task):
-                    if not task.done():
-                        task.cancel()
-                # A generator cannot be closed while its first anext is running.
-                await asyncio.gather(first_chunk_task,
-                                     disconnect_task,
-                                     return_exceptions=True)
-                await stream.aclose()
+                if not protected:
+                    await close_unhanded_stream()
+                else:
+                    cancelled = False
+                    with anyio.CancelScope(shield=True):
+                        closing = asyncio.create_task(close_unhanded_stream())
+                        while not closing.done():
+                            try:
+                                await asyncio.shield(closing)
+                            except asyncio.CancelledError:
+                                cancelled = True
+                        closing.result()
+                    if cancelled:
+                        raise asyncio.CancelledError
 
     @staticmethod
     async def _close_adapted_context_stream(

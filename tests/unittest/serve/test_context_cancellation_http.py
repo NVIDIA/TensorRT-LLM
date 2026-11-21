@@ -1476,6 +1476,49 @@ async def test_prelude_cancellation_during_successful_stream_watcher_join() -> N
     client.cancel_context_cancellation.assert_awaited_once_with("ctx:8000", "opaque")
 
 
+@pytest.mark.asyncio
+async def test_first_frame_repeated_cancel_finishes_protected_cleanup() -> None:
+    """A second handler cancellation cannot interrupt GEN cleanup or lose the CTX receipt."""
+    entered, closing, release, closed = (asyncio.Event() for _ in range(4))
+    client = SimpleNamespace(cancel_context_cancellation=AsyncMock(return_value="queued"))
+    cancellation = _ContextCancellation(client)
+    cancellation._server, cancellation._token = "ctx:8000", "opaque"
+
+    async def source() -> AsyncGenerator[bytes, None]:
+        try:
+            entered.set()
+            await asyncio.Future()
+            yield b"unreachable"
+        finally:
+            closing.set()
+            await release.wait()
+            closed.set()
+
+    async def receive() -> Message:
+        await asyncio.Future()
+        raise AssertionError("The waiting listener must be cancelled")
+
+    stream = cancellation.stream(source(), False)
+    await stream.__anext__()
+    task = asyncio.create_task(
+        OpenAIDisaggServer._start_stream(stream, Request({"type": "http"}, receive), protected=True)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        await asyncio.wait_for(closing.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
+        try:
+            assert task.cancelled() and closed.is_set() and stream.ag_frame is None
+            client.cancel_context_cancellation.assert_awaited_once_with("ctx:8000", "opaque")
+        finally:
+            await stream.aclose()
+
+
 @pytest.mark.parametrize("rank,supported", [(0, True), (0, False), (0, 1), (1, True)])
 def test_worker_capability_uses_running_engine_and_rank(rank: int, supported: object) -> None:
     """Only the qualified rank-zero executor advertises independent retirement."""
