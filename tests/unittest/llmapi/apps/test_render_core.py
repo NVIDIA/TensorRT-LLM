@@ -907,7 +907,7 @@ class TestControlTokensAsText:
                 tokenizer, clean.token_ids, token
             )
 
-    def test_a_tool_response_shaped_message_cannot_switch_the_marking_off(self, tokenizer) -> None:
+    def test_special_tokens_stay_marked_in_a_tool_response_shaped_message(self, tokenizer) -> None:
         # Marked tool-response tags fail the template's startswith check and change the prompt;
         # the special tokens inside are still marked.
         def request(inner):
@@ -963,6 +963,25 @@ class TestControlTokensAsText:
             truncate_prompt_tokens=5,
         )
         assert parsed.token_ids == [tokenizer.bos_token_id, *full[-4:]]
+        # A limit the special tokens use up keeps none of the prompt.
+        assert ids(add_special_tokens=True, truncate_prompt_tokens=1) == [tokenizer.bos_token_id]
+
+    def test_truncation_on_the_right_keeps_the_start_of_the_prompt(self) -> None:
+        tokenizer = make_tokenizer(name=LLAMA)
+        full = render_chat(
+            chat_request(messages=_user(LLAMA_TURN_TEXT)), resources(tokenizer)
+        ).token_ids
+        tokenizer.truncation_side = "right"
+
+        result = render_chat(
+            chat_request(
+                messages=_user(LLAMA_TURN_TEXT), add_special_tokens=True, truncate_prompt_tokens=5
+            ),
+            resources(tokenizer),
+        )
+
+        assert result.text is None
+        assert result.token_ids == [tokenizer.bos_token_id, *full[:4]]
 
     def test_markers_in_the_input_cannot_fake_a_marked_token(self, tokenizer) -> None:
         start, end = "\U000f0000", "\U000f0001"
