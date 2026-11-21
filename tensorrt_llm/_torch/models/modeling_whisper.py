@@ -640,6 +640,9 @@ class WhisperInputProcessor(InputProcessor):
                 f"positions, but config.max_source_positions is "
                 f"{self.config.max_source_positions}."
             )
+        # Encoder positions every request produces; requests carry it and the
+        # cross-KV pool is sized from it.
+        self.encoder_output_len = encoder_positions
         self._decoder_prompt = self._build_decoder_prompt()
 
     # The decoder prompt contains no multimodal placeholder tokens (the audio
@@ -800,7 +803,7 @@ class WhisperInputProcessor(InputProcessor):
                     "encoder_input_features": input_features.contiguous(),
                     # Post-conv position count (mel frames // 2): the cross-KV
                     # capacity every downstream consumer sizes against.
-                    "encoder_output_len": int(self.config.max_source_positions),
+                    "encoder_output_len": self.encoder_output_len,
                 }
             }
         }
@@ -865,6 +868,9 @@ class WhisperModel(nn.Module):
 @register_auto_model("WhisperForConditionalGeneration")
 class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
     """Whisper encoder-decoder model with LM head."""
+
+    # The native audio path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"audio": frozenset()}
 
     def __init__(self, model_config: ModelConfig[WhisperConfig]):
         super().__init__()

@@ -7,9 +7,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm as op
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm as op
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
     fp4_quantize,
 )
 
@@ -80,7 +80,15 @@ def test_certified_cells(cell) -> None:
     alpha = (1.0 / (act_gs * weight_gs)).float().reshape(1)
 
     with validating(op):
-        out = op(act, weight, act_sf, weight_sf, alpha, torch.bfloat16)
+        out = op(
+            act,
+            weight,
+            act_sf,
+            weight_sf,
+            alpha,
+            torch.bfloat16,
+            allowed_backends=spec.get("backend", "cutlass,cublaslt,cuda_core"),
+        )
     assert out.shape == (spec["m"], spec["n"])
     _compare(out, op.reference(act, weight, act_sf, weight_sf, alpha, torch.bfloat16))
 

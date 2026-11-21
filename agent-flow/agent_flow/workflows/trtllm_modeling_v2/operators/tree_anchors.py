@@ -43,7 +43,7 @@ class Anchor:
     """One thing the workflow reads or points at, and how to find it after it moves."""
 
     key: str
-    #: What it is, as ``tree_map.md`` and the lint say it.
+    #: What it is, as ``tree_map.md`` says it.
     concept: str
     #: Repository-relative path it was last seen at; looked at first.
     hint: str
@@ -61,8 +61,6 @@ class Anchor:
     many: bool = False
     #: How a person or an agent finds it by hand, for ``tree_map.md``.
     search: str = ""
-    #: What a run loses when it is missing, for the lint.
-    consequence: str = ""
 
     def matches(self, text: str) -> re.Match[str] | None:
         return re.search(self.marker, text, re.M) if self.marker else None
@@ -107,7 +105,6 @@ ANCHORS: dict[str, Anchor] = _anchors(
         ("tensorrt_llm",),
         marker=r"^class \w+\((?:\w+\.)*AttentionBackend\b",
         search="classes that subclass `AttentionBackend`",
-        consequence="the prior-art scan skips the attention backends",
     ),
     Anchor(
         "custom_ops",
@@ -117,7 +114,6 @@ ANCHORS: dict[str, Anchor] = _anchors(
         ("tensorrt_llm",),
         marker=r"torch\.library\.custom_op\(|@torch\.library\.register_fake\b",
         search="files that register ops with `torch.library.custom_op`",
-        consequence="the prior-art scan skips the custom ops",
     ),
     Anchor(
         "kernels",
@@ -127,7 +123,6 @@ ANCHORS: dict[str, Anchor] = _anchors(
         ("tensorrt_llm",),
         dirname="kernels",
         search="directories named `kernels` under `tensorrt_llm/`",
-        consequence="the prior-art scan skips the Python kernels",
     ),
     Anchor(
         "moe_modules",
@@ -137,27 +132,6 @@ ANCHORS: dict[str, Anchor] = _anchors(
         ("tensorrt_llm",),
         marker=r"^class \w+\((?:\w+\.)*(?:MoE|MoEImplBase)\b",
         search="classes that subclass `MoE` or `MoEImplBase`",
-        consequence="the prior-art scan skips the MoE modules",
-    ),
-    Anchor(
-        "builtin_models",
-        "built-in (stock) models",
-        "tensorrt_llm/_torch/models",
-        DIR,
-        ("tensorrt_llm",),
-        marker=r"register_auto_model\(",
-        search="modules that call `register_auto_model`",
-        consequence="the lint cannot tell whether the stock path boots this architecture",
-    ),
-    Anchor(
-        "builtin_model_index",
-        "the lazy index of built-in architectures",
-        "tensorrt_llm/_torch/models/_arch_index.py",
-        FILE,
-        ("tensorrt_llm",),
-        marker=r"^MODEL_ARCH_TO_MODULE\s*(?::[^=\n]*)?=",
-        search="`MODEL_ARCH_TO_MODULE`",
-        consequence="architectures only the lazy index registers are not seen",
     ),
     Anchor(
         "kv_cache_dtypes",
@@ -167,7 +141,6 @@ ANCHORS: dict[str, Anchor] = _anchors(
         ("tensorrt_llm",),
         marker=r"_VALID_KV_CACHE_DTYPES\s*(?::[^=\n]*)?=",
         search="`_VALID_KV_CACHE_DTYPES`",
-        consequence="a KV-cache dtype the engine does not load is not caught before launch",
     ),
     Anchor(
         "fmha_head_dims",
@@ -178,7 +151,6 @@ ANCHORS: dict[str, Anchor] = _anchors(
         marker=r"HeadDimV must be ([0-9, ]+?),? or a multiple of (\d+)",
         name="*.h",
         search='the check that says "HeadDimV must be"',
-        consequence="a head dimension the FMHA has no kernel for is not named before the survey",
     ),
     Anchor(
         "unit_tests",
@@ -348,11 +320,6 @@ def read(repo: str | Path | None, anchor: Anchor | str) -> tuple[str, re.Match[s
     return (text, match, found.where) if match else None
 
 
-def missing(repo: str | Path | None, keys: Iterable[str]) -> list[Resolution]:
-    """The anchors among ``keys`` this checkout has nowhere."""
-    return [r for r in (resolve(repo, k) for k in keys) if not r.found]
-
-
 def render_map(repo: str | Path | None, found: Sequence[Resolution] | None = None) -> str:
     """``tree_map.md``: where each anchor is in the checkout at ``repo``, and how to find it.
 
@@ -390,7 +357,6 @@ __all__ = [
     "MAX_SEARCH_BYTES",
     "Anchor",
     "Resolution",
-    "missing",
     "read",
     "render_map",
     "resolve",

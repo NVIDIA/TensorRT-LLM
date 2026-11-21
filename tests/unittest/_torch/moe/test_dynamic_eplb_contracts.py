@@ -878,10 +878,18 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/py_executor.py",
         "PyExecutor",
-        {"shutdown", "_release_execution_resources", "_release_execution_pools"},
+        {
+            "shutdown",
+            "_release_execution_resources",
+            "_release_execution_pools",
+            "_shutdown_resource_managers",
+        },
         {
             "AsyncWorkerMixin": AsyncWorkerMixin,
             "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+            "monitor_providers": SimpleNamespace(
+                unregister_providers_of=lambda manager: events.append("monitor_unregister")
+            ),
         },
     )
     worker_cls = _extract_class(
@@ -912,6 +920,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor._kv_connector_failed = False
     executor.dist = SimpleNamespace(pp_size=1)
     executor._shutdown_sleep_wakeup_listeners = lambda: events.append("listener_shutdown")
+    executor._release_memory_monitor = lambda: events.append("monitor_release")
     executor.encoder_launch_executor = None
     executor.worker_started = True
     executor.resource_manager = SimpleNamespace(
@@ -922,6 +931,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor.virtual_memory_pools = RetryingPool()
     executor.sampler = Sampler()
     executor.dwdp_manager = DwdpManager()
+    executor.dense_dwdp_manager = None
 
     def terminal_cleanup(*, local_safe):
         events.append(("terminal_cleanup", local_safe))
@@ -952,8 +962,10 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         "profile_cleanup",
         "worker_join",
         "listener_shutdown",
+        "monitor_release",
         ("sampler_stop", 1),
         "release_graphs",
+        "monitor_unregister",
         "resource_shutdown",
         ("pool_delete", 1),
         ("terminal_cleanup", False),
@@ -1799,7 +1811,6 @@ def test_route_wait_occurs_after_independent_staging():
     def run():
         trace = []
         owner = impl()
-        owner._last_staged_T = {8: 8}
         owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
         bufs = SimpleNamespace(
             **{
@@ -1823,7 +1834,6 @@ def test_route_wait_occurs_after_independent_staging():
     assert trace.index("copy:activation") < trace.index("wait")
     assert trace.index("copy:topk_weights") < trace.index("wait")
     assert trace.index("wait") < trace.index("copy:topk_idx_local")
-    assert owner._last_staged_T[8] == 4
 
 
 @pytest.mark.parametrize("has_sm_budget", [True, False])
@@ -1866,6 +1876,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     _extract_function(source, "_fp4_quantize_has_sm_budget", namespace)
     impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
     owner = impl()
+    owner._shared_activation_target = lambda num_tokens: None
     owner.fc31_input_scale = "scale"
 
     owner.quantize_input(Activation(3, 64))
@@ -1996,6 +2007,7 @@ def _autotune_helpers(torch):
         "_DEFAULT_TOKEN_BACK_READY_GRANULARITY",
         "_TOKEN_BACK_READY_GRANULARITIES",
         "_TACTIC_LEN",
+        "_TACTIC_LEN_V5",
         "_TACTIC_LEN_V4",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",
@@ -2404,11 +2416,16 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         "get_active_route_capture": lambda: None,
         "torch": SimpleNamespace(int32="int32", float32="float32"),
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
+        "RouterLogitPartials": type("RouterLogitPartials", (), {}),
         "MoERunContext": lambda **kwargs: SimpleNamespace(**kwargs),
     }
     _extract_function(source, "_record_routes", namespace)
     _extract_function(source, "_leading_rows", namespace)
-    scheduler_cls = _extract_class(source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace)
+    _extract_function(source, "_num_rows", namespace)
+    _extract_class(source, "MoEScheduler", {"_try_fused_route_quant"}, namespace)
+    scheduler_cls = _extract_class(
+        source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace, bases=("MoEScheduler",)
+    )
 
     plan = SimpleNamespace(reserved_sms=4)
     layer = (
@@ -2452,7 +2469,11 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _load_balancer_route=route,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
         _load_balancer_done_set_cpu_stage=lambda is_last_call: trace.append("done_set_cpu"),
+        _using_dynamic_load_balancer=lambda: False,
+        _warmup_placement_route_counters=lambda row_offset: None,
+        _load_balancer_count_warmup=lambda *args: None,
         backend=SimpleNamespace(
+            fused_route_quant_enabled=False,
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             run_moe=run_moe,
@@ -2471,30 +2492,30 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
-    tail = [("quantize", {}), ("bucket", 6)]
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
         # The layer has no CPU stage or host statistics, so only the post-MoE
         # hook that releases its plan runs.
         expected = [
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
             ("quantize", {"reserved_sms": 4}),
-            ("bucket", 6),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]
     elif mode == "standard":
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             "done_wait_gpu",
             ("update_statistic", "logical"),
             ("route", "logical"),
             ("statistic", "slots"),
             ("calibrator", "slots"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
             "done_set_cpu",
@@ -2502,9 +2523,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     else:
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed logical", None),
             "start_set_cpu",
             "done_set_cpu",

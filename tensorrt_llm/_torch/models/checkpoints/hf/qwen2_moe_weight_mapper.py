@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 from torch import nn
 
@@ -5,6 +8,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
 def _unfuse_moe_expert_weights(weights: dict) -> dict:
@@ -57,7 +61,7 @@ def _unfuse_moe_expert_weights(weights: dict) -> dict:
     return updated
 
 
-@register_mapper("HF", "Qwen2MoeForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen2MoeForCausalLM")
 class Qwen2MoeHfWeightMapper(HfWeightMapper):
 
     def is_special_instance_module(self, module: nn.Module) -> bool:

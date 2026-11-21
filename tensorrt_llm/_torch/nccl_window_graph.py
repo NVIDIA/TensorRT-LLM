@@ -112,6 +112,19 @@ def nccl_window_graph_capture(
             yield
 
 
+def promote_synchronized_nccl_window_releases() -> None:
+    """Make windows released so far reusable from any stream, after a device sync.
+
+    A released window stays bound to its release stream until promoted. Captures that
+    run eager work first (breakable prefill warmup) must promote before that work, or
+    best-fit depends on whether a rank's capture stream equals the release stream, and
+    a rank that misses enters the collective window registration alone.
+    """
+    release_epoch = torch.ops.trtllm.get_nccl_window_buffer_release_epoch()
+    torch.cuda.synchronize()
+    torch.ops.trtllm.promote_nccl_window_buffer_releases(torch.cuda.current_device(), release_epoch)
+
+
 def abandon_nccl_window_graph_owner(pool: Any) -> None:
     """Forget a locally failed pool without making its C++ buffers reusable.
 
@@ -131,3 +144,18 @@ def release_nccl_window_graph_owner(pool: Any) -> None:
         if owner is not None:
             torch.ops.trtllm.release_nccl_window_graph_owner(owner)
             del _pool_owners[key]
+
+
+@contextlib.contextmanager
+def nccl_window_allocation_suppressed() -> Iterator[None]:
+    """Serve NCCL-window requests on this thread from plain memory.
+
+    The window pool is left untouched, so work that does not run in SPMD order
+    across ranks cannot make a later request miss on only some ranks and enter
+    the collective registration alone.
+    """
+    previous = torch.ops.trtllm.set_nccl_window_allocation_suppressed(True)
+    try:
+        yield
+    finally:
+        torch.ops.trtllm.set_nccl_window_allocation_suppressed(previous)

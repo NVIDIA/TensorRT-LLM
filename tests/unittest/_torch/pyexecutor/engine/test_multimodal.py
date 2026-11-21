@@ -236,6 +236,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     item_scheduling: bool,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor import _util, model_engine
+    from tensorrt_llm._torch.pyexecutor.engine import model_setup
 
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
         encoder_cuda_graph_modality = "vision"
@@ -257,7 +258,10 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     model.encoder = Encoder(mm_config)
     model.config = SimpleNamespace(torch_dtype=torch.float32)
     model.model_config = SimpleNamespace(
-        pretrained_config=model.config, mapping=mapping, sparse_attention_config=None
+        pretrained_config=model.config,
+        mapping=mapping,
+        sparse_attention_config=None,
+        is_generation=True,
     )
     llm_args = SimpleNamespace(
         encode_only=False,
@@ -291,7 +295,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     ):
         monkeypatch.setattr(_util, name, Mock(return_value=False))
     monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
-    monkeypatch.setattr(model_engine, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
     monkeypatch.setattr(model_engine, "create_input_processor", Mock(return_value=object()))
     monkeypatch.setattr(
         model_engine, "resolve_mrope_position_deltas_cache", Mock(return_value=None)
@@ -312,10 +316,9 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     )
     engine_cls = model_engine.ModelEngine
     monkeypatch.setattr(engine_cls, "_validate_breakable_cuda_graph_compatibility", Mock())
-    monkeypatch.setattr(engine_cls, "_init_model_capacity", engine_cls._init_max_num_tokens)
     monkeypatch.setattr(engine_cls, "__del__", lambda self: None)
     monkeypatch.setattr(
-        model_engine,
+        model_setup,
         "get_attention_backend",
         Mock(side_effect=RuntimeError("encoder graph setup complete")),
     )
@@ -339,6 +342,53 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     assert mm_config.encoder_cuda_graph["vision"].max_num_tokens is None
     model.encoder.build_runner.assert_called_once()
     model.encoder._blocks_graph_runner.capture_all.assert_called_once_with(torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    ("encoder_max_num_tokens", "max_num_tokens", "tower_budget"),
+    [(None, 4096, 4096), (1024, 4096, 1024), (None, None, 128)],
+    ids=["configured", "encoder_budget", "resolved"],
+)
+def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_max_num_tokens: int | None,
+    max_num_tokens: int | None,
+    tower_budget: int,
+) -> None:
+    """A merged item fits a prompt shorter than its patches, so the clamped budget is too small."""
+    from tensorrt_llm._torch.pyexecutor.engine import model_setup
+
+    model = SimpleNamespace(model_config=SimpleNamespace())
+    loader = Mock()
+    loader.load.return_value = (model, None)
+    for name in ("init_process_setup", "configure_autotuner_nvmmh", "prepare_loaded_model"):
+        monkeypatch.setattr(model_setup, name, Mock())
+    monkeypatch.setattr(model_setup, "create_model_loader", Mock(return_value=loader))
+    monkeypatch.setattr(model_setup, "resolve_max_seq_len", lambda model, max_seq_len: max_seq_len)
+    monkeypatch.setattr(model_setup, "create_engine_input_processor", Mock())
+    monkeypatch.setattr(
+        model_setup, "compile_model", Mock(return_value=SimpleNamespace(model=model))
+    )
+    monkeypatch.setattr(model_setup.MultimodalEncoderRunner, "create", Mock())
+    setup_metadata, setup_graphs = Mock(), Mock()
+    monkeypatch.setattr(model_setup, "setup_mm_encoder_attn_metadata", setup_metadata)
+    monkeypatch.setattr(model_setup, "setup_mm_encoder_cuda_graphs", setup_graphs)
+    llm_args = SimpleNamespace(
+        max_num_tokens=max_num_tokens,
+        encoder_max_num_tokens=encoder_max_num_tokens,
+        get_runtime_sizes=lambda: (1, max_num_tokens, 128, 1),
+        multimodal_config=None,
+        cuda_graph_config=None,
+        prefill_capture_num_tokens=None,
+    )
+
+    with model_setup.build_mm_encoder_runner(
+        llm_args, model_path="", checkpoint_loader=Mock(), mapping=Mapping(), dist=None
+    ) as built:
+        assert built.max_num_tokens == 128
+
+    assert setup_metadata.call_args.args[2] == tower_budget
+    assert setup_graphs.call_args.kwargs["max_num_tokens"] == tower_budget
 
 
 @pytest.mark.parametrize("enable_padding", [False, True])
@@ -536,6 +586,40 @@ def test_item_encoder_classifies_output_count_contract_error() -> None:
 
     with pytest.raises(MultimodalEncoderRequestError, match="one output per item"):
         mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+
+
+def test_item_encoder_drains_replayed_host_functions_first() -> None:
+    """The item path drains replayed host functions before it runs the encoder."""
+    calls = []
+
+    class _Model(MultimodalModelMixin):
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        def forward_multimodal_encoder_items(
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor]:
+            calls.append("encode")
+            return []
+
+    mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    request = make_mm_request(1, [4])
+    _bind_items(mm_item_scheduler, request)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.engine.multimodal.drain_captured_hostfuncs",
+            side_effect=lambda: calls.append("drain"),
+        ),
+        # The empty output ends the forward right after the encoder call.
+        pytest.raises(MultimodalEncoderRequestError, match="one output per item"),
+    ):
+        mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+
+    assert calls == ["drain", "encode"]
 
 
 @pytest.mark.parametrize("failure_stage", ["prepare", "forward"])

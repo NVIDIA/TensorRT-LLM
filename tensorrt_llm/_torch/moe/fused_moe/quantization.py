@@ -39,13 +39,15 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
-    float4_e2m1x2, float4_sf_dtype,
-    get_reorder_rows_for_gated_act_gemm_row_indices,
+    NVFP4_PLUS_SF_VEC_SIZE, NVFP4_SF_VEC_SIZE, e8m0_to_ue5m3, float4_e2m1x2,
+    float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
     nvfp4_scaling_vector_size)
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from .activation import (materialize_activation_params,
+                         resolve_activation_support)
 from .interface import MoEWeightLoadingMode
 
 # The declarations aligns with moe_kernels.h
@@ -61,6 +63,11 @@ FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_K = 0
 TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_MN = 1
 TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K = 2
+# The NVFP4 AWQ loader keeps one pre_quant_scale per MoE layer, so the experts of
+# a layer must agree on it within this tolerance. DWDP setup, where each rank
+# loads its own experts, holds the ranks' copies to the same tolerance.
+PRE_QUANT_SCALE_RTOL = 1e-5
+PRE_QUANT_SCALE_ATOL = 1e-8
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -138,12 +145,16 @@ class FusedMoEQuantScalesMXFP8(NamedTuple):
 
 def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
         dst_w3_w1_weight: torch.Tensor,
-        cache_permute_indices: Dict[tuple[tuple[int, int, int], str],
-                                    torch.Tensor],
+        cache_permute_indices: Dict[tuple, torch.Tensor],
         epilogue_tile_m: int,
         num_elts_per_sf: Union[None, int] = None,
         is_gated_act_gemm: bool = True) -> torch.Tensor:
-    key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1))
+    # The gated flag is part of the key. The quant methods keep one cache per
+    # class, so a gated layer and a non-gated one with the same w3/w1 shape
+    # would otherwise share an entry, and the second would get the row order
+    # of the first.
+    gated = bool(is_gated_act_gemm)
+    key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1), gated)
 
     if key not in cache_permute_indices:
         # Get permute indices and chain them together
@@ -880,8 +891,9 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
     block_k = 64
     use_shuffled_weight = True
     weight_layout = TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
-    _cache_permute_indices: Dict[tuple[tuple[int, ...], str, int],
-                                 torch.Tensor] = {}
+    # One cache for the class, shared by every layer, keyed by shape (and, for
+    # w3/w1, by the gated flag).
+    _cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
     def create_weights(self, module: torch.nn.Module):
         super().create_weights(module)
@@ -903,8 +915,7 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
             self._cache_permute_indices,
             epilogue_tile_m=128)
 
-    def _convert_to_block_major_k_layout(
-            self, input_tensor: torch.Tensor) -> torch.Tensor:
+    def _block_major_k_view(self, input_tensor: torch.Tensor) -> torch.Tensor:
         if input_tensor.dim() != 2:
             raise ValueError(
                 f"input_tensor must be 2D for BlockMajorK conversion, got shape={tuple(input_tensor.shape)}"
@@ -915,44 +926,227 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
                 f"K dimension ({k}) must be divisible by block_k ({self.block_k}) for BlockMajorK layout."
             )
         return input_tensor.view(m, k // self.block_k,
-                                 self.block_k).permute(1, 0, 2).contiguous()
+                                 self.block_k).permute(1, 0, 2)
 
-    def _prepare_bf16_weight_for_trtllm_gen(
-            self, weight: torch.Tensor,
-            permute_indices: torch.Tensor) -> torch.Tensor:
-        shuffled_weight = weight[permute_indices.to(weight.device)].contiguous()
-        if self.weight_layout == TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K:
-            return self._convert_to_block_major_k_layout(shuffled_weight)
-        raise ValueError(
-            f"Unsupported TRTLLM-Gen BF16 weight_layout={self.weight_layout}")
+    def _kernel_layout_view(self, weight: torch.Tensor,
+                            permute_indices: torch.Tensor) -> torch.Tensor:
+        """One expert's ``[M, K]`` weight in the kernel layout, as a view.
+
+        Rows are shuffled by ``permute_indices``, then split into BlockMajorK
+        (``[K / 64, M, 64]``).
+        """
+        if self.weight_layout != TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K:
+            raise ValueError(
+                f"Unsupported TRTLLM-Gen BF16 weight_layout={self.weight_layout}"
+            )
+        return self._block_major_k_view(weight[permute_indices.to(
+            weight.device)])
+
+    def _w3_w1_to_kernel_layout(self, module: torch.nn.Module,
+                                expert: torch.Tensor) -> torch.Tensor:
+        """One expert's w3/w1 ``[M, K]`` in the kernel layout, as a view.
+
+        The single definition of that layout for the first load, an in-place
+        refit and the online-EPLB host copies, which must all hold the same
+        bytes. A gated activation also reorders the rows for its fused GEMM.
+        The permute indices are cached per shape, so a call per expert costs a
+        lookup.
+        """
+        permute_indices = self._get_w3_w1_permute_indices(
+            expert, is_gated_act_gemm=module.is_gated_activation)
+        return self._kernel_layout_view(expert, permute_indices)
+
+    def _w2_to_kernel_layout(self, expert: torch.Tensor) -> torch.Tensor:
+        """One expert's w2 ``[M, K]`` in the kernel layout, as a view. The w2
+        counterpart of ``_w3_w1_to_kernel_layout``."""
+        return self._kernel_layout_view(expert,
+                                        self._get_w2_permute_indices(expert))
+
+    def _use_inplace_refit(self, module: torch.nn.Module) -> bool:
+        """Whether a weight reload can write each expert straight into the
+        kernel-layout tensors the layer already holds.
+
+        The kernel layout of an expert depends on that expert alone, so it can
+        be converted as soon as its tensors arrive. Two cases are not updated
+        in place. A layer that is not in the kernel layout yet (no experts on
+        this rank, or not finalized yet) has no converted tensors, so the
+        reload writes its creation-layout tensors and finalize converts them.
+        A gated activation interleaves the w3 and w1 rows of an expert, which
+        a partial reload may deliver in different calls, so a gated layer is
+        re-created in the creation layout, a second copy of the routed experts
+        until finalize.
+        """
+        metadata = module.rebuild_tensor_metadata
+        if "w3_w1_weight" not in metadata or "w2_weight" not in metadata:
+            return False
+        if module.is_gated_activation:
+            logger.info_once(
+                "BF16 TRTLLM-Gen MoE weight reload re-creates the routed "
+                "experts of a gated layer in the creation layout (a second "
+                "copy until finalize): a gated activation interleaves w3 and w1 "
+                "of an expert, which a reload may deliver in different calls.",
+                key="bf16_trtllm_gen_refit_recreate_gated")
+            return False
+        return True
+
+    def pre_reload_weights(self, module: torch.nn.Module) -> None:
+        """Prepare the expert weights for a reload.
+
+        When ``_use_inplace_refit`` allows it, the kernel-layout tensors
+        (``[experts, K / 64, M, 64]``) stay registered: CUDA graphs captured
+        their addresses, and ``load_expert_*`` overwrite one expert slot at a
+        time, so an expert the reload does not deliver keeps its weights.
+        Otherwise the base class re-creates, in its creation shape, every
+        tensor that ``rebuild_tensor_metadata`` lists (the expert stacks of a
+        converted gated layer; none for a layer not converted yet), and
+        ``process_weights_after_loading`` converts the layer again. Experts a
+        reload does not deliver into a re-created stack are left
+        uninitialized.
+        """
+        if not self._use_inplace_refit(module):
+            super().pre_reload_weights(module)
+            return
+        for param_name in ("w3_w1_weight", "w2_weight"):
+            module.register_parameter(
+                param_name, module.rebuild_tensor_metadata[param_name]['param'])
+
+    def _empty_expert_in_creation_layout(self, module: torch.nn.Module,
+                                         param_name: str,
+                                         device: torch.device) -> torch.Tensor:
+        meta = module.rebuild_tensor_metadata[param_name]['meta']
+        return torch.empty(meta.shape[1:], dtype=meta.dtype, device=device)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor | None,
+                                 w3_weight: torch.Tensor | None,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False) -> None:
+        if dst_w3_w1_weight.dim() == 2:
+            # Creation layout [M, K]: the first load, or a re-created layer.
+            super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                             dst_w3_w1_weight,
+                                             allow_partial_loading)
+            return
+        # Kernel-layout slot [K / 64, M, 64], kept by pre_reload_weights.
+        if module.is_gated_activation and ((w1_weight is None) != (w3_weight
+                                                                   is None)):
+            # The slot interleaves both halves, so one half alone cannot be
+            # written; pre_reload_weights re-creates a gated layer instead.
+            raise ValueError(
+                "A gated BF16 TRTLLM-Gen MoE layer in the kernel layout needs "
+                "w1 and w3 of an expert in one load; call pre_reload_weights() "
+                "before a partial reload")
+        if w1_weight is None:
+            if not allow_partial_loading:
+                raise ValueError(
+                    "w1_weight is missing for an expert of a BF16 TRTLLM-Gen "
+                    "MoE layer, and allow_partial_loading is not set")
+            return
+        expert = self._empty_expert_in_creation_layout(module, "w3_w1_weight",
+                                                       dst_w3_w1_weight.device)
+        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight, expert,
+                                         allow_partial_loading)
+        dst_w3_w1_weight.copy_(self._w3_w1_to_kernel_layout(module, expert))
+
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor | None,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False) -> None:
+        if dst_w2_weight.dim() == 2:
+            # Creation layout [M, K]: the first load, or a re-created layer.
+            super().load_expert_w2_weight(module, w2_weight, dst_w2_weight,
+                                          allow_partial_loading)
+            return
+        # Kernel-layout slot [K / 64, M, 64], kept by pre_reload_weights.
+        if w2_weight is None:
+            if not allow_partial_loading:
+                raise ValueError(
+                    "w2_weight is missing for an expert of a BF16 TRTLLM-Gen "
+                    "MoE layer, and allow_partial_loading is not set")
+            return
+        expert = self._empty_expert_in_creation_layout(module, "w2_weight",
+                                                       dst_w2_weight.device)
+        super().load_expert_w2_weight(module, w2_weight, expert,
+                                      allow_partial_loading)
+        dst_w2_weight.copy_(self._w2_to_kernel_layout(expert))
+
+    def _transform_expert_stacks_for_trtllm_gen(
+            self, module: torch.nn.Module, w3_w1: torch.Tensor,
+            w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rewrite stacked expert weights into shuffled BlockMajorK.
+
+        Each expert goes through the per-expert conversion an in-place refit
+        uses (``_w3_w1_to_kernel_layout`` / ``_w2_to_kernel_layout``), so the
+        two cannot drift apart. An empty stack (a rank that stages no shared
+        experts) is returned unchanged.
+        """
+        if w3_w1.shape[0] == 0 or w2.shape[0] == 0:
+            return w3_w1, w2
+
+        # The module's slots live on its GPU; transform there rather than on
+        # whatever the current CUDA device happens to be.
+        compute_device = module.w3_w1_weight.device
+
+        def transform(weights: torch.Tensor,
+                      to_kernel_layout: Callable) -> torch.Tensor:
+            # One expert at a time on the GPU: the gather is far cheaper there,
+            # while a host-resident stack never needs a device-sized allocation
+            # of its own. Each expert returns to the stack's original device.
+            return torch.stack([
+                to_kernel_layout(expert.to(compute_device)).contiguous().to(
+                    weights.device) for expert in weights
+            ])
+
+        def w3_w1_to_kernel_layout(expert: torch.Tensor) -> torch.Tensor:
+            return self._w3_w1_to_kernel_layout(module, expert)
+
+        return (transform(w3_w1, w3_w1_to_kernel_layout),
+                transform(w2, self._w2_to_kernel_layout))
 
     def process_weights_after_loading(self, module: torch.nn.Module):
+        if module.w3_w1_weight.dim() == 4:
+            # Already in the kernel layout [experts, K / 64, M, 64], from an
+            # earlier conversion or an in-place reload that wrote each
+            # delivered expert as it arrived; converting again would shuffle
+            # the rows twice.
+            return
         if module.w3_w1_weight.numel() == 0 or module.w2_weight.numel() == 0:
             module._trtllm_gen_layout_transform_pending = False
             return
 
-        w3_w1_permute_indices = self._get_w3_w1_permute_indices(
-            module.w3_w1_weight.data[0],
-            is_gated_act_gemm=getattr(module, "is_gated_activation", True))
-        w2_permute_indices = self._get_w2_permute_indices(
-            module.w2_weight.data[0])
-
-        processed_w3_w1 = torch.stack([
-            self._prepare_bf16_weight_for_trtllm_gen(expert,
-                                                     w3_w1_permute_indices)
-            for expert in module.w3_w1_weight.data
-        ])
-        processed_w2 = torch.stack([
-            self._prepare_bf16_weight_for_trtllm_gen(expert, w2_permute_indices)
-            for expert in module.w2_weight.data
-        ])
-
+        processed_w3_w1, processed_w2 = self._transform_expert_stacks_for_trtllm_gen(
+            module, module.w3_w1_weight.data, module.w2_weight.data)
         replace_parameter_and_save_metadata(module, "w3_w1_weight",
                                             processed_w3_w1,
                                             module.rebuild_tensor_metadata)
         replace_parameter_and_save_metadata(module, "w2_weight", processed_w2,
                                             module.rebuild_tensor_metadata)
         module._trtllm_gen_layout_transform_pending = False
+
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+        """Put the online-EPLB host copies in the same layout as the slots.
+
+        A migration copies an expert's host copy into a slot byte for byte, so
+        both must hold the same layout. The host copies are staged in the
+        layout the slots had when ``load_weights`` ran, the checkpoint's MajorK
+        on a first load, and ``process_weights_after_loading`` has rewritten
+        the slots into shuffled BlockMajorK since. Like that device transform,
+        this goes by rank: a stack of BlockMajorK experts is 4-D, a stack of
+        MajorK experts 3-D, so the host copies are never converted twice.
+        """
+        if module.w3_w1_weight.dim() != 4:
+            # The device transform skips empty weights, so the slots are still
+            # MajorK and the host copies must stay MajorK as well.
+            return
+        if module.local_shared_w3_w1_tensors.dim() == 4:
+            # Already BlockMajorK, like the slots.
+            return
+        (module.local_shared_w3_w1_tensors, module.local_shared_w2_tensors) = (
+            self._transform_expert_stacks_for_trtllm_gen(
+                module, module.local_shared_w3_w1_tensors,
+                module.local_shared_w2_tensors))
 
     def transform_weights(self, module: torch.nn.Module) -> None:
         if getattr(module, "_trtllm_gen_layout_transform_pending", False):
@@ -3008,6 +3202,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                               local_shared_w2_scale_tensors,
                                               module.tmp_shared_weight_scale_2)
 
+    # Whether the checkpoint carries the NVFP4 global scales (weight_scale_2
+    # and input_scale).
+    checkpoint_has_global_scales = True
+
     # Whether this backend's kernel consumes the gate and up global weight
     # scales as two separate scalars. trtllm-gen does
     # (``output1_scale_gate_scalar`` for the gate half,
@@ -3118,7 +3316,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 (all_w3[i], w3_reference, "w3.pre_quant_scale"),
                 (all_w1[i], w1_reference, "w1.pre_quant_scale")
             ]:
-                if not torch.allclose(scale, ref, rtol=1e-5, atol=1e-8):
+                if not torch.allclose(scale,
+                                      ref,
+                                      rtol=PRE_QUANT_SCALE_RTOL,
+                                      atol=PRE_QUANT_SCALE_ATOL):
                     max_diff = (scale - ref).abs().max()
                     msg = (
                         f"MoE pre_quant_scale: expert {expert_ids[i]} {name} "
@@ -3134,7 +3335,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # loader, ``fc31_act_scale.device`` for ``load_quant_scales``, which
         # keys its own staging off this same parameter -- and
         # ``_ensure_fc31_act_scale`` is the one place that chooses the device.
-        fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+        fc31_checkpoint_scale = torch.max(w3_reference, w1_reference)
+        # The cast below drops the dtype the checkpoint stores the scale in;
+        # DWDP setup compares the ranks' copies by it.
+        module.fc31_act_scale_checkpoint_dtype = fc31_checkpoint_scale.dtype
+        fc31_pre_quant_scale = fc31_checkpoint_scale.to(
             dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 
@@ -3205,12 +3410,19 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Step 4: Finalize shared weight alphas if needed
         if hasattr(module, 'tmp_shared_weight_scale_2'):
-            num_shared = len(module.tmp_shared_weight_scale_2)
-            shared_fc31_alpha = torch.empty(
+            # One entry per host-staged expert. A checkpoint without global
+            # scales (an MXFP4 checkpoint served as NVFP4_PLUS) has no
+            # weight_scale_2 entries and keeps alphas of 1.
+            if self.checkpoint_has_global_scales:
+                num_shared = len(module.tmp_shared_weight_scale_2)
+            else:
+                num_shared = len(
+                    module.layer_load_balancer.get_load_expert_ids())
+            shared_fc31_alpha = torch.ones(
                 (num_shared, ) + module.fc31_alpha.data.shape[1:],
                 dtype=module.fc31_alpha.data.dtype,
                 device='cpu')
-            shared_fc2_alpha = torch.empty(
+            shared_fc2_alpha = torch.ones(
                 (num_shared, ) + module.fc2_alpha.data.shape[1:],
                 dtype=module.fc2_alpha.data.dtype,
                 device='cpu')
@@ -3273,6 +3485,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
     block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+    # Values sharing one block scale along K.
+    scaling_vector_size = NVFP4_SF_VEC_SIZE
     NVFP4_ROW_ALIGNMENT = 128
     NVFP4_COL_ALIGNMENT = 4
 
@@ -3336,9 +3550,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         self.block_scales_vec_size = torch.iinfo(
             self.block_scales_dtype).bits // 8
 
-        super().create_weights(module, self.weight_dtype, weight_vec_size,
+        super().create_weights(module,
+                               self.weight_dtype,
+                               weight_vec_size,
                                self.block_scales_dtype,
-                               self.block_scales_vec_size)
+                               self.block_scales_vec_size,
+                               scaling_vector_size=self.scaling_vector_size)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -3852,14 +4069,16 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         """Interleave FC1 scales for GEMM1 + SwiGLU fusion (CuteDsl-specific)."""
         n = module.intermediate_size_per_partition * 2
         k = module.hidden_size
+        sf_vec_size = module.scaling_vector_size
         w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
-        w3_w1_weight_scale_unswizzled = unswizzle_sf(
-            w3_w1_weight_scale, n, k).view(n, k // module.scaling_vector_size)
+        w3_w1_weight_scale_unswizzled = unswizzle_sf(w3_w1_weight_scale, n, k,
+                                                     sf_vec_size).view(
+                                                         n, k // sf_vec_size)
         w3_w1_weight_scale_unswizzled_interleaved = self._interleave_fc1_rows(
             w3_w1_weight_scale_unswizzled)
         w3_w1_weight_scale_interleaved = swizzle_sf(
-            w3_w1_weight_scale_unswizzled_interleaved, n,
-            k).view(n, k // module.scaling_vector_size)
+            w3_w1_weight_scale_unswizzled_interleaved, n, k,
+            sf_vec_size).view(n, k // sf_vec_size)
         dst_w3_w1_weight_scale.copy_(
             w3_w1_weight_scale_interleaved.view(dst_w3_w1_weight_scale.dtype))
 
@@ -3910,6 +4129,55 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             self._interleave_w3_w1_weight(module.w3_w1_weight.data[expert_idx])
             self._interleave_w3_w1_weight_scale_cute_dsl(
                 module, module.w3_w1_weight_scale.data[expert_idx])
+
+
+class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
+    """NVFP4_PLUS: E2M1 weights with one UE5M3 scale per 32 values, no global scale.
+
+    Loads MXFP4 checkpoints. The E2M1 payload is kept as is, and every E8M0
+    block scale becomes the UE5M3 code of the same power of two. Such a
+    checkpoint has no ``weight_scale_2`` or ``input_scale``, so the NVFP4 flow
+    leaves the per-expert alphas and the activation global scales at 1.
+    """
+
+    scaling_vector_size = NVFP4_PLUS_SF_VEC_SIZE
+    checkpoint_has_global_scales = False
+    # Scales an MXFP4 checkpoint never has. The kernels apply no global scale
+    # and no AWQ pre-quant scale, so serving a checkpoint with them would
+    # silently drop them.
+    unsupported_scale_suffixes = ("input_scale", "weight_scale_2",
+                                  "pre_quant_scale")
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
+        unsupported = sorted(key for key in weights
+                             if key.endswith(self.unsupported_scale_suffixes))
+        if unsupported:
+            raise ValueError(
+                "NVFP4_PLUS loads MXFP4 checkpoints, which have no "
+                "input_scale, weight_scale_2 or pre_quant_scale, but this "
+                f"checkpoint has {', '.join(unsupported[:3])}"
+                f"{' ...' if len(unsupported) > 3 else ''}")
+        super().load_quant_scales(module, weights)
+
+    def load_expert_w3_w1_weight_scale_nvfp4(
+            self,
+            module: torch.nn.Module,
+            w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor,
+            expert_idx: int = -1) -> None:
+        super().load_expert_w3_w1_weight_scale_nvfp4(
+            module,
+            None if w1_weight_scale is None else e8m0_to_ue5m3(w1_weight_scale),
+            None if w3_weight_scale is None else e8m0_to_ue5m3(w3_weight_scale),
+            dst_w3_w1_weight_scale,
+            expert_idx=expert_idx)
+
+    def load_expert_w2_weight_scale_nvfp4(
+            self, module: torch.nn.Module, w2_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor) -> None:
+        super().load_expert_w2_weight_scale_nvfp4(
+            module, e8m0_to_ue5m3(w2_weight_scale), dst_w2_weight_scale)
 
 
 class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
@@ -5340,8 +5608,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         """Hand MegaMoE-format CPU staging tensors to the load balancer,
         then drop the module attrs so they do not double-keep the host memory.
 
-        Per the trtllm-moe-develop "CPU shared-staging buffer family"
-        rules, each per-expert ``nn.Parameter`` on the module must have
+        Each per-expert ``nn.Parameter`` on the module must have
         a corresponding CPU staging tensor in the ``weight_fns`` dict
         passed to ``register_all_parameter_slot_and_to_fix_weight_fns``;
         otherwise the load balancer either crashes on the first
@@ -7515,7 +7782,9 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module) -> None:
+        # GEMM1 ScaleC stores FC1 input scale / FC2 input scale; ScaleGate
+        # stores the raw FC1 dequant scale, also used to quantize the input.
         fc31_input_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
                                           requires_grad=False)
@@ -7546,7 +7815,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         dst_fc31_input_scale.copy_(w1_input_scale)
         dst_fc2_input_scale.copy_(w2_input_scale)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
@@ -7572,6 +7841,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
                 w1_input_scale, w3_input_scale, w2_input_scale,
                 tmp_fc31_input_scale[expert_id], tmp_fc2_input_scale[expert_id])
 
+        # Keep GEMM1's output-scale ratio separate from the raw input scale.
         module.fc31_input_dequant.data.copy_(tmp_fc31_input_scale.max() /
                                              tmp_fc2_input_scale.max())
         module.fc31_input_gate_dequant.data.copy_(tmp_fc31_input_scale.max())
@@ -7579,6 +7849,36 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
         # Step2: Load weight block scales.
         super().load_quant_scales(module, weights)
+
+        # Bias is consumed before the GEMM dequant scale.
+        # FC1's output scale includes FC2 quantization, so use its gate scale
+        # (the FC1 dequant scale alone) for the accumulator-unit conversion.
+        if module.bias:
+            module.w3_w1_bias.data.div_(
+                module.fc31_input_gate_dequant.view(-1, 1))
+            module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
+
+    def cache_derived_state(self, module: torch.nn.Module) -> None:
+        """Restore activation registers after materialization or weight transfer.
+
+        Args:
+            module: Weight owner holding the semantic activation configuration
+                and the loaded FC1 gate dequantization scales.
+        """
+        super().cache_derived_state(module)
+        params = materialize_activation_params(
+            module.activation,
+            resolve_activation_support(module),
+            num_local_experts=module.expert_size_per_partition,
+            device=module.fc31_input_gate_dequant.device,
+            owner=type(module).__name__,
+        )
+        if params.alpha is not None:
+            module.act_alpha.data.copy_(params.alpha)
+        for target, value in ((module.act_beta, params.beta), (module.act_clamp,
+                                                               params.clamp)):
+            if value is not None:
+                target.data.copy_(value / module.fc31_input_gate_dequant)
 
 
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):

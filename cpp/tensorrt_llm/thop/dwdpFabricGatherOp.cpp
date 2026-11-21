@@ -51,11 +51,12 @@ int64_t const* checkedInt64(torch::Tensor const& t, char const* name, int64_t ex
 
 //! Launch the gather described by `dstPtrs` / `srcPtrs` / `lines`, grouped by `rowStarts`.
 //!
-//! Runs on the current stream.  Pointers are raw device addresses (destinations in the local weight
+//! Runs on the current stream, with the TMA bulk-copy kernel when `useTma` is set (the register kernel
+//! where the device cannot run it).  Pointers are raw device addresses (destinations in the local weight
 //! buffer, sources in a peer's MNNVL mapping); every pointer and byte count must be 16-byte aligned,
 //! which the host-side plan builder checks (falling back to the copy engine otherwise).
 void dwdpFabricGather(torch::Tensor const& dstPtrs, torch::Tensor const& srcPtrs, torch::Tensor const& lines,
-    torch::Tensor const& rowStarts, int64_t blocksPerRow, int64_t threads)
+    torch::Tensor const& rowStarts, int64_t blocksPerRow, int64_t threads, bool useTma)
 {
     int64_t const numDescriptors = dstPtrs.numel();
     TORCH_CHECK(numDescriptors > 0, "dwdp_fabric_gather: empty descriptor list");
@@ -72,7 +73,7 @@ void dwdpFabricGather(torch::Tensor const& dstPtrs, torch::Tensor const& srcPtrs
         "dwdp_fabric_gather: threads must be a positive multiple of 32 up to 1024, got ", threads);
 
     kernels::invokeDwdpFabricGather(reinterpret_cast<void* const*>(dsts), reinterpret_cast<void const* const*>(srcs),
-        lineCounts, starts, rows, blocksPerRow, threads, at::cuda::getCurrentCUDAStream());
+        lineCounts, starts, rows, blocksPerRow, threads, useTma, at::cuda::getCurrentCUDAStream());
 }
 
 } // namespace torch_ext
@@ -83,7 +84,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "dwdp_fabric_gather(Tensor dst_ptrs, Tensor src_ptrs, Tensor lines, Tensor row_starts, "
-        "int blocks_per_row, int threads) -> ()");
+        "int blocks_per_row, int threads, bool use_tma=False) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

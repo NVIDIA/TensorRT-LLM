@@ -128,6 +128,13 @@ def _leading_rows(t: torch.Tensor, n: int) -> torch.Tensor:
     return t if t.shape[0] == n else t[:n]
 
 
+def _kv_rows(t: torch.Tensor, num_ctx_tokens: int, kv_row_total: int | None) -> torch.Tensor:
+    """Keep a full-KV span; otherwise limit dense input to the context prefix."""
+    if kv_row_total is not None and t.shape[0] == kv_row_total:
+        return t
+    return _leading_rows(t, num_ctx_tokens)
+
+
 class PhasedFmha(Fmha):
     """FMHA helper for paged-KV libraries that split work by request phase."""
 
@@ -291,6 +298,8 @@ class PhasedFmha(Fmha):
 
         Args:
             q, k, v: The call's inputs [num_tokens, ...], context tokens first; k / v None with fused QKV.
+                MLA calls contain only one phase; expanded context K/V may include a cached prefix
+                or chunk whose row count differs from Q.
             metadata: The context phase is its first num_contexts sequences and num_ctx_tokens tokens.
             forward_args: The call's arguments; its output [num_tokens, ...] is written.
             workspace: The call's attention workspace.
@@ -309,8 +318,20 @@ class PhasedFmha(Fmha):
         phase_input = _leading_rows(q, num_ctx_tokens)
         params.qkv_input = phase_input if forward_args.is_fused_qkv else None
         params.query_input = None if forward_args.is_fused_qkv else phase_input
-        params.key_input = _leading_rows(k, num_ctx_tokens) if k is not None else None
-        params.value_input = _leading_rows(v, num_ctx_tokens) if v is not None else None
+        if self.attn.is_mla_enable:
+            # An expanded MLA prefix or KV chunk can be longer than its Q span.
+            params.key_input = k
+            params.value_input = v
+        else:
+            kv_row_total = (
+                int(metadata.kv_lens_runtime[:num_seqs].sum())
+                if metadata.kv_lens_runtime is not None
+                else None
+            )
+            params.key_input = _kv_rows(k, num_ctx_tokens, kv_row_total) if k is not None else None
+            params.value_input = (
+                _kv_rows(v, num_ctx_tokens, kv_row_total) if v is not None else None
+            )
         params.output = out_tensor if fused_epilogue else _leading_rows(out_tensor, num_ctx_tokens)
         params.sequence_lengths = metadata.kv_lens_cuda_runtime
         params.context_lengths = metadata.prompt_lens_cuda_runtime

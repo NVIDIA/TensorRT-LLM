@@ -1222,6 +1222,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 galpha_scale_mnl_current_tile = galpha_scale_mnl[
                     None, alpha_tile_idx, None, batch_idx_w6
                 ]
+                # Bound alpha loads by the global token row, not the row within the tile.
+                alpha_row_base = alpha_tile_idx * self.alpha_scale_dim
 
                 tAgAlphaScale = thr_copy_alpha_scale.partition_S(galpha_scale_mnl_current_tile)
                 tAsAlphaScale = thr_copy_alpha_scale.partition_D(sAlphaScale)
@@ -1251,7 +1253,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     for iter_idx in cutlass.range(num_iters, unroll_full=True):
                         iter_coord = (None, iter_idx)
                         pred = cutlass.Boolean(
-                            32 * iter_idx + cute.arch.lane_idx() < malpha_scale_mnl.shape[0]
+                            alpha_row_base + 32 * iter_idx + cute.arch.lane_idx()
+                            < malpha_scale_mnl.shape[0]
                         )
                         if pred:
                             cute.copy(
@@ -1865,7 +1868,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                             m_global = m_base_tile + m_local_start
                             n_global = n_base_subtile + n_local
-                            if m_global + 7 < m_total:
+                            # Bound by C itself: with swap_ab, M is the hidden size and N the tokens.
+                            if m_global + 7 < mC_raw.shape[0] and n_global < mC_raw.shape[1]:
                                 rVec = cute.make_rmem_tensor(
                                     cute.make_layout((4, 2), stride=(2, 1)),
                                     self.c_dtype,
@@ -1909,21 +1913,25 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 1
                             ] + subtile_idx * cute.size(tTR_rC)
 
+                            # Unlike TMA stores, atomics are not clipped at the last column.
                             for index in cutlass.range(self.epi_loop_size_atomic, unroll_full=True):
                                 coord_n = base_coord_n + index * self.element_offset_atomic
-                                scatter_out = cute.domain_offset((0, coord_n, 0), scatter_base)
-                                if cutlass.const_expr(self.c_dtype == cutlass.Float16):
-                                    vectorized_atomic_add_fp16x8(
-                                        rOut_epi[index, None, None], scatter_out
-                                    )
-                                elif cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
-                                    vectorized_atomic_add_bf16x8(
-                                        rOut_epi[index, None, None], scatter_out
-                                    )
-                                elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                                    vectorized_atomic_add_fp32x2(rOut_epi[index, None], scatter_out)
-                                else:
-                                    atomic_add_func(rOut_epi[index], scatter_out)
+                                if coord_n < mC_raw.shape[1]:
+                                    scatter_out = cute.domain_offset((0, coord_n, 0), scatter_base)
+                                    if cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                        vectorized_atomic_add_fp16x8(
+                                            rOut_epi[index, None, None], scatter_out
+                                        )
+                                    elif cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                        vectorized_atomic_add_bf16x8(
+                                            rOut_epi[index, None, None], scatter_out
+                                        )
+                                    elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                        vectorized_atomic_add_fp32x2(
+                                            rOut_epi[index, None], scatter_out
+                                        )
+                                    else:
+                                        atomic_add_func(rOut_epi[index], scatter_out)
                 else:
                     #
                     # Standard TMA store path (split_k=1)

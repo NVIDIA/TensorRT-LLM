@@ -63,6 +63,12 @@ class MoEExecutionContractMixin:
     # backend has to handle a short final partition to claim it.
     _supports_non_divisible_ep: bool = False
 
+    # An un-finalized ``run_moe`` handed ``MoERunContext.lamport_fc2_out`` may
+    # write its FC2 rows there and then returns that buffer as the rows;
+    # otherwise it returns its own rows and leaves the buffer untouched
+    # (``trtllm_gen.decode_moe.rows_in_lamport``).
+    takes_lamport_fc2_out: bool = False
+
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
         """Whether ``run_moe`` can write its output into the alltoall workspace.
 
@@ -149,6 +155,10 @@ class MoEWeightOwnerMixin:
     # Declared here so the mixin's own lifecycle methods never depend on a
     # subclass constructor having assigned it first.
     _weights_created: bool = False
+    # The one-shot transform guard exists before any weight load, so a staged
+    # receiver that installs already transformed bytes without loading can
+    # mark this owner transformed, as it does for `Linear`.
+    _weights_transformed: bool = False
 
     # ---- weight lifecycle -------------------------------------------------
     def create_weights(self) -> None:
@@ -202,7 +212,7 @@ class MoEWeightOwnerMixin:
         self.quant_method.load_weights(self, weights[0], self.weight_loading_mode, **kargs)
 
     def transform_weights(self) -> None:
-        if getattr(self, "_weights_transformed", False):
+        if self._weights_transformed:
             return
         self.quant_method.transform_weights(self)
         self._weights_transformed = True
@@ -226,7 +236,11 @@ class MoEWeightOwnerMixin:
 
     def pre_reload_weights(self):
         """
-        Prepare tensors for weight reloading by reverting them to their original creation shape.
+        Prepare tensors for weight reloading.
+
+        The quant method decides how: most re-create each tensor in its original creation
+        shape, while some keep tensors they can update in place (for example
+        ``BF16TRTLLMGenFusedMoEMethod`` keeps its kernel-layout experts).
         """
         assert hasattr(self.quant_method, "pre_reload_weights"), (
             "pre_reload_weights is not supported for this quant method"

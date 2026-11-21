@@ -28,7 +28,8 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import get_sm_version, llm_models_root, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
-                               get_registered_worker_urls, run_ctx_worker,
+                               get_registered_worker_urls,
+                               resolve_server_start_timeout, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
@@ -335,6 +336,9 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         tokens_per_block = 32  # TODO: read from config
         prev_ctx_match_count = 0
         prev_gen_match_count = 0
+        ctx_match_count = 0
+        gen_match_count = 0
+        gen_evicted = False
         assert len(self.ctx_servers) == 1 and len(self.gen_servers) == 1, \
             "This test assumes 1P1D"
         ctx_server = self.ctx_servers[0]
@@ -667,7 +671,10 @@ def background_workers(llm_venv, config_file: str):
                                       env=env)
 
     try:
-        asyncio.run(wait_for_disagg_server_ready(disagg_port))
+        asyncio.run(
+            wait_for_disagg_server_ready(disagg_port,
+                                         timeout=resolve_server_start_timeout(
+                                             config, None)))
         ctx_urls, gen_urls = get_registered_worker_urls(disagg_port)
         assert len(ctx_urls) == num_ctx and len(gen_urls) == num_gen, (
             f"Expected {num_ctx} ctx and {num_gen} gen workers registered, "
@@ -703,6 +710,7 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
@@ -774,6 +782,7 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
 
 
+@pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
