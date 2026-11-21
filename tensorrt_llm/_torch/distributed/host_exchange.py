@@ -341,7 +341,11 @@ class HostExchange:
         if rows is None:
             return None
         active = round_mask & ~self._missing
-        lengths = self._header_lengths(rows, active)
+        # The ranks that finished this round counted every header in it, so the rounds that
+        # follow count them too, including the header of a rank whose payload is missing.
+        lengths = self._header_lengths(rows, round_mask)
+        if self._missing:
+            lengths *= rows[:, 0] >> np.uint64(32) == self._epoch
         payload_bytes = int(lengths[self._ranks_of(readers & active)[0]].max(initial=0))
         packets = 1 + min(self._words, ceil_div(payload_bytes, 4))
         self._failed |= readers & (~round_mask | self._missing)

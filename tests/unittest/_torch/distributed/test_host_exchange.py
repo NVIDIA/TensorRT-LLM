@@ -483,6 +483,36 @@ def test_lagging_rank_takes_completed_round():
     assert exchange.epoch == 3
 
 
+@pytest.mark.timeout(60)
+def test_completed_round_counts_header_of_missing_payload(monkeypatch):
+    """Check that a rank runs as many rounds as its peers after completing a round from their rows.
+
+    In a gather to rank 0, rank 2's payload takes two rounds. Rank 2 failed after its header
+    reached rank 1 but before its payload reached rank 0. Rank 1 finished round 1 from the
+    headers and stopped in round 2, so rank 0 must run round 2 as well.
+    """
+    exchange = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)[0]
+    group, rows = exchange.group, exchange.group.rows
+
+    def write(row, epoch, sender, packets):
+        slot = row * rows.stride + (epoch & 1) * group._slot_set_bytes + sender * group._slot_bytes
+        rows._memory[slot : slot + packets.nbytes] = packets.view(np.uint8)
+
+    write(0, 1, 1, _slot(1, b"p1"))
+    write(1, 1, 2, _slot(1, b"", length=2 * _SLOT_BYTES)[:1])
+
+    def change():
+        exchange.set_interrupt_handler(lambda: False)
+        exchange.install(None, 0b011, 3)
+        # Rank 1's slot of round 2, which carries no payload, sent over the new rows.
+        write(0, 3, 1, _slot(3, b""))
+
+    exchange.set_interrupt_handler(lambda: bool(exchange.waiting_for & 0b100), change)
+    results = _run_ranks([exchange], [lambda e: e.exchange(b"x0", recipients=(0,))])
+    assert results[0] == [b"x0", b"p1", None]
+    assert exchange.epoch == 3
+
+
 def test_retried_install_keeps_completed_round(monkeypatch):
     """Check that a retried install takes the round that a failed install completed.
 
