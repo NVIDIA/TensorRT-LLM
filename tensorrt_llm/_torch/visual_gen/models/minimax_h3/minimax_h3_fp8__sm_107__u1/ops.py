@@ -4,6 +4,8 @@
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .kernels import gate_up_swiglu, projection_residual
 from .kernels.adaln import launch as adaln_launch
 from .kernels.conversion import BLOCKS, THREADS, modules_for_device
@@ -32,6 +34,20 @@ def _qkv_gemm_fake(activation, weight, input_scale, weight_scale):
     return torch.empty(
         (activation.shape[0], weight.shape[0]), device=activation.device, dtype=torch.bfloat16
     )
+
+
+_UNFUSED_REPORTED: set[str] = set()
+
+
+def _report_unfused(projection: str) -> None:
+    """Warn the first time a projection runs unfused: correct, but slower on every later call too."""
+    if projection not in _UNFUSED_REPORTED:
+        _UNFUSED_REPORTED.add(projection)
+        logger.warning(
+            f"MiniMax-H3 static FP8: the {projection} projection received tensors outside the "
+            "fused kernel's contract (dtypes, layout or 256-byte alignment) and runs on the "
+            "unfused cuBLAS path; reported once"
+        )
 
 
 def _cublas_scaled_mm(
@@ -102,6 +118,7 @@ def down(
             indices,
             projection_residual.DOWN_GATE,
         ).reshape_as(hidden)
+    _report_unfused("Down")
     projected = _cublas_scaled_mm(activation, weight, input_scale, weight_scale).reshape_as(hidden)
     return _gated_residual(hidden, projected, modulation, indices, projection_residual.DOWN_GATE)
 
@@ -184,6 +201,7 @@ def attention_projection(
             residual, None, norm_weight, modulation, indices, reciprocal_scale, eps, 0, 4, 3
         )[1]
         return residual, codes
+    _report_unfused("attention output")
     projected = _cublas_scaled_mm(activation, weight, input_scale, weight_scale).reshape_as(hidden)
     return adaln_launch(
         hidden, projected, norm_weight, modulation, indices, reciprocal_scale, eps, 2, 4, 3

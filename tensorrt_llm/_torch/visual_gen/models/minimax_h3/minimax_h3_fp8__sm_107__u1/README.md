@@ -80,7 +80,8 @@ wraps the blocks; the Triton kernels compile during the loader's warmup request.
 The denoise loop compiles no projection kernel: an input outside the compiled
 kernel's dtypes, layout or 256-byte alignment takes the unfused cuBLAS path
 (whose Triton AdaLN variant compiles on first use; the blocks' own tensors
-never take it).
+never take it). The first such call of each projection logs a warning, since
+the slower path then serves every later call as well.
 The packed GateUp weights replace the checkpoint layout in place, so the
 model's `state_dict()` no longer holds that weight in checkpoint order.
 
@@ -121,4 +122,5 @@ quantize emits the FP8 NaN code. Finite values are unaffected.
 | `test_fp8_pipeline.py` | the same GPU, `MiniMax-H3-FP8` checkpoint, `NVIDIA_TF32_OVERRIDE=0` | 8-step end-to-end generation; not in a CI list |
 
 The `rope_halves_equal` option is tested with the NVFP4 scenario's kernel tests
-(`test_h3_scenario_fused_fp8_qk.py`).
+(`test_h3_scenario_fused_fp8_qk.py`); the family table's equal halves, which it
+relies on, are pinned by a CPU test in `test_minimax_h3_attention_precision.py`.

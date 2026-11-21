@@ -322,3 +322,18 @@ class TestModel:
         )
         with pytest.raises(ValueError, match="differ in"):
             h3.MiniMaxH3Transformer3DModel(config)
+
+
+def test_rope_table_repeats_its_frequencies():
+    """Both halves of the cos / sin table hold the same angles.
+
+    The static FP8 scenario relies on it: its Q/K kernel reads the first half only
+    (``rope_halves_equal=True``)."""
+    positions = torch.stack(
+        [torch.arange(40) % 5, torch.arange(40) % 7, torch.arange(40) % 11], dim=1
+    )
+    cos, sin = h3.MiniMaxH3RotaryPosEmbed()(positions)
+    half = cos.shape[-1] // 2
+    assert half > 0 and cos.shape == sin.shape == (40, 2 * half)
+    assert torch.equal(cos[..., :half], cos[..., half:])
+    assert torch.equal(sin[..., :half], sin[..., half:])

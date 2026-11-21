@@ -393,16 +393,19 @@ def test_non_finite_values_saturate_in_adaln(scenario):
     assert bool(((got[nan_code] & 0x7F) == 0x7E).all())
 
 
-def test_family_rope_table_repeats_its_frequencies():
-    """The contract behind ``rope_halves_equal=True`` in the FP8 attention."""
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 import (
-        MiniMaxH3RotaryPosEmbed,
-    )
-
-    positions = torch.stack(
-        [torch.arange(40) % 5, torch.arange(40) % 7, torch.arange(40) % 11], dim=1
-    )
-    cos, sin = MiniMaxH3RotaryPosEmbed()(positions)
-    half = cos.shape[-1] // 2
-    assert torch.equal(cos[..., :half], cos[..., half:])
-    assert torch.equal(sin[..., :half], sin[..., half:])
+def test_the_unfused_path_is_reported_once(scenario, weights, branch, monkeypatch):
+    ops = scenario[0]
+    warnings = []
+    monkeypatch.setattr(ops, "_UNFUSED_REPORTED", set())
+    monkeypatch.setattr(ops.logger, "warning", warnings.append)
+    x = _inputs(300, rows=3)
+    weight, weight_scale = weights["down"]
+    down_scale, _ = _scale(0.05)
+    activation = _quantize(x["randn"](300, UP, std=2.0).to(BF16), down_scale)
+    arguments = (activation, weight, down_scale, weight_scale)
+    ops.down(*arguments, x["hidden"], x["modulation"], x["indices"])
+    assert warnings == []
+    for _ in range(3):
+        ops.down(*arguments, _misaligned(x["hidden"]), x["modulation"], x["indices"])
+    assert branch == {"fused": 1, "unfused": 3}
+    assert len(warnings) == 1 and "Down projection" in warnings[0]
