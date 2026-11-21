@@ -21,6 +21,7 @@ from ...impl_contract import (
     MoEProblem,
     MoERejectReason,
     check_quant_matches_identity,
+    spare_slots_rejection,
 )
 from ...impl_environment import MoEDep
 from ...interface import _reject
@@ -43,6 +44,7 @@ def check_grouped_gemm_leaf(
         check_sm(cls, d),
         check_dtype(cls, p),
         check_grouped_gemm_shared(cls, p, d),
+        spare_slots_rejection(cls, d),
         *leaf_gates,
     ):
         if verdict is not None:

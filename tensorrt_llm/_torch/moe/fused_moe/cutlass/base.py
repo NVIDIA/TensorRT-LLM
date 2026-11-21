@@ -22,6 +22,7 @@ bottom are the ones more than one format binds.
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from functools import cached_property, partial
 
 import torch
 
@@ -251,6 +252,14 @@ class CutlassFusedMoEBase(MoEImplBase):
             return
         self._check_quant_config_is_my_format()
         super().create_weights()
+        if self.uses_spare_slots:
+            self._fused_moe_op = partial(torch.ops.trtllm.fused_moe, **self.tuner_layout_kwargs)
+
+    @cached_property
+    def _fused_moe_op(self):
+        """``torch.ops.trtllm.fused_moe``. A module with spare slots binds the tuner layout of its
+        active slots to it in :meth:`create_weights`."""
+        return torch.ops.trtllm.fused_moe
 
     def _check_configs(self) -> None:
         assert self._weights_created
@@ -349,7 +358,7 @@ class CutlassFusedMoEBase(MoEImplBase):
             w3_w1, w2 = dequantized_weights
             quant_scales, input_sf, swizzled_input_sf = [], None, False
 
-        result = torch.ops.trtllm.fused_moe(
+        result = self._fused_moe_op(
             ctx.x,
             ctx.token_selected_experts,
             ctx.token_final_scales,

@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Optional, Protocol, Sequence, runtime_checkable
 
 import pynvml
 import torch
@@ -37,6 +37,43 @@ from tensorrt_llm._dlpack_utils import pack_strided_memory
 from tensorrt_llm._utils import is_sm_120f, mpi_comm, mpi_disabled
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+
+class MnnvlRanksError(RuntimeError):
+    """An MNNVL memory error that names the ranks ``ranks`` it involves."""
+
+    def __init__(self, ranks: Sequence[int], message: str) -> None:
+        self.ranks = tuple(sorted(set(ranks)))
+        super().__init__(message)
+
+    def __reduce__(self) -> tuple[type["MnnvlRanksError"], tuple[tuple[int, ...], str]]:
+        return type(self), (self.ranks, self.args[0])
+
+
+class MnnvlPeerHandleError(MnnvlRanksError):
+    """Raised when this rank cannot import the MNNVL handles of the peers ``ranks``.
+
+    The caller can exclude those peers and map the memory again.
+    """
+
+
+class MnnvlMappingError(MnnvlRanksError):
+    """Raised on every active rank when the ranks ``ranks`` cannot map MNNVL memory.
+
+    The failure is on their own side, such as a failed handle export.
+    """
+
+
+@runtime_checkable
+class MembershipComm(Protocol):
+    """A communicator whose gathers return None for an inactive member, such as a ``StoreGroup``.
+
+    ``membership`` lists every member's global rank in communicator rank order, and
+    ``exchange_failed`` tells whether the latest exchange itself raised.
+    """
+
+    membership: tuple[int, ...]
+    exchange_failed: bool
 
 
 class ProcessGroupComm:
@@ -545,8 +582,26 @@ class MnnvlMemory:
         start_address: int,
         rank_stride: int,
         address_offset: int,
+        absent_rows_on_scratch: bool = False,
+        mapped_handles: Optional[Sequence[Any]] = None,
+        members: Optional[Sequence[int]] = None,
     ) -> List[Any]:
+        """Exchange handles through ``comm`` and map every row not in ``mapped_handles``.
+
+        A rank for which ``comm.allgather`` returns None is absent. Its row stays unmapped, or maps
+        one local scratch allocation if ``absent_rows_on_scratch``. A non-None entry of
+        ``mapped_handles`` is a row already mapped with that handle, which this call keeps as is.
+        The errors name each rank by its entry in ``members``, by default its rank in ``comm``.
+
+        Raises:
+            MnnvlPeerHandleError: An active peer's handle could not be imported.
+            MnnvlMappingError: Some active rank could not export its handle.
+        """
+        if members is None:
+            members = range(comm.Get_size())
+        kept = [None] * comm.Get_size() if mapped_handles is None else list(mapped_handles)
         local_handle = None
+        scratch_handle = None
         exported_handle = None
         pidfds = []
         remote_fds = []
@@ -568,9 +623,11 @@ class MnnvlMemory:
                     allocation_prop.requestedHandleTypes
                     == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
                 )
-                local_handle = _check_cu_result(
-                    cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
-                )
+                local_handle = kept[comm.Get_rank()]
+                if local_handle is None:
+                    local_handle = _check_cu_result(
+                        cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+                    )
                 exported_handle = _check_cu_result(
                     cuda.cuMemExportToShareableHandle(
                         local_handle, allocation_prop.requestedHandleTypes, 0
@@ -591,24 +648,28 @@ class MnnvlMemory:
                 },
                 operation="handle export",
             )
-            export_errors = [
-                f"rank {rank}: {payload['error']}"
-                for rank, payload in enumerate(exported_by_rank)
-                if payload["error"] is not None
-            ]
-            if export_errors:
-                raise RuntimeError(
-                    "MNNVL handle export failed before mapping:\n" + "\n".join(export_errors)
+            active = [rank for rank, payload in enumerate(exported_by_rank) if payload is not None]
+            export_failed = [rank for rank in active if exported_by_rank[rank]["error"] is not None]
+            if export_failed:
+                raise MnnvlMappingError(
+                    [members[rank] for rank in export_failed],
+                    "MNNVL handle export failed before mapping:\n"
+                    + "\n".join(
+                        f"rank {members[rank]}: {exported_by_rank[rank]['error']}"
+                        for rank in export_failed
+                    ),
                 )
-            fabric_modes = {payload["is_fabric"] for payload in exported_by_rank}
+            fabric_modes = {exported_by_rank[rank]["is_fabric"] for rank in active}
             if len(fabric_modes) != 1:
                 raise RuntimeError("MNNVL ranks selected inconsistent shareable handle types")
             is_fabric = fabric_modes.pop()
+            all_handles_data = [None] * len(exported_by_rank)
             if is_fabric:
-                all_handles_data = [payload["handle"] for payload in exported_by_rank]
+                for rank in active:
+                    all_handles_data[rank] = exported_by_rank[rank]["handle"]
             else:
-                all_exported_fds = [payload["handle"] for payload in exported_by_rank]
-                all_pids = [payload["pid"] for payload in exported_by_rank]
+                all_exported_fds = [exported_by_rank[rank]["handle"] for rank in active]
+                all_pids = [exported_by_rank[rank]["pid"] for rank in active]
                 syscall = ctypes.CDLL(None, use_errno=True).syscall
                 fd_import_error = None
                 try:
@@ -657,22 +718,38 @@ class MnnvlMemory:
                         "MNNVL POSIX file descriptor import failed on one or more ranks:\n"
                         + "\n".join(failed_ranks)
                     )
-                all_handles_data = remote_fds
+                for rank, remote_fd in zip(active, remote_fds):
+                    all_handles_data[rank] = remote_fd
 
             access_desc = cuda.CUmemAccessDesc()
             access_desc.location = allocation_prop.location
             access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            if absent_rows_on_scratch and len(active) < len(all_handles_data):
+                scratch_handle = _check_cu_result(
+                    cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+                )
             for rank, handle_data in enumerate(all_handles_data):
                 rank_ptr = start_address + rank_stride * rank + address_offset
+                if kept[rank] is not None:
+                    if handle_data is None:
+                        raise RuntimeError(
+                            f"Rank {members[rank]} left while this rank maps its pages, "
+                            "so its row needs fresh pages"
+                        )
+                    mem_handles[rank] = kept[rank]
+                    continue
                 handle = (
                     local_handle
                     if rank == comm.Get_rank()
-                    else _check_cu_result(
-                        cuda.cuMemImportFromShareableHandle(
-                            handle_data, allocation_prop.requestedHandleTypes
-                        )
+                    else cls._peer_row_handle(
+                        handle_data,
+                        allocation_prop.requestedHandleTypes,
+                        members[rank],
+                        scratch_handle,
                     )
                 )
+                if handle is None:
+                    continue
                 mem_handles[rank] = handle
                 _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, handle, 0))
                 mapped_rank_ptrs.append(rank_ptr)
@@ -685,9 +762,14 @@ class MnnvlMemory:
                 except RuntimeError as error:
                     logger.warning(f"Failed to unmap incomplete MNNVL allocation: {error}")
 
-            handles_to_release = [handle for handle in mem_handles if handle is not None]
-            if local_handle is not None and mem_handles[comm.Get_rank()] is None:
-                handles_to_release.append(local_handle)
+            handles_to_release = []
+            for handle in [*mem_handles, local_handle, scratch_handle]:
+                # Release each handle once, as the scratch handle backs several rows, and never a
+                # kept handle, which the caller still maps.
+                if handle is not None and all(
+                    handle is not other for other in [*handles_to_release, *kept]
+                ):
+                    handles_to_release.append(handle)
             for handle in handles_to_release:
                 try:
                     _check_cu_result(cuda.cuMemRelease(handle))
@@ -711,8 +793,28 @@ class MnnvlMemory:
                 except OSError as error:
                     logger.warning(f"Failed to close exported MNNVL file descriptor: {error}")
 
-    @classmethod
-    def open_mnnvl_memory(cls, mapping: Mapping, size: int):
+    @staticmethod
+    def _peer_row_handle(
+        handle_data: Any, handle_type: Any, member: int, absent_row_handle: Any
+    ) -> Any:
+        """Return the handle that maps the row of the peer ``member``.
+
+        A peer that exported ``handle_data`` gets its imported handle. An absent peer, whose
+        ``handle_data`` is None, gets ``absent_row_handle``, and None leaves its row unmapped.
+
+        Raises:
+            MnnvlPeerHandleError: The peer's handle could not be imported.
+        """
+        if handle_data is None:
+            return absent_row_handle
+        try:
+            return _check_cu_result(cuda.cuMemImportFromShareableHandle(handle_data, handle_type))
+        except RuntimeError as error:
+            raise MnnvlPeerHandleError([member], str(error)) from error
+
+    @staticmethod
+    def _init_device() -> int:
+        """Initialize MnnvlMemory and return the current device's id."""
         # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
         MnnvlMemory.initialize()
 
@@ -723,10 +825,19 @@ class MnnvlMemory:
         assert dev_id == MnnvlMemory.dev_id, (
             f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
+        return dev_id
+
+    @classmethod
+    def open_mnnvl_memory(cls, mapping: Mapping, size: int):
+        dev_id = cls._init_device()
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
-        comm_membership = tuple(int(rank) for rank in comm.allgather(mapping.rank))
+        if isinstance(comm, MembershipComm):
+            # A gather leaves the inactive members out, so the communicator lists them.
+            comm_membership = tuple(comm.membership)
+        else:
+            comm_membership = tuple(int(rank) for rank in comm.allgather(mapping.rank))
         if len(comm_membership) != comm_size:
             raise RuntimeError(
                 "MNNVL communicator membership size does not match its rank count: "
@@ -734,7 +845,10 @@ class MnnvlMemory:
             )
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
-        assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
+        # Absent ranks (None) take no part in the allocation.
+        assert all(x == size for x in all_rank_allocate_sizes if x is not None), (
+            "Not all rank allocating same size."
+        )
         granularity = cls.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
@@ -777,7 +891,7 @@ class MnnvlMemory:
             raise
         ptr = cls.current_start_address + cls.current_mem_offset
         stride = cls.current_rank_stride
-        cls.allocated_map[ptr] = _MnnvlAllocationRecord(
+        record = _MnnvlAllocationRecord(
             comm=comm,
             comm_size=comm_size,
             comm_rank=comm_rank,
@@ -789,12 +903,18 @@ class MnnvlMemory:
             rank_stride=cls.current_rank_stride,
             address_offset=cls.current_mem_offset,
         )
-        cls.address_refcnt[cls.current_start_address] = (
-            cls.address_refcnt.get(cls.current_start_address, 0) + 1
-        )
+        cls._register_allocation(ptr, record)
 
         cls.current_mem_offset += aligned_size
         return ptr, stride
+
+    @classmethod
+    def _register_allocation(cls, ptr: int, record: _MnnvlAllocationRecord) -> None:
+        """Record the allocation at ``ptr`` that ``close_mnnvl_memory`` releases."""
+        cls.allocated_map[ptr] = record
+        cls.address_refcnt[record.start_address] = (
+            cls.address_refcnt.get(record.start_address, 0) + 1
+        )
 
     @classmethod
     def close_mnnvl_memory(cls, ptr: int):
@@ -830,7 +950,10 @@ class MnnvlMemory:
     @classmethod
     def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
         first_error = None
-        for rank in range(record.comm_size):
+        released = []
+        for rank, handle in enumerate(record.mem_handles):
+            if handle is None:
+                continue
             rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
             try:
                 _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
@@ -838,13 +961,15 @@ class MnnvlMemory:
                 if first_error is None:
                     first_error = error
                 continue
-            try:
-                _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
-            except RuntimeError as error:
-                if first_error is None:
-                    first_error = error
-            else:
-                record.mem_handles[rank] = None
+            if all(handle is not other for other in released):
+                released.append(handle)
+                try:
+                    _check_cu_result(cuda.cuMemRelease(handle))
+                except RuntimeError as error:
+                    if first_error is None:
+                        first_error = error
+                    continue
+            record.mem_handles[rank] = None
         if first_error is not None:
             raise first_error
 
