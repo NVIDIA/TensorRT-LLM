@@ -1,0 +1,409 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Inkling tool-call parsing, batch and streaming.
+
+Inkling frames a call with special tokens and carries the tool name twice --
+once in the `<|message_model|>` header and once inside the JSON payload:
+
+    <|message_model|>get_weather<|content_invoke_tool_json|>
+        {"name":"get_weather","args":{"city":"NYC"}}<|end_message|>
+
+Three things are easy to get wrong and are asserted here rather than assumed:
+the two names disagreeing (the call must be dropped, not executed under a
+guess), a control token split across streaming deltas (its first half must not
+leak as visible text), and streaming having to agree with a one-shot parse for
+every possible chunk boundary.
+"""
+
+import json
+
+import pytest
+
+from tensorrt_llm.llmapi.inkling_tokens import (
+    INKLING_CONTENT_TEXT,
+    INKLING_END_MESSAGE,
+    INKLING_INVOKE_TOOL_JSON,
+    INKLING_MESSAGE_MODEL,
+)
+from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam, FunctionDefinition
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
+
+pytestmark = pytest.mark.cpu_only
+
+MM, IT, EM, CT = (
+    INKLING_MESSAGE_MODEL,
+    INKLING_INVOKE_TOOL_JSON,
+    INKLING_END_MESSAGE,
+    INKLING_CONTENT_TEXT,
+)
+
+
+def _tools(*names):
+    return [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name=n, description=n, parameters={"type": "object", "properties": {}}
+            ),
+        )
+        for n in names
+    ]
+
+
+def _parser():
+    return ToolParserFactory.create_tool_parser("inkling")
+
+
+def _call(name, args, header=None):
+    head = f"{MM}{header if header is not None else name}"
+    return f'{head}{IT}{{"name":"{name}","args":{json.dumps(args)}}}{EM}'
+
+
+def test_registered_and_needs_raw_special_tokens():
+    """The parser is reachable by name and declares that it needs the tokens.
+
+    Without the flag the serving layer strips the delimiters before the parser
+    runs, and there is nothing left to detect.
+    """
+    parser = _parser()
+    assert parser.needs_raw_special_tokens is True
+    assert parser.has_tool_call(_call("f", {}))
+    assert not parser.has_tool_call("plain answer")
+
+
+def test_auto_resolves_from_model_type(tmp_path):
+    """`--tool_parser auto` has to find Inkling from its HF config."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import resolve_auto_tool_parser
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "inkling2"}))
+    assert resolve_auto_tool_parser(str(tmp_path)) == "inkling"
+
+
+def test_single_call_batch():
+    text = f"{CT}Let me look it up.{EM}" + _call("get_weather", {"city": "NYC"})
+    result = _parser().detect_and_parse(text, _tools("get_weather"))
+    assert len(result.calls) == 1
+    assert result.calls[0].name == "get_weather"
+    assert json.loads(result.calls[0].parameters) == {"city": "NYC"}
+    # Framing must not survive into visible text.
+    assert "<|" not in result.normal_text
+    assert result.normal_text.strip() == "Let me look it up."
+
+
+def test_two_calls_batch():
+    text = _call("a", {"x": 1}) + _call("b", {"y": 2})
+    result = _parser().detect_and_parse(text, _tools("a", "b"))
+    assert [c.name for c in result.calls] == ["a", "b"]
+    assert [c.tool_index for c in result.calls] == [0, 1]
+
+
+def test_header_payload_mismatch_is_dropped():
+    """The header and the payload naming different tools is not a guess to make.
+
+    Executing either name could call the wrong function; the call is dropped and
+    the surrounding text is still cleaned.
+    """
+    text = f"{CT}before{EM}" + _call("real", {"a": 1}, header="other")
+    result = _parser().detect_and_parse(text, _tools("real", "other"))
+    assert result.calls == []
+    assert "<|" not in result.normal_text
+    # The rejected region is dropped, not regurgitated as an answer.
+    assert "real" not in result.normal_text
+
+
+def test_undeclared_tool_is_still_surfaced():
+    """A hallucinated tool surfaces as a structured call, as OpenAI does.
+
+    The harness can then return a tool error and let the model correct itself,
+    instead of the invocation degrading into terminal answer text.
+    """
+    result = _parser().detect_and_parse(_call("not_declared", {"a": 1}), _tools("declared"))
+    assert len(result.calls) == 1
+    assert result.calls[0].name == "not_declared"
+
+
+def test_no_tool_call_passthrough():
+    result = _parser().detect_and_parse(f"{CT}just an answer{EM}", _tools("f"))
+    assert result.calls == []
+    assert result.normal_text.strip() == "just an answer"
+
+
+def _stream(text, splits, tools):
+    parser = _parser()
+    edges = [0] + list(splits) + [len(text)]
+    normal, calls = "", []
+    for a, b in zip(edges, edges[1:]):
+        r = parser.parse_streaming_increment(text[a:b], tools)
+        normal += r.normal_text
+        calls.extend(r.calls)
+    return normal, calls
+
+
+def _assembled(calls):
+    """Reassemble streamed name/argument deltas into whole calls."""
+    out = {}
+    for c in calls:
+        entry = out.setdefault(c.tool_index, {"name": None, "args": ""})
+        if c.name:
+            entry["name"] = c.name
+        entry["args"] += c.parameters
+    return [(v["name"], v["args"]) for _, v in sorted(out.items())]
+
+
+def test_streaming_matches_batch_char_by_char():
+    """Char-by-char streaming must reproduce the one-shot parse.
+
+    This walks a split through the middle of every control token, which is the
+    part of the parser most likely to leak framing.
+    """
+    tools = _tools("get_weather")
+    text = f"{CT}checking{EM}" + _call("get_weather", {"city": "NYC"})
+    batch = _parser().detect_and_parse(text, tools)
+    normal, calls = _stream(text, range(1, len(text)), tools)
+    assert "<|" not in normal
+    assert normal.strip() == batch.normal_text.strip()
+    assert _assembled(calls) == [("get_weather", batch.calls[0].parameters)]
+
+
+@pytest.mark.parametrize("split", [3, 12, 27, 41, 55])
+def test_streaming_no_control_token_leak_at_any_split(split):
+    """A control token cut in half must not emit its first half as text."""
+    tools = _tools("f")
+    text = f"{CT}hello{EM}" + _call("f", {"k": "v"})
+    if split >= len(text):
+        pytest.skip("split beyond text")
+    normal, calls = _stream(text, [split], tools)
+    assert "<|" not in normal, f"leaked framing at split {split}: {normal!r}"
+    assert _assembled(calls)[0][0] == "f"
+
+
+def test_streaming_two_calls_get_distinct_indices():
+    """Consecutive calls must not collide on tool_index 0.
+
+    An abandoned call that reset the counter would slice the next call's
+    arguments against the wrong tool's already-streamed text.
+    """
+    tools = _tools("a", "b")
+    text = _call("a", {"x": 1}) + _call("b", {"y": 2})
+    _, calls = _stream(text, range(1, len(text)), tools)
+    assembled = _assembled(calls)
+    assert [name for name, _ in assembled] == ["a", "b"]
+
+
+def test_streaming_rejected_call_does_not_shift_the_next_one():
+    """After a dropped call the next valid one still parses correctly."""
+    tools = _tools("good")
+    text = _call("real", {"a": 1}, header="other") + _call("good", {"b": 2})
+    _, calls = _stream(text, range(1, len(text)), tools)
+    assembled = _assembled(calls)
+    assert [name for name, _ in assembled] == ["good"]
+    assert json.loads(assembled[0][1]) == {"b": 2}
+
+
+@pytest.mark.parametrize("bad_first", [True, False], ids=["malformed_first", "malformed_between"])
+def test_batch_malformed_payload_keeps_the_other_calls(bad_first):
+    """A payload that is not JSON drops only its own invocation."""
+    tools = _tools("a", "b")
+    bad = f'{MM}a{IT}{{"name":"a","args":{{"x":}}{EM}'
+    good_a, good_b = _call("a", {"x": 1}), _call("b", {"y": 2})
+    text = bad + good_a + good_b if bad_first else good_a + bad + good_b
+    result = _parser().detect_and_parse(text, tools)
+    assert [(c.tool_index, c.name, json.loads(c.parameters)) for c in result.calls] == [
+        (0, "a", {"x": 1}),
+        (1, "b", {"y": 2}),
+    ]
+
+
+def test_streaming_rejected_payload_is_never_announced():
+    """A call whose arguments are not an object emits nothing, then the next call parses."""
+    tools = _tools("f", "g")
+    text = f'{MM}f{IT}{{"name":"f","args":[]}}{EM}' + _call("g", {"y": 2})
+    parser = _parser()
+    seen = []
+    for i in range(len(text)):
+        seen.extend(parser.parse_streaming_increment(text[i], tools).calls)
+    assert {c.name for c in seen if c.name} == {"g"}
+    assert _assembled(seen) == [("g", json.dumps({"y": 2}))]
+    assert [entry["name"] for entry in parser.prev_tool_call_arr] == ["g"]
+
+
+def test_streaming_rejected_call_keeps_the_rest_of_its_increment():
+    """One increment: a header/payload mismatch, then a valid call, then text."""
+    tools = _tools("good")
+    text = _call("real", {"a": 1}, header="other") + _call("good", {"b": 2}) + f"{CT}done"
+    result = _parser().parse_streaming_increment(text, tools)
+    assert _assembled(result.calls) == [("good", json.dumps({"b": 2}))]
+    assert result.normal_text == "done"
+
+
+def test_streaming_malformed_payload_keeps_the_next_call():
+    tools = _tools("a", "b")
+    text = f'{MM}a{IT}{{"name":"a","args":{{"x":}}{EM}' + _call("b", {"y": 2})
+    normal, calls = _stream(text, range(1, len(text)), tools)
+    assert _assembled(calls) == [("b", json.dumps({"y": 2}))]
+    assert "<|" not in normal
+
+
+def test_final_increment_with_two_calls_drains_exactly_once():
+    """The last delta reports both of its calls itself; finish() has nothing left to add."""
+    tools = _tools("a", "b")
+    parser = _parser()
+    first = parser.parse_streaming_increment(f"{CT}checking{EM}", tools)
+    last = parser.parse_streaming_increment(
+        _call("a", {"x": 1}) + _call("b", {"y": 2}) + f"{CT}ok", tools
+    )
+    tail = parser.finish(tools)
+    assert not first.calls and first.normal_text == "checking"
+    assert [(c.tool_index, c.name) for c in last.calls if c.name] == [(0, "a"), (1, "b")]
+    assert _assembled(last.calls) == [("a", json.dumps({"x": 1})), ("b", json.dumps({"y": 2}))]
+    assert last.normal_text == "ok"
+    assert not tail.calls and tail.normal_text == ""
+
+
+@pytest.mark.parametrize(
+    "held, expected",
+    [("answer <", "answer <"), ("answer <|", "answer <|"), (f"answer {MM}get_weather", "answer ")],
+    ids=["partial_token", "partial_token_bar", "tool_header"],
+)
+def test_finish_releases_held_text_but_not_a_tool_header(held, expected):
+    """A partial control token at the end of the stream is text; a dangling header is not."""
+    parser = _parser()
+    streamed = parser.parse_streaming_increment(held, _tools("get_weather"))
+    tail = parser.finish(_tools("get_weather"))
+    assert streamed.normal_text + tail.normal_text == expected
+    assert not streamed.calls and not tail.calls
+
+
+@pytest.mark.parametrize(
+    "unfinished",
+    [f'{MM}f{IT}{{"name":"f","ar', f'{MM}f{IT}{{"name":"f","args":{{}}}}'],
+    ids=["partial_payload", "payload_without_end_token"],
+)
+def test_finish_drops_an_unfinished_invocation(unfinished):
+    """Without its end token an invocation is not a call, as in the one-shot parse."""
+    parser = _parser()
+    streamed = parser.parse_streaming_increment(unfinished, _tools("f"))
+    tail = parser.finish(_tools("f"))
+    assert not streamed.calls and not tail.calls
+    assert streamed.normal_text + tail.normal_text == ""
+    assert not _parser().detect_and_parse(unfinished, _tools("f")).calls
+
+
+def test_streaming_judges_the_whole_framed_payload():
+    """Streaming judges a call by its whole framed payload, as the one-shot parse does.
+
+    A complete object followed by other text before the end token is malformed; a call whose end
+    token comes in a later delta is reported then.
+    """
+    tools = _tools("f", "g")
+    head = f'{MM}f{IT}{{"name":"f","args":{{}}}}'
+    parser = _parser()
+    deltas = [head, f"not-json{EM}", _call("g", {"y": 2})[: -len(EM)], EM]
+    results = [parser.parse_streaming_increment(d, tools) for d in deltas]
+    tail = parser.finish(tools)
+    assert [bool(r.calls) for r in results] == [False, False, False, True]
+    assert _assembled(results[-1].calls) == [("g", json.dumps({"y": 2}))]
+    assert not tail.calls
+    assert [c.name for c in _parser().detect_and_parse("".join(deltas), tools).calls] == ["g"]
+
+
+_ONE_SHOT_EQUALS_STREAMING = [
+    (_call("f", {"a": 1}) + f"{MM}{CT}done{EM}", "done", ["f"]),
+    (
+        f"{CT}before {EM}"
+        + _call("f", {"a": 1})
+        + f"{MM}{CT}between {EM}"
+        + _call("g", {"b": 2})
+        + f"{MM}{CT}after{EM}",
+        "before between after",
+        ["f", "g"],
+    ),
+    (
+        _call("f", {"a": 1}, header="g") + f"{MM}{CT}after a rejected call{EM}",
+        "after a rejected call",
+        [],
+    ),
+    (f"{MM}f{CT}hello{EM}", "hello", []),
+    (f'{CT}text{EM}{MM}f{IT}{{"name":"f","ar', "text", []),
+    (f"answer {MM}f", "answer ", []),
+]
+
+
+@pytest.mark.parametrize(
+    "text, normal_text, names",
+    _ONE_SHOT_EQUALS_STREAMING,
+    ids=[
+        "text_after_a_call",
+        "text_around_calls",
+        "after_a_rejected_call",
+        "named_header",
+        "unfinished_call",
+        "trailing_tool_header",
+    ],
+)
+def test_one_shot_parse_equals_streaming(text, normal_text, names):
+    """A streaming and a non-streaming client get the same content and calls for one output."""
+    tools = _tools("f", "g")
+    batch = _parser().detect_and_parse(text, tools)
+    assert batch.normal_text == normal_text
+    assert [c.name for c in batch.calls] == names
+    for splits in ([], range(1, len(text))):
+        parser = _parser()
+        normal, calls = "", []
+        edges = [0, *splits, len(text)]
+        for a, b in zip(edges, edges[1:]):
+            result = parser.parse_streaming_increment(text[a:b], tools)
+            normal += result.normal_text
+            calls += result.calls
+        result = parser.finish(tools)
+        normal += result.normal_text
+        calls += result.calls
+        assert normal == normal_text
+        assert _assembled(calls) == [(c.name, c.parameters) for c in batch.calls]
+
+
+def test_structure_info_round_trip():
+    """The structural tag must frame exactly what the parser accepts."""
+    info = _parser().structure_info()("get_weather")
+    text = info.begin + '{"city":"NYC"}' + info.end
+    result = _parser().detect_and_parse(text, _tools("get_weather"))
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {"city": "NYC"}
+
+
+def test_reasoning_parser_then_tool_parser_yields_a_call():
+    """The composition trtllm-serve actually runs, which no test covered.
+
+    `postprocess_handlers` applies the reasoning parser first and gives its
+    content to the tool parser. Every other test here feeds the framed form
+    directly, so they all passed while the served path returned
+    `content: {"name": ...}` with `tool_calls: []` -- measured against the BF16
+    release (job 6032875). The two parsers are only correct together.
+    """
+    from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+    raw = (
+        f"<|content_thinking|>The user wants the weather.<|end_message|>"
+        f'{MM}get_weather{IT}{{"name":"get_weather","args":{{"city":"Paris"}}}}{EM}'
+    )
+    reasoning = ReasoningParserFactory.create_reasoning_parser("inkling")
+    parsed = reasoning.parse(raw)
+    assert parsed.reasoning_content == "The user wants the weather."
+
+    parser = ToolParserFactory.create_tool_parser("inkling")
+    result = parser.detect_and_parse(parsed.content, _tools("get_weather"))
+    assert [c.name for c in result.calls] == ["get_weather"]
+    assert json.loads(result.calls[0].parameters) == {"city": "Paris"}
+    assert result.normal_text.strip() == ""
