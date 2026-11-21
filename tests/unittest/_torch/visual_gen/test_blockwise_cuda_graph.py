@@ -7,6 +7,7 @@ import gc
 import weakref
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
     wrap_blocks_with_cuda_graphs,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm.logger import logger
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -191,8 +193,8 @@ def test_replay_matches_eager():
 def test_graph_keys():
     """Model graph keys select graphs and reach the block during capture; so do block args.
 
-    Once capture stops (after warmup), a new key runs eagerly and adds no graph; the block
-    still sees the call's model graph keys, as it would in a replay.
+    Once capture stops (after warmup), a new key runs eagerly, adds no graph and is logged
+    once per block; the block still sees the call's model graph keys, as in a replay.
     """
     torch.manual_seed(0)
     model = _TwoBlockModel(timestep_key=True, block_cls=_PhaseBlock).cuda().eval()
@@ -219,8 +221,12 @@ def test_graph_keys():
     assert len(runners["transformer.blocks.0"].graphs) == 6
 
     BasePipeline._stop_block_graph_capture(SimpleNamespace(_cuda_graph_runners=runners))
-    _assert_same(model(**longer, timestep=100), expected_longer)
+    with patch.object(logger, "warning_once") as warning_once:
+        for _ in range(2):
+            _assert_same(model(**longer, timestep=100), expected_longer)
     assert [len(runner.graphs) for runner in runners.values()] == [6, 2]
+    assert warning_once.call_count == 2
+    assert "(2, 32, 64)" in warning_once.call_args.args[0]
 
 
 @torch.inference_mode()
@@ -387,6 +393,28 @@ def test_cache_dit_caches_through_block_graphs():
     assert stats == expected_stats
     _assert_same(outputs, expected)
     assert all(len(runner.graphs) == 1 for runner in runners.values())
+
+
+@pytest.mark.parametrize("flux2", [False, True], ids=["flux1", "flux2"])
+def test_flux_warmup_keys_with_block_graphs(flux2):
+    """Block graph keys hold every block input shape, so FLUX's warmup keys add batch size and
+    text length: the executor then warns about requests whose blocks run without graphs."""
+    from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
+    from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+
+    pipeline_cls = Flux2Pipeline if flux2 else FluxPipeline
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    params = SimpleNamespace(
+        height=1024, width=1024, num_frames=None, num_images_per_prompt=2, max_sequence_length=512
+    )
+    req = SimpleNamespace(prompt=["a fox"], params=params, prepared_inputs={})
+    assert pipeline.request_warmup_cache_key(req) == (1024, 1024)
+
+    pipeline.pipeline_config = SimpleNamespace(
+        cuda_graph=SimpleNamespace(enable=True), cache_backend="cache_dit"
+    )
+    assert pipeline.warmup_cache_key(1024, 1024, num_frames=1) == (1024, 1024, 1, 512)
+    assert pipeline.request_warmup_cache_key(req) == (1024, 1024, 2, 512)
 
 
 _FLUX1_TINY_CONFIG = {

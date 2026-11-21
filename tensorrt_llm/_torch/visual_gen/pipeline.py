@@ -123,9 +123,12 @@ class BasePipeline(nn.Module):
     supports_image_edit: bool = False
     # Opt in only after implementing per-request noise and batched media output.
     supports_dynamic_batching: bool = False
-    # With Cache-DiT + CUDA graphs, capture each transformer block as its own graph. Opt in
-    # only when the warmup shapes give every block graph key of a request (e.g. text padded
-    # to a fixed length): block graphs are not captured after warmup.
+    # With Cache-DiT + CUDA graphs, capture each transformer block as its own graph. Block
+    # graphs are captured only during warmup, so opt in only when the warmup shapes give the
+    # block graph keys of the requests to serve (e.g. text padded to a fixed length). Blocks
+    # whose inputs warmup did not produce (another batch size or text length, or a graph key
+    # warmup did not reach, such as a later sparse-attention phase) run without graphs and
+    # log a warning once per new input.
     supports_blockwise_cuda_graphs: bool = False
 
     @classmethod
@@ -172,19 +175,6 @@ class BasePipeline(nn.Module):
         self._init_transformer()
 
         self._install_nccl_window_tensor_scope_hooks()
-
-        cfg = self.pipeline_config
-        if (
-            cfg.cuda_graph.enable
-            and cfg.cache_backend == "cache_dit"
-            and not self.supports_blockwise_cuda_graphs
-        ):
-            logger.warning(
-                f"{type(self).__name__} has no per-block CUDA graphs: with Cache-DiT, its "
-                "whole-forward CUDA graph freezes one cache decision, so no block is cached, "
-                "and max_warmup_steps <= 2 can fail graph capture. Disable "
-                "cuda_graph_config.enable to use Cache-DiT with this pipeline."
-            )
 
         # CUDA graph runner - wrap transformer.forward
         # Order matters: TeaCache will wrap on top of it and still call the
@@ -306,9 +296,10 @@ class BasePipeline(nn.Module):
 
     def _uses_blockwise_cuda_graphs(self) -> bool:
         """Cache-DiT picks the blocks inside ``forward``, so graphs must be per block."""
-        cfg = self.pipeline_config
+        cfg = getattr(self, "pipeline_config", None)  # None if built without __init__
         return (
             self.supports_blockwise_cuda_graphs
+            and cfg is not None
             and bool(cfg.cuda_graph.enable)
             and cfg.cache_backend == "cache_dit"
         )
@@ -391,7 +382,8 @@ class BasePipeline(nn.Module):
         """Return the cache key for a given warmup shape.
 
         Image models (FLUX) override to return (height, width), ignoring
-        num_frames.  Video models use the default (height, width, num_frames).
+        num_frames, plus batch size and text length with per-block CUDA graphs.
+        Video models use the default (height, width, num_frames).
         The executor uses this to check whether a request shape was warmed up.
         """
         return (height, width, num_frames)
@@ -859,6 +851,13 @@ class BasePipeline(nn.Module):
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
             acc.wrap()
             self.cache_accelerator = acc
+            if cfg.cuda_graph.enable and not self._uses_blockwise_cuda_graphs():
+                logger.warning(
+                    f"{type(self).__name__} has no per-block CUDA graphs: with Cache-DiT, its "
+                    "whole-forward CUDA graph freezes one cache decision, so no block is "
+                    "cached, and max_warmup_steps <= 2 can fail graph capture. Disable "
+                    "cuda_graph_config.enable to use Cache-DiT with this pipeline."
+                )
             return
 
         if cfg.cache_backend == "seacache":
