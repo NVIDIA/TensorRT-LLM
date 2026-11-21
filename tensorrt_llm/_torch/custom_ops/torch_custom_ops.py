@@ -19,7 +19,7 @@ import threading
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import lru_cache
-from typing import ClassVar, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import ClassVar, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
@@ -3053,14 +3053,24 @@ _AR_TUNE_NCCL_SYMMETRIC = os.environ.get("TRTLLM_AR_TUNE_NCCL_SYMMETRIC",
 _AR_TUNE_NCCL_SYMMETRIC_LOGGED = False
 
 
+@lru_cache(maxsize=None)
+def _fusion_workspace_limit(tp_size: int, configured: Optional[str]) -> int:
+    """CustomAllReduceHelper.max_workspace_size_auto, once per value of
+    TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE (`configured`), which it reads and
+    logs."""
+    return CustomAllReduceHelper.max_workspace_size_auto(
+        tp_size, support_deterministic=False)
+
+
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     # Set from AllReduce.__init__ via extra_attrs when the model is built.
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
     _prealloc_dtype: ClassVar[Optional[torch.dtype]] = None
-    # The buckets registered in the native tactic cache, by what keys them.
-    _registered_buckets: ClassVar[Dict[Tuple, Set[int]]] = {}
+    # The buckets registered in the native tactic cache, by what keys them
+    # there, each with the unique_id of the runner that registered it.
+    _registered_buckets: ClassVar[Dict[Tuple, Dict[int, str]]] = {}
     # Populate buckets at engine configuration or first standalone use, not import.
     tuning_config = TuningConfig(
         constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
@@ -3107,8 +3117,8 @@ class AllReduceRunner(TunableRunner):
         self.input_uses_nccl_window = input_uses_nccl_window
         self.exclude_nccl_symmetric = exclude_nccl_symmetric
         # Larger inputs run NCCL only (get_valid_tactics).
-        self.max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
-            tp_size, support_deterministic=False)
+        self.max_workspace_size = _fusion_workspace_limit(
+            tp_size, os.environ.get("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE"))
 
     def unique_id(
         self
@@ -3118,7 +3128,7 @@ class AllReduceRunner(TunableRunner):
             self.tp_size,
             # Keep Python cache entries aligned with the native tactic cache:
             # groups with the same size can use distinct communicators/topologies.
-            # The members in order, as the communicator takes them.
+            # Sorted: the communicator takes its members as a set.
             tuple(sorted(self.group)),
             self.input_dtype,
             self.op,
@@ -3215,30 +3225,34 @@ class AllReduceRunner(TunableRunner):
             tuning_buckets = [b for b in tuning_buckets if b == current]
         cache = tuner.profiling_cache
         input_shapes = tuple(tuner._get_input_sizes(inputs))
+        # As the native cache keys the tactics (runners of other unique_ids
+        # can share a key), and the configured buckets.
         registered = AllReduceRunner._registered_buckets.setdefault(
-            (str(self.unique_id()), tuple(self.group), tuple(
-                input_shapes[0][1:]), repr(input_shapes[1:])), set())
+            (tuple(self.group), self.op, self.input_uses_nccl_window,
+             self.input_dtype, tuple(input_shapes[0][1:]), repr(
+                 input_shapes[1:]), tuple(spec.gen_tuning_buckets)), {})
+        identity = str(self.unique_id())
         # Look up the configured allreduce buckets directly instead of
         # scanning unrelated custom-op and profile entries in the full cache.
-        for bucket in tuning_buckets:
-            bucket_input_shapes = list(input_shapes)
-            bucket_input_shapes[0] = torch.Size((bucket, *input_shapes[0][1:]))
-            cache_key = cache.get_cache_key(
-                custom_op,
-                self,
-                tuple(bucket_input_shapes),
-                self.tuning_config,
-                apply_map_to_tuning_buckets=False,
-            )
+        cache_keys = cache.get_cache_keys(
+            custom_op,
+            self, [(torch.Size(
+                (bucket, *input_shapes[0][1:])), *input_shapes[1:])
+                   for bucket in tuning_buckets],
+            self.tuning_config,
+            apply_map_to_tuning_buckets=False)
+        for bucket, cache_key in zip(tuning_buckets, cache_keys):
             cache_entry = cache.cache.get(cache_key)
             if cache_entry is None:
-                if tuner.is_tuning_mode and bucket in registered:
-                    # Tuned again without a winner: remove the tactic
-                    # registered before, so every rank falls back alike.
+                if (tuner.is_tuning_mode
+                        and registered.get(bucket) == identity):
+                    # Tuned again without a winner: remove the tactic this
+                    # runner registered before, so every rank falls back
+                    # alike.
                     torch.ops.trtllm.register_allreduce_tactic(
                         input, residual, norm_weight, scale, bias, workspace,
                         self.group, self.op, bucket, -1)
-                    registered.discard(bucket)
+                    del registered[bucket]
                 continue
             _, tactic, _ = cache_entry
             if ((self.exclude_nccl_symmetric or not _AR_TUNE_NCCL_SYMMETRIC)
@@ -3249,7 +3263,7 @@ class AllReduceRunner(TunableRunner):
                                                        workspace, self.group,
                                                        self.op, bucket,
                                                        int(tactic))
-            registered.add(bucket)
+            registered[bucket] = identity
 
     def forward(
         self,

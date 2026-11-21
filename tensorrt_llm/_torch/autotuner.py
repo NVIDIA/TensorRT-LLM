@@ -1123,12 +1123,7 @@ def _held_identity(value, depth: int, active: Set[int]) -> Any:
     if isinstance(value, partial):
         active.add(id(value))
         try:
-            return ("partial", _held_identity(value.func, depth + 1, active),
-                    tuple(
-                        _held_identity(v, depth + 1, active)
-                        for v in value.args),
-                    tuple((k, _held_identity(v, depth + 1, active))
-                          for k, v in sorted(value.keywords.items())))
+            return _partial_identity(value, depth, active)
         finally:
             active.discard(id(value))
     if callable(value):
@@ -1142,21 +1137,35 @@ def _held_identity(value, depth: int, active: Set[int]) -> Any:
     return type(value)
 
 
+def _partial_identity(value: partial, depth: int, active: Set[int]) -> Tuple:
+    """The identity of a partial (already in `active`): its function and
+    arguments."""
+    return ("partial", _held_identity(value.func, depth + 1, active),
+            tuple(_held_identity(v, depth + 1, active) for v in value.args),
+            tuple((k, _held_identity(v, depth + 1, active))
+                  for k, v in sorted(value.keywords.items())))
+
+
 def _function_identity(fn,
                        depth: int = 0,
                        active: Optional[Set[int]] = None) -> Tuple:
     """The code of the function `fn` runs (the innermost it wraps), then the
     code and the identities of what it holds (_held) of `fn` and of each
-    function it wraps: what tells apart functions one factory builds."""
+    function it wraps (a wrapped partial by its function and arguments):
+    what tells apart functions one factory builds."""
     active = set() if active is None else active
     layers = _wrapper_layers(fn)
     ids = {id(layer) for layer in layers} - active
     active.update(ids)
     try:
-        identities = tuple((getattr(layer, "__code__", None),
-                            tuple((var, _held_identity(value, depth, active))
-                                  for var, value in _held(layer)))
-                           for layer in layers)
+        identities = tuple(
+            _partial_identity(layer, depth, active) if isinstance(
+                layer, partial) else (getattr(layer, "__code__", None),
+                                      tuple(
+                                          (var,
+                                           _held_identity(value, depth, active))
+                                          for var, value in _held(layer)))
+            for layer in layers)
     finally:
         active.difference_update(ids)
     return identities[-1][0], identities
@@ -1439,7 +1448,7 @@ _loaded_libraries.cache_clear = _mapped_libraries.cache_clear
 def _rescan_loaded_libraries() -> None:
     """Look at the loaded libraries again when the fingerprints are next
     taken (_refresh_fingerprints): the process may have loaded another one.
-    Called where tuning starts, not on every lookup."""
+    Called when a tuning session starts (autotune), not on every lookup."""
     _mapped_libraries.cache_clear()
 
 
@@ -1741,7 +1750,10 @@ class _FingerprintWalk:
         Module-level statements that change the value, in each module on the
         way, count with it."""
         for _ in range(16):
-            if module not in sys.modules or not self.counts(module):
+            # A module the chain reaches is imported if it is not yet (the
+            # branch of a fallback import this process did not take), so that
+            # the fingerprint does not depend on what it happened to import.
+            if not self.counts(module) or _load_module(module) is None:
                 return module, attr, None
             index = self.index(sys.modules[module])
             if index is not None:
@@ -1755,10 +1767,13 @@ class _FingerprintWalk:
             # an `except` branch) count too: either may have bound the name.
             for other_level, other_source, other_attr in others:
                 other = _resolve_import(other_level, other_source, package)
-                if other in sys.modules:
+                # Imported if it is not yet, so that the fingerprint does not
+                # depend on whether this process happened to import it.
+                other_module = (_load_module(other) if other is not None
+                                and self.counts(other) else None)
+                if other_module is not None:
                     self.todo.append((f"{other}.{other_attr}",
-                                      _attribute(sys.modules[other],
-                                                 other_attr)))
+                                      _attribute(other_module, other_attr)))
             resolved = _resolve_import(level, source, package)
             if resolved is None:
                 return module, attr, None
@@ -2095,13 +2110,27 @@ def _build_fingerprint() -> str:
     return (_EDITED_PREFIX if _native_replaced() else "") + digest
 
 
+# type -> whether it is a TunableRunner class: an ABC isinstance on every
+# attribute of every candidate of every lookup is slow.
+_RUNNER_TYPES: Dict[type, bool] = {}
+
+
+def _is_runner_type(cls: type) -> bool:
+    known = _RUNNER_TYPES.get(cls)
+    if known is None:
+        if len(_RUNNER_TYPES) >= 4096:
+            _RUNNER_TYPES.clear()
+        known = _RUNNER_TYPES[cls] = issubclass(cls, TunableRunner)
+    return known
+
+
 def _held_runners(runner, depth: int = 0) -> Tuple[type, ...]:
     """The classes of the runners `runner` holds in its attributes (a wrapper
     delegating to an underlying runner), and of the runners those hold."""
     held: List[type] = []
     if depth < 4:
         for value in getattr(runner, "__dict__", {}).values():
-            if isinstance(value, TunableRunner) and value is not runner:
+            if _is_runner_type(type(value)) and value is not runner:
                 held += [type(value), *_held_runners(value, depth + 1)]
     return tuple(held)
 
@@ -2236,6 +2265,42 @@ def _kind_name(kind) -> str:
     return name
 
 
+# What _candidate_key_fingerprints depends on -> its result.
+_KEY_FINGERPRINTS: Dict[Tuple, Tuple[Optional[str], ...]] = {}
+
+
+def _candidate_key_fingerprints(
+        runners,
+        kinds,
+        unique_ids: Optional[Tuple[str,
+                                   ...]] = None) -> Tuple[Optional[str], ...]:
+    """_key_fingerprint of each of `runners` (of _runner_kind `kinds`, and
+    str(unique_id()) `unique_ids` if known) tuned among them, memoized by
+    what it depends on: every lookup takes them."""
+    if _CACHE_KEY_MODE == "none":
+        return (None, ) * len(runners)
+    _refresh_fingerprints()
+    several = len(runners) > 1  # Only then do unique_ids and spaces count.
+    if several and unique_ids is None:
+        unique_ids = tuple(str(r.unique_id()) for r in runners)
+    memo_key = (kinds, unique_ids if several else
+                (), tuple(repr(r.tactic_space_key())
+                          for r in runners) if several else
+                (), _CACHE_KEY_MODE, _FINGERPRINT_GENERATION[0],
+                _device_capability())
+    fingerprints = _KEY_FINGERPRINTS.get(memo_key)
+    if fingerprints is None:
+        set_fingerprint = _candidates_fingerprint(kinds)
+        tactic_spaces = _tactic_spaces(runners, kinds)
+        fingerprints = tuple(
+            _key_fingerprint(kind, set_fingerprint, tactic_spaces)
+            for kind in kinds)
+        if len(_KEY_FINGERPRINTS) >= 4096:
+            _KEY_FINGERPRINTS.clear()
+        _KEY_FINGERPRINTS[memo_key] = fingerprints
+    return fingerprints
+
+
 def _own_fingerprint(fingerprint: str) -> Tuple[str, str, str]:
     """(the runner's own fingerprint, its _kind_name, the GPU architecture)
     of a _key_fingerprint."""
@@ -2274,41 +2339,46 @@ def _rank_signature(runners) -> str:
 
 def _choice_scope_of(groups: Tuple, uids: Tuple, device: str) -> Tuple:
     """The ranks that must choose alike, as _choice_scope names them."""
-    return (device, ("group", groups) if any(g is not None for g in groups) else
-            ("unique_id", uids))
+    if any(g is not None for g in groups):
+        return ("group", groups)
+    return ("unique_id", device, uids)
 
 
 def _choice_scope(runners) -> Tuple:
     """What names the ranks of a tuning group whose entries for `runners`
-    must choose the same runner and tactic: their GPU architecture, and
-    their communicators (TunableRunner.rank_group) when the runners name
-    them, else their unique_ids. Ranks of different scopes, such as the TP
-    subgroups of Helix CP, may choose differently."""
+    must choose the same runner and tactic: their communicators
+    (TunableRunner.rank_group) when the runners name them, since the ranks
+    of one collective must run one protocol; else their unique_ids and GPU
+    architecture. Ranks of different scopes, such as the TP subgroups of
+    Helix CP, may choose differently."""
     return _choice_scope_of(tuple(r.rank_group() for r in runners),
                             tuple(str(r.unique_id()) for r in runners),
                             _device_capability())
 
 
-def _lockstep_scope(scope: Tuple) -> Optional[Tuple]:
-    """The ranks that profile a profile together: the communicator a scope
-    names, else (None) the whole tuning group, whose runners may run
-    collectives this module cannot see."""
-    return scope if scope[1][0] == "group" else None
-
-
-def _missed_profiles(per_rank) -> Set[Tuple]:
+def _missed_profiles(per_rank, absent_agrees: bool = False) -> Set[Tuple]:
     """(lockstep scope, opt shapes) of each profile to tune again, from each
-    rank's (scope, profile opt shapes, choices): a profile some rank misses
-    (a None choice), or ranks of one scope chose differently, is tuned again
-    by the ranks of its lockstep scope (_lockstep_scope)."""
+    rank's (choice scope, lockstep scope, profile opt shapes, choices): a
+    profile some rank misses (a None choice), or ranks of one choice scope
+    chose differently, is tuned again by the ranks of its lockstep scope
+    (AutoTuner._lockstep_scope). With `absent_agrees`, a profile that every
+    rank of a choice scope misses alike is not one of them."""
     missed = set()
     chosen: Dict[Tuple, Any] = {}
-    for scope, keys, choices in per_rank:
+    for scope, lockstep, keys, choices in per_rank:
         for key, choice in zip(keys, choices):
-            if choice is None or chosen.setdefault(
+            if (choice is None and not absent_agrees) or chosen.setdefault(
                 (scope, key), choice) != choice:
-                missed.add((_lockstep_scope(scope), key))
+                missed.add((lockstep, key))
     return missed
+
+
+class _ProfileKey(NamedTuple):
+    """A profile known by its opt shapes only (a key a lookup maps to)."""
+    shapes: Tuple
+
+    def get_opt_shapes(self) -> Tuple:
+        return self.shapes
 
 
 class _Agreement(NamedTuple):
@@ -2320,6 +2390,18 @@ class _Agreement(NamedTuple):
     shared_scope: bool
 
 
+def _foreign_layout(key: Tuple) -> bool:
+    """Whether a cache key has the other layout than TLLM_AUTOTUNER_CACHE_KEY's
+    mode gives keys (`(op, runner, unique_id, shapes[, fingerprint][, tactic
+    space])`): without a fingerprint under "build" or "code" (a file written
+    before fingerprints, or under "none"), or with one under "none". Such an
+    entry is never looked up here."""
+    if len(key) < 4:
+        return False
+    fingerprinted = len(key) > 4 and isinstance(key[4], str)
+    return fingerprinted != (_CACHE_KEY_MODE != "none")
+
+
 def _edited_key(key: Tuple) -> bool:
     """Whether a cache key carries a fingerprint marked _EDITED_PREFIX."""
     return (len(key) > 4 and isinstance(key[4], str)
@@ -2328,6 +2410,7 @@ def _edited_key(key: Tuple) -> bool:
 
 def _clear_fingerprints() -> None:
     _FINGERPRINT_GENERATION[0] += 1
+    _KEY_FINGERPRINTS.clear()
     _STALE_BYTECODE.clear()
     _FINGERPRINT_CONTEXT.clear()
     _build_fingerprint.cache_clear()
@@ -2400,6 +2483,9 @@ def autotune(tune_mode: bool = True,
 
     if autotune_enabled:
         logger.info("[Autotuner] Autotuning process starts ...")
+        # Libraries loaded since the fingerprints were taken change them; every
+        # rank looks before it tunes, so a session tunes under one fingerprint.
+        _rescan_loaded_libraries()
 
     # Fine-grained sync kernels deadlock when profiled, so force them off for the duration via the
     # C++ override rather than mutating os.environ. TODO: remove once autotuning handles them.
@@ -2616,7 +2702,8 @@ class AutoTunerProfilingCache:
         self.cache.clear()
         self.independent_op.clear()
         self.excluded_op.clear()
-        self.__dict__.pop("_current_keys", None)
+        for name in ("_current_keys", "_dropped_keys", "_superseded_index"):
+            self.__dict__.pop(name, None)
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -2687,15 +2774,15 @@ class AutoTunerProfilingCache:
         among `runners` (get_cache_key), in order, as each is needed: the
         entries that compete for one profile. The set's fingerprint is
         computed once."""
-        kinds = tuple(map(_runner_kind, runners))
-        set_fingerprint = _candidates_fingerprint(kinds)
-        tactic_spaces = ("" if set_fingerprint is None else _tactic_spaces(
-            runners, kinds))
-        for r, kind in zip(runners, kinds):
-            yield self._cache_key(
-                custom_op, r, input_shapes, tuning_config,
-                apply_map_to_tuning_buckets,
-                _key_fingerprint(kind, set_fingerprint, tactic_spaces))
+        unique_ids = tuple(str(r.unique_id()) for r in runners)
+        for r, unique_id, fingerprint in zip(
+                runners, unique_ids,
+                _candidate_key_fingerprints(runners,
+                                            tuple(map(_runner_kind, runners)),
+                                            unique_ids)):
+            yield self._cache_key(custom_op, r, input_shapes, tuning_config,
+                                  apply_map_to_tuning_buckets, fingerprint,
+                                  unique_id)
 
     def get_cache_key(
         self,
@@ -2722,14 +2809,31 @@ class AutoTunerProfilingCache:
                 _runner_kind(runner), set_fingerprint,
                 "" if set_fingerprint is None else _tactic_spaces(candidates)))
 
-    def _cache_key(self, custom_op: str, runner: TunableRunner,
-                   input_shapes: Tuple[torch.Size], tuning_config: TuningConfig,
+    def get_cache_keys(self, custom_op: str, runner: TunableRunner, shapes_list,
+                       tuning_config: TuningConfig,
+                       apply_map_to_tuning_buckets: bool) -> List[Tuple]:
+        """get_cache_key of `runner` tuned alone, for each input shapes of
+        `shapes_list`, with the fingerprint computed once."""
+        [fingerprint] = _candidate_key_fingerprints([runner],
+                                                    (_runner_kind(runner), ))
+        return [
+            self._cache_key(custom_op, runner, shapes, tuning_config,
+                            apply_map_to_tuning_buckets, fingerprint)
+            for shapes in shapes_list
+        ]
+
+    def _cache_key(self,
+                   custom_op: str,
+                   runner: TunableRunner,
+                   input_shapes: Tuple[torch.Size],
+                   tuning_config: TuningConfig,
                    apply_map_to_tuning_buckets: bool,
-                   fingerprint: Optional[str]) -> Tuple:
+                   fingerprint: Optional[str],
+                   unique_id: Optional[str] = None) -> Tuple:
         cache_key = (
             custom_op,
             runner.__class__.__name__,
-            str(runner.unique_id()),
+            str(runner.unique_id()) if unique_id is None else unique_id,
             AutoTuner.get()._find_nearest_profile(
                 input_shapes,
                 tuning_config.dynamic_tensor_specs,
@@ -2765,12 +2869,13 @@ class AutoTunerProfilingCache:
     def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
 
-    def drop(self, keys) -> None:
-        """Remove the entries of `keys` that the cache holds. save_cache
-        removes them from the file too, unless they are stored again."""
+    def drop(self, keys, forget: bool = True) -> None:
+        """Remove the entries of `keys` that the cache holds. With `forget`,
+        save_cache removes them from the file too, unless they are stored
+        again."""
         dropped = self.__dict__.setdefault("_dropped_keys", set())
         for key in keys:
-            if self.cache.pop(key, None) is not None:
+            if self.cache.pop(key, None) is not None and forget:
                 dropped.add(key)
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
@@ -2778,13 +2883,14 @@ class AutoTunerProfilingCache:
 
     def shareable(self, entries: Dict[Tuple, Tuple]) -> Dict[Tuple, Tuple]:
         """`entries` other processes may use: without those keyed under an
-        edited source's fingerprint, which serve their own process only, and
-        those another build or code keyed (_superseded)."""
+        edited source's fingerprint, which serve their own process only,
+        those another build or code keyed (_superseded), and those of
+        another key layout (_foreign_layout)."""
         superseded = self._superseded()
         return {
             k: v
-            for k, v in entries.items()
-            if not _edited_key(k) and not superseded(k)
+            for k, v in entries.items() if not _foreign_layout(k)
+            and not _edited_key(k) and not superseded(k)
         }
 
     def add_independent_op(self, custom_op: str,
@@ -2935,18 +3041,25 @@ class AutoTunerProfilingCache:
         another implementation), stay. Saving and exchanges drop these, or a
         cache file reused across builds would keep an entry per build, read
         and exchanged by every later run."""
-        dropped = self.__dict__.get("_dropped_keys", set()) - self.cache.keys()
-        owns: Dict[Tuple, Set[str]] = {}
-        current = set()
-        for key in self.__dict__.get("_current_keys", ()):
-            if (len(key) > 4 and isinstance(key[4], str)
-                    and not _edited_key(key)):
-                current.add(key)
-                own, name, device = _own_fingerprint(key[4])
-                owns.setdefault((key[:4], name, device), set()).add(own)
+        dropped = self.__dict__.get("_dropped_keys", set())
+        current_keys = self.__dict__.get("_current_keys", set())
+        # The index of the current keys, built again only when they grow.
+        memo = self.__dict__.get("_superseded_index")
+        if memo is None or memo[0] != len(current_keys):
+            owns: Dict[Tuple, Set[str]] = {}
+            current = set()
+            for key in current_keys:
+                if (len(key) > 4 and isinstance(key[4], str)
+                        and not _edited_key(key)):
+                    current.add(key)
+                    own, name, device = _own_fingerprint(key[4])
+                    owns.setdefault((key[:4], name, device), set()).add(own)
+            memo = self.__dict__["_superseded_index"] = (len(current_keys),
+                                                         owns, current)
+        _, owns, current = memo
 
         def superseded(key: Tuple) -> bool:
-            if key in dropped:
+            if key in dropped and key not in self.cache:
                 return True
             if len(key) <= 4 or not isinstance(key[4], str) or key in current:
                 return False
@@ -3541,23 +3654,41 @@ class AutoTuner:
         # every profile of the op, chosen alike (the native caches some ops
         # fill from the cache take them all).
         profiles = None
+        # The key a lookup maps this input to, as a profile to agree on.
+        current = None
+        # The config the profiling runs under.
+        profile_config = tuning_config
         if self._needs_rank_agreement(strategy):
             profiles = self._profiles_for(tuning_config, inputs, input_shapes)
+            # The entry this call returns counts too, under the key a lookup
+            # maps its input to, which the profiles need not include: where
+            # the ranks disagree on it, the merge or broadcast reconciles it.
+            current = _ProfileKey(
+                self._find_nearest_profile(input_shapes,
+                                           tuning_config.dynamic_tensor_specs,
+                                           tuning_config.constraint_specs,
+                                           tuning_config.tune_max_num_tokens,
+                                           True))
             agreement = self._agree_on_cache_hit(
-                runners, is_cache_hit,
-                (best_runner_id, _tactic_repr(best_tactic)), profiles,
-                [cached_choice(p) for p in profiles])
+                runners, is_cache_hit, [*profiles, current], [
+                    *(cached_choice(p) for p in profiles),
+                    (best_runner_id,
+                     _tactic_repr(best_tactic)) if is_cache_hit else None
+                ])
             is_cache_hit = agreement.hit
             if not agreement.shared_scope and strategy in (
                     DistributedTuningStrategy.BROADCAST,
                     DistributedTuningStrategy.PARALLEL):
-                # Ranks that may choose apart (other communicators, unique_ids
-                # or GPUs) cannot take one rank's measurements or share a deal
-                # of the tactics: each measures its own pairs, and the merge
-                # keeps the fastest of each key.
-                tuning_config = replace(
+                # Ranks that may choose apart (other unique_ids or GPUs)
+                # cannot take one rank's measurements or share a deal of the
+                # tactics: each profiles all its own pairs, as under
+                # INDEPENDENT (not MERGE, whose per-tactic barrier would wait
+                # for ranks profiling other pairs), and the ranks then merge
+                # as under MERGE, keeping the fastest of each key.
+                profile_config = replace(
                     tuning_config,
-                    distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+                    distributed_tuning_strategy=DistributedTuningStrategy.
+                    INDEPENDENT)
                 strategy = DistributedTuningStrategy.MERGE
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
@@ -3579,8 +3710,6 @@ class AutoTuner:
             custom_op, strategy=tuning_config.distributed_tuning_strategy)
 
         tuning_start_time = time.perf_counter()
-        # Libraries loaded since the fingerprints were taken change them.
-        _rescan_loaded_libraries()
         if profiles is None:
             profiles = self._optimization_profiles(tuning_config, inputs)
         # The entries this rank drops to tune them again.
@@ -3607,7 +3736,8 @@ class AutoTuner:
                     zip([p.get_opt_shapes() for p in profiles],
                         self._profile_hits_on_all_ranks(
                             profiles, [cached_choice(p) for p in profiles],
-                            _choice_scope(runners))))
+                            _choice_scope(runners),
+                            self._lockstep_scope(runners))))
                 # Only this round's measurements compete for a profile tuned
                 # again: an older entry of another candidate, or one a rank
                 # that profiles none of the profile's pairs (PARALLEL) still
@@ -3629,7 +3759,7 @@ class AutoTuner:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
                         *_, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op, runners, tensors, p, tuning_config,
+                            custom_op, runners, tensors, p, profile_config,
                             **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
@@ -3662,15 +3792,17 @@ class AutoTuner:
 
         received = self._maybe_sync_cache_data(strategy, custom_op, tuned_again)
         if received is not None:
-            for p in profiles:
+            for p in (profiles if current is None else [*profiles, current]):
                 keys = slot_keys(p)
                 if strategy == DistributedTuningStrategy.BROADCAST:
                     # A peer holds what the root holds for the profile, which
                     # may be no entry (no valid tactic, or a shape the root
                     # did not build); BROADCAST adds the root's entries to
-                    # the peer's own, which the lookup could find first.
-                    self.profiling_cache.drop(key for key in keys
-                                              if key not in received)
+                    # the peer's own, which the lookup could find first. Only
+                    # a loser to the root's winner leaves the cache file too.
+                    self.profiling_cache.drop(
+                        (key for key in keys if key not in received),
+                        forget=any(key in received for key in keys))
                     continue
                 # The ranks' winners can be of different candidates: keep the
                 # fastest, which the lookup would otherwise not find first.
@@ -4841,7 +4973,7 @@ class AutoTuner:
     def print_profiling_cache(self):
         self._debug_logger(f"[Autotuner] The profiling_cache entries:")
         self._debug_logger(
-            f"[Autotuner] Cache contents: (custom_op, runner, unique_id, shape_profiles, code_fingerprint[, tactic_space]) -> (runner_id, tactic, min_time)"
+            f"[Autotuner] Cache contents: (custom_op, runner, unique_id, shape_profiles, fingerprint (build or code, runner names, GPU)[, tactic_space]) -> (runner_id, tactic, min_time)"
         )
         for key, value in self.profiling_cache.cache.items():
             runner_id, tactic, min_time = value
@@ -5025,16 +5157,17 @@ class AutoTuner:
         self,
         runners: List[TunableRunner],
         is_cache_hit: bool,
-        choice: Any = None,
         profiles: Sequence[OptimizationProfile] = (),
         profile_choices: Sequence[Any] = ()
     ) -> _Agreement:
-        """Whether every rank of the tuning group has the entry and the
-        entries of `profiles` (`profile_choices`: a choice each, or None),
-        and the ranks that must agree (_choice_scope) chose the same runner
-        and tactic in them, and whether all ranks share one scope (one host
-        all-gather of these, and of the fingerprint, _rank_signature, rank
-        groups, unique_ids and GPU architecture of `runners`).
+        """Whether every rank of the tuning group has the entry of its input,
+        and the ranks that must agree (_choice_scope) hold the same entries
+        of `profiles` (`profile_choices`: the runner and tactic chosen in
+        each, or None): the same choice, or none on all of them (a profile
+        for an input size no lookup maps to, or one no tactic can run); and
+        whether all ranks share one scope (one host all-gather of these, and
+        of the fingerprint, _rank_signature, rank groups, unique_ids and GPU
+        architecture of `runners`).
 
         Ranks that fingerprint the runners differently may be running
         different code, with different valid tactics: their keys would not
@@ -5055,8 +5188,7 @@ class AutoTuner:
         uids = tuple(str(r.unique_id()) for r in runners)
         gathered = self._dist.tp_cp_allgather(
             obj=(bool(is_cache_hit), _candidates_fingerprint(kinds),
-                 _rank_signature(runners), choice if is_cache_hit else None,
-                 groups, uids, _device_capability(),
+                 _rank_signature(runners), groups, uids, _device_capability(),
                  [p.get_opt_shapes() for p in profiles], list(profile_choices)))
         fingerprints = {entry[1] for entry in gathered}
         names = sorted({".".join(_class_name(type(r))) for r in runners})
@@ -5086,7 +5218,7 @@ class AutoTuner:
                 "candidates alike on every rank.")
         built: Dict[Tuple, Tuple] = {}
         for entry in gathered:
-            rank_groups, rank_uids = entry[4], entry[5]
+            rank_groups, rank_uids = entry[3], entry[4]
             if any(g is not None for g in rank_groups) and built.setdefault(
                     rank_groups, rank_uids) != rank_uids:
                 raise RuntimeError(
@@ -5096,40 +5228,49 @@ class AutoTuner:
                     "different tactics for one collective. Build the runners "
                     "alike on every rank of it.")
         scopes = [
-            _choice_scope_of(entry[4], entry[5], entry[6]) for entry in gathered
+            _choice_scope_of(entry[3], entry[4], entry[5]) for entry in gathered
         ]
         shared_scope = len(set(scopes)) == 1
         if not all(entry[0] for entry in gathered):
             return _Agreement(False, shared_scope)
-        chosen: Dict[Tuple, Any] = {}
-        if any(
-                chosen.setdefault(scope, entry[3]) != entry[3]
-                for scope, entry in zip(scopes, gathered)):
-            return _Agreement(False, shared_scope)
         return _Agreement(
-            not _missed_profiles((scope, entry[7], entry[8])
-                                 for scope, entry in zip(scopes, gathered)),
-            shared_scope)
+            not _missed_profiles(((scope, None, entry[6], entry[7])
+                                  for scope, entry in zip(scopes, gathered)),
+                                 absent_agrees=True), shared_scope)
 
     def _profile_hits_on_all_ranks(
-        self,
-        profiles: List[OptimizationProfile],
-        hits: List[Any],
-        scope: Tuple = ("", ("unique_id", ()))) -> List[bool]:
+            self,
+            profiles: List[OptimizationProfile],
+            hits: List[Any],
+            scope: Tuple = ("unique_id", "", ()),
+            lockstep: Optional[Tuple] = None) -> List[bool]:
         """Per profile, whether it needs no tuning on this rank, whose
-        choices are scoped by `scope` (_choice_scope): every rank that builds
-        it and profiles with this one (_lockstep_scope) has it cached, and
-        the ranks of each scope chose alike where ``hits`` holds choices (one
-        host all-gather). A hit is a choice, or True; a miss None or False.
+        choices are scoped by `scope` (_choice_scope) and which profiles with
+        the ranks of `lockstep` (_lockstep_scope): every rank of its lockstep
+        scope that builds it has it cached, and the ranks of each choice
+        scope chose alike where ``hits`` holds choices (one host all-gather).
+        A hit is a choice, or True; a miss None or False.
 
         Ranks build their profiles from their own input shapes (attention DP), so the lists may differ.
         """
         keys = [p.get_opt_shapes() for p in profiles]
         missed = _missed_profiles(
             self._dist.tp_cp_allgather(
-                obj=(scope, keys, [hit if hit else None for hit in hits])))
-        lockstep = _lockstep_scope(scope)
+                obj=(scope, lockstep, keys,
+                     [hit if hit else None for hit in hits])))
         return [(lockstep, key) not in missed for key in keys]
+
+    def _lockstep_scope(self, runners: List[TunableRunner]) -> Optional[Tuple]:
+        """The ranks that profile a profile together: the communicator the
+        runners name (TunableRunner.rank_group) when it is this rank's TP
+        group, which the per-tactic barrier of MERGE profiling spans, as for
+        the TP subgroups of Helix CP; else (None) the whole tuning group."""
+        groups = {r.rank_group() for r in runners} - {None}
+        tp_group = getattr(self.mapping, "tp_group", None)
+        if (len(groups) == 1 and tp_group is not None
+                and next(iter(groups)) == tuple(sorted(tp_group))):
+            return next(iter(groups))
+        return None
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:
