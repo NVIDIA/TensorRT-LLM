@@ -67,7 +67,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--goal",
         default=None,
         help="With --checkpoint: the features, members and workload in one line, e.g. "
-        '"mtp disagg@tp1/tp2 tp1 tep4 dep4 isl=8192 osl=1024 tune" (spec/derive.py). '
+        '"mtp disagg@tp1/tp2 tp1 tep4 dep4 isl=8192 osl=1024" (spec/derive.py). '
         "Features the checkpoint carries are built unless named `-<feature>`.",
     )
     parser.add_argument(
@@ -111,7 +111,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="SECONDS",
         help="While work is in flight, batch ordinary reports, green finishes and nonblocking "
         "task failures for this many seconds. Failures blocking pending hard dependencies, "
-        "operator messages, failed re-checks, or an idle graph wake the planner at once. "
+        "operator messages, failed checks, or an idle graph wake the planner at once. "
         f"Default {DEFAULT_EVENT_WINDOW_S:g}.",
     )
     parser.add_argument(
@@ -134,9 +134,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run preflight, resolve the environment, print the plan of "
-        "record, and stop before the first agent turn. The fastest way to "
-        "find out whether this host can host this run.",
+        help="Run preflight, resolve the environment, prove each agent with one "
+        "short turn, print the plan of record, and stop before the planner's first "
+        "turn. The fastest way to find out whether this host can host this run.",
     )
     parser.add_argument(
         "--wait-for-spool",
@@ -146,31 +146,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="With a session_spool environment, wait up to MINUTES for the "
         "spool to appear (its compute session is still importing the image) "
         "instead of failing validation at once.",
-    )
-    parser.add_argument(
-        "--skip-substrate-gate",
-        action="store_true",
-        help="Skip preflight's substrate gate — the cold start that proves "
-        "this host generates a token on the STOCK modeling path under this "
-        "run's runtime block. It is the single highest-value preflight "
-        "check and skipping it means the three failures it catches "
-        "(MPI_ERR_SPAWN, kvCache sizing, NVRTC's missing cuda.h) resurface "
-        "hours later inside an agent's turn, reading as target defects. "
-        "A resumed run already skips the gate when its last pass "
-        "(gates/substrate/pass.json) is under 12 h old in the same environment; "
-        "use this only when the gate itself is what is broken. It is "
-        "NOT the answer to an architecture the stock path does not know — "
-        "declare `environment.substrate_checkpoint` for that, which keeps "
-        "the two checks that do not depend on the checkpoint.",
-    )
-    parser.add_argument(
-        "--stage",
-        dest="entry_stage",
-        choices=["", "tune"],
-        default="",
-        help="Start at a later stage. `tune` runs the performance stage (ground truth, "
-        "tuner candidates) on an already-onboarded target, or re-enters a "
-        "delivered run at it. Same as the `tune` subcommand. Needs a `perf:` block.",
     )
     parser.add_argument(
         "--agent-turn-timeout",
@@ -347,7 +322,7 @@ def _feedback(argv: list[str]) -> int:
 #: A run is ``trtllm-modeling-v2 --task ...``; a first argument named here
 #: dispatches instead, and everything after it is the subcommand's own.
 SUBCOMMANDS = {
-    # From a request to a spec, before launch: `intake derive|lint ...` (spec/INTAKE.md).
+    # From a request to a spec, before launch: `intake derive ...` (spec/INTAKE.md).
     "intake": _lazy_main(".spec.intake"),
     "gate": _lazy_main(".checks.gate_cli"),
     # Compute sessions: render entry scripts, hand-over.
@@ -390,9 +365,6 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in SUBCOMMANDS:
         sys.exit(SUBCOMMANDS[argv[0]](argv[1:]))
-    if argv and argv[0] == "tune":
-        # `trtllm-modeling-v2 tune --task T --workspace W` == `--stage tune`.
-        argv = [*argv[1:], "--stage", "tune"]
     args = _parse_args(argv)
     if args.wait_for_spool > 0:
         # A derived task takes its environment from the site.
@@ -447,9 +419,7 @@ def main(argv: list[str] | None = None) -> None:
         max_attempts=args.max_attempts,
         clean=args.clean,
         dry_run=args.dry_run,
-        skip_substrate_gate=args.skip_substrate_gate,
         agent_turn_timeout=args.agent_turn_timeout,
-        entry_stage=args.entry_stage,
         event_window_s=args.event_window_s,
         primers=args.primers,
     ) as workflow:

@@ -56,6 +56,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor import _util as util_module
 from tensorrt_llm._torch.pyexecutor import seq_slot_manager as seq_slot_manager_module
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -73,13 +74,21 @@ from tensorrt_llm._torch.pyexecutor._util import (
     should_enable_scheduler_aware_adp_dummy,
     validate_seq_slot_pool_covers_admission,
 )
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_deltas_cache
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyStore
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    SchedulerConfig,
+    SkipSoftmaxAttentionConfig,
+    SleepConfig,
+)
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
 
 # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
 SIZING_CASES = [
@@ -352,6 +361,63 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
     assert selected is (KVCacheManager if enable_sleep else KVCacheManagerV2)
     assert resolved is issubclass(selected, KVCacheManagerV2)
     assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
+
+
+@pytest.mark.parametrize("use_v2", [True, False])
+@pytest.mark.parametrize(
+    "max_beam_width,enable_sleep",
+    [(1, False), (4, False), (1, True)],
+)
+def test_skip_softmax_selects_the_dense_manager_resolved_v2_predicts(
+    use_v2, max_beam_width, enable_sleep
+):
+    """Skip Softmax keeps the dense KV cache, so it follows the dense V2 rules.
+
+    ``resolved_kv_cache_manager_is_v2`` sizes the seat pool from the dense
+    rules alone, so the manager the creator selects for a Skip Softmax model
+    must be the one those rules predict: V2 when requested, including beam
+    search, and the plain V1 fallback only for a V2-incompatible feature.
+    """
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            architectures=["Qwen3MoeForCausalLM"], num_hidden_layers=2
+        ),
+        sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
+    creator._kv_cache_config = kv_cache_config
+    creator._max_beam_width = max_beam_width
+    creator._is_disagg = False
+    creator._cache_transceiver_config = None
+    creator._speculative_config = None
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
+
+    selected = creator._get_model_kv_cache_manager_cls()
+    resolved = resolved_kv_cache_manager_is_v2(
+        kv_cache_config, max_beam_width, enable_sleep=enable_sleep
+    )
+
+    assert selected is (KVCacheManagerV2 if use_v2 and not enable_sleep else KVCacheManager)
+    assert resolved is issubclass(selected, KVCacheManagerV2)
+
+
+@pytest.mark.parametrize("max_beam_width,enable_sleep", [(4, False), (1, True)])
+def test_sparse_kv_cache_manager_v2_does_not_fall_back(max_beam_width, enable_sleep):
+    """A sparse algorithm with its own cache manager still refuses the V1 fallback."""
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="dsa"),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._max_beam_width = max_beam_width
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
+
+    with pytest.raises(NotImplementedError, match="sparse-attention models.*'dsa'"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
 
 
 @pytest.mark.parametrize("max_beam_width", [1, 2, 4])
@@ -769,6 +835,7 @@ def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) 
     c._disable_overlap_scheduler = disable_overlap_scheduler
     c._llm_args = SimpleNamespace(
         kv_cache_config=SimpleNamespace(kv_events_config=None),
+        enable_locality_domains=False,
     )
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True
@@ -985,7 +1052,7 @@ def _sampler_with(store):
 def test_penalty_store_is_read_from_the_torch_sampler_only():
     store = _penalty_store(16)
     assert get_penalty_store(_sampler_with(store)) is store
-    # EarlyStopSampler and friends own no penalty handler, and estimation may have no sampler.
+    # Early-stop samplers own no penalty handler, and estimation may have no sampler.
     assert get_penalty_store(SimpleNamespace()) is None
     assert get_penalty_store(None) is None
     # A mocked sampler auto-creates the attributes; that is not a store to size from.
@@ -1017,3 +1084,51 @@ def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_he
     assert creator._get_penalty_workspace_reserve(SimpleNamespace(sampler=SimpleNamespace())) == 0
     # Nor does a mocked executor, as the KV-estimation tests pass in.
     assert creator._get_penalty_workspace_reserve(Mock()) == 0
+
+
+def test_resource_factory_rejects_live_slots_before_rebinding(monkeypatch):
+    previous = SeqSlotManager(4)
+    previous.prepare_resources(_batch(_fake_req(CUDA_GRAPH_DUMMY_REQUEST_ID)))
+    previous.shutdown()
+    resources = {ResourceManagerType.SEQ_SLOT_MANAGER: previous}
+
+    monkeypatch.setattr(util_module, "set_low_latency_dispatch", lambda enabled: None)
+    monkeypatch.setattr(util_module, "SimpleUnifiedScheduler", Mock())
+    monkeypatch.setattr(util_module, "create_kv_cache_transceiver", Mock(return_value=None))
+    engine = SimpleNamespace(
+        mm_encoder_item_scheduling_enabled=False,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(model_type="llama"), is_encoder_decoder=False
+            )
+        ),
+    )
+    scheduler_config = SchedulerConfig(
+        use_python_scheduler=True,
+        enable_prefix_aware_scheduling=True,
+        capacity_scheduler_policy=util_module.CapacitySchedulerPolicy.MAX_UTILIZATION,
+        waiting_queue_policy=util_module.WaitingQueuePolicy.FCFS,
+    )
+    kwargs = dict(
+        dist=SimpleNamespace(),
+        resources=resources,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        llm_args=SimpleNamespace(extra_resource_managers={}),
+        ctx_chunk_config=None,
+        model_engine=engine,
+        max_batch_size=2,
+        max_num_tokens=128,
+        max_num_sequences=4,
+        scheduler_config=scheduler_config,
+    )
+    bound = util_module.create_py_executor_resources(**kwargs)
+    manager = bound.resource_manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
+    assert manager.get_max_resource_count() == 4
+    assert not manager.slot_manager.slot_mapping
+    manager.prepare_resources(_batch(_fake_req(100)))
+    extra_manager = object()
+    kwargs["llm_args"].extra_resource_managers = {"test_extra": extra_manager}
+    with pytest.raises(RuntimeError, match="Sequence slots must be released"):
+        util_module.create_py_executor_resources(**kwargs)
+    assert "test_extra" not in resources
+    assert manager.slot_manager.get_slot(100) is not None

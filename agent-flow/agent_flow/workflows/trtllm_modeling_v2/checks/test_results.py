@@ -16,8 +16,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
-import yaml
-
 from ..infra.git import git_output
 from .harness.test_driver import RECORD_VERSION, SESSIONS_DIRNAME
 
@@ -130,75 +128,6 @@ def list_test_files(repo: str | Path, commit: str, paths: Iterable[str]) -> list
     return sorted(f for f in listing.split("\0") if f and TEST_FILE.search(f))
 
 
-@dataclass(frozen=True)
-class Comparison:
-    """A test that fails at the head, and how it ended at the base."""
-
-    head: Result
-    base: Result | None
-    #: The base does not hold the test at all.
-    new: bool = False
-
-
-@dataclass
-class CompareReport:
-    """The tests of a declared list at the head, against the base."""
-
-    regressions: list[Comparison] = field(default_factory=list)
-    pre_existing: list[Comparison] = field(default_factory=list)
-    base_unknown: list[Comparison] = field(default_factory=list)
-    #: Test ids with no result at the head; a file no session collected, whole.
-    not_run: list[str] = field(default_factory=list)
-    passed: int = 0
-
-    @property
-    def verdict(self) -> str:
-        """``REGRESSED``; ``INCOMPLETE``: a test unrun at the head, or of unknown standing; ``CLEAN``."""
-        if self.regressions:
-            return "REGRESSED"
-        if self.base_unknown or self.not_run:
-            return "INCOMPLETE"
-        return "CLEAN"
-
-
-def compare(
-    head: Results, base: Results, files: Sequence[str], base_files: Iterable[str]
-) -> CompareReport:
-    """``head``'s results for the tests of ``files`` against ``base``'s.
-
-    A test that fails at the head is a regression when it passed at the base or
-    the base does not hold it (its file is not among ``base_files``, or the
-    base's collection of that file has no such test); pre-existing when it
-    failed there too; and of unknown standing when the base has no result for it.
-    """
-    at_base = set(base_files)
-    report = CompareReport()
-    for file in files:
-        ids = head.test_ids(file)
-        if ids is None:
-            report.not_run.append(file)
-            continue
-        held = base.test_ids(file) if file in at_base else []
-        for nodeid in ids:
-            now = head.result(nodeid)
-            if now is None:
-                report.not_run.append(nodeid)
-                continue
-            if now.outcome not in FAILING:
-                report.passed += 1
-                continue
-            then = base.result(nodeid)
-            new = then is None and held is not None and nodeid not in held
-            entry = Comparison(now, then, new)
-            if new or (then is not None and then.outcome not in FAILING):
-                report.regressions.append(entry)
-            elif then is None:
-                report.base_unknown.append(entry)
-            else:
-                report.pre_existing.append(entry)
-    return report
-
-
 @dataclass
 class HeadResults:
     """What the recorded results say of some tests at one commit, on their own."""
@@ -258,47 +187,6 @@ def head_results(results: Results, files: Iterable[str]) -> HeadResults:
     return found
 
 
-def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | None:
-    """The commit a regression check last cleared, else the run's starting commit.
-
-    The first is the newest ``cleared`` among the receipts in
-    ``<workspace>/tasks/`` that is an ancestor of ``head``; the second, the
-    parent of the oldest commit any receipt says its task integrated.
-    """
-
-    def resolve(rev: str) -> str | None:
-        found = git_output(repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
-        return (found or "").strip() or None
-
-    def ancestor(older: str, newer: str) -> bool:
-        return git_output(repo, "merge-base", "--is-ancestor", older, newer) is not None
-
-    receipts = []
-    for path in sorted((Path(workspace) / "tasks").glob("*.receipt.yaml")):
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if isinstance(data, dict):
-            receipts.append(data)
-    cleared = []
-    for receipt in receipts:
-        commit = resolve(str(receipt["cleared"])) if receipt.get("cleared") else None
-        if commit and ancestor(commit, head):
-            cleared.append((str(receipt.get("written_at") or ""), commit))
-    if cleared:
-        return max(cleared)[1]
-    integrated = []
-    for receipt in receipts:
-        for line in receipt.get("commits") or ():
-            words = str(line).split()
-            commit = resolve(words[0]) if words else None
-            if commit and ancestor(commit, head):
-                integrated.append(commit)
-    oldest = [c for c in integrated if all(ancestor(c, o) for o in integrated)]
-    return resolve(f"{oldest[0]}^") if oldest else None
-
-
 def write_selection(path: Path, lines: Sequence[str]) -> Path:
     """``lines``, one per line, at ``path``: what one driver job runs."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,7 +194,12 @@ def write_selection(path: Path, lines: Sequence[str]) -> Path:
     return path
 
 
-def driver_command(python: str, cache: str | Path, tree: str | Path, selection: str | Path) -> str:
+def driver_command(
+    python: str,
+    cache: str | Path,
+    tree: str | Path,
+    selection: str | Path,
+) -> str:
     """The driver's command line over the tests ``selection`` lists, run in ``tree``."""
     words = [str(DRIVER), "run", "--cache", str(cache), "--repo", str(tree)]
     words += ["--selection", str(selection)]
@@ -319,14 +212,10 @@ def driver_command(python: str, cache: str | Path, tree: str | Path, selection: 
 __all__ = [
     "CACHE_DIRNAME",
     "DRIVER",
-    "CompareReport",
-    "Comparison",
     "HeadResults",
     "Result",
     "Results",
     "Session",
-    "compare",
-    "default_base",
     "driver_command",
     "head_results",
     "list_test_files",

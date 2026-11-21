@@ -176,6 +176,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     dynamic tree draft loop, verification, and tree construction.
     """
 
+    # Tree verification reads the target logits of every tree node itself.
+    verifies_on_target_shard = False
+
     def __init__(
         self, spec_config: "EagleDecodingConfig", mapping, use_separate_draft_kv_cache: bool = False
     ):
