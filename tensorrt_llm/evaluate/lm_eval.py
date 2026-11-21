@@ -296,6 +296,15 @@ class LmEvalWrapper(TemplateLM):
         #   stop <- gen_kwargs.get("until", ...)
         # See: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/models/openai_completions.py
 
+        # lm-eval passes the same gen_kwargs dict for every repeat of a
+        # request and logs it with the samples, so leave it untouched.
+        gen_kwargs = dict(gen_kwargs)
+        # As in lm-eval's HF and vLLM backends (normalize_gen_kwargs),
+        # do_sample=False means greedy decoding whatever the temperature:
+        # the LongBench tasks set temperature 1 with do_sample False.
+        if gen_kwargs.pop("do_sample", None) is False:
+            gen_kwargs["temperature"] = 0.0
+
         if self.sampling_params is None:
             sampling_params = SamplingParams(
                 max_tokens=gen_kwargs.get("max_gen_toks", 256),
