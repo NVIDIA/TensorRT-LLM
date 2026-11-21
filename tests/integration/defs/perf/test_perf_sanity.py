@@ -29,6 +29,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -1665,6 +1666,119 @@ def add_startup_metric_values(
     )
 
 
+# Name of the aggregated server in its warmup time file. A disagg worker uses
+# its serving type instead (CTX_0, GEN_1, ...).
+AGGREGATE_SERVER_NAME = "aggregate"
+WARMUP_TIME_POLL_INTERVAL = 1.0
+
+
+def _warmup_time_path(test_output_dir: str, server_name: str, server_idx: int) -> str:
+    return os.path.join(test_output_dir, f"warmup_time.{server_name}.{server_idx}.json")
+
+
+def write_warmup_time(
+    test_output_dir: str, server_name: str, server_idx: int, warmup_time: float
+) -> None:
+    """Save a server's warmup time for the task that uploads the results.
+
+    The warmup time is the seconds from the server's launch until its /health
+    first returns 200, so it includes weight loading and the executor warmup.
+    """
+    print_info(f"{server_name} warmup time: {warmup_time:.1f}s")
+    path = _warmup_time_path(test_output_dir, server_name, server_idx)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as output_file:
+        json.dump({"warmup_time": warmup_time}, output_file)
+    os.replace(tmp_path, path)
+
+
+def warmup_time_fields(
+    test_output_dir: str, server_idx: int, server_names: List[str]
+) -> Dict[str, float]:
+    """Return the OpenSearch fields of the warmup times these servers saved.
+
+    The aggregated server's field is d_warmup_time, and a disagg worker's field
+    carries the worker's name, e.g. d_gen_0_warmup_time. A server that saved no
+    warmup time gets no field.
+    """
+    fields = {}
+    for server_name in server_names:
+        path = _warmup_time_path(test_output_dir, server_name, server_idx)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as input_file:
+                warmup_time = float(json.load(input_file)["warmup_time"])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print_warning(f"Failed to read the warmup time from {path}: {error}")
+            continue
+        prefix = "" if server_name == AGGREGATE_SERVER_NAME else f"{server_name.lower()}_"
+        fields[f"d_{prefix}warmup_time"] = warmup_time
+    return fields
+
+
+def _server_reports_healthy(addr_path: str) -> bool:
+    """Return whether the server whose address is in addr_path answers /health with 200."""
+    try:
+        with open(addr_path, "r", encoding="utf-8") as addr_file:
+            host, _, port = addr_file.read().strip().rpartition(":")
+        if not port:
+            return False
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=5) as response:
+            return response.status == 200
+    except (OSError, ValueError, http.client.HTTPException):
+        # The address is not reported yet, the server is not listening yet, or
+        # /health answers 503 while the server starts.
+        return False
+
+
+class WarmupTimeRecorder:
+    """Save a server's warmup time from a background thread.
+
+    For a disagg worker, whose task waits for the benchmark to finish instead of
+    for its own server. addr_path is the file the server's host:port is (or will
+    be) reported to. Stop the recorder before stopping the server, and before the
+    test ends: integration tests fail on a thread that is still running.
+    """
+
+    def __init__(
+        self,
+        server_proc: subprocess.Popen,
+        addr_path: str,
+        launch_time: float,
+        test_output_dir: str,
+        server_name: str,
+        server_idx: int,
+    ):
+        # A retry reuses test_output_dir; never upload the previous attempt's value.
+        stale_path = _warmup_time_path(test_output_dir, server_name, server_idx)
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+        self._stop_event = threading.Event()
+
+        def record() -> None:
+            while not self._stop_event.is_set() and server_proc.poll() is None:
+                if _server_reports_healthy(addr_path):
+                    write_warmup_time(
+                        test_output_dir, server_name, server_idx, time.monotonic() - launch_time
+                    )
+                    return
+                self._stop_event.wait(WARMUP_TIME_POLL_INTERVAL)
+
+        self._thread = threading.Thread(target=record, name=f"warmup-time-{server_name}")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join()
+
+    def __enter__(self) -> "WarmupTimeRecorder":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.stop()
+
+
 def get_model_dir(model_name: str) -> str:
     """Get model directory path from model name."""
     if model_name in MODEL_PATH_DICT:
@@ -3020,6 +3134,7 @@ class AggrTestCmds(NamedTuple):
             if server_idx < len(self.server_configs):
                 server_env.update(self.server_configs[server_idx].to_env())
             with open(server_file_path, "w") as server_ctx:
+                launch_time = time.monotonic()
                 server_proc = subprocess.Popen(
                     server_cmd_with_port,
                     env=server_env,
@@ -3035,6 +3150,12 @@ class AggrTestCmds(NamedTuple):
                     ),
                     check_files=[server_file_path],
                     server_proc=server_proc,
+                )
+                write_warmup_time(
+                    self.test_output_dir,
+                    AGGREGATE_SERVER_NAME,
+                    server_idx,
+                    time.monotonic() - launch_time,
                 )
                 observation = collect_startup_observation(
                     f"{server_hostname}:{server_port}",
@@ -3878,12 +3999,21 @@ class DisaggTestCmds(NamedTuple):
         try:
             print_info(f"Starting DWDP ctx rank {rank}/{world_size}. cmd is {server_cmd}")
             with open(server_log, "w") as log_file:
+                launch_time = time.monotonic()
                 server_proc = subprocess.Popen(
                     server_cmd, env=worker_env, stdout=log_file, stderr=subprocess.STDOUT
                 )
-                self.wait_for_benchmark_ready(
-                    benchmark_status_file, server_proc=server_proc, server_log=server_log
-                )
+                with WarmupTimeRecorder(
+                    server_proc,
+                    self._hostname_file(server_idx, f"CTX_{rank}"),
+                    launch_time,
+                    self.test_output_dir,
+                    f"CTX_{rank}",
+                    server_idx,
+                ):
+                    self.wait_for_benchmark_ready(
+                        benchmark_status_file, server_proc=server_proc, server_log=server_log
+                    )
         finally:
             print_info(f"DWDP ctx rank {rank} stopped")
             if server_proc is not None:
@@ -3954,17 +4084,26 @@ class DisaggTestCmds(NamedTuple):
                 if worker_cfg is not None:
                     worker_env.update(worker_cfg.to_env())
                 with open(server_file_path, "w") as server_ctx:
+                    launch_time = time.monotonic()
                     server_proc = subprocess.Popen(
                         server_cmd,
                         env=worker_env,
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
                     )
-                    self.wait_for_benchmark_ready(
-                        benchmark_status_file,
-                        server_proc=server_proc,
-                        server_log=server_file_path,
-                    )
+                    with WarmupTimeRecorder(
+                        server_proc,
+                        hostname_file,
+                        launch_time,
+                        self.test_output_dir,
+                        self.disagg_serving_type,
+                        server_idx,
+                    ):
+                        self.wait_for_benchmark_ready(
+                            benchmark_status_file,
+                            server_proc=server_proc,
+                            server_log=server_file_path,
+                        )
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
                 server_proc.terminate()
@@ -4350,6 +4489,7 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
 
         gen_proc = None
         proxy_proc = None
+        gen_warmup_recorder = None
         try:
             num_frontends = getattr(gen_cfg, "num_serve_frontends", 1) or 1
             gen_addr_path = os.path.join(self.test_output_dir, f"GEN_0.{server_idx}.addr")
@@ -4376,11 +4516,15 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
             # in benchmark gen-only mode, whichever launcher started this test.
             gen_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
             with open(gen_log_path, "a") as gen_ctx:
+                launch_time = time.monotonic()
                 gen_proc = subprocess.Popen(
                     gen_cmd_with_port,
                     env=gen_env,
                     stdout=gen_ctx,
                     stderr=subprocess.STDOUT,
+                )
+                gen_warmup_recorder = WarmupTimeRecorder(
+                    gen_proc, gen_addr_path, launch_time, self.test_output_dir, "GEN_0", server_idx
                 )
                 gen_host, gen_port = wait_for_reported_addr(gen_addr_path, self.timeout, gen_proc)
 
@@ -4512,6 +4656,8 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
                             server_idx=server_idx,
                         )
         finally:
+            if gen_warmup_recorder is not None:
+                gen_warmup_recorder.stop()
             for proc, name in ((proxy_proc, "disagg proxy"), (gen_proc, "gen worker")):
                 if proc:
                     print_info(f"Stopping {name}")
@@ -5640,6 +5786,9 @@ class PerfSanityTestConfig:
                 server_config_dict = server_config.to_db_data()
                 server_perf_results = self._perf_results.get(server_idx, [])
                 startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
+                warmup_times = warmup_time_fields(
+                    self.test_output_dir, server_idx, [AGGREGATE_SERVER_NAME]
+                )
                 startup_primary_row_pending = True
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
@@ -5695,6 +5844,7 @@ class PerfSanityTestConfig:
                         server_config.checkpoint_io_experiment,
                         expected_server_count=1,
                     )
+                    new_data.update(warmup_times)
 
                     new_data_dict[cmd_idx] = new_data
                     startup_primary_row_pending = False
@@ -5717,6 +5867,12 @@ class PerfSanityTestConfig:
                 client_configs = self.server_client_configs[server_idx]
                 server_perf_results = self._perf_results.get(server_idx, [])
                 startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
+                warmup_times = warmup_time_fields(
+                    self.test_output_dir,
+                    server_idx,
+                    [f"CTX_{i}" for i in range(disagg_config.num_ctx_servers)]
+                    + [f"GEN_{i}" for i in range(disagg_config.num_gen_servers)],
+                )
                 startup_primary_row_pending = True
                 # Skip if server failed
                 if len(server_perf_results) != len(client_configs):
@@ -5792,6 +5948,7 @@ class PerfSanityTestConfig:
                         role="gen",
                         expected_server_count=num_gen_servers,
                     )
+                    new_data.update(warmup_times)
 
                     new_data_dict[cmd_idx] = new_data
                     startup_primary_row_pending = False

@@ -78,6 +78,10 @@ The device value reported at iter `N` is the device step time of iter `N-1` (dev
 
 If the mean cannot be parsed for a `gen_only` run, `check_test_failure` raises `RuntimeError` and no data is uploaded. Other modes omit the five columns instead of failing: there the family is diagnostic and throughput still gates, so hard-failing would make every `e2e` case on every cluster red on log-scrape plumbing rather than on performance.
 
+#### `d_warmup_time`, `d_{ctx,gen}_<i>_warmup_time`
+
+Seconds from a server's launch until its `/health` first returns 200, so weight loading and the executor warmup are included; the client warmup requests are not. An aggregated row (also `ctx_only`) has one `d_warmup_time`; a disaggregated row has one field per worker (`d_ctx_0_warmup_time`, ..., `d_gen_0_warmup_time`, ...). They are uploaded only: not in `MINIMIZE_METRICS`, so they get no baseline and never gate.
+
 ### Match Keys
 
 Match keys are the fields that identify a test case when looking up its history to
