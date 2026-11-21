@@ -161,7 +161,7 @@ Follow this step-by-step guide to quantize a model:
 
 ```bash
 git clone https://github.com/NVIDIA/Model-Optimizer.git
-cd Model-Optimizer/examples/llm_ptq
+cd Model-Optimizer/examples/hf_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8
 ```
 
@@ -171,7 +171,7 @@ To generate the checkpoint for NVFP4 KV cache:
 
 ```bash
 git clone https://github.com/NVIDIA/Model-Optimizer.git
-cd Model-Optimizer/examples/llm_ptq
+cd Model-Optimizer/examples/hf_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --kv_cache_quant nvfp4
 ```
 
