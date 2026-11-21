@@ -29,6 +29,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionResponse,
 )
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
+from tensorrt_llm._torch.visual_gen.session_protocol import SessionOpen
 from tensorrt_llm.visual_gen import BatchingConfig, MediaRef, VisualGenArgs, VisualGenParams
 
 pytestmark = pytest.mark.cpu_only
@@ -162,6 +163,18 @@ def test_incompatible_requests_keep_fifo_order():
     scheduler = DynamicBatchScheduler(4, 5, clock=requests.clock)
     assert _next(scheduler, requests) is first
     assert _next(scheduler, requests) is second
+    assert _next(scheduler, requests) is third
+    assert _next(scheduler, requests) is None
+
+
+def test_session_open_is_never_merged_and_keeps_fifo_order():
+    first, third = _request(1), _request(3)
+    session_open = SessionOpen(_request(2))
+    requests = _Queue([(0, first), (0, session_open), (0, third), (0, None)])
+    scheduler = DynamicBatchScheduler(4, 5, clock=requests.clock)
+    assert request_batch_key(session_open) is None
+    assert _next(scheduler, requests) is first
+    assert _next(scheduler, requests) is session_open
     assert _next(scheduler, requests) is third
     assert _next(scheduler, requests) is None
 
@@ -396,7 +409,10 @@ def test_receive_loop_broadcasts_a_single_merged_request():
     executor.sender_thread = None
     executor.visual_gen_args = VisualGenArgs(batching_config={"max_batch_size": 2})
     executor.pipeline = SimpleNamespace(supports_dynamic_batching=True)
-    executor.requests_ipc = SimpleNamespace(get=requests.receive, poll=requests.poll)
+    executor.requests_ipc = SimpleNamespace(
+        get=lambda timeout=None: requests.receive(), poll=requests.poll
+    )
+    executor.controls_ipc = None
     executor._broadcast_request = Mock(side_effect=lambda req: req)
     executor.process_request = Mock()
     executor.serve_forever()
@@ -418,7 +434,10 @@ def test_unsupported_pipeline_or_cache_uses_singletons(supports_batching, cache)
         cache_config=cache,
     )
     executor.pipeline = SimpleNamespace(supports_dynamic_batching=supports_batching)
-    executor.requests_ipc = SimpleNamespace(get=requests.receive, poll=requests.poll)
+    executor.requests_ipc = SimpleNamespace(
+        get=lambda timeout=None: requests.receive(), poll=requests.poll
+    )
+    executor.controls_ipc = None
     executor.process_request = Mock()
     executor.serve_forever()
     assert executor.process_request.call_count == 2
@@ -482,6 +501,7 @@ def test_coordinator_drains_ready_batch_responses_without_repeated_input_wait():
         client._check_worker_liveness = Mock(return_value=None)
         client._init_ipc = Mock(return_value=True)
         client._cleanup_ipc = Mock()
+        client._process_controls = Mock()
         client._request_to_send = None
         client.pending_requests = Mock(wraps=queue.Queue())
         ready = deque(DiffusionResponse(i) for i in range(3))

@@ -35,6 +35,7 @@ from tensorrt_llm.visual_gen.params import (
     prepare_reference_slots,
     validate_visual_gen_params,
 )
+from tensorrt_llm.visual_gen.session import VisualGenSession
 
 __all__ = [
     "VisualGen",
@@ -42,6 +43,7 @@ __all__ = [
     "ExtraParamSchema",
     "RefSlotSpec",
     "VisualGenResult",
+    "VisualGenSession",
 ]
 from tensorrt_llm.llmapi.utils import set_api_status
 from tensorrt_llm.logger import logger
@@ -454,6 +456,66 @@ class VisualGen:
         request.refs_to_shm()
         self.executor.enqueue_requests([request])
         return VisualGenResult(req_id, self.executor, batch_size=batch_size)
+
+    def _session_request(self, prompt: str, params: Optional[VisualGenParams]) -> DiffusionRequest:
+        if not isinstance(prompt, str):
+            raise ValueError("a session takes one prompt string")
+        req_id = next(self._req_counter)
+        if params is not None:
+            resolved_params = params.model_copy(deep=True)
+            validate_visual_gen_params(
+                resolved_params,
+                declared_defaults=self.executor.default_generation_params,
+                extra_param_specs=self.executor.extra_param_specs,
+                ref_slot_specs=self.executor.ref_slot_specs,
+            )
+        else:
+            resolved_params = self.default_params
+        if resolved_params.seed is None:
+            resolved_params.seed = secrets.randbits(63)
+        prepare_reference_slots(resolved_params)
+        request = DiffusionRequest(request_id=req_id, prompt=[prompt], params=resolved_params)
+        request.refs_to_shm()
+        return request
+
+    @set_api_status("prototype")
+    def open_session(
+        self,
+        prompt: str,
+        params: Optional[VisualGenParams] = None,
+    ) -> VisualGenSession:
+        """Open a streaming session.
+
+        The model state for ``prompt`` and ``params`` stays alive on the worker while
+        the session delivers results one advance at a time and accepts input while
+        it runs.
+
+        Blocks until the worker has initialized the session. Behind an ordinary
+        ``generate()`` it waits as any request does; while another session is open
+        on this model instance it raises without waiting. Raises ``ValueError`` when
+        the pipeline does not support sessions, or when it refuses the request and
+        reports the request as the cause; ``MemoryError`` when it lacks the
+        capacity; ``RuntimeError`` for any other failure to open.
+        """
+        request = self._session_request(prompt, params)
+        channel = self.executor.open_session(request)
+        channel.wait_open()
+        return VisualGenSession(self.executor, channel)
+
+    @set_api_status("prototype")
+    async def open_session_async(
+        self,
+        prompt: str,
+        params: Optional[VisualGenParams] = None,
+    ) -> VisualGenSession:
+        """Asynchronous form of :meth:`open_session`, same contract.
+
+        Cancelling the awaiting task relinquishes the session: an open that
+        completes anyway is closed on the worker and its capacity released.
+        """
+        request = self._session_request(prompt, params)
+        channel = await self.executor.open_session_async(request)
+        return VisualGenSession(self.executor, channel)
 
     def __enter__(self):
         return self
