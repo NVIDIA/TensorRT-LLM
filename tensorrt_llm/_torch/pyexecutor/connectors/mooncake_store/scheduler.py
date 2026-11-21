@@ -165,6 +165,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     #: last block whose lookahead the prompt holds, and saves publish only the
     #: blocks a pass computed.
     supports_speculative_prefill = True
+    #: `request_finished` never reads its page indices, so a context server
+    #: may skip gathering them for every finished request.
+    uses_finished_block_ids = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
@@ -211,6 +214,17 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             f"tokens_per_block={self._tokens_per_block}, "
             f"prompt_lookahead={self._prompt_lookahead}, async_load={self._async_load})"
         )
+
+    @property
+    def loads_async(self) -> bool:
+        """Whether served prefixes load off the forward pass.
+
+        True when `async_load` is on and this role loads: an offered request
+        parks while its pages arrive instead of loading inside the forward
+        pass that schedules it. Schedulers that size context chunks around
+        store hits read this.
+        """
+        return self._async_load
 
     def wait_for_initialization(self):
         """Bind to the process-local worker, which owns the store handle."""

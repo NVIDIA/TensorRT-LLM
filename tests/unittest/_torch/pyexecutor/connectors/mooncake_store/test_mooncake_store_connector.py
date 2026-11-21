@@ -1942,6 +1942,27 @@ def _mtp(*, separate_draft_cache: bool, vanilla: bool = False) -> MTPDecodingCon
     return config
 
 
+@pytest.mark.parametrize(
+    "role, async_load, expected",
+    [
+        ("consumer", True, True),
+        ("both", True, True),
+        ("producer", True, False),
+        ("both", False, False),
+    ],
+)
+def test_scheduler_loads_async_follows_async_load_and_role(
+    store_config, role, async_load, expected
+):
+    set_pool_setting(store_config, role=role, async_load=async_load)
+    scheduler = make_scheduler(store_config)
+    assert scheduler.loads_async is expected
+
+
+def test_scheduler_ignores_finished_block_ids():
+    assert MooncakeStoreConnectorScheduler.uses_finished_block_ids is False
+
+
 def test_mooncake_declares_speculative_prefill_support():
     assert MooncakeStoreConnectorScheduler.supports_speculative_prefill is True
     assert MooncakeStoreConnectorWorker.supports_speculative_prefill is True
