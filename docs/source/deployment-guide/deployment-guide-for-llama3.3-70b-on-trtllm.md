@@ -274,7 +274,7 @@ Sample result in Blackwell
 To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
-cat <<EOF >  bench.sh
+cat <<'EOF' > bench.sh
 concurrency_list="1 2 4 8 16 32 64 128 256"
 multi_round=5
 isl=1024
