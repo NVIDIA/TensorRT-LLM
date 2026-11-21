@@ -65,6 +65,9 @@ class Fmha(ABC):
     # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
     supports_deferred_prologue: ClassVar[bool] = False
     supports_variable_window: ClassVar[bool] = False
+    # When available, this library serves every generation profile eligible for
+    # DeepSeek-V4 sparse MLA warmup. Lower-priority libraries need no precompile.
+    covers_dsv4_generation_warmup: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)

@@ -1128,13 +1128,19 @@ def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
         ("disabled", False, False, torch.bfloat16),
         ("prims", False, False, torch.float16),
         ("fallback_first", False, True, torch.bfloat16),
+        ("covered_first", False, True, torch.bfloat16),
     ):
         attn = Mock(spec=DeepseekV4TrtllmAttention)
         attn.compress_ratio = 4
         attn.attn_sink = object() if sinks else None
-        libraries = [] if enabled == "disabled" else [PrimsTSSparseMlaFmha(attn)]
+        attn.is_mla_enable = True
         if enabled == "fallback_first":
-            libraries.insert(0, Mock(spec=FallbackFmha))
+            first = FallbackFmha(attn)
+        else:
+            first = SimpleNamespace(covers_dsv4_generation_warmup=enabled == "covered_first")
+        libraries = [first]
+        if enabled != "disabled":
+            libraries.append(PrimsTSSparseMlaFmha(attn))
         attn._fmha_manager = SimpleNamespace(fmha_libs=libraries)
         layer = MLA.__new__(MLA)
         torch.nn.Module.__init__(layer)
