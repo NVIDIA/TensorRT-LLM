@@ -633,7 +633,8 @@ def test_run_hybrid_calls_the_stages_in_order(monkeypatch):
     assert kw == {
         "config": SPEC,
         "pdl": False,
-    }  # a caller's top-K kernel never triggers early: no pdl
+        "poll": False,
+    }  # a caller's top-K kernel never triggers early and never arms its output: no pdl, no poll
     # no config: the default of run_attention (the kernel is the same for both specs)
     calls.clear()
     tail.run_hybrid(k1, topk_fn, *(args[n] for n in names))
@@ -1011,16 +1012,57 @@ def test_run_hybrid_with_stand_in_stages(batch, attn):
 # programmatic dependent launch (``pdl``): the tail attention starts while the top-K kernel still runs
 
 
-def test_precompile_and_run_attention_take_the_pdl_flag():
+def test_precompile_and_run_attention_take_the_pdl_and_poll_flags():
     tail = _tail()
     for fn in (tail.precompile, tail.run_attention):
-        p = inspect.signature(fn).parameters["pdl"]
-        assert p.default is False and p.kind is not p.POSITIONAL_ONLY
-    assert inspect.signature(tail.run_hybrid).parameters["pdl"].default is None
+        for flag in ("pdl", "poll"):
+            p = inspect.signature(fn).parameters[flag]
+            assert p.default is False and p.kind is not p.POSITIONAL_ONLY
+    for flag in ("pdl", "poll"):
+        assert inspect.signature(tail.run_hybrid).parameters[flag].default is None
     from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_attention as TA
 
-    assert TA.TailAttention(CLUSTER, SPEC).pdl is False
+    assert (TA.TailAttention(CLUSTER, SPEC).pdl, TA.TailAttention(CLUSTER, SPEC).poll) == (
+        False,
+        False,
+    )
     assert TA.TailAttention(CLUSTER, SPEC, pdl=True).pdl is True
+    assert TA.TailAttention(CLUSTER, SPEC, pdl=True).poll is False
+    assert TA.TailAttention(CLUSTER, SPEC, pdl=True, poll=True).poll is True
+
+
+def test_poll_needs_pdl():
+    """Polling the entries of the selection is a variant of the programmatic launch: without it nothing launches early
+    and a poll loop would wait for entries that a finished kernel already wrote. Refused before any device work."""
+    pytest.importorskip("cutlass.cute")  # CuTe DSL; no GPU needed
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_attention as TA
+
+    with pytest.raises(ValueError, match="poll needs pdl"):
+        TA.TailAttention(CLUSTER, SPEC, poll=True)
+    with pytest.raises(ValueError, match="poll needs pdl"):
+        _tail().run_attention(**_host_args(4), poll=True)
+    with pytest.raises(ValueError, match="poll needs pdl"):
+        _tail().run_attention(**_host_args(4), pdl=False, poll=True)
+
+
+def test_run_hybrid_poll_is_refused_before_any_stage_runs(monkeypatch):
+    """poll needs the multi-CTA top-K (the only writer that arms the entries) and pdl; refused before the K1 stage."""
+    tail = _tail()
+    args = _host_args(3)
+    called = []
+    monkeypatch.setattr(tail, "run_attention", lambda *a, **k: called.append("attention"))
+    names = ("topk", "q_att", "swa_pool", "bt_swa", "c_pool", "bt_c", "kv_lens", "sinks", "out")
+    for kw, match in (
+        ({"poll": True, "topk_fn": lambda lg: called.append("topk")}, "poll needs the multi-CTA"),
+        ({"poll": True, "pdl": False}, "poll needs pdl"),
+    ):
+        topk_fn = kw.pop("topk_fn", None)
+        with pytest.raises(ValueError, match=match):
+            tail.run_hybrid(
+                lambda: called.append("k1"), topk_fn, *(args[n] for n in names),
+                ctx_lens=torch.zeros(3, dtype=torch.int32), **kw,
+            )  # fmt: skip
+    assert called == [], "refused before any stage ran"
 
 
 def _slow_selector():
@@ -1095,12 +1137,174 @@ def test_pdl_tail_attention_waits_for_a_slow_top_k(batch):
         _check_rows(inp, out, "realistic")
 
 
+# The polling variant (``poll``): the entries of the selection are the synchronization, not the grid dependency. A
+# stand-in producer of that protocol (``topk_multicta_op.run(trigger=True, arm=True)`` does the same): it marks every
+# entry -2, lets the dependent grid launch, and writes every entry exactly once with a value >= -1.
+_SENTINEL = 0x7FC07FC0  # two bf16 NaNs: the fill of ``out`` that a stored output can never equal
+_ARMING = {}
+
+
+def _arming_selector(hold):
+    """A stand-in top-K kernel of the polling protocol: it marks the 512 entries of its row -2, makes the marks visible
+    (fence) and triggers the dependent launch, sleeps ~400 us and only then copies the selection into ``dst`` entry by
+    entry. With ``hold`` it stays alive afterwards for up to ~20 ms, until the first word of its row of ``out`` (viewed
+    as int32) is no longer ``_SENTINEL``, and records in ``seen[row]`` that the tail attention stored its output while
+    this grid was still running (a CuTe kernel per ``hold``, compiled once)."""
+    import cuda.bindings.driver as cuda_driver
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import megakernel_lib as L
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_attention as TA
+
+    if hold in _ARMING:
+        return _ARMING[hold]
+    words_per_row = H_ATT * D_ATT // 2
+
+    @cute.kernel
+    def kern(src: cute.Tensor, dst: cute.Tensor, words: cute.Tensor, seen: cute.Tensor):
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        j = tid
+        while j < Int32(K_TOP):
+            dst[row, j] = Int32(-2)
+            j = j + Int32(32)
+        L.fence_acq_rel_gpu()
+        cute.arch.griddepcontrol_launch_dependents()
+        for _ in cutlass.range(400, unroll=1):
+            L.nanosleep(Int32(1000))
+        j = tid
+        while j < Int32(K_TOP):
+            dst[row, j] = src[row, j]
+            j = j + Int32(32)
+        if cutlass.const_expr(hold):
+            if tid == Int32(0):
+                addr = words.iterator.toint() + Int64(row) * Int64(words_per_row) * Int64(4)
+                n = Int32(0)
+                while n < Int32(20000):
+                    if TA._ld_atomic_i32(addr) != Int32(_SENTINEL):
+                        seen[row] = Int32(1)
+                        n = Int32(20000)
+                    else:
+                        L.nanosleep(Int32(1000))
+                        n = n + Int32(1)
+
+    @cute.jit
+    def host(
+        src: cute.Tensor,
+        dst: cute.Tensor,
+        words: cute.Tensor,
+        seen: cute.Tensor,
+        stream: cuda_driver.CUstream,
+    ):
+        kern(src, dst, words, seen).launch(
+            grid=(src.shape[0], 1, 1), block=(32, 1, 1), stream=stream
+        )
+
+    rt = cute.runtime
+    sb = cute.sym_int()
+    fn = cute.compile(
+        host,
+        rt.make_fake_compact_tensor(Int32, (sb, K_TOP), stride_order=(1, 0)),
+        rt.make_fake_compact_tensor(Int32, (sb, K_TOP), stride_order=(1, 0)),
+        rt.make_fake_compact_tensor(Int32, (sb, words_per_row), stride_order=(1, 0)),
+        rt.make_fake_compact_tensor(Int32, (sb,), stride_order=(0,)),
+        rt.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+    _ARMING[hold] = fn
+    return fn
+
+
+def _launch_behind_arming(inp, sel, topk, out, seen, hold, pdl, poll, stale, attn="realistic"):
+    """One launch of the stand-in producer and the tail attention behind it (``pdl`` / ``poll`` as given). ``topk``
+    holds a stale selection before the launch (the one of an earlier launch: the first 256 entries of ``sel`` dropped,
+    or nothing selected) that a reader of unarmed entries would take for a result."""
+    topk.copy_(sel)
+    if stale == "dropped":
+        topk[:, :256] = -1
+    else:
+        topk.fill_(-1)
+    out.view(torch.int32).fill_(_SENTINEL)
+    seen.zero_()
+    _arming_selector(hold)(sel, topk, out.view(torch.int32), seen)
+    _tail().run_attention(
+        topk, inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"], inp["bt_c"],
+        inp["kv_lens"], inp["sinks"], out, _scale_of(attn), config=SPEC_FP4, pdl=pdl, poll=poll,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+
 @requires_b200
+@pytest.mark.parametrize("batch", [1, 9, 16, MAX_ROWS])
+def test_poll_tail_attention_waits_for_the_entries_of_a_slow_top_k(batch):
+    """The polling tail attention starts while the producer sleeps with every entry marked -2 and no grid dependency
+    to wait for: it must gather a row only from the entries that have been written (a load that reads a stale -2 or the
+    stale selection of the previous launch shows as a wrong attention), and the result is the plain launch's, bit for
+    bit."""
+    inp = _make_case(_rows(batch, 5), seed=3300 + batch)
+    sel = inp["topk"].clone()
+    topk = torch.full_like(sel, -1)
+    inp = {**inp, "topk": topk}
+    plain = _new_out(batch)
+    _launch({**inp, "topk": sel}, plain, SPEC_FP4)
+    torch.cuda.synchronize()
+    _tail().precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True, poll=True)
+    out = _new_out(batch)
+    seen = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    for stale in (
+        "dropped",
+        "none",
+        "dropped",
+        "none",
+    ):  # the first launch of a kernel is slow to start
+        _launch_behind_arming(inp, sel, topk, out, seen, False, True, True, stale)
+        assert torch.equal(topk, sel)
+        _check_rows(inp, out, "realistic")
+        assert torch.equal(out, plain)
+
+
+@requires_b200
+@pytest.mark.parametrize("batch", [1, 9, 16, MAX_ROWS])
+def test_poll_tail_attention_finishes_while_the_top_k_grid_still_runs(batch):
+    """The point of ``poll``: the grid dependency is not waited for. The producer holds on after its last write until
+    the tail attention has stored its output (it gives up after ~20 ms), so the attention of the polling variant
+    finishes inside the producer's lifetime, which the variant that waits for the grid (``pdl`` alone, the control)
+    cannot do: its attention starts only after the producer is gone."""
+    inp = _make_case(_rows(batch, 5), seed=3400 + batch)
+    sel = inp["topk"].clone()
+    topk = torch.full_like(sel, -1)
+    inp = {**inp, "topk": topk}
+    tail = _tail()
+    tail.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True, poll=True)
+    tail.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True)
+    out = _new_out(batch)
+    seen = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    # warm-up: the first launch of each kernel loads its module, which would outlast the producer's hold
+    for poll in (True, False):
+        _launch_behind_arming(inp, sel, topk, out, seen, False, True, poll, "none")
+        _launch_behind_arming(inp, sel, topk, out, seen, True, True, poll, "none")
+    for stale in ("dropped", "none", "dropped"):
+        _launch_behind_arming(inp, sel, topk, out, seen, True, True, True, stale)
+        assert bool((seen == 1).all()), (
+            "the polling attention did not finish while the producer ran"
+        )
+        _check_rows(inp, out, "realistic")
+    for stale in ("dropped", "none"):
+        _launch_behind_arming(inp, sel, topk, out, seen, True, True, False, stale)
+        assert bool((seen == 0).all()), "pdl without poll started before the producer was done"
+        _check_rows(inp, out, "realistic")
+
+
+@requires_b200
+@pytest.mark.parametrize("poll", [False, True])
 @pytest.mark.parametrize("attn", ATTN_MODES)
 @pytest.mark.parametrize("batch", [5, MAX_ROWS])
-def test_pdl_launch_behind_a_plain_kernel_is_bit_equal(batch, attn):
+def test_pdl_launch_behind_a_plain_kernel_is_bit_equal(batch, attn, poll):
     """The programmatic attribute behind a kernel that never triggers (here: a torch op) waits for its completion: the
-    same result as the plain launch, bit for bit."""
+    same result as the plain launch, bit for bit. The polling variant finds a complete selection (no entry is -2) and
+    does not wait for anything more."""
     inp = _make_case(_rows(batch, 2), seed=3200 + batch, attn=attn)
     plain = _new_out(batch)
     _launch(inp, plain, SPEC_FP4, _scale_of(attn))
@@ -1110,7 +1314,7 @@ def test_pdl_launch_behind_a_plain_kernel_is_bit_equal(batch, attn):
     junk.fill_(1.0)  # an unrelated kernel right before the launch
     tail.run_attention(
         inp["topk"], inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"], inp["bt_c"],
-        inp["kv_lens"], inp["sinks"], pdl_out, _scale_of(attn), config=SPEC_FP4, pdl=True,
+        inp["kv_lens"], inp["sinks"], pdl_out, _scale_of(attn), config=SPEC_FP4, pdl=True, poll=poll,
     )  # fmt: skip
     torch.cuda.synchronize()
     assert torch.equal(plain, pdl_out)
@@ -1126,11 +1330,16 @@ def test_pdl_is_a_separate_compile_of_the_same_cluster_size(monkeypatch):
     compiles = []
     real = TA.compile_tail_attention
     monkeypatch.setattr(
-        TA, "compile_tail_attention", lambda k: compiles.append((k.g, k.pdl)) or real(k)
+        TA, "compile_tail_attention", lambda k: compiles.append((k.g, k.pdl, k.poll)) or real(k)
     )
     dev = torch.device("cuda")
     for b in (1, 13, MAX_ROWS):
         tail.precompile(dev, b)
         tail.precompile(dev, b, SPEC_FP4, pdl=True)
         tail.precompile(dev, b, SPEC, pdl=True)
-    assert sorted(compiles) == [(CLUSTER, False), (CLUSTER, True)]
+        tail.precompile(dev, b, SPEC_FP4, pdl=True, poll=True)
+    assert sorted(compiles) == [
+        (CLUSTER, False, False),
+        (CLUSTER, True, False),
+        (CLUSTER, True, True),
+    ]

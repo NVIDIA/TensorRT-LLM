@@ -35,7 +35,12 @@ a selected position.
   guards the barrier between the levels of the fallback);
 - CUDA graphs: capture after ``precompile`` (no warm-up launch), replay with the logits and the lengths refilled in
   place, a capture that would compile is refused, one compile per cluster size;
-- the hybrid: ``tail_op.run_hybrid(topk_fn=None)`` end to end against the fp64 attention reference of the tail tests.
+- the armed variant (``trigger=True, arm=True``: it marks the 512 entries of every row -2 at its start and writes each
+  one once, for the polling tail attention): the exactness tests above run on it too (no -2 is left in any row of any
+  kind, short rows and the forced radix select included);
+- the hybrid: ``tail_op.run_hybrid(topk_fn=None)`` end to end against the fp64 attention reference of the tail tests
+  (default launch: programmatic with polling, up to 24 rows), launched again and again on new logits without clearing
+  the selection (a stale selection must never be read).
 """
 
 import dataclasses
@@ -117,6 +122,14 @@ requires_b200 = pytest.mark.skipif(
 def spec(request):
     """The spec under test: the kernel reads the logits only, so both indexer K dtypes are served."""
     return SPEC_FP4 if request.param == "fp4" else SPEC
+
+
+@pytest.fixture(params=[False, True], ids=["plain", "armed"])
+def armed(request):
+    """The kernel variant under test: the plain one, or the one that triggers the dependent launch and marks its output
+    -2 first (the producer of the polling tail attention; with no dependent grid the marks and the trigger are all it
+    adds, and every entry must end up written)."""
+    return request.param
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -252,15 +265,16 @@ def _check(rows, out):
         )
 
 
-def _run(rows, forced=False, npad=NPAD):
-    """Launch on the rows (eager) and return (out, logits, ctx, device rows)."""
+def _run(rows, forced=False, npad=NPAD, armed=False):
+    """Launch on the rows (eager) and return (out, logits, ctx, device rows); ``armed``: the variant that triggers the
+    dependent launch and marks the output -2 first."""
     op = _op()
     lg, ctx, drows = _logits(rows, npad)
     out = torch.full((len(rows), K_TOP), -9, dtype=torch.int32, device="cuda")
     if forced:
-        op._fn(lg.device, op.cluster_size(len(rows)), True)(lg, ctx, out)
+        op._fn(lg.device, op.cluster_size(len(rows)), True, armed, armed)(lg, ctx, out)
     else:
-        op.run(lg, out, ctx)
+        op.run(lg, out, ctx, trigger=armed, arm=armed)
     torch.cuda.synchronize()
     return out, lg, ctx, drows
 
@@ -519,9 +533,12 @@ def test_default_launch_of_the_hybrid_follows_the_batch_size():
 
     assert tail_op.PDL_MAX_BATCH == 24
     assert [tail_op.default_pdl(b) for b in range(1, MAX_ROWS + 1)] == [True] * 24 + [False] * 2
+    # the polling protocol is on up to 23 rows (at 24 it costs what it wins), always with the programmatic launch
+    assert tail_op.POLL_MAX_BATCH == 23 <= tail_op.PDL_MAX_BATCH
+    assert [tail_op.default_poll(b) for b in range(1, MAX_ROWS + 1)] == [True] * 23 + [False] * 3
 
 
-@pytest.mark.parametrize("batch", [3, 24, 25, 26])
+@pytest.mark.parametrize("batch", [3, 23, 24, 25, 26])
 def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatch, batch):
     """K1 logits, then the multi-CTA top-K on those logits and the lengths, then the tail attention with the caller's
     tensors."""
@@ -536,12 +553,12 @@ def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatc
         calls.append("k1")
         return logits
 
-    def fake_topk(lg, topk, ctx_lens, *, config=None, trigger=False):
+    def fake_topk(lg, topk, ctx_lens, *, config=None, trigger=False, arm=False):
         assert lg is logits and ctx_lens is ctx, (
             "the top-K stage gets the logits of the K1 stage and ctx_lens"
         )
         assert topk is args["topk"]
-        calls.append(("multicta", config, trigger))
+        calls.append(("multicta", config, trigger, arm))
 
     def fake_attention(*a, **kw):
         calls.append(("attention", a, kw))
@@ -551,12 +568,14 @@ def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatc
     names = ("topk", "q_att", "swa_pool", "bt_swa", "c_pool", "bt_c", "kv_lens", "sinks", "out")
     tail_op.run_hybrid(k1, None, *(args[n] for n in names), 0.125, config=SPEC, ctx_lens=ctx)
     # the multi-CTA top-K triggers the dependent launch and the tail attention launches programmatically by default, up
-    # to PDL_MAX_BATCH rows (above it the clusters of the tail attention fill the wave: plain launches)
+    # to PDL_MAX_BATCH rows (above it the clusters of the tail attention fill the wave: plain launches); the top-K also
+    # marks its output and the tail attention polls the marks up to POLL_MAX_BATCH rows
     pdl = batch <= tail_op.PDL_MAX_BATCH
-    assert calls[:2] == ["k1", ("multicta", SPEC, pdl)] and len(calls) == 3
+    poll = batch <= tail_op.POLL_MAX_BATCH
+    assert calls[:2] == ["k1", ("multicta", SPEC, pdl, poll)] and len(calls) == 3
     _, a, kw = calls[2]
     assert len(a) == 10 and all(x is args[n] for x, n in zip(a, names)) and a[9] == 0.125
-    assert kw == {"config": SPEC, "pdl": pdl}
+    assert kw == {"config": SPEC, "pdl": pdl, "poll": poll}
 
 
 def test_run_hybrid_without_a_top_k_function_needs_ctx_lens(monkeypatch):
@@ -595,14 +614,14 @@ def test_run_hybrid_with_a_top_k_function_does_not_touch_the_multicta_kernel(mon
 
 @requires_b200
 @pytest.mark.parametrize("batch", BOUNDARY_BATCHES)
-def test_exact_mixed_kinds_at_the_cluster_boundaries(batch, spec):
+def test_exact_mixed_kinds_at_the_cluster_boundaries(batch, spec, armed):
     """Every cluster size (8 / 6 / 5 / 4 CTAs: 1-15 / 16 / 17-24 / 25-26 rows) on rows of every kind and long
     lengths."""
     lengths = [262144, 200000, 131071, 100001, 65536, 28672, 20000, 16384]
     rows = _make(KINDS, lengths, seed=100 + batch, batch=batch)
     lg, ctx, drows = _logits(rows)
     out = torch.full((batch, K_TOP), -9, dtype=torch.int32, device="cuda")
-    _op().run(lg, out, ctx, config=spec)
+    _op().run(lg, out, ctx, config=spec, trigger=armed, arm=armed)
     torch.cuda.synchronize()
     _check(drows, out)
 
@@ -610,40 +629,42 @@ def test_exact_mixed_kinds_at_the_cluster_boundaries(batch, spec):
 @requires_b200
 @pytest.mark.parametrize("batch", [3, 16, MAX_ROWS])
 @pytest.mark.parametrize("kind", KINDS)
-def test_exact_per_row_kind(kind, batch):
+def test_exact_per_row_kind(kind, batch, armed):
     """Rows of one kind, long and mid lengths, with 8 / 6 / 4 CTAs per row; the kinds with ties and plateaus take the
     exact fallback on most rows, the others the fast path."""
     lengths = [262144, 131071, 100001, 65536, 28672, 20000, 16384, 8193]
-    out, _, _, drows = _run(_make([kind], lengths, seed=7, batch=batch))
+    out, _, _, drows = _run(_make([kind], lengths, seed=7, batch=batch), armed=armed)
     _check(drows, out)
 
 
 @requires_b200
 @pytest.mark.parametrize("n", EDGES)
-def test_exact_at_every_edge_length(n):
+def test_exact_at_every_edge_length(n, armed):
     """Thirteen rows (6 CTAs per row) of the same length n and different kinds: the short rows (identity), the rows
     without a sample (<= 8192), the first sampled lengths and the lengths that end inside a chunk."""
     kinds = ["gauss", "lognorm", "quant", "signed_tail", "neg", "ties512", "flat"]
-    out, _, _, drows = _run(_make(kinds, [n], seed=11 + n, batch=13))
+    out, _, _, drows = _run(_make(kinds, [n], seed=11 + n, batch=13), armed=armed)
     _check(drows, out)
 
 
 @requires_b200
 @pytest.mark.parametrize("batch", [5, 13, MAX_ROWS])
-def test_exact_with_a_different_length_in_every_row(batch):
+def test_exact_with_a_different_length_in_every_row(batch, armed):
     """Rows of one batch with lengths from 1 to 2**18 (a cluster of every kind, the slowest row decides the launch)."""
     lengths = random.Random(batch).sample(EDGES, batch)
     kinds = ["gauss", "signed_tail", "quant", "lognorm", "neg", "plateau_top"]
-    out, _, _, drows = _run(_make(kinds, lengths, seed=300 + batch, batch=batch))
+    out, _, _, drows = _run(_make(kinds, lengths, seed=300 + batch, batch=batch), armed=armed)
     _check(drows, out)
 
 
 @requires_b200
 @pytest.mark.parametrize("batch", [1, 13, 16, 17, 25, 26])
-def test_exact_fallback_forced_on_every_row(batch):
+def test_exact_fallback_forced_on_every_row(batch, armed):
     """The in-kernel radix select on every row, including the rows whose fast path would certify: the same exactness."""
     lengths = [262144, 131071, 65536, 20000, 16384, 8193, 8192, 4096, 600, 513, 512, 100, 1]
-    out, _, _, drows = _run(_make(KINDS, lengths, seed=900 + batch, batch=batch), forced=True)
+    out, _, _, drows = _run(
+        _make(KINDS, lengths, seed=900 + batch, batch=batch), forced=True, armed=armed
+    )
     _check(drows, out)
 
 
@@ -660,11 +681,12 @@ def test_forced_and_default_kernels_select_the_same_set_when_it_is_unique():
 
 
 @requires_b200
-def test_planted_ties_at_the_512th_value():
+def test_planted_ties_at_the_512th_value(armed):
     """700 equal values straddling the 512th rank on every row (and a quantized tail): the value multiset is exact
     whichever of the tied positions are taken."""
     out, _, _, drows = _run(
-        _make(["ties512", "gauss_tail_ties", "quant"], [262144, 100001, 28672], seed=3, batch=18)
+        _make(["ties512", "gauss_tail_ties", "quant"], [262144, 100001, 28672], seed=3, batch=18),
+        armed=armed,
     )
     _check(drows, out)
     # the part of the tied value that the selection could not leave out: every strictly larger value is selected
@@ -798,7 +820,7 @@ def test_one_compile_per_cluster_size(monkeypatch):
     assert sorted(g for g, _ in compiles) == sorted(CLUSTER_SIZES) and not any(
         f for _, f in compiles
     )
-    assert {(d, g) for (d, g, f, t) in op._compiled} == {
+    assert {(d, g) for (d, g, f, t, a) in op._compiled} == {
         (torch.cuda.current_device(), g) for g in CLUSTER_SIZES
     }
     for b in range(1, MAX_ROWS + 1):
@@ -1065,9 +1087,9 @@ def test_run_hybrid_with_the_multicta_top_k_in_a_cuda_graph():
             ctx_lens=ctx,
         )
 
-    # the default variants of run_hybrid with the multi-CTA top-K are the programmatic ones
-    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True)
-    op.precompile(torch.device("cuda"), batch, SPEC_FP4, trigger=True)
+    # the default variants of run_hybrid with the multi-CTA top-K are the programmatic, polling ones
+    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True, poll=True)
+    op.precompile(torch.device("cuda"), batch, SPEC_FP4, trigger=True, arm=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         hybrid()
@@ -1094,11 +1116,37 @@ def test_run_hybrid_with_the_multicta_top_k_in_a_cuda_graph():
 # programmatic dependent launch: the top-K triggers after its stream phase, the tail attention launches with it
 
 
-def test_precompile_and_run_take_the_trigger_flag():
+def test_precompile_and_run_take_the_trigger_and_arm_flags():
     op = _op()
     for fn in (op.precompile, op.run):
-        p = inspect.signature(fn).parameters["trigger"]
-        assert p.default is False and p.kind is not p.POSITIONAL_ONLY
+        for flag in ("trigger", "arm"):
+            p = inspect.signature(fn).parameters[flag]
+            assert p.default is False and p.kind is not p.POSITIONAL_ONLY
+
+
+def test_arm_needs_trigger():
+    """The marks are for a dependent grid that polls them: without the trigger nothing could read them early. Refused
+    before any device work, in every entry point."""
+    pytest.importorskip("cutlass.cute")  # CuTe DSL; no GPU needed
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import topk_multicta as TM
+
+    op = _op()
+    with pytest.raises(ValueError, match="arm needs trigger"):
+        op.precompile(torch.device("cpu"), 4, arm=True)
+    with pytest.raises(ValueError, match="arm needs trigger"):
+        TM.TopkMultiCta(8, arm=True)  # the CTA 0 would never arrive: a deadlock, not a result
+    kernel = TM.TopkMultiCta(8, trigger=True, arm=True)
+    assert (kernel.trigger, kernel.arm) == (True, True)
+    assert (TM.TopkMultiCta(8).trigger, TM.TopkMultiCta(8).arm) == (False, False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_run_arm_needs_trigger_before_any_launch():
+    args = {k: v.cuda() for k, v in _host_args(4, cols=1024).items()}
+    with pytest.raises(ValueError, match="arm needs trigger"):
+        _op().run(**args, arm=True)
+    torch.cuda.synchronize()
+    assert bool((args["topk"] == -1).all()), "nothing was launched"
 
 
 def test_run_hybrid_pdl_needs_the_multicta_top_k(monkeypatch):
@@ -1117,10 +1165,24 @@ def test_run_hybrid_pdl_needs_the_multicta_top_k(monkeypatch):
     assert called == [], "refused before any stage ran"
 
 
-@pytest.mark.parametrize("pdl, expected", [(None, True), (True, True), (False, False)])
-def test_run_hybrid_pdl_selects_the_launch_variants_of_both_kernels(monkeypatch, pdl, expected):
+@pytest.mark.parametrize(
+    "pdl, poll, expected",
+    [
+        (None, None, (True, True)),
+        (True, None, (True, True)),
+        (False, None, (False, False)),
+        (True, False, (True, False)),
+        (True, True, (True, True)),
+        (None, False, (True, False)),
+        (None, True, (True, True)),
+    ],
+)
+def test_run_hybrid_pdl_selects_the_launch_variants_of_both_kernels(
+    monkeypatch, pdl, poll, expected
+):
     """With the multi-CTA top-K ``pdl`` (default: on) makes it trigger the dependent launch and launches the tail
-    attention with the programmatic attribute; off, both are plain launches."""
+    attention with the programmatic attribute, and ``poll`` (default: with ``pdl``) makes the top-K mark its output and
+    the tail attention poll it instead of waiting for the grid; with ``pdl`` off, both are plain launches."""
     from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
 
     op = _op()
@@ -1129,20 +1191,25 @@ def test_run_hybrid_pdl_selects_the_launch_variants_of_both_kernels(monkeypatch,
     monkeypatch.setattr(
         op,
         "run",
-        lambda lg, topk, ctx, *, config=None, trigger=False: calls.append(("topk", trigger)),
+        lambda lg, topk, ctx, *, config=None, trigger=False, arm=False: calls.append(
+            ("topk", trigger, arm)
+        ),
     )
     monkeypatch.setattr(
-        tail_op, "run_attention", lambda *a, pdl=False, **k: calls.append(("attention", pdl))
+        tail_op,
+        "run_attention",
+        lambda *a, pdl=False, poll=False, **k: calls.append(("attention", pdl, poll)),
     )
     names = ("topk", "q_att", "swa_pool", "bt_swa", "c_pool", "bt_c", "kv_lens", "sinks", "out")
-    kw = {} if pdl is None else {"pdl": pdl}
+    kw = {k: v for k, v in (("pdl", pdl), ("poll", poll)) if v is not None}
     tail_op.run_hybrid(lambda: object(), None, *(args[n] for n in names), ctx_lens=object(), **kw)
-    assert calls == [("topk", expected), ("attention", expected)]
+    assert calls == [("topk", *expected), ("attention", *expected)]
 
 
 @requires_b200
 def test_one_compile_per_cluster_size_and_trigger(monkeypatch):
-    """The trigger is part of the compile: the 4 cluster sizes compile once for each value, none for a second pass."""
+    """The trigger and the marks are part of the compile: the 4 cluster sizes compile once for each of the three
+    variants (plain, trigger, trigger + arm), none for a second pass."""
     from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import topk_multicta as TM
 
     op = _op()
@@ -1150,47 +1217,56 @@ def test_one_compile_per_cluster_size_and_trigger(monkeypatch):
     compiles = []
     real = TM.compile_topk_multicta
     monkeypatch.setattr(
-        TM, "compile_topk_multicta", lambda k: compiles.append((k.g, k.trigger)) or real(k)
+        TM,
+        "compile_topk_multicta",
+        lambda k: compiles.append((k.g, k.trigger, k.arm)) or real(k),
     )
     dev = torch.device("cuda")
     for b in range(1, MAX_ROWS + 1):
         op.precompile(dev, b)
         op.precompile(dev, b, SPEC_FP4, trigger=True)
+        op.precompile(dev, b, SPEC_FP4, trigger=True, arm=True)
     for b in range(1, MAX_ROWS + 1):
         op.precompile(dev, b, SPEC, trigger=True)
+        op.precompile(dev, b, SPEC, trigger=True, arm=True)
     assert sorted(compiles) == sorted(
-        [(g, False) for g in CLUSTER_SIZES] + [(g, True) for g in CLUSTER_SIZES]
+        [(g, False, False) for g in CLUSTER_SIZES]
+        + [(g, True, False) for g in CLUSTER_SIZES]
+        + [(g, True, True) for g in CLUSTER_SIZES]
     )
 
 
 @requires_b200
 @pytest.mark.parametrize("batch", [5, 9, 13, 17, MAX_ROWS])
 def test_run_hybrid_pdl_is_bit_equal_to_the_plain_launches(batch):
-    """K1 stand-in -> multi-CTA top-K (triggering) -> tail attention (programmatic launch) against the two plain
-    launches of the same kernels: the same selection and the same attention output, bit for bit (several launches in a
-    row)."""
+    """K1 stand-in -> multi-CTA top-K (triggering) -> tail attention (programmatic launch, waiting for the grid or
+    polling the entries) against the two plain launches of the same kernels: the same selection and the same attention
+    output, bit for bit (several launches in a row)."""
     from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
 
     inp, lg, ctx, drows = _hybrid_case(batch, 3, seed=2200 + batch)
     runs = {}
-    for pdl in (False, True, False, True):
+    variants = [(False, False), (True, False), (True, True)]  # (pdl, poll)
+    for pdl, poll in variants * 2:
         topk = torch.full((batch, K_TOP), -9, dtype=torch.int32, device="cuda")
         out = T._new_out(batch)
         tail_op.run_hybrid(
             lambda: lg, None, topk, inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"],
-            inp["bt_c"], inp["kv_lens"], inp["sinks"], out, config=SPEC_FP4, ctx_lens=ctx, pdl=pdl,
+            inp["bt_c"], inp["kv_lens"], inp["sinks"], out, config=SPEC_FP4, ctx_lens=ctx,
+            pdl=pdl, poll=poll,
         )  # fmt: skip
         torch.cuda.synchronize()
         _check(drows, topk)
         T._check_rows({**inp, "topk": topk}, out, "realistic")
-        runs.setdefault(pdl, []).append((topk.sort(dim=1).values, out))
-    for pdl, lst in runs.items():
+        runs.setdefault((pdl, poll), []).append((topk.sort(dim=1).values, out))
+    for lst in runs.values():
         for t2, o2 in lst[1:]:
             assert torch.equal(t2, lst[0][0]) and torch.equal(o2, lst[0][1]), (
                 "deterministic per variant"
             )
-    assert torch.equal(runs[True][0][0], runs[False][0][0])
-    assert torch.equal(runs[True][0][1], runs[False][0][1])
+    for v in variants[1:]:
+        assert torch.equal(runs[v][0][0], runs[variants[0]][0][0])
+        assert torch.equal(runs[v][0][1], runs[variants[0]][0][1])
 
 
 @requires_b200
@@ -1210,8 +1286,8 @@ def test_run_hybrid_pdl_in_a_cuda_graph():
             inp["bt_c"], inp["kv_lens"], inp["sinks"], out, config=SPEC_FP4, ctx_lens=ctx, pdl=True,
         )  # fmt: skip
 
-    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True)
-    op.precompile(torch.device("cuda"), batch, SPEC_FP4, trigger=True)
+    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True, poll=True)
+    op.precompile(torch.device("cuda"), batch, SPEC_FP4, trigger=True, arm=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         hybrid()
@@ -1226,4 +1302,49 @@ def test_run_hybrid_pdl_in_a_cuda_graph():
         graph.replay()
         torch.cuda.synchronize()
         _check(drows2, topk)
+        T._check_rows({**inp, "topk": topk}, out, "realistic")
+
+
+@requires_b200
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+@pytest.mark.parametrize("batch", [5, 16, 24])
+def test_run_hybrid_poll_reads_no_stale_selection(batch, mode):
+    """The polling tail attention behind the armed top-K on logits that change from launch to launch (two sets with
+    different lengths and values, alternating), the selection and the output left as the previous launch wrote them
+    (never cleared): an entry read before the top-K wrote it in this launch would show as the attention over the
+    selection of the previous launch."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
+
+    inp, lg, ctx, _ = _hybrid_case(batch, 3, seed=2400 + batch)
+    topk = torch.full((batch, K_TOP), -9, dtype=torch.int32, device="cuda")
+    out = T._new_out(batch)
+
+    def hybrid():  # explicit: the default is the polling protocol only up to POLL_MAX_BATCH rows (24 is tested too)
+        tail_op.run_hybrid(
+            lambda: lg, None, topk, inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"],
+            inp["bt_c"], inp["kv_lens"], inp["sinks"], out, config=SPEC_FP4, ctx_lens=ctx,
+            pdl=True, poll=True,
+        )  # fmt: skip
+
+    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True, poll=True)
+    _op().precompile(torch.device("cuda"), batch, SPEC_FP4, trigger=True, arm=True)
+    graph = None
+    if mode == "graph":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hybrid()
+    ctx_a = ctx.clone()
+    ctx_b = ((inp["kv_lens"] // T.RATIO) // 2 + 1).to(torch.int32)
+    gen = torch.Generator().manual_seed(2450 + batch)
+    for i in range(6):
+        ctx_i = ctx_a if i % 2 == 0 else ctx_b
+        lg_i, _, drows = _logits([_row("gauss", int(n), gen) for n in ctx_i.tolist()])
+        lg.copy_(lg_i)
+        ctx.copy_(ctx_i)
+        if graph is None:
+            hybrid()
+        else:
+            graph.replay()
+        torch.cuda.synchronize()
+        _check(drows, topk)
         T._check_rows({**inp, "topk": topk}, out, "realistic")

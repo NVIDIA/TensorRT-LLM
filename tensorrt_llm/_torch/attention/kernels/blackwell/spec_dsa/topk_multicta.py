@@ -48,6 +48,14 @@ to 26 rows). The launch is a plain stream-ordered launch. With ``trigger`` every
 (``griddepcontrol.launch_dependents``) as soon as its stream phase is done, which is what the tail attention launched
 with the programmatic attribute (``tail_op``, ``pdl``) needs to run its prologue while this kernel ranks the crossing
 bin; the production kernels around it never trigger a dependent launch early.
+
+With ``arm`` the CTA 0 of every row marks the 512 entries of the row's output -2 at its start (a written entry is
+>= -1; every path writes every entry exactly once): the tail attention launched behind it with ``poll``
+(``tail_attention``) reads its entries as soon as they exist instead of waiting for the completion of this grid.
+The order that makes this safe: the CTA 0 arrives at the cluster barrier with release semantics right before its own
+trigger, so its marks are in memory before the dependent grid can start, and the other CTAs store entries only after
+the cluster wait that follows that arrival (no mark can land after an entry); the other CTAs arrive early and relaxed,
+as without ``arm``. A short row (no stream phase) arrives with release right after the marks.
 """
 
 from __future__ import annotations
@@ -485,19 +493,28 @@ class TopkMultiCta:
             takes it only when the certificate of the fast path fails).
         trigger: launch the dependent grid once the stream phase of the CTA is done (programmatic dependent launch).
             A CTA that takes another path (a short row) triggers when it exits.
+        arm: mark the 512 output entries of every row -2 ("not written yet") at the start of the kernel, for a tail
+            attention that polls them (needs ``trigger``).
 
     The compiled function takes, in order: ``logits`` float32 [B, npad] (unit column stride, row stride a multiple of
     128, 16-byte aligned base), ``ctx`` int32 [B] (valid length of each row) and ``out`` int32 [B, 512].
     """
 
-    def __init__(self, g: int, force_fallback: bool = False, trigger: bool = False):
+    def __init__(
+        self, g: int, force_fallback: bool = False, trigger: bool = False, arm: bool = False
+    ):
         if g not in SUPPORTED_CLUSTER_SIZES:
             raise ValueError(
                 f"cluster size {g} not supported (built and validated for {SUPPORTED_CLUSTER_SIZES})"
             )
         self.g = g
         self.force_fallback = force_fallback
+        if arm and not trigger:
+            raise ValueError(
+                "arm needs trigger: the CTA 0 arrives at the cluster barrier before its trigger"
+            )
         self.trigger = trigger
+        self.arm = arm
 
     @cute.jit
     def __call__(
@@ -550,6 +567,15 @@ class TopkMultiCta:
             L.sts_v4(misc + zi * Int32(16), Int32(0), Int32(0), Int32(0), Int32(0))
             zi = zi + Int32(NT)
         # ---- t = 0: every global load whose address does not depend on n
+        if cutlass.const_expr(self.arm):
+            # the polling tail attention behind this kernel starts after every CTA has run its stream phase: mark the
+            # row's entries "not written yet" (-2) now (released by the CTA 0's arrive right before its trigger, see the
+            # module docstring)
+            if d == Int32(0):
+                st_g_i32(
+                    out.iterator.toint() + (Int64(row) * Int64(K_TOP) + Int64(tid)) * Int64(4),
+                    Int32(-2),
+                )
         n = L.ld_cg_i32(ctx.iterator.toint() + Int64(row) * Int64(4))
         npad = Int32(logits.layout.stride[0])
         rowbase = logits.iterator.toint() + Int64(row) * Int64(logits.layout.stride[0]) * Int64(4)
@@ -589,7 +615,11 @@ class TopkMultiCta:
                     TGT = Int32(1)
             # ---------------- sample -> T1, span ----------------
             L.bar(1, NT)
-            L.cluster_arrive_relaxed()
+            if cutlass.const_expr(self.arm):
+                if d != Int32(0):
+                    L.cluster_arrive_relaxed()
+            else:
+                L.cluster_arrive_relaxed()
             smx = Uint32(0)
             for r in cutlass.range_constexpr(NR):
                 jw = tid + Int32(NT * r)
@@ -712,6 +742,11 @@ class TopkMultiCta:
                 )
                 kb = kb + Int32(1)
             if cutlass.const_expr(self.trigger):
+                if cutlass.const_expr(self.arm):
+                    # the marks are in memory (gpu scope) before any CTA of the dependent grid can start and before
+                    # the other CTAs of the cluster, which wait for this arrival, store an entry
+                    if d == Int32(0):
+                        L.cluster_arrive()
                 cute.arch.griddepcontrol_launch_dependents()
             # histogram of the warp's own candidates (32 entries per step)
             lsth = sb + Int32(OFF_LST) + warp * Int32(LCAPW * 8)
@@ -1095,7 +1130,13 @@ class TopkMultiCta:
         else:
             # short row: identity and a -1 tail (written by CTA 0 of the row's cluster)
             L.bar(1, NT)
-            L.cluster_arrive_relaxed()
+            if cutlass.const_expr(self.arm):
+                if d == Int32(0):
+                    L.cluster_arrive()
+                else:
+                    L.cluster_arrive_relaxed()
+            else:
+                L.cluster_arrive_relaxed()
             if d == Int32(0):
                 for r2 in cutlass.range_constexpr(512 // NT if NT < 512 else 1):
                     jq = tid + Int32(r2 * NT)

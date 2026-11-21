@@ -40,6 +40,13 @@ is 1 to 26 rows (the batch sizes of the tail attention): a cluster of 8 / 6 / 5 
 16 / 17-24 / 25-26 rows, and the clusters of a launch have to fit one wave of co-resident clusters on the 148 SMs.
 The kernel reads the logits only, so both indexer K dtypes are served (``config``: either supported spec, default
 DS-V4-Flash). ``topk`` must not alias an input.
+
+Launch variants (each is a compile of its own): ``trigger`` lets the tail attention launched behind it with the
+programmatic attribute (``tail_op.run_attention(pdl=True)``) start while this kernel ranks the crossing bin, and
+``arm`` (needs ``trigger``) also marks the 512 entries of every row -2 at the start, so that the tail attention
+launched with ``poll=True`` reads each entry as soon as it is written instead of waiting for the end of this grid
+(``tail_op.run_hybrid`` sets both by default up to ``tail_op.POLL_MAX_BATCH`` rows). Every entry is written exactly
+once with a value >= -1 in every path (fast path, radix fallback, short rows).
 """
 
 from __future__ import annotations
@@ -126,21 +133,29 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def _fn(device: torch.device, g: int, force_fallback: bool = False, trigger: bool = False):
+def _fn(
+    device: torch.device,
+    g: int,
+    force_fallback: bool = False,
+    trigger: bool = False,
+    arm: bool = False,
+):
     """The compiled kernel of cluster size ``g`` on ``device``, compiled on first use (one compile per device, cluster
     size and variant). ``force_fallback`` selects the variant that runs the exact radix select on every row: a hook
     for the tests, ``run`` never uses it. ``trigger`` selects the variant that launches the dependent grid after the
-    stream phase (see ``run``)."""
+    stream phase, ``arm`` the variant that marks the output entries -2 at its start (see ``run``)."""
     from . import topk_multicta as TM
 
-    key = (_device_index(device), g, force_fallback, trigger)
+    key = (_device_index(device), g, force_fallback, trigger, arm)
     with _lock:
         if key not in _compiled:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "spec_dsa multi-CTA top-K: compile (precompile) before CUDA-graph capture"
                 )
-            _compiled[key] = TM.compile_topk_multicta(TM.TopkMultiCta(g, force_fallback, trigger))
+            _compiled[key] = TM.compile_topk_multicta(
+                TM.TopkMultiCta(g, force_fallback, trigger, arm)
+            )
         return _compiled[key]
 
 
@@ -149,14 +164,17 @@ def precompile(
     batch_size: int,
     config: SpecDsaConfig | None = None,
     trigger: bool = False,
+    arm: bool = False,
 ) -> None:
     """Compile the kernel of ``batch_size`` rows on ``device`` (one compile per cluster size, 8, 6, 5 and 4 CTAs, and
-    per ``trigger`` value: precompile the variant ``run`` will launch).
+    per ``trigger`` / ``arm`` value: precompile the variant ``run`` will launch).
 
     Must run outside CUDA-graph capture; ``run`` compiles on first use otherwise.
     """
     supported_spec(config)
-    _fn(device, _cluster(batch_size), False, trigger)
+    if arm and not trigger:
+        raise ValueError("arm needs trigger: the entries are polled by a dependent grid")
+    _fn(device, _cluster(batch_size), False, trigger, arm)
 
 
 def _require(ok: bool, what: str, t: torch.Tensor) -> None:
@@ -218,6 +236,7 @@ def run(
     *,
     config: SpecDsaConfig | None = None,
     trigger: bool = False,
+    arm: bool = False,
 ) -> None:
     """Launch the exact top-512 selection on the current stream (see the module docstring for the contract).
 
@@ -234,9 +253,14 @@ def run(
         config: the spec (default: DS-V4-Flash); either indexer K dtype: the launch is the same.
         trigger: let the dependent grid launch as soon as the stream phase of every CTA is done (programmatic dependent
             launch): set it only when the next kernel on the stream is launched with the programmatic attribute and
-            waits for this grid before it reads ``topk`` (``tail_op.run_attention(pdl=True)``); the results are the
-            same.
+            waits for this grid before it reads ``topk`` (``tail_op.run_attention(pdl=True)``) or polls its entries
+            (``arm``); the results are the same.
+        arm: mark all 512 entries of every row of ``topk`` -2 at the start of the kernel (every entry is written exactly
+            once with a value >= -1 before the kernel is done) so that the tail attention launched with
+            ``run_attention(pdl=True, poll=True)`` can read the entries as they are written; needs ``trigger``.
     """
     config = supported_spec(config)
     b = _check_arguments(config, logits, topk, ctx_lens)
-    _fn(logits.device, _cluster(b), False, trigger)(logits, ctx_lens, topk)
+    if arm and not trigger:
+        raise ValueError("arm needs trigger: the entries are polled by a dependent grid")
+    _fn(logits.device, _cluster(b), False, trigger, arm)(logits, ctx_lens, topk)

@@ -28,6 +28,16 @@ per hybrid step on average over 9 to 24 rows (B200, nsys: 0.0 to 1.4 us at 15 of
 behind a top-K kernel that never triggers early (the production one) the attribute only costs 0.7 to 0.8 us, so
 ``pdl`` stays off there. ``run_hybrid`` uses it by default up to ``PDL_MAX_BATCH`` rows (``default_pdl``).
 
+With ``poll=True`` (the default of ``run_hybrid`` up to ``POLL_MAX_BATCH`` rows, ``default_poll``) the tail attention
+does not wait for the end of the top-K grid either: the multi-CTA top-K marks the 512 entries of its output "not
+written yet" at its start (``topk_multicta_op.run(trigger=True, arm=True)``) and writes each one once, and every
+loader thread of a selected tile reads its entry (an atomic read) until it is written. A row is served when its own
+top-K cluster is done and not when the slowest row of the batch is, and the 0.6 to 0.8 us between the last CTA of the
+top-K and the release of the wait go: 0.47 us less per hybrid step on average over 5 to 24 rows (B200, nsys, 1M-token
+captures: 0.0 to 1.1 us per size; at 24 rows it is flat, within +-0.3 us per pass, and off); the results are the same
+bit for bit. Polling is only correct behind that top-K kernel on the same ``topk`` tensor: any other writer leaves the
+kernel waiting for entries that never change (or reading stale ones).
+
 The kernel reads neither the indexer nor its K cache, so it is the same for the specs with an FP8 and an MXFP4 indexer
 K cache: one compile per device serves both, and ``config`` (default: DS-V4-Flash) only has to be a supported spec.
 
@@ -49,8 +59,10 @@ from .config import SpecDsaConfig, check_device, supported_spec
 
 __all__ = [
     "PDL_MAX_BATCH",
+    "POLL_MAX_BATCH",
     "TAIL_MAX_BATCH",
     "default_pdl",
+    "default_poll",
     "is_batch_size_supported",
     "is_supported",
     "precompile",
@@ -65,6 +77,13 @@ __all__ = [
 # at 25 rows and costs ~3 us at 26 rows, the plain launches are used.
 PDL_MAX_BATCH = 24
 
+# Largest batch size for which ``run_hybrid`` also polls the entries of the multi-CTA top-K by default (``poll``): above
+# it the clusters of the two kernels are far over one wave (120 + 120 CTAs at 24 rows on 148 SMs), the tail attention
+# starts as the top-K CTAs exit and the marks of the protocol cost what the early start of the first rows wins (nsys,
+# 1M-token captures, 3 to 8 passes: -0.2 to -1.1 us at 5 to 23 rows; flat at 24: mean -0.02 us, -0.4 to +0.3 per pass).
+POLL_MAX_BATCH = 23
+assert POLL_MAX_BATCH <= PDL_MAX_BATCH
+
 # (largest batch size, CTAs per row): the co-resident clusters of a 148-SM B200 at one CTA per SM (measured) are 26
 # clusters of 5. Clusters of 4 / 3 would fit 33 / 45 rows but win nothing over the large-batch kernels there and leave
 # only 0.5 to 0.8 % of the numerical headroom: not offered.
@@ -78,9 +97,19 @@ _compiled: dict[tuple, object] = {}
 def default_pdl(batch_size: int) -> bool:
     """Whether ``run_hybrid`` launches the tail attention programmatically by default (with the multi-CTA top-K) for
     ``batch_size`` rows: up to ``PDL_MAX_BATCH``. Precompile both kernels with this value
-    (``precompile(..., pdl=default_pdl(b))``, ``topk_multicta_op.precompile(..., trigger=default_pdl(b))``) before a
-    CUDA-graph capture of ``run_hybrid`` with the default."""
+    (``precompile(..., pdl=default_pdl(b), poll=default_poll(b))``,
+    ``topk_multicta_op.precompile(..., trigger=default_pdl(b), arm=default_poll(b))``) before a CUDA-graph capture of
+    ``run_hybrid`` with the default."""
     return batch_size <= PDL_MAX_BATCH
+
+
+def default_poll(batch_size: int) -> bool:
+    """Whether ``run_hybrid`` polls the entries of the multi-CTA top-K by default (``poll``, behind the armed top-K)
+    for ``batch_size`` rows: up to ``POLL_MAX_BATCH``. Precompile both kernels with this value
+    (``precompile(..., pdl=default_pdl(b), poll=default_poll(b))``,
+    ``topk_multicta_op.precompile(..., trigger=default_pdl(b), arm=default_poll(b))``) before a CUDA-graph capture of
+    ``run_hybrid`` with the default."""
+    return batch_size <= POLL_MAX_BATCH
 
 
 def tail_cluster_size(batch_size: int) -> int | None:
@@ -125,17 +154,17 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def _fn(device: torch.device, g: int, pdl: bool = False):
+def _fn(device: torch.device, g: int, pdl: bool = False, poll: bool = False):
     from . import tail_attention as TA
 
-    key = (_device_index(device), g, pdl)
+    key = (_device_index(device), g, pdl, poll)
     with _lock:
         if key not in _compiled:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "spec_dsa tail attention: compile (precompile) before CUDA-graph capture"
                 )
-            _compiled[key] = TA.compile_tail_attention(TA.TailAttention(g, pdl=pdl))
+            _compiled[key] = TA.compile_tail_attention(TA.TailAttention(g, pdl=pdl, poll=poll))
         return _compiled[key]
 
 
@@ -144,15 +173,16 @@ def precompile(
     batch_size: int,
     config: SpecDsaConfig | None = None,
     pdl: bool = False,
+    poll: bool = False,
 ) -> None:
     """Compile the tail attention kernel of ``batch_size`` rows on ``device``.
 
     The compiled kernel serves every batch size with the same cluster size and both indexer K dtypes; the launch
-    variant (``pdl``) is part of the compile. Must run outside CUDA-graph capture; ``run_attention`` compiles on first
-    use otherwise.
+    variant (``pdl``, ``poll``) is part of the compile. Must run outside CUDA-graph capture; ``run_attention`` compiles
+    on first use otherwise.
     """
     supported_spec(config)
-    _fn(device, _cluster_size(batch_size), pdl)
+    _fn(device, _cluster_size(batch_size), pdl, poll)
 
 
 def _require(ok: bool, what: str, t: torch.Tensor) -> None:
@@ -241,6 +271,7 @@ def run_attention(
     *,
     config: SpecDsaConfig | None = None,
     pdl: bool = False,
+    poll: bool = False,
 ) -> None:
     """Launch the tail attention on the current stream (see the module docstring for the contract).
 
@@ -258,8 +289,13 @@ def run_attention(
         config: the spec (default: DS-V4-Flash); either indexer K dtype: the launch is the same.
         pdl: launch with the programmatic dependent launch attribute: only behind a kernel that triggers the dependent
             launch early (``topk_multicta_op.run(trigger=True)``), see the module docstring.
+        poll: poll the entries of ``topk`` instead of waiting for the top-K grid (needs ``pdl``): only behind
+            ``topk_multicta_op.run(trigger=True, arm=True)`` on the same ``topk`` tensor, which marks every entry -2 and
+            writes each one once; any other writer would leave the kernel waiting for entries that never change.
     """
     config = supported_spec(config)
+    if poll and not pdl:
+        raise ValueError("poll needs pdl")
     if topk.dim() != 2:
         raise ValueError(
             f"topk must be a contiguous int32 [B, {config.topk}] tensor, got {tuple(topk.shape)}"
@@ -269,7 +305,7 @@ def run_attention(
     _check_arguments(config, b, topk, q_att, swa_pool, bt_swa, c_pool, bt_c, kv_lens, sinks, out)
     if softmax_scale is None:
         softmax_scale = config.default_softmax_scale
-    fn = _fn(q_att.device, g, pdl)
+    fn = _fn(q_att.device, g, pdl, poll)
     fn(
         q_att.view(torch.uint8).view(b, config.attn_heads, config.kv_dim),
         swa_pool.view(torch.uint8).view(-1, config.kv_dim),
@@ -302,6 +338,7 @@ def run_hybrid(
     config: SpecDsaConfig | None = None,
     ctx_lens: torch.Tensor | None = None,
     pdl: bool | None = None,
+    poll: bool | None = None,
 ) -> None:
     """The decode chain with K3 + K4 + K4b replaced: ``k1_logits_fn()``, the top-K stage (fills ``topk``), then K4'.
 
@@ -319,6 +356,13 @@ def run_hybrid(
     ``precompile(..., pdl=pdl)``; ``default_pdl(batch_size)`` is the default) before a CUDA-graph capture.
     ``pdl=True`` with a ``topk_fn`` raises ValueError.
 
+    ``poll`` (default: on with the multi-CTA top-K up to ``POLL_MAX_BATCH`` rows, ``default_poll``): the multi-CTA
+    top-K marks the entries of ``topk`` -2 at its start (``arm``) and the tail attention does not wait for the
+    completion of the top-K grid but polls its entries, so that a row is served as soon as its own top-K CTAs are done
+    (the results are the same); precompile both kernels with the same value
+    (``topk_multicta_op.precompile(..., arm=poll)``, ``precompile(..., poll=poll)``) before a CUDA-graph capture.
+    ``poll=True`` needs ``pdl`` and the multi-CTA top-K (``topk_fn=None``).
+
     The arguments of the tail attention and ``config`` are those of ``run_attention``.
     """
     if topk_fn is None and ctx_lens is None:
@@ -329,9 +373,15 @@ def run_hybrid(
         )
     if pdl is None:
         pdl = topk_fn is None and default_pdl(int(topk.shape[0]))
+    if poll and topk_fn is not None:
+        raise ValueError("poll needs the multi-CTA top-K (topk_fn=None)")
+    if poll is None:
+        poll = bool(pdl) and topk_fn is None and default_poll(int(topk.shape[0]))
+    if poll and not pdl:
+        raise ValueError("poll needs pdl")
     logits = k1_logits_fn()
     if topk_fn is None:
-        topk_multicta_op.run(logits, topk, ctx_lens, config=config, trigger=pdl)
+        topk_multicta_op.run(logits, topk, ctx_lens, config=config, trigger=pdl, arm=poll)
     else:
         topk_fn(logits)
     run_attention(
@@ -347,4 +397,5 @@ def run_hybrid(
         softmax_scale,
         config=config,
         pdl=pdl,
+        poll=poll,
     )

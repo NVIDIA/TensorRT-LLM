@@ -48,6 +48,12 @@ after its stream phase) and run the barrier / TMEM setup, the Q load and the sli
 kernel; the CTAs of the selected tiles also bring the block-table row of their request into L2 (the loads behind the
 wait read random pages of it). Behind a top-K kernel that never triggers early (the production one) the attribute only
 costs 0.7 to 0.8 us at 8 to 16 rows (measured): ``pdl`` is for the multi-CTA top-K.
+
+With ``poll`` the kernel does not wait for the completion of the top-K grid at all: the multi-CTA top-K armed with
+``arm`` marks every entry of its output -2 before the dependent launch and writes every entry exactly once with a
+value >= -1, and each loader thread of a selected-tile CTA polls its own entry (an atomic read: a plain or relaxed
+load may return a stale copy for microseconds on the two-partition L2) and gathers its row as soon as it is there.
+A row is served when its own top-K CTAs are done instead of when the last row of the grid is.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as xcuda
 import cutlass.pipeline as pipeline
 from cutlass import Boolean, Float32, Int32, Int64, Uint32
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from . import large_batch_lib as L
@@ -98,6 +105,21 @@ SUPPORTED_CLUSTER_SIZES = (5,)
 E4M3 = cutlass.Float8E4M3FN
 
 
+@dsl_user_op
+def _ld_atomic_i32(addr, *, loc=None, ip=None):
+    """Read a 32-bit word through an atomic (``or`` with 0, GPU scope): performed at the L2, never a stale copy."""
+    return Int32(
+        ML._asm(
+            T.i32(),
+            [ML._v(addr, loc, ip)],
+            "atom.relaxed.gpu.global.or.b32 $0, [$1], 0;",
+            "=r,l",
+            loc,
+            ip,
+        )
+    )
+
+
 class TailAttention:
     """The tail attention kernel; ``compile_tail_attention`` compiles it.
 
@@ -106,13 +128,17 @@ class TailAttention:
         config: a spec of the DS-V4-Flash attention (default: DS-V4-Flash), with either indexer K dtype since the
             kernel does not read the indexer; a config with another attention raises NotImplementedError.
         pdl: launch with the programmatic dependent launch attribute (see the module docstring).
+        poll: poll the top-K entries instead of waiting for the top-K grid (needs ``pdl`` and a top-K kernel that marks
+            its entries, ``topk_multicta_op.run(arm=True)``; see the module docstring).
 
     The compiled function takes, in order: ``q_att`` uint8 [B, 64, 512], ``swa_pool`` and ``c_pool`` uint8 [rows, 512],
     ``topk`` int32 [B, 512], ``kv_lens`` int32 [B], ``bt_swa`` / ``bt_c`` int32 [B, pages], ``sinks`` float32 [64],
     ``out`` bf16 [B, 64, 512], the softmax scale and the number of rows B.
     """
 
-    def __init__(self, g: int, config: SpecDsaConfig | None = None, pdl: bool = False):
+    def __init__(
+        self, g: int, config: SpecDsaConfig | None = None, pdl: bool = False, poll: bool = False
+    ):
         require_built_for(
             config, SPEC_FP4 if config is not None and config.index_k_dtype == "fp4" else SPEC
         )
@@ -120,8 +146,13 @@ class TailAttention:
             raise ValueError(
                 f"cluster size {g} not supported (built and validated for {SUPPORTED_CLUSTER_SIZES})"
             )
+        if poll and not pdl:
+            raise ValueError(
+                "poll needs pdl (the kernel has to start before the top-K kernel is done)"
+            )
         self.g = g
         self.pdl = pdl
+        self.poll = poll
         # the output slices (one per owner CTA, ranks 0-3) are computed and sent in the order of the CTA rank (``_pv``)
         self.rotate = g >= NSLICE
         # with the programmatic launch the CTAs wait for the top-K kernel: they prefetch the block-table row meanwhile
@@ -275,11 +306,18 @@ class TailAttention:
                             + Int64(row) * Int64(mbc) * Int64(4)
                             + Int64(li) * Int64(128)
                         )
-        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(not self.poll):
+            cute.arch.griddepcontrol_wait()
         for t in cutlass.range(t0, nt, unroll=1):
             jg = j0 + t
             ta = topk_base + Int64((jg - Int32(1)) * Int32(TILE_N * 4))
-            c = L.ld_cg_i32(ta)
+            if cutlass.const_expr(self.poll):
+                # the entry is -2 until the top-K kernel writes it (a written entry is >= -1)
+                c = _ld_atomic_i32(ta)
+                while c == Int32(-2):
+                    c = _ld_atomic_i32(ta)
+            else:
+                c = L.ld_cg_i32(ta)
             grow = L.l2g_compressed(c, row, bt_c, mbc, Int32(0))
             vm = Int32(cute.arch.vote_ballot_sync(grow >= Int32(0)))
             if lane == Int32(0):

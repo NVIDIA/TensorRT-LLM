@@ -50,8 +50,13 @@ differ between models live and how to add a model.
   but win nothing, so the caller keeps its production top-K for them. Its CTAs launch the tail attention (programmatic
   dependent launch, `trigger`) when their stream phase is done, so that the tail attention's prologue (barrier and TMEM
   setup, query load, sliding-window tile) overlaps the end of the top-K kernel: `run_hybrid` does it by default with this
-  top-K up to 24 rows (`pdl=None`, `tail_op.default_pdl`; at 25 and 26 rows the clusters of the tail attention fill the
-  wave and the plain launches are faster), the results are the same.
+  top-K up to 24 rows (`pdl=None`, `tail_op.default_pdl`; at 25 and 26 rows the clusters of the tail attention fill
+  the wave and the plain launches are faster), the results are the same. With `poll` (default: on with `pdl` up to 23
+  rows, `tail_op.default_poll`) the tail attention does not even wait for the end of the top-K grid: the top-K marks
+  its output entries -2 at its start (`arm`) and writes each one exactly once, and the tail attention reads the
+  entries of its row as they appear, so that a row is served when its own top-K cluster is done and not when the
+  slowest row of the batch is. The two flags go together (`topk_multicta_op.run(trigger=True, arm=True)`,
+  `run_attention(pdl=True, poll=True)` behind it on the same `topk` tensor); `run_hybrid` sets both.
 
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |
