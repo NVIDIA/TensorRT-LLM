@@ -137,7 +137,6 @@ full:VR200/accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test
 full:VR200/accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[no_reuse] SKIP (https://nvbugs/7045027)
 full:VR200/accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache] SKIP (https://nvbugs/7045027)
 full:VR200/accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache_offsets] SKIP (https://nvbugs/7045027)
-full:VR200/accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv] SKIP (https://nvbugs/7036883)
 full:VR200/accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4] SKIP (https://nvbugs/7036883)
 full:VR200/accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] SKIP (https://nvbugs/7036883)
 full:VR200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl SKIP (https://nvbugs/7036886)
