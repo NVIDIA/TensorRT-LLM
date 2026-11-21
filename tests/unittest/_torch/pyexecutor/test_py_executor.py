@@ -2842,6 +2842,8 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
 
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
+    from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+
     class StopSchedule(RuntimeError):
         pass
 
@@ -2851,7 +2853,8 @@ def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
     held = types.SimpleNamespace(request_id=1, py_request_id=1, lora_task_id=7)
     healthy = types.SimpleNamespace(py_request_id=2, lora_task_id=8)
     executor.active_requests = [held, healthy]
-    executor.inflight_req_ids = set()
+    executor.inflight_req_ids = ReqIdsSet()
+    executor.inflight_req_ids.insert(9)
     executor.kv_cache_manager = Mock()
     executor.scheduler = Mock()
     executor.scheduler.schedule_request.side_effect = StopSchedule
@@ -2860,8 +2863,11 @@ def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
     with pytest.raises(StopSchedule):
         executor._schedule()
 
-    inflight = {held.request_id} if pp_size == 1 else set()
-    executor.scheduler.schedule_request.assert_called_once_with([held, healthy], inflight)
+    executor.scheduler.schedule_request.assert_called_once()
+    requests, inflight = executor.scheduler.schedule_request.call_args.args
+    assert requests == [held, healthy]
+    assert set(inflight) == ({9, held.request_id} if pp_size == 1 else {9})
+    assert set(executor.inflight_req_ids) == {9}
 
 
 class TestComputeScheduledTokens:

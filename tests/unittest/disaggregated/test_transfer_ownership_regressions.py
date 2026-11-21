@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import DEFAULT, Mock
@@ -1291,6 +1292,7 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._num_threads = 1
     sender._pending_settlements = [{}]
     sender._pending_session_quiescence = {}
+    sender._routed_cancels = set()
     sender._send_task_queues = [queue.Queue()]
     return sender
 
@@ -1588,6 +1590,58 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     dealer.send.assert_called_once_with([MessageType.SESSION_QUIESCED, b"5", b"97"])
     assert not sender._pending_session_quiescence
     assert sender._send_task_queues[0].empty()
+
+
+@pytest.mark.cpu_only
+def test_legacy_cancel_ack_outlives_parked_adp_routes_and_stays_rank_local() -> None:
+    rid = 97
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._registrar = Mock()
+    rx = _make_rx_session(receiver, rid)
+    rx.receive(_sole_piece())
+    _publish_report_tokens(rx, ranks=(0, 1))
+    rx._aux_expected_writers = 1
+    rx._kv_tasks[0].expected_transfers = 1
+
+    other_receiver = _ReceiverProbe()
+    other_receiver._enforce_physical_ownership = False
+    other = _make_rx_session(other_receiver, rid)
+    other.receive(_sole_piece())
+    _publish_report_tokens(other, ranks=(0, 1))
+
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._instance_rank = 1
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
+    )
+    sender._peer_requests[rid] = {
+        rank: SimpleNamespace(context_first=False, instance_rank=rank) for rank in (0, 1)
+    }
+    sender._peer_requests_timestamps[rid] = time.monotonic() - sender._STALE_REQ_INFO_TTL_S - 1
+    sender.sweep_stale_req_infos()
+    assert rid not in sender._peer_requests
+
+    def deliver(message):
+        assert message == [MessageType.SESSION_QUIESCED, b"1", b"97"]
+        rx.process_session_quiesced(1)
+
+    dealer = Mock()
+    dealer.send.side_effect = deliver
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
+    assert rx.cancel()
+    sender._handle_cancel_session([MessageType.CANCEL_SESSION, b"97", b"gen", b"0"])
+    assert sender._send_session_quiesced(sender._send_task_queues[0].get_nowait())
+    sender._get_or_connect_thread_dealer.assert_called_once_with("0")
+    assert not other.committed_failure
+    assert not rx.resources_drained()
+
+    rx.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    assert not rx.resources_drained()
+    rx.process_aux_agent_result(0, AgentResult.SUCCESS)
+    assert rx.resources_drained()
+    assert not rx.committed_failure
 
 
 @pytest.mark.cpu_only

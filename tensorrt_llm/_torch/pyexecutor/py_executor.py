@@ -10522,7 +10522,7 @@ class PyExecutor:
         held_failures = self._held_transfer_failures()
         if held_failures and self.dist.pp_size == 1:
             if self._is_kv_manager_v2:
-                inflight_request_ids = inflight_request_ids | {
+                inflight_request_ids = set(inflight_request_ids) | {
                     req.request_id
                     for req, _ in held_failures.values()
                 }
