@@ -31,8 +31,9 @@ Differences vs the Triton path are absorbed inside this wrapper:
     ``[N, H, V, K]`` logical layout, so the adapter gathers/scatters without
     transposing the last two dims. The SM100/SM103 kernel carries the recurrent
     state in fp32 in TMEM regardless of the initial/output-state I/O dtype, so
-    the round-trip stays in the native pool dtype (bf16/fp16) there with no
-    precision change; only SM90/SM120 need an fp32 up-cast/down-cast.
+    the ordinary round-trip stays in the native pool dtype (bf16/fp16) there
+    with no precision change. FP32 checkpoint buffers use FP32 state I/O when
+    the plain kernel may run; SM90/SM120 use an fp32 up-cast/down-cast.
 
 This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
@@ -363,18 +364,40 @@ def chunk_gated_delta_rule(
     # regardless of the initial/output-state I/O dtype (the state tensors are
     # only the gmem load/store format), so passing bf16/fp16 state there is
     # numerically identical to the fp32 round-trip while moving half the bytes.
-    # SM90/SM120 still require fp32 state.
-    state_dtype = initial_state.dtype if is_sm_100f() else torch.float32
+    # The SM100/SM103 non-CP kernel uses the state I/O dtype for its
+    # checkpoint stores, so an FP32 checkpoint buffer needs FP32 state I/O
+    # when auto dispatch may select that kernel. Explicit CP accepts both dtypes.
+    native_state_io = is_sm_100f()
+    fp32_checkpoint_io = (
+        native_state_io
+        and use_cp is not True
+        and checkpoint_every_n_tokens > 0
+        and state_checkpoints is not None
+        and state_checkpoints.dtype == torch.float32
+    )
+    state_dtype = (
+        initial_state.dtype if native_state_io and not fp32_checkpoint_io else torch.float32
+    )
     num_seqs = cu_seqlens.shape[0] - 1
     if state_workspace is not None:
         assert len(state_workspace) == 2
         # Both buffers hold the same group of sequences.
         assert state_workspace[0].shape == state_workspace[1].shape
+        workspace_dtype = state_workspace[0].dtype
+        assert workspace_dtype == state_dtype or (
+            fp32_checkpoint_io and workspace_dtype == initial_state.dtype
+        )
         for buffer in state_workspace:
             assert buffer.shape[0] >= 1
             assert buffer.shape[1:] == initial_state.shape[1:]
-            assert buffer.dtype == state_dtype
+            assert buffer.dtype == workspace_dtype
             assert buffer.device == initial_state.device
+        if workspace_dtype != state_dtype:
+            rows = min(state_workspace[0].shape[0], max(num_seqs, 1))
+            state_workspace = (
+                torch.empty_like(state_workspace[0][:rows], dtype=state_dtype),
+                torch.empty_like(state_workspace[1][:rows], dtype=state_dtype),
+            )
 
     # Only allocate / request final state when a caller actually consumes it
     # (either inplace scatter back to the SSM pool, or return to the caller);

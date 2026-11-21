@@ -603,6 +603,7 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
 
     _supports_periodic_snapshots = True
 
+    @override
     def _periodic_snapshot_compatible(self) -> bool:
         return (
             self._state_layout.conv_state_layout == "x_b_c"

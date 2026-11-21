@@ -6610,6 +6610,30 @@ def test_shortest_first_counts_the_spec_recompute_tail_as_uncached() -> None:
 class TestShortestFirstStarvation:
     """8192-token budget: a starved request holds 8192 // 4 = 2048 tokens."""
 
+    @pytest.mark.parametrize("capacity", [0, 4])
+    def test_periodic_snapshot_keeps_starved_request_share(self, capacity):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = capacity
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = _make_srpt_scheduler(
+            budget=1024, mgr=mgr, policy=ContextChunkingPolicy.FORCE_CHUNK, starvation_iterations=8
+        )
+        (old,) = _ctx_batch(0, [4096], seen_at=0)
+        (young,) = _ctx_batch(1, [2048])
+        for req in (old, young):
+            req.expect_snapshot_points = list(range(256, req.prompt_len + 1, 256))
+            req.is_dummy_request = False
+            req.is_last_context_chunk = False
+            req.py_multimodal_data = None
+
+        out = sched.schedule_request([old, young], set())
+
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert old.context_chunk_size >= 256
+
     @pytest.mark.parametrize("limit", [None, 8])
     def test_starved_request_takes_its_share_first(self, limit):
         sched = _make_srpt_scheduler(starvation_iterations=limit)

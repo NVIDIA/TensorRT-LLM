@@ -12803,10 +12803,15 @@ class PyExecutor:
             try:
                 self._wait_for_model_engine_input_copy()
             except Exception as copy_wait_error:
-                if (getattr(self, "_periodic_snapshot_tp_used", False)
-                        and _periodic_tp_unrecoverable_error(
-                            str(copy_wait_error))):
-                    raise
+                if getattr(self, "_periodic_snapshot_tp_used", False):
+                    fatal_error = _find_periodic_tp_unrecoverable_exception(
+                        copy_wait_error)
+                    if fatal_error is not None:
+                        logger.error(
+                            f"Periodic TP input-copy wait failed with an "
+                            f"unrecoverable error: {type(fatal_error).__name__}: "
+                            f"{fatal_error}")
+                        raise
                 logger.warning("Input-copy wait before error cleanup failed: "
                                f"{copy_wait_error}")
 

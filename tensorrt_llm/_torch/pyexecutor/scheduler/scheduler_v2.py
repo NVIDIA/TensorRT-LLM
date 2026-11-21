@@ -1146,8 +1146,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                             budget,
                             preempt_for_pages,
                             token_cap,
+                            # An expanded chunk ends this pass; let starved requests
+                            # consume their held shares first.
                             allow_periodic_snapshot=(
-                                not (scheduled_ctx or scheduled_encoder)
+                                not starved_ctx
+                                and not (scheduled_ctx or scheduled_encoder)
                                 and (
                                     not scheduled_gen
                                     or (

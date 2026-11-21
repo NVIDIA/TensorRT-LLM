@@ -741,7 +741,7 @@ def test_overlap_offsets_follow_the_packed_prefix(
     state.new_tokens = torch.arange(12, dtype=torch.int32).reshape(4, 3)
     state.new_tokens_lens = torch.tensor([2, 3, 4], dtype=torch.int32)
     state.next_draft_tokens = torch.arange(9, dtype=torch.int32).reshape(3, 3)
-    metadata = SimpleNamespace(is_cuda_graph=False, prepare=lambda: None)
+    metadata = SimpleNamespace(is_cuda_graph=False, mamba_metadata=None, prepare=lambda: None)
 
     prepared = decoder.prepare_inputs(
         scheduled,

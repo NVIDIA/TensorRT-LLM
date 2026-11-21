@@ -109,6 +109,7 @@ def _forward_step_executor(
         _stream_ordering_events=(Mock(), Mock()),
         _handle_errors=Mock(),
         _finish_inforward_snapshots=False,
+        _finish_periodic_snapshots=False,
         kv_cache_manager=Mock(),
     )
 

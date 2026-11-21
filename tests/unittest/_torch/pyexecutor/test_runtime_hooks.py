@@ -673,6 +673,7 @@ def _forward_step_executor(monkeypatch, log: list):
     executor._kv_connector_wait_for_save = lambda: None
     executor._stream_ordering_events = (_Event(), _Event())
     executor._finish_inforward_snapshots = False
+    executor._finish_periodic_snapshots = False
     return executor
 
 

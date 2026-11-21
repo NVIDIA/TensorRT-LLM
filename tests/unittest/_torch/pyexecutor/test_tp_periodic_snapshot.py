@@ -1093,7 +1093,8 @@ def test_periodic_tp_propagates_fatal_prefetch_errors(
 @pytest.mark.parametrize(
     "message", ["CUDA error: device-side assert triggered", "CUDA error: misaligned address"]
 )
-def test_fatal_input_copy_wait_after_periodic_tp_is_not_swallowed(message):
+@pytest.mark.parametrize("chain", ["direct", "cause", "context"])
+def test_fatal_input_copy_wait_after_periodic_tp_is_not_swallowed(message, chain):
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
     executor.kv_connector_manager = None
@@ -1102,10 +1103,22 @@ def test_fatal_input_copy_wait_after_periodic_tp_is_not_swallowed(message):
     executor._fatal_error = None
     executor._error_budget = ErrorBudget()
     executor.active_requests = []
-    executor._wait_for_model_engine_input_copy = Mock(side_effect=RuntimeError(message))
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._enqueue_responses = Mock()
+    fatal = RuntimeError(message)
+    error = fatal if chain == "direct" else RuntimeError("input copy cleanup failed")
+    if chain == "cause":
+        error.__cause__ = fatal
+    elif chain == "context":
+        error.__context__ = fatal
+        error.__suppress_context__ = True
+    executor._wait_for_model_engine_input_copy = Mock(side_effect=error)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(RuntimeError) as caught:
         executor._handle_errors("request validation failed", requests=[], charge_budget=False)
+
+    assert caught.value is error
 
 
 @pytest.mark.cpu_only

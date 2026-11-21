@@ -208,6 +208,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
     gdn_fused_verify = False
     _supports_periodic_snapshots = True
 
+    @override
     def _periodic_snapshot_min_window(self) -> int:
         return max(
             super()._periodic_snapshot_min_window(),
@@ -215,12 +216,14 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             self._ple_ngram_context_shape[-1] if self._ple_ngram_context_shape else 0,
         )
 
+    @override
     def _periodic_snapshot_roles(self, layer_id: int) -> tuple:
         roles = super()._periodic_snapshot_roles(layer_id)
         if layer_id in self._ple_layer_ids:
             roles += (PLE_CONV_STATE, PLE_NGRAM_CONTEXT)
         return roles
 
+    @override
     def _periodic_snapshot_staging_in_use_bytes(self) -> int:
         return super()._periodic_snapshot_staging_in_use_bytes() + sum(
             tensor.numel() * tensor.element_size()
