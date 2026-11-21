@@ -1549,7 +1549,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if request.context_current_position >= commit_limit:
             self._mark_context_position_as_history(request, kv_cache)
         if request.context_remaining_length == 0:
-            kv_cache.stop_committing()
+            # free_resources reaches here mid-decode, so a deferred tail must commit first.
+            self._stop_committing(request.py_request_id, kv_cache)
 
     def _count_snapshot_commit(self, request: LlmRequest, point: int) -> None:
         """Count a recurrent-state snapshot committed at ``point`` of ``request``'s prompt."""
