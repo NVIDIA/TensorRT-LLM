@@ -886,6 +886,7 @@ def test_m3_budget_estimate_covers_actual_paged_buffers(
     manager.enable_stats = False
     manager._has_cp_helix = False
     manager.layer_specs = None
+    manager.kv_connector_manager = None
 
     config = manager._build_base_config(
         KvCacheConfig(

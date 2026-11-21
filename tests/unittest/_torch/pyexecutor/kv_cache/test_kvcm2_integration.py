@@ -1676,8 +1676,10 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
     [
         (False, False, False, False, 1, 1, [6]),
         (True, False, False, False, 1, TOKENS_PER_BLOCK, [6]),
-        # A dropped backoff has no rewind, so the SWA window is not widened.
-        (True, True, False, False, 0, 1, [5]),
+        # A dropped backoff has no rewind, so the SWA window is not widened; the match
+        # still aligns to whole blocks, since trimming it to an SWA layer's pages can end
+        # it mid-block.
+        (True, True, False, False, 0, TOKENS_PER_BLOCK, [5]),
         (True, True, True, False, 1, 1, [6]),
         # A paired draft pool keeps its backoff but aligns with the target.
         (True, True, False, True, 1, TOKENS_PER_BLOCK, [6]),
