@@ -1104,9 +1104,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
-        # TP first, then PP. A local timeout remains nonterminal, so it is
-        # represented by the absence of that request from completed.
-        c, f, d, q = self._consensus_outcome(
+        timed_out = [
+            rid
+            for rid in to_process
+            if getattr(self._send_sessions.get(rid), "timed_out", False) is True
+        ]
+        c, f, d, q, timed_out = self._consensus_outcome(
             to_process,
             cancelled,
             failed,
@@ -1114,10 +1117,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._dist.tp_allgather,
             self._ctx_need_tp_sync,
             locally_quiesced,
+            locally_timed_out=timed_out,
         )
         if self._ctx_need_pp_sync:
             pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-            c, f, d, q = self._consensus_outcome(to_process, c, f, d, pp_allgather, True, q)
+            c, f, d, q, timed_out = self._consensus_outcome(
+                to_process, c, f, d, pp_allgather, True, q, locally_timed_out=timed_out
+            )
+        for rid in timed_out.intersection(q, c + f):
+            req = self._send_reqs.get(rid)
+            if req is not None:
+                req.py_kv_transfer_timed_out = True
         return c, f, d, q
 
     def _sync_transfer_timing(self, reqs: list):
@@ -1149,6 +1159,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     )
                 else:
                     merged[rid] = (start, end, size)
+
+        for req in reqs:
+            rid = get_unique_rid(req)
+            local_start, local_end, _ = local_data[rid]
+            start, end, _ = merged[rid]
+            req.set_kv_cache_transfer_local_duration(
+                max(0, (local_end - local_start).total_seconds())
+            )
+            req.set_kv_cache_transfer_start(start)
+            req.set_kv_cache_transfer_end(end)
 
         return merged
 

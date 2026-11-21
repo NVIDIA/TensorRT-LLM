@@ -152,7 +152,7 @@ def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_
             pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
             # Peer CP rank: rid 9 cancelled and already retirable there; nothing
             # write-verified (payload = cancelled, failed, completed, retirable, verified).
-            cp_allgather=lambda payload: [payload, [[9], [], [], [9], []]],
+            cp_allgather=lambda payload: [payload, [[9], [], [], [9], [], []]],
         )
         tc = _transceiver(
             _mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist

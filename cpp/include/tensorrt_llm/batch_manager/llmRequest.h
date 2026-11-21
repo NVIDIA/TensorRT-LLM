@@ -1342,7 +1342,7 @@ public:
 
     void markKvCacheTransferFailed() noexcept
     {
-        mKvCacheTransferFailed = !mKvCacheTransferCancelled;
+        mKvCacheTransferFailed = true;
     }
 
     [[nodiscard]] bool getKvCacheTransferFailed() const noexcept
@@ -1372,6 +1372,11 @@ public:
     [[nodiscard]] size_t getKvCacheSize() const
     {
         return std::atomic_ref(mPerfMetrics.timingMetrics.kvCacheSize).load(std::memory_order_relaxed);
+    }
+
+    void setKvCacheTransferLocalDuration(double seconds) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheTransferLocalDuration = seconds;
     }
 
     void setKvCacheTransferLocalSize(size_t bytes) const

@@ -643,6 +643,7 @@ def test_sync_rank_info_admission_rejects_all_ranks_before_publication(rejected_
             py_disaggregated_params=None,
             state=LlmRequestState.DISAGG_GENERATION_INIT,
             set_kv_cache_size=Mock(),
+            set_kv_cache_transfer_local_size=Mock(),
         )
         transceivers.append(tc)
         requests.append(req)

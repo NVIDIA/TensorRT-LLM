@@ -827,12 +827,21 @@ class DisaggTransferCoordinator:
         local_failed_ids = [
             req.py_request_id for req in admitted if req.state == LlmRequestState.DISAGG_TRANS_ERROR
         ]
-        # small_payload: at most one iteration's gen-init request ids.
-        failed_ids = {
-            rid
-            for peer_ids in self._dist.cp_allgather(local_failed_ids, small_payload=True)
-            for rid in peer_ids
-        }
+        local_timeouts = [
+            req.py_request_id
+            for req in admitted
+            if req.state == LlmRequestState.DISAGG_TRANS_ERROR
+            and (
+                getattr(req, "py_kv_transfer_timed_out", False) is True
+                or getattr(req, "kv_cache_transfer_timed_out", False) is True
+            )
+        ]
+        outcomes = self._dist.cp_allgather((local_failed_ids, local_timeouts), small_payload=True)
+        failed_ids = {rid for peer_failed, _ in outcomes for rid in peer_failed}
+        timed_out_ids = {rid for _, peer_timed_out in outcomes for rid in peer_timed_out}
+        for req in admitted:
+            if req.py_request_id in timed_out_ids:
+                req.py_kv_transfer_timed_out = True
         failed_on_a_peer_only = [
             req
             for req in admitted

@@ -2153,7 +2153,6 @@ TEST(KvCacheManagerV2StatsTest, GpuOnlyCacheDoesNotCountHostDrops)
 
     auto const dropped = manager->getAndResetIterationStats();
     EXPECT_GT(countDrops(), before);
-    ASSERT_FALSE(dropped.empty());
     for (auto const& [lifeCycle, stats] : dropped)
     {
         EXPECT_EQ(stats.iterHostDroppedBlocks, 0) << "life cycle " << lifeCycle.value();

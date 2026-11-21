@@ -232,7 +232,7 @@ def test_sync_receive_failure_under_multi_rank_adp_waits_for_the_synced_vote(syn
 
 
 def _cp_dist(
-    peer_failed_ids, *, enable_attention_dp=False, tp_size=1, pp_size=1
+    peer_failed_ids, *, peer_timeouts=None, enable_attention_dp=False, tp_size=1, pp_size=1
 ) -> SimpleNamespace:
     """Dist stub for CP rank 0 of N = len(peer_failed_ids) + 1 CP ranks.
 
@@ -243,8 +243,9 @@ def _cp_dist(
     errors fail at once."""
 
     def cp_allgather(ids, *, small_payload=False):
-        dist.gathered.append(list(ids))
-        return [ids, *peer_failed_ids]
+        dist.gathered.append(ids)
+        timeouts = peer_timeouts if peer_timeouts is not None else [[] for _ in peer_failed_ids]
+        return [ids, *zip(peer_failed_ids, timeouts)]
 
     cp_size = len(peer_failed_ids) + 1
     world_size = tp_size * cp_size * pp_size if enable_attention_dp else 1
@@ -271,7 +272,7 @@ def test_sync_receive_that_failed_on_a_cp_peer_fails_here_too(sync_mode) -> None
 
     h.coordinator.receive_gen_init([first, second])
 
-    assert dist.gathered == [[]]
+    assert dist.gathered == [([], [])]
     assert first.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
     assert second.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert h.effects.failed == [(_GEN_ERROR_MSG, [second], False)]
@@ -285,9 +286,25 @@ def test_sync_receive_failure_here_is_shared_with_cp_peers(sync_mode) -> None:
 
     h.coordinator.receive_gen_init([failing, received])
 
-    assert dist.gathered == [[1]]
+    assert dist.gathered == [([1], [])]
     assert received.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
     assert h.effects.failed == [(_GEN_ERROR_MSG, [failing], False)]
+
+
+@pytest.mark.parametrize("local_timeout", [False, True])
+def test_sync_receive_counts_cp_timeout_on_both_ranks(sync_mode, local_timeout) -> None:
+    peer_timeouts = [[]] if local_timeout else [[1]]
+    dist = _cp_dist(peer_timeouts, peer_timeouts=peer_timeouts)
+    h = CoordinatorHarness(dist=dist)
+    req = _gen_init(h, 1)
+    if local_timeout:
+        h.transceiver.script_sync_recv(req, "error")
+        req.py_kv_transfer_timed_out = True
+
+    h.coordinator.receive_gen_init([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.coordinator.transfer_outcomes == (0, 0, 1)
 
 
 def test_sync_receive_failed_on_a_cp_peer_under_adp_reaches_the_synced_vote(sync_mode) -> None:
@@ -327,7 +344,7 @@ def test_sync_receive_failure_gather_under_attention_dp_follows_pp_scheduling(
 
     h.coordinator.receive_gen_init([req])
 
-    assert dist.gathered == ([[]] if gathers else [])
+    assert dist.gathered == ([([], [])] if gathers else [])
     assert req.state == (
         LlmRequestState.DISAGG_TRANS_ERROR
         if gathers

@@ -702,11 +702,12 @@ void initRequestBindings(nb::module_& m)
     auto timingMetricsGetstate = [](tle::RequestPerfMetrics::TimingMetrics const& self)
     {
         return nb::make_tuple(self.arrivalTime, self.firstScheduledTime, self.firstTokenTime, self.lastTokenTime,
-            self.kvCacheTransferStart, self.kvCacheTransferEnd, self.kvCacheSize, self.kvCacheTransferLocalSize);
+            self.kvCacheTransferStart, self.kvCacheTransferEnd, self.kvCacheSize, self.kvCacheTransferLocalSize,
+            self.kvCacheTransferLocalDuration);
     };
     auto timingMetricsSetstate = [](tle::RequestPerfMetrics::TimingMetrics& timingMetrics, nb::tuple const& state)
     {
-        if (state.size() != 7 && state.size() != 8)
+        if (state.size() < 7 || state.size() > 9)
         {
             throw std::runtime_error("Invalid TimingMetrics state!");
         }
@@ -717,7 +718,8 @@ void initRequestBindings(nb::module_& m)
                 nb::cast<tle::RequestPerfMetrics::TimePoint>(state[3]),
                 nb::cast<tle::RequestPerfMetrics::TimePoint>(state[4]),
                 nb::cast<tle::RequestPerfMetrics::TimePoint>(state[5]), nb::cast<size_t>(state[6]),
-                state.size() == 8 ? nb::cast<std::optional<size_t>>(state[7]) : std::nullopt};
+                state.size() >= 8 ? nb::cast<std::optional<size_t>>(state[7]) : std::nullopt,
+                state.size() >= 9 ? nb::cast<std::optional<double>>(state[8]) : std::nullopt};
     };
     nb::class_<tle::RequestPerfMetrics::TimingMetrics>(m, "TimingMetrics")
         .def(nb::init<>())
@@ -729,6 +731,8 @@ void initRequestBindings(nb::module_& m)
         .def_rw("kv_cache_transfer_end", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferEnd)
         .def_rw("kv_cache_size", &tle::RequestPerfMetrics::TimingMetrics::kvCacheSize)
         .def_rw("kv_cache_transfer_local_size", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferLocalSize)
+        .def_rw(
+            "kv_cache_transfer_local_duration", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferLocalDuration)
         .def("__getstate__", timingMetricsGetstate)
         .def("__setstate__", timingMetricsSetstate);
 
