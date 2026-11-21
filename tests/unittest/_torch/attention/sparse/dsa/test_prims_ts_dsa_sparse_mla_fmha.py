@@ -362,6 +362,21 @@ def test_prims_ts_matches_the_gather(written_records, monkeypatch):
     library.__init__(layer)
     assert library._is_supported(fused_q, None, None, metadata, forward_args)
     library.forward(fused_q, None, None, metadata, forward_args)
+    # A failed optional scan must still allow this row count to execute.
+    with monkeypatch.context() as failure:
+        from unittest.mock import Mock
+
+        scan = Mock(side_effect=RuntimeError("an unrelated specialization failed"))
+        failure.setattr(prims_ts_dsa_sparse_mla, "_plan_kernel_variants", scan)
+        failure.setattr(prims_ts_dsa_sparse_mla, "_ATTEMPTED_WARM_PROFILES", set())
+        failure.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
+        with pytest.raises(RuntimeError, match="unrelated specialization"):
+            library.forward(fused_q, None, None, metadata, forward_args)
+        failure.setenv("TLLM_PRIMTS_WARM_STRICT", "0")
+        output.fill_(torch.nan)
+        library.forward(fused_q, None, None, metadata, forward_args)
+        library._warm_kernel_variants(metadata=metadata, device=query.device, topk=topk)
+        assert scan.call_count == 2  # One strict and one non-strict attempt.
     torch.cuda.synchronize()
 
     keys = _gather(written_records, indices).float()
