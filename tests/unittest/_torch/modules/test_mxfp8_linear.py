@@ -29,6 +29,7 @@ from tensorrt_llm._torch.autotuner import (
     AutoTuner,
     AutoTunerProfilingCache,
     _candidates_fingerprint,
+    _key_fingerprint,
     autotune,
 )
 from tensorrt_llm._torch.custom_ops.mxfp8_gemm import (
@@ -521,7 +522,7 @@ def _mxfp8_profiling_cache(entries):
     """A profiling cache holding ``entries`` (keys without the code fingerprint)
     as tuning ``MXFP8GemmRunner`` alone under the current code keys them."""
     cache = AutoTunerProfilingCache.__new__(AutoTunerProfilingCache)  # No device query.
-    fingerprint = _candidates_fingerprint((MXFP8GemmRunner,))
+    fingerprint = _key_fingerprint(MXFP8GemmRunner, _candidates_fingerprint((MXFP8GemmRunner,)))
     # No fingerprint element under TLLM_AUTOTUNER_CACHE_KEY=none.
     suffix = () if fingerprint is None else (fingerprint,)
     cache.cache = {(*key, *suffix): value for key, value in entries.items()}

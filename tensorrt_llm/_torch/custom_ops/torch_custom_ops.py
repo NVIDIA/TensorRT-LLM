@@ -3123,6 +3123,10 @@ class AllReduceRunner(TunableRunner):
                   ),
         )
 
+    def rank_group(self) -> Tuple[int, ...]:
+        # Every rank of the communicator must run the same protocol.
+        return tuple(self.group)
+
     @classmethod
     def _maybe_preallocate_buffers(cls,
                                    input_tensor: torch.Tensor,
