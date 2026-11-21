@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 
 class CacheAccelerator(ABC):
@@ -35,3 +36,12 @@ class CacheAccelerator(ABC):
     @abstractmethod
     def is_enabled(self) -> bool:
         """Whether acceleration is currently active."""
+
+    def min_warmup_steps(self, default_steps: int) -> int:
+        """Warmup denoise steps needed to reach this backend's cached path."""
+        return default_steps
+
+    @contextlib.contextmanager
+    def warmup_scope(self) -> Iterator[None]:
+        """Context for the startup warmup passes."""
+        yield
