@@ -14974,6 +14974,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            split_k_fp32_partials: ClassVar[bool] = False
+            max_split_k_workspace_bytes: ClassVar[int] = 64 * 1024 * 1024
+            split_k_reduction_cache: ClassVar[dict] = {}
             # Whether an output_tensor without partition_id is a plain in-place
             # GEMM. Otherwise a missing partition_id is rejected.
             allow_unpartitioned_output: ClassVar[bool] = False
@@ -15000,6 +15003,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # run (or the reverse).  Unpinned runs keep the old key.
                 base = (self.output_dtype, self.to_userbuffers,
                         self.use_tvm_ffi)
+                if self.split_k_fp32_partials:
+                    base += ("fp32_split_k_partials", self.split_k_candidates)
                 override = _dense_gemm_scheduler_override()
                 return base if override is None else base + (override, )
 
@@ -15290,12 +15295,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         kernel_n = n
 
                     for split_k in self.split_k_candidates:
+                        if split_k > 1 and (real_k % mma_tiler_k != 0 or
+                                            (real_k // mma_tiler_k) % split_k
+                                            != 0):
+                            continue
+                        fp32_partials = self.split_k_fp32_partials and split_k > 1
+                        if (fp32_partials and m * n * split_k * 4
+                                > self.max_split_k_workspace_bytes):
+                            continue
                         if self.__class__.kernel_class.can_implement(
                             (kernel_m, kernel_n, real_k, batch_size),
                                 self.a_dtype,
                                 self.b_dtype,
                                 self.sf_dtype,
-                                cutlass.BFloat16,
+                                cutlass.Float32
+                                if fp32_partials else cutlass.BFloat16,
                                 a_major,
                                 b_major,
                                 c_major,
@@ -15545,6 +15559,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[
                     0]
 
+                # A cached profile can cover larger M than its tuning sample.
+                # Keep the workspace bound valid for the actual invocation.
+                if (self.split_k_fp32_partials and split_k > 1 and
+                        m * n * split_k * 4 > self.max_split_k_workspace_bytes):
+                    split_k = 1
+
                 partition_id = kwargs.get("partition_id", -1)
                 # A caller-owned output is a locality-domain half GEMM, except on
                 # runners that opt into plain in-place output without a partition.
@@ -15591,7 +15611,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 if swap_ab:
                     c_tensor = c_tensor.permute(1, 0)
-                if split_k > 1:
+                fp32_partials = self.split_k_fp32_partials and split_k > 1
+                if fp32_partials:
+                    if output_tensor is not None or self.to_userbuffers:
+                        raise ValueError(
+                            "FP32 split-K partials require a standalone output")
+                    partials = torch.empty((split_k, m, n),
+                                           dtype=torch.float32,
+                                           device=a_tensor.device)
+                    kernel_c_tensor = partials
+                    kernel_c_dtype = cutlass.Float32
+                else:
+                    kernel_c_tensor = c_tensor
+                    kernel_c_dtype = cutlass.BFloat16
+                if split_k > 1 and not fp32_partials:
                     # Split-K uses TMA reduce-add stores, so every invocation
                     # and CUDA-graph replay must begin from a zeroed output.
                     c_tensor.zero_()
@@ -15635,7 +15668,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_ptr = self.make_cute_dsl_global_pointer(
                     b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                 c_ptr = self.make_cute_dsl_global_pointer(
-                    c_tensor, cutlass.BFloat16, 16)
+                    kernel_c_tensor, kernel_c_dtype, 16)
 
                 # get stream
                 torch_stream = torch.cuda.current_stream()
@@ -15719,9 +15752,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              mma_inst_shape, preferred_cluster_shape_mn,
                              cluster_shape_mn, swap_ab, use_prefetch,
                              raster_order, scheduler_mode, split_k,
-                             swizzle_size, locality_domain_half_gemm,
-                             self.use_tvm_ffi, max_active_preferred_clusters,
-                             max_active_clusters)
+                             swizzle_size, fp32_partials,
+                             locality_domain_half_gemm, self.use_tvm_ffi,
+                             max_active_preferred_clusters, max_active_clusters)
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
                 # get stream
@@ -15739,7 +15772,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_sf_ptr = self.make_cute_dsl_global_pointer(
                             b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                         c_ptr = self.make_cute_dsl_global_pointer(
-                            c_tensor, cutlass.BFloat16, 16)
+                            kernel_c_tensor, kernel_c_dtype, 16)
                         alpha_cute_tensor = cute.runtime.from_dlpack(
                             alpha_tensor)
                         # make faked stream
@@ -15789,6 +15822,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             raster_order=raster_order,
                             scheduler_type=scheduler_type,
                             split_k=split_k,
+                            split_k_partials=fp32_partials,
                         )
                     # Note: when tvm_ffi fake stream is used, at least one parameter should be tensor type,
                     # so we make alpha as the cute.Tensor type in the jit func.
@@ -15842,7 +15876,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         kernel_b_tensor.data_ptr(),
                         kernel_a_sf_tensor.data_ptr(),
                         kernel_b_sf_tensor.data_ptr(),
-                        c_tensor.data_ptr(),
+                        kernel_c_tensor.data_ptr(),
                         alpha_tensor,
                         c_ld_key,
                     ]
@@ -15868,6 +15902,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 if swap_ab:
                     c_tensor = c_tensor.permute(1, 0)
+                if fp32_partials:
+                    self._reduce_split_k_partials(partials, c_tensor, split_k)
 
                 if output_tensor is None:
                     if bias is not None:
@@ -15882,6 +15918,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     return
                 else:
                     return
+
+            def _reduce_split_k_partials(self, partials: torch.Tensor,
+                                         output: torch.Tensor,
+                                         split_k: int) -> None:
+                from ..kernels.rubin.dense_blockscaled_gemm_persistent import \
+                    reduce_split_k_fp32
+
+                partials_flat = partials.view(-1)
+                output_flat = output.view(-1)
+                partials_cute = cute.runtime.from_dlpack(
+                    partials_flat).mark_layout_dynamic()
+                output_cute = cute.runtime.from_dlpack(
+                    output_flat).mark_layout_dynamic()
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+                key = (split_k, self.use_tvm_ffi)
+                if key not in self.split_k_reduction_cache:
+                    compile_stream = (cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+                                      if self.use_tvm_ffi else stream)
+                    self.split_k_reduction_cache[key] = cute.compile(
+                        reduce_split_k_fp32,
+                        partials_cute,
+                        output_cute,
+                        split_k,
+                        compile_stream,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
+                reduction = self.split_k_reduction_cache[key]
+                if self.use_tvm_ffi:
+                    reduction(partials_flat, output_flat)
+                else:
+                    reduction(partials_cute, output_cute, stream)
 
         class CuteDSLNVFP4RubinLinear(CuteDSLBlockScaledRubinLinear):
             """SM107 NVFP4 runner backed by the persistent dense kernel."""
@@ -15943,6 +16012,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         class CuteDSLKimiK3MXFP8RubinLinear(CuteDSLMXFP8RubinLinear):
             """MXFP8 runner with fine-grained tuning for K3's low-M range."""
+
+            # Split-K keeps separate FP32 partials and reduces them in order,
+            # rounding only the completed sum to the public BF16 output.
+            split_k_fp32_partials = True
 
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
