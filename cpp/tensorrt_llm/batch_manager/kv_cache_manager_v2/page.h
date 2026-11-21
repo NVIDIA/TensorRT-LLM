@@ -65,6 +65,7 @@ public:
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
     //! Dedupes the pages of one batched call: the StorageManager::nextVisitStamp() of the last call that took it.
     uint64_t visitStamp = 0;
+    bool hostDropHandled{false}; //!< Set once eviction has handed this page off, so its destruction does not again.
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 

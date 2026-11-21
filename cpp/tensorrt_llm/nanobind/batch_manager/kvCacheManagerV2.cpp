@@ -33,9 +33,12 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/streamingEventSink.h"
 #include "kv_cache_manager_v2/utils/copyUtils.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
+#include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
 #include <cassert>
@@ -667,6 +670,39 @@ public:
     {
         nb::gil_scoped_acquire acquire;
         return nb::cast<std::vector<std::vector<kv::KVCacheEvent>>>(nb::borrow<nb::object>(mCallback)(events));
+    }
+
+private:
+    PyObject* mCallback;
+};
+
+//! Owns a reference to the host-drop hook's Python callable and drops it under the GIL, wherever the last copy of the
+//! hook is destroyed (removal, replacement or manager teardown).
+class PythonHostDropCallback
+{
+public:
+    explicit PythonHostDropCallback(nb::handle callback)
+        : mCallback(callback.ptr())
+    {
+        Py_INCREF(mCallback);
+    }
+
+    ~PythonHostDropCallback()
+    {
+        if (Py_IsInitialized())
+        {
+            nb::gil_scoped_acquire acquire;
+            Py_DECREF(mCallback);
+        }
+    }
+
+    PythonHostDropCallback(PythonHostDropCallback const&) = delete;
+    PythonHostDropCallback& operator=(PythonHostDropCallback const&) = delete;
+
+    //! The caller must hold the GIL.
+    [[nodiscard]] nb::handle get() const noexcept
+    {
+        return nb::handle(mCallback);
     }
 
 private:
@@ -3894,6 +3930,128 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 nb::gil_scoped_release release;
                 return self.poolGroupDescs().raw();
+            })
+        .def(
+            "set_host_drop_hook",
+            [](kv::KvCacheManager& self, nb::object callback)
+            {
+                // See the stub in tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi for the record layout and the
+                // hook's rules.
+                kv::HostDropHook hook;
+                if (!callback.is_none())
+                {
+                    KVCM2_REJECT_IF_POISONED();
+                    TLLM_CHECK_WITH_INFO(
+                        PyCallable_Check(callback.ptr()), "set_host_drop_hook: callback must be callable or None");
+                    auto holder = std::make_shared<PythonHostDropCallback>(callback);
+                    hook = [holder = std::move(holder)](std::vector<kv::HostDropRecord> const& records)
+                    {
+                        // Keeps the callable alive for this call even if the closure that holds it is destroyed.
+                        auto const callable = holder;
+                        nb::gil_scoped_acquire gil;
+                        // ~CommittedPage can get here from tp_dealloc while an exception is in flight: park it, so
+                        // the hook starts with a clean error indicator and the caller gets its exception back.
+                        nb::error_scope const pendingError;
+                        try
+                        {
+                            nb::list items;
+                            for (auto const& r : records)
+                            {
+                                items.append(nb::make_tuple(nb::bytes(r.key.data(), r.key.size()), r.lifeCycle,
+                                    r.numTokens, r.address, r.bytes));
+                            }
+                            callable->get()(items);
+                        }
+                        catch (std::exception const& error) // nb::python_error included
+                        {
+                            // Rethrown as a plain C++ exception while the GIL is held (a python_error must not leave
+                            // it), so the storage manager counts and logs the failed hand-off as for a C++ hook.
+                            throw std::runtime_error(error.what());
+                        }
+                    };
+                }
+                // Never wait for the API lock with the GIL held: an evicting thread holds that lock while it waits
+                // for the GIL inside the hook. The replaced hook is destroyed after the lock is released (its
+                // callable takes the GIL to drop its reference), but before the GIL is taken back.
+                nb::gil_scoped_release release;
+                kv::HostDropHook previous;
+                {
+                    auto const apiLock = self.lockExclusive();
+                    // A hook runs under this lock: a nested call would replace, and destroy, the running hook.
+                    TLLM_CHECK_WITH_INFO(
+                        apiLock.owns(), "set_host_drop_hook cannot be called from inside a KVCacheManager callback");
+                    previous = self.storage().setHostDropHook(std::move(hook));
+                }
+            },
+            nb::arg("callback").none())
+        .def(
+            "host_drop_ring",
+            [](kv::KvCacheManager& self, size_t ringBytes, bool preferKernel, bool lossless, double losslessMaxWaitS,
+                size_t losslessChunk)
+            {
+                // (address, slot_bytes, num_slots, kernel_copy) of the pinned ring the last host level copies its
+                // drops into. Switches the hand-off to the ring; the hook is no longer called on eviction. With
+                // `lossless`, a full ring makes the evicting call wait for released slots instead of dropping pages
+                // without a hand-off (see StorageManager::setUpHostDropRing).
+                kv::HostDropRingInfo info{};
+                {
+                    // Setup shares the storage with eviction and shutdown, so it takes the exclusive API lock (after
+                    // the GIL is released, as in set_host_drop_hook) and runs in the manager's CUDA context.
+                    KVCM2_REJECT_IF_POISONED();
+                    nb::gil_scoped_release release;
+                    kv::CudaContextScope const context(self.cudaContext());
+                    TLLM_CHECK_WITH_INFO(context.usable(), "host_drop_ring: the manager's CUDA context is unusable");
+                    auto const apiLock = self.lockExclusive();
+                    TLLM_CHECK_WITH_INFO(
+                        apiLock.owns(), "host_drop_ring cannot be called from inside a KVCacheManager callback");
+                    info = self.storage().setUpHostDropRing(ringBytes, preferKernel,
+                        kv::HostDropLosslessConfig{
+                            .enabled = lossless, .maxWaitS = losslessMaxWaitS, .minChunk = losslessChunk});
+                }
+                return nb::make_tuple(info.address, info.slotBytes, info.numSlots, info.kernelCopy);
+            },
+            nb::arg("ring_bytes"), nb::arg("prefer_kernel") = true, nb::arg("lossless") = false,
+            nb::arg("lossless_max_wait_s") = 2.0, nb::arg("lossless_chunk") = 64)
+        .def(
+            "drain_host_drops",
+            [](kv::KvCacheManager& self, size_t maxRecords)
+            {
+                // Ring records whose copies completed, oldest first: (key, life_cycle, num_tokens, slot, bytes).
+                std::vector<kv::HostDropRingRecord> records;
+                {
+                    nb::gil_scoped_release release;
+                    records = self.storage().drainHostDrops(maxRecords);
+                }
+                nb::list items;
+                for (auto const& r : records)
+                {
+                    items.append(nb::make_tuple(
+                        nb::bytes(r.key.data(), r.key.size()), r.lifeCycle, r.numTokens, r.slot, r.bytes));
+                }
+                return items;
+            },
+            nb::arg("max_records") = 4096)
+        .def(
+            "release_host_drop_slots",
+            [](kv::KvCacheManager& self, std::vector<int32_t> const& slots)
+            {
+                nb::gil_scoped_release release;
+                self.storage().releaseHostDropSlots(slots);
+            },
+            nb::arg("slots"))
+        .def("host_drop_stats",
+            [](kv::KvCacheManager& self)
+            {
+                // Cumulative host-drop hand-off counters, in pages.
+                auto& c = self.storage().hostDropStats();
+                nb::dict out;
+                out["handed"] = c.handed.load();
+                out["ring_full"] = c.ringFull.load();
+                out["errors"] = c.errors.load();
+                out["waits"] = c.waits.load();
+                out["wait_ns"] = c.waitNs.load();
+                out["timeouts"] = c.timeouts.load();
+                return out;
             })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())

@@ -509,6 +509,15 @@ atomic, read without any lock by `StorageManager::anyRemoteLevelFailed()` /
 probes' check for newly failed levels, which then take the lock exclusively to
 unlink their pages before matching.
 
+The host-drop ring adds a third. Its state (free list, per-slot owner, queued
+batches, waiting budget) is guarded by `StorageManager::mHostDropMutex`, never
+held while waiting for the API lock. The consumer bindings `drain_host_drops`,
+`release_host_drop_slots` and `host_drop_stats` take only that mutex (the stats
+are atomics) and never the API lock, because a lossless eviction holds the API
+lock while it waits for released slots: a consumer must not take the API lock
+between a drain and its release. `set_host_drop_hook` and `host_drop_ring`
+mutate the storage manager and take the API lock exclusively.
+
 **What the lock does and does not cover.** It protects state *shared between*
 `KvCache`s, not the fields of an individual one, and it is a guarantee about the
 bound (Python-visible) API only -- see "Where the guarantee applies" below.
@@ -700,8 +709,8 @@ readers a separate index rather than making the lock finer-grained.
   creating an `nb::object`, or changing Python reference counts.
 - **Every binding that can block on the API lock must release the GIL first.**
   This is a correctness requirement, not a throughput one. `KvCacheManager` calls
-  back into Python while holding the lock (the priority callback and the event
-  sink both do `nb::gil_scoped_acquire`), so a thread that waits for the lock
+  back into Python while holding the lock (the priority callback, the event
+  sink and the host-drop hook all do `nb::gil_scoped_acquire`), so a thread that waits for the lock
   *while holding the GIL* deadlocks against a lock holder that is waiting for the
   GIL. A binding that blocks with the GIL held also stops every other Python
   thread for the duration of a `resize`, which is the opposite of the point.

@@ -482,7 +482,17 @@ void KvCacheManager::shutdown()
     //
     // The latch is read under the lock because it is normally set by a thread holding it: a read
     // taken before blocking would only say the cache was intact before this call started waiting.
+    //
+    // The host-drop hook is taken out on every path, poisoned included: it may hold a Python callable
+    // that refers back to the manager's owner, a cycle the garbage collector cannot see. It is declared
+    // before the lock so it is destroyed after the lock is released, since a Python callable takes
+    // the GIL to drop its reference.
+    HostDropHook hostDropHook;
     auto const apiLock = lockExclusive();
+    if (mStorage)
+    {
+        hostDropHook = mStorage->setHostDropHook({});
+    }
     if (Poison::poisoned() || mShutDown)
     {
         // Recorded on the poisoned path too: nothing will be released later either way, and the
