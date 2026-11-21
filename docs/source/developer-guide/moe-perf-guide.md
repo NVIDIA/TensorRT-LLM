@@ -162,13 +162,13 @@ TensorRT-LLM provides many MoE implementations, differing in supported quantizat
 | Backend | GPU arch | Quantization |
 |---|---|---|
 | `CUTLASS` | SM80+ | unquantized, FP8 QDQ, FP8 block-scale, NVFP4, W4A16_NVFP4, W4A8_AWQ, W8A16, MXFP4, MXFP8 |
-| `TRTLLM` | SM100 / SM103 | NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 |
+| `TRTLLM` | SM100 / SM103 / SM107 | NVFP4, FP8 block-scale, W4A8_NVFP4_FP8 (SM100 / SM103), W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 |
 | `CUTEDSL` | SM100 / SM103 / SM107, SM120 / SM121 (CUTLASS prefill / FlashInfer decode) | NVFP4, BF16 (SM107), W4A16_NVFP4 (SM120 / SM121) |
 | `CUTEDSL_FC12` | SM107 | NVFP4 |
 | `DEEPGEMM` | SM100 / SM103 / SM107 | FP8 block-scale |
 | `DENSEGEMM` | SM100 / SM103 | NVFP4 |
 | `MEGAMOE_CUTEDSL` | SM100 / SM103 / SM107 | NVFP4 |
-| `MEGAMOE_DEEPGEMM` | SM100 / SM103 | W4A8_MXFP4_MXFP8 |
+| `MEGAMOE_DEEPGEMM` | SM100 / SM103 / SM107 | W4A8_MXFP4_MXFP8 |
 | `MARLIN` | SM89 – SM99 | NVFP4, W4A16_NVFP4 (BF16 activations) |
 | `TRITON` (Deprecated) | SM90 (GPT-OSS) | BF16, FP8 QDQ, W4A16_MXFP4, W4A8_MXFP4_FP8 |
 
@@ -275,7 +275,7 @@ Segment values a tactic can use, by field:
 ### Terminology
 
 - **`world_size`**: number of ranks (GPUs) the model is served on.
-- **NVLink domain**: the set of GPUs reachable over NVLink. GB300 (NVL72) forms one domain of up to 72 GPUs, so EP crosses the domain only when `world_size > 72`. B300 forms one domain per 8-GPU node, so EP crosses the domain when `world_size > 8` and falls back to the slower network.
+- **NVLink domain**: the set of GPUs reachable over NVLink. GB300 (NVL72) and Vera Rubin NVL72 support up to 72 GPUs per domain; EP stays within NVLink only when all its ranks are placed in the same physical domain. B300 forms one domain per 8-GPU node, so EP crosses the domain when `world_size > 8` and falls back to the slower network.
 - **prefill / decode**: prefill processes the whole prompt at once (large GEMM `M`, compute bound), decode produces one token per request per step (small `M`, communication and memory bound). The two phases usually need different configurations.
 
 ## Recommended Configuration
@@ -312,34 +312,78 @@ Backend
 │      ├─ NVFP4, tokens per rank < 64, ep_size==1, no attention DP  → CUTEDSL
 │      └─ else                                                      → CUTLASS
 │
-└─ SM100 / SM103  (B300 / GB300)
+├─ SM100 / SM103  (B300 / GB300)
+│      │
+│      ├─ attention TP
+│      │      │
+│      │      ├─ NVFP4
+│      │      │      ├─ decode (CUDA graph on)
+│      │      │      │      ├─ intermediate_size <= 2304            → CUTEDSL
+│      │      │      │      ├─ else if activated_tokens_per_rank <= 8192
+│      │      │      │      │                                       → TRTLLM
+│      │      │      │      └─ else                                 → CUTEDSL
+│      │      │      └─ prefill (CUDA graph off)
+│      │      │             ├─ top_k <= 4                           → TRTLLM
+│      │      │             └─ else                                 → CUTEDSL
+│      │      │
+│      │      └─ W4A8_MXFP4_MXFP8
+│      │             ├─ decode, top_k == 6,
+│      │             │  activated_tokens_per_rank >= 768 and num_tokens <= 8192
+│      │             │                                              → CUTLASS
+│      │             └─ else                                        → TRTLLM
+│      │
+│      └─ attention DP
+│             │
+│             ├─ NVFP4
+│             │      ├─ decode (CUDA graph on)
+│             │      │      ├─ activated_tokens_per_rank <= 512
+│             │      │      │                                       → TRTLLM
+│             │      │      └─ else                                 → MEGAMOE_CUTEDSL
+│             │      └─ prefill (CUDA graph off)
+│             │             ├─ activated_tokens_per_rank > 32768,
+│             │             │  world_size <= 4 and top_k > 6        → CUTEDSL
+│             │             └─ else                                 → MEGAMOE_CUTEDSL
+│             │
+│             └─ W4A8_MXFP4_MXFP8
+│                    ├─ top_k <= 4                                  → TRTLLM
+│                    └─ else                                        → MEGAMOE_DEEPGEMM
+│
+└─ SM107 (Vera Rubin NVL72, within one NVLink domain)
        │
-       ├─ attention TP                                          → TRTLLM
+       ├─ attention TP
+       │      │
+       │      ├─ NVFP4
+       │      │      ├─ decode (CUDA graph on)
+       │      │      │      ├─ top_k <= 4 or activated_tokens_per_rank <= 32
+       │      │      │      │                                       → TRTLLM
+       │      │      │      └─ else                                 → CUTEDSL
+       │      │      └─ prefill (CUDA graph off)
+       │      │             ├─ top_k <= 4 and intermediate_size <= 3072
+       │      │             │                                       → TRTLLM
+       │      │             └─ else                                 → CUTEDSL
+       │      │
+       │      └─ W4A8_MXFP4_MXFP8
+       │             ├─ decode, top_k == 6,
+       │             │  activated_tokens_per_rank >= 768 and num_tokens <= 8192
+       │             │                                              → CUTLASS
+       │             └─ else                                        → TRTLLM
        │
        └─ attention DP
               │
-              ├─ GB300 with world_size <= 72, or B300 with world_size <= 8
-              │  (EP within one NVLink domain)
-              │      │
-              │      ├─ NVFP4
-              │      │      ├─ decode (CUDA graph on)
-              │      │      │      ├─ activated_tokens_per_rank <= 512
-              │      │      │      │      ├─ world_size <= 8      → TRTLLM
-              │      │      │      │      └─ else                 → CUTEDSL
-              │      │      │      └─ else                        → MEGAMOE_CUTEDSL
-              │      │      │
-              │      │      └─ prefill (CUDA graph off)
-              │      │             ├─ activated_tokens_per_rank <= 16384
-              │      │             │                              → TRTLLM
-              │      │             └─ else                        → MEGAMOE_CUTEDSL
-              │      │
-              │      └─ W4A8_MXFP4_MXFP8                          → MEGAMOE_DEEPGEMM
+              ├─ NVFP4
+              │      ├─ decode (CUDA graph on)
+              │      │      ├─ activated_tokens_per_rank <= 16,
+              │      │      │  or top_k > 4 and activated_tokens_per_rank <= 128
+              │      │      │                                       → TRTLLM
+              │      │      └─ else                                 → MEGAMOE_CUTEDSL
+              │      └─ prefill (CUDA graph off)
+              │             ├─ activated_tokens_per_rank > 32768,
+              │             │  world_size <= 8 and top_k > 6        → CUTEDSL
+              │             └─ else                                 → MEGAMOE_CUTEDSL
               │
-              └─ B300 with world_size > 8
-                 (EP crosses the NVLink domain)
-                        ├─ NVFP4             → CUTEDSL
-                        └─ W4A8_MXFP4_MXFP8  → TRTLLM
-
+              └─ W4A8_MXFP4_MXFP8
+                     ├─ top_k <= 4                                  → TRTLLM
+                     └─ else                                        → MEGAMOE_DEEPGEMM
 
 ═════════════════ STEP3: Communication ═════════════════
 
@@ -364,9 +408,11 @@ Communication
 > `{2048, 2560, 3584, 4096, 5120, 6144, 7168}` and `top_k <= 16`.
 
 > **Notes**
-> - The tree is an empirical summary from `bench_moe` sweeps on TensorRT-LLM `v1.3.0rc26` (`21dc97fbc8`, 2026-09-13).
-> - Coverage: GB300 / B300, typical workloads of key models (DeepSeek-V4-Pro, GLM-5, Kimi-K2, Kimi-K3, Qwen3.8) on the MoE Perf Dashboard, module-level `bench_moe` with perfect routing and `--use_low_precision_moe_combine`. GB300 is covered only through `world_size <= 72`; larger GB300 deployments (EP crossing the NVLink domain) were not benchmarked.
-> - Perfect routing assigns tokens evenly across experts. Relative rankings of backends and communication strategies hold under this configuration, but a real router can be skewed, so absolute latency can differ from what the deployment sees.
+> - The backend recommendations summarize `bench_moe` sweeps of the five models below on TensorRT-LLM `v1.4.0rc3` (`9e334fbaae`).
+> - Coverage: B300 at `world_size` 4/8; GB300 and Vera Rubin NVL72 at 4/8/16/32, within one NVLink domain. All five models cover NVFP4 and W4A8_MXFP4_MXFP8.
+> - `MEGAMOE_*` requires `num_slots % moe_ep_size == 0` (`num_slots == num_experts` without EPLB).
+> - For MiniMax M3.1 Flash W4A8 attention-DP prefill at 16/32 GPUs, NVLINK_TWO_SIDED was faster than NVLINK_ONE_SIDED on GB300 and Rubin.
+> - The sweeps use balanced routing and request `--use_low_precision_moe_combine`. Real routing imbalance can change latency and backend rankings.
 > - The decision tree is a fit to those sweeps, and may not be optimal for a specific workload. Meanwhile, results can become outdated as kernels and autotuning change. To push performance further, test the options yourself with `bench_moe`, as described in *Tuning a Specific Workload*.
 
 ### Hints for Making the Choice
@@ -397,21 +443,19 @@ All three options switch for the same reason. Every configuration pays two kinds
 
 #### Rationale Behind Each Threshold
 
-**The MoE layout is always expert parallelism.** Under attention DP, expert parallelism is always the optimum at every workload point in the sweep. Under attention TP, a hybrid TP x EP layout can be slightly better at small token counts, but the gain is small (0.3% at the median and 4% at the 90th percentile). A deployment that is squeezing the last few percent out of a low-latency configuration should still measure `TP<k>EP<m>`.
+**The default MoE layout is expert parallelism.** Under attention DP, expert parallelism is a strong starting point. Under attention TP, a hybrid TP x EP layout can be better at small token counts. A deployment that is squeezing the last few percent out of a low-latency configuration should still measure `TP<k>EP<m>`.
 
-**The fused path is not always the best choice.** The fused scheme carries a fixed setup cost: three cross-rank NVLink barriers inside the kernel, plus metadata preparation whose cost follows the token bucket size rather than the number of tokens actually present. With few tokens in flight that cost exceeds the overlapped dispatch and combine cost, and fusion only takes off once the workload is large enough for the cost to be amortised and for the overlap to repay it. The threshold `activated_tokens_per_rank = 512` with CUDA graph on is derived from the `bench_moe` sweep over typical workloads.
+**The fused path is not always the best choice.** The fused scheme carries a fixed setup cost: three cross-rank NVLink barriers inside the kernel, plus metadata preparation whose cost follows the token bucket size rather than the number of tokens actually present. With few tokens in flight that cost exceeds the overlapped dispatch and combine cost, and fusion only takes off once the workload is large enough for the cost to be amortised and for the overlap to repay it. The threshold `activated_tokens_per_rank = 512` applies to SM100 / SM103 NVFP4 attention-DP decode; SM107 uses the conditions in the tree.
 
-**We prefer `TRTLLM` over `CUTEDSL` when `world_size <= 8`.** A small world size leaves many experts on each rank (`num_experts / world_size` can be 32 to 224), so the grouped GEMM has many groups with a small `M` dimension. In these cases, TRTLLM-Gen's tuned kernels fit that shape better than the generic CuteDSL grouped GEMM.
+**A small `world_size` does not always favor `TRTLLM` over `CUTEDSL`.** A small world size leaves many experts on each rank (`num_experts / world_size` can be 32 to 224), so the grouped GEMM has many groups with a small `M` dimension. Which backend fits that shape better depends on the model and workload.
 
 **The crossover moves out much further with CUDA graph off.** A CUDA graph replays a recorded launch sequence and reduces the kernel launch overhead during forward. Without CUDA graph, `TRTLLM` drives its whole MoE from one host-side call that issues its kernels internally, while the fused path is a chain of separate host-side steps, including quantize, staging copies, the fused kernel, and a separate top-k reduce, each carrying its own dispatch and autotuner lookup. With CUDA graph off, the host overhead dominates the execution of the MoE module. The fused path's expert-GEMM advantage therefore stays out of the comparison until `TRTLLM`'s GPU work has grown past that dispatch cost, which moves the crossover point much further out. In a disaggregated deployment, CUDA graph off maps to the prefill phase.
 
-**Attention TP always uses `TRTLLM`.** Attention TP is a low-latency choice, and the MoE forward never gets a large batch: across the disaggregated-serving workloads behind this guide, attention TP appears only in the decode phase and `activated_tokens_per_rank` never exceeds 64. `CUTEDSL` does overtake `TRTLLM` once the expert GEMM becomes compute bound, but that only happens above roughly 24576 activated tokens per rank, which attention TP does not reach in a disaggregated deployment.
+**Attention TP does not always use `TRTLLM`.** The choice depends on precision, shape and phase; follow the attention-TP branch above.
 
 #### Impacts of Crossing the NVLink Domain
 
-An NVL72 system keeps up to 72 GPUs in one domain, while B300 keeps 8 per node. Once expert parallelism extends beyond that, the tokens go over the network, where per-GPU bandwidth drops. The same bytes then cost close to twenty times more, which moves every crossover earlier and is why the cross-domain branch switches on absolute dispatch bytes (`dispatch_KB`) rather than on a token count (`activated_tokens_per_rank`).
-
-> The thresholds above were obtained from sweeps over typical workloads on key models, all measured with `--use_low_precision_moe_combine` enabled. This flag speeds up `NVLINK_ONE_SIDED` by about 4% while leaving the fused `NONE` path untouched.
+An NVL72 system keeps up to 72 GPUs in one domain, while B300 keeps 8 per node. Once expert parallelism extends beyond that, tokens travel over the network and communication costs change. The current recommendations cover EP within one NVLink domain; cross-domain deployments require their own measurements.
 
 ### Typical Deployment Scenarios
 
@@ -423,7 +467,7 @@ Optimize for the smallest possible per-step latency at low concurrency, acceptin
 |---|---|
 | Attention | TP |
 | MoE parallelism | EP |
-| Backend | `TRTLLM` on SM100 / SM103 |
+| Backend | Follow the attention-TP branch above |
 | Communication | `NONE` (attention TP needs no dispatch) |
 | CUDA graph | On |
 
@@ -437,8 +481,8 @@ Optimize for aggregate throughput at high concurrency, accepting higher per-requ
 |---|---|
 | Attention | DP |
 | MoE parallelism | EP, typically wide |
-| Backend | `MEGAMOE_CUTEDSL` (NVFP4) / `MEGAMOE_DEEPGEMM` (W4A8_MXFP4_MXFP8) |
-| Communication | `NONE` |
+| Backend | Follow the attention-DP branch above |
+| Communication | Follow the communication branch above; fused backends use `NONE` |
 | CUDA graph | On for decode, off for prefill |
 
 Attention DP accumulates tokens per rank as concurrency grows. Fusion is for that case: the MoE module has enough work to benefit from overlapping dispatch and combine with the GEMM operations. It is also important to keep expert parallelism inside one NVLink domain if you can.
@@ -447,8 +491,8 @@ Attention DP accumulates tokens per rank as concurrency grows. Fusion is for tha
 
 In a disaggregated deployment the two phases are separate services and should be configured separately rather than compromised into one profile:
 
-- **Prefill / context servers**: large `M`, compute bound, CUDA graph off. Follow the CUDA-graph-off branch of the tree (crossover at `activated_tokens_per_rank = 16384`). This is also the only phase where DWDP applies.
-- **Decode / generation servers**: small `M` per step, communication and memory bound, CUDA graph on. Follow the CUDA-graph-on branch (crossover at 512). This is the phase where EPLB pays off, since expert imbalance shows up as a straggler on every step.
+- **Prefill / context servers**: large `M`, compute bound, CUDA graph off. Follow the CUDA-graph-off branch of the tree for the target platform and shape. This is also the only phase where DWDP applies.
+- **Decode / generation servers**: small `M` per step, communication and memory bound, CUDA graph on. Follow the CUDA-graph-on branch for the target platform and shape. This is the phase where EPLB pays off, since expert imbalance shows up as a straggler on every step.
 
 ## Tuning a Specific Workload
 
@@ -461,15 +505,15 @@ PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} \
 mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 8 \
   python3 -m bench_moe \
   --world_size 8 \
-  --model deepseek_v4_pro \
+  --model deepseek_v4_1_flash \
   --quant NVFP4 \
   --search full \
   --balanced_total_num_tokens 256 8192 \
   --use_low_precision_moe_combine \
-  --output_file out/deepseek_v4_pro_ws8.json
+  --output_file out/deepseek_v4_1_flash_ws8.json
 ```
 
-This writes `out/deepseek_v4_pro_ws8.json` and `out/deepseek_v4_pro_ws8.analysis.xlsx`. If attention parallelism is already decided, pin `--parallel_mode DEP` or `TEP` and `--search backend comm` instead.
+This writes `out/deepseek_v4_1_flash_ws8.json` and `out/deepseek_v4_1_flash_ws8.analysis.xlsx`. If attention parallelism is already decided, pin `--parallel_mode DEP` or `TEP` and `--search backend comm` instead.
 
 The JSON has `results` (one object per candidate) and `rankings` grouped by `(num_tokens, parallel_mode)`. Start at `rankings`: `best` is the `status=success` candidate with the lowest `score_ms` in that group.
 
@@ -491,7 +535,7 @@ The JSON has `results` (one object per candidate) and `rankings` grouped by `(nu
 
 Search axes and further recipes: [`BENCH_MOE_USER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/microbenchmarks/bench_moe/BENCH_MOE_USER_GUIDE.md).
 
-One thing to know before trusting a `bench_moe` ranking: it has been cross-validated against end-to-end disaggregated serving, detailed in *Appendix*.
+Historical cross-validation against end-to-end disaggregated serving is detailed in *Appendix*. The five-model sweep above measures the MoE module only.
 
 ## Advanced Techniques
 
@@ -579,15 +623,17 @@ Covered Models with MoE Configuration:
 
 | Model | `num_experts` | `top_k` | `hidden_size` | `intermediate_size` |
 |---|---|---|---|---|
-| DeepSeek-V4-Pro | 384 | 6 | 7168 | 3072 |
-| GLM-5 | 256 | 8 | 6144 | 2048 |
-| Kimi-K2 | 384 | 8 | 7168 | 2048 |
-| Kimi-K3 | 896 | 16 | 3584 | 3072 |
-| Qwen3.8 | 512 | 10 | 8192 | 2048 |
+| DeepSeek v4.1 Flash | 384 | 6 | 5120 | 2304 |
+| Kimi K3.1 Pro | 896 | 16 | 3584† | 3072 |
+| GLM 5.3 Flash | 288 | 8 | 4096 | 2048 |
+| MiniMax M3.1 Flash | 128 | 4 | 6144 | 3072 |
+| Inkling 2 Small | 384 | 8 | 4608 | 2304 |
+
+† For latent/pooled MoE models, `hidden_size` is the routed-expert input width rather than the checkpoint's top-level model hidden size.
 
 ### Cross Validation of Microbenchmark with End-to-end Performance
 
-The microbenchmark ranks MoE configurations by module latency, without serving the full model. This ranking is validated against disaggregated serving.
+The microbenchmark ranks MoE configurations by module latency, without serving the full model. The end-to-end validation below uses the previous set of key models.
 
 #### Baseline: the Pareto serving configuration
 
