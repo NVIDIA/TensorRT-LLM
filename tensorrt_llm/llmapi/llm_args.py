@@ -3160,11 +3160,12 @@ class DecodingBaseConfig(StrictBaseModel):
         default=False,
         status="prototype",
         description=
-        "If true, enables the occurrence penalties (repetition / presence / frequency) "
+        "If true, enables the occurrence penalties (repetition / presence / frequency), "
+        "embedding_bias (logit_bias) and bad_words "
         "for one-model speculative decoding. Off by default because the penalties need a "
         "[num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front "
         "(CUDA graphs capture fixed buffer addresses). While off, a request that asks for "
-        "any of these penalties is rejected at admission rather than silently decoded "
+        "any of these is rejected at admission rather than silently decoded "
         "without them.")
 
     spec_dec_variant: PositiveInt = Field(
