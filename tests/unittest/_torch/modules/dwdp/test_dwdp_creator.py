@@ -292,6 +292,7 @@ def _create(
         mem_get_info=lambda: (2 << 30, 4 << 30),
         empty_cache=lambda: None,
         reset_peak_memory_stats=lambda: None,
+        current_device=lambda: 0,
         memory_stats=lambda: {"allocated_bytes.all.current": 0},
         Stream=lambda: SimpleNamespace(cuda_stream=123),
     )

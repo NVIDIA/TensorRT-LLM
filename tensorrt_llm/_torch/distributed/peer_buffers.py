@@ -106,15 +106,14 @@ class PeerBuffers:
             return None
         dist = Distributed.get(mapping)
         # A holder only: when collected it frees peer_ptrs[tp_rank] and closes the other peer_ptrs.
-        ipc = IpcMemory(mapping, nbytes, False)
-        ipc.open_ipc = True
+        ipc = IpcMemory(mapping, nbytes, False, label="TP peer buffers")
         handle = None
         try:
             # 2 MiB-aligned like IpcMemory: smaller allocations can share an IPC handle.
             size = (nbytes + (1 << 21) - 1) // (1 << 21) * (1 << 21)
             error, ptr = cudart.cudaMalloc(size)
             _raise_if_error(error)
-            ipc.local_ptr = ipc.peer_ptrs[mapping.tp_rank] = ptr
+            ipc.adopt_local_buffer(ptr, size)
             _raise_if_error(cudart.cudaMemset(ptr, 0, size)[0])
             error, local_handle = cudart.cudaIpcGetMemHandle(ptr)
             _raise_if_error(error)

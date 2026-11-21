@@ -705,7 +705,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 
     if (bestFit != commBuffers.end())
     {
-        bestFit->inUse = true;
+        setInUseLocked(*bestFit, true);
         bestFit->reusableOnAnyStream = false;
         bestFit->reusableStream.reset();
         bestFit->releaseEpoch = 0;
@@ -766,6 +766,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     {
         buffer.leaseId = mNextLeaseId++;
         commBuffers.push_back({buffer, true, getDevice(), isCapturing ? std::make_optional(graphOwner) : std::nullopt});
+        addEntryUsageLocked(commBuffers.back());
     }
     else
     {
@@ -845,7 +846,7 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
             {
                 return;
             }
-            entry.inUse = false;
+            setInUseLocked(entry, false);
             entry.reusableOnAnyStream = true;
             entry.reusableStream.reset();
             entry.releaseEpoch = 0;
@@ -880,7 +881,7 @@ bool NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, cudaStream_t
         {
             continue;
         }
-        entry.inUse = false;
+        setInUseLocked(entry, false);
         entry.reusableOnAnyStream = false;
         entry.reusableStream = stream;
         entry.releaseEpoch = mNextReleaseEpoch++;
@@ -1086,7 +1087,7 @@ bool NCCLWindowAllocator::releaseTensorLeaseLocked(TensorLease const& tensorLeas
         {
             continue;
         }
-        entry.inUse = false;
+        setInUseLocked(entry, false);
         entry.reusableOnAnyStream = false;
         entry.reusableStream = stream;
         entry.releaseEpoch = mNextReleaseEpoch++;
@@ -1116,7 +1117,7 @@ void NCCLWindowAllocator::quarantineTensorLeaseLocked(TensorLease const& tensorL
         {
             continue;
         }
-        entry.inUse = false;
+        setInUseLocked(entry, false);
         entry.reusableOnAnyStream = false;
         entry.reusableStream.reset();
         entry.releaseEpoch = 0;
@@ -1173,7 +1174,7 @@ void NCCLWindowAllocator::releaseBufferFromDestructor(ncclComm_t comm, void* ptr
         {
             continue;
         }
-        entry.inUse = false;
+        setInUseLocked(entry, false);
         entry.reusableOnAnyStream = false;
         entry.reusableStream.reset();
         entry.releaseEpoch = 0;
@@ -1256,6 +1257,56 @@ size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const
         }
     }
     return count;
+}
+
+NCCLWindowAllocator::DeviceUsage NCCLWindowAllocator::getDeviceUsage(int device) const
+{
+    std::lock_guard<std::mutex> lock(mUsageMutex);
+    auto const it = mDeviceUsage.find(device);
+    return it != mDeviceUsage.end() ? it->second : DeviceUsage{};
+}
+
+void NCCLWindowAllocator::addEntryUsageLocked(BufferEntry const& entry)
+{
+    std::lock_guard<std::mutex> lock(mUsageMutex);
+    auto& usage = mDeviceUsage[entry.device];
+    ++usage.bufferCount;
+    usage.totalBytes += entry.buffer.size;
+    if (entry.inUse)
+    {
+        usage.inUseBytes += entry.buffer.size;
+    }
+}
+
+void NCCLWindowAllocator::removeEntryUsageLocked(BufferEntry const& entry)
+{
+    std::lock_guard<std::mutex> lock(mUsageMutex);
+    auto& usage = mDeviceUsage[entry.device];
+    --usage.bufferCount;
+    usage.totalBytes -= entry.buffer.size;
+    if (entry.inUse)
+    {
+        usage.inUseBytes -= entry.buffer.size;
+    }
+}
+
+void NCCLWindowAllocator::setInUseLocked(BufferEntry& entry, bool inUse)
+{
+    if (entry.inUse == inUse)
+    {
+        return;
+    }
+    entry.inUse = inUse;
+    std::lock_guard<std::mutex> lock(mUsageMutex);
+    auto& usage = mDeviceUsage[entry.device];
+    if (inUse)
+    {
+        usage.inUseBytes += entry.buffer.size;
+    }
+    else
+    {
+        usage.inUseBytes -= entry.buffer.size;
+    }
 }
 
 bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
@@ -1478,6 +1529,10 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
         }
     }
 
+    for (auto const& entry : commIt->second)
+    {
+        removeEntryUsageLocked(entry);
+    }
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
     mMinSymmetricFailureSize.erase(comm);

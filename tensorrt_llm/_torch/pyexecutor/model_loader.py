@@ -41,6 +41,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from ..locality_domain.policy import LocalityDomainPolicy
+from ..memory.monitor import claims as monitor_claims
+from ..memory.monitor import names as monitor_names
 from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
                           wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
@@ -1457,6 +1459,9 @@ class ModelLoader:
                             for name, value in self._metrics.items())
         logger.info(
             f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+        # Attribute the parameters the model ended up with, whichever load
+        # path produced them. Only a weak reference; read when reporting.
+        monitor_claims.claim_module_memory(model, monitor_names.WEIGHTS)
         return model, moe_load_balancer
 
     def _timed_load(
