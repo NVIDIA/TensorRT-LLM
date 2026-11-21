@@ -698,9 +698,19 @@ def test_completed_ids_inactive_never_inspect_rows(
     """Keep completed-copy observation lazy when its region or profiler is inactive."""
     select_regions(monkeypatch, *(("moe",) if selected else ()))
     monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: active)
-    profiler.record_moe_routing_ids(
-        cast(torch.Tensor, object()), step=1, rank=0, layer_pos=((7, 0),)
-    )
+    inspected: list[str] = []
+
+    class Rows:
+        def __getattribute__(self, name: str) -> object:
+            inspected.append(name)
+            return super().__getattribute__(name)
+
+        def __getitem__(self, key: object) -> object:
+            inspected.append("__getitem__")
+            raise TypeError("inactive rows were indexed")
+
+    profiler.record_moe_routing_ids(cast(torch.Tensor, Rows()), step=1, rank=0, layer_pos=((7, 0),))
+    assert inspected == []
 
 
 @pytest.mark.cpu_only
