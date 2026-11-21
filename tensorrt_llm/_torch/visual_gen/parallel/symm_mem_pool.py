@@ -94,8 +94,10 @@ Rules
   allocation, before any peer can signal, so a protocol may start from "no flag set" after
   each :meth:`SymmMemPool.reserve` that reallocated. A pad has the size of torch's
   process-wide ``signal_pad_size`` at the time of its allocation, and the pool fixes
-  :attr:`SymmMemPool.channels` from the value it reads then (``set_signal_pad_size`` belongs
-  before the first symmetric allocation of the process, on every rank).
+  :attr:`SymmMemPool.channels` from the value it reads then. ``set_signal_pad_size`` belongs
+  before the first symmetric allocation of the process, with one value on every rank: torch's
+  ``rendezvous`` fails on every rank when the sizes round to different multiples of 128 bytes,
+  and the pool fails the allocation with the sizes by rank when they differ at all.
 * Timeouts: a :meth:`SymmMemPool.wait` or :meth:`SymmMemPool.signal` that exceeds ``timeout_ms``
   is a device-side trap (PyTorch's signal kernels print a fatal message and ``__trap()``);
   treat the process as lost. The spin starts when the GPU reaches the kernel, so host-side skew
@@ -112,9 +114,10 @@ Rules
   does not own the peer's memory and dangles once the pool frees it; a ``region`` view keeps
   this rank's old block mapped until it is dropped. Drop cached views before a ``reserve`` that
   may grow and before ``release``.
-* Environment: the pool requires and sets nothing, and never selects a symmetric-memory backend
-  (``set_backend``); its channels assume torch's default ``CUDA`` backend, whose signal pad
-  holds one flag per channel and rank (``reserve`` logs the active backend). On a
+* Environment: the pool sets nothing and never selects a symmetric-memory backend
+  (``set_backend``); its channels need torch's default ``CUDA`` backend (``TORCH_SYMMMEM`` unset
+  or ``CUDA``), whose signal pad holds one flag per channel and rank, and the probe and
+  ``reserve`` decline another one. On a
   multicast-capable group torch's ``rendezvous`` also creates and binds an NVLS multicast
   object for each allocation, which the pool does not use;
   ``TORCH_SYMM_MEM_DISABLE_MULTICAST=1``, set on every rank, makes the group skip that.
@@ -150,7 +153,10 @@ __all__ = [
 ]
 
 DEFAULT_ALIGN = 256
-"""int: Default region alignment in bytes (covers every dtype view a caller may take)."""
+"""int: Default region alignment in bytes. It aligns offsets inside the allocation, which is what
+a dtype view of a region needs, and 256 covers every dtype. The address of a region is torch's:
+on torch 2.14's ``CUDA`` backend the data buffer starts at the block's mapping plus the signal pad
+size rounded up to 128 bytes, so a region starts on a multiple of ``min(align, 128)`` bytes."""
 
 DEFAULT_TIMEOUT_MS = 600_000
 """int: Default device-side signal deadline: 10 minutes, the default collective timeout of an NCCL
@@ -285,16 +291,23 @@ class PoolLayout:
 # =============================================================================
 
 
-def _agree(group: dist.ProcessGroup, ok: bool, reason: str) -> tuple[bool, str]:
+def _agree(
+    group: dist.ProcessGroup, ok: bool, reason: str, *, same: tuple[str, int] | None = None
+) -> tuple[bool, str]:
     """The MIN of ``ok`` over the group's ranks (collective), with the failing ranks' reasons.
 
     Carried by ``all_gather_object`` rather than an ``all_reduce`` so that every rank learns
-    which rank declined and why (the one line the caller logs must name the reason).
+    which rank declined and why (the one line the caller logs must name the reason). ``same``
+    is a ``(name, value)`` the ranks must also share: when every rank passed and the values
+    differ, the verdict is a failure that lists them by rank.
     """
     # Every entry is filled by the gather.
-    verdicts: list[tuple[bool, str]] = [None] * dist.get_world_size(group)
-    dist.all_gather_object(verdicts, (bool(ok), reason), group=group)
-    failures = [f"rank {rank}: {why}" for rank, (good, why) in enumerate(verdicts) if not good]
+    verdicts: list[tuple[bool, str, int | None]] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(verdicts, (bool(ok), reason, same and same[1]), group=group)
+    failures = [f"rank {rank}: {why}" for rank, (good, why, _) in enumerate(verdicts) if not good]
+    values = [value for _, _, value in verdicts]
+    if not failures and same is not None and len(set(values)) > 1:
+        failures = [f"the ranks differ on {same[0]}: {values} by rank"]
     return (True, "") if not failures else (False, "; ".join(failures))
 
 
@@ -324,6 +337,20 @@ def _nccl_backend_reasons(group: dist.ProcessGroup, device: torch.device) -> lis
     return []
 
 
+def _symm_backend_reasons(device: torch.device) -> list[str]:
+    try:
+        backend = _symm_mem().get_backend(device)
+    except ImportError:
+        return []  # reported by the caller
+    if backend != "CUDA":
+        return [
+            f"torch's symmetric-memory backend for {device.type} devices is {backend!r}; the "
+            "pool's signal channels need the default 'CUDA' backend (one flag per channel and "
+            "rank on each block's own pad)"
+        ]
+    return []
+
+
 def _local_preconditions(group: dist.ProcessGroup, device: torch.device) -> list[str]:
     """Everything that must hold on this rank before a rendezvous is attempted; empty when OK."""
     reasons: list[str] = []
@@ -347,6 +374,7 @@ def _local_preconditions(group: dist.ProcessGroup, device: torch.device) -> list
                 "torch.cuda.set_device first: the capture guard and the group's object "
                 "collectives act on the current device"
             )
+        reasons.extend(_symm_backend_reasons(device))
     reasons.extend(_nccl_backend_reasons(group, device))
     return reasons
 
@@ -504,7 +532,8 @@ class SymmMemPool:
             RuntimeError: Under CUDA-graph capture, on an unsupported group or device, when the
                 ranks hold the pool in different states, and with the agreed reason when the
                 allocation fails on any rank (``symm_mem.empty``, the rendezvous, a signal pad
-                that is too small, the addressing check). Whatever a group collective raises
+                that is too small or whose size differs across ranks, the addressing check).
+                Whatever a group collective raises
                 after the rendezvous propagates as well, with the allocation dropped without a
                 fence.
             ValueError: On a non-positive request or when the ranks disagree on the alignment.
@@ -583,10 +612,10 @@ class SymmMemPool:
            the group's store and a rank that enters it alone waits for the store's timeout, so
            no rank enters it unless every rank has its block.
         2. ``rendezvous`` (collective inside torch), the checks of the handle it returns and
-           the clearing of this rank's signal pad (local), then an agreement. The pool's state
-           is written only after it, so ``reserved`` and ``generation`` never differ across
-           ranks, and a rank that passed while a peer failed just drops its block: no peer
-           wrote to it.
+           the clearing of this rank's signal pad (local), then an agreement, which also
+           requires one signal pad size on every rank. The pool's state is written only
+           after it, so ``reserved`` and ``generation`` never differ across ranks, and a rank
+           that passed while a peer failed just drops its block: no peer wrote to it.
         3. The addressing check (collective, phase-aligned), with a fenced free on an agreed
            failure: markers were pushed into the peers' buffers.
 
@@ -594,6 +623,7 @@ class SymmMemPool:
         (see "Allocation failures" in the module docstring).
         """
         buf = handle = None
+        pad_nbytes = 0
         detail = ""
         try:
             buf = _symm_mem().empty(layout.nbytes, dtype=torch.uint8, device=self.device)
@@ -613,7 +643,11 @@ class SymmMemPool:
                 torch.cuda.synchronize(self.device)
         except Exception as e:  # noqa: BLE001 - every local failure becomes an agreed verdict
             detail = f"rendezvous failed: {type(e).__name__}: {e}"
-        ok, reason = _agree(self.group, not detail, detail)
+        # The pad size is a per-process torch setting: ranks with pads of different sizes would
+        # count different channels, and a signal on one could have no matching wait on another.
+        ok, reason = _agree(
+            self.group, not detail, detail, same=("the signal pad size in bytes", pad_nbytes)
+        )
         if not ok:
             return False, reason
         self._buf, self._handle, self._layout = buf, handle, layout
@@ -659,11 +693,11 @@ class SymmMemPool:
         return self._channel_shortfall(channels, min_channels)
 
     def _require_channels(self, min_channels: int) -> None:
-        """Collective: raise on every rank when any rank's pad is too small.
+        """Collective: raise on every rank when the pad is too small for ``min_channels``.
 
-        ``set_signal_pad_size`` is a per-process setting, so the ranks' channel counts can differ;
-        agreeing first keeps every rank on the same side of the raise (a rank raising alone would
-        leave its peers waiting at the next collective).
+        Every rank computes the same verdict (one pad size per allocation, the agreed maximum
+        of ``min_channels``); it is gathered like every other one so the reason has the same
+        by-rank form.
         """
         shortfall = self._channel_shortfall(self.channels, min_channels)
         ok, reason = _agree(self.group, not shortfall, shortfall)
@@ -872,11 +906,13 @@ def probe_symmetric_memory(
 
     Every rank of ``group`` must call it, eagerly: it raises under CUDA-graph capture. Round one
     agrees on the local preconditions (the symmetric-memory module imports, the group has >= 2
-    ranks, ``device`` is the current CUDA device and NCCL serves it in the group). Only when
+    ranks, ``device`` is the current CUDA device, torch's symmetric-memory backend for it is
+    ``CUDA``, NCCL serves it in the group, and ``min_channels`` is positive). Only when
     every rank passes does it allocate one tiny region per rank (the allocation path of
     :meth:`SymmMemPool.reserve`, with the check that the signal pad offers ``min_channels``
     channels) and release it again. Each verdict is the MIN over ranks, so a failure anywhere is
-    a failure everywhere and the reason names the failing ranks; a declining probe leaves
+    a failure everywhere and the reason names the failing ranks (or the values the ranks
+    differ on); a declining probe leaves
     nothing reserved or mapped on any rank. The probe sets nothing in the environment and
     reports a decline at debug level only: the caller decides how loudly to fall back. Its
     allocation is a rendezvous like any other: see "Groups with different members" in the
@@ -906,6 +942,8 @@ def probe_symmetric_memory(
     try:
         device = torch.device(device)
         reasons = _local_preconditions(group, device)
+        if min_channels < 1:
+            reasons.append(f"min_channels must be >= 1 (got {min_channels})")
     except Exception as e:  # noqa: BLE001 - every local failure becomes an agreed verdict
         reasons = [f"the local preconditions could not be evaluated: {type(e).__name__}: {e}"]
     ok, reason = _agree(group, not reasons, "; ".join(reasons))

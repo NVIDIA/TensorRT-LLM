@@ -29,6 +29,7 @@ import re
 import time
 import weakref
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -165,6 +166,46 @@ def test_probe_declines_gloo_without_cuda(gloo_world):
         probe_symmetric_memory(None, "cpu")
 
 
+def test_probe_declines_a_non_positive_channel_request_before_allocating(
+    gloo_world, fake_symm, collectives
+):
+    assert probe_symmetric_memory(gloo_world, "cpu", min_channels=0) == (
+        False,
+        "rank 0: min_channels must be >= 1 (got 0)",
+    )
+    # A value that cannot be compared is this rank's verdict too, not a raise of its own.
+    ok, reason = probe_symmetric_memory(gloo_world, "cpu", min_channels=None)
+    assert ok is False and "could not be evaluated: TypeError" in reason
+    # Declined in the first agreement each time (the peers are in it), and nothing allocated.
+    assert collectives == ["all_gather_object"] * 2
+    assert fake_symm.allocated == 0
+
+
+def test_another_symmetric_memory_backend_is_a_failed_precondition(gloo_world, monkeypatch):
+    """The pool's channels are the CUDA backend's: one flag per channel and rank on the block's
+    own pad. A process that selected another backend must fall back, on every rank."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    backend = {"name": "NVSHMEM"}
+    monkeypatch.setattr(
+        symm_mem_pool, "_symm_mem", lambda: SimpleNamespace(get_backend=lambda d: backend["name"])
+    )
+    reasons = symm_mem_pool._local_preconditions(gloo_world, torch.device("cuda:0"))
+    assert any("symmetric-memory backend for cuda devices is 'NVSHMEM'" in r for r in reasons)
+    backend["name"] = "CUDA"
+    reasons = symm_mem_pool._local_preconditions(gloo_world, torch.device("cuda:0"))
+    assert not any("symmetric-memory backend" in r for r in reasons)
+
+    # A build without the module: reported once, as the import failure.
+    def unimportable():
+        raise ImportError("no symmetric memory in this build")
+
+    monkeypatch.setattr(symm_mem_pool, "_symm_mem", unimportable)
+    reasons = symm_mem_pool._local_preconditions(gloo_world, torch.device("cuda:0"))
+    assert "is not importable (no symmetric memory in this build)" in reasons[0]
+    assert not any("symmetric-memory backend" in r for r in reasons)
+
+
 def test_probe_agrees_on_preconditions_that_cannot_be_evaluated(gloo_world, monkeypatch):
     """A rank whose precondition check itself raises (CUDA that cannot initialize, a device
     string torch rejects) must still reach the first agreement: its peers are waiting in it."""
@@ -284,7 +325,9 @@ class _FakeHandle:
         if self._fake.fail == "get_buffer":
             raise RuntimeError("injected: get_buffer")
         start = 0 if self._fake.fail == "misaddress" else storage_offset * dtype.itemsize
-        return self._blocks[rank][start : start + sizes[0] * dtype.itemsize].view(dtype)
+        view = self._blocks[rank][start : start + sizes[0] * dtype.itemsize].view(dtype)
+        self._fake.peer_views.add(view)
+        return view
 
     def get_signal_pad(self, rank, sizes, dtype):
         assert rank == self.rank, "the pool only touches its own rank's pad"
@@ -318,6 +361,7 @@ class _FakeSymmMem:
         self.signals: list[tuple] = []
         self.handles: weakref.WeakSet = weakref.WeakSet()  # the handles still alive
         self.buffers: weakref.WeakSet = weakref.WeakSet()  # the pool tensors still alive
+        self.peer_views: weakref.WeakSet = weakref.WeakSet()  # the get_buffer views still alive
         self.block: torch.Tensor | None = None  # this rank's most recent block and pad
         self.pad: torch.Tensor | None = None
         self._allocations: dict[int, tuple[str, torch.Tensor]] = {}
@@ -659,8 +703,9 @@ def _one_rank_fails_locally(rank: int, group, root: str) -> None:
                 assert ok is False, where
             unnamed = 1 if expected.startswith("rank 0") else 0
             assert expected in reason and f"rank {unnamed}:" not in reason, (where, reason)
-            # Nothing is left mapped on any rank ...
+            # Nothing is left mapped on any rank, the peer views the pool cached included ...
             assert len(fake.handles) == 0 and len(fake.buffers) == 0, where
+            assert len(fake.peer_views) == 0, where
             # ... every rank holds the same verdict and the group's next collective still pairs ...
             verdicts = [None, None]
             dist.all_gather_object(verdicts, reason, group=group)
@@ -671,17 +716,33 @@ def _one_rank_fails_locally(rank: int, group, root: str) -> None:
             assert pool.reserved and (pool.slots, pool.region_nbytes) == (2, 2048), where
             pool.release()
             assert not pool.reserved and len(fake.handles) == 0, where
+            assert len(fake.peer_views) == 0, where
 
-    # A request the allocation covers, needing more channels than rank 1's pad has: agreed as
-    # well, and the allocation stays.
-    if rank == 1:
-        _inject(fake, "pad")
+    # A request the allocation covers, needing more channels than the pad has (the same small
+    # pad on both ranks): agreed as well, naming both ranks, and the allocation stays.
+    _inject(fake, "pad")
     pool = SymmMemPool(group, "cpu")
     assert pool.reserve(4096, slots=2) is True
-    with pytest.raises(RuntimeError, match=_LOCAL_FAILURES["pad"]) as info:
+    with pytest.raises(RuntimeError) as info:
         pool.reserve(4096, slots=2, min_channels=2)
-    assert "rank 0:" not in str(info.value)
+    shortfall = "the signal pad offers 1 channels for 2 ranks; need 2"
+    assert f"rank 0: {shortfall}" in str(info.value) and f"rank 1: {shortfall}" in str(info.value)
     assert pool.reserved and pool.generation == 1
+    _lift(fake)
+
+    # Pad sizes that differ inside one of torch's 128-byte steps (its rendezvous compares the
+    # rounded size, so it lets these through): the ranks would count 1152 and 1150 channels, so
+    # the allocation fails with the sizes by rank, through reserve and through the probe.
+    if rank == 1:
+        fake.pad_nbytes = 9200
+    differ = "the ranks differ on the signal pad size in bytes: [9216, 9200] by rank"
+    other = SymmMemPool(group, "cpu")
+    with pytest.raises(RuntimeError, match=re.escape(f"SymmMemPool.reserve: {differ}")):
+        other.reserve(4096, slots=2, min_channels=2)
+    assert not other.reserved and other.generation == 0
+    assert probe_symmetric_memory(group, "cpu", min_channels=2) == (False, differ)
+    # Only the pool reserved above is still mapped.
+    assert len(fake.handles) == 1 and len(fake.buffers) == 1
     _lift(fake)
 
     # A pool that has to grow, and rank 1 cannot allocate the larger block: the old allocation
@@ -1075,4 +1136,4 @@ def test_release_after_the_group_was_destroyed_clears_without_a_collective(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    raise SystemExit(pytest.main([__file__, "-v"]))
