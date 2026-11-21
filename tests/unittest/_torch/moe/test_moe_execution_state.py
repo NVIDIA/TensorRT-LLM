@@ -34,7 +34,6 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVL
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.pyexecutor import rank_failure_model_load
 from tensorrt_llm._torch.pyexecutor.rank_failure_model_load import moe_comms, prepare_model
-from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
@@ -454,7 +453,7 @@ def test_unbindable_moe_layer_is_refused(kind: str, mapping, uses: str, cause: s
     with pytest.raises(ValueError, match=re.escape(f"MoE layer 1 {uses}")) as error:
         moe_comms(torch.nn.ModuleList([bound, layer]))
     assert cause in str(error.value)
-    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
 
 
 @pytest.mark.cpu_only
@@ -472,7 +471,7 @@ def test_layers_over_different_ep_groups_refused() -> None:
         ),
     ) as error:
         moe_comms(torch.nn.ModuleList(layers))
-    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
 
 
 @pytest.mark.cpu_only
@@ -512,9 +511,6 @@ def _target_with_drafter(
     model.moe = _moe_layer(ConfigurableMoE, comm=target_comm)
     model.draft_model = torch.nn.Module()
     model.draft_model.moe = _moe_layer(ConfigurableMoE, comm=draft_comm)
-    model.model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
-    )
     return model
 
 
@@ -547,4 +543,4 @@ def test_drafter_over_another_ep_group_refused() -> None:
         ),
     ) as error:
         prepare_model(model)
-    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)

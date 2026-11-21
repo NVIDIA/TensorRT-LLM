@@ -405,7 +405,8 @@ class EplbExpertRestore:
     def release_empty_spare_slots(self) -> int:
         """Map the spare slots that the installed placement leaves empty back to the shared scratch.
 
-        An online EPLB update may still run, because it never fills these slots.
+        An online EPLB update may still run, because it never fills these slots. An active slot
+        that a stopped restore emptied is unusable too, but it has no unbacked memory to release.
 
         Returns:
             The number of bytes released.
@@ -414,7 +415,10 @@ class EplbExpertRestore:
         if balancer.in_iter:
             raise RuntimeError("Cannot release spare slots while an iteration is active")
         return self.set_spare_slots_backed(
-            [layer.get_unusable_local_slots() for layer in balancer.single_layer_load_balancers],
+            [
+                [slot for slot in layer.get_unusable_local_slots() if slot in layer.spare_slots]
+                for layer in balancer.single_layer_load_balancers
+            ],
             False,
         )
 
