@@ -21,8 +21,12 @@ same logits kernel when every row has 16,384 or more positions (``topk_multicta_
 ``run_attention`` takes the exact top-512 selection (``topk`` [B, 512] int32, local compressed positions in no
 particular order, -1 for an unused entry) and writes ``out`` [B, 64 * 512] bf16 like ``AttentionTail`` of the
 large-batch kernels does. One cluster of 5 CTAs serves a row, up to 26 rows (the clusters of 5 that a B200 holds at
-once at one CTA per SM). The launch is a plain stream-ordered launch (no programmatic dependent launch: the production
-top-K kernels never trigger it, and the attribute then costs 0.7 to 0.8 us).
+once at one CTA per SM). The launch is a plain stream-ordered launch, or, with ``pdl=True``, a programmatic dependent
+launch: behind the multi-CTA top-K of ``topk_multicta_op`` (which triggers the launch after its stream phase,
+``run(trigger=True)``) the CTAs of the tail attention start while that kernel ranks the crossing bin: 0.5 us less
+per hybrid step on average over 9 to 24 rows (B200, nsys: 0.0 to 1.4 us at 15 of the 16 sizes, +0.15 us at one);
+behind a top-K kernel that never triggers early (the production one) the attribute only costs 0.7 to 0.8 us, so
+``pdl`` stays off there.
 
 The kernel reads neither the indexer nor its K cache, so it is the same for the specs with an FP8 and an MXFP4 indexer
 K cache: one compile per device serves both, and ``config`` (default: DS-V4-Flash) only has to be a supported spec.
@@ -105,28 +109,34 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def _fn(device: torch.device, g: int):
+def _fn(device: torch.device, g: int, pdl: bool = False):
     from . import tail_attention as TA
 
-    key = (_device_index(device), g)
+    key = (_device_index(device), g, pdl)
     with _lock:
         if key not in _compiled:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "spec_dsa tail attention: compile (precompile) before CUDA-graph capture"
                 )
-            _compiled[key] = TA.compile_tail_attention(TA.TailAttention(g))
+            _compiled[key] = TA.compile_tail_attention(TA.TailAttention(g, pdl=pdl))
         return _compiled[key]
 
 
-def precompile(device: torch.device, batch_size: int, config: SpecDsaConfig | None = None) -> None:
+def precompile(
+    device: torch.device,
+    batch_size: int,
+    config: SpecDsaConfig | None = None,
+    pdl: bool = False,
+) -> None:
     """Compile the tail attention kernel of ``batch_size`` rows on ``device``.
 
-    The compiled kernel serves every batch size with the same cluster size and both indexer K dtypes. Must run outside
-    CUDA-graph capture; ``run_attention`` compiles on first use otherwise.
+    The compiled kernel serves every batch size with the same cluster size and both indexer K dtypes; the launch
+    variant (``pdl``) is part of the compile. Must run outside CUDA-graph capture; ``run_attention`` compiles on first
+    use otherwise.
     """
     supported_spec(config)
-    _fn(device, _cluster_size(batch_size))
+    _fn(device, _cluster_size(batch_size), pdl)
 
 
 def _require(ok: bool, what: str, t: torch.Tensor) -> None:
@@ -214,6 +224,7 @@ def run_attention(
     softmax_scale: float | None = None,
     *,
     config: SpecDsaConfig | None = None,
+    pdl: bool = False,
 ) -> None:
     """Launch the tail attention on the current stream (see the module docstring for the contract).
 
@@ -229,6 +240,8 @@ def run_attention(
         out: bfloat16 [B, 64 * 512] output.
         softmax_scale: attention softmax scale (default: ``1 / sqrt(kv_dim)`` of the spec).
         config: the spec (default: DS-V4-Flash); either indexer K dtype: the launch is the same.
+        pdl: launch with the programmatic dependent launch attribute: only behind a kernel that triggers the dependent
+            launch early (``topk_multicta_op.run(trigger=True)``), see the module docstring.
     """
     config = supported_spec(config)
     if topk.dim() != 2:
@@ -240,7 +253,7 @@ def run_attention(
     _check_arguments(config, b, topk, q_att, swa_pool, bt_swa, c_pool, bt_c, kv_lens, sinks, out)
     if softmax_scale is None:
         softmax_scale = config.default_softmax_scale
-    fn = _fn(q_att.device, g)
+    fn = _fn(q_att.device, g, pdl)
     fn(
         q_att.view(torch.uint8).view(b, config.attn_heads, config.kv_dim),
         swa_pool.view(torch.uint8).view(-1, config.kv_dim),
@@ -272,6 +285,7 @@ def run_hybrid(
     *,
     config: SpecDsaConfig | None = None,
     ctx_lens: torch.Tensor | None = None,
+    pdl: bool | None = None,
 ) -> None:
     """The decode chain with K3 + K4 + K4b replaced: ``k1_logits_fn()``, the top-K stage (fills ``topk``), then K4'.
 
@@ -282,13 +296,25 @@ def run_hybrid(
     ask it with the host lengths of the step); keep the production top-K as ``topk_fn`` for the other batches. Compile
     both kernels (``precompile`` here and ``topk_multicta_op.precompile``) before a CUDA-graph capture.
 
+    ``pdl`` (default: on with the multi-CTA top-K, off with a ``topk_fn``): the multi-CTA top-K triggers the dependent
+    launch after its stream phase and the tail attention is launched with the programmatic attribute, so that its
+    prologue overlaps the end of the top-K kernel (the results are the same). Precompile both kernels with the same
+    value (``topk_multicta_op.precompile(..., trigger=pdl)``, ``precompile(..., pdl=pdl)``) before a CUDA-graph capture.
+    ``pdl=True`` with a ``topk_fn`` raises ValueError.
+
     The arguments of the tail attention and ``config`` are those of ``run_attention``.
     """
     if topk_fn is None and ctx_lens is None:
         raise ValueError("run_hybrid without a topk_fn needs ctx_lens (int32 [B] on the device)")
+    if pdl and topk_fn is not None:
+        raise ValueError(
+            "pdl needs the multi-CTA top-K (topk_fn=None): a top-K kernel that never triggers early only loses time"
+        )
+    if pdl is None:
+        pdl = topk_fn is None
     logits = k1_logits_fn()
     if topk_fn is None:
-        topk_multicta_op.run(logits, topk, ctx_lens, config=config)
+        topk_multicta_op.run(logits, topk, ctx_lens, config=config, trigger=pdl)
     else:
         topk_fn(logits)
     run_attention(
@@ -303,4 +329,5 @@ def run_hybrid(
         out,
         softmax_scale,
         config=config,
+        pdl=pdl,
     )

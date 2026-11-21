@@ -528,12 +528,12 @@ def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatc
         calls.append("k1")
         return logits
 
-    def fake_topk(lg, topk, ctx_lens, *, config=None):
+    def fake_topk(lg, topk, ctx_lens, *, config=None, trigger=False):
         assert lg is logits and ctx_lens is ctx, (
             "the top-K stage gets the logits of the K1 stage and ctx_lens"
         )
         assert topk is args["topk"]
-        calls.append(("multicta", config))
+        calls.append(("multicta", config, trigger))
 
     def fake_attention(*a, **kw):
         calls.append(("attention", a, kw))
@@ -542,10 +542,11 @@ def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatc
     monkeypatch.setattr(tail_op, "run_attention", fake_attention)
     names = ("topk", "q_att", "swa_pool", "bt_swa", "c_pool", "bt_c", "kv_lens", "sinks", "out")
     tail_op.run_hybrid(k1, None, *(args[n] for n in names), 0.125, config=SPEC, ctx_lens=ctx)
-    assert calls[:2] == ["k1", ("multicta", SPEC)] and len(calls) == 3
+    # the multi-CTA top-K triggers the dependent launch and the tail attention launches programmatically by default
+    assert calls[:2] == ["k1", ("multicta", SPEC, True)] and len(calls) == 3
     _, a, kw = calls[2]
     assert len(a) == 10 and all(x is args[n] for x, n in zip(a, names)) and a[9] == 0.125
-    assert kw == {"config": SPEC}
+    assert kw == {"config": SPEC, "pdl": True}
 
 
 def test_run_hybrid_without_a_top_k_function_needs_ctx_lens(monkeypatch):
@@ -787,7 +788,7 @@ def test_one_compile_per_cluster_size(monkeypatch):
     assert sorted(g for g, _ in compiles) == sorted(CLUSTER_SIZES) and not any(
         f for _, f in compiles
     )
-    assert {(d, g) for (d, g, f) in op._compiled} == {
+    assert {(d, g) for (d, g, f, t) in op._compiled} == {
         (torch.cuda.current_device(), g) for g in CLUSTER_SIZES
     }
     for b in range(1, MAX_ROWS + 1):
@@ -1054,8 +1055,9 @@ def test_run_hybrid_with_the_multicta_top_k_in_a_cuda_graph():
             ctx_lens=ctx,
         )
 
-    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4)
-    op.precompile(torch.device("cuda"), batch, SPEC_FP4)
+    # the default variants of run_hybrid with the multi-CTA top-K are the programmatic ones
+    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True)
+    op.precompile(torch.device("cuda"), batch, SPEC_FP4, trigger=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         hybrid()
@@ -1076,3 +1078,142 @@ def test_run_hybrid_with_the_multicta_top_k_in_a_cuda_graph():
     torch.cuda.synchronize()
     _check(drows2, topk)
     T._check_rows({**inp, "topk": topk}, out, "realistic")
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# programmatic dependent launch: the top-K triggers after its stream phase, the tail attention launches with it
+
+
+def test_precompile_and_run_take_the_trigger_flag():
+    op = _op()
+    for fn in (op.precompile, op.run):
+        p = inspect.signature(fn).parameters["trigger"]
+        assert p.default is False and p.kind is not p.POSITIONAL_ONLY
+
+
+def test_run_hybrid_pdl_needs_the_multicta_top_k(monkeypatch):
+    """pdl=True with the caller's top-K kernel is refused before any stage runs (that kernel never triggers early)."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
+
+    args = _stub_hybrid_args(3)
+    called = []
+    monkeypatch.setattr(tail_op, "run_attention", lambda *a, **k: called.append("attention"))
+    names = ("topk", "q_att", "swa_pool", "bt_swa", "c_pool", "bt_c", "kv_lens", "sinks", "out")
+    with pytest.raises(ValueError, match="pdl needs the multi-CTA top-K"):
+        tail_op.run_hybrid(
+            lambda: called.append("k1"), lambda lg: called.append("topk"),
+            *(args[n] for n in names), pdl=True,
+        )  # fmt: skip
+    assert called == [], "refused before any stage ran"
+
+
+@pytest.mark.parametrize("pdl, expected", [(None, True), (True, True), (False, False)])
+def test_run_hybrid_pdl_selects_the_launch_variants_of_both_kernels(monkeypatch, pdl, expected):
+    """With the multi-CTA top-K ``pdl`` (default: on) makes it trigger the dependent launch and launches the tail
+    attention with the programmatic attribute; off, both are plain launches."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
+
+    op = _op()
+    calls = []
+    args = _stub_hybrid_args(3)
+    monkeypatch.setattr(
+        op,
+        "run",
+        lambda lg, topk, ctx, *, config=None, trigger=False: calls.append(("topk", trigger)),
+    )
+    monkeypatch.setattr(
+        tail_op, "run_attention", lambda *a, pdl=False, **k: calls.append(("attention", pdl))
+    )
+    names = ("topk", "q_att", "swa_pool", "bt_swa", "c_pool", "bt_c", "kv_lens", "sinks", "out")
+    kw = {} if pdl is None else {"pdl": pdl}
+    tail_op.run_hybrid(lambda: object(), None, *(args[n] for n in names), ctx_lens=object(), **kw)
+    assert calls == [("topk", expected), ("attention", expected)]
+
+
+@requires_b200
+def test_one_compile_per_cluster_size_and_trigger(monkeypatch):
+    """The trigger is part of the compile: the 4 cluster sizes compile once for each value, none for a second pass."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import topk_multicta as TM
+
+    op = _op()
+    monkeypatch.setattr(op, "_compiled", {})
+    compiles = []
+    real = TM.compile_topk_multicta
+    monkeypatch.setattr(
+        TM, "compile_topk_multicta", lambda k: compiles.append((k.g, k.trigger)) or real(k)
+    )
+    dev = torch.device("cuda")
+    for b in range(1, MAX_ROWS + 1):
+        op.precompile(dev, b)
+        op.precompile(dev, b, SPEC_FP4, trigger=True)
+    for b in range(1, MAX_ROWS + 1):
+        op.precompile(dev, b, SPEC, trigger=True)
+    assert sorted(compiles) == sorted(
+        [(g, False) for g in CLUSTER_SIZES] + [(g, True) for g in CLUSTER_SIZES]
+    )
+
+
+@requires_b200
+@pytest.mark.parametrize("batch", [5, 9, 13, 17, MAX_ROWS])
+def test_run_hybrid_pdl_is_bit_equal_to_the_plain_launches(batch):
+    """K1 stand-in -> multi-CTA top-K (triggering) -> tail attention (programmatic launch) against the two plain
+    launches of the same kernels: the same selection and the same attention output, bit for bit (several launches in a
+    row)."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
+
+    inp, lg, ctx, drows = _hybrid_case(batch, 3, seed=2200 + batch)
+    runs = {}
+    for pdl in (False, True, False, True):
+        topk = torch.full((batch, K_TOP), -9, dtype=torch.int32, device="cuda")
+        out = T._new_out(batch)
+        tail_op.run_hybrid(
+            lambda: lg, None, topk, inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"],
+            inp["bt_c"], inp["kv_lens"], inp["sinks"], out, config=SPEC_FP4, ctx_lens=ctx, pdl=pdl,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        _check(drows, topk)
+        T._check_rows({**inp, "topk": topk}, out, "realistic")
+        runs.setdefault(pdl, []).append((topk.sort(dim=1).values, out))
+    for pdl, lst in runs.items():
+        for t2, o2 in lst[1:]:
+            assert torch.equal(t2, lst[0][0]) and torch.equal(o2, lst[0][1]), (
+                "deterministic per variant"
+            )
+    assert torch.equal(runs[True][0][0], runs[False][0][0])
+    assert torch.equal(runs[True][0][1], runs[False][0][1])
+
+
+@requires_b200
+def test_run_hybrid_pdl_in_a_cuda_graph():
+    """Both kernels compiled in their programmatic variants before the capture; the replay follows refilled buffers."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
+
+    op = _op()
+    batch = 16
+    inp, lg, ctx, drows = _hybrid_case(batch, 3, seed=2300)
+    topk = torch.full((batch, K_TOP), -9, dtype=torch.int32, device="cuda")
+    out = T._new_out(batch)
+
+    def hybrid():
+        tail_op.run_hybrid(
+            lambda: lg, None, topk, inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"],
+            inp["bt_c"], inp["kv_lens"], inp["sinks"], out, config=SPEC_FP4, ctx_lens=ctx, pdl=True,
+        )  # fmt: skip
+
+    tail_op.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True)
+    op.precompile(torch.device("cuda"), batch, SPEC_FP4, trigger=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        hybrid()
+    for seed in (2301, 2302):
+        ctx2 = ((inp["kv_lens"] // T.RATIO) // 2 + 1).to(torch.int32)
+        gen = torch.Generator().manual_seed(seed)
+        lg2, _, drows2 = _logits([_row("gauss", int(n), gen) for n in ctx2.tolist()])
+        lg.copy_(lg2)
+        ctx.copy_(ctx2)
+        topk.fill_(-9)
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check(drows2, topk)
+        T._check_rows({**inp, "topk": topk}, out, "realistic")

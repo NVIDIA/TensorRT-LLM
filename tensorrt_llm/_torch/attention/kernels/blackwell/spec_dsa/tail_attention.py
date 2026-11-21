@@ -35,9 +35,12 @@ cluster size of 3 to 5, but the clusters of 4 and 3 CTAs (27 to 45 rows) were me
 large-batch kernels and to leave only 0.5 to 0.8 % of the headroom to the accuracy bar of the real-capture gates (5
 CTAs leave about 9 %), so the constructor refuses them.
 
-The launch is a plain stream-ordered launch. The kernel waits for the grid dependency before it reads the selection
-(``griddepcontrol.wait``, a no-op in a plain launch), but the production top-K kernels never trigger a dependent launch
-early and the programmatic-launch attribute then costs 0.7 to 0.8 us at 8 to 16 rows (measured), so it is not used.
+The launch is a plain stream-ordered launch, or, with ``pdl``, a programmatic dependent launch: the kernel waits for
+the grid dependency before it reads the selection (``griddepcontrol.wait``, a no-op in a plain launch), so its CTAs can
+start while the top-K kernel still ranks its crossing bin (the multi-CTA top-K of ``topk_multicta`` triggers the launch
+after its stream phase) and run the barrier / TMEM setup, the Q load and the sliding-window tile in the shadow of that
+kernel. Behind a top-K kernel that never triggers early (the production one) the attribute only costs 0.7 to 0.8 us at
+8 to 16 rows (measured): ``pdl`` is for the multi-CTA top-K.
 """
 
 from __future__ import annotations
@@ -95,13 +98,14 @@ class TailAttention:
         g: CTAs (the cluster) per row, one of ``SUPPORTED_CLUSTER_SIZES``; another value raises ValueError.
         config: a spec of the DS-V4-Flash attention (default: DS-V4-Flash), with either indexer K dtype since the
             kernel does not read the indexer; a config with another attention raises NotImplementedError.
+        pdl: launch with the programmatic dependent launch attribute (see the module docstring).
 
     The compiled function takes, in order: ``q_att`` uint8 [B, 64, 512], ``swa_pool`` and ``c_pool`` uint8 [rows, 512],
     ``topk`` int32 [B, 512], ``kv_lens`` int32 [B], ``bt_swa`` / ``bt_c`` int32 [B, pages], ``sinks`` float32 [64],
     ``out`` bf16 [B, 64, 512], the softmax scale and the number of rows B.
     """
 
-    def __init__(self, g: int, config: SpecDsaConfig | None = None):
+    def __init__(self, g: int, config: SpecDsaConfig | None = None, pdl: bool = False):
         require_built_for(
             config, SPEC_FP4 if config is not None and config.index_k_dtype == "fp4" else SPEC
         )
@@ -110,6 +114,7 @@ class TailAttention:
                 f"cluster size {g} not supported (built and validated for {SUPPORTED_CLUSTER_SIZES})"
             )
         self.g = g
+        self.pdl = pdl
         self.base, self.extra = divmod(NTILES, g)
         self.nkv = self.base + (1 if self.extra else 0)  # most tiles of one CTA
         self.no_max = -(-NSLICE // g)  # most output slices of one CTA
@@ -186,6 +191,7 @@ class TailAttention:
             cluster=(self.g, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.pdl,
         )
 
     # ------------------------------------------------------------------------------------------------------------

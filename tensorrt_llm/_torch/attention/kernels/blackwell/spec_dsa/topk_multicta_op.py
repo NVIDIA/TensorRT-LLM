@@ -125,30 +125,37 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def _fn(device: torch.device, g: int, force_fallback: bool = False):
+def _fn(device: torch.device, g: int, force_fallback: bool = False, trigger: bool = False):
     """The compiled kernel of cluster size ``g`` on ``device``, compiled on first use (one compile per device, cluster
     size and variant). ``force_fallback`` selects the variant that runs the exact radix select on every row: a hook
-    for the tests, ``run`` never uses it."""
+    for the tests, ``run`` never uses it. ``trigger`` selects the variant that launches the dependent grid after the
+    stream phase (see ``run``)."""
     from . import topk_multicta as TM
 
-    key = (_device_index(device), g, force_fallback)
+    key = (_device_index(device), g, force_fallback, trigger)
     with _lock:
         if key not in _compiled:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "spec_dsa multi-CTA top-K: compile (precompile) before CUDA-graph capture"
                 )
-            _compiled[key] = TM.compile_topk_multicta(TM.TopkMultiCta(g, force_fallback))
+            _compiled[key] = TM.compile_topk_multicta(TM.TopkMultiCta(g, force_fallback, trigger))
         return _compiled[key]
 
 
-def precompile(device: torch.device, batch_size: int, config: SpecDsaConfig | None = None) -> None:
-    """Compile the kernel of ``batch_size`` rows on ``device`` (one compile per cluster size: 8, 6, 5 and 4 CTAs).
+def precompile(
+    device: torch.device,
+    batch_size: int,
+    config: SpecDsaConfig | None = None,
+    trigger: bool = False,
+) -> None:
+    """Compile the kernel of ``batch_size`` rows on ``device`` (one compile per cluster size, 8, 6, 5 and 4 CTAs, and
+    per ``trigger`` value: precompile the variant ``run`` will launch).
 
     Must run outside CUDA-graph capture; ``run`` compiles on first use otherwise.
     """
     supported_spec(config)
-    _fn(device, _cluster(batch_size))
+    _fn(device, _cluster(batch_size), False, trigger)
 
 
 def _require(ok: bool, what: str, t: torch.Tensor) -> None:
@@ -209,6 +216,7 @@ def run(
     ctx_lens: torch.Tensor,
     *,
     config: SpecDsaConfig | None = None,
+    trigger: bool = False,
 ) -> None:
     """Launch the exact top-512 selection on the current stream (see the module docstring for the contract).
 
@@ -223,7 +231,11 @@ def run(
         ctx_lens: int32 [B] on the device, the valid length of each row in positions (at most ``npad``); a row of
             at most 512 positions gets ``0 .. n - 1`` and -1 entries.
         config: the spec (default: DS-V4-Flash); either indexer K dtype: the launch is the same.
+        trigger: let the dependent grid launch as soon as the stream phase of every CTA is done (programmatic dependent
+            launch): set it only when the next kernel on the stream is launched with the programmatic attribute and
+            waits for this grid before it reads ``topk`` (``tail_op.run_attention(pdl=True)``); the results are the
+            same.
     """
     config = supported_spec(config)
     b = _check_arguments(config, logits, topk, ctx_lens)
-    _fn(logits.device, _cluster(b))(logits, ctx_lens, topk)
+    _fn(logits.device, _cluster(b), False, trigger)(logits, ctx_lens, topk)

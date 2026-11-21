@@ -38,7 +38,8 @@ differ between models live and how to add a model.
   that replaces the local-to-global mapping, the sparse MLA and its reduction kernel of the unfused chain. A cluster of
   5 CTAs serve a row (up to 26 rows, the clusters of 5 that fit one wave at one CTA per SM):
   every CTA runs the attention of its KV tiles with a local softmax maximum, the partial outputs are combined through
-  distributed shared memory. Plain stream-ordered launch (the production top-K kernel never triggers a dependent launch).
+  distributed shared memory. Plain stream-ordered launch behind the production top-K kernel (it never triggers a dependent
+  launch); behind the multi-CTA top-K (below) a programmatic dependent launch (`pdl`).
   Against the production FP4 chain (1M-token captures, B200) the fastest path per batch size is the megakernel up to 8 rows,
   the tail attention from 9 to 26 rows and the large-batch kernels above.
   The top-K stage of the hybrid can be the multi-CTA top-K (`tail_op.run_hybrid(..., topk_fn=None, ctx_lens=...)`, or
@@ -46,7 +47,10 @@ differ between models live and how to add a model.
   top-512 of the logits in one pass over the row. It is exact for every input (a row whose sampled threshold does not
   certify the fast path takes an in-kernel radix select) and is the faster top-K stage when every row has 16,384
   positions or more (`topk_multicta_op.is_profitable`; 64K tokens at the compression ratio 4); shorter rows are exact too
-  but win nothing, so the caller keeps its production top-K for them.
+  but win nothing, so the caller keeps its production top-K for them. Its CTAs launch the tail attention (programmatic
+  dependent launch, `trigger`) when their stream phase is done, so that the tail attention's prologue (barrier and TMEM
+  setup, query load, sliding-window tile) overlaps the end of the top-K kernel: `run_hybrid` does it by default with this
+  top-K (`pdl=None`), the results are the same.
 
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |

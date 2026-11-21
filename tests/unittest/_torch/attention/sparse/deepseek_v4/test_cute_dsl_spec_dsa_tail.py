@@ -336,7 +336,7 @@ def _new_out(batch):
 def _compiled_clusters():
     """Cluster sizes the op has compiled on the current device (one compile serves both specs)."""
     dev = torch.cuda.current_device()
-    return {g for (d, g) in _tail()._compiled if d == dev}
+    return {key[1] for key in _tail()._compiled if key[0] == dev}
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -630,7 +630,10 @@ def test_run_hybrid_calls_the_stages_in_order(monkeypatch):
     assert calls[:2] == ["k1", "topk"] and len(calls) == 3
     _, a, kw = calls[2]
     assert len(a) == 10 and all(x is args[n] for x, n in zip(a, names)) and a[9] == 0.125
-    assert kw == {"config": SPEC}
+    assert kw == {
+        "config": SPEC,
+        "pdl": False,
+    }  # a caller's top-K kernel never triggers early: no pdl
     # no config: the default of run_attention (the kernel is the same for both specs)
     calls.clear()
     tail.run_hybrid(k1, topk_fn, *(args[n] for n in names))
@@ -1002,3 +1005,132 @@ def test_run_hybrid_with_stand_in_stages(batch, attn):
     torch.cuda.synchronize()
     assert float(logits[0, 0]) == before + 1.0, "the K1 stage is part of the graph"
     _check_rows({**inp, "topk": topk}, out, attn)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# programmatic dependent launch (``pdl``): the tail attention starts while the top-K kernel still runs
+
+
+def test_precompile_and_run_attention_take_the_pdl_flag():
+    tail = _tail()
+    for fn in (tail.precompile, tail.run_attention):
+        p = inspect.signature(fn).parameters["pdl"]
+        assert p.default is False and p.kind is not p.POSITIONAL_ONLY
+    assert inspect.signature(tail.run_hybrid).parameters["pdl"].default is None
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_attention as TA
+
+    assert TA.TailAttention(CLUSTER, SPEC).pdl is False
+    assert TA.TailAttention(CLUSTER, SPEC, pdl=True).pdl is True
+
+
+def _slow_selector():
+    """A stand-in top-K kernel: it lets the dependent grid launch at once, sleeps ~400 us and only then copies the
+    selection into ``topk`` (a CuTe kernel, compiled once)."""
+    import cuda.bindings.driver as cuda_driver
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32
+
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import megakernel_lib as L
+
+    if "fn" in _SLOW:
+        return _SLOW["fn"]
+
+    @cute.kernel
+    def kern(src: cute.Tensor, dst: cute.Tensor):
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        cute.arch.griddepcontrol_launch_dependents()
+        for _ in cutlass.range(400, unroll=1):
+            L.nanosleep(Int32(1000))
+        j = tid
+        while j < Int32(K_TOP):
+            dst[row, j] = src[row, j]
+            j = j + Int32(32)
+
+    @cute.jit
+    def host(src: cute.Tensor, dst: cute.Tensor, stream: cuda_driver.CUstream):
+        kern(src, dst).launch(grid=(src.shape[0], 1, 1), block=(32, 1, 1), stream=stream)
+
+    rt = cute.runtime
+    sb = cute.sym_int()
+    fn = cute.compile(
+        host,
+        rt.make_fake_compact_tensor(Int32, (sb, K_TOP), stride_order=(1, 0)),
+        rt.make_fake_compact_tensor(Int32, (sb, K_TOP), stride_order=(1, 0)),
+        rt.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+    _SLOW["fn"] = fn
+    return fn
+
+
+_SLOW = {}
+
+
+@requires_b200
+@pytest.mark.parametrize("batch", [1, 9, 16, MAX_ROWS])
+def test_pdl_tail_attention_waits_for_a_slow_top_k(batch):
+    """The tail attention launched with the programmatic attribute starts while the top-K stage sleeps (it triggers the
+    dependent launch first), so a missing griddepcontrol.wait before the first read of the selection shows as an
+    attention over the -1 entries of the not yet written selection."""
+    inp = _make_case(_rows(batch, 5), seed=3100 + batch)
+    sel = inp["topk"].clone()
+    topk = torch.full_like(sel, -1)
+    inp = {**inp, "topk": topk}
+    slow = _slow_selector()
+    tail = _tail()
+    tail.precompile(torch.device("cuda"), batch, SPEC_FP4, pdl=True)
+    out = _new_out(batch)
+    for _ in range(4):  # the first launch of a kernel is slow to start: later ones race the sleeper
+        topk.fill_(-1)
+        out.zero_()
+        slow(sel, topk)
+        tail.run_attention(
+            topk, inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"], inp["bt_c"],
+            inp["kv_lens"], inp["sinks"], out, SM_SCALE, config=SPEC_FP4, pdl=True,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        assert torch.equal(topk, sel)
+        _check_rows(inp, out, "realistic")
+
+
+@requires_b200
+@pytest.mark.parametrize("attn", ATTN_MODES)
+@pytest.mark.parametrize("batch", [5, MAX_ROWS])
+def test_pdl_launch_behind_a_plain_kernel_is_bit_equal(batch, attn):
+    """The programmatic attribute behind a kernel that never triggers (here: a torch op) waits for its completion: the
+    same result as the plain launch, bit for bit."""
+    inp = _make_case(_rows(batch, 2), seed=3200 + batch, attn=attn)
+    plain = _new_out(batch)
+    _launch(inp, plain, SPEC_FP4, _scale_of(attn))
+    tail = _tail()
+    pdl_out = _new_out(batch)
+    junk = torch.empty(1 << 24, device="cuda")
+    junk.fill_(1.0)  # an unrelated kernel right before the launch
+    tail.run_attention(
+        inp["topk"], inp["q_att"], inp["swa_pool"], inp["bt_swa"], inp["c_pool"], inp["bt_c"],
+        inp["kv_lens"], inp["sinks"], pdl_out, _scale_of(attn), config=SPEC_FP4, pdl=True,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    assert torch.equal(plain, pdl_out)
+    _check_rows(inp, pdl_out, attn)
+
+
+@requires_b200
+def test_pdl_is_a_separate_compile_of_the_same_cluster_size(monkeypatch):
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_attention as TA
+
+    tail = _tail()
+    monkeypatch.setattr(tail, "_compiled", {})
+    compiles = []
+    real = TA.compile_tail_attention
+    monkeypatch.setattr(
+        TA, "compile_tail_attention", lambda k: compiles.append((k.g, k.pdl)) or real(k)
+    )
+    dev = torch.device("cuda")
+    for b in (1, 13, MAX_ROWS):
+        tail.precompile(dev, b)
+        tail.precompile(dev, b, SPEC_FP4, pdl=True)
+        tail.precompile(dev, b, SPEC, pdl=True)
+    assert sorted(compiles) == [(CLUSTER, False), (CLUSTER, True)]
