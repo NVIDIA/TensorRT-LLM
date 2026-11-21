@@ -337,6 +337,26 @@ def resolve_hf_torch_dtype(config):
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class SSMStatePoolGeometry:
+    """Target-declared storage for one recurrent-state head, before TP sharding.
+
+    ``shape`` excludes the slot, layer, and head axes. ``dtype`` describes the
+    backing tensor; ``layout`` identifies the encoding consumed by the target.
+    """
+
+    layout: str
+    dtype: torch.dtype
+    shape: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        if not self.layout or len(self.shape) != 2 or any(d <= 0
+                                                          for d in self.shape):
+            raise ValueError(
+                "SSM state geometry requires a layout and two positive dimensions"
+            )
+
+
 def resolve_ssm_cache_dtype(config):
     """Return the dtype to use for hybrid SSM-style state cache allocations.
 
@@ -607,6 +627,7 @@ class MambaKVCacheParams:
     dtype: torch.dtype  # config.torch_dtype
     mamba_ssm_cache_dtype: Optional[
         torch.dtype]  # quant_config.mamba_ssm_cache_dtype
+    ssm_state_pool_geometry: Optional[SSMStatePoolGeometry] = None
 
     def get_layer_masks(
         self,
@@ -650,15 +671,22 @@ class MambaKVCacheParams:
         ssm_dtype = (self.mamba_ssm_cache_dtype
                      if self.mamba_ssm_cache_dtype is not None else self.dtype)
         conv_bytes = conv_dim * (self.conv_kernel - 1) * conv_dtype.itemsize
-        ssm_bytes = (nheads * self.head_dim * self.state_size *
-                     ssm_dtype.itemsize)
+        geometry = self.ssm_state_pool_geometry
+        rows, columns = (geometry.shape if geometry is not None else
+                         (self.head_dim, self.state_size))
+        if geometry is not None and geometry.dtype != ssm_dtype:
+            raise ValueError(
+                "SSM state geometry dtype differs from the cache dtype")
+        ssm_bytes = nheads * rows * columns * ssm_dtype.itemsize
         state_bytes_per_layer = conv_bytes + ssm_bytes
         return state_bytes_per_layer
 
 
-def extract_mamba_kv_cache_params(config,
-                                  spec_config=None,
-                                  quant_config=None) -> MambaKVCacheParams:
+def extract_mamba_kv_cache_params(
+        config,
+        spec_config=None,
+        quant_config=None,
+        ssm_state_pool_geometry=None) -> MambaKVCacheParams:
     """Dispatch geometry extraction to the model's cache implementation."""
     if is_nemotron_hybrid(config):
         from ..modules.mamba.cache_manager import \
@@ -674,7 +702,9 @@ def extract_mamba_kv_cache_params(config,
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
-    return extract(config, spec_config=spec_config, quant_config=quant_config)
+    params = extract(config, spec_config=spec_config, quant_config=quant_config)
+    params.ssm_state_pool_geometry = ssm_state_pool_geometry
+    return params
 
 
 def build_mamba_kv_cache_params(config,

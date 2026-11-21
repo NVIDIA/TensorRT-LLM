@@ -1882,6 +1882,186 @@ class TestMambaEffectiveTpSize:
         ) == 16 * params.get_states_bytes_per_layer(helix)
 
 
+class TestInt8RecurrentStatePool:
+    """Target-declared recurrent storage reaches validation and memory budgeting."""
+
+    @staticmethod
+    def _geometry():
+        """A target-declared geometry of Qwen3.8-27B's size (260 rows of 128 bytes per head).
+        Built here: shared code and its tests do not import a target."""
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import SSMStatePoolGeometry
+
+        return SSMStatePoolGeometry(layout="test", dtype=torch.int8, shape=(260, 128))
+
+    @staticmethod
+    def _tp1() -> SimpleNamespace:
+        return SimpleNamespace(
+            tp_size=1, cp_size=1, enable_attention_dp=False, has_cp_helix=lambda: False
+        )
+
+    def test_budget_counts_the_int8_pool_bytes(self) -> None:
+        """Qwen3.8-27B's Gated-DeltaNet geometry: 48 value heads of 128x128, 16 key heads."""
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
+
+        def params(ssm_dtype, geometry=None):
+            return MambaKVCacheParams(
+                state_size=128,
+                conv_kernel=4,
+                num_heads=48,
+                n_groups=16,
+                head_dim=128,
+                mamba_layer_mask=[True],
+                target_full_attention_layer_mask=[False],
+                num_mamba_layers=1,
+                num_draft_layers=0,
+                dtype=torch.bfloat16,
+                mamba_ssm_cache_dtype=ssm_dtype,
+                ssm_state_pool_geometry=geometry,
+            )
+
+        conv_bytes = (48 * 128 + 2 * 16 * 128) * (4 - 1) * 2
+        int8 = params(torch.int8, self._geometry()).get_states_bytes_per_layer(self._tp1())
+        assert int8 == conv_bytes + 48 * 260 * 128
+        # Twice the bytes of an int8 state plus 4 bytes per row: the bf16 pool's size plus
+        # the scales.
+        bf16 = params(torch.bfloat16).get_states_bytes_per_layer(self._tp1())
+        assert int8 - bf16 == 48 * 128 * 4
+        # A generic int8 tensor does not imply the target's int16-code layout.
+        assert params(torch.int8).get_states_bytes_per_layer(self._tp1()) == (
+            conv_bytes + 48 * 128 * 128
+        )
+        for dtype in (torch.float16, torch.float32):
+            assert params(dtype).get_states_bytes_per_layer(self._tp1()) == (
+                conv_bytes + 48 * 128 * 128 * dtype.itemsize
+            )
+        with pytest.raises(ValueError, match="geometry dtype"):
+            params(torch.float32, self._geometry()).get_states_bytes_per_layer(self._tp1())
+
+    @staticmethod
+    def _model_config(target):
+        import torch
+
+        return SimpleNamespace(
+            pretrained_config=SimpleNamespace(model_type="qwen3_5_text"),
+            torch_dtype=torch.bfloat16,
+            modeling_v2_target=target,
+            quant_config=SimpleNamespace(),
+        )
+
+    def test_int8_is_refused_without_a_modeling_v2_target(self) -> None:
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        config = self._model_config(target=None)
+        with pytest.raises(ValueError, match="selected target to declare"):
+            validate_and_set_mamba_ssm_cache_dtype(config, "int8")
+        # Other dtypes are unaffected.
+        validate_and_set_mamba_ssm_cache_dtype(config, "bfloat16")
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            type("UnrelatedTarget", (), {}),
+            type(
+                "DecliningTarget",
+                (),
+                {"get_ssm_state_pool_geometry": classmethod(lambda cls, cfg, dtype: None)},
+            ),
+        ],
+    )
+    def test_int8_is_refused_for_an_unsupported_target(self, target) -> None:
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        with pytest.raises(ValueError, match="selected target to declare"):
+            validate_and_set_mamba_ssm_cache_dtype(self._model_config(target), "int8")
+
+    def test_int8_is_accepted_when_the_selected_target_declares_geometry(self) -> None:
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        geometry = self._geometry()
+        target = type(
+            "Target",
+            (),
+            {"get_ssm_state_pool_geometry": classmethod(lambda cls, cfg, dtype: geometry)},
+        )
+        config = self._model_config(target=target)
+        validate_and_set_mamba_ssm_cache_dtype(config, "int8")
+        assert config.quant_config.mamba_ssm_cache_dtype == torch.int8
+        assert config.ssm_state_pool_geometry == geometry
+
+    def test_loader_accepts_a_frozen_model_config(self) -> None:
+        """`ModelConfig.from_pretrained` returns a frozen config, and the layer-wise
+        benchmarks' `Runner.create_kv_cache_manager` passes it straight to the loader."""
+        import torch
+
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        config = ModelConfig(
+            pretrained_config=SimpleNamespace(model_type="qwen3_next", torch_dtype=torch.bfloat16)
+        )
+        config._frozen = True
+        validate_and_set_mamba_ssm_cache_dtype(config, "auto")
+        assert config.ssm_state_pool_geometry is None
+        validate_and_set_mamba_ssm_cache_dtype(config, "float32")
+        assert config.quant_config.mamba_ssm_cache_dtype == torch.float32
+
+    def test_loader_rejects_a_geometry_with_the_wrong_storage_dtype(self) -> None:
+        from dataclasses import replace
+
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        geometry = replace(self._geometry(), dtype=torch.float32)
+        target = type(
+            "Target",
+            (),
+            {"get_ssm_state_pool_geometry": classmethod(lambda cls, cfg, dtype: geometry)},
+        )
+        with pytest.raises(ValueError, match="geometry dtype"):
+            validate_and_set_mamba_ssm_cache_dtype(self._model_config(target), "int8")
+
+    def test_the_legacy_python_manager_refuses_int8(self) -> None:
+        """Only the V2 hybrid manager lays out the int8 pool; the guard runs before any
+        allocation."""
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            PythonMambaCacheManager,
+        )
+
+        with pytest.raises(NotImplementedError, match="only by the V2 Mamba cache manager"):
+            PythonMambaCacheManager(
+                d_state=128,
+                d_conv=4,
+                num_heads=48,
+                n_groups=16,
+                head_dim=128,
+                num_layers=1,
+                max_batch_size=1,
+                spec_state_size=0,
+                mapping=Mapping(),
+                dtype=torch.bfloat16,
+                ssm_cache_dtype=torch.int8,
+            )
+
+
 def _v2_model_config(num_layers=24, layer_types=None, sliding_window=None):
     """Minimal model config the V2 static estimators accept."""
     pretrained = SimpleNamespace(

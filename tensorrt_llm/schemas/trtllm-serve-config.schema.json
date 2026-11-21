@@ -3926,12 +3926,13 @@
         },
         "mamba_ssm_cache_dtype": {
           "default": "auto",
-          "description": "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config.",
+          "description": "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config. 'int8' is accepted only when the modeling_v2 target that claims the model declares its state-pool layout; it is refused otherwise.",
           "enum": [
             "auto",
             "float16",
             "bfloat16",
-            "float32"
+            "float32",
+            "int8"
           ],
           "title": "Mamba Ssm Cache Dtype",
           "type": "string"

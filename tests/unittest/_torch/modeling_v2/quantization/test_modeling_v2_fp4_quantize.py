@@ -50,6 +50,22 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(16, 256), dtype=torch.bfloat16, vec=16, swizzled=True),
         ),
     ),
+    # qwen3_5 (Qwen3.8-27B) quantizes its hidden-5120 activations for the W4A4
+    # projections, the MLP and lm_head, swizzled, at every step size.
+    "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1": (
+        Cell(
+            why="qwen3.8-27b decode: 1 token, hidden 5120, swizzled",
+            spec=dict(shape=(1, 5120), dtype=torch.bfloat16, vec=16, swizzled=True),
+        ),
+        Cell(
+            why="qwen3.8-27b, 41 rows at hidden 5120: a partial 128-row swizzle tile",
+            spec=dict(shape=(41, 5120), dtype=torch.bfloat16, vec=16, swizzled=True),
+        ),
+        Cell(
+            why="qwen3.8-27b prefill at max_num_tokens 8192, hidden 5120, swizzled",
+            spec=dict(shape=(8192, 5120), dtype=torch.bfloat16, vec=16, swizzled=True),
+        ),
+    ),
     "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen3.8 decode: 1 token, hidden 2560, linear -- its routed-expert input",

@@ -4896,6 +4896,8 @@ def _create_kv_cache_manager(
             config,
             spec_config=spec_config,
             quant_config=quant_config,
+            ssm_state_pool_geometry=getattr(_model_config,
+                                            "ssm_state_pool_geometry", None),
         )
         mamba_layer_mask, full_attention_layer_mask = (
             _get_mamba_cache_layer_masks(
@@ -4925,6 +4927,8 @@ def _create_kv_cache_manager(
             # dtype policy from the model config when it composes the FP4
             # MLA cache layout (NVFP4 KV cache).
             kda_extra_kwargs["pretrained_config"] = config
+            kda_extra_kwargs[
+                "ssm_state_pool_geometry"] = mamba_params.ssm_state_pool_geometry
         if is_glm5_next:
             from ..attention.backends.sparse.glm_kpool import \
                 glm_kpool_index_state_dim
@@ -5016,6 +5020,8 @@ def _create_kv_cache_manager(
             config,
             spec_config=spec_config,
             quant_config=quant_config,
+            ssm_state_pool_geometry=getattr(_model_config,
+                                            "ssm_state_pool_geometry", None),
         )
         mamba_layer_mask, full_attention_layer_mask = (
             _get_mamba_cache_layer_masks(
@@ -5044,6 +5050,8 @@ def _create_kv_cache_manager(
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
             # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
+            mamba_manager_extra_kwargs[
+                "ssm_state_pool_geometry"] = mamba_params.ssm_state_pool_geometry
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -5089,6 +5097,8 @@ def _create_kv_cache_manager(
             config,
             spec_config=spec_config,
             quant_config=quant_config,
+            ssm_state_pool_geometry=getattr(_model_config,
+                                            "ssm_state_pool_geometry", None),
         )
         mamba_layer_mask, full_attention_layer_mask = (
             _get_mamba_cache_layer_masks(
@@ -5105,6 +5115,8 @@ def _create_kv_cache_manager(
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
             # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
+            mamba_manager_extra_kwargs[
+                "ssm_state_pool_geometry"] = mamba_params.ssm_state_pool_geometry
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
                 and model_engine is not None):

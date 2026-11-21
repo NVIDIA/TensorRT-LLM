@@ -506,6 +506,7 @@ def _get_local_mamba_cache_layout(
         model_config.pretrained_config,
         spec_config=spec_config,
         quant_config=model_config.quant_config,
+        ssm_state_pool_geometry=getattr(model_config, "ssm_state_pool_geometry", None),
     )
     mamba_layer_mask, full_attention_layer_mask = params.get_layer_masks(
         is_draft=is_draft,

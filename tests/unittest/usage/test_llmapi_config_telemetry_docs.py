@@ -305,6 +305,7 @@ def test_golden_manifest_uses_compact_semantic_policies():
         "float16",
         "bfloat16",
         "float32",
+        "int8",
     ]
     assert enum_row["capture_policy"] == "enum[PrefillCudaGraphBackend]"
     assert enum_row["allowed_values"] == ["disabled", "piecewise", "breakable"]
