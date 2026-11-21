@@ -866,6 +866,7 @@ def test_fp4_block_scale_moe_decode_tuning(
     """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
     rank; otherwise every rank tunes on its own over the power-of-2 ladder."""
     from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
 
     config = FP4BlockScaleMoERunner.get_tuning_config(4, decode_tuning=decode_tuning)
@@ -884,14 +885,16 @@ def test_fp4_block_scale_moe_decode_tuning(
         assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
 
     # Only the declaring model's tuning cache key carries the flag, and with it do_finalize (finalized and
-    # un-finalized calls run different kernels); the expert shard is keyed only where each rank tunes alone.
-    monkeypatch.delenv("TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION", raising=False)
+    # un-finalized calls run different kernels); the routing the tactics are timed on follows.
+    monkeypatch.setattr(trtllm_gen_custom_ops, "_dummy_distribution", lambda: "random")
     for do_finalize in (False, True):
         runner = FP4BlockScaleMoERunner(
             512, 10, None, None, 512, 0, 64, None, 1, do_finalize, 0, decode_tuning=decode_tuning
         )
-        assert runner.unique_id() == (10, 512, 64, 0, 512, False, "random") + (
-            (True, do_finalize) if decode_tuning else (0,)
+        assert runner.unique_id() == (
+            (10, 512, 64, 0)
+            + ((True, do_finalize) if decode_tuning else ())
+            + (512, False, 1, None, None, "random")
         )
 
 

@@ -19,6 +19,7 @@ import itertools
 import json
 import math
 import os
+import pathlib
 import pickle
 import re
 import statistics
@@ -47,6 +48,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.utils import (deep_gemm_jit_warmup_buckets,
                                        get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
+from tensorrt_llm._utils import is_blackwell_datacenter
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -2083,11 +2085,12 @@ def test_trtllm_gen_moe_dummy_topk_local_experts_less_than_topk(
     EP64 -> 2 local experts per rank, attention-DP => use_dp=True).
     Dummy rows keep the production shape: top_k distinct ids per row, all
     local experts present, remaining slots padded with out-of-shard ids."""
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import \
         prepare_dummy_topk_and_hook
 
-    monkeypatch.setenv("TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION",
-                       distribution)
+    monkeypatch.setattr(trtllm_gen_custom_ops, "_dummy_distribution",
+                        lambda: distribution)
     num_tokens, top_k = 8, 4
     num_experts, local_num_experts, local_expert_offset = 128, 2, 6
     hidden_states = torch.randn(num_tokens,
@@ -2228,14 +2231,11 @@ def test_fp4_moe_tunes_on_dummy_topk_and_runs_on_runtime_topk(monkeypatch):
 
 _FP8_MOE_OP = "trtllm::fp8_block_scale_moe_runner"
 _needs_trtllm_gen_moe = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    not is_blackwell_datacenter(),
     reason="TRTLLM-Gen MoE kernels need SM100 or SM103")
 
 
-def _fp8_block_scale_moe(num_experts: int,
-                         local_expert_offset: int = 0,
-                         use_dp: bool = False) -> None:
+def _fp8_block_scale_moe(num_experts: int, use_dp: bool = False) -> None:
     """One pre-routed TRTLLM-Gen FP8 block-scale MoE call on an 8-expert shard of random weights."""
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import \
         fp8_block_scale_moe_runner
@@ -2244,11 +2244,11 @@ def _fp8_block_scale_moe(num_experts: int,
     tokens, hidden, inter, top_k, local = 64, 512, 512, 2, 8
     gen = torch.Generator(device="cuda").manual_seed(0)
 
-    def fp8(*shape):
+    def fp8(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, device="cuda",
                            generator=gen).to(torch.float8_e4m3fn)
 
-    def scale(*shape):
+    def scale(*shape: int) -> torch.Tensor:
         return torch.rand(*shape, device="cuda", generator=gen) + 0.5
 
     weights, ids = torch.rand(tokens, num_experts, device="cuda",
@@ -2267,7 +2267,7 @@ def _fp8_block_scale_moe(num_experts: int,
                                None,
                                None,
                                inter,
-                               local_expert_offset,
+                               0,
                                local,
                                None,
                                int(RoutingMethodType.Renormalize),
@@ -2278,32 +2278,30 @@ def _fp8_block_scale_moe(num_experts: int,
 
 @_needs_trtllm_gen_moe
 def test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart(
-        tmp_path, monkeypatch):
-    """A tactics file reused under another EP size, expert shard, attention-DP mode or dummy distribution
-    re-tunes that configuration instead of serving it another one's tactics; the first one still reuses its own."""
+        tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tactics file reused under another EP size, attention-DP mode or dummy distribution re-tunes that
+    configuration instead of serving it another one's tactics; the first one still reuses its own."""
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops
+
     tuner = AutoTuner.get()
     path = str(tmp_path / "tactics.json")
 
-    def profiled(num_experts=8,
-                 use_dp=False,
-                 distribution="random",
-                 local_expert_offset=0) -> int:
-        monkeypatch.setenv("TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION",
-                           distribution)
+    def profiled(num_experts: int = 8,
+                 use_dp: bool = False,
+                 distribution: str = "random") -> int:
+        monkeypatch.setattr(trtllm_gen_custom_ops, "_dummy_distribution",
+                            lambda: distribution)
         tuner.clear_cache()
         tuner.reset_statistics()
         # One bucket per pass: the key is the one a full sweep writes.
         with autotune(cache_path=path, skip_dynamic_tuning_buckets=True):
-            _fp8_block_scale_moe(num_experts,
-                                 local_expert_offset=local_expert_offset,
-                                 use_dp=use_dp)
+            _fp8_block_scale_moe(num_experts, use_dp=use_dp)
         return tuner.stats.tuned_op_profiled_configs.get(_FP8_MOE_OP, 0)
 
     try:
         assert profiled() > 0
-        for other in (dict(num_experts=16),
-                      dict(num_experts=16, local_expert_offset=8),
-                      dict(use_dp=True), dict(distribution="balanced")):
+        for other in (dict(num_experts=16), dict(use_dp=True),
+                      dict(distribution="balanced")):
             assert profiled(**other) > 0, f"{other} took another's tactics"
         assert profiled() == 0, "the first configuration re-tuned"
     finally:

@@ -14,8 +14,9 @@
 # limitations under the License.
 
 import os
+from abc import abstractmethod
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -69,20 +70,36 @@ _BALANCED = "balanced"
 _RANDOM = "random"
 
 
+@cache
 def _dummy_distribution() -> str:
+    """The dummy distribution, read once: every runner keys on it."""
     return os.environ.get(_MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV, _RANDOM).lower()
 
 
-def _dummy_routing_key(num_experts: int, local_expert_offset: int, use_dp: bool,
-                       tuning_config: TuningConfig) -> Tuple:
-    """Autotuner cache-key fields for the dummy routing a tactic is timed on (see the comment above).
+def _routing_key(num_experts: int, use_dp: bool, routing_method_type: int,
+                 n_group: Optional[int], topk_group: Optional[int]) -> Tuple:
+    """Autotuner cache-key fields for the routing a tactic is timed on (see the comment above).
 
-    The expert shard is keyed only where each rank tunes alone: ranks that share one rank's tactics need equal keys."""
-    key = (num_experts, use_dp, _dummy_distribution())
-    if (tuning_config.distributed_tuning_strategy ==
-            DistributedTuningStrategy.INDEPENDENT):
-        key += (local_expert_offset, )
-    return key
+    The expert shard is not one: every shard is timed on the same routing pattern, so EP ranks keep equal keys."""
+    # Plain ints: the key is compared as a string, and a runner built in Python can get a RoutingMethodType
+    # where the op's own calls get its int value.
+    groups = tuple(None if group is None else int(group)
+                   for group in (n_group, topk_group))
+    return (int(num_experts), bool(use_dp), int(routing_method_type), *groups,
+            _dummy_distribution())
+
+
+class _TrtllmGenMoERunner(TunableRunner):
+    """A TRTLLM-Gen MoE runner, keyed by its kernel and by the routing its tactics are timed on."""
+
+    routing_key: Tuple
+
+    @abstractmethod
+    def _kernel_key(self) -> Tuple:
+        """The members that decide which kernels and tactics are valid."""
+
+    def unique_id(self) -> Tuple:
+        return self._kernel_key() + self.routing_key
 
 
 def _select_explicit_fallback_tactic(
@@ -458,7 +475,7 @@ class FP4BlockScaleMoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
-class FP4BlockScaleMoERunner(TunableRunner):
+class FP4BlockScaleMoERunner(_TrtllmGenMoERunner):
 
     runner_dict = dict()
     tuning_config = None
@@ -507,14 +524,13 @@ class FP4BlockScaleMoERunner(TunableRunner):
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp,
             decode_tuning=decode_tuning)
-        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
-                                              use_dp, self.tuning_config)
+        self.routing_key = _routing_key(num_experts, use_dp,
+                                        routing_method_type, n_group,
+                                        topk_group)
 
-    # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity and the dummy routing the tactics are timed on
-    def unique_id(self):
+    def _kernel_key(self) -> Tuple:
         key = (self.top_k, self.intermediate_size, self.local_num_experts,
-               self.act_type) + self.routing_key
+               self.act_type)
         # Without decode tuning the key is the base tuple. With it, finalized and un-finalized calls run
         # different kernels (decode_moe.select), so they are tuned apart.
         return key + (True, self.do_finalize) if self.decode_tuning else key
@@ -1320,7 +1336,7 @@ class FP8BlockScaleMoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
-class FP8BlockScaleMoERunner(TunableRunner):
+class FP8BlockScaleMoERunner(_TrtllmGenMoERunner):
 
     runner_dict = dict()
     fallback_tactic_dict = dict()
@@ -1363,15 +1379,13 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
-        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
-                                              use_dp, self.tuning_config)
+        self.routing_key = _routing_key(num_experts, use_dp,
+                                        routing_method_type, n_group,
+                                        topk_group)
 
-    # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity and the dummy routing the tactics are timed on
-    def unique_id(self):
+    def _kernel_key(self) -> Tuple:
         return (self.top_k, self.num_fused_shared_experts,
-                self.intermediate_size, self.local_num_experts,
-                self.act_type) + self.routing_key
+                self.intermediate_size, self.local_num_experts, self.act_type)
 
     def get_runner(self):
         instance_key = ()
@@ -1686,7 +1700,7 @@ class MxE4m3MxE2m1BlockScaleMoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
-class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
+class MxE4m3MxE2m1BlockScaleMoERunner(_TrtllmGenMoERunner):
 
     runner_dict = dict()
     tuning_config = None
@@ -1724,12 +1738,11 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
-        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
-                                              use_dp, self.tuning_config)
+        self.routing_key = _routing_key(num_experts, use_dp,
+                                        routing_method_type, n_group,
+                                        topk_group)
 
-    # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity and the dummy routing the tactics are timed on
-    def unique_id(self):
+    def _kernel_key(self) -> Tuple:
         return (
             self.top_k,
             self.intermediate_size,
@@ -1737,7 +1750,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ) + self.routing_key
+        )
 
     def get_runner(self):
         instance_key = (self.act_type, True)
@@ -2028,7 +2041,7 @@ class E4m3MxE2m1BlockScaleMoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
-class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
+class E4m3MxE2m1BlockScaleMoERunner(_TrtllmGenMoERunner):
 
     runner_dict = dict()
     tuning_config = None
@@ -2066,12 +2079,11 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
-        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
-                                              use_dp, self.tuning_config)
+        self.routing_key = _routing_key(num_experts, use_dp,
+                                        routing_method_type, n_group,
+                                        topk_group)
 
-    # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity and the dummy routing the tactics are timed on
-    def unique_id(self):
+    def _kernel_key(self) -> Tuple:
         return (
             self.top_k,
             self.intermediate_size,
@@ -2079,7 +2091,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ) + self.routing_key
+        )
 
     def get_runner(self):
         instance_key = (self.act_type, False)
@@ -2352,7 +2364,7 @@ class Bf16MxE2m1BlockScaleMoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
-class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
+class Bf16MxE2m1BlockScaleMoERunner(_TrtllmGenMoERunner):
 
     runner_dict = dict()
     tuning_config = None
@@ -2390,12 +2402,11 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
-        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
-                                              use_dp, self.tuning_config)
+        self.routing_key = _routing_key(num_experts, use_dp,
+                                        routing_method_type, n_group,
+                                        topk_group)
 
-    # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity and the dummy routing the tactics are timed on
-    def unique_id(self):
+    def _kernel_key(self) -> Tuple:
         return (
             self.top_k,
             self.intermediate_size,
@@ -2403,7 +2414,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ) + self.routing_key
+        )
 
     def get_runner(self):
         instance_key = (self.act_type, )
@@ -2664,7 +2675,7 @@ class Bf16MoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
-class Bf16MoERunner(TunableRunner):
+class Bf16MoERunner(_TrtllmGenMoERunner):
     """Unquantized BF16 x BF16 TRTLLM-Gen MoE.
 
     The weights are in the shuffled BlockMajorK layout
@@ -2703,12 +2714,13 @@ class Bf16MoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
-        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
-                                              use_dp, self.tuning_config)
+        self.routing_key = _routing_key(num_experts, use_dp,
+                                        routing_method_type, n_group,
+                                        topk_group)
 
-    def unique_id(self) -> Tuple:
+    def _kernel_key(self) -> Tuple:
         return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type) + self.routing_key
+                self.act_type)
 
     def get_runner(self) -> torch.ScriptObject:
         instance_key = (self.act_type, )
@@ -2951,7 +2963,7 @@ class FP8FP4BlockScaleMoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
-class FP8FP4BlockScaleMoERunner(TunableRunner):
+class FP8FP4BlockScaleMoERunner(_TrtllmGenMoERunner):
 
     runner_dict = dict()
     tuning_config = None
@@ -2987,16 +2999,17 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
-        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
-                                              use_dp, self.tuning_config)
+        self.routing_key = _routing_key(num_experts, use_dp,
+                                        routing_method_type, n_group,
+                                        topk_group)
 
-    def unique_id(self):
+    def _kernel_key(self) -> Tuple:
         return (
             self.top_k,
             self.intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ) + self.routing_key
+        )
 
     def get_runner(self):
         instance_key = (self.act_type, )

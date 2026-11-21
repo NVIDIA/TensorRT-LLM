@@ -1420,10 +1420,15 @@ def test_r1_autotuner_cache_is_inert(clear_autotuner_cache):
         for off, n, wa in layouts:
             run(off, n, wa, _R1_TOKENS[-1])
             profiled.append(tuner.stats.tuned_op_profiled_configs.get(op, 0))
-    # What the tuner's key separates, counted rather than timed: local_num_experts
-    # and, as each rank tunes its own shard, local_expert_offset — every layout sweeps.
-    assert all(b > a for a, b in zip(profiled, profiled[1:])), (
-        f"a layout reused another layout's tuning: {profiled}"
+    # What the tuner's key does and does not separate, counted rather than
+    # timed: switching from local_num_experts 256 to 64 forces a fresh sweep,
+    # while the three remaining local_expert_offsets profile nothing at all —
+    # they hit the entries the offset-0 window just wrote.
+    assert profiled[1] > profiled[0], (
+        f"local_num_experts 64 reused the 256-expert tuning: {profiled}"
+    )
+    assert profiled[2:] == [profiled[1]] * 3, (
+        f"a 64-wide window at a nonzero local_expert_offset re-profiled: {profiled}"
     )
     keys = entries()
     assert keys, "autotune() recorded nothing for this op — nothing was warmed"
