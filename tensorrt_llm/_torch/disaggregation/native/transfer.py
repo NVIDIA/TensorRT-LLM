@@ -4827,7 +4827,7 @@ class RxSession(RxSessionBase):
                             task._kv_result_report_tokens.keys()
                             - task._writer_reports.keys()
                             - quiesced
-                            if task._legacy_published
+                            if task._legacy_published and task._kv_result_report_tokens
                             else task.status == TaskStatus.TRANSFERRING
                         )
                         for task in self._kv_tasks
@@ -4863,11 +4863,10 @@ class RxSession(RxSessionBase):
         if self._aux_expected_writers == 0:
             return False
         if self._terminal_status == SessionStatus.CANCELLED:
-            return bool(
-                self._kv_tasks[0]._kv_result_report_tokens.keys()
-                - self._aux_writer_reports
-                - self._legacy_quiesced_writers
-            )
+            tokens = self._kv_tasks[0]._kv_result_report_tokens
+            if not tokens:
+                return len(self._aux_writer_reports) < self._aux_expected_writers
+            return bool(tokens.keys() - self._aux_writer_reports - self._legacy_quiesced_writers)
         return (
             self._logical_outcomes.failed
             and len(self._aux_writer_reports) < self._aux_expected_writers

@@ -311,11 +311,6 @@ def test_cancelled_receive_retains_destinations_until_all_accessors_settle(
 
 
 @pytest.mark.parametrize("cause", ["user", "timeout"])
-@pytest.mark.xfail(
-    strict=True,
-    raises=_PrematureReuse,
-    reason="default Python receive retirement does not enforce physical ownership",
-)
 def test_default_receive_cancellation_retains_pending_destinations(
     monkeypatch: pytest.MonkeyPatch, cause: Literal["user", "timeout"]
 ) -> None:
