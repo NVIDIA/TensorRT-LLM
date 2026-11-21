@@ -93,7 +93,11 @@ def test_bitwise_stock_op(cell, case) -> None:
         for ctas in (1, 4, 8, 16, 32, 64):
             if ctas > 1 and batch * ctas > entry.sm_count(args[0].device):
                 continue
-            _same(op(*args, entry.prebuild(args[0].device), ctas), got, f"ctas_per_row={ctas}")
+            _same(
+                op(*args, workspace=entry.prebuild(args[0].device), ctas_per_row=ctas),
+                got,
+                f"ctas_per_row={ctas}",
+            )
 
 
 def test_outside_the_contract_the_override_declines() -> None:
@@ -238,7 +242,7 @@ def test_v3_adversarial_rows_bitwise(case, v) -> None:
                 if ctas > 1 and batch * ctas > entry.sm_count(args[0].device):
                     continue
                 _same(
-                    op(*args, entry.prebuild(args[0].device), ctas),
+                    op(*args, workspace=entry.prebuild(args[0].device), ctas_per_row=ctas),
                     ref,
                     f"{case} v={v} batch={batch} seed={seed} ctas={ctas}",
                 )
