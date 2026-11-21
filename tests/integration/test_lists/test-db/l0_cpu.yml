@@ -113,6 +113,9 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_modeling_v2_mtp_draft_moe.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
+  # The GLM TP8 routed-MoE kernel's synchronization source checks: AST reads of the
+  # kernel source against the DSL's primitives, no device.
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/moe/test_modeling_v2_cute_dsl_routed_moe_xc_sync.py
   # The GLM-5.3-Flash target's admission check and guided-decoding refusal, on fake requests,
   # and its step metadata's hooks (cpu_only, so the GPU stage's entry for the target's
   # directory deselects them).
