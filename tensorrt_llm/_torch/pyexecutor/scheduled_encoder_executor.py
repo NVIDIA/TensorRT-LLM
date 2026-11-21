@@ -11,7 +11,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -28,9 +28,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import host_profiler_context
 
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from .engine.model_setup import build_encoder_runner
-from .engine.runners.encoder import EncoderRunner, resolve_scheduled_encoder_args
-from .engine.runners.interface import ScheduledInputs
+from .engine.model_setup import build_encoder_runner, build_mm_encoder_runner
+from .engine.runners.encoder import resolve_scheduled_encoder_args
+from .engine.runners.interface import ScheduledInputs, ScheduledModelRunner
 from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .hang_detector import (
@@ -59,11 +59,15 @@ if TYPE_CHECKING:
     from .llm_request import ExecutorRequest
     from .model_loader import ModelLoader
 
-__all__ = ["ScheduledEncoderExecutor", "fit_batch", "prompt_cost"]
+__all__ = [
+    "MultimodalEmbeddingCompletion",
+    "PoolingCompletion",
+    "ScheduledEncoderExecutor",
+    "fit_batch",
+    "prompt_cost",
+]
 
-_MULTIMODAL_INPUT_ERROR = (
-    "Scheduled requests to a non-generation model cannot carry multimodal inputs."
-)
+_MULTIMODAL_INPUT_ERROR = "Requests to a pooling model cannot carry multimodal inputs."
 
 # One forward runs while the next is launched; a third waits for the first to be published.
 _MAX_IN_FLIGHT = 2
@@ -74,7 +78,6 @@ class _InFlight:
     """A launched batch whose forward the completion thread still has to wait for and publish."""
 
     requests: list[LlmRequest]
-    responses: list[tuple[int, LlmResponse]]
     done: torch.cuda.Event
     iteration: int
     host_start: float
@@ -107,6 +110,62 @@ def fit_batch(
     return len(items)
 
 
+class PoolingCompletion:
+    """Store each request's pooled row as its context logits, when the request asked for them."""
+
+    accepts_multimodal_inputs = False
+
+    def store(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        for request, row in zip(requests, outputs["logits"]):
+            if request.py_return_context_logits:
+                request.py_result.append_context_logits(row.unsqueeze(0) if row.ndim == 1 else row)
+
+    def retire(self, requests: list[LlmRequest]) -> None:
+        for request in requests:
+            request.py_result.drop_context_logits()
+
+
+class MultimodalEmbeddingCompletion:
+    """Export each request's multimodal embeddings, and its MRoPE positions, as CUDA IPC handles.
+
+    A request without multimodal items in the batch completes without a result. Only the rank
+    whose responses reach the frontend exports: an exported allocation stays alive until a
+    consumer opens and releases its handle, or ``retire`` consumes it.
+    """
+
+    accepts_multimodal_inputs = True
+
+    def __init__(self, *, exports: bool) -> None:
+        self._exports = exports
+
+    def store(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        if not self._exports:
+            return
+        metadata = outputs.get("mm_embedding_metadata")
+        mrope_position_ids = outputs.get("mrope_position_ids")
+        mrope_position_deltas = outputs.get("mrope_position_deltas")
+        for result, (request_index, embeddings, lengths) in enumerate(
+            zip(
+                outputs["mm_embedding_request_indices"],
+                outputs["mm_embeddings"],
+                outputs["mm_embedding_lengths"],
+                strict=True,
+            )
+        ):
+            py_result = requests[request_index].py_result
+            py_result.append_mm_embeddings(
+                embeddings, lengths, None if metadata is None else metadata[result]
+            )
+            if mrope_position_ids is not None and mrope_position_deltas is not None:
+                py_result.set_mrope_position(
+                    mrope_position_ids[result], mrope_position_deltas[result]
+                )
+
+    def retire(self, requests: list[LlmRequest]) -> None:
+        for request in requests:
+            request.py_result.release_exports()
+
+
 class ScheduledEncoderExecutor:
     """Serve scheduled requests to a non-generation model: queue, admission, batching, one forward.
 
@@ -116,12 +175,16 @@ class ScheduledEncoderExecutor:
     forwards are in flight, so the next batch is prepared and launched while the previous
     one runs, and a completion thread publishes each batch as soon as its forward finishes.
     A forward that fails on the device after its launch is not recoverable and ends the
-    loop like any other crash. Settings that only tune generation are ignored: the overlap
-    scheduler, chunked prefill, guided decoding, ``scheduler_config``, the waiting-queue
-    policy and the iteration-based batch waits. Iteration statistics and KV cache events
+    loop like any other crash. Requests wait in the queue that ``scheduler_config``'s
+    waiting-queue policy selects. Settings that only tune generation are ignored: the overlap
+    scheduler, chunked prefill, guided decoding, the rest of ``scheduler_config`` and the
+    iteration-based batch waits. Iteration statistics and KV cache events
     are always empty. With ``print_iter_log`` rank 0 logs one line per batch: its requests
     and prompt tokens, the requests still waiting when it launched, the host time from
     taking the batch to publishing it, and the GPU time of the forward.
+
+    A pooling model's runner pairs with ``PoolingCompletion``, a multimodal encoder's
+    with ``MultimodalEmbeddingCompletion``.
     """
 
     is_generation_model = False
@@ -129,8 +192,9 @@ class ScheduledEncoderExecutor:
 
     def __init__(
         self,
-        runner: EncoderRunner,
+        runner: ScheduledModelRunner,
         *,
+        completion: PoolingCompletion | MultimodalEmbeddingCompletion,
         model_loader: ModelLoader,
         llm_args: TorchLlmArgs,
         mapping: Mapping,
@@ -143,6 +207,9 @@ class ScheduledEncoderExecutor:
 
         Args:
             runner: The model's runner; every forward goes through its scheduled entry point.
+            completion: How a forward's outputs complete its requests; it fits the runner.
+                ``store`` attaches a forward's results before their responses are created;
+                ``retire`` withdraws them from requests that finish without their result.
             model_loader: The loader that loaded the model, cleaned up at shutdown.
             llm_args: The resolved arguments; the executor reads its timeouts, garbage
                 collection threshold and metrics switches.
@@ -153,6 +220,7 @@ class ScheduledEncoderExecutor:
             max_seq_len: The longest prompt a request may have.
         """
         self._runner = runner
+        self._completion = completion
         self._model_loader = model_loader
         self.dist = dist
         self.max_batch_size = max_batch_size
@@ -169,14 +237,22 @@ class ScheduledEncoderExecutor:
         self._gc_gen0_threshold = llm_args.garbage_collection_gen0_threshold
 
         self._hang_detector = HangDetector(on_detected=self._on_hang_detected)
+        scheduler_config = llm_args.scheduler_config
+        # The wait cap ages requests by rank 0's arrival stamps on rank 0's clock, so that
+        # every rank pops the same order.
+        aging = scheduler_config.waiting_queue_max_wait_s is not None
         self._request_queue = ExecutorRequestQueue(
             dist,
             max_batch_size,
             enable_iter_perf_stats=False,
             batch_wait_timeout_ms=llm_args.batch_wait_timeout_ms,
+            stamp_admission_times=aging,
         )
-        self._broadcaster = RequestBroadcaster(dist, self._hang_detector)
-        self._waiting_queue = create_waiting_queue()
+        self._broadcaster = RequestBroadcaster(dist, self._hang_detector, sync_clock=aging)
+        self._waiting_queue = create_waiting_queue(
+            scheduler_config.waiting_queue_policy,
+            max_wait_s=scheduler_config.waiting_queue_max_wait_s,
+        )
         self._error_budget = ErrorBudget()
         self._perf_manager = PerfMetricsManager(enabled=llm_args.return_perf_metrics)
         self._iter_log = llm_args.print_iter_log and dist.rank == 0
@@ -185,6 +261,12 @@ class ScheduledEncoderExecutor:
         self._last_staged: torch.cuda.Event | None = None
         self._completion_thread: threading.Thread | None = None
         self._completion_error: BaseException | None = None
+        # Ids of the launched, unpublished requests, and of those among them cancelled since;
+        # and ids whose cancellation was sent but not yet taken by the loop.
+        self._cancel_lock = threading.Lock()
+        self._launched_ids: set[int] = set()
+        self._cancelled_after_launch: set[int] = set()
+        self._cancel_sent: set[int] = set()
         self._response_channel = ResponseChannel()
         self._iter_counter = 0
         self._profiler = ProfileController(
@@ -218,6 +300,9 @@ class ScheduledEncoderExecutor:
     ) -> ScheduledEncoderExecutor:
         """Load and compile the model, build its runner, and warm it up on every rank.
 
+        With ``mm_encoder_only`` the checkpoint's vision encoder is built and rank 0 exports
+        its embeddings; otherwise the checkpoint's pooling model is built.
+
         Args:
             llm_args: The arguments; scheduled-encoder constraints are applied to them first.
             model_path: The checkpoint directory.
@@ -229,7 +314,14 @@ class ScheduledEncoderExecutor:
             The executor, warmed up; its loop starts with ``start_worker``.
         """
         llm_args = resolve_scheduled_encoder_args(llm_args)
-        with build_encoder_runner(
+        if llm_args.mm_encoder_only:
+            build = build_mm_encoder_runner
+            # Attention DP is rejected, so rank 0 alone answers the frontend.
+            completion = MultimodalEmbeddingCompletion(exports=dist.rank == 0)
+        else:
+            build = build_encoder_runner
+            completion = PoolingCompletion()
+        with build(
             llm_args,
             model_path=model_path,
             checkpoint_loader=checkpoint_loader,
@@ -242,6 +334,7 @@ class ScheduledEncoderExecutor:
                 )
             return cls(
                 built.runner,
+                completion=completion,
                 model_loader=built.model_loader,
                 llm_args=llm_args,
                 mapping=mapping,
@@ -333,11 +426,17 @@ class ScheduledEncoderExecutor:
         )
 
     def cancel_request(self, id: int) -> None:
-        """Cancel a request; a queued one finishes as cancelled, a finished one is ignored.
+        """Cancel a request; it finishes as cancelled unless its batch's completion was settled.
+
+        The completion thread settles a batch in ``_cancel_launched``, just before publishing it.
 
         Args:
             id: The request id.
         """
+        # A launched batch may complete before the loop takes the queued cancellation;
+        # rank 0, which publishes, checks this record then.
+        with self._cancel_lock:
+            self._cancel_sent.add(id)
         self._request_queue.enqueue_cancel_request(id)
 
     def start_profile(
@@ -474,7 +573,9 @@ class ScheduledEncoderExecutor:
                             max_num_tokens=self.max_num_tokens,
                         )
                         if count:
-                            self._run([self._waiting_queue.pop_request() for _ in range(count)])
+                            items = [self._waiting_queue.pop_request() for _ in range(count)]
+                            self._waiting_queue.mark_admitted(items)
+                            self._run(items)
                         # Every pass counts, idle ones too, so a stop requested while idle fires.
                         self._iter_counter += 1
         finally:
@@ -506,6 +607,8 @@ class ScheduledEncoderExecutor:
             with self._hang_detector.pause():
                 items = self._request_queue.get_from_request_queue(timeout)
         items = self._broadcaster.broadcast(items, prefer_cpu=idle)
+        if self._broadcaster.sync_clock:
+            self._waiting_queue.set_now(self._broadcaster.rank0_now)
 
         canceled_ids = set()
         rejected = []
@@ -532,13 +635,16 @@ class ScheduledEncoderExecutor:
         if self.dist.rank == 0:
             self._respond_with_errors(rejected)
         if canceled_ids:
+            with self._cancel_lock:
+                self._cancelled_after_launch.update(canceled_ids & self._launched_ids)
+                self._cancel_sent -= canceled_ids
             self._cancel_waiting(canceled_ids)
 
     @nvtx_range("_check_admissible")
     def _check_admissible(self, item: RequestQueueItem) -> None:
         """Raise ValueError if one forward cannot run this request."""
         request = item.request
-        if (
+        if not self._completion.accepts_multimodal_inputs and (
             getattr(request, "py_multimodal_data", None) is not None
             or request.mrope_config is not None
         ):
@@ -553,7 +659,7 @@ class ScheduledEncoderExecutor:
             )
 
     def _cancel_waiting(self, request_ids: set[int]) -> None:
-        """Finish queued requests as cancelled; ids no longer queued have already completed."""
+        """Finish queued requests as cancelled; ids no longer queued are launched or completed."""
         items = [item for item in self._waiting_queue if item.id in request_ids]
         if not items:
             return
@@ -621,17 +727,19 @@ class ScheduledEncoderExecutor:
                         timing.end_time,
                         timing.end_time,
                     )
-                responses = self._complete(requests, outputs)
+                self._complete(requests, outputs)
                 done = torch.cuda.Event()
                 done.record()
         except Exception as error:
             self._slots.release()
+            self._completion.retire(requests)
             self._fail(requests, error)
             return
+        with self._cancel_lock:
+            self._launched_ids.update(item.id for item in items)
         self._in_flight.put(
             _InFlight(
                 requests=requests,
-                responses=responses,
                 done=done,
                 iteration=self._iter_counter,
                 host_start=host_start,
@@ -649,9 +757,11 @@ class ScheduledEncoderExecutor:
                 with nvtx_range("synchronize"):
                     # Responses carry device tensors that other threads and processes read.
                     flight.done.synchronize()
+                self._cancel_launched(flight)
                 if self.dist.rank == 0:
                     self._publish(
-                        flight.responses, (request.py_request_id for request in flight.requests)
+                        self._create_responses(flight.requests),
+                        (request.py_request_id for request in flight.requests),
                     )
                 if self._iter_log:
                     self._log_iteration(flight)
@@ -664,6 +774,30 @@ class ScheduledEncoderExecutor:
                     self._request_queue.enqueue_shutdown_request()
             finally:
                 self._slots.release()
+
+    def _cancel_launched(self, flight: _InFlight) -> None:
+        """Finish the batch's requests cancelled since its launch as cancelled, without results.
+
+        A cancelled request's exports are retired; a cancellation that arrives after this
+        point finds the request completed.
+        """
+        request_ids = {request.py_request_id for request in flight.requests if not request.is_child}
+        with self._cancel_lock:
+            self._launched_ids -= request_ids
+            cancelled_ids = (self._cancelled_after_launch | self._cancel_sent) & request_ids
+            self._cancelled_after_launch -= cancelled_ids
+        if not cancelled_ids:
+            return
+        cancelled = [
+            request
+            for request in flight.requests
+            if (request.parent_request_id if request.is_child else request.py_request_id)
+            in cancelled_ids
+        ]
+        self._completion.retire(cancelled)
+        for request in cancelled:
+            # Replaces the reason LENGTH set by _complete.
+            request.set_finished_reason(FinishReason.CANCELLED, 0)
 
     def _log_iteration(self, flight: _InFlight) -> None:
         """Log one batch: its size, the host time until it was published and the GPU time of its forward."""
@@ -679,16 +813,12 @@ class ScheduledEncoderExecutor:
         )
 
     @nvtx_range("_complete")
-    def _complete(
-        self, requests: list[LlmRequest], outputs: dict[str, torch.Tensor]
-    ) -> list[tuple[int, LlmResponse]]:
-        """Store each request's pooled row as its context logits and report it finished with reason LENGTH."""
+    def _complete(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        """Store the forward's results on its requests and finish each with reason LENGTH."""
+        self._completion.store(requests, outputs)
         batch_token_time = self._perf_manager.get_timestamp()
         gpu_times_cache = {}
-        responses = []
-        for request, row in zip(requests, outputs["logits"]):
-            if request.py_return_context_logits:
-                request.py_result.append_context_logits(row.unsqueeze(0) if row.ndim == 1 else row)
+        for request in requests:
             # The public result reports a finished request with no tokens and reason LENGTH.
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, 0)
@@ -699,6 +829,16 @@ class ScheduledEncoderExecutor:
                 self._perf_manager.compute_batch_gpu_times(
                     [request], gpu_times_cache=gpu_times_cache
                 )
+
+    @staticmethod
+    def _create_responses(requests: list[LlmRequest]) -> list[tuple[int, LlmResponse]]:
+        """The batch's responses, created once each request's finish reason is settled.
+
+        Creating a response marks its sequence final, so a second one for a sequence could
+        end the request before its other sequences arrive.
+        """
+        responses = []
+        for request in requests:
             response = request.create_response()
             if response is not None:
                 responses.append((request.py_request_id, response))

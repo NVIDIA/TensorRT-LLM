@@ -465,11 +465,8 @@ def _branch_snapshot_ctx_chunk_config(
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
-def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
-                           is_generation: bool) -> None:
+def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
     """Reject the settings a non-generation model cannot run with; warn on those it ignores."""
-    if is_generation:
-        return
     if mapping.has_pp():
         raise ValueError(
             "Pipeline parallelism is not supported for non-generation models "
@@ -488,7 +485,7 @@ def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
 def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
                                      mapping: Mapping) -> None:
     """Reject the settings ScheduledEncoderExecutor cannot serve a non-generation model with."""
-    _check_no_kv_execution(llm_args, mapping, is_generation=False)
+    _check_no_kv_execution(llm_args, mapping)
     if mapping.cp_size > 1:
         raise ValueError(
             "Context parallelism is not supported for non-generation models; "
@@ -505,6 +502,8 @@ def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
         ("enable_resource_governor", llm_args.enable_resource_governor),
         ("sleep_config", llm_args.sleep_config is not None),
         ("orchestrator_type='ray'", llm_args.orchestrator_type == "ray"),
+        ("enable_client_io_during_gpu_wait",
+         llm_args.enable_client_io_during_gpu_wait),
     )
     settings = [name for name, used in checks if used]
     if settings:
@@ -737,7 +736,7 @@ def _create_py_executor(
         llm_args, checkpoint_loader, is_generation = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
 
-    if not llm_args.mm_encoder_only and not is_generation:
+    if not is_generation:
         return _create_scheduled_encoder_executor(llm_args, checkpoint_dir,
                                                   checkpoint_loader,
                                                   _startup_timer,
@@ -788,7 +787,6 @@ def _create_py_executor(
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
 
-    mm_encoder_only = llm_args.mm_encoder_only
     enable_chunked_context = llm_args.enable_chunked_prefill
 
     (
@@ -837,16 +835,6 @@ def _create_py_executor(
         spec_config,
         llm_args.disable_overlap_scheduler,
         sparse_attention_config=llm_args.sparse_attention_config)
-
-    if mm_encoder_only:
-        llm_args.mm_encoder_only = True
-        llm_args.disable_overlap_scheduler = True
-
-        # Disable overlap scheduler for multimodal encoder-only mode
-        logger.warning(
-            "Disabling overlap scheduler for multimodal encoder-only mode. "
-            "The overlap scheduler is designed for generation models and is not needed "
-            "when only processing vision encoder inputs.")
 
     _rank_dspark_on_host_without_overlap(spec_config,
                                          llm_args.disable_overlap_scheduler)
@@ -1043,12 +1031,6 @@ def _create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
-
-    is_generation = model_engine.model.model_config.is_generation
-    _check_no_kv_execution(llm_args, mapping, is_generation)
-    if not is_generation:
-        enable_chunked_context = False
-        model_engine.attn_runtime_features.chunked_prefill = False
 
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
@@ -1265,7 +1247,6 @@ def _create_py_executor(
             mapping,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
-            mm_encoder_only=mm_encoder_only,
             speculative_config=spec_config,
             max_num_sequences=max_num_seq_slots,
         )
@@ -1393,82 +1374,78 @@ def _create_py_executor(
     logger.info(
         f"[create_py_executor] Created execution_stream: {execution_stream}")
 
-    if model_engine.model.model_config.is_generation:
-        #NOTE: non-generation models do not have kv cache
+    is_disagg = is_disagg_enabled(cache_transceiver_config)
+    is_hybrid = is_hybrid_linear(
+        model_engine.model.model_config.pretrained_config)
 
-        is_disagg = is_disagg_enabled(cache_transceiver_config)
-        is_hybrid = is_hybrid_linear(
-            model_engine.model.model_config.pretrained_config)
+    if is_disagg and is_hybrid:
+        # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
+        # no effect in disagg. The disagg manager choice is driven by
+        # get_kv_cache_manager_cls and cache_transceiver_config.
+        if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
+            logger.warning(
+                "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
+                "configure transceiver_runtime='PYTHON' with backend='NIXL' "
+                "to select MixedMambaHybridCacheManager.")
+        else:
+            logger.info("Disaggregated serving with hybrid model detected. "
+                        "Using the configured Mamba cache manager.")
 
-        if is_disagg and is_hybrid:
-            # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
-            # no effect in disagg. The disagg manager choice is driven by
-            # get_kv_cache_manager_cls and cache_transceiver_config.
-            if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
-                logger.warning(
-                    "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
-                    "configure transceiver_runtime='PYTHON' with backend='NIXL' "
-                    "to select MixedMambaHybridCacheManager.")
-            else:
-                logger.info("Disaggregated serving with hybrid model detected. "
-                            "Using the configured Mamba cache manager.")
+    # Get draft config for one-engine speculative decoding if available
+    draft_config = getattr(model_engine.model, 'draft_config', None)
 
-        # Get draft config for one-engine speculative decoding if available
-        draft_config = getattr(model_engine.model, 'draft_config', None)
+    if not skip_est and is_decode_only(sparse_attention_config):
+        # The estimation dry run prefills dummy prompts, which a
+        # decode-only worker cannot execute. Size the KV cache from free
+        # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
+        logger.info("KV cache size estimation is not supported for a "
+                    "decode-only worker, disable it.")
+        skip_est = True
 
-        if not skip_est and is_decode_only(sparse_attention_config):
-            # The estimation dry run prefills dummy prompts, which a
-            # decode-only worker cannot execute. Size the KV cache from free
-            # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
-            logger.info("KV cache size estimation is not supported for a "
-                        "decode-only worker, disable it.")
-            skip_est = True
+    kv_cache_creator = KvCacheCreator(
+        model_engine=model_engine,
+        mapping=mapping,
+        net_max_seq_len=net_max_seq_len,
+        kv_connector_manager=kv_connector_manager,
+        max_num_tokens=max_num_tokens,
+        max_beam_width=max_beam_width,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        llm_args=llm_args,
+        speculative_config=spec_config,
+        profiling_stage_data=profiling_stage_data,
+        sparse_attention_config=sparse_attention_config,
+        execution_stream=execution_stream,
+        draft_config=draft_config,
+        gen_preemption_headroom=getattr(model_engine, "gen_preemption_headroom",
+                                        0),
+        skip_est=skip_est,
+        is_disagg=is_disagg,
+    )
 
-        kv_cache_creator = KvCacheCreator(
-            model_engine=model_engine,
-            mapping=mapping,
-            net_max_seq_len=net_max_seq_len,
-            kv_connector_manager=kv_connector_manager,
-            max_num_tokens=max_num_tokens,
-            max_beam_width=max_beam_width,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            kv_cache_config=kv_cache_config,
-            llm_args=llm_args,
-            speculative_config=spec_config,
-            profiling_stage_data=profiling_stage_data,
-            sparse_attention_config=sparse_attention_config,
-            execution_stream=execution_stream,
-            draft_config=draft_config,
-            gen_preemption_headroom=getattr(model_engine,
-                                            "gen_preemption_headroom", 0),
-            skip_est=skip_est,
-            is_disagg=is_disagg,
-        )
+    if not skip_est:
+        log_memory_usage("after loading weights")
 
-        if not skip_est:
-            log_memory_usage("after loading weights")
+    estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
-        estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+    # Without the estimation, build_managers sizes the final KV cache from
+    # the device memory free now, so DWDP is set up first: the KV cache
+    # then gets the replicated dense weights dense DWDP frees, and the
+    # expert prefetch ring holds its memory before the KV cache takes its
+    # share of the rest. With the estimation, it is set up below, before
+    # the estimation run measures the memory.
+    if not estimating_kv_cache and (dwdp_manager is not None
+                                    or dense_dwdp_manager is not None):
+        manager = (dwdp_manager
+                   if dwdp_manager is not None else dense_dwdp_manager)
+        manager.setup(model_engine.model)
+        dwdp_set_up = True
 
-        # Without the estimation, build_managers sizes the final KV cache from
-        # the device memory free now, so DWDP is set up first: the KV cache
-        # then gets the replicated dense weights dense DWDP frees, and the
-        # expert prefetch ring holds its memory before the KV cache takes its
-        # share of the rest. With the estimation, it is set up below, before
-        # the estimation run measures the memory.
-        if not estimating_kv_cache and (dwdp_manager is not None
-                                        or dense_dwdp_manager is not None):
-            manager = (dwdp_manager
-                       if dwdp_manager is not None else dense_dwdp_manager)
-            manager.setup(model_engine.model)
-            dwdp_set_up = True
-
-        with allocation_scope(
-                ExecutorMemoryType.INIT_KV_CACHE
-                if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
-            kv_cache_creator.build_managers(resources, estimating_kv_cache)
+    with allocation_scope(ExecutorMemoryType.INIT_KV_CACHE if
+                          estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
+        kv_cache_creator.build_managers(resources, estimating_kv_cache)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
     # weight manager + MoE backend fixup (single entry point). Dense DWDP is set

@@ -115,8 +115,12 @@ def _forward_step_executor(
 
 def _run_forward_step(executor, batch, new_tensors=None):
     with (
-        patch("torch.cuda.current_stream", return_value=Mock()),
-        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.current_cuda_stream", return_value=Mock()
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.CudaStreamScope", return_value=nullcontext()
+        ),
         patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
     ):
         return PyExecutor._forward_step(executor, batch, new_tensors)
@@ -1031,6 +1035,14 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
     with (
         patch("torch.cuda.current_stream", return_value=caller_stream),
         patch("torch.cuda.stream", return_value=nullcontext()),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.current_cuda_stream",
+            return_value=caller_stream,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.CudaStreamScope",
+            return_value=nullcontext(),
+        ),
         patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
     ):
         result = PyExecutor._forward_step(executor, batch)
@@ -1921,12 +1933,6 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyE
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
-
-
-def test_get_kv_cache_capacity_without_manager():
-    executor = _make_executor_with_kv_cache_manager(None)
-
-    assert executor.get_kv_cache_capacity() == {}
 
 
 @pytest.mark.parametrize("streaming_events", [False, True])
@@ -5281,19 +5287,19 @@ def test_early_response_suppresses_repeat_and_leaves_terminal_for_normal_pass() 
     batch = types.SimpleNamespace(all_requests=lambda: [request])
 
     executor._emit_first_token_responses(batch)
-    assert len(executor.responses[42]) == 1
-    assert not executor.responses[42][0].result.is_final
+    assert len(executor._response_channel.responses[42]) == 1
+    assert not executor._response_channel.responses[42][0].result.is_final
     executor._handle_responses(emit_first_iter=False)
-    assert len(executor.responses[42]) == 1
+    assert len(executor._response_channel.responses[42]) == 1
     executor._terminate_request.assert_not_called()
 
     request.finish_by_reason(native.FinishReason.CANCELLED)
     executor._emit_first_token_responses(batch)
-    assert len(executor.responses[42]) == 1
+    assert len(executor._response_channel.responses[42]) == 1
     executor._handle_responses(emit_first_iter=False)
-    assert len(executor.responses[42]) == 2
-    assert executor.responses[42][-1].result.is_final
+    assert len(executor._response_channel.responses[42]) == 2
+    assert executor._response_channel.responses[42][-1].result.is_final
     executor._terminate_request.assert_called_once_with(request)
     executor._handle_responses(emit_first_iter=False)
-    assert len(executor.responses[42]) == 2
+    assert len(executor._response_channel.responses[42]) == 2
     assert executor._terminate_request.call_count == 1

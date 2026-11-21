@@ -19,6 +19,7 @@ l0_gb300:
       backend: pytorch
   tests:
   # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_fixed_e8m0.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/embedding

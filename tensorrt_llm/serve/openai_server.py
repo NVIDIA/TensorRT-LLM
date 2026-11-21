@@ -40,6 +40,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
@@ -3070,9 +3071,16 @@ class OpenAIServer(_VideoRoutesMixin):
         async def create_mm_embedding_response(promise: RequestOutput):
             await promise.aresult()
             # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
-            mm_embedding_handles = (
-                promise.disaggregated_params.multimodal_embedding_handles
-                if promise.disaggregated_params else None)
+            params = promise.disaggregated_params
+            mm_embedding_handles = (params.multimodal_embedding_handles
+                                    if params else None)
+            # The response returns only the embedding handles; release the
+            # exports no caller can open.
+            if params is not None:
+                for handle in (params.mrope_position_ids_handle,
+                               params.mrope_position_deltas_handle):
+                    if handle is not None:
+                        SharedTensorContainer.release_dict(handle)
             if not mm_embedding_handles:
                 return self.create_error_response(
                     message="Multimodal embedding handle missing in response",

@@ -31,7 +31,8 @@ except ImportError:
     from cuda import cudart
 
 from tensorrt_llm._startup import _StartupTimer
-from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+from tensorrt_llm._utils import (CUASSERT, CudaStreamScope, current_cuda_stream,
+                                 customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
                                  is_trace_enabled, mpi_comm, mpi_disabled,
                                  nvtx_range, set_thread_local_mpi_comm,
@@ -701,7 +702,19 @@ class _ExecutorExecutionConfig:
     defer_generation_only_release: bool = False
 
 
+def _without_batch_idx_first(requests: List[LlmRequest]) -> List[LlmRequest]:
+    """A new list of ``requests``, those without a batch index first, stably."""
+    without_batch_idx = [req for req in requests if req.py_batch_idx is None]
+    if not without_batch_idx:
+        return list(requests)
+    return without_batch_idx + [
+        req for req in requests if req.py_batch_idx is not None
+    ]
+
+
 class PyExecutor:
+    # Requests generate tokens, rather than finish after one forward.
+    is_generation_model = True
     # True while the overlap loop runs with the execution stream current
     # (_overlap_loop_stream_scope).
     _loop_on_execution_stream = False
@@ -1201,7 +1214,7 @@ class PyExecutor:
         # context resources before transfer or response handling can terminate
         # a request.
         self._prefetched_request_ids: set[int] = set()
-        self.enable_kv_cache_events = self.kv_cache_manager is not None and (
+        self.enable_kv_cache_events = (
             self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
                 self.kv_cache_manager, "streaming_kv_events_enabled", False))
         # Event routing also needs the sum of actual per-rank capacities after
@@ -1225,7 +1238,7 @@ class PyExecutor:
                     self._kv_load_tracker.snapshot = aggregate_load(rank_loads)
             elif initial_sample:
                 self._kv_load_tracker.record_local(initial_sample)
-        self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        self.enable_kv_cache_reuse = self.kv_cache_manager.enable_block_reuse
         # Router Replay (R3): SharedRouteCache bound, derived once from the KV
         # pool token capacity on the first non-warmup step (0 = block reuse off,
         # -1 = capacity unknown -> the capturer keeps its own fallback bound).
@@ -1838,11 +1851,6 @@ class PyExecutor:
             model._encoder_forward_context = self.perf_manager.record_encoder_forward
 
     @property
-    def is_generation_model(self) -> bool:
-        """Whether requests generate tokens, rather than finish after one forward."""
-        return self.sampler.is_generation_model()
-
-    @property
     def metrics(self) -> dict[str, float | dict[str, float]]:
         """Return executor construction and model-engine startup metrics."""
         return self._metrics
@@ -1913,10 +1921,6 @@ class PyExecutor:
             if self.enable_attention_dp != self.kv_connector_manager.enable_attention_dp:
                 raise ValueError(
                     "KV connector and executor attention-DP modes must agree.")
-
-            if self.kv_cache_manager is None:
-                raise ValueError(
-                    "KV Cache Connector requires a KV Cache Manager.")
 
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
@@ -3082,8 +3086,6 @@ class PyExecutor:
     def _read_kv_cache_capacity(self) -> dict:
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if kv_cache_manager is None:
-            return {}
 
         block_counts = getattr(type(kv_cache_manager),
                                "get_primary_block_counts", None)
@@ -3138,7 +3140,7 @@ class PyExecutor:
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if not kv_cache_manager or not self.enable_kv_cache_events:
+        if not self.enable_kv_cache_events:
             return []
 
         events = kv_cache_manager.get_latest_events(0)
@@ -3564,41 +3566,40 @@ class PyExecutor:
 
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if kv_cache_manager is not None:
-            kv_stats = kv_cache_manager.get_kv_cache_stats()
-            kv_stats_to_save = KvCacheStats()
-            kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
-            kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
-            kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
-            kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
-            kv_stats_to_save.alloc_total_blocks = kv_stats.alloc_total_blocks
-            kv_stats_to_save.alloc_new_blocks = kv_stats.alloc_new_blocks
-            kv_stats_to_save.reused_blocks = kv_stats.reused_blocks
-            kv_stats_to_save.missed_blocks = kv_stats.missed_blocks
-            kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
-            self._fill_kv_host_stats(kv_stats_to_save, kv_cache_manager,
-                                     consume_deltas)
-            stats.kv_cache_stats = kv_stats_to_save
+        kv_stats = kv_cache_manager.get_kv_cache_stats()
+        kv_stats_to_save = KvCacheStats()
+        kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
+        kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
+        kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
+        kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
+        kv_stats_to_save.alloc_total_blocks = kv_stats.alloc_total_blocks
+        kv_stats_to_save.alloc_new_blocks = kv_stats.alloc_new_blocks
+        kv_stats_to_save.reused_blocks = kv_stats.reused_blocks
+        kv_stats_to_save.missed_blocks = kv_stats.missed_blocks
+        kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
+        self._fill_kv_host_stats(kv_stats_to_save, kv_cache_manager,
+                                 consume_deltas)
+        stats.kv_cache_stats = kv_stats_to_save
 
-            # Collect per-iteration stats (with deltas) at configured interval.
-            # Between calls, C++ deltas accumulate so the reported values cover multiple iterations.
-            # Key the interval on the record's construction iteration, not
-            # the live counter: under the overlap and PP schedulers this runs
-            # in a later loop, and with iter_perf_stats_interval > 1 only
-            # sampled construction iterations reach this point, so a check on
-            # the live counter could never match.
-            # Guard: only fetch once per record iteration.
-            # Queue-only snapshots pass consume_deltas=False: the C++ delta
-            # fetch and the two cached fields below belong to measured
-            # iterations and must not be consumed or cleared here.
-            if consume_deltas:
-                if (stats.iter % self._kv_iter_stats_interval == 0
-                        and self._last_kv_iter_stats_fetch_iter != stats.iter):
-                    self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
-                    )
-                    self._last_kv_iter_stats_fetch_iter = stats.iter
-                else:
-                    self._latest_kv_iter_stats = None
+        # Collect per-iteration stats (with deltas) at configured interval.
+        # Between calls, C++ deltas accumulate so the reported values cover multiple iterations.
+        # Key the interval on the record's construction iteration, not
+        # the live counter: under the overlap and PP schedulers this runs
+        # in a later loop, and with iter_perf_stats_interval > 1 only
+        # sampled construction iterations reach this point, so a check on
+        # the live counter could never match.
+        # Guard: only fetch once per record iteration.
+        # Queue-only snapshots pass consume_deltas=False: the C++ delta
+        # fetch and the two cached fields below belong to measured
+        # iterations and must not be consumed or cleared here.
+        if consume_deltas:
+            if (stats.iter % self._kv_iter_stats_interval == 0
+                    and self._last_kv_iter_stats_fetch_iter != stats.iter):
+                self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
+                )
+                self._last_kv_iter_stats_fetch_iter = stats.iter
+            else:
+                self._latest_kv_iter_stats = None
 
         rank_metrics = {
             "rank": self.dist.rank,
@@ -3608,20 +3609,19 @@ class PyExecutor:
             "cpuMemUsage": stats.cpu_mem_usage,
             "pinnedMemUsage": stats.pinned_mem_usage,
         }
-        if kv_cache_manager is not None:
-            rank_metrics["kvCacheStats"] = {
-                "maxNumBlocks": kv_stats.max_num_blocks,
-                "freeNumBlocks": kv_stats.free_num_blocks,
-                "usedNumBlocks": kv_stats.used_num_blocks,
-                "tokensPerBlock": kv_stats.tokens_per_block,
-                "allocTotalBlocks": kv_stats.alloc_total_blocks,
-                "allocNewBlocks": kv_stats.alloc_new_blocks,
-                "reusedBlocks": kv_stats.reused_blocks,
-                "missedBlocks": kv_stats.missed_blocks,
-                "cacheHitRate": kv_stats.cache_hit_rate,
-            }
-            append_kv_cache_iteration_stats(rank_metrics,
-                                            self._latest_kv_iter_stats)
+        rank_metrics["kvCacheStats"] = {
+            "maxNumBlocks": kv_stats.max_num_blocks,
+            "freeNumBlocks": kv_stats.free_num_blocks,
+            "usedNumBlocks": kv_stats.used_num_blocks,
+            "tokensPerBlock": kv_stats.tokens_per_block,
+            "allocTotalBlocks": kv_stats.alloc_total_blocks,
+            "allocNewBlocks": kv_stats.alloc_new_blocks,
+            "reusedBlocks": kv_stats.reused_blocks,
+            "missedBlocks": kv_stats.missed_blocks,
+            "cacheHitRate": kv_stats.cache_hit_rate,
+        }
+        append_kv_cache_iteration_stats(rank_metrics,
+                                        self._latest_kv_iter_stats)
 
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
@@ -4545,10 +4545,8 @@ class PyExecutor:
                     # the generation requests always have batch_idx.
                     # Sort before preparing resources, so the resource managers see
                     # the requests in the order the forward runs them.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    scheduled_batch.generation_requests = _without_batch_idx_first(
+                        scheduled_batch.generation_requests)
 
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
@@ -7012,14 +7010,13 @@ class PyExecutor:
         stats = self._get_init_iter_stats(0, 0)
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if kv_cache_manager is not None:
-            kv_stats = kv_cache_manager.get_kv_cache_stats()
-            kv_stats_to_save = KvCacheStats()
-            kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
-            kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
-            kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
-            kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
-            stats.kv_cache_stats = kv_stats_to_save
+        kv_stats = kv_cache_manager.get_kv_cache_stats()
+        kv_stats_to_save = KvCacheStats()
+        kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
+        kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
+        kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
+        kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
+        stats.kv_cache_stats = kv_stats_to_save
         self._append_iter_stats(stats)
 
     def _build_step_scope_label(self,
@@ -8372,10 +8369,8 @@ class PyExecutor:
                     # the generation requests always have batch_idx.
                     # Sort before preparing resources, so the resource managers see
                     # the requests in the order the forward runs them.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    scheduled_batch.generation_requests = _without_batch_idx_first(
+                        scheduled_batch.generation_requests)
 
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
@@ -8544,7 +8539,7 @@ class PyExecutor:
                     # current stream).
                     sample_stream = (self.execution_stream if isinstance(
                         self.sampler, SpecSampler) else None)
-                    with torch.cuda.stream(
+                    with CudaStreamScope(
                             sample_stream
                     ), self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
@@ -10435,8 +10430,6 @@ class PyExecutor:
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if not kv_cache_manager:
-            return
         # Flush iteration events at each iteration to ensure that events have enough time
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
@@ -12240,7 +12233,12 @@ class PyExecutor:
         non-overlap mode, so the second union term is a no-op there.
         """
         model = getattr(self.model_engine, "model", None)
-        if model is None:
+        # The helper does nothing for other models or with the prefetch off.
+        if not isinstance(model, MultimodalModelMixin):
+            return
+        max_prefetch_ahead = (
+            self.llm_args.multimodal_config.encoder_side_stream_max_ahead)
+        if max_prefetch_ahead is None or max_prefetch_ahead <= 0:
             return
         in_flight = {r.py_request_id for r in scheduled_batch.all_requests()}
         if self.previous_batch is not None:
@@ -12254,8 +12252,6 @@ class PyExecutor:
         ]
         if not pending:
             return
-        max_prefetch_ahead = (
-            self.llm_args.multimodal_config.encoder_side_stream_max_ahead)
         try:
             maybe_prefetch_mm_encoder_for_next_iter(
                 model=model,
@@ -12351,12 +12347,11 @@ class PyExecutor:
             # with KVCacheTransferManager's onboard/offload operations. With the
             # loop on the execution stream both waits are program order.
             if not self._loop_on_execution_stream:
-                self._stream_ordering_events[0].record(
-                    torch.cuda.current_stream())
+                self._stream_ordering_events[0].record(current_cuda_stream())
                 self.execution_stream.wait_event(
                     self._stream_ordering_events[0])
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
-            with torch.cuda.stream(self.execution_stream):
+            with CudaStreamScope(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, cache_indirection_buffer)
                 if isinstance(outputs, dict):
@@ -12378,7 +12373,7 @@ class PyExecutor:
             # before downstream operations use the outputs.
             if not self._loop_on_execution_stream:
                 self._stream_ordering_events[1].record(self.execution_stream)
-                torch.cuda.current_stream().wait_event(
+                current_cuda_stream().wait_event(
                     self._stream_ordering_events[1])
 
             if self._is_kv_manager_v2:
@@ -12423,8 +12418,9 @@ class PyExecutor:
         and adjust the exclude_last_generation_logits flag accordingly.
         """
         for request in generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
-            ):
+            # will_complete_next_iteration is rarely true, so test it first.
+            if request.will_complete_next_iteration(
+            ) and request.state != LlmRequestState.GENERATION_COMPLETE:
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
@@ -13739,7 +13735,10 @@ class PyExecutor:
                     new_active_requests.append(request)
                 continue
 
-            if request.is_generation_only_request and not request.is_finished:
+            # Nothing below changes the request's state before the response.
+            is_generation_only = request.is_generation_only_request
+            is_finished = request.is_finished
+            if is_generation_only and not is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
@@ -13747,10 +13746,11 @@ class PyExecutor:
                         not self.disable_overlap_scheduler
                         and getattr(request, "py_csa2_remote_tail_mode", None)
                         != "destination" and request.py_decoding_iter <= 1):
-                    self.perf_manager.append_step_metrics(
-                        request,
-                        self.iter_counter,
-                        batch_token_time=batch_token_time)
+                    if perf_metrics_enabled:
+                        self.perf_manager.append_step_metrics(
+                            request,
+                            self.iter_counter,
+                            batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
 
@@ -13770,7 +13770,7 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            if request.is_finished:
+            if is_finished:
                 # Guard the engine lookup -- minimal executors (unit tests)
                 # may have no engine.
                 route_capture = getattr(getattr(self, "model_engine", None),
@@ -13779,7 +13779,7 @@ class PyExecutor:
                     route_capture.attach_routes(request)  # R3: append routes
             # A generation-only request's first streamed content must not wait
             # for stream_interval after the context-side first token.
-            first_gen_emit = (request.is_generation_only_request
+            first_gen_emit = (is_generation_only
                               and not request.py_gen_first_emitted)
             should_emit = self._should_emit_response(request, emit_first_iter,
                                                      first_gen_emit)
@@ -13788,8 +13788,7 @@ class PyExecutor:
             # every earlier step only costs a native call. Requests that
             # return perf metrics keep the call: it finalizes their ctx GPU
             # totals.
-            if (should_emit and not request.is_finished
-                    and not request.streaming
+            if (should_emit and not is_finished and not request.streaming
                     and not request.return_perf_metrics):
                 should_emit = False
             if should_emit:

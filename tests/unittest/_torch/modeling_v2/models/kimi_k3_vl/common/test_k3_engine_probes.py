@@ -370,7 +370,7 @@ def test_dspark_latent_cache_helix_mapping():
     shard = _k3_module("dspark.drafter")._latent_cache_helix_mapping
     if hasattr(KvCacheCreator, "_unified_drafter_reads_helix_pages"):
         assert "_unified_drafter_reads_helix_pages()" in inspect.getsource(
-            KvCacheCreator._dflash_unify_blocker
+            KvCacheCreator._dflash_shared_unify_blocker
         )
         assert "reads_helix_sharded_ctx_pages" in inspect.getsource(
             KvCacheCreator._unified_drafter_reads_helix_pages

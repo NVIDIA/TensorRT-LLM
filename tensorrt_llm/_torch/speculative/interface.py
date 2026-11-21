@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import functools
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -477,6 +478,8 @@ class SpeculativeDecodingMode(IntEnum):
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
 
+    # Asked per request and per pass; the answer is fixed per mode.
+    @functools.cache
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
         ) or self.is_external_drafter() or self.is_sa()
@@ -631,15 +634,10 @@ class OneModelSamplingParams:
     top_p: float
     min_p: float
     is_greedy: bool
+    # Sampled with a temperature alone: no top-k, top-p or min-p filter.
+    is_temperature_only: bool
     # The user's ``SamplingParams.seed``, None when unset.
     seed: Optional[int]
-
-    @property
-    def is_temperature_only(self) -> bool:
-        """Sampled with a temperature alone: no top-k, top-p or min-p filter."""
-        return (not self.is_greedy
-                and self.top_k == torch.iinfo(torch.int32).max
-                and self.top_p >= 1.0 and self.min_p <= 0.0)
 
     @property
     def is_shard_sampleable(self) -> bool:
@@ -671,13 +669,17 @@ class OneModelSamplingParams:
         # Greedy rows get a sentinel below the kernels' greedy threshold
         # (non-zero, one-hot under softmax); it must not reach a non-greedy row.
         disable_temperature = GREEDY_TEMPERATURE_THRESHOLD / 10
+        # Very large values disable top-k.
+        no_top_k = torch.iinfo(torch.int32).max
+        top_k = row.top_k if row.top_k > 0 else no_top_k
         return cls(
             temperature=disable_temperature if is_greedy else row.temperature,
-            # Very large values disable top-k.
-            top_k=row.top_k if row.top_k > 0 else torch.iinfo(torch.int32).max,
+            top_k=top_k,
             top_p=row.top_p,
             min_p=row.min_p,
             is_greedy=is_greedy,
+            is_temperature_only=(not is_greedy and top_k == no_top_k
+                                 and row.top_p >= 1.0 and row.min_p <= 0.0),
             seed=request_random_seed(request),
         )
 
@@ -865,6 +867,9 @@ class SpecMetadata:
     # Stage the per-step Philox seed/offset uploads into the engine's step-input
     # pack (RuntimeHooks.pack_spec_rng_uploads) instead of copying each one.
     pack_rng_uploads: bool = False
+    # Verify a generation-only step's hidden states without the row gather
+    # (deploy-time; RuntimeHooks.skip_verify_row_gather).
+    skip_verify_row_gather: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
