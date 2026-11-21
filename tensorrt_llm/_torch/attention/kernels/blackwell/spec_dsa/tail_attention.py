@@ -29,6 +29,12 @@ to the owner through distributed shared memory (``st.async`` completing the owne
 with 2^(L (m_i - m*)) weights (L = scale * log2 e), applies the sink and the normalization (the arithmetic of
 ``megakernel_attention._merge_*``) and stores.
 
+The CTAs compute and send the output slices in the order of their rank (``_pv``, ``_softmax``): CTA r starts with its
+own slice and then serves the owners r + 1, r + 2, ... one after the other, so that every owner receives from one CTA
+at a time (in the order 0, 1, 2, 3 all CTAs queued up at one owner after the other, and the distributed shared memory
+of an SM takes ~28 bytes per clock). The slices are sent before the CTA waits for the (max, sum) pairs of its peers,
+which the sends do not need. The results do not change (bit-identical).
+
 Only the cluster size 5 is built and validated (``SUPPORTED_CLUSTER_SIZES``): it serves up to 26 rows, the clusters of
 5 CTAs that a 148-SM B200 holds at once at one CTA per SM. The tile split and the slice ownership are written for any
 cluster size of 3 to 5, but the clusters of 4 and 3 CTAs (27 to 45 rows) were measured to win nothing over the
@@ -39,8 +45,9 @@ The launch is a plain stream-ordered launch, or, with ``pdl``, a programmatic de
 the grid dependency before it reads the selection (``griddepcontrol.wait``, a no-op in a plain launch), so its CTAs can
 start while the top-K kernel still ranks its crossing bin (the multi-CTA top-K of ``topk_multicta`` triggers the launch
 after its stream phase) and run the barrier / TMEM setup, the Q load and the sliding-window tile in the shadow of that
-kernel. Behind a top-K kernel that never triggers early (the production one) the attribute only costs 0.7 to 0.8 us at
-8 to 16 rows (measured): ``pdl`` is for the multi-CTA top-K.
+kernel; the CTAs of the selected tiles also bring the block-table row of their request into L2 (the loads behind the
+wait read random pages of it). Behind a top-K kernel that never triggers early (the production one) the attribute only
+costs 0.7 to 0.8 us at 8 to 16 rows (measured): ``pdl`` is for the multi-CTA top-K.
 """
 
 from __future__ import annotations
@@ -115,6 +122,10 @@ class TailAttention:
             )
         self.g = g
         self.pdl = pdl
+        # the output slices (one per owner CTA, ranks 0-3) are computed and sent in the order of the CTA rank (``_pv``)
+        self.rotate = g >= NSLICE
+        # with the programmatic launch the CTAs wait for the top-K kernel: they prefetch the block-table row meanwhile
+        self.prefetch_bt = pdl
         self.base, self.extra = divmod(NTILES, g)
         self.nkv = self.base + (1 if self.extra else 0)  # most tiles of one CTA
         self.no_max = -(-NSLICE // g)  # most output slices of one CTA
@@ -249,6 +260,21 @@ class TailAttention:
                 lane,
             )
             t0 = Int32(1)
+        if cutlass.const_expr(self.prefetch_bt):
+            # the selected tiles (CTAs 1-4 of the cluster) read random pages of this request's block-table row (32 KB):
+            # each CTA brings a quarter of its 128-byte lines into L2 while the top-K kernel finishes, so that the loads
+            # behind the wait hit L2
+            if j0 != Int32(0):
+                nl = (mbc * Int32(4) + Int32(127)) // Int32(128)
+                qn = (nl + Int32(3)) // Int32(4)
+                li = (j0 - Int32(1)) * qn + tid
+                if tid < qn:
+                    if li < nl:
+                        ML.prefetch_l2_line(
+                            bt_c.iterator.toint()
+                            + Int64(row) * Int64(mbc) * Int64(4)
+                            + Int64(li) * Int64(128)
+                        )
         cute.arch.griddepcontrol_wait()
         for t in cutlass.range(t0, nt, unroll=1):
             jg = j0 + t
@@ -310,11 +336,46 @@ class TailAttention:
 
     # ------------------------------------------------------------------------------------------------------------
     @cute.jit
-    def _pv(self, abar, tp, tmem, kv_base, idesc_pv):
-        # O += P(tp) V(tp) once the softmax warps have stored P and rescaled O.
+    def _pv(self, abar, tp, tmem, kv_base, idesc_pv, rk):
+        # O += P(tp) V(tp) once the softmax warps have stored P and rescaled O. With ``rotate`` the slices are computed
+        # in the order rk, rk + 1, ... (mod 4) of the CTA rank rk: the first one is the CTA's own slice, the others go
+        # to different owners at any time.
         _wait(abar + Int32(self.B_PRDY), tp & Int32(1))
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-        if prims.elect_sync():
+        if cutlass.const_expr(self.rotate):
+            if prims.elect_sync():
+                s_addr = tmem + (tp & Int32(1)) * Int32(TM_SB)
+                for k in cutlass.range_constexpr(NSLICE):
+                    v = (Int32(k) + rk) & Int32(NSLICE - 1)
+                    vdesc = prims.Tcgen05SmemDesc.build(
+                        kv_base + (tp * Int32(4) + v) * Int32(SLOT_BYTES),
+                        leading_byte_offset=0,
+                        stride_byte_offset=1024,
+                        layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+                    )
+                    d_addr = (
+                        tmem
+                        + Int32(TM_O)
+                        + (v & Int32(1)) * Int32(128)
+                        + (v >> Int32(1)) * Int32(PANEL1)
+                    )
+                    a_addr = s_addr + Int32(TILE_N // 4) + (v >> Int32(1)) * Int32(PANEL1)
+                    for kb in cutlass.range_constexpr(TILE_N // 32):
+                        en = Boolean(True)
+                        if cutlass.const_expr(kb == 0):
+                            en = Boolean(tp > Int32(0))
+                        prims.tcgen05_mma(
+                            prims.Tcgen05MMAKind.F8F6F4,
+                            prims.CTAGroup.CTA_1,
+                            prims.make_tmem_ptr(d_addr, Float32),
+                            prims.make_tmem_ptr(a_addr + Int32(8 * kb), E4M3),
+                            vdesc.advance_start_address(kb * 32 * SLICE),
+                            idesc_pv,
+                            en,
+                        )
+                    prims.tcgen05_commit(abar + Int32(self.B_PVS) + v, group=prims.CTAGroup.CTA_1)
+                prims.tcgen05_commit(abar + Int32(self.B_PV), group=prims.CTAGroup.CTA_1)
+        elif prims.elect_sync():
             s_addr = tmem + (tp & Int32(1)) * Int32(TM_SB)
             for v in cutlass.range_constexpr(NSLICE):
                 vdesc = prims.Tcgen05SmemDesc.build(
@@ -342,7 +403,7 @@ class TailAttention:
             prims.tcgen05_commit(abar + Int32(self.B_PV), group=prims.CTAGroup.CTA_1)
 
     @cute.jit
-    def _mma(self, nt, abar, q_base, kv_base, tmem):
+    def _mma(self, nt, abar, q_base, kv_base, tmem, rk):
         idesc_qk = prims.Tcgen05InstrDesc.build(
             c_dtype=Float32, a_dtype=E4M3, b_dtype=E4M3, n_dim=TILE_N, m_dim=HEADS
         )
@@ -397,8 +458,8 @@ class TailAttention:
                     abar + Int32(self.B_SFULL) + (t & Int32(1)), group=prims.CTAGroup.CTA_1
                 )
             if t >= Int32(1):
-                self._pv(abar, t - Int32(1), tmem, kv_base, idesc_pv)
-        self._pv(abar, nt - Int32(1), tmem, kv_base, idesc_pv)
+                self._pv(abar, t - Int32(1), tmem, kv_base, idesc_pv, rk)
+        self._pv(abar, nt - Int32(1), tmem, kv_base, idesc_pv, rk)
 
     # ------------------------------------------------------------------------------------------------------------
     @cute.jit
@@ -548,36 +609,56 @@ class TailAttention:
                 rc = ML.mapa_u32(stat_a + (r * Int32(64) + head) * Int32(8), Int32(d))
                 mc = ML.mapa_u32(bar_stat_a, Int32(d))
                 ML.st_async_v2(rc, mc, L.u32_of_f32(m_run), L.u32_of_f32(l_tot))
-        # owners: weights of the G partials (the (max, sum) pairs arrive while the last PV runs)
-        wn_me = Float32(0.0)
-        wn = []
-        if r < Int32(self.owners):
-            ML.wait_cl(bar_stat_a, Int32(0))
-        ms = []
-        ls = []
-        for s in cutlass.range_constexpr(G):
-            sa = stat_a + (Int32(s * 64) + head) * Int32(8)
-            ms.append(L.f32_of_u32(Uint32(ML.lds_u32(sa))))
-            ls.append(L.f32_of_u32(Uint32(ML.lds_u32(sa + Int32(4)))))
-        m_star = ms[0]
-        for s in cutlass.range_constexpr(1, G):
-            m_star = cute.math.max(m_star, ms[s], ftz=True)
-        ws = []
-        for s in cutlass.range_constexpr(G):
-            ws.append(cute.math.exp2(Ls * (ms[s] - m_star), fastmath=True))
-        l_star = ws[0] * ls[0]
-        for s in cutlass.range_constexpr(1, G):
-            l_star = l_star + ws[s] * ls[s]
-        norm = _final_norm(m_star, l_star, sink, scale_log2)
-        for s in cutlass.range_constexpr(G):
-            wn.append(ws[s] * norm)
-        wn_me = wn[0]
-        for s in cutlass.range_constexpr(1, G):
-            wn_me = cutlass.select_(r == Int32(s), wn[s], wn_me)
         # partial O slices that another CTA owns: as soon as the PV MMAs of a slice have completed, its 64 heads x 128
         # columns (bf16) go from the registers into the owner's receive buffer (``st.async``), completing the owner's
         # per-source mbarrier
-        for v in cutlass.range_constexpr(NSLICE):
+        if cutlass.const_expr(self.rotate):
+            # slices in the order r, r + 1, ... (mod 4), one slice per owner (ranks 0-3, no_max == 1): the CTA's own
+            # slice is not sent, the others go to one owner after the other, so that every owner receives from one
+            # CTA at a time
+            for k in cutlass.range_constexpr(NSLICE):
+                v = (Int32(k) + r) & Int32(NSLICE - 1)
+                if r != v:
+                    _wait(abar + Int32(self.B_PVS) + v, nt - Int32(1) & Int32(1))
+                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                    raws = []
+                    for hc in cutlass.range_constexpr(2):
+                        o_addr = (
+                            tmem
+                            + lane_base
+                            + Int32(TM_O)
+                            + (v & Int32(1)) * Int32(128)
+                            + (v >> Int32(1)) * Int32(PANEL1)
+                            + Int32(32 * hc)
+                        )
+                        raws.append(
+                            prims.tcgen05_ld(
+                                prims.Tcgen05LdStShape.SHAPE_16X32BX2,
+                                prims.make_tmem_ptr(o_addr, Float32),
+                                num=32,
+                                offset=Int64(64),
+                            )
+                        )
+                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                    words = []
+                    for hc in cutlass.range_constexpr(2):
+                        o = raws[hc]
+                        for pi in cutlass.range_constexpr(16):
+                            words.append(_pack_bf16x2(Float32(o[2 * pi]), Float32(o[2 * pi + 1])))
+                    sidx = r - cutlass.select_(r > v, Int32(1), Int32(0))
+                    off = sidx * Int32(self.no_max) * Int32(SLICE_BYTES_O)
+                    rc0 = ML.mapa_u32(rx_a + off + rtid * Int32(16), v)
+                    mc = ML.mapa_u32(bar_rx_a + sidx * Int32(8), v)
+                    for q in cutlass.range_constexpr(8):
+                        ML.st_async_v4(
+                            rc0 + Int32(q * 2048),
+                            mc,
+                            words[4 * q],
+                            words[4 * q + 1],
+                            words[4 * q + 2],
+                            words[4 * q + 3],
+                        )
+        for v in cutlass.range_constexpr(0 if self.rotate else NSLICE):
             ov = v % G
             oi = v // G
             if r != Int32(ov):
@@ -615,6 +696,32 @@ class TailAttention:
                         words[4 * q + 2],
                         words[4 * q + 3],
                     )
+        # owners: weights of the G partials (the (max, sum) pairs have arrived while the slices were sent)
+        wn_me = Float32(0.0)
+        wn = []
+        if r < Int32(self.owners):
+            ML.wait_cl(bar_stat_a, Int32(0))
+        ms = []
+        ls = []
+        for s in cutlass.range_constexpr(G):
+            sa = stat_a + (Int32(s * 64) + head) * Int32(8)
+            ms.append(L.f32_of_u32(Uint32(ML.lds_u32(sa))))
+            ls.append(L.f32_of_u32(Uint32(ML.lds_u32(sa + Int32(4)))))
+        m_star = ms[0]
+        for s in cutlass.range_constexpr(1, G):
+            m_star = cute.math.max(m_star, ms[s], ftz=True)
+        ws = []
+        for s in cutlass.range_constexpr(G):
+            ws.append(cute.math.exp2(Ls * (ms[s] - m_star), fastmath=True))
+        l_star = ws[0] * ls[0]
+        for s in cutlass.range_constexpr(1, G):
+            l_star = l_star + ws[s] * ls[s]
+        norm = _final_norm(m_star, l_star, sink, scale_log2)
+        for s in cutlass.range_constexpr(G):
+            wn.append(ws[s] * norm)
+        wn_me = wn[0]
+        for s in cutlass.range_constexpr(1, G):
+            wn_me = cutlass.select_(r == Int32(s), wn[s], wn_me)
         # owners: combine
         if r < Int32(self.owners):
             for oi in cutlass.range_constexpr(self.no_max):
@@ -772,7 +879,7 @@ class TailAttention:
                 sRX,
             )
         else:
-            self._mma(nt, abar, q_base, kv_base, tmem_addr)
+            self._mma(nt, abar, q_base, kv_base, tmem_addr, r)
         if tid < Int32(128) or tid >= Int32(256):
             # the softmax warps waited for the start barrier before their first remote operation; the others do it now
             # (one wait per arrive)

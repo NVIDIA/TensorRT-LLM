@@ -36,17 +36,18 @@ differ between models live and how to add a model.
   every CTA runs the attention of its KV tiles with a local softmax maximum, the partial outputs are combined through
   distributed shared memory. Plain stream-ordered launch behind the production top-K kernel (it never triggers a dependent
   launch); behind the multi-CTA top-K (below) a programmatic dependent launch (`pdl`).
-  Against the production FP4 chain (1M-token captures, B200) the fastest path per batch size is the megakernel up to 8 rows,
-  the tail attention from 9 to 26 rows and the large-batch kernels above.
+  Against the production FP4 chain (1M-token captures, B200) the fastest path per batch size is the megakernel up to 4 rows,
+  the tail attention from 5 to 26 rows and the large-batch kernels above.
   The top-K stage of the hybrid can be the multi-CTA top-K (`tail_op.run_hybrid(..., topk_fn=None, ctx_lens=...)`, or
-  `topk_multicta_op.run`): a cluster of 8 / 6 / 5 / 4 CTAs per row (1-12 / 13-16 / 17-24 / 25-26 rows) selects the exact
+  `topk_multicta_op.run`): a cluster of 8 / 6 / 5 / 4 CTAs per row (1-15 / 16 / 17-24 / 25-26 rows) selects the exact
   top-512 of the logits in one pass over the row. It is exact for every input (a row whose sampled threshold does not
   certify the fast path takes an in-kernel radix select) and is the faster top-K stage when every row has 16,384
   positions or more (`topk_multicta_op.is_profitable`; 64K tokens at the compression ratio 4); shorter rows are exact too
   but win nothing, so the caller keeps its production top-K for them. Its CTAs launch the tail attention (programmatic
   dependent launch, `trigger`) when their stream phase is done, so that the tail attention's prologue (barrier and TMEM
   setup, query load, sliding-window tile) overlaps the end of the top-K kernel: `run_hybrid` does it by default with this
-  top-K (`pdl=None`), the results are the same.
+  top-K up to 24 rows (`pdl=None`, `tail_op.default_pdl`; at 25 and 26 rows the clusters of the tail attention fill the
+  wave and the plain launches are faster), the results are the same.
 
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |

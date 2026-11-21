@@ -15,7 +15,7 @@
 """specDSA multi-CTA exact top-512 (``topk_multicta_op``, CuTe DSL, SM100) against ``torch.topk``.
 
 The kernel selects the exact top-512 of every row of the fp32 indexer logits with one cluster of 4 to 8 CTAs per row
-(8 / 6 / 5 / 4 CTAs for 1-12 / 13-16 / 17-24 / 25-26 rows). Its fast path guesses a threshold from sampled logits and
+(8 / 6 / 5 / 4 CTAs for 1-15 / 16 / 17-24 / 25-26 rows). Its fast path guesses a threshold from sampled logits and
 certifies it by a count; a row where the guess does not hold, and every row of at most 8192 positions (no sample), takes
 an exact radix select inside the kernel. The checks of every row are the contract of the top-K stage: all 512 positions
 are in [0, n) and distinct, their values are the multiset ``torch.topk`` returns (which of several equal values at the
@@ -60,9 +60,9 @@ PRO = dataclasses.replace(SPEC, name="DS-V4-Pro", topk=1024)
 
 # The batch sizes of the tail attention, and the CTAs per row of the cluster that serves each.
 MAX_ROWS = 26
-CLUSTER_OF = {1: 8, 2: 8, 5: 8, 8: 8, 12: 8, 13: 6, 16: 6, 17: 5, 24: 5, 25: 4, 26: 4}
+CLUSTER_OF = {1: 8, 2: 8, 5: 8, 8: 8, 12: 8, 13: 8, 15: 8, 16: 6, 17: 5, 24: 5, 25: 4, 26: 4}
 CLUSTER_SIZES = (8, 6, 5, 4)
-BOUNDARY_BATCHES = [1, 2, 8, 12, 13, 16, 17, 24, 25, 26]
+BOUNDARY_BATCHES = [1, 2, 8, 12, 13, 15, 16, 17, 24, 25, 26]
 REFUSED = [27, 33, 47, 74, 75, 148, 1024]
 # co-resident clusters of a B200 at one CTA per SM (measured): the batch sizes of a cluster size must fit one wave
 CO_RESIDENT = {8: 15, 6: 22, 5: 26, 4: 33}
@@ -272,8 +272,8 @@ def _run(rows, forced=False, npad=NPAD):
 def test_cluster_size_table():
     op = _op()
     assert op.MAX_BATCH == MAX_ROWS
-    assert [op.cluster_size(b) for b in range(1, 13)] == [8] * 12
-    assert [op.cluster_size(b) for b in range(13, 17)] == [6] * 4
+    assert [op.cluster_size(b) for b in range(1, 16)] == [8] * 15
+    assert [op.cluster_size(b) for b in range(16, 17)] == [6]
     assert [op.cluster_size(b) for b in range(17, 25)] == [5] * 8
     assert [op.cluster_size(b) for b in range(25, 27)] == [4] * 2
     for b, g in CLUSTER_OF.items():
@@ -514,14 +514,22 @@ def _stub_hybrid_args(batch):
     return T._host_args(batch)
 
 
-def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatch):
+def test_default_launch_of_the_hybrid_follows_the_batch_size():
+    from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
+
+    assert tail_op.PDL_MAX_BATCH == 24
+    assert [tail_op.default_pdl(b) for b in range(1, MAX_ROWS + 1)] == [True] * 24 + [False] * 2
+
+
+@pytest.mark.parametrize("batch", [3, 24, 25, 26])
+def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatch, batch):
     """K1 logits, then the multi-CTA top-K on those logits and the lengths, then the tail attention with the caller's
     tensors."""
     from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import tail_op
 
     op = _op()
     calls = []
-    args = _stub_hybrid_args(3)
+    args = _stub_hybrid_args(batch)
     logits, ctx = object(), object()
 
     def k1():
@@ -542,11 +550,13 @@ def test_run_hybrid_with_the_multicta_top_k_calls_the_stages_in_order(monkeypatc
     monkeypatch.setattr(tail_op, "run_attention", fake_attention)
     names = ("topk", "q_att", "swa_pool", "bt_swa", "c_pool", "bt_c", "kv_lens", "sinks", "out")
     tail_op.run_hybrid(k1, None, *(args[n] for n in names), 0.125, config=SPEC, ctx_lens=ctx)
-    # the multi-CTA top-K triggers the dependent launch and the tail attention launches programmatically by default
-    assert calls[:2] == ["k1", ("multicta", SPEC, True)] and len(calls) == 3
+    # the multi-CTA top-K triggers the dependent launch and the tail attention launches programmatically by default, up
+    # to PDL_MAX_BATCH rows (above it the clusters of the tail attention fill the wave: plain launches)
+    pdl = batch <= tail_op.PDL_MAX_BATCH
+    assert calls[:2] == ["k1", ("multicta", SPEC, pdl)] and len(calls) == 3
     _, a, kw = calls[2]
     assert len(a) == 10 and all(x is args[n] for x, n in zip(a, names)) and a[9] == 0.125
-    assert kw == {"config": SPEC, "pdl": True}
+    assert kw == {"config": SPEC, "pdl": pdl}
 
 
 def test_run_hybrid_without_a_top_k_function_needs_ctx_lens(monkeypatch):
@@ -586,7 +596,7 @@ def test_run_hybrid_with_a_top_k_function_does_not_touch_the_multicta_kernel(mon
 @requires_b200
 @pytest.mark.parametrize("batch", BOUNDARY_BATCHES)
 def test_exact_mixed_kinds_at_the_cluster_boundaries(batch, spec):
-    """Every cluster size (8 / 6 / 5 / 4 CTAs: 1-12 / 13-16 / 17-24 / 25-26 rows) on rows of every kind and long
+    """Every cluster size (8 / 6 / 5 / 4 CTAs: 1-15 / 16 / 17-24 / 25-26 rows) on rows of every kind and long
     lengths."""
     lengths = [262144, 200000, 131071, 100001, 65536, 28672, 20000, 16384]
     rows = _make(KINDS, lengths, seed=100 + batch, batch=batch)
@@ -629,7 +639,7 @@ def test_exact_with_a_different_length_in_every_row(batch):
 
 
 @requires_b200
-@pytest.mark.parametrize("batch", [1, 12, 13, 17, 25])
+@pytest.mark.parametrize("batch", [1, 13, 16, 17, 25, 26])
 def test_exact_fallback_forced_on_every_row(batch):
     """The in-kernel radix select on every row, including the rows whose fast path would certify: the same exactness."""
     lengths = [262144, 131071, 65536, 20000, 16384, 8193, 8192, 4096, 600, 513, 512, 100, 1]
