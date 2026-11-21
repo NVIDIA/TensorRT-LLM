@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
 )
+from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import GqaDecodeFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -41,20 +42,22 @@ _FLASHINFER_TRTLLM_GEN_MODULE = "tensorrt_llm._torch.attention.backends.fmha.fla
 
 @pytest.mark.parametrize("sm", [100, 103])
 @pytest.mark.parametrize(
-    "env,expected",
+    "env,requested",
     [
-        ({}, True),
-        ({"FORCE_DETERMINISTIC": "1"}, False),
-        ({"FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1"}, False),
-        ({"FORCE_DETERMINISTIC": "1", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0"}, False),
-        ({"FORCE_DETERMINISTIC": "0", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1"}, False),
-        ({"FORCE_DETERMINISTIC": "0", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0"}, True),
-        ({"FORCE_MOE_KERNEL_DETERMINISTIC": "1"}, True),
+        ({}, False),
+        ({"FORCE_DETERMINISTIC": "1"}, True),
+        ({"FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1"}, True),
+        ({"FORCE_DETERMINISTIC": "1", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0"}, True),
+        ({"FORCE_DETERMINISTIC": "0", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1"}, True),
+        ({"FORCE_DETERMINISTIC": "0", "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "0"}, False),
+        ({"FORCE_MOE_KERNEL_DETERMINISTIC": "1"}, False),
     ],
 )
 def test_deterministic_attention_uses_supported_fmha(
-    monkeypatch: pytest.MonkeyPatch, sm: int, env: dict[str, str], expected: bool
+    monkeypatch: pytest.MonkeyPatch, sm: int, env: dict[str, str], requested: bool
 ) -> None:
+    """With deterministic attention requested, the libraries built on TRTLLM-Gen for their own kernels are
+    left out, and the plain library stays as the last resort after the fallback."""
     from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
 
     for name in (
@@ -70,8 +73,79 @@ def test_deterministic_attention_uses_supported_fmha(
     monkeypatch.setattr(FlashInferTrtllmGenFmha, "_missing_fused_nanobind_ops", lambda: [])
     attn = FakeAttention()
     attn.sparse_params = None
+    attn.gqa_decode = object()
 
-    assert FlashInferTrtllmGenFmha.is_available(attn) is expected
+    assert FlashInferTrtllmGenFmha.is_available(attn)
+    assert FlashInferTrtllmGenFmha(attn)._defers_to_fallback is requested
+    assert GqaDecodeFmha.is_available(attn) is not requested
+
+
+@pytest.mark.parametrize("num_contexts,num_generations", [(5, 0), (0, 1), (4, 1)])
+@pytest.mark.parametrize("page_size,paged_context", [(32, False), (128, True)])
+def test_deterministic_attention_keeps_requests_the_fallback_cannot_serve(
+    monkeypatch: pytest.MonkeyPatch,
+    num_contexts: int,
+    num_generations: int,
+    page_size: int,
+    paged_context: bool,
+) -> None:
+    """With deterministic attention requested, the plain library hands a request to the fallback when the
+    fallback serves it, and keeps it when the fallback has no kernel for it (paged prefill with 128-token
+    pages) or is not one of the layer's libraries."""
+    monkeypatch.setattr(f"{_FLASHINFER_TRTLLM_GEN_MODULE}.get_sm_version", lambda: 100)
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+    attn = FakeAttention()
+    attn.head_dim = 256
+    attn.sparse_params = None
+    attn.position_embedding_type = 0
+    default = FlashInferTrtllmGenFmha(attn)
+    monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
+    fmha = FlashInferTrtllmGenFmha(attn)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.dtype = None
+    manager.trtllm_gen_extra_tokens_per_block = frozenset({128})
+    manager.impl = SimpleNamespace(get_page_index_upper_bound=lambda *args: 32)
+    metadata = SimpleNamespace(
+        num_contexts=num_contexts,
+        num_generations=num_generations,
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=manager,
+        tokens_per_block=page_size,
+        use_paged_context_fmha=paged_context,
+        is_cross=False,
+        beam_width=1,
+    )
+    if num_contexts == 0:
+        input_type = AttentionInputType.generation_only
+        phases = (None, FmhaPhase.GENERATION)
+    elif num_generations == 0:
+        input_type = AttentionInputType.context_only
+        phases = (None, FmhaPhase.CONTEXT)
+    else:
+        input_type = AttentionInputType.mixed
+        phases = (None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION)
+    num_tokens = num_contexts + num_generations
+    q = torch.empty((num_tokens, 3 * attn.head_dim), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((num_tokens, attn.head_dim), dtype=torch.bfloat16),
+        attention_input_type=input_type,
+        is_fused_qkv=True,
+    )
+
+    for phase in phases:
+        request = (q, None, None, metadata, forward_args)
+        fallback_has_no_kernel = bool(
+            paged_context and num_contexts and phase != FmhaPhase.GENERATION
+        )
+        attn._fmha_manager = SimpleNamespace(fmha_libs=[fmha, FallbackFmha(attn)])
+        assert fmha.is_supported(*request, phase=phase) is fallback_has_no_kernel
+        assert default.is_supported(*request, phase=phase)
+        attn._fmha_manager = SimpleNamespace(fmha_libs=[fmha])
+        assert fmha.is_supported(*request, phase=phase)
 
 
 def test_flashinfer_fp8_mode_remains_implementation_local() -> None:

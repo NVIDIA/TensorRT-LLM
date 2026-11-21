@@ -45,20 +45,25 @@ MoE, and communication can introduce differences elsewhere in a model.
 
 The deterministic FMHA library supports BF16 causal MHA/GQA with BF16 paged KV
 caches, head dimensions 64, 128, and 256, page sizes 32 and 64, beam width 1,
-and at most 32 query heads per KV head on SM100/SM103. Sliding windows,
+and at most 32 query heads per KV head on SM100. Sliding windows,
 attention sinks, cross attention, MLA, and speculative decoding are not
-supported. Unsupported layers or batches emit a warning and use the existing
-fallback, which does not provide this arithmetic guarantee. An explicit
-`TLLM_FMHA_LIBS` override must include `deterministic` to select this library;
-if it leaves out `fallback`, an unsupported layer or batch raises a
-`RuntimeError` instead.
+supported. An unsupported layer or batch emits a warning and does not get this
+arithmetic guarantee. With either switch set it also leaves the TRTLLM-Gen
+kernels, MLA generation included: it runs in the fallback FMHA library whenever
+that library can serve it, and stays on TRTLLM-Gen only when the fallback has
+no kernel for it (for example paged prefill with a model-specific KV page
+size). An explicit `TLLM_FMHA_LIBS` override must include `deterministic` to
+select this library.
 
 The kernel uses Tensor Cores and rounds the attention probabilities to BF16
 before the value product, so its accuracy against an exact reference is that of
 ordinary BF16 attention. Keys are reduced in fixed 1024-key segments. Decode
-evaluates the segments in parallel when the attention workspace can hold their
-partial results (up to 256 MiB is requested) and serially otherwise; both
-layouts produce the same bits.
+evaluates the segments in parallel when their partial results fit in the 32 MiB
+generation workspace of the TRTLLM-Gen path and serially otherwise; both
+layouts produce the same bits. Prefill and decode use different tile shapes, so
+their equality also relies on the Tensor Core instructions Triton emits for
+each shape rounding alike; the unit tests check this bit for bit on the
+running GPU.
 
 This opt-in path favors reproducibility over throughput. Measure prefill and
 decode separately for the intended workload; enabling the flag is not a

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha import deterministic, flashinfer_trtllm_gen
 from tensorrt_llm._torch.attention.backends.fmha.deterministic import DeterministicFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -37,6 +38,47 @@ def deterministic_launches(monkeypatch):
 
     monkeypatch.setattr(DeterministicFmha, "_run_attention", recorded)
     return phases
+
+
+@pytest.fixture
+def parallel_segments(monkeypatch):
+    """For each launch of the kernel, whether it ran the key segments in parallel."""
+    layouts = []
+    kernel = deterministic.deterministic_attention
+
+    def recorded(**kwargs):
+        layouts.append(kernel(**kwargs))
+        return layouts[-1]
+
+    monkeypatch.setattr(deterministic, "deterministic_attention", recorded)
+    return layouts
+
+
+@pytest.mark.parametrize("sm, available", [(100, True), (103, False)])
+def test_deterministic_library_serves_sm100_only(monkeypatch, sm, available):
+    monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
+    monkeypatch.setattr(deterministic, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(flashinfer_trtllm_gen, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(flashinfer_trtllm_gen, "IS_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(DeterministicFmha, "_missing_fused_nanobind_ops", lambda: [])
+    layer = SimpleNamespace(
+        is_mla_enable=False,
+        head_dim=128,
+        num_heads=8,
+        num_kv_heads=2,
+        sparse_params=None,
+        skip_correction_threshold=0.0,
+    )
+    assert DeterministicFmha.is_available(layer) is available
+
+
+def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Bitwise equality of BF16 tensors: +0 and -0 differ, and a NaN equals itself."""
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    assert actual.shape == expected.shape
+    assert torch.equal(
+        actual.contiguous().view(torch.int16), expected.contiguous().view(torch.int16)
+    )
 
 
 @pytest.mark.parametrize(
@@ -104,8 +146,8 @@ def test_requests_the_kernel_cannot_serve_are_left_to_the_fallback(change, reaso
 @pytest.mark.parametrize("generations", [1, 2])
 def test_context_attention_ignores_generation_length_tail(contexts: int, generations: int) -> None:
     """The context phase must not launch kernels for the decode metadata tail."""
-    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
-        pytest.skip("Requires SM100 or SM103")
+    if not torch.cuda.is_available() or get_sm_version() != 100:
+        pytest.skip("Requires SM100")
     torch.manual_seed(20261006)
     heads, kv_heads, dim, page = 4, 2, 64, 32
     context_lengths = [3 + 2 * i for i in range(contexts)]
@@ -151,12 +193,9 @@ def test_context_attention_ignores_generation_length_tail(contexts: int, generat
         seq_lens=lengths[:contexts],
         out=expected,
     )
-    torch.testing.assert_close(output[:num_context_tokens], expected, rtol=0, atol=0)
-    torch.testing.assert_close(
-        output[num_context_tokens:],
-        torch.full_like(output[num_context_tokens:], 123),
-        rtol=0,
-        atol=0,
+    _assert_same_bits(output[:num_context_tokens], expected)
+    _assert_same_bits(
+        output[num_context_tokens:], torch.full_like(output[num_context_tokens:], 123)
     )
 
 
@@ -165,8 +204,8 @@ def test_context_attention_ignores_generation_length_tail(contexts: int, generat
 def test_deterministic_attention_runtime_phase_invariance(
     monkeypatch, deterministic_launches, dim, page
 ):
-    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
-        pytest.skip("Requires SM100 or SM103")
+    if not torch.cuda.is_available() or get_sm_version() != 100:
+        pytest.skip("Requires SM100")
     monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     torch.manual_seed(71)
@@ -223,16 +262,26 @@ def test_deterministic_attention_runtime_phase_invariance(
     finally:
         manager.shutdown()
     assert deterministic_launches == [FmhaPhase.CONTEXT, FmhaPhase.GENERATION]
-    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+    _assert_same_bits(results[0], results[1])
 
 
-@pytest.mark.parametrize("length", [513, 2049, 8193])
+@pytest.mark.parametrize(
+    "length, max_seq_len, parallel",
+    [
+        (513, None, [True, True]),
+        (2049, None, [True, True]),
+        (8193, None, [True, True]),
+        # A long sequence limit: the partial results of 32 requests no longer fit
+        # in the generation workspace, so that batch walks its segments serially.
+        (513, 1 << 16, [True, False]),
+    ],
+)
 @pytest.mark.parametrize("page", [32, 64])
 def test_deterministic_attention_runtime_batch_invariance(
-    monkeypatch, deterministic_launches, length, page
+    monkeypatch, deterministic_launches, parallel_segments, length, max_seq_len, parallel, page
 ):
-    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
-        pytest.skip("Requires SM100 or SM103")
+    if not torch.cuda.is_available() or get_sm_version() != 100:
+        pytest.skip("Requires SM100")
     monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     torch.manual_seed(20261005)
@@ -243,13 +292,16 @@ def test_deterministic_attention_runtime_batch_invariance(
     outputs = []
     for batch in (1, 32):
         manager = KVCacheManager(
-            KvCacheConfig(max_tokens=batch * pages * page, enable_block_reuse=False),
+            # The manager lowers the sequence limit to what its pool can hold.
+            KvCacheConfig(
+                max_tokens=max(batch * pages * page, max_seq_len or 0), enable_block_reuse=False
+            ),
             CacheType.SELF,
             num_layers=1,
             num_kv_heads=kv_heads,
             head_dim=dim,
             tokens_per_block=page,
-            max_seq_len=pages * page,
+            max_seq_len=max_seq_len or pages * page,
             max_batch_size=batch,
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
             dtype=DataType.BF16,
@@ -291,4 +343,5 @@ def test_deterministic_attention_runtime_batch_invariance(
         finally:
             manager.shutdown()
     assert deterministic_launches == [FmhaPhase.GENERATION] * 2
-    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+    assert parallel_segments == parallel
+    _assert_same_bits(outputs[0], outputs[1])

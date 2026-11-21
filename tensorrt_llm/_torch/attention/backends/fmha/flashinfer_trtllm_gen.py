@@ -63,6 +63,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .fallback import FallbackFmha
 from .interface import FmhaPhase, FmhaPrewarmConfig
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
@@ -218,6 +219,14 @@ def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
 
 if IS_FLASHINFER_AVAILABLE:
     _install_flashinfer_mla_decode_tuning_config_cache()
+
+
+def deterministic_attention_requested() -> bool:
+    """Whether the environment asks for attention with a fixed reduction order."""
+    return (
+        os.getenv("FORCE_DETERMINISTIC") == "1"
+        or os.getenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") == "1"
+    )
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -425,7 +434,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     An attention backend using pure trtllm-gen kernels from flashinfer.
     """
 
+    # This API cannot request a fixed KV reduction. When deterministic attention is
+    # requested, a library registered on top of this one for its own kernels is left
+    # out unless it sets ``_supports_deterministic``, and this library itself takes
+    # only the requests the fallback FMHA does not serve (``_defers_to_fallback``).
     _supports_deterministic = False
+    _defers_to_fallback = False
 
     # Default KV layout for flashinfer
     # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
@@ -492,6 +506,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._layout = self.DEFAULT_KV_LAYOUT
         # Read once so the hot path is not sensitive to later environment changes.
         self._enable_pdl = get_env_enable_pdl()
+        self._defers_to_fallback = (
+            type(self) is FlashInferTrtllmGenFmha and deterministic_attention_requested()
+        )
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
@@ -600,15 +617,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        if not cls._supports_deterministic and (
-            os.getenv("FORCE_DETERMINISTIC") == "1"
-            or os.getenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") == "1"
+        if (
+            cls is not FlashInferTrtllmGenFmha
+            and not cls._supports_deterministic
+            and deterministic_attention_requested()
         ):
-            # This API cannot request a fixed KV reduction. Leave selection
-            # to the deterministic FMHA library or the existing fallback.
-            logger.debug(
-                "FlashInfer TRTLLM-Gen FMHA is unavailable: deterministic attention is enabled."
-            )
+            # Leave the layer to the deterministic FMHA library, then to the
+            # fallback, and last to the plain TRTLLM-Gen library.
+            logger.debug(f"{cls.__name__} is unavailable: deterministic attention is enabled.")
             return False
 
         if not cls.is_environment_available():
@@ -750,6 +766,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        if self._defers_to_fallback and self._fallback_serves(
+            q, k, v, metadata, forward_args, phase
+        ):
+            logger.debug(
+                "FlashInfer trtllm-gen fmha library does not support request: deterministic "
+                "attention is enabled and the fallback FMHA serves it."
+            )
+            return False
         supported, reason = self._is_supported_with_reason(
             q,
             k,
@@ -762,6 +786,32 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if not supported:
             logger.debug(f"FlashInfer trtllm-gen fmha library does not support request: {reason}")
         return supported
+
+    def _fallback_serves(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        phase: Optional[FmhaPhase],
+    ) -> bool:
+        """Whether the fallback FMHA of this layer takes the request.
+
+        The fallback raises for a request it has no kernel for, because no library
+        follows it; such a request stays on this library.
+        """
+        manager = getattr(self.attn, "_fmha_manager", None)
+        fallback = next(
+            (lib for lib in getattr(manager, "fmha_libs", ()) if isinstance(lib, FallbackFmha)),
+            None,
+        )
+        if fallback is None:
+            return False
+        try:
+            return fallback.is_supported(q, k, v, metadata, forward_args, phase=phase)
+        except RuntimeError:
+            return False
 
     def _is_supported_with_reason(
         self,

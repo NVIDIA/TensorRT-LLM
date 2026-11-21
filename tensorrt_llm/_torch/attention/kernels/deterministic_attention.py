@@ -19,6 +19,17 @@ One program serves a block of query positions of one sequence for all query head
 share one KV head. Prefill walks every segment of its rows in one program. Decode can
 instead launch one program per segment, which run in parallel, and merge the segment
 results with a second kernel; both layouts give the same bits.
+
+What the source does not enforce: prefill and decode programs differ in their number of
+rows (128 or 64 against 16 or 32) and of warps, so Triton may lower their dots to different
+Tensor Core instructions (on SM100, tcgen05 MMA for the large tiles and ``mma.sync`` for the
+small ones). A row has the same bits in both only while those instructions round the
+BF16 to FP32 reduction over keys in the same way. The bit-exact tests in
+``tests/unittest/_torch/attention`` check this on the running GPU and Triton version; rerun
+them after a Triton upgrade or on a new architecture.
+
+The softmax scale and every stride are ``tl.constexpr``, so each distinct scale or cache
+layout compiles its own kernel: one set per model.
 """
 
 import torch
@@ -166,7 +177,9 @@ def _attention(
             exponent = new_exponent
         if SPLIT:
             ws_row = ((seq.to(tl.int64) * HK + kv_head) * NSEG + segment) * (BQ * GP) + rows
-            ws_ptr = WS + ws_row * (BD + 2)
+            # A row holds BD sums, the exponent, the denominator and two unused floats,
+            # so that every row starts on a 16-byte boundary.
+            ws_ptr = WS + ws_row * (BD + 4)
             tl.store(ws_ptr[:, None] + dims[None, :], acc)
             tl.store(ws_ptr + BD, exponent)
             tl.store(ws_ptr + BD + 1, denom)
@@ -228,7 +241,7 @@ def _merge_segments(
     merged_acc = tl.full((BQ * GP, BD), 0, tl.float32)
     for segment in range(0, num_segments):
         ws_row = ((seq.to(tl.int64) * HK + kv_head) * NSEG + segment) * (BQ * GP) + rows
-        ws_ptr = WS + ws_row * (BD + 2)
+        ws_ptr = WS + ws_row * (BD + 4)
         acc = tl.load(ws_ptr[:, None] + dims[None, :])
         exponent = tl.load(ws_ptr + BD)
         denom = tl.load(ws_ptr + BD + 1)
@@ -255,7 +268,7 @@ def split_workspace_bytes(
     group_padded = tr.next_power_of_2(num_heads // num_kv_heads)
     rows = _decode_rows(group_padded) * group_padded
     num_segments = tr.cdiv(max_kv_len, _SEGMENT_KEYS)
-    return num_seqs * num_kv_heads * num_segments * rows * (tr.next_power_of_2(head_dim) + 2) * 4
+    return num_seqs * num_kv_heads * num_segments * rows * (tr.next_power_of_2(head_dim) + 4) * 4
 
 
 def deterministic_attention(
@@ -272,7 +285,7 @@ def deterministic_attention(
     shared_page_indices: bool,
     output: torch.Tensor,
     workspace: torch.Tensor | None = None,
-) -> None:
+) -> bool:
     """Causal paged attention with the same arithmetic for every query in every phase.
 
     Q is token-major, K/V caches are HND, and output is contiguous. Separate
@@ -282,10 +295,10 @@ def deterministic_attention(
     ``workspace`` is an optional byte buffer. When it holds at least
     ``split_workspace_bytes`` for this call, decode runs its key segments in
     parallel; otherwise each program walks its segments serially. The output
-    bits are the same either way.
+    bits are the same either way. Returns whether the segments ran in parallel.
     """
     if query.numel() == 0:
-        return
+        return False
     heads, kv_heads, dim = query.shape[1], key_cache.shape[1], query.shape[-1]
     page = key_cache.shape[2]
     group = heads // kv_heads
@@ -367,3 +380,4 @@ def deterministic_attention(
             _SEGMENT_KEYS,
             num_warps=4,
         )
+    return split

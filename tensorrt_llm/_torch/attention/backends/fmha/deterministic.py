@@ -2,21 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixed-reduction causal MHA for deterministic prefill and generation."""
 
-import math
-import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
-from tensorrt_llm._torch.attention.kernels.deterministic_attention import (
-    deterministic_attention,
-    split_workspace_bytes,
-)
+from tensorrt_llm._torch.attention.kernels.deterministic_attention import deterministic_attention
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
-from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha, deterministic_attention_requested
 from .interface import FmhaPhase
 
 if TYPE_CHECKING:
@@ -31,23 +27,19 @@ class DeterministicFmha(FlashInferTrtllmGenFmha):
     """Reuse paged-KV preprocessing with a fixed per-query reduction."""
 
     _supports_deterministic = True
-    # Decode runs its key segments in parallel when the attention workspace can
-    # hold their partial results. Larger requests keep the serial layout, which
-    # gives the same bits.
-    _MAX_SPLIT_WORKSPACE_BYTES = 256 << 20
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        enabled = (
-            os.getenv("FORCE_DETERMINISTIC") == "1"
-            or os.getenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") == "1"
-        )
-        if not enabled:
+        if not deterministic_attention_requested():
             return False
         if attn.is_mla_enable:
             reason = "MLA attention"
         elif attn.head_dim not in (64, 128, 256):
             reason = f"head dimension {attn.head_dim}"
+        elif get_sm_version() != 100:
+            # Prefill and decode tiles may use different Tensor Core instructions;
+            # their equal rounding is verified on SM100 only.
+            reason = f"SM{get_sm_version()}, the kernel is verified on SM100 only"
         elif not super()._is_available(attn):
             reason = "the TRTLLM-Gen FMHA prerequisites are missing"
         else:
@@ -119,28 +111,6 @@ class DeterministicFmha(FlashInferTrtllmGenFmha):
         )
         return False
 
-    def prepare_workspace(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: "AttentionForwardArgs",
-        workspace: torch.Tensor,
-    ) -> None:
-        super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
-        required = split_workspace_bytes(
-            metadata.max_num_sequences or metadata.max_num_requests,
-            self.attn.num_heads,
-            self.attn.num_kv_heads,
-            self.attn.head_dim,
-            metadata.max_seq_len,
-        )
-        current = workspace.numel() * workspace.element_size()
-        capturing = metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing()
-        if current < required <= self._MAX_SPLIT_WORKSPACE_BYTES and not capturing:
-            workspace.resize_((math.ceil(required / workspace.element_size()),))
-
     def _run_attention(self, phase: FmhaPhase, **kwargs) -> None:
         query = kwargs["query"]
         fixed_q = kwargs.get("q_len_per_req") or 0
@@ -162,5 +132,8 @@ class DeterministicFmha(FlashInferTrtllmGenFmha):
             scale=kwargs["bmm1_scale"],
             shared_page_indices=kwargs["uses_shared_paged_kv_idx"],
             output=kwargs["out"],
+            # The generation workspace of the TRTLLM-Gen layout (32 MiB). Decode
+            # runs its key segments in parallel when their partial results fit
+            # in it, and serially otherwise; both give the same bits.
             workspace=kwargs.get("workspace_buffer") if phase == FmhaPhase.GENERATION else None,
         )

@@ -15,6 +15,15 @@ from tensorrt_llm._torch.attention.kernels.deterministic_attention import (
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
 
+def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Bitwise equality of BF16 tensors: +0 and -0 differ, and a NaN equals itself."""
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    assert actual.shape == expected.shape
+    assert torch.equal(
+        actual.contiguous().view(torch.int16), expected.contiguous().view(torch.int16)
+    )
+
+
 def test_attention_ignores_cuda_graph_padding_pages():
     keys = torch.randn(3, 1, 32, 64, device="cuda", dtype=torch.bfloat16)
     values = torch.randn_like(keys)
@@ -51,7 +60,7 @@ def test_attention_ignores_cuda_graph_padding_pages():
     )
     assert torch.isfinite(output).all()
     assert not output[0].count_nonzero()
-    torch.testing.assert_close(output[1:], expected, rtol=0, atol=0)
+    _assert_same_bits(output[1:], expected)
 
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
@@ -96,7 +105,7 @@ def test_attention_prefill_decode_and_ragged_batch(dim, length, shared):
     target_q = queries[length - 1 : length].contiguous()
     lengths = torch.tensor([length], device="cuda", dtype=torch.int32)
     decoded = run(target_q, lengths, tables, fixed_q=1)
-    torch.testing.assert_close(decoded[0], full[length - 1], rtol=0, atol=0)
+    _assert_same_bits(decoded[0], full[length - 1])
 
     # FP64 reference uses dense logical K/V, independently of paging and tiles.
     k = keys[table.long()].transpose(1, 2).reshape(-1, kv_heads, dim)[:length].double()
@@ -121,7 +130,7 @@ def test_attention_prefill_decode_and_ragged_batch(dim, length, shared):
         torch.tensor([0, 1, 4, 6], device="cuda", dtype=torch.int32),
         max_q=3,
     )
-    torch.testing.assert_close(ragged[0], decoded[0], rtol=0, atol=0)
+    _assert_same_bits(ragged[0], decoded[0])
 
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -130,7 +139,7 @@ def test_attention_prefill_decode_and_ragged_batch(dim, length, shared):
     target_q.mul_(0.5)
     expected = run(target_q, lengths, tables, fixed_q=1)
     graph.replay()
-    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    _assert_same_bits(captured, expected)
 
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
@@ -176,7 +185,7 @@ def test_attention_all_rows_unaligned_chunks_and_graph_metadata(dim, shared):
         fixed=1,
         maxq=1,
     )
-    torch.testing.assert_close(decoded, full, rtol=0, atol=0)
+    _assert_same_bits(decoded, full)
     start = 0
     for stop in (1, 3, 16, 33, 64, 97, 130, length):
         chunk = run(
@@ -186,7 +195,7 @@ def test_attention_all_rows_unaligned_chunks_and_graph_metadata(dim, shared):
             torch.tensor([0, stop - start], device="cuda", dtype=torch.int32),
             maxq=stop - start,
         )
-        torch.testing.assert_close(chunk, full[start:stop], rtol=0, atol=0)
+        _assert_same_bits(chunk, full[start:stop])
         start = stop
     run(q, lens, table, cu)
     torch.cuda.synchronize()
@@ -197,7 +206,7 @@ def test_attention_all_rows_unaligned_chunks_and_graph_metadata(dim, shared):
     lens.add_(17)
     table.copy_(table.roll(1, dims=-1))
     graph.replay()
-    torch.testing.assert_close(captured, run(q, lens, table, cu), rtol=0, atol=0)
+    _assert_same_bits(captured, run(q, lens, table, cu))
 
 
 # 32 query heads per KV head is the largest supported group; decode then runs
@@ -247,7 +256,7 @@ def test_attention_key_segments_and_parallel_decode(dim, shared, heads_kv):
     lens = (positions + 1).int()
     tables = table.expand(len(positions), *table.shape[1:]).contiguous()
     serial = run(decode_q, lens, tables, fixed=1)
-    torch.testing.assert_close(serial, full[positions], rtol=0, atol=0)
+    _assert_same_bits(serial, full[positions])
 
     workspace = torch.empty(
         split_workspace_bytes(len(positions), heads, kv_heads, dim, pages * page),
@@ -255,10 +264,10 @@ def test_attention_key_segments_and_parallel_decode(dim, shared, heads_kv):
         dtype=torch.uint8,
     )
     parallel = run(decode_q, lens, tables, fixed=1, workspace=workspace)
-    torch.testing.assert_close(parallel, serial, rtol=0, atol=0)
+    _assert_same_bits(parallel, serial)
     # A workspace that is too small keeps the serial layout.
     small = run(decode_q, lens, tables, fixed=1, workspace=workspace[:64])
-    torch.testing.assert_close(small, serial, rtol=0, atol=0)
+    _assert_same_bits(small, serial)
 
     # A captured parallel decode follows lengths that grow across a segment boundary.
     lens = torch.tensor([1020], device="cuda", dtype=torch.int32)
@@ -272,4 +281,4 @@ def test_attention_key_segments_and_parallel_decode(dim, shared, heads_kv):
         one_q.copy_(queries[position : position + 1])
         lens.fill_(position + 1)
         graph.replay()
-        torch.testing.assert_close(captured[0], full[position], rtol=0, atol=0)
+        _assert_same_bits(captured[0], full[position])
