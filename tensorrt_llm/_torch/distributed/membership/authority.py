@@ -544,7 +544,7 @@ class Authority:
         waited_on = 0
         if state in expected:
             waited_on = rank_mask(
-                (r for r in active if not self._replied(reports.get(r), expected[state])),
+                (r for r in active if not self._rank_replied(r, reports, expected[state])),
                 self.world_size,
             )
         # During the startup a rank that started waits on every rank that has not.

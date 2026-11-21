@@ -468,6 +468,29 @@ def test_stalled_joiner_left_out_early():
     assert cluster.now - stalled_s <= admission_s + 0.2
 
 
+def test_ready_joiner_not_hung_while_survivor_finishes_step():
+    """Keep a joiner whose readiness counts as READY while a survivor finishes its step.
+
+    The joiner sends no READY of its own and makes no progress, so the authority must not wait on
+    it, or its admission timeout would leave it out.
+    """
+    admission_s = 2.0
+    cluster = Cluster(admission_timeout_s=admission_s)
+    cluster.alive.discard(2)
+    cluster.run(1.0)
+    _join(cluster, 2)
+    cluster.run_until(MembershipState.PROPOSE)
+    proposed = cluster.authority.record
+    cluster.hung.update({1, 2})  # neither replies READY
+    cluster.installing.add(1)  # rank 1 still makes progress in its step
+    assert cluster.run(admission_s + 1.0) == proposed
+    _release(cluster)
+    cluster.installing.clear()
+    record = cluster.run(1.0)
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == ALL
+
+
 def test_frozen_survivor_removed_before_joiner():
     """Remove a survivor that froze during an admission, not the joiner it holds up."""
     cluster = Cluster(hang_timeout_s=4.0, admission_timeout_s=1.0)
