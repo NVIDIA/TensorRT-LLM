@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+context_parallel_size: 1
+enable_attention_dp: false
+disable_overlap_scheduler: true
+num_postprocess_workers: 0
+enable_resource_governor: false
+max_beam_width: 1
+allreduce_strategy: NCCL
+torch_compile_config: null
+max_batch_size: 1
+max_seq_len: 512
+max_num_tokens: 1024
+enable_chunked_prefill: false
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: false
+  host_cache_size: 0
+  max_tokens: 4096
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1]
