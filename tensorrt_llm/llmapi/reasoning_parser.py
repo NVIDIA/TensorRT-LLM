@@ -735,8 +735,87 @@ _QWEN3_MODEL_TYPES = frozenset({
     "qwen3_next",
 })
 
+# DeepSeek types that 'auto' maps to "deepseek-r1" only when the model name
+# contains "R1"; their other checkpoints cannot be detected.
+DEEPSEEK_R1_ONLY_MODEL_TYPES = frozenset({"deepseek_v3", "deepseek_v32"})
 
-def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
+
+@dataclass(frozen=True)
+class AutoReasoningParserResult:
+    """Outcome of ``--reasoning_parser auto`` detection.
+
+    Attributes:
+        parser: The reasoning parser key to use, or None.
+        no_parser_needed: True only when ``parser`` is None because the
+            model's chat template shows that it never emits a reasoning
+            block. A None ``parser`` without this flag means detection
+            could not pick a parser, and the caller should report it.
+    """
+
+    parser: Optional[str]
+    no_parser_needed: bool = False
+
+
+def _select_default_chat_template(chat_template: Any) -> Optional[str]:
+    """Return the template that a tokenizer applies by default, if any.
+
+    A ``chat_template`` entry is either a single template string or a list
+    of ``{"name": ..., "template": ...}`` entries, of which the one named
+    ``"default"`` is applied when no template is requested by name.
+    """
+    if isinstance(chat_template, str):
+        return chat_template if chat_template.strip() else None
+    if isinstance(chat_template, list):
+        for entry in chat_template:
+            if (isinstance(entry, dict) and entry.get("name") == "default"
+                    and isinstance(entry.get("template"), str)):
+                return _select_default_chat_template(entry["template"])
+    return None
+
+
+def _read_chat_template(model: str) -> Optional[str]:
+    """Return the chat template of a local HF checkpoint, or None if absent.
+
+    As in the ``transformers`` tokenizer, a standalone ``chat_template.jinja``
+    takes priority over the ``chat_template`` entry of
+    ``tokenizer_config.json``. ``chat_template.json``, which only the
+    processor reads, is consulted last. Templates under
+    ``additional_chat_templates/`` are not read, and a list of named templates
+    without a ``"default"`` entry counts as no template. Empty or
+    whitespace-only templates and files that cannot be read or parsed are
+    skipped, so detection falls through to the next source.
+    """
+    model_dir = Path(model)
+    jinja_path = model_dir / "chat_template.jinja"
+    if jinja_path.is_file():
+        try:
+            template = _select_default_chat_template(
+                jinja_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("Cannot read '%s': %s", jinja_path, e)
+            template = None
+        if template is not None:
+            return template
+
+    for file_name in ("tokenizer_config.json", "chat_template.json"):
+        path = model_dir / file_name
+        if not path.is_file():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning("Cannot read '%s': %s", path, e)
+            continue
+        template = _select_default_chat_template(
+            config.get("chat_template") if isinstance(config, dict) else None)
+        if template is not None:
+            return template
+
+    return None
+
+
+def _resolve_qwen3_reasoning_parser(model: str) -> AutoReasoningParserResult:
     """Distinguish Qwen3 hybrid / forced-thinking / forced-non-thinking models.
 
     The Qwen3 family has three reasoning variants with different chat templates:
@@ -748,27 +827,25 @@ def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
       → use the ``"deepseek-r1"`` parser (``reasoning_at_start=True``).
     - **Forced-non-thinking** (e.g. Qwen3-235B-A22B-Instruct-2507): the
       template never injects ``<think>``.
-      → no reasoning parser needed (returns ``None``).
+      → no reasoning parser needed.
+
+    Only a template that was actually read can establish the last case; a
+    checkpoint without one falls back to the ``"qwen3"`` parser.
     """
-    tokenizer_config_path = Path(model) / "tokenizer_config.json"
-    if not tokenizer_config_path.exists():
+    chat_template = _read_chat_template(model)
+    if chat_template is None:
         logger.warning(
-            "Cannot read tokenizer_config.json for Qwen3 model at '%s'. "
+            "Cannot read a chat template for Qwen3 model at '%s'. "
             "Defaulting to 'qwen3' reasoning parser. If this is a "
             "forced-thinking model (*-Thinking-*), use "
             "'--reasoning_parser deepseek-r1' instead.",
             model,
         )
-        return "qwen3"
-
-    with open(tokenizer_config_path) as f:
-        tokenizer_config = json.load(f)
-
-    chat_template = tokenizer_config.get("chat_template", "")
+        return AutoReasoningParserResult("qwen3")
 
     if "enable_thinking" in chat_template:
         # Hybrid model: has enable_thinking toggle.
-        return "qwen3"
+        return AutoReasoningParserResult("qwen3")
 
     if "<think>" in chat_template:
         # Forced-thinking model: always injects <think> tag.
@@ -776,42 +853,54 @@ def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
             "Detected forced-thinking Qwen3 model (no enable_thinking "
             "toggle, but <think> tag present in chat template). "
             "Using 'deepseek-r1' reasoning parser.", )
-        return "deepseek-r1"
+        return AutoReasoningParserResult("deepseek-r1")
 
     # Forced-non-thinking model: no <think> tag at all.
     logger.info(
         "Detected forced-non-thinking Qwen3 model (no <think> tag in "
         "chat template). No reasoning parser needed.", )
-    return None
+    return AutoReasoningParserResult(None, no_parser_needed=True)
 
 
-def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
+def detect_auto_reasoning_parser(model: str) -> AutoReasoningParserResult:
     """Resolve 'auto' reasoning parser by reading the model's HF config.
 
     For DeepSeek models, only maps to deepseek-r1 if the model path
     suggests it is a reasoning model (contains 'R1' in the name).
 
     For Qwen3 models, inspects the chat template to distinguish hybrid,
-    forced-thinking, and forced-non-thinking variants.
+    forced-thinking, and forced-non-thinking variants. Only the last one
+    reports ``no_parser_needed``; every other None result is a detection
+    failure.
     """
     config_path = Path(model) / "config.json"
     if not config_path.exists():
-        return None
+        return AutoReasoningParserResult(None)
 
     with open(config_path) as f:
         config = json.load(f)
 
     model_type = config.get("model_type", "")
 
-    if model_type in ("deepseek_v3", "deepseek_v32"):
+    if model_type in DEEPSEEK_R1_ONLY_MODEL_TYPES:
         model_name = Path(model).name.lower()
         if "r1" not in model_name:
-            return None
+            return AutoReasoningParserResult(None)
 
     if model_type in _QWEN3_MODEL_TYPES:
         return _resolve_qwen3_reasoning_parser(model)
 
-    return MODEL_TYPE_TO_REASONING_PARSER.get(model_type)
+    return AutoReasoningParserResult(
+        MODEL_TYPE_TO_REASONING_PARSER.get(model_type))
+
+
+def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
+    """Return the reasoning parser key that 'auto' selects, or None.
+
+    None covers both "no parser needed" and "cannot detect"; use
+    ``detect_auto_reasoning_parser`` to tell them apart.
+    """
+    return detect_auto_reasoning_parser(model).parser
 
 
 @register_reasoning_parser("nemotron-v3")

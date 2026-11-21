@@ -68,8 +68,9 @@ from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           TorchLlmArgs, build_cli_config)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
-from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
-                                                  resolve_auto_reasoning_parser)
+from tensorrt_llm.llmapi.reasoning_parser import (
+    DEEPSEEK_R1_ONLY_MODEL_TYPES, MODEL_TYPE_TO_REASONING_PARSER,
+    ReasoningParserFactory, detect_auto_reasoning_parser)
 from tensorrt_llm.llmapi.startup_checks import no_visible_gpu_error
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
@@ -1861,19 +1862,25 @@ def serve(
         tool_parser = resolved
 
     if reasoning_parser == "auto":
-        resolved = resolve_auto_reasoning_parser(model)
-        if resolved is None:
+        detected = detect_auto_reasoning_parser(model)
+        if detected.parser is not None:
+            logger.info(f"Auto-detected reasoning parser: {detected.parser}")
+        elif detected.no_parser_needed:
+            logger.info(f"The chat template of model '{model}' never opens a "
+                        f"reasoning block; serving without a reasoning parser.")
+        else:
+            supported_model_types = ", ".join(
+                f"{model_type} (R1 only)" if model_type in
+                DEEPSEEK_R1_ONLY_MODEL_TYPES else model_type
+                for model_type in sorted(MODEL_TYPE_TO_REASONING_PARSER))
             raise click.BadParameter(
                 f"Cannot auto-detect reasoning parser for model '{model}'. "
-                f"Supported model types for auto-detection: qwen3, qwen3_moe, "
-                f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
-                f"deepseek_v32 (R1 only), deepseek_v4, nemotron_h, gemma4, "
-                f"kimi_k2, kimi_k25. "
+                f"Supported model types for auto-detection: "
+                f"{supported_model_types}. "
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
                 param_hint="--reasoning_parser")
-        logger.info(f"Auto-detected reasoning parser: {resolved}")
-        reasoning_parser = resolved
+        reasoning_parser = detected.parser
     if "--revision" in sys.argv:
         logger.warning("--revision is deprecated, use --hf_revision instead.")
 
