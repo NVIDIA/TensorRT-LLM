@@ -178,9 +178,10 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
             f"rows must be a contiguous int32 tensor on {device}, one-dimensional or, with valid_seq_lens, "
             f"[{shape[0]}, m]"
         )
-    elif rows.numel() < 2 * rank:
+    elif rows.shape[-1] < 2 * rank:
         raise ValueError(
-            f"rows must hold at least {2 * rank} tokens: the basis of rank {rank} is estimated on them"
+            f"rows must hold at least {2 * rank} tokens per batch element: the basis of rank {rank} is "
+            "estimated on them"
         )
     if lens is None:
         return Operands(pv, rank, shape[:3], family.prepare(q, k, v, workspace, pv, rank, rows))
