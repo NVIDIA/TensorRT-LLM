@@ -209,13 +209,24 @@ def slice_request_boundaries(cu_seq_lens: list[int], start: int, end: int) -> tu
 
 
 def _run_abi(run_args) -> tuple:
-    return tuple((name, tuple(t.shape), tuple(t.stride()), t.dtype) for name, t in run_args)
+    return tuple(
+        (name, tuple(t.shape), tuple(t.stride()), t.dtype, t.device, t.data_ptr() % 16)
+        for name, t in run_args
+    )
+
+
+class _Plan:
+    __slots__ = ("wrapper", "abi")
+
+    def __init__(self, wrapper) -> None:
+        self.wrapper = wrapper
+        # Run ABI of the last validated launch; None until one succeeds.
+        self.abi: tuple | None = None
 
 
 class _PrimsTSSparseCore:
     def __init__(self) -> None:
-        self._plans: dict[tuple, object] = {}
-        self._last_abi: dict[tuple, tuple] = {}
+        self._plans: dict[tuple, _Plan] = {}
         self._workspace: torch.Tensor | None = None
         # Graphs captured before a growth keep the old buffer's address.
         self._retired_workspaces: list[torch.Tensor] = []
@@ -374,8 +385,8 @@ class _PrimsTSSparseCore:
                 (padded_rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device
             )
         with self._lock:
-            wrapper = self._plans.get(key)
-            if wrapper is None:
+            plan = self._plans.get(key)
+            if plan is None:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("QSA PrimTS plan must be prepared before CUDA-graph capture")
                 nbytes = workspace_size(
@@ -410,21 +421,24 @@ class _PrimsTSSparseCore:
                     kv_dtype=k_cache.dtype,
                     out_dtype=out_dtype,
                 )
-                self._plans[key] = wrapper
+                plan = self._plans[key] = _Plan(wrapper)
+            wrapper = plan.wrapper
             run_out = out.view_as(route_q) if is_decode else out
             run_args = (
                 ("q", route_q),
-                ("block_ids", block_ids),
+                ("k_cache", k_cache),
+                ("v_cache", v_cache),
                 ("block_table", block_table),
+                ("block_ids", block_ids),
                 *metadata_args,
+                *((("qo_indptr", qo_indptr),) if qo_indptr is not None else ()),
                 ("out", run_out),
             )
             abi = _run_abi(run_args)
-            previous = self._last_abi.get(key)
             try:
-                # The wrapper's per-call validation costs host time; the plan key
-                # fixes K/V and qo_indptr storage, so a repeat of a validated ABI
-                # can skip it.
+                # The wrapper's per-call validation costs host time. It covers
+                # the same tensors as abi, so a repeat of the ABI this wrapper
+                # last validated can skip it.
                 wrapper.run(
                     route_q,
                     (k_cache, v_cache),
@@ -436,16 +450,19 @@ class _PrimsTSSparseCore:
                     qo_indptr=qo_indptr,
                     sm_scale=softmax_scale,
                     out=run_out,
-                    validate=previous != abi,
+                    validate=plan.abi != abi,
                 )
             except RuntimeError as error:
-                changed = (
-                    [(a, b) for a, b in zip(previous, abi) if a != b]
-                    if previous
-                    else [("no eager run for this plan key", None)]
-                )
-                raise RuntimeError(f"{error}; ABI changes vs first eager run: {changed}") from error
-            self._last_abi[key] = abi
+                previous, plan.abi = plan.abi, None
+                if previous is None:
+                    detail = "no validated run for this plan"
+                elif previous == abi:
+                    detail = "validation skipped for an unchanged ABI"
+                else:
+                    changed = [(a, b) for a, b in zip(previous, abi) if a != b]
+                    detail = f"ABI changes vs the last validated run: {changed}"
+                raise RuntimeError(f"{error}; {detail}") from error
+            plan.abi = abi
         if result is None:
             return out[:rows]
         if result is not out:

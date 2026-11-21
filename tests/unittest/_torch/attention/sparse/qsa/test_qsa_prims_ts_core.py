@@ -311,42 +311,66 @@ def test_repeat_runs_skip_wrapper_validation() -> None:
     _requires_prims_ts()
     import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
 
+    softmax_scale = HEAD_DIM**-0.5
     kwargs = dict(
-        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=softmax_scale, is_decode=False
     )
     cases = [_make_case([36, 92], seed=60 + i) for i in range(2)]
-    k_cache, v_cache, block_table = cases[0][1], cases[0][2], cases[0][3]
-    other = _make_case([40, 100], seed=70)
+    # 192 rows need a larger workspace, which drops every plan.
+    larger = _make_case([40, 100], seed=70)
+    # One K/V cache for every call, so the cases share a plan key.
+    k_cache, v_cache, block_table, metadata = cases[0][1], cases[0][2], cases[0][3], cases[0][8]
 
-    def run(case):
+    def run(case: tuple, positions_dtype: torch.dtype = torch.int32) -> torch.Tensor:
         q, _, _, _, block_ids, request_indices, positions, _, _ = case
         return prims_ts_sparse_gqa(
-            q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            block_ids,
+            request_indices,
+            positions.to(positions_dtype),
+            **kwargs,
         )
 
-    expected = [run(case).clone() for case in cases]
+    def reference(case: tuple) -> torch.Tensor:
+        q, _, _, _, _, request_indices, _, selected_tokens, _ = case
+        return qsa_sparse_gqa_reference(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            selected_tokens=selected_tokens,
+            request_indices=request_indices,
+            metadata=metadata,
+            softmax_scale=softmax_scale,
+        )
+
     validated = []
     wrapper_cls = fi_metadata.QTokenKvBlockSparsePagedTSWrapper
     original = wrapper_cls.run
 
-    def recorded(self, *args, validate=True, **kw):
+    def recorded(self, *args, validate: bool = True, **kw) -> torch.Tensor:
         validated.append(validate)
         return original(self, *args, validate=validate, **kw)
 
     wrapper_cls.run = recorded
     try:
-        # Fresh core so the first run is the eager, validated one.
         core = prims_ts_core._PrimsTSSparseCore()
         with mock.patch.object(prims_ts_core, "_CORE", core):
             outputs = [run(case).clone() for case in cases]
-            run(other)
+            run(larger)
+            outputs.append(run(cases[0]).clone())
+            outputs.append(run(cases[1], torch.int64).clone())
+            outputs.append(run(cases[1], torch.int64).clone())
     finally:
         wrapper_cls.run = original
     torch.cuda.synchronize()
-    # Same plan key and ABI skips validation; a new plan key validates again.
-    assert validated == [True, False, True]
-    for out, ref in zip(outputs, expected):
-        assert torch.equal(out, ref)
+    # Same plan and ABI skips validation. A new plan key, a plan rebuilt after
+    # workspace growth and a changed ABI under one plan each validate again.
+    assert validated == [True, False, True, True, True, False]
+    for out, case in zip(outputs, (cases[0], cases[1], cases[0], cases[1], cases[1])):
+        torch.testing.assert_close(out.float(), reference(case).float(), atol=2e-2, rtol=2e-2)
 
 
 def test_auto_gates_small_decode_batches() -> None:
