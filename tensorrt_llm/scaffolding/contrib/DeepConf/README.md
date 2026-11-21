@@ -74,7 +74,6 @@ Under the same configuration, confidence-based voting methods significantly impr
 
 ## References
 
-- Blog post: [Deep Think with Confidence](https://jiaweizzhao.github.io/deepconf/)
 - Paper: [https://arxiv.org/abs/2508.15260](https://arxiv.org/abs/2508.15260)
 - Codebase: [https://github.com/facebookresearch/deepconf](https://github.com/facebookresearch/deepconf)
 
