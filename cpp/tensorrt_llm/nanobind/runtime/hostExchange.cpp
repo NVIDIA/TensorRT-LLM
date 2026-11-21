@@ -39,14 +39,16 @@
 // Each rank owns a row of MNNVL memory that every rank maps. A row holds two slot sets, and each set holds one slot per
 // sender rank. Rounds alternate between the sets by the parity of their epoch, so a fast rank never overwrites a slot
 // that a slow rank still reads. A slot is a run of 8-byte packets:
-//   packet 0 (header):  [ epoch : 32 | payload length in bytes : 32 ]
-//   packet i (payload): [ epoch : 32 | 4 payload bytes             ]
+//   packet 0 (header):  [ epoch : 32 | payload bytes left : 32 ]
+//   packet i (payload): [ epoch : 32 | 4 payload bytes         ]
+// The header holds the payload bytes its sender has left from this round on, capped at 0xFFFFFFFF; the wait reads at
+// most a slot of them.
 // The epoch counts rounds and skips 0, because the rows start zeroed. A packet belongs to the current round when it
 // carries the round's epoch, so a reader needs no separate ready flag. This relies on the copy engines moving each
 // aligned 8-byte packet in one transaction, so that a reader never sees a packet's epoch with the other half of an
 // older packet. CUDA does not document this; on GB200 no packet was seen torn in 3.8e9 polled packets of 4 KiB and
 // 64 KiB slots, while a writer splitting each packet into two 4-byte copies tore 5.1e8. A torn header would carry an
-// older payload length, and the wait would return a payload of that length; a torn payload packet would carry older
+// older length, and the wait would return a payload of that length; a torn payload packet would carry older
 // payload bytes.
 //
 // One round on rank r:
