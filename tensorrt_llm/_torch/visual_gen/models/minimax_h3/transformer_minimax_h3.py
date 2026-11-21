@@ -1122,11 +1122,16 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             packed_hidden_states = _pad_tensor_dim(packed_hidden_states, 1, pad)
             adaln_indices = _pad_tensor_dim(adaln_indices, 0, pad)
             timestep_indices_for_norm = _pad_tensor_dim(timestep_indices, 0, pad)
-            # One padded tensor per tags tensor: a backend that draws tokens by modality keeps
-            # its draw with the tensor it is given.
+            # One padded tensor per tags content: a backend that draws tokens by modality keeps
+            # its draw with the tensor it is given. The memo holds its own copy of the tags, so
+            # a caller that refills one tags buffer in place gets the padding of the new tags.
             padded_tags = self._padded_token_tags
-            if padded_tags is None or padded_tags[0] is not token_tags or padded_tags[1] != pad:
-                padded_tags = (token_tags, pad, _pad_tensor_dim(token_tags, 0, pad, -1))
+            if (
+                padded_tags is None
+                or padded_tags[1] != pad
+                or not torch.equal(padded_tags[0], token_tags)
+            ):
+                padded_tags = (token_tags.clone(), pad, _pad_tensor_dim(token_tags, 0, pad, -1))
                 self._padded_token_tags = padded_tags
             token_tags_for_mask = padded_tags[2]
             rotary_emb = _pad_rotary_emb(rotary_emb, pad)

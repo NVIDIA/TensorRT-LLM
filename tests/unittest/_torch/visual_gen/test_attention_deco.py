@@ -27,6 +27,7 @@ from tensorrt_llm._torch.visual_gen.attention.backends import (
     create_attention,
     get_visual_gen_attention_backend,
 )
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 HEAD_DIM = 128
@@ -36,14 +37,16 @@ _UNSEEN_LENGTHS = itertools.count(2001)
 
 
 def _require_deco_gpu(v_dtype: str = "fp8") -> torch.device:
-    """Skip unless the GPU has a DeCo kernel with this V format (NVFP4 PV: SM120 only)."""
+    """Skip unless the GPU has a DeCo kernel with this V format, as the kernel package reports it
+    (NVFP4 PV: SM120 only)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the DeCo-Attention kernels.")
-    capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3), (10, 7), (12, 0)):
+    try:
+        pv_formats = deco_attention.pv_formats()
+    except NotImplementedError:
         pytest.skip("DeCo-Attention kernels need an SM100, SM103, SM107 or SM120 GPU.")
-    if v_dtype == "nvfp4" and capability != (12, 0):
-        pytest.skip("DeCo-Attention with NVFP4 PV needs an SM120 GPU.")
+    if v_dtype not in pv_formats:
+        pytest.skip(f"DeCo-Attention with {v_dtype} PV has no kernel on this GPU.")
     return torch.device("cuda:0")
 
 
@@ -233,6 +236,10 @@ def test_deco_delegates_unsupported_calls() -> None:
     assert not out[:, 200:].any()
     ref = _sdpa(q[:, :200], k[:, :200], v[:, :200], attn_mask=key_padding_mask[:, None, None, :200])
     assert _relative_error(out[:, :200], ref) < 2e-2
+    # Cross-attention keeps all its keys: only the padded query rows are zero.
+    out = attn.forward(q, k[:, :128], v[:, :128], valid_seq_len=200)
+    assert not out[:, 200:].any()
+    assert _relative_error(out[:, :200], _sdpa(q[:, :200], k[:, :128], v[:, :128])) < 2e-2
 
     assert "deco_workspace" not in attn._state
     # The causal call has the shape of a self-attention call: the layer notes it once.
@@ -242,8 +249,6 @@ def test_deco_delegates_unsupported_calls() -> None:
 def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
     """With the token tags of a packed sequence the preparation takes half of its rows from the
     text and audio tokens and none from the padding; the rows are drawn once per tags tensor."""
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
-
     device = _require_deco_gpu()
     batch_size, seq_len, num_heads = 1, 4096, 2
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
@@ -256,8 +261,9 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
 
     out = attn.forward(q, k, v, token_tags=token_tags)
 
-    ((kept_tags, rows),) = state["deco_tagged_rows"]
-    assert kept_tags is token_tags
+    (entry,) = state["deco_tagged_rows"]
+    assert entry.tags is token_tags and not entry.captured
+    rows = entry.rows
     drawn = token_tags[rows.long()]
     assert (drawn >= 0).all()
     assert int((drawn > 0).sum()) == rows.numel() // 2
@@ -286,6 +292,16 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
     assert deco_attention.sample_rows(seq_len, device, padding).numel() == 0
     with pytest.raises(ValueError, match="at least 64 tokens"):
         deco_attention.prepare(q, k, v, workspace, "fp8", rows=rows[:63])
+    # The floor holds per batch element for the rows of a padded batch.
+    lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="at least 64 tokens"):
+        deco_attention.prepare(q, k, v, workspace, "fp8", rows=rows[:63][None], valid_seq_lens=lens)
+
+    # Tags with fewer valid tokens than the basis needs leave the draw to the preparation.
+    few_valid = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
+    few_valid[:50] = 1
+    assert torch.equal(attn.forward(q, k, v, token_tags=few_valid), attn.forward(q, k, v))
+    assert state["deco_tagged_rows"][0].rows is None
 
     # A row outside the sequence stands for its nearest token.
     beyond, last = rows.clone(), rows.clone()
@@ -331,8 +347,6 @@ def test_deco_valid_seq_len_attends_the_prefix(v_dtype: str) -> None:
         attn.forward(q, k, v, valid_seq_len=seq_len + 1)
 
     # A batch element without valid tokens comes back zero, whatever its padding holds.
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
-
     lens = torch.tensor([0, valid_seq_len], dtype=torch.int32, device=device)
     num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, device, v_dtype)
     workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
@@ -346,24 +360,31 @@ def test_deco_valid_seq_len_attends_the_prefix(v_dtype: str) -> None:
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_cuda_graph(v_dtype: str) -> None:
     """A forward is captured after an eager forward of its shape and replays onto new inputs,
-    also after eager forwards of other shapes reused and regrew the component's workspace. A
+    also after eager forwards of other shapes reused and regrew the component's workspace and
+    other requests' token tags passed through the state, which keeps the captured draw. A
     sequence length first met under capture is rejected with a clear error."""
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
-
     device = _require_deco_gpu(v_dtype)
     batch_size, seq_len, num_heads = 1, 384, 2
-    attn = _backend(num_heads, v_dtype)
+    state: dict = {}
+    attn = _backend(num_heads, v_dtype, state=state)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
+    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    token_tags[:64] = 1
 
-    attn.forward(q, k, v)
+    attn.forward(q, k, v, token_tags=token_tags)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_out = attn.forward(q, k, v)
+        graph_out = attn.forward(q, k, v, token_tags=token_tags)
+    (entry,) = state["deco_tagged_rows"]
+    assert entry.captured
 
-    for other_len in (128, 1024):
-        attn.forward(*_random_qkv(batch_size, other_len, num_heads, device))
+    for other_len in (128, 1024, 256, 512, 640, 768):
+        other_tags = torch.zeros(other_len, dtype=torch.int32, device=device)
+        other_tags[:64] = 1
+        attn.forward(*_random_qkv(batch_size, other_len, num_heads, device), token_tags=other_tags)
+    assert entry in state["deco_tagged_rows"] and len(state["deco_tagged_rows"]) == 5
     new_q, new_k, new_v = _random_qkv(batch_size, seq_len, num_heads, device, seed=1)
-    expected = attn.forward(new_q, new_k, new_v).clone()
+    expected = attn.forward(new_q, new_k, new_v, token_tags=token_tags).clone()
     q.copy_(new_q)
     k.copy_(new_k)
     v.copy_(new_v)
@@ -380,3 +401,7 @@ def test_deco_cuda_graph(v_dtype: str) -> None:
     with pytest.raises(RuntimeError, match="eagerly once before capturing"):
         with torch.cuda.graph(torch.cuda.CUDAGraph()):
             deco_attention.prepare(*unseen, workspace, v_dtype)
+    # So does the backend for the draw of token tags it has not seen.
+    with pytest.raises(RuntimeError, match="eagerly once before capturing"):
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            attn.forward(q, k, v, token_tags=token_tags.clone())
