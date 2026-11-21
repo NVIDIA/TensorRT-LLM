@@ -914,8 +914,6 @@ def warmup_prims_ts_sparse_mla(
     )
     from tensorrt_llm._torch.attention.mla import MLA
 
-    from .fallback import FallbackFmha
-
     if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
         raise RuntimeError("PrimTS kernel warmup requires eager metadata outside graph capture")
 
@@ -927,13 +925,12 @@ def warmup_prims_ts_sparse_mla(
         if manager is None or not any(True for _ in layer.parameters()):
             continue
         for library in manager.fmha_libs:
-            if isinstance(library, FallbackFmha):
-                # The fallback accepts the DeepSeek-V4 generation call on this layer.
-                break
             if isinstance(library, PrimsTSSparseMlaFmha):
                 profile = library.warmup_profile(layer, metadata)
                 if profile is not None:
                     profiles.append(profile)
+                break
+            if library.covers_dsv4_generation_warmup:
                 break
     _warmup_profiles(profiles, metadata)
 
