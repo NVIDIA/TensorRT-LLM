@@ -437,6 +437,7 @@ def executor_for_preemption(p, reqs, scheduler):
         active_requests=reqs,
         inflight_req_ids=set(),
         canceled_req_ids=[],
+        _held_transfer_failures=lambda: {},
         kv_cache_manager=Mock(spec=[]),
         kv_cache_transceiver=None,
         _cancelled_disagg_model_request_ids=lambda: set(),

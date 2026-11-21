@@ -59,6 +59,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorkerConfig,
     TxSession,
     _validate_rank_info_auth_key,
+    agent_recovery_supported,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -422,6 +423,37 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
         self._context_first_ownership_logged = False
         ownership_capable = enforce_physical_ownership or self._context_first_ownership
+        recovery_enabled = agent_recovery_supported(
+            enforce_physical_ownership,
+            self._context_first_ownership,
+            cache_transceiver_config.kv_cache_bounce_size_mb,
+        ) and (mapping.world_size == 1 or (ENABLE_MULTI_DEVICE and not mpi_disabled()))
+        if mapping.world_size > 1:
+            validation_error = None
+            recovery_comm = None
+            if recovery_enabled:
+                try:
+                    recovery_comm = _retirement_executor_comm(mapping, warn=False)
+                except ValueError as error:
+                    validation_error = str(error)
+            votes = dist.allgather((recovery_enabled, validation_error))
+            errors = [error for _, error in votes if error is not None]
+            if any(enabled != recovery_enabled for enabled, _ in votes):
+                raise ValueError(
+                    "NIXL recovery startup agreement failed: inconsistent recovery profiles"
+                )
+            if errors:
+                recovery_enabled = False
+                if mapping.rank == 0:
+                    logger.info(f"NIXL agent recovery unavailable: {errors[0]}")
+            if recovery_enabled:
+                self._retirement_mpi_comm = recovery_comm
+                if mapping.rank == 0:
+                    logger.warning(
+                        "NIXL recovery uses executor-scoped MPI retirement fail-stop; "
+                        "MPI/launcher termination may include other executors in the same job."
+                    )
+        self._agent_recovery = recovery_enabled
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -460,6 +492,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 agent_buffer_size_mb=cache_transceiver_config.kv_cache_bounce_size_mb,
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
                 rank_info_auth_key=cache_transceiver_config._rank_info_auth_key,
+                recovery_fatal_callback=(
+                    self._fail_unproven_transfer if recovery_enabled else None
+                ),
             )
         )
         if enforce_physical_ownership:
@@ -677,6 +712,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             + self._gen_deferred_receives
             + len(self._pending_rank_info_admissions or {})
             + len(self._rank_info_start_failures or {})
+            + int(not self._local_agent_ready())
         )
         counts = self._dist.tp_cp_allgather_int64([local])
         return bool(counts.any())
@@ -999,6 +1035,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_quiesced=None,
         locally_verified=None,
         local_session_count: Optional[int] = None,
+        failure_intents: Optional[list[int]] = None,
+        agent_ready: Optional[bool] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
@@ -1014,6 +1052,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             local_outcome.append(list(locally_verified))
         if local_session_count is not None:
             local_outcome.append([local_session_count])
+        if failure_intents is not None:
+            local_outcome.append(list(failure_intents))
+        if agent_ready is not None:
+            local_outcome.append([int(agent_ready)])
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -1025,6 +1067,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
         global_completed = self._intersection(all_done, n)
+        extra_index = 3 + int(locally_quiesced is not None) + int(locally_verified is not None)
+        extra_index += int(local_session_count is not None)
+        intents = (
+            self._union([p[extra_index] for p in packed]) if failure_intents is not None else set()
+        )
+        # Internal failures use cancellation for drain, without becoming user cancellations.
+        global_failed.update(intents)
+        global_cancelled.difference_update(intents)
         new_cancelled = [rid for rid in to_process if rid in global_cancelled]
         cancel_set = set(new_cancelled)
         new_failed = [rid for rid in to_process if rid in global_failed and rid not in cancel_set]
@@ -1049,22 +1099,94 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             result.append({rid for rid in to_process if rid in global_verified})
         if local_session_count is not None:
             result.append(all(p[idx][0] == 0 for p in packed))
+            idx += 1
+        if failure_intents is not None:
+            result.append(intents)
+            idx += 1
+        if agent_ready is not None:
+            result.append(all(p[idx][0] for p in packed))
         return tuple(result)
 
+    def _local_agent_ready(self) -> bool:
+        worker = getattr(self, "_transfer_worker", None)
+        return getattr(worker, "agent_available", True) is not False
+
+    @property
+    def can_admit_gen_requests(self) -> bool:
+        """Whether the receive group and the local agent accept new transfers."""
+        # Group agreement selects the same candidates; the native publication
+        # gate below catches a local fence racing this scheduling boundary.
+        return getattr(self, "_gen_agent_ready", True)
+
+    @property
+    def can_admit_ctx_requests(self) -> bool:
+        """Whether the send group may start more context work."""
+        return getattr(self, "_ctx_agent_ready", True)
+
+    @property
+    def has_pending_agent_recovery(self) -> bool:
+        """Keep the existing idle poll active until both groups reopen admission."""
+        return not (self.can_admit_ctx_requests and self.can_admit_gen_requests)
+
+    def _failure_intents(self, sessions: dict, side: str) -> set[int]:
+        """Retain logical failures independently of physical retirement."""
+        pending = self.__dict__.setdefault(f"_{side}_failure_intents", set())
+        pending.intersection_update(sessions)
+        pending.update(
+            rid
+            for rid, session in sessions.items()
+            if session.status == SessionStatus.ERROR
+            or (isinstance(session, RxSession) and session.committed_failure)
+        )
+        if not self._local_agent_ready():
+            pending.update(
+                rid
+                for rid, session in sessions.items()
+                if session.status not in (SessionStatus.CANCELLED, SessionStatus.TRANSFERRED)
+            )
+        return pending
+
+    def _cancel_failed_transfers(self, sessions: dict, intents: set[int]) -> None:
+        """Reuse session cancellation; it fences publication and retains live accessors."""
+        for rid in intents:
+            session = sessions.get(rid)
+            if session is None:
+                continue
+            if isinstance(session, (TxSession, RxSession)):
+                if getattr(session, "_failure_cancel_notified", False):
+                    continue
+                error = RuntimeError("KV transfer agent unavailable")
+                try:
+                    if isinstance(session, TxSession):
+                        session._logical_outcomes.fail(error)
+                        session.cancel_local(by_peer=True)
+                        session._sender.send_cancel_to_receivers(rid, failure=True)
+                    else:
+                        session.record_recovery_failure(error)
+                        if not session.cancel(by_peer=True):
+                            session.notify_cancel()
+                    session._failure_cancel_notified = True
+                except RuntimeError as error:
+                    logger.warning(f"Transfer {rid} failure cancellation will retry: {error}")
+
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
-        # A failure/cancellation may be global, but reuse is safe only after
-        # every participating rank has drained its local physical accessor.
-        locally_retirable = []
-        for rid in to_process:
-            # A coordinated start failure may precede session creation on this rank.
-            session = self._recv_sessions.get(rid)
-            if not self._retirement_blocked(session):
-                locally_retirable.append(rid)
+        sessions = self._recv_sessions
+        recovery = getattr(self, "_agent_recovery", False)
+        candidates = list(dict.fromkeys([*to_process, *sessions])) if recovery else to_process
         idle_skip = self._gen_idle_poll_skip
-        deferred = self._gen_deferred_receives
-        pending_admissions = len(self._pending_rank_info_admissions or {})
+        intents = self._failure_intents(sessions, "gen") if recovery else None
+        terminal = None
+        if recovery:
+            self._cancel_failed_transfers(sessions, intents)
+            terminal = intents | set(cancelled) | set(failed) | set(completed)
+        locally_retirable = [
+            rid
+            for rid in candidates
+            if not self._retirement_blocked(sessions.get(rid))
+            and (terminal is None or rid in terminal)
+        ]
         outcome = self._consensus_outcome(
-            to_process,
+            candidates,
             cancelled,
             failed,
             completed,
@@ -1073,13 +1195,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             locally_retirable,
             locally_verified,
             local_session_count=(
-                len(self._recv_sessions) + deferred + pending_admissions if idle_skip else None
+                len(sessions)
+                + self._gen_deferred_receives
+                + len(self._pending_rank_info_admissions or {})
+                if idle_skip
+                else None
             ),
+            failure_intents=list(intents) if intents is not None else None,
+            agent_ready=self._local_agent_ready() if recovery else None,
         )
         new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
+        if recovery:
+            newly_failed = outcome[-2] - intents
+            intents.update(outcome[-2])
+            self._gen_agent_ready = outcome[-1]
+            self._cancel_failed_transfers(sessions, newly_failed)
         if idle_skip:
-            # Every rank derives this from the same gathered payload.
-            self._gen_idle_agreed = outcome[5]
+            # Keep the existing control poll alive until the group has recovered.
+            self._gen_idle_agreed = (
+                outcome[5] and getattr(self, "_gen_agent_ready", True) and not intents
+            )
         retirable = set(globally_retirable)
         return (
             [rid for rid in new_cancelled if rid in retirable],
@@ -1089,21 +1224,53 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
-        # TP first, then PP. A local timeout remains nonterminal, so it is
-        # represented by the absence of that request from completed.
-        c, f, d, q = self._consensus_outcome(
-            to_process,
+        sessions = getattr(self, "_send_sessions", {})
+        recovery = getattr(self, "_agent_recovery", False)
+        candidates = list(dict.fromkeys([*to_process, *sessions])) if recovery else to_process
+        intents = self._failure_intents(sessions, "ctx") if recovery else None
+        if recovery:
+            self._cancel_failed_transfers(sessions, intents)
+        terminal = set(cancelled) | set(failed) | set(completed)
+        quiesced = (
+            [
+                rid
+                for rid in candidates
+                if (rid in intents or rid in terminal)
+                and (rid not in sessions or not self._retirement_blocked(sessions[rid]))
+            ]
+            if recovery
+            else locally_quiesced
+        )
+        outcome = self._consensus_outcome(
+            candidates,
             cancelled,
             failed,
             completed,
             self._dist.tp_allgather,
             self._ctx_need_tp_sync,
-            locally_quiesced,
+            quiesced,
+            failure_intents=list(intents) if recovery else None,
+            agent_ready=self._local_agent_ready() if recovery else None,
         )
         if self._ctx_need_pp_sync:
-            pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-            c, f, d, q = self._consensus_outcome(to_process, c, f, d, pp_allgather, True, q)
-        return c, f, d, q
+            c, f, d, q = outcome[:4]
+            outcome = self._consensus_outcome(
+                candidates,
+                c,
+                f,
+                d,
+                self._dist.pp_allgather,
+                True,
+                q,
+                failure_intents=list(outcome[4]) if recovery else None,
+                agent_ready=outcome[5] if recovery else None,
+            )
+        if recovery:
+            newly_failed = outcome[4] - intents
+            intents.update(outcome[4])
+            self._ctx_agent_ready = outcome[5]
+            self._cancel_failed_transfers(sessions, newly_failed)
+        return outcome[:4]
 
     def _sync_transfer_timing(self, reqs: list):
         """Allgather timing for a batch of completed requests in one collective.
@@ -1222,8 +1389,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if session is not None and not session_already_closed:
             if getattr(session, "_enforce_physical_ownership", False):
                 self._close_session_or_raise(session, rid, outcome)
-            else:
-                session.close()
+            elif session.close() is False:
+                return
         self._send_sessions.pop(rid, None)
         # Early teardown may occur before _send_reqs is populated.
         req = req if req is not None else self._send_reqs.get(rid)
@@ -1233,7 +1400,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @staticmethod
     def _ownership_blocks_retirement(session: object) -> bool:
-        """Whether an ownership-enabled session still holds physical resources."""
+        """Whether a session still holds physical transfer resources."""
+        if isinstance(session, TxSession):
+            return session._close_requires_drain() and not session.resources_drained()
         if not getattr(session, "_enforce_physical_ownership", False):
             return False
         resources_drained = getattr(session, "resources_drained", None)
@@ -1249,10 +1418,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """
         if cls._ownership_blocks_retirement(session):
             return True
-        return isinstance(session, RxSession) and session.failed_receive_awaits_writers()
+        return isinstance(session, RxSession) and (
+            session.failed_receive_awaits_writers()
+            or (session.status == SessionStatus.CANCELLED and session.has_transferring_tasks())
+        )
 
     def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
         """Close one terminal session or fail-stop instead of diverging locally."""
+        if (
+            outcome == "shutdown"
+            and getattr(self, "_agent_recovery", False)
+            and isinstance(session, (TxSession, RxSession))
+            and not getattr(session, "_enforce_physical_ownership", False)
+        ):
+            sender = self._transfer_worker._sender
+            deadline = time.monotonic() + sender._retirement_timeout_s
+            session.cancel()
+            while self._retirement_blocked(session):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    sender._fail_agent_recovery(
+                        sender._agent_generation, rid, deadline - sender._retirement_timeout_s
+                    )
+                    raise RuntimeError("NIXL shutdown retirement timed out")
+                time.sleep(min(0.01, remaining))
         if self._ownership_blocks_retirement(session):
             raise RuntimeError(
                 f"refusing to retire {outcome} KV transfer rid={rid}: "
@@ -1590,10 +1779,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ):
                     self._emit_transfer_settled("gen", rid, req, session, settlement_outcome)
             else:
+                self._recv_sessions[rid] = session
+                self._recv_reqs[rid] = req
                 logger.error(
                     f"request_and_receive_sync: retaining rid={rid} because receive "
                     "resources remain active"
                 )
+
+    def reap_sync_receives(self) -> bool:
+        """Retry close for synchronous receives left open by the blocking call."""
+        retired = False
+        for rid, session in list(self._recv_sessions.items()):
+            if self._retirement_blocked(session) or session.close() is False:
+                continue
+            req = self._recv_reqs.pop(rid)
+            del self._recv_sessions[rid]
+            retired = True
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                self._emit_transfer_settled("gen", rid, req, session, "failed")
+        return retired
 
     def _open_peer_source(self, req: LlmRequest) -> PeerFetch:
         """The paired backend: pull this request's cache from the worker that ran its context."""
@@ -1954,7 +2158,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
                 # server timeout).  Return the req objects so the caller can
                 # distinguish the two cases and set the appropriate state.
-                cancelled.append(rid)
+                if isinstance(session, RxSession) and session.recovery_failed:
+                    failed.append(rid)
+                else:
+                    cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
                 if session.transfer_end_time is not None:
@@ -2288,9 +2495,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 session.notify_cancel()
             else:
                 session.cancel()
-            if session.has_transferring_tasks():
+            if isinstance(session, RxSession) and (
+                session.recovery_failed
+                or (
+                    getattr(self, "_agent_recovery", False)
+                    and (
+                        session.committed_failure
+                        or (
+                            self._gen_need_sync
+                            and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
+                        )
+                    )
+                )
+            ):
+                # Keep the local retirement vote even if this shard drained first.
                 has_transferring = True
-            elif session.close() is False:
+            elif session.has_transferring_tasks() or session.close() is False:
                 has_transferring = True
             else:
                 # The bridge has a stable, rank-local receive outcome. Keep
@@ -2355,6 +2575,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Place new generation-first context requests into wait state, then
         # use allgather consensus to promote ready requests to CONTEXT_INIT.
         for req in requests:
+            if (
+                req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+                and self.can_admit_ctx_requests
+            ):
+                continue
             if not self._validate_bridge_req(req):
                 continue
             rid = get_unique_rid(req)
@@ -2374,7 +2599,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         local_ready = [
             rid
             for rid in self._wait_reqs
-            if self._transfer_worker.has_all_peer_req_infos_for_send(rid)
+            if self._local_agent_ready()
+            and (
+                self._wait_reqs[rid].py_disaggregated_params.schedule_style
+                == DisaggScheduleStyle.CONTEXT_FIRST
+                or self._transfer_worker.has_all_peer_req_infos_for_send(rid)
+            )
         ]
         for rid in self._ctx_consensus(local_ready):
             self._wait_reqs[rid].state = LlmRequestState.CONTEXT_INIT
