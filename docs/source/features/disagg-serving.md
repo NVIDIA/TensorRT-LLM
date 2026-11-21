@@ -165,6 +165,26 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
 
+Native multimodal encoder outputs can be published and consumed independently of
+serving protocols. The current path is validated for single-rank Qwen3-VL
+image encoding. `tensorrt_llm._torch.disaggregation.encoder_output` defines the
+input context, encoded-media reference, and local output ownership helpers.
+`NixlEncoderCache` in `encoder_nixl` transfers outputs across hosts using NIXL;
+the caller supplies the peer-transfer callback. Consumers validate the original
+input and model identity before preparing native `MultimodalParams`.
+A claimed output is single-use. Unclaimed outputs can be released idempotently;
+uncertain transfers quarantine their buffers until process exit; normal close
+does not reclaim them.
+Receive quotas bound in-flight and quarantined transfers, not tensors retained
+by successfully admitted generation requests.
+
+Single-rank context workers keep polling pending native sends during shutdown.
+Ordinary idle workers retain their configured polling interval.
+With the C++ transceiver, setting `kv_transfer_timeout_ms: null` removes the
+transfer deadline; an orphaned send can then keep shutdown waiting indefinitely.
+The sender-future polling interval does not impose an overall deadline. Use a
+finite transfer timeout when a bounded transfer wait is required.
+
 ```{warning}
 The C++ cache transceiver (`transceiver_runtime: CPP`, or `null`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use the Python transceiver, the default, with `backend: NIXL` and KV cache manager V2 on both the context and the generation worker.
 
