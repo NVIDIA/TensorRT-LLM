@@ -47,6 +47,7 @@ from ..k3r_gemm.low_m_bf16_splitk import (
     SplitKTactic,
     _align_up,
     _from_dlpack_dynamic,
+    _mbarrier_wait_acquire_cluster,
     _smem_bytes,
     _store_shared_remote_v4,
     validate_tactic,
@@ -510,7 +511,7 @@ class SplitKArPushGemmKernel(SplitKDenseGemmKernel):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (

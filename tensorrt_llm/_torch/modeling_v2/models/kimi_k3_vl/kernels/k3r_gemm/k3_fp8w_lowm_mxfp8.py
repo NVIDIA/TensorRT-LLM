@@ -80,6 +80,7 @@ from .k3_fp8w_lowm_gemm import (
     _lds_v4_b32,
     _lds_v4_f32,
     _mbarrier_arrive_remote,
+    _mbar_wait_cluster_acquire,
     _quant_bf16x8_to_e4m3,
     _s2t_partition_sf,
     _st_async_v4_f32,
@@ -1141,7 +1142,8 @@ class K3Fp8wLowMMxGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         storage.mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
                     )
-                cute.arch.mbarrier_wait(storage.mbox_full, 0)
+                # The peers' st.async complete-tx releases at cluster scope.
+                _mbar_wait_cluster_acquire(storage.mbox_full, 0)
                 for i in cutlass.range_constexpr(self.chunks_cap):
                     if i < my_chunks:
                         acc = [rOwn[i * 4 + v] for v in range(4)]

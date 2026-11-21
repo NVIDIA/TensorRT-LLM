@@ -318,6 +318,38 @@ def _store_shared_remote_v4(
     )
 
 
+@dsl_user_op
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: "cute.Pointer",
+    phase: "Int32",
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            phase.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 #: Rank that gathers partials and stores the output.
 OWNER_RANK = 0
 
@@ -670,6 +702,10 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open, it counts toward phase 0, and the parity-1 wait can then pass
+        # before the epilogue has read TMEM.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
@@ -788,7 +824,7 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (

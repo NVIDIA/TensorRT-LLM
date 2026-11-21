@@ -38,6 +38,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 from .k3_fused_router import (
     _EVICT_FIRST,
@@ -109,6 +110,23 @@ def _st_async_v4_f32(local_addr, v0, v1, v2, v3, local_mbar, peer, *, loc=None, 
         loc=loc,
         ip=ip,
     )
+
+
+@cute.jit
+def _mbar_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: Int32):
+    """Wait for ``phase`` of this CTA's mbarrier at ``mbar_ptr``, acquiring at cluster scope.
+
+    ``cute.arch.mbarrier_wait`` acquires at CTA scope. The peers' ``st.async ...
+    mbarrier::complete_tx`` that completes this barrier releases at cluster scope, and only a
+    cluster-scope acquire orders their payload before the reads that follow the wait: a relaxed
+    cluster-scope try_wait loop and an acquire fence restricted to shared::cluster (the ISA's
+    acquire pattern for it; unlike ``.acquire.cluster`` on the wait it adds no L1 invalidate).
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @dsl_user_op
@@ -323,7 +341,8 @@ class K3RouterExactKernel:
             off = tidx * 16
             tot = [Float32(0.0)] * 4
             if rank == 1:
-                cute.arch.mbarrier_wait(mbox_full, 0)
+                # CTA 0's st.async complete-tx releases at cluster scope.
+                _mbar_wait_cluster_acquire(mbox_full, 0)
                 tot = list(_lds_v4_f32(mbox_base + off))
             for w in cutlass.range_constexpr(NUM_WARPS):
                 v = _lds_v4_f32(red_base + w * _FRAG_BYTES + off)
