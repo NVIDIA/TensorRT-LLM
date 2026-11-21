@@ -19,7 +19,8 @@ from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
-from ..quantization.modelopt_config import (is_modelopt_quant_config,
+from ..quantization.modelopt_config import (is_foreign_hf_quant_config,
+                                            is_modelopt_quant_config,
                                             read_modelopt_quant_config,
                                             reject_checkpoint_nvfp4_plus,
                                             warn_if_inline_diverges)
@@ -153,11 +154,21 @@ class ModelLoader:
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
+            with open(hf_quant_config_path, "r") as f:
+                hf_quant_config_raw = json.load(f)
+            if is_foreign_hf_quant_config(hf_quant_config_raw):
+                # The model implementation reads the checkpoint's own format;
+                # the inline config.json block does not apply either.
+                logger.info(
+                    "hf_quant_config.json declares quant_method="
+                    f"{hf_quant_config_raw['quant_method']!r}, which is not a "
+                    "ModelOpt config; leaving the checkpoint's quantization to "
+                    "the model implementation")
+                return False
             logger.info(
                 f"Found {hf_quant_config_path}, pre-quantized checkpoint is used."
             )
-            with open(hf_quant_config_path, "r") as f:
-                normalized = read_modelopt_quant_config(json.load(f))
+            normalized = read_modelopt_quant_config(hf_quant_config_raw)
             # Cross-check against inline config.json.quantization_config if any.
             # Done before _apply_modelopt_quant_config since the apply step
             # mutates ``normalized`` via ``.pop()``.
