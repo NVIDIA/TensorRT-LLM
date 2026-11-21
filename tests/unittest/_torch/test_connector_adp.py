@@ -85,6 +85,13 @@ def _manager(rank: int = 1) -> KvCacheConnectorManager:
         return KvCacheConnectorManager(worker, scheduler, enable_attention_dp=True)
 
 
+def _admit_nothing(executor: "PyExecutor", _waiting_queue, _total_num_active, all_rank_states):
+    """``_pop_from_waiting_queue`` that admits nothing and routes under the executor's cap."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import _AdpRouting
+
+    return [], _AdpRouting(all_rank_states, executor.max_num_active_requests, {})
+
+
 def _configure_recovery_controls(executor: "PyExecutor") -> None:
     from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
 
@@ -1255,7 +1262,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
         executor.request_broadcaster.broadcast.return_value = []
-        executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
+        executor._pop_from_waiting_queue = MagicMock(side_effect=partial(_admit_nothing, executor))
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
@@ -1405,7 +1412,7 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.enable_iter_perf_stats = False
-        executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
+        executor._pop_from_waiting_queue = MagicMock(side_effect=partial(_admit_nothing, executor))
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
         executor.previous_batch = None

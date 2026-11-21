@@ -97,6 +97,12 @@ class DisaggTransferCoordinator:
     # Since take_gen_receive_counters: most deferred receives pending at once, and the wait (s).
     _max_deferred_gen_receives = 0
     _gen_receive_ready_wait_s = 0.0
+    # The last poll skipped the status collectives, so a completed receive may not be reaped yet.
+    _gen_poll_skipped = False
+    _skipped_gen_polls = 0
+    # Most polls in a row a full batch skips: settles receives long before a transfer timeout and
+    # bounds how long cancelled or failed receives keep their KV pages.
+    _MAX_SKIPPED_GEN_POLLS = 127
 
     def __init__(
         self,
@@ -267,12 +273,30 @@ class DisaggTransferCoordinator:
         self._transceiver.prepare_context_requests(gen_first_ctx_requests)
 
     @nvtx_range("poll_gen_transfers")
-    def poll_gen_transfers(self) -> None:
-        """Poll receive-side transfers and their timeouts; rank-synchronized."""
+    def poll_gen_transfers(self, batch_full: bool = False) -> None:
+        """Poll receive-side transfers and their timeouts; rank-synchronized.
+
+        ``batch_full``, equal on every rank, skips the status collectives while
+        no completed receive could join the batch: at most
+        ``_MAX_SKIPPED_GEN_POLLS`` polls in a row, and never under attention DP,
+        whose ranks hold different requests. Until the next unskipped poll,
+        which reaps receives first, completed, CTX-cancelled and failed
+        receives stay unreaped and keep their KV pages, timed-out receives are
+        not cancelled, and generation deadlines are not checked.
+        """
         if not uses_async_gen_transfer():
             return
         if self._defer_unready_gen_receives:
             self._publish_ready_gen_receives()
+        skip = (
+            batch_full
+            and not self._enable_attention_dp
+            and self._skipped_gen_polls < self._MAX_SKIPPED_GEN_POLLS
+        )
+        self._skipped_gen_polls = self._skipped_gen_polls + 1 if skip else 0
+        self._gen_poll_skipped = skip
+        if skip:
+            return
         # Gen-transfer status performs cross-rank consensus internally. Enter
         # it symmetrically; ranks with no ready local future contribute an
         # empty ready set.
@@ -417,6 +441,8 @@ class DisaggTransferCoordinator:
             ):
                 req.py_kv_transfer_start_time = peer_ready_time
             self._flag_transfer_timeout(req, "context", timeout_ms, current_time=now)
+        if self._gen_poll_skipped:
+            return
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 self._flag_transfer_timeout(req, "generation", timeout_ms)
@@ -1620,7 +1646,7 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         return None
 
-    def poll_gen_transfers(self) -> None:
+    def poll_gen_transfers(self, batch_full: bool = False) -> None:
         return None
 
     def poll_progress_when_idle(self) -> None:

@@ -6512,21 +6512,7 @@ class KVCacheManagerV2(BaseResourceManager):
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
         if self.layer_specs is not None:
-            # Each lifecycle needs one slot per block. Coalesced layers share a
-            # lifecycle, while separate lifecycles can compete for the same pool.
-            slots_per_block: dict[int, int] = defaultdict(int)
-            for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
-                slots_per_block[int(pool_id)] += 1
-
-            # Available slots already exclude the guard's permanent reservation.
-            stats = self._get_storage_statistics(GPU_LEVEL)
-            return min(
-                (
-                    int(stats[pool_id].available) // slot_count
-                    for pool_id, slot_count in slots_per_block.items()
-                ),
-                default=0,
-            )
+            return self.num_free_gpu_blocks()
 
         # Legacy managers estimate primary-pool capacity from page indices.
         max_num_pages = max(
@@ -6541,6 +6527,24 @@ class KVCacheManagerV2(BaseResourceManager):
         # count if a reservation ever spans more than one.
         reserved_pages = sum(int(self.kv_cache_map[req_id].num_blocks) for req_id in reserved)
         return max_num_pages // self.kv_factor - reserved_pages
+
+    def num_free_gpu_blocks(self) -> int:
+        """How many one-block sequences the GPU pools can still take, from their available slots."""
+        # Each lifecycle needs one slot per block. Coalesced layers share a
+        # lifecycle, while separate lifecycles can compete for the same pool.
+        slots_per_block: dict[int, int] = defaultdict(int)
+        for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
+            slots_per_block[int(pool_id)] += 1
+
+        # Available slots already exclude the guard's permanent reservation.
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        return min(
+            (
+                int(stats[pool_id].available) // slot_count
+                for pool_id, slot_count in slots_per_block.items()
+            ),
+            default=0,
+        )
 
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
         if self.is_draft or (not self.enable_stats and not self._request_stats_enabled_ids):

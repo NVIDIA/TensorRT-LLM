@@ -17,8 +17,8 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, NoReturn, Optional, Sequence, Set, Tuple, Union,
-                    cast)
+                    Literal, NamedTuple, NoReturn, Optional, Sequence, Set,
+                    Tuple, Union, cast)
 
 import torch
 from strenum import StrEnum
@@ -398,6 +398,74 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 # max_input_len truncation.
 _UNBOUNDED_PAUSE_MAX_INPUT_LEN = 0x7fffffff
 
+# Receive-ahead slots per generation worker (at most its batch size): more than
+# the receives that start while one KV transfer is in flight.
+_RECEIVE_AHEAD_SLOTS = 4
+
+
+class _AdpRouting(NamedTuple):
+    """What ``ADPRouter.route_requests`` takes for one admission pass."""
+    rank_states: List[RankState]
+    rank_cap: int
+    # Request id -> rank the router planned; empty when none are planned.
+    placement: Dict[int, int]
+
+
+def _is_lone_generation_only(item: RequestQueueItem) -> bool:
+    """Whether a queued request is generation-only and has no child requests."""
+    return (item.request is not None and not item.child_req_ids
+            and item.request.request_type
+            == RequestType.REQUEST_TYPE_GENERATION_ONLY)
+
+
+class _GenerationOnlyRun:
+    """The lone generation-only requests at the head of a waiting queue.
+
+    Offers the part of ``WaitingQueue`` that ``ADPRouter.pop_requests`` uses;
+    peeking or popping past those requests raises.
+    """
+
+    def __init__(self, queue: WaitingQueue):
+        self._queue = queue
+
+    def __bool__(self) -> bool:
+        return bool(self._queue) and _is_lone_generation_only(
+            self._queue.peek_request())
+
+    def __len__(self) -> int:
+        return len(self.peek_requests(len(self._queue)))
+
+    def __iter__(self) -> Iterator[RequestQueueItem]:
+        return iter(self.peek_requests(len(self._queue)))
+
+    def peek_request(self) -> RequestQueueItem:
+        if not self:
+            raise IndexError("no generation-only request heads the queue")
+        return self._queue.peek_request()
+
+    def peek_requests(self, k: int) -> List[RequestQueueItem]:
+        run = []
+        for item in self._queue.peek_requests(k):
+            if not _is_lone_generation_only(item):
+                break
+            run.append(item)
+        return run
+
+    def pop_request(self) -> RequestQueueItem:
+        if not self:
+            raise IndexError("no generation-only request heads the queue")
+        return self._queue.pop_request()
+
+    def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
+        self._queue.prepend_requests(requests)
+
+    def admission_groups(self, requests: List[RequestQueueItem]) -> List[int]:
+        return self._queue.admission_groups(requests)
+
+    def mark_admitted(self, requests: Iterable[RequestQueueItem]) -> None:
+        self._queue.mark_admitted(requests)
+
+
 # Period of the native MPI progress thread that pipeline-parallel ranks run;
 # a value <= 0 disables the thread, and a value above the maximum is malformed.
 PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME = "TLLM_PP_MPI_PROGRESS_INTERVAL_US"
@@ -775,6 +843,8 @@ class PyExecutor:
     _loop_iteration = 0
     _staged_at = 0
     _fetch_may_block = False
+    # Receive-ahead admission (set by _initialize_execution); 0 is off.
+    _receive_ahead_slots = 0
     # Holds context final windows across passes when that empties decoder passes (set by __init__).
     ctx_decoder_batcher: Optional[CtxDecoderBatcher] = None
 
@@ -1710,6 +1780,31 @@ class PyExecutor:
                 self._disagg_transfer_admission_controller)
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
+        # Receive-ahead (RuntimeHooks.disagg_gen_receive_ahead; off with
+        # TLLM_DISAGG_GEN_RECEIVE_AHEAD=0): live requests, retiring ones
+        # included, stay within the per-request pools sized for two batches by
+        # the overlap headroom, and under attention DP one seat stays free for
+        # the padding dummy. Off with the slot policies it would defeat: GEN
+        # slot preemption frees slots for at-risk waiters, and the first-token
+        # priority would let every received request take a running decode's
+        # slot.
+        self._receive_ahead_slots = 0
+        if (model_hooks.disagg_gen_receive_ahead
+                and os.environ.get("TLLM_DISAGG_GEN_RECEIVE_AHEAD", "1") != "0"
+                and isinstance(self.scheduler, KVCacheV2Scheduler)
+                and not self.scheduler.prioritizes_first_token_gen
+                and not self.is_benchmark_disagg and self.dist.cp_size == 1
+                and self._gen_preemption is None
+                and self.model_engine.enable_overlap_headroom
+                and transfer_window_bypass_eligible(self.kv_cache_transceiver,
+                                                    self.dist,
+                                                    self._is_kv_manager_v2)):
+            self._receive_ahead_slots = min(
+                self.max_num_active_requests - int(self.enable_attention_dp),
+                _RECEIVE_AHEAD_SLOTS)
+        if self._receive_ahead_slots:
+            self.scheduler.set_gen_init_receive_ahead(
+                self.max_num_active_requests)
         # True while the benchmark disagg fill phase is in progress (waiting
         # for all benchmark requests to complete KV transfer before the first
         # forward pass).  Cleared by _check_benchmark_disagg_gate when the
@@ -6040,7 +6135,8 @@ class PyExecutor:
         new_requests = self._progress_context_cancellations(new_requests)
         new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self.disagg.prepare_context_schedulable(new_requests)
-        self.disagg.poll_gen_transfers()
+        self.disagg.poll_gen_transfers(
+            batch_full=self._gen_transfer_batch_full())
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
         # After the polls so a transfer that completed this iteration releases
@@ -9792,14 +9888,13 @@ class PyExecutor:
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
         all_rank_states: Optional[List[RankState]] = None
-    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+    ) -> Tuple[List[RequestQueueItem], Optional[_AdpRouting]]:
         """Pop requests from waiting_queue based on available capacity.
 
-        Returns the requests and, with attention DP, the ranks the router
-        planned for them (request id -> rank; empty when none are planned).
+        Returns the requests and, with attention DP, how to route them.
         """
         admission_capacity = self._get_request_admission_capacity()
-
+        receive_ahead_slots = getattr(self, "_receive_ahead_slots", 0)
         max_new_requests = admission_capacity - total_num_active_requests
 
         # Benchmark disagg fill-phase admission throttle (slow-start ramp).
@@ -9826,11 +9921,41 @@ class PyExecutor:
             kv_balance = not (self.is_warmup or
                               (self.is_benchmark_disagg
                                and self._benchmark_fill_phase_active))
-            return self.adp_router.pop_requests(waiting_queue,
-                                                all_rank_states,
-                                                max_new_requests,
-                                                self.max_num_active_requests,
-                                                kv_balance=kv_balance)
+            queue = waiting_queue
+            rank_states = all_rank_states
+            rank_cap = self.max_num_active_requests
+            if receive_ahead_slots:
+                # Receive-ahead raises each rank's cap by its slots: with an
+                # empty queue to bound the router's expected per-rank load, else
+                # for a pass that pops only the lone generation-only requests at
+                # the queue head, when they are more than the batch has room
+                # for. Retiring requests count against the slots, so live
+                # requests fit the pools for two batches, and no rank's cap is
+                # lower than without receive-ahead.
+                room = max(max_new_requests, 0)
+                run = _GenerationOnlyRun(waiting_queue)
+                if not waiting_queue:
+                    rank_cap += receive_ahead_slots
+                elif len(run.peek_requests(room + 1)) > room:
+                    queue = run
+                    rank_cap += receive_ahead_slots
+                    rank_states = [
+                        dataclasses.replace(
+                            state,
+                            num_active_requests=state.num_active_requests +
+                            min(state.num_retiring_requests,
+                                receive_ahead_slots))
+                        for state in all_rank_states
+                    ]
+                    max_new_requests = self.dist.tp_size * rank_cap - sum(
+                        state.num_active_requests for state in rank_states)
+            new_requests, placement = self.adp_router.pop_requests(
+                queue,
+                rank_states,
+                max_new_requests,
+                rank_cap,
+                kv_balance=kv_balance)
+            return new_requests, _AdpRouting(rank_states, rank_cap, placement)
         mm_admission = getattr(self, "_mm_encoder_item_scheduling_enabled",
                                False)
         new_requests = get_from_waiting_queue(
@@ -9840,12 +9965,17 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             mark_admitted=not mm_admission)
         if not mm_admission:
-            return new_requests, {}
+            if receive_ahead_slots:
+                num_live = len(self.active_requests) + sum(
+                    1 + len(item.child_req_ids or ()) for item in new_requests)
+                new_requests += self._pop_receive_ahead_requests(
+                    waiting_queue, num_live)
+            return new_requests, None
         # Deferred requests go back with their arrival order, so only the rest are admitted.
         admitted = (self._apply_mm_encoder_admission(
             waiting_queue, new_requests) if new_requests else [])
         waiting_queue.mark_admitted(admitted)
-        return admitted, {}
+        return admitted, None
 
     def _publish_adp_iter_stats(self, all_rank_states: List[RankState],
                                 idle_wait_follows: bool) -> None:
@@ -9881,6 +10011,45 @@ class PyExecutor:
                 # forget what the last fanout was: the idle wait is planned
                 # from it (see _plan_idle_heartbeat_wait).
                 return
+
+    def _pop_receive_ahead_requests(self, waiting_queue: WaitingQueue,
+                                    num_live: int) -> List[RequestQueueItem]:
+        """Pop queued generation-only requests into the receive-ahead slots.
+
+        ``num_live`` counts retiring requests, which still hold their slots.
+        """
+        room = (self.max_num_active_requests + self._receive_ahead_slots -
+                num_live)
+        popped = []
+        while (room > 0 and waiting_queue
+               and _is_lone_generation_only(waiting_queue.peek_request())):
+            popped.append(waiting_queue.pop_request())
+            room -= 1
+        if popped:
+            waiting_queue.mark_admitted(popped)
+        return popped
+
+    def _gen_transfer_batch_full(self) -> bool:
+        """Whether no completed receive could join the batch this iteration.
+
+        True while decodes holding their KV fill the batch (a decode suspended
+        for pages leaves a seat) and no receive ends at its first token, which
+        needs no seat. Without attention DP every rank holds the same requests
+        and decides alike.
+        """
+        if not self._receive_ahead_slots or self.enable_attention_dp:
+            return False
+        generating = LlmRequestState.GENERATION_IN_PROGRESS.value
+        resident = self.kv_cache_manager.is_request_active
+        if sum(1 for req in self.active_requests
+               if req.state_value == generating
+               and resident(req.py_request_id)) < self.max_num_active_requests:
+            return False
+        # A generation-first receive learns its first token only on arrival.
+        return not any(req.is_disagg_generation_transmission_in_progress and
+                       (req.py_max_new_tokens <= 1
+                        or self._first_gen_token_finish_reason(req) is not None)
+                       for req in self.active_requests)
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -10041,7 +10210,7 @@ class PyExecutor:
                 preemption.maybe_log()
 
         # 3. Pop requests from waiting queue
-        new_requests, placement = self._pop_from_waiting_queue(
+        new_requests, routing = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests, all_rank_states)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
@@ -10059,8 +10228,8 @@ class PyExecutor:
 
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
-                    all_rank_states, new_requests,
-                    self.max_num_active_requests, placement=placement)
+                    routing.rank_states, new_requests,
+                    routing.rank_cap, placement=routing.placement)
             self.request_broadcaster.deliver_prompts(all_ranks_new_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
@@ -11304,13 +11473,18 @@ class PyExecutor:
             # test below, and a rank holding surplus requests needs no dummy,
             # so tolerate the surplus. Asserting here took down the executor
             # event loop on every affected rank at once, leaving the survivors
-            # to HangDetector-abort.
-            logger.warning(
-                f"routable active_requests "
-                f"({num_routable_active_requests}) exceeds "
-                f"expected_num_active_requests "
-                f"({expected_num_active_requests}); tolerating (a busy rank "
-                f"needs no attention-DP dummy).")
+            # to HangDetector-abort. With receive-ahead, a surplus of up to its
+            # slots is expected: the router's cap includes them only while the
+            # queue head is generation-only.
+            receive_ahead_slots = getattr(self, "_receive_ahead_slots", 0)
+            if not (receive_ahead_slots and num_routable_active_requests
+                    <= self.max_num_active_requests + receive_ahead_slots):
+                logger.warning(
+                    f"routable active_requests "
+                    f"({num_routable_active_requests}) exceeds "
+                    f"expected_num_active_requests "
+                    f"({expected_num_active_requests}); tolerating (a busy "
+                    f"rank needs no attention-DP dummy).")
             expected_num_active_requests = num_routable_active_requests
 
         num_active_request = self._count_schedulable_active_requests()
@@ -11478,9 +11652,10 @@ class PyExecutor:
         # recovery while peers still need this owner to participate in forward.
         if self.expected_num_active_requests <= 0:
             return
-        # This path can still hold active requests, so respect the same cap
-        # that `_pad_attention_dp_dummy_request` asserts against.
-        if len(self.active_requests) >= self.max_num_active_requests:
+        # This path can still hold active requests, so a rank already at its
+        # request cap (raised by the receive-ahead slots) gets no dummy.
+        if (len(self.active_requests) >= self.max_num_active_requests +
+                getattr(self, "_receive_ahead_slots", 0)):
             return
         # The fill gate suppresses forwards on purpose; dummies added then are
         # never terminated (termination follows a forward pass).

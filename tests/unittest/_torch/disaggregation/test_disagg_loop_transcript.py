@@ -227,7 +227,7 @@ _SCHEDULE_HEAD = [
     ("handle_errors_synced",),
     ("start_deferred_gen_receives",),
     ("prepare_context_schedulable", []),
-    ("poll_gen_transfers",),
+    ("poll_gen_transfers", "batch_full=False"),
     ("check_transfer_timeouts",),
     ("admit", []),
     ("align_gen_admission_across_cp", []),

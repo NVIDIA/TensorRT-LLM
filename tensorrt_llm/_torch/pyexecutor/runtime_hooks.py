@@ -253,6 +253,10 @@ class RuntimeHooks:
     # Under multi-rank MPI attention DP, rank 0 sends each admitted request's prompt only to the rank
     # that owns it instead of broadcasting every prompt to every rank (RequestBroadcaster).
     prompts_to_owners: bool = False
+    # A disaggregated generation worker admits up to min(batch size, 4) generation-only requests beyond its batch
+    # (per rank under attention DP): they receive their KV while the batch decodes and, once received, join it as
+    # running requests free their slots.
+    disagg_gen_receive_ahead: bool = False
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
