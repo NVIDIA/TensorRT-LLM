@@ -26,6 +26,7 @@ differ between models live and how to add a model.
 | `megakernel.py`, `megakernel_attention.py`, `megakernel_lib.py` | megakernel: kernel and row descriptors, attention (KV gather, MMA, softmax), PTX helpers and selection primitives |
 | `large_batch.py`, `large_batch_lib.py` | large-batch kernels: indexer kernel and attention tail, selection routines and the ready queue |
 | `tail_attention.py`, `tail_op.py` | tail attention: the decode sparse MLA of up to 26 rows behind any exact top-K kernel, the KV tiles of a row split over a cluster of 5 CTAs with the combine inside the cluster (host side: `run_attention`, `run_hybrid`) |
+| `topk_multicta.py`, `topk_multicta_op.py` | multi-CTA exact top-512 of the fp32 indexer logits for the tail-attention hybrid (1 to 26 rows): a cluster of 4 to 8 CTAs per row, a sampled threshold, one all-gather round of the candidate histograms, an in-kernel exact fallback (host side: `run`, `precompile`, `is_supported`, `is_profitable`) |
 
 ## Implementations and specs
 
@@ -40,6 +41,12 @@ differ between models live and how to add a model.
   distributed shared memory. Plain stream-ordered launch (the production top-K kernel never triggers a dependent launch).
   Against the production FP4 chain (1M-token captures, B200) the fastest path per batch size is the megakernel up to 8 rows,
   the tail attention from 9 to 26 rows and the large-batch kernels above.
+  The top-K stage of the hybrid can be the multi-CTA top-K (`tail_op.run_hybrid(..., topk_fn=None, ctx_lens=...)`, or
+  `topk_multicta_op.run`): a cluster of 8 / 6 / 5 / 4 CTAs per row (1-12 / 13-16 / 17-24 / 25-26 rows) selects the exact
+  top-512 of the logits in one pass over the row. It is exact for every input (a row whose sampled threshold does not
+  certify the fast path takes an in-kernel radix select) and is the faster top-K stage when every row has 16,384
+  positions or more (`topk_multicta_op.is_profitable`; 64K tokens at the compression ratio 4); shorter rows are exact too
+  but win nothing, so the caller keeps its production top-K for them.
 
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |

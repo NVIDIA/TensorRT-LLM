@@ -14,7 +14,9 @@
 # limitations under the License.
 """specDSA tail attention, host side: the multi-CTA sparse MLA (K4') that replaces the K3 (local-to-global mapping) +
 K4 (sparse MLA) + K4b (reduction) kernels of the unfused decode chain behind any exact top-K kernel, and ``run_hybrid``
-(the caller's indexer logits kernel and top-K kernel, then K4').
+(the caller's indexer logits kernel and top-K kernel, then K4'). The top-K stage of ``run_hybrid`` can be the multi-CTA
+exact top-K of ``topk_multicta_op`` instead of the caller's kernel (``topk_fn=None``): it is the faster stage behind the
+same logits kernel when every row has 16,384 or more positions (``topk_multicta_op.is_profitable``).
 
 ``run_attention`` takes the exact top-512 selection (``topk`` [B, 512] int32, local compressed positions in no
 particular order, -1 for an unused entry) and writes ``out`` [B, 64 * 512] bf16 like ``AttentionTail`` of the
@@ -38,6 +40,7 @@ import threading
 
 import torch
 
+from . import topk_multicta_op
 from .config import SpecDsaConfig, check_device, supported_spec
 
 __all__ = [
@@ -268,13 +271,26 @@ def run_hybrid(
     softmax_scale: float | None = None,
     *,
     config: SpecDsaConfig | None = None,
+    ctx_lens: torch.Tensor | None = None,
 ) -> None:
-    """The decode chain with K3 + K4 + K4b replaced: ``k1_logits_fn()``, ``topk_fn(logits)`` (fills ``topk``), then K4'.
+    """The decode chain with K3 + K4 + K4b replaced: ``k1_logits_fn()``, the top-K stage (fills ``topk``), then K4'.
+
+    The top-K stage is ``topk_fn(logits)``, or, when ``topk_fn`` is None, the multi-CTA exact top-K of
+    ``topk_multicta_op`` on the logits with ``ctx_lens`` (int32 [B] on the device: the lengths the logits kernel was
+    given; required then, ignored otherwise). That kernel is exact for every row length but the faster one only when
+    every row has ``topk_multicta_op.MIN_PROFITABLE_ROW_LEN`` positions or more (``topk_multicta_op.is_profitable``:
+    ask it with the host lengths of the step); keep the production top-K as ``topk_fn`` for the other batches. Compile
+    both kernels (``precompile`` here and ``topk_multicta_op.precompile``) before a CUDA-graph capture.
 
     The arguments of the tail attention and ``config`` are those of ``run_attention``.
     """
+    if topk_fn is None and ctx_lens is None:
+        raise ValueError("run_hybrid without a topk_fn needs ctx_lens (int32 [B] on the device)")
     logits = k1_logits_fn()
-    topk_fn(logits)
+    if topk_fn is None:
+        topk_multicta_op.run(logits, topk, ctx_lens, config=config)
+    else:
+        topk_fn(logits)
     run_attention(
         topk,
         q_att,
