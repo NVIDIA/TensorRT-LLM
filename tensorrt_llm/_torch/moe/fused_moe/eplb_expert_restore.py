@@ -407,13 +407,19 @@ class EplbExpertRestore:
     def empty_spare_slots(self) -> list[list[int]]:
         """Return, by layer, the spare slots that the installed placement leaves empty.
 
+        An active slot that a stopped restore emptied is unusable too, but it has no unbacked
+        memory to release.
+
         Raises:
             RuntimeError: An iteration is active.
         """
         balancer = self.balancer
         if balancer.in_iter:
             raise RuntimeError("Cannot read the empty spare slots while an iteration is active")
-        return [layer.get_unusable_local_slots() for layer in balancer.single_layer_load_balancers]
+        return [
+            [slot for slot in layer.get_unusable_local_slots() if slot in layer.spare_slots]
+            for layer in balancer.single_layer_load_balancers
+        ]
 
     def release_spare_slots(self, layer_slots: Sequence[Sequence[int]]) -> int:
         """Map the empty spare slots ``layer_slots``, by layer, back to the shared scratch.

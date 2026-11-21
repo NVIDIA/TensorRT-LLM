@@ -16,7 +16,7 @@
 
 import functools
 import os
-import select
+import selectors
 import socket
 import threading
 import time
@@ -112,6 +112,17 @@ def _closed_in_forked_child() -> "weakref.WeakSet[socket.socket | IO[bytes]]":
 def close_in_forked_child(resource: socket.socket | IO[bytes]) -> None:
     """Close ``resource`` in every child that this process forks, without keeping it alive."""
     _closed_in_forked_child().add(resource)
+
+
+def _readable(watched: list, timeout_s: Optional[float]) -> list:
+    """Return the files of ``watched`` that are readable within ``timeout_s``, None to block.
+
+    Unlike ``select.select``, this accepts descriptors numbered above ``FD_SETSIZE``.
+    """
+    with selectors.DefaultSelector() as selector:
+        for fileobj in watched:
+            selector.register(fileobj, selectors.EVENT_READ)
+        return [key.fileobj for key, _ in selector.select(timeout_s)]
 
 
 def _warn_while_no_authority(store: SignedStore) -> None:
@@ -372,14 +383,14 @@ class MembershipClient:
                     return
                 listed = member
             watched = [self._sock, self._wake_read]
-            readable, _, _ = select.select(watched, [], [], max(0.0, tick_s - time.monotonic()))
+            readable = _readable(watched, max(0.0, tick_s - time.monotonic()))
             if (
                 self._sock not in readable
                 and time.monotonic() - heard_s > AUTHORITY_SILENCE_TIMEOUT_S
             ):
                 # This thread can wait long for a CPU or the GIL after its select returns, while the
                 # authority's lines arrive. Look again before taking the authority as silent.
-                readable, _, _ = select.select(watched, [], [], 0.0)
+                readable = _readable(watched, 0.0)
                 if self._sock not in readable:
                     raise TimeoutError(
                         "the membership authority sent nothing for "

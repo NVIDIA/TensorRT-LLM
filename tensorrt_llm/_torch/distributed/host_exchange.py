@@ -24,6 +24,7 @@ membership change interrupted. ``MnnvlHostExchangeGroup`` moves the slots throug
 from __future__ import annotations
 
 import functools
+import itertools
 import pickle  # nosec B403
 from typing import Callable, Iterator, Optional, Protocol, Sequence
 
@@ -64,7 +65,11 @@ class HostExchangeGroup(Protocol):
     def start_round(
         self, epoch: int, words: np.ndarray, length: int, recipients: Optional[int]
     ) -> None:
-        """Stage this rank's slot of round ``epoch``, its payload for ``recipients`` (None: all)."""
+        """Stage this rank's slot of round ``epoch``, its payload for ``recipients`` (None: all).
+
+        ``words`` holds the round's payload bytes, at most one slot. ``length`` goes in the header:
+        the payload bytes this rank has left from this round on, capped at 0xFFFFFFFF.
+        """
 
     def wait(
         self,
@@ -114,6 +119,8 @@ class HostExchange:
 
     # Sized so that a step's request broadcast and response gather usually take one round.
     DEFAULT_SLOT_PAYLOAD_BYTES = 64 * 1024
+    # The largest length a header holds in its 32 bits.
+    _MAX_HEADER_LENGTH = 0xFFFFFFFF
 
     def __init__(self, group: HostExchangeGroup):
         self.group = group
@@ -139,6 +146,8 @@ class HostExchange:
         self._finished_round: Optional[np.ndarray] = None
         # The epoch to continue from once the round takes _finished_round.
         self._epoch_after_round: Optional[int] = None
+        # The installs so far. A wait runs its round again only after an install.
+        self._installs = 0
         # Cached _ranks_of results, keyed by mask.
         self._ranks_by_mask: dict[int, tuple[np.ndarray, list[int]]] = {}
 
@@ -163,7 +172,8 @@ class HostExchange:
         a wait, after each ``wake()``. When it holds, the exchange sets ``stopped_epoch`` to the
         current or next round's epoch and calls ``on_interrupt``, which runs the change and calls
         ``install()``. The exchange then takes the round that ``install()`` completed from the
-        peers' rows, or runs the round again.
+        peers' rows, or runs the round again. If no ``install()`` ran, a wait goes on waiting for
+        the round it already sent.
         """
         self._interrupted = interrupted
         self._on_interrupt = on_interrupt
@@ -211,6 +221,7 @@ class HostExchange:
         if completed is not None:
             self._finished_round = completed
         self.admit(active_mask, epoch)
+        self._installs += 1
         if self._finished_round is not None:
             # Take the completed round at its own epoch, then continue from the installed epoch.
             self._epoch_after_round, self._epoch = self._epoch, round_epoch
@@ -266,8 +277,9 @@ class HostExchange:
         ranks = self._ranks_of(readers)[1]
         out = np.zeros((self.nranks, data.size), dtype=np.uint8)
         step = 4 * self._words
+        expected = min(data.size, self._MAX_HEADER_LENGTH)
         for k, (lengths, rows) in enumerate(self._rounds(data.tobytes(), readers)):
-            if k == 0 and (lengths[self._ranks_of(readers & ~self._failed)[0]] != data.size).any():
+            if k == 0 and (lengths[self._ranks_of(readers & ~self._failed)[0]] != expected).any():
                 raise ValueError(
                     f"allgather_array rows differ in size across ranks: {lengths.tolist()}"
                 )
@@ -299,15 +311,20 @@ class HostExchange:
     def _rounds(
         self, data: bytes, readers: int, recipients: Optional[int] = None, idle: bool = False
     ) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
-        """Yield header lengths and packets per round, sending one slot of ``data`` per round."""
+        """Yield header lengths and packets per round, sending one slot of ``data`` per round.
+
+        Each header carries the bytes its sender has left from that round on, up to the largest
+        32-bit length. Another round follows while some header carries more than a slot.
+        """
         self._round_readers = readers
         self._failed = 0
         step = 4 * self._words
-        lengths, rows = self._round(data[:step], len(data), readers, recipients, idle)
-        yield lengths, rows
-        for k in range(1, ceil_div(int(lengths.max()), step)):
-            chunk = data[step * k : step * (k + 1)]
-            yield self._round(chunk, len(chunk), readers, recipients, idle)
+        for start in itertools.count(0, step):
+            left = min(max(len(data) - start, 0), self._MAX_HEADER_LENGTH)
+            lengths, rows = self._round(data[start : start + step], left, readers, recipients, idle)
+            yield lengths, rows
+            if int(lengths.max()) <= step:
+                return
 
     def _round(
         self,
@@ -341,7 +358,11 @@ class HostExchange:
         if rows is None:
             return None
         active = round_mask & ~self._missing
-        lengths = self._header_lengths(rows, active)
+        # The ranks that finished this round counted every header in it, so the rounds that
+        # follow count them too, including the header of a rank whose payload is missing.
+        lengths = self._header_lengths(rows, round_mask)
+        if self._missing:
+            lengths *= rows[:, 0] >> np.uint64(32) == self._epoch
         payload_bytes = int(lengths[self._ranks_of(readers & active)[0]].max(initial=0))
         packets = 1 + min(self._words, ceil_div(payload_bytes, 4))
         self._failed |= readers & (~round_mask | self._missing)
@@ -351,7 +372,7 @@ class HostExchange:
         return lengths, (rows[:, :packets] if packets > 1 else None)
 
     def _header_lengths(self, headers: np.ndarray, active: int) -> np.ndarray:
-        """Return the payload length in each rank's header, or 0 for a rank outside ``active``."""
+        """Return the length in each rank's header, or 0 for a rank outside ``active``."""
         return headers.view(np.uint32)[:, 0] * self._ranks_of(active)[0]
 
     @property
@@ -401,10 +422,12 @@ class HostExchange:
         in_active, in_readers = self._ranks_of(active)[0], self._ranks_of(readers)[0]
         while (rows := self.group.wait(self._epoch, in_active, in_readers, idle)) is None:
             if self._interrupted():
+                installs = self._installs
                 self._stop(self._epoch)
                 if self._finished_round is not None:
                     return self._take_finished_round(active, readers)
-                return None
+                if self._installs != installs:
+                    return None
         return rows
 
 

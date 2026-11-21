@@ -951,7 +951,7 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
         return {"skip": "NVLink one-sided is not supported on every participating GPU"}
 
     hidden, capacity, slots_per_rank = 256, 8, 2
-    waited = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
+    evidence = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
     health = EPGroupHealth(ep_size)
     mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
     comm = NVLinkOneSided(
@@ -1020,8 +1020,8 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
                 time.sleep(0.01)
             check(
                 state.waited_flags().get(failed_rank) == stuck_on,
-                f"no waited flag for rank {failed_rank}: "
-                f"{state.abort[waited : waited + ep_size].tolist()}",
+                f"no wait evidence on rank {failed_rank}: "
+                f"{state.abort[evidence : evidence + ep_size].tolist()}",
             )
             check(not done.query(), "the round completed without the stopped rank")
             check(not state.aborted(), "aborted before the request")
@@ -1030,7 +1030,7 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
             torch.cuda.synchronize()
             check(time.monotonic() - start < 10, "the abort did not release the waiting collective")
             check(state.abort[:2].tolist() == [1, 1], f"abort state {state.abort[:2].tolist()}")
-            check(not state.abort[waited:].any(), "waited flags left after the abort")
+            check(not state.abort[evidence:].any(), "wait evidence left after the abort")
             # The combine of an incomplete round takes only the tokens this rank routed to itself.
             expected = torch.zeros_like(x)
             own = torch.arange(capacity, device=x.device) % ep_size == rank

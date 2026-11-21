@@ -866,6 +866,72 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
         balancer.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_release_skips_empty_active_slot(monkeypatch):
+    """Release an empty spare slot while an active slot is empty too.
+
+    The empty active slot is unusable as well, but it has no unbacked memory to release.
+    """
+    monkeypatch.setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1")
+    # Two ranks on two nodes, so rank 0 gets three spare slots after EPLB's three.
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
+    torch.cuda.set_device(0)
+    expert_count = 4
+    # Slots of 8 MiB, whole VMM chunks.
+    slot_elements = 1 << 21
+    # The one VMM chunk all unbacked pieces of the process map: released once no piece maps it.
+    scratch = 2 << 20
+    balancer = FaultTolerantMoeLoadBalancer(
+        0,
+        2,
+        0,
+        shared_memory_base_name=f"test_release_{os.getpid()}",
+        mapping=None)
+    try:
+        layer = balancer.add_layer(expert_count, 1, 3)
+        slot_count = layer.total_slot_count_per_rank
+        active = layer.active_slot_count_per_rank
+        assignments = layer.with_spare_slots([0, 1, 2, 3, 0, 1])
+        host = [torch.randn(slot_elements) for _ in range(expert_count)]
+        loaded = torch.stack([host[e] for e in assignments[:active]] +
+                             [torch.zeros(slot_elements)] *
+                             (slot_count - active))
+        weights = create_spare_slot_storage(layer, "w", loaded)
+        assert weights is not None
+        for expert_id in range(expert_count):
+            layer.host_tensor_sharer.share_host_tensor_with_shape(
+                expert_id, "w", host[expert_id])
+        layer.add_to_migrate_weight_fn(use_spare_slot_storage,
+                                       (layer, weights, "w"))
+        layer.host_tensor_sharer.finalize_layer_weights()
+        layer.set_initial_weight_assignments(assignments)
+        balancer.register_weight_slots_after_to_cuda()
+        balancer.finalize_model()
+        balancer.set_warm_up_iter_count(0)
+        restore = balancer.expert_restore
+        # Rank 1 fails: its expert 3 moves into rank 0's spare slot 3, which a
+        # restore backs.
+        plan = restore.plan_expert_restore([True, False],
+                                           [layer.get_old_rank_expert_ids()])
+        assert restore.restore_lost_experts(plan) == plan.device_bytes > 0
+        # Rank 1 is back with a placement that leaves rank 0's active slot 0
+        # empty, as a stopped restore leaves a slot whose expert has another
+        # replica.
+        balancer.load_balancer_impl.restore_placement(
+            [], [[[-1, 1, 2, -1, -1, -1], [3, 0, 1, -1, -1, -1]]])
+        assert layer.get_unusable_local_slots() == [0, 3, 4, 5]
+        assert restore.empty_spare_slots() == [[3, 4, 5]]
+        free = torch.cuda.mem_get_info()[0]
+        assert restore.release_spare_slots(
+            restore.empty_spare_slots()) == plan.device_bytes
+        assert torch.cuda.mem_get_info(
+        )[0] - free >= plan.device_bytes - scratch
+        # Spare slot 3 is unbacked, so backing it again maps memory.
+        assert spare_slot_bytes_to_back(layer, [3]) > 0
+    finally:
+        balancer.shutdown()
+
+
 _EXPERTS, _HIDDEN, _INTERMEDIATE = 4, 2048, 2048
 _RELEASE_TIMEOUT_S = 120
 

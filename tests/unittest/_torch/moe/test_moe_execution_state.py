@@ -504,7 +504,7 @@ def test_unbindable_moe_layer_is_refused(kind: str, mapping, uses: str, cause: s
     with pytest.raises(ValueError, match=re.escape(f"MoE layer 1 {uses}")) as error:
         moe_comms(torch.nn.ModuleList([bound, layer]))
     assert cause in str(error.value)
-    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
 
 
 @pytest.mark.cpu_only
@@ -522,7 +522,7 @@ def test_layers_over_different_ep_groups_refused() -> None:
         ),
     ) as error:
         moe_comms(torch.nn.ModuleList(layers))
-    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
 
 
 @pytest.mark.cpu_only
@@ -622,4 +622,4 @@ def test_drafter_over_another_ep_group_refused() -> None:
         ),
     ) as error:
         prepare_model(model)
-    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)

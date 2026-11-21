@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, input_preparer
@@ -32,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import inputs as inputs_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers,
     DecoderInputPreparer,
@@ -46,6 +48,10 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
+from tensorrt_llm._torch.utils import (
+    get_per_request_prefill_cuda_graph_flag,
+    set_per_request_prefill_cuda_graph_flag,
+)
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -58,7 +64,7 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig,
     SamplingParams,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import CpType, Mapping
 
 if TYPE_CHECKING:
@@ -272,6 +278,60 @@ def test_zero_fill_row_spans_without_spans_is_noop() -> None:
     buffer = torch.arange(4, dtype=torch.int32)
     _zero_fill_row_spans(buffer, [])
     assert buffer.tolist() == [0, 1, 2, 3]
+
+
+class _DistWithInactiveRank:
+    """Three attention-DP ranks; rank 1 is inactive, as after a rank failure under
+    ``MnnvlDist``: its row is zeros unless the gather is ``active_only``."""
+
+    def tp_allgather_int64(self, values, *, active_only: bool = False) -> np.ndarray:
+        rows = np.tile(np.asarray(values, dtype=np.int64), (3, 1))
+        if active_only:
+            return rows[[0, 2]]
+        rows[1] = 0
+        return rows
+
+
+@pytest.mark.cpu_only
+def test_breakable_prefill_graph_vote_skips_inactive_ranks() -> None:
+    def pad_tokens(attn_metadata, num_tokens, *args, **kwargs):
+        set_per_request_prefill_cuda_graph_flag(True)
+        attn_metadata.padded_num_tokens = 8
+        return 8
+
+    preparer = object.__new__(DecoderInputPreparer)
+    preparer._config = SimpleNamespace(
+        enable_attention_dp=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE
+    )
+    preparer.mapping = None
+    preparer.dist = _DistWithInactiveRank()
+    preparer.model = SimpleNamespace()
+    preparer.breakable_cuda_graph_runner = SimpleNamespace(
+        is_capturing=False, is_warming_up=False, has_graph=lambda num_tokens: True
+    )
+    preparer.pad_tokens = pad_tokens
+    host = SimpleNamespace(
+        total_num_tokens=5,
+        num_ctx_requests=1,
+        lists=SimpleNamespace(multimodal_params_list=[]),
+        remote_tail_modes=set(),
+    )
+    attn_metadata = SimpleNamespace(padded_num_tokens=None)
+    try:
+        with patch.object(inputs_module, "get_all_rank_num_tokens", return_value=[5, 0, 5]):
+            preparer._pad_inputs(
+                host,
+                SimpleNamespace(attention_dp_phase=None, context_requests=[]),
+                attn_metadata,
+                None,
+                False,
+                is_dummy=False,
+            )
+        assert get_per_request_prefill_cuda_graph_flag()
+        assert host.virtual_num_tokens == 8
+        assert attn_metadata.padded_num_tokens == 8
+    finally:
+        set_per_request_prefill_cuda_graph_flag(False)
 
 
 class DecoderInputPreparerTestCase(unittest.TestCase):

@@ -20,9 +20,10 @@ Each rank owns one segment with two slot sets and one slot per sender::
     segment: | slot set 0: slot 0 | slot 1 | ... | slot set 1: slot 0 | slot 1 | ... |
     slot:    | header | payload packet 1 | payload packet 2 | ... |
 
-A slot is a run of 8-byte packets. The lower 32 bits hold the payload length in the header and 4
-payload bytes in a payload packet. The upper 32 bits hold the round's epoch, so a packet is new when
-it carries the current epoch and a slot needs no ready flag.
+A slot is a run of 8-byte packets. The lower 32 bits hold, in the header, the payload bytes that the
+sender has left from this round on, capped at 0xFFFFFFFF, and in a payload packet 4 payload bytes.
+The upper 32 bits hold the round's epoch, so a packet is new when it carries the current epoch and a
+slot needs no ready flag.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal.runtime import wait_for_slots
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
@@ -229,7 +230,13 @@ class MnnvlHostExchangeGroup:
                 "fabric handles, because fault tolerance remaps MNNVL memory and exchanges host "
                 "values through fabric handles; the fabric handles also need IMEX running and an "
                 "IMEX channel in the container, which this check does not test",
-            )
+            ),
+            (
+                get_sm_version() == 100,
+                "an SM 100 GPU (Blackwell B200/GB200), because the host exchange relies on the "
+                "copy engines writing each aligned 8-byte packet in one transaction, which a tear "
+                "test confirmed on GB200 only",
+            ),
         ]
 
     @classmethod
