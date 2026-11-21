@@ -78,6 +78,8 @@ class InklingToolParser(BaseToolParser):
         invocation is a call, or is dropped on its own when its payload is malformed or rejected.
         """
         if self.bot_token not in text:
+            # A trailing tool header is framing, as `finish()` treats it at the end of a stream.
+            text, _ = self._split_trailing_tool_header(text)
             return StreamingParseResult(normal_text=self._clean_normal_text(text))
 
         try:

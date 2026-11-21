@@ -337,6 +337,7 @@ _ONE_SHOT_EQUALS_STREAMING = [
     ),
     (f"{MM}f{CT}hello{EM}", "hello", []),
     (f'{CT}text{EM}{MM}f{IT}{{"name":"f","ar', "text", []),
+    (f"answer {MM}f", "answer ", []),
 ]
 
 
@@ -349,6 +350,7 @@ _ONE_SHOT_EQUALS_STREAMING = [
         "after_a_rejected_call",
         "named_header",
         "unfinished_call",
+        "trailing_tool_header",
     ],
 )
 def test_one_shot_parse_equals_streaming(text, normal_text, names):
