@@ -107,9 +107,8 @@ _READ_WARNING = re.compile(
 def _matching_warnings(caught, prefix: str) -> List[str]:
     """Messages of the FutureWarnings that start with ``prefix``.
 
-    Filtering by message, as ``tests/unittest/_torch/peft/test_shim_peft.py``
-    does, also drops the warning of a parent shim package that a fresh import of
-    one of its submodules emits.
+    Filtering by message also drops the warning of a parent shim package that a
+    fresh import of one of its submodules emits.
     """
     return [
         str(record.message)
