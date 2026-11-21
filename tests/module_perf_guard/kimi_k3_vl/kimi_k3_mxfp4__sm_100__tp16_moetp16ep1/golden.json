@@ -1,0 +1,12 @@
+{
+  "gpu_name": "NVIDIA GB200",
+  "modules": {
+    "input_layernorm": {
+      "noise_threshold": 0.05,
+      "concurrency_to_latency_us": {
+        "1": null,
+        "2": null
+      }
+    }
+  }
+}
