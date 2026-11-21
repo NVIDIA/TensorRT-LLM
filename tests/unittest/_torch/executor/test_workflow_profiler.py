@@ -216,8 +216,8 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
     failure = RuntimeError("model failed")
     default_stream = SimpleNamespace(wait_event=lambda event: events.append("default_wait"))
     execution_stream = SimpleNamespace(wait_event=lambda event: events.append("execution_wait"))
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: default_stream)
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(py_executor, "current_cuda_stream", lambda: default_stream)
+    monkeypatch.setattr(py_executor, "CudaStreamScope", lambda stream: nullcontext())
     route_capture = SimpleNamespace(
         set_iter=lambda iteration: events.append("route_iter"),
         prepare=lambda *args, **kwargs: events.append("route_prepare"),
