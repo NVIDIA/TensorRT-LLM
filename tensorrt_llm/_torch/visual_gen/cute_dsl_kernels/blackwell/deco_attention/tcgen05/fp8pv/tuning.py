@@ -54,7 +54,7 @@ TUNING = {
         s_probe=True,
         rescale_loop=False,
         vs_batched=False,
-        lens_own_loads=("load", "epilogue", "store"),
+        lens_own_loads=("mma", "softmax", "epilogue", "store"),
     ),
     "sm_107": Tuning(
         load_sleep_ns=0,

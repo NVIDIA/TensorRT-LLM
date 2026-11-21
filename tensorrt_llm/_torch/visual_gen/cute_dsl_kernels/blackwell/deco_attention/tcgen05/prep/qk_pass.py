@@ -149,7 +149,7 @@ def _tile_origin(st):
 def _live_blocks(st, b):
     """With lengths: the 128-token blocks of batch element b that hold a valid token (those of the last element for
     a b past it)."""
-    return (valid_len(st.lens, cutlass.min(b, st.B - 1), st.S) + 127) // 128
+    return (valid_len(st.lens, cutlass.min(b, st.B - 1), st.S) + 127) >> 7
 
 
 def _first_tile(st):
@@ -341,15 +341,19 @@ def _zero_scales(st, scales):
     tiles (t0_all, n_all), which no role visits. scales: the global addresses of (q_sfv, k_sfv); a lane stores its
     share of the 16-byte chunks of a tile's BF16 scales."""
     z = Uint32(0)
-    for t in cutlass.range(st.t0_all, st.t0_all + st.n_all):
-        bh = t // st.nb2
-        rem = t - bh * st.nb2
-        sblk = rem >> 1
-        if sblk >= _live_blocks(st, bh // st.H):
+    end = st.t0_all + st.n_all
+    # per (batch, head) of the range: its tiles from the first block without a valid token on
+    for bh in cutlass.range(st.t0_all // st.nb2, (end + st.nb2 - 1) // st.nb2):
+        t0 = bh * st.nb2
+        for t in cutlass.range(
+            cutlass.max(st.t0_all, t0 + 2 * _live_blocks(st, bh // st.H)),
+            cutlass.min(end, t0 + st.nb2),
+        ):
+            rem = t - t0
             base = scales[0]
             if rem & 1 == 1:
                 base = scales[1]
-            base = base + _scale_tile(st, bh, sblk) * Int64(2)
+            base = base + _scale_tile(st, bh, rem >> 1) * Int64(2)
             for c in cutlass.range(st.lane, st.sfv_tile // 8, 32):
                 store_vector(gptr(Uint32, base + Int64(c * 16), 16), (z, z, z, z))
 
@@ -747,17 +751,17 @@ def _live_tiles(lens, S, H, batch, bidx, gdim):
     their batch element; the CTAs take contiguous ranges of them of the same size."""
     total = Int32(0)
     for b in cutlass.range(batch):
-        total = total + H * 2 * ((valid_len(lens, b, S) + 127) // 128)
+        total = total + H * 2 * ((valid_len(lens, b, S) + 127) >> 7)
     l0 = (bidx * total) // gdim
     n = ((bidx + 1) * total) // gdim - l0
     # the batch element that holds live tile l0, and the live tiles before it
     b = Int32(0)
     before = Int32(0)
-    per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) // 128)
+    per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) >> 7)
     while (b < batch) & (l0 >= before + H * per_head):
         before = before + H * per_head
         b = b + 1
-        per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) // 128)
+        per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) >> 7)
     local = l0 - before
     h = local // cutlass.max(per_head, Int32(1))
     rem = local - h * per_head

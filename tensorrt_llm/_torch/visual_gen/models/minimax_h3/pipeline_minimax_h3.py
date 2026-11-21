@@ -81,7 +81,7 @@ from .packing import (
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
-from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel, _is_deco_recipe
+from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel, _attention_backend_class
 from .vsa import build_h3_vsa_metadata, set_h3_vsa_context
 
 if TYPE_CHECKING:
@@ -244,23 +244,17 @@ class MiniMaxH3Pipeline(BasePipeline):
                     "cfg_size=1, ring_size=1, attn2d_size=(1, 1), and "
                     "tp_size * ulysses_size=world_size."
                 )
-            # A DeCo-Attention recipe takes the valid prefix of the padded sequence.
-            if (
-                vgm.ulysses_size > 1
-                and not _is_deco_recipe(pipeline_config)
-                and pipeline_config.attention.backend
-                not in (
-                    "VANILLA",
-                    "FA4",
-                    "TRTLLM",
-                    "FLASHINFER",
-                )
-            ):
-                raise NotImplementedError(
-                    "MiniMax-H3 Ulysses requires VANILLA, FA4, TRTLLM, or FLASHINFER attention, "
-                    "or a DeCo-Attention recipe. Other attention backends do not support the "
-                    "required packed-row padding mask."
-                )
+            if vgm.ulysses_size > 1:
+                # Ulysses pads the packed sequence to a multiple of its size.
+                backend_cls = _attention_backend_class(pipeline_config)
+                if not (
+                    backend_cls.support_key_padding_mask() or backend_cls.support_valid_seq_len()
+                ):
+                    raise NotImplementedError(
+                        "MiniMax-H3 Ulysses requires an attention backend that takes "
+                        "key_padding_mask or valid_seq_len for the padded packed rows; the "
+                        f"{pipeline_config.attention.backend} backend takes neither."
+                    )
         self._text_encoder_tp_group = None
         if (
             self._uses_tensor_parallel_text_encoder
