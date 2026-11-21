@@ -210,9 +210,11 @@ def _parallel_config_key(case: str) -> str:
 
 def _unittest_case_filename(case: str) -> str:
     """Keep artifacts readable and distinguish full entries with a shared prefix."""
-    prefix = re.sub(r'[/\s"\']+', '-', case)[:63]
+    filename = re.sub(r'[/\s"\']+', '-', case)
+    if len(filename) <= 80:
+        return filename
     digest = hashlib.sha256(case.encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}-{digest}"
+    return f"{filename[:63]}-{digest}"
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
