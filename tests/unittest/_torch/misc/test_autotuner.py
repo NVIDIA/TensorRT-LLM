@@ -234,6 +234,12 @@ def test_prime_cached_tactics_on_cache_hit(monkeypatch, strategy) -> None:
             tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
         assert len(JitGemmRunner.calls) == len(expected)
 
+        # A kernel cache emptied in place is filled again.
+        JitGemmRunner.kernel_cache.clear()
+        with autotune(cache_path=cache_path):
+            tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+        assert set(JitGemmRunner.kernel_cache) == expected
+
         monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "0")
         tuner._primed_cached_tactics.clear()
         JitGemmRunner.calls.clear()
@@ -264,7 +270,7 @@ def test_prime_cached_tactics_after_parallel_cache_merge(monkeypatch) -> None:
     JitGemmRunner.kernel_cache.clear()
     JitGemmRunner.calls.clear()
 
-    def merge_remote_winners(strategy, custom_op) -> None:
+    def merge_remote_winners(strategy, custom_op, tuned_again=()) -> None:
         assert strategy == DistributedTuningStrategy.PARALLEL
         for m, tactic in ((3, 0), (20, 1)):
             cache_key = tuner.profiling_cache.get_cache_key(
@@ -1942,16 +1948,2222 @@ def _tactic_space_cache_key(cache, runner):
                                _TACTIC_SPACE_SHAPES, TuningConfig())
 
 
-def test_tactic_space_key_extends_the_cache_key():
+def test_tactic_space_key_extends_the_cache_key(monkeypatch):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
     cache = autotuner.AutoTuner().profiling_cache
     default = _tactic_space_cache_key(cache, _TacticSpaceRunner())
     assert default == ("test_tactic_space", "_TacticSpaceRunner", "()",
-                       ((16, 64), ))
+                       ((16, 64), ),
+                       autotuner._key_fingerprint(
+                           _TacticSpaceRunner,
+                           autotuner._runner_fingerprint(_TacticSpaceRunner)))
     guided = _tactic_space_cache_key(cache, _TacticSpaceRunner(
         ("nvmmh", "x", 3)))
     assert guided == default + (("nvmmh", "x", 3), )
     assert _tactic_space_cache_key(cache, _TacticSpaceRunner(
         ("nvmmh", "x", 5))) != guided
+
+
+_FP_BASE = """
+from tensorrt_llm._torch.autotuner import TunableRunner
+
+
+class Base(TunableRunner):
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0]
+
+    def forward(self, inputs, tactic=-1, **kwargs):
+        return inputs[0]
+"""
+
+
+@pytest.fixture
+def fp_modules(tmp_path, monkeypatch):
+    """Modules written to tmp_path; those named fp_* stand in for tensorrt_llm
+    ones, and fp_base holds a TunableRunner base."""
+    import textwrap
+    import types
+
+    monkeypatch.setattr(autotuner, "_tracked",
+                        lambda module: module.startswith("fp_"))
+    # These tests exercise the code walk (TLLM_AUTOTUNER_CACHE_KEY=code).
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "code")
+    # Rewritten sources must never run from a stale .pyc (one written within
+    # the same second for a source of the same size).
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    # The modules are written after this process started; only
+    # test_code_fingerprint_marks_sources_edited_after_start wants that seen.
+    monkeypatch.setattr(autotuner, "_EPOCH_NS", float("inf"))
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    def write(name, text):
+        (tmp_path / f"{name}.py").write_text(textwrap.dedent(text))
+
+    def load(name, text):
+        write(name, text)
+        path = tmp_path / f"{name}.py"
+        module = types.ModuleType(name)
+        module.__file__ = str(path)
+        monkeypatch.setitem(sys.modules, name, module)
+        # Compiled from the source just written, never from bytecode.
+        exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+        return module
+
+    def edit(name, old, new):
+        path = tmp_path / f"{name}.py"
+        text = path.read_text()
+        assert old in text
+        path.write_text(text.replace(old, new))
+
+    def fingerprints(*runner_classes):
+        # As a new process would: an edit that keeps a file's size can share
+        # its mtime with the previous write, so the source index is dropped.
+        autotuner._SOURCE_INDEXES.clear()
+        autotuner._code_fingerprint.cache_clear()
+        autotuner._candidates_fingerprint.cache_clear()
+        return [autotuner._code_fingerprint(k) for k in runner_classes]
+
+    before = set(sys.modules)
+    load("fp_base", _FP_BASE)
+    yield SimpleNamespace(root=tmp_path,
+                          write=write,
+                          load=load,
+                          edit=edit,
+                          fingerprints=fingerprints)
+    autotuner._candidates_fingerprint.cache_clear()
+    # Drop the fp_* modules a fingerprint imported.
+    for name in set(sys.modules) - before:
+        if name.startswith("fp_"):
+            del sys.modules[name]
+
+
+def _changed(before, after):
+    return [b != a for b, a in zip(before, after)]
+
+
+def test_code_fingerprint_follows_the_definitions_a_runner_uses(fp_modules):
+    fp_modules.load(
+        "fp_util", """
+        def used():
+            return 0
+
+
+        def unused():
+            return 0
+        """)
+    runners = fp_modules.load(
+        "fp_runners", """
+        import fp_util
+        from fp_base import Base
+
+
+        class UsesUtil(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return fp_util.used()
+
+
+        class Other(Base):
+            pass
+        """)
+    classes = (runners.UsesUtil, runners.Other)
+
+    before = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_util", "def unused():\n    return 0",
+                    "def unused():\n    return 42")
+    assert fp_modules.fingerprints(*classes) == before
+    fp_modules.edit("fp_util", "def used():\n    return 0",
+                    "def used():\n    return 42")
+    assert _changed(before, fp_modules.fingerprints(*classes)) == [True, False]
+
+
+def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
+    fp_modules.load(
+        "fp_util", """
+        BLOCK = 128
+        TILE = BLOCK * 2
+        TABLE = {"small": 1}
+        OVERRIDE = None
+
+
+        def build_tactics():
+            return [0]
+
+
+        TACTICS = build_tactics()
+
+        # Tables and classes completed after they are bound.
+        LAUNCH = {100: (2048, 4)}
+        LAUNCH[103] = LAUNCH[100]
+        LAUNCH.update({90: (512, 2)})
+
+
+        class Config:
+            tile = 1
+
+
+        Config.tile = 2
+
+        # Tables and values decided by a loop or a branch around them.
+        REGS = {}
+        for atom in range(9, 17):
+            REGS[atom] = 16
+
+        if BLOCK > 64:
+            MODE = 1
+        else:
+            MODE = 2
+        """)
+    runners = fp_modules.load(
+        "fp_runners", """
+        import fp_util
+        from fp_base import Base
+
+
+        def tactics(limit=fp_util.BLOCK):
+            return [limit]
+
+
+        class UsesDerivedConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.TILE]
+
+
+        class UsesTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return list(fp_util.TABLE)
+
+
+        class UsesClassAttribute(Base):
+            block = fp_util.BLOCK + 0
+
+
+        class UsesDefaultArgument(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return tactics()
+
+
+        class UsesBuiltTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return fp_util.TACTICS
+
+
+        class UsesNoneConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.OVERRIDE or 0]
+
+
+        class ImportsNoneConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                from fp_util import OVERRIDE
+                return [OVERRIDE or 0]
+
+
+        class UsesCompletedTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.LAUNCH[103]]
+
+
+        class UsesPatchedClass(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.Config.tile]
+
+
+        class UsesLoopTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.REGS.get(7, 0)]
+
+
+        class UsesBranchConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.MODE]
+        """)
+    names = ("UsesDerivedConstant", "UsesTable", "UsesClassAttribute",
+             "UsesDefaultArgument", "UsesBuiltTable", "UsesNoneConstant",
+             "ImportsNoneConstant", "UsesCompletedTable", "UsesPatchedClass",
+             "UsesLoopTable", "UsesBranchConstant")
+    classes = [getattr(runners, name) for name in names]
+
+    # Each edit, and the runners it must re-key (no other runner may).
+    edits = [
+        (("BLOCK = 128", "BLOCK = 1024"), {
+            "UsesDerivedConstant", "UsesClassAttribute", "UsesDefaultArgument",
+            "UsesBranchConstant"
+        }),
+        (('{"small": 1}', '{"small": 1, "large": 2}'), {"UsesTable"}),
+        (("return [0]", "return [0, 1]"), {"UsesBuiltTable"}),
+        (("OVERRIDE = None", "OVERRIDE = 1024"),
+         {"UsesNoneConstant", "ImportsNoneConstant"}),
+        # The repository's _SILU_AND_MUL_2IN_LAUNCH_PARAMS is completed so.
+        (("LAUNCH[103] = LAUNCH[100]", "LAUNCH[103] = (1024, 8)"),
+         {"UsesCompletedTable"}),
+        (("{90: (512, 2)}", "{90: (512, 32)}"), {"UsesCompletedTable"}),
+        (("Config.tile = 2", "Config.tile = 32"), {"UsesPatchedClass"}),
+        # Only the loop's range changes (as for fp4_paged_mqa_logits' tables).
+        (("range(9, 17)", "range(7, 17)"), {"UsesLoopTable"}),
+        (("if BLOCK > 64:", "if BLOCK > 512:"), {"UsesBranchConstant"}),
+    ]
+    before = fp_modules.fingerprints(*classes)
+    for (old, new), expected in edits:
+        fp_modules.edit("fp_util", old, new)
+        after = fp_modules.fingerprints(*classes)
+        changed = {name for name, b, a in zip(names, before, after) if b != a}
+        assert changed == expected, old
+        before = after
+
+
+def test_code_fingerprint_follows_kernel_objects_and_imports(
+        fp_modules, monkeypatch):
+    # jitlib stands in for a kernel DSL outside tensorrt_llm (as triton.jit):
+    # its kernels are callable objects, not functions.
+    fp_modules.load(
+        "jitlib", """
+        class jit:
+            def __init__(self, fn):
+                self.fn = fn
+                self.__module__ = fn.__module__
+                self.__qualname__ = fn.__qualname__
+
+            def __call__(self, *args):
+                return self.fn(*args)
+        """)
+    fp_modules.load(
+        "fp_kernels", """
+        import jitlib
+
+
+        @jitlib.jit
+        def helper():
+            return 0
+
+
+        @jitlib.jit
+        def kernel():
+            return helper()
+        """)
+    # A key must not import modules outside tensorrt_llm: once imported,
+    # this one would stay in sys.modules.
+    fp_modules.write("side_effect_mod", "IMPORTED = True\n")
+    # Nor look up attributes of one, which can import (PEP 562).
+    lazy = fp_modules.load(
+        "lazypkg", """
+        CALLS = []
+
+
+        def __getattr__(name):
+            CALLS.append(name)
+            raise AttributeError(name)
+        """)
+    (fp_modules.root / "fp_pkg").mkdir()
+    fp_modules.write("fp_pkg/__init__", "")
+    fp_modules.write("fp_pkg/mod", "def run():\n    return 0\n")
+    (fp_modules.root / "fp_pkg" / "sub").mkdir()
+    fp_modules.write("fp_pkg/sub/__init__", "")
+    fp_modules.write("fp_pkg/sub/deep", "def run():\n    return 0\n")
+    runners = fp_modules.load(
+        "fp_runners", """
+        import lazypkg
+        from fp_base import Base
+        from fp_kernels import kernel
+
+
+        class UsesKernel(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return kernel()
+
+
+        class ImportsInForward(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import side_effect_mod
+                from fp_kernels import helper
+                return helper(), side_effect_mod
+
+
+        class ImportsAliasedModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_pkg.mod as mod
+                return mod.run()
+
+
+        class ImportsDeepAliasedModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_pkg.sub.deep as deep
+                return deep.run()
+
+
+        class UsesLazyPackage(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return lazypkg.backend.run()
+        """)
+    versions = {"side_effect_mod": "1.0"}
+    monkeypatch.setattr(autotuner, "_package_versions",
+                        lambda top: versions.get(top, ""))
+    classes = (runners.UsesKernel, runners.ImportsInForward,
+               runners.ImportsAliasedModule, runners.ImportsDeepAliasedModule,
+               runners.UsesLazyPackage)
+
+    # Each change, and which of the runners above it must re-key.
+    def bump_side_effect_mod():
+        versions["side_effect_mod"] = "2.0"
+
+    changes = [
+        (lambda: fp_modules.edit("fp_kernels", "def helper():\n    return 0",
+                                 "def helper():\n    return 42"),
+         [1, 1, 0, 0, 0]),
+        (lambda: fp_modules.edit("fp_pkg/mod", "return 0", "return 42"),
+         [0, 0, 1, 0, 0]),
+        (lambda: fp_modules.edit("fp_pkg/sub/deep", "return 0", "return 42"),
+         [0, 0, 0, 1, 0]),
+        (bump_side_effect_mod, [0, 1, 0, 0, 0]),
+    ]
+    before = fp_modules.fingerprints(*classes)
+    assert "side_effect_mod" not in sys.modules
+    for change, expected in changes:
+        change()
+        after = fp_modules.fingerprints(*classes)
+        assert _changed(before, after) == [bool(e) for e in expected]
+        before = after
+    assert "side_effect_mod" not in sys.modules
+    assert lazy.CALLS == []
+
+
+def test_code_fingerprint_survives_a_module_that_fails_to_import(fp_modules):
+    # A runner may import, in a branch it never takes here, a module that
+    # cannot load on this system; the key must still compute.
+    fp_modules.write("fp_broken", "raise ValueError('unsupported system')\n")
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class ImportsBrokenModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                if tactic == 99:
+                    from fp_broken import kernel
+                    return kernel()
+                return inputs[0]
+        """)
+    [fingerprint] = fp_modules.fingerprints(runners.ImportsBrokenModule)
+    assert fp_modules.fingerprints(runners.ImportsBrokenModule) == [fingerprint]
+
+
+def test_code_fingerprint_follows_which_definition_a_name_binds(fp_modules):
+    fp_modules.load(
+        "fp_impls", """
+        def primary():
+            return 0
+
+
+        def alternate():
+            return 1
+        """)
+    fp_modules.load("fp_impl_a", "def run():\n    return 0\n")
+    fp_modules.load("fp_impl_b", "def run():\n    return 1\n")
+    # Each runner source, and the swap of the two definitions its names bind.
+    cases = [
+        ("""
+        from fp_base import Base
+        from fp_impls import primary as first, alternate as second
+
+
+        class Runner(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return (first if tactic == 0 else second)()
+        """, "primary as first, alternate as second",
+         "alternate as first, primary as second"),
+        ("""
+        from fp_base import Base
+        import fp_impl_a as first, fp_impl_b as second
+
+
+        class Runner(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return first.run() if tactic == 0 else second.run()
+        """, "fp_impl_a as first, fp_impl_b as second",
+         "fp_impl_b as first, fp_impl_a as second"),
+    ]
+    for source, bindings, swapped_bindings in cases:
+        [before] = fp_modules.fingerprints(
+            fp_modules.load("fp_runners", source).Runner)
+        assert fp_modules.fingerprints(
+            fp_modules.load("fp_runners", source).Runner) == [before]
+        swapped = source.replace(bindings, swapped_bindings)
+        assert fp_modules.fingerprints(
+            fp_modules.load("fp_runners", swapped).Runner) != [before]
+
+
+def test_code_fingerprint_follows_modules_imported_in_a_function(fp_modules):
+    fp_modules.load("fp_helpers", "def helper():\n    return 0\n")
+    fp_modules.load("fp_backend_a", "def run():\n    return 0\n")
+    fp_modules.load("fp_backend_b", "def run():\n    return 1\n")
+    fp_modules.load("fp_impl", "def select():\n    return 0\n")
+    # Only re-exports what another module defines.
+    fp_modules.load("fp_catalog", "from fp_impl import select\n")
+    (fp_modules.root / "fp_moe").mkdir()
+    fp_modules.write("fp_moe/__init__", "")
+    fp_modules.write(
+        "fp_moe/decode", """
+        from fp_helpers import helper
+
+
+        def select():
+            return helper()
+
+
+        def unused():
+            return 0
+        """)
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def run_with(module):
+            return module.select()
+
+
+        class UsesAttribute(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                from fp_moe import decode
+                return decode.select()
+
+
+        class PassesModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                from fp_moe import decode
+                return run_with(decode)
+
+
+        class PicksBackend(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                if tactic == 0:
+                    import fp_backend_a as backend
+                else:
+                    import fp_backend_b as backend
+                return backend.run()
+
+
+        class RebindsLocal(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_backend_a as backend
+                first = backend.run()
+                import fp_backend_b as backend
+                return first + backend.run()
+
+
+        class PassesCatalog(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_catalog
+                return run_with(fp_catalog)
+        """)
+    classes = (runners.UsesAttribute, runners.PassesModule,
+               runners.PicksBackend, runners.RebindsLocal,
+               runners.PassesCatalog)
+
+    before = fp_modules.fingerprints(*classes)
+    # What the module's code uses counts, in another file too.
+    fp_modules.edit("fp_helpers", "return 0", "return 42")
+    after_helper = fp_modules.fingerprints(*classes)
+    assert _changed(before, after_helper) == [True, True, False, False, False]
+    # A module used only through its attributes counts by those; one passed
+    # on as a whole counts whole.
+    fp_modules.edit("fp_moe/decode", "def unused():\n    return 0",
+                    "def unused():\n    return 42")
+    after_unused = fp_modules.fingerprints(*classes)
+    assert _changed(after_helper,
+                    after_unused) == [False, True, False, False, False]
+    # A local that two imports bind, in two branches or one after the
+    # other, counts both modules.
+    for backend in ("fp_backend_a", "fp_backend_b"):
+        previous = fp_modules.fingerprints(*classes)
+        fp_modules.edit(backend, "return ", "return 4")
+        assert _changed(previous, fp_modules.fingerprints(*classes)) == [
+            False, False, True, True, False
+        ]
+    # A module counted whole counts what it re-exports.
+    previous = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_impl", "return 0", "return 42")
+    assert _changed(previous, fp_modules.fingerprints(*classes)) == [
+        False, False, False, False, True
+    ]
+
+
+def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
+    import uuid
+
+    op = f"op_{uuid.uuid4().hex[:12]}"
+    fp_modules.load(
+        "fp_ops", f"""
+        import torch
+        from tensorrt_llm._torch.custom_ops.fast_custom_op import fast_custom_op
+
+        _lib = torch.library.Library("fp_test", "FRAGMENT")
+        _lib.define("native_{op}(Tensor x) -> Tensor")
+
+
+        @torch.library.custom_op("fp_test::python_{op}", mutates_args=())
+        def python_op(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+
+        @python_op.register_kernel("cpu")
+        def python_op_cpu(x):
+            return x.mul(1)
+
+
+        # Registered through Library.define / impl, not torch.library.custom_op.
+        @fast_custom_op("fp_test::fast_{op}", mutates_args=(), device_types="CPU")
+        def fast_op(x: torch.Tensor) -> torch.Tensor:
+            return x.add(1)
+        """)
+    runners = fp_modules.load(
+        "fp_runners", f"""
+        import torch
+        import fp_ops
+        from fp_base import Base
+
+
+        class UsesPythonOp(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.ops.fp_test.python_{op}(inputs[0])
+
+
+        class UsesNativeOp(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.ops.fp_test.native_{op}(inputs[0])
+
+
+        class UsesNativeClass(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                runner = torch.classes.fp_test.Runner_{op}()
+                return list(range(runner.get_num_configs()))
+
+
+        class ImportsClassesLocally(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                from torch import classes
+                runner = classes.fp_test.Runner_{op}()
+                return list(range(runner.get_num_configs()))
+
+
+        class ImportsTorchLocally(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import torch as t
+                return t.ops.fp_test.native_{op}(inputs[0])
+
+
+        class UsesFastOp(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.ops.fp_test.fast_{op}(inputs[0])
+        """)
+    build = {"id": "a"}
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: build["id"])
+    classes = (runners.UsesPythonOp, runners.UsesNativeOp,
+               runners.UsesNativeClass, runners.ImportsClassesLocally,
+               runners.ImportsTorchLocally, runners.UsesFastOp)
+
+    # Each change, and which of the runners above it must re-key.
+    def rebuild():
+        build["id"] = "b"
+
+    changes = [
+        (lambda: fp_modules.edit("fp_ops", "return x.clone()",
+                                 "return x.clone() + 0"), [1, 0, 0, 0, 0, 0]),
+        (lambda: fp_modules.edit("fp_ops", "x.mul(1)", "x.mul(10)"),
+         [1, 0, 0, 0, 0, 0]),
+        (lambda: fp_modules.edit("fp_ops", "x.add(1)", "x.add(10)"),
+         [0, 0, 0, 0, 0, 1]),
+        (rebuild, [0, 1, 1, 1, 1, 0]),
+    ]
+    before = fp_modules.fingerprints(*classes)
+    for change, expected in changes:
+        change()
+        after = fp_modules.fingerprints(*classes)
+        assert _changed(before, after) == [bool(e) for e in expected]
+        before = after
+
+
+_CANDIDATE_RUNNERS = """
+    import fp_util
+    from fp_base import Base
+
+
+    class Winner(Base):
+        pass
+
+
+    class Loser(Base):
+        def forward(self, inputs, tactic=-1, **kwargs):
+            return fp_util.helper()
+    """
+
+
+def test_candidates_fingerprint_covers_every_candidate(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return 0\n")
+    runners = fp_modules.load("fp_runners", _CANDIDATE_RUNNERS)
+
+    def fingerprints():
+        [own] = fp_modules.fingerprints(runners.Winner)
+        candidates = autotuner._candidates_fingerprint
+        return (own, candidates(
+            (runners.Winner, )), candidates((runners.Winner, runners.Loser)),
+                candidates((runners.Loser, runners.Winner)))
+
+    before = fingerprints()
+    own, alone, pair, pair_reversed = before
+    assert alone == own and pair == pair_reversed and pair != alone
+    # A change to the runner that lost re-keys entries tuned against it.
+    fp_modules.edit("fp_util", "return 0", "return 42")
+    assert _changed(before, fingerprints()) == [False, False, True, True]
+
+
+def test_code_fingerprint_marks_sources_edited_after_start(
+        fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Runner(Base):
+            pass
+        """)
+    [unchanged_since_start] = fp_modules.fingerprints(runners.Runner)
+    warnings = []
+    monkeypatch.setattr(autotuner.logger,
+                        "warning_once",
+                        lambda message, key=None: warnings.append(key))
+    monkeypatch.setattr(autotuner, "_EPOCH_NS", 0)
+    # The process may run other code than the disk holds: its key matches no
+    # entry a process that loaded the edited file writes, and is not saved.
+    [edited_since_start] = fp_modules.fingerprints(runners.Runner)
+    assert edited_since_start == autotuner._EDITED_PREFIX + unchanged_since_start
+    assert autotuner._edited_key(("op", "Runner", "()", (), edited_since_start))
+    assert any(key and key[0] == "autotuner_source_edited" for key in warnings)
+
+
+_FACTORY_RUNNERS = """
+    from fp_base import Base
+
+
+    class Narrow(Base):
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0]
+
+
+    class Wide(Base):
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0, 1]
+
+
+    def factory(base):
+        class Runner(base):
+            pass
+
+        return Runner
+    """
+
+
+def test_code_fingerprint_tells_factory_built_runner_classes_apart(fp_modules):
+    runners = fp_modules.load("fp_runners", _FACTORY_RUNNERS)
+    narrow = runners.factory(runners.Narrow)
+    wide = runners.factory(runners.Wide)
+    assert narrow.__qualname__ == wide.__qualname__
+    fp_modules.fingerprints()
+    cached = [autotuner._code_fingerprint(k) for k in (narrow, wide)]
+    walked = [autotuner._FingerprintWalk(k).digest() for k in (narrow, wide)]
+    assert cached == walked and cached[0] != cached[1]
+    assert autotuner._candidates_fingerprint(
+        (narrow, )) != autotuner._candidates_fingerprint((wide, ))
+    # Built again on the same base, it is the same runner.
+    assert autotuner._code_fingerprint(runners.factory(
+        runners.Narrow)) == cached[0]
+
+
+# One factory whose runners differ only in the implementation they capture.
+_CLOSURE_RUNNERS = """
+    from fp_base import Base
+
+
+    def narrow():
+        return [0]
+
+
+    def wide():
+        return [0, 1]
+
+
+    def factory(impl):
+        class Runner(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return impl()
+
+        return Runner
+    """
+
+
+def test_code_fingerprint_follows_captured_implementations(fp_modules):
+    runners = fp_modules.load("fp_runners", _CLOSURE_RUNNERS)
+    narrow = runners.factory(runners.narrow)
+    wide = runners.factory(runners.wide)
+    fp_modules.fingerprints()
+    cached = [autotuner._code_fingerprint(k) for k in (narrow, wide)]
+    walked = [autotuner._FingerprintWalk(k).digest() for k in (narrow, wide)]
+    assert cached == walked and cached[0] != cached[1]
+    pair = autotuner._candidates_fingerprint((narrow, wide))
+    assert autotuner._key_fingerprint(narrow,
+                                      pair) != autotuner._key_fingerprint(
+                                          wide, pair)
+    # Built again around the same implementation, it is the same runner.
+    assert autotuner._code_fingerprint(runners.factory(
+        runners.narrow)) == cached[0]
+    # An edit to the captured implementation re-keys only its runner.
+    fp_modules.edit("fp_runners", "return [0, 1]", "return [0, 1, 2]")
+    assert _changed(cached, fp_modules.fingerprints(narrow,
+                                                    wide)) == [False, True]
+
+
+def test_candidates_fingerprint_follows_the_build(fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Winner(Base):
+            pass
+
+
+        class Loser(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return 0
+        """)
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    build = {"id": "a"}
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: build["id"])
+
+    def fingerprints():
+        autotuner._candidates_fingerprint.cache_clear()
+        return [
+            autotuner._candidates_fingerprint(classes)
+            for classes in ((runners.Winner, ), (runners.Loser, ),
+                            (runners.Winner, runners.Loser))
+        ]
+
+    before = fingerprints()
+    assert len(set(before)) == 3
+    # The same on every process of an installation, whatever the code does.
+    fp_modules.edit("fp_runners", "return 0", "return 42")
+    assert fingerprints() == before
+    # A rebuild re-keys every runner.
+    build["id"] = "b"
+    assert _changed(before, fingerprints()) == [True, True, True]
+
+
+def test_candidates_fingerprint_covers_the_losers_tactic_spaces(fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Spaced(Base):
+            def __init__(self, space=None, uid=()):
+                self.space = space
+                self.uid = uid
+
+            def unique_id(self):
+                return self.uid
+
+            def tactic_space_key(self):
+                return self.space
+
+
+        class Winner(Base):
+            pass
+        """)
+    winner = runners.Winner()
+    classes = (runners.Winner, runners.Spaced)
+    set_fingerprint = autotuner._candidates_fingerprint(classes)
+
+    def key(loser):
+        spaces = autotuner._tactic_spaces([winner, loser])
+        return autotuner._key_fingerprint(runners.Winner, set_fingerprint,
+                                          spaces)
+
+    # A loser that widens its tactic space re-opens the comparison, and so
+    # does one that changes its unique_id without a tactic space key.
+    assert key(runners.Spaced(("limited", ))) != key(runners.Spaced(("all", )))
+    assert key(runners.Spaced(uid=(1, ))) != key(runners.Spaced(uid=(2, )))
+
+    # So does one of the same class as the winner, which it tells apart by
+    # unique_id.
+    alike = autotuner._candidates_fingerprint((runners.Spaced, ))
+
+    def alike_key(winner_space, loser_space):
+        candidates = [
+            runners.Spaced(winner_space, uid=(0, )),
+            runners.Spaced(loser_space, uid=(1, ))
+        ]
+        return autotuner._key_fingerprint(runners.Spaced, alike,
+                                          autotuner._tactic_spaces(candidates))
+
+    assert alike_key(("all", ), ("limited", )) != alike_key(("all", ),
+                                                            ("all", ))
+    assert alike_key(("all", ), ("limited", )) != alike_key(("limited", ),
+                                                            ("all", ))
+
+
+def test_code_fingerprint_of_a_factory_runner_that_names_itself(fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def factory():
+            class Runner(Base):
+                tactics = [0]
+
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return Runner.tactics
+
+            return Runner
+        """)
+    fp_modules.fingerprints()
+    first, second = runners.factory(), runners.factory()
+    assert autotuner._code_fingerprint(first) == autotuner._code_fingerprint(
+        second)
+
+
+def test_candidates_fingerprint_keys_same_named_runners_apart(fp_modules):
+    runners = fp_modules.load("fp_runners", _FACTORY_RUNNERS)
+    narrow = runners.factory(runners.Narrow)
+    wide = runners.factory(runners.Wide)
+    fp_modules.fingerprints()
+    pair = autotuner._candidates_fingerprint((narrow, wide))
+    # Same class name and unique_id: only their own fingerprints differ.
+    assert autotuner._key_fingerprint(narrow,
+                                      pair) != autotuner._key_fingerprint(
+                                          wide, pair)
+    # A runner tuned alone is keyed by its own fingerprint (and the GPU's).
+    alone = autotuner._candidates_fingerprint((narrow, ))
+    assert autotuner._own_fingerprint(autotuner._key_fingerprint(
+        narrow, alone))[0] == alone
+    # Their names tell which runner an entry is for: they are not one runner
+    # under two builds.
+    assert autotuner._own_fingerprint(autotuner._key_fingerprint(
+        narrow, alone))[1] != autotuner._own_fingerprint(
+            autotuner._key_fingerprint(
+                wide, autotuner._candidates_fingerprint((wide, ))))[1]
+
+
+def test_candidates_fingerprint_tells_factory_runners_apart_by_build(
+        fp_modules, monkeypatch):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    for source, narrow_impl, wide_impl in (
+        (_FACTORY_RUNNERS, "Narrow", "Wide"),
+        (_CLOSURE_RUNNERS, "narrow", "wide"),
+    ):
+        runners = fp_modules.load("fp_runners", source)
+        narrow, wide, again = (runners.factory(getattr(runners, impl))
+                               for impl in (narrow_impl, wide_impl,
+                                            narrow_impl))
+        fp_modules.fingerprints()
+        # Built around different bases or implementations: their names differ.
+        assert autotuner._runner_fingerprint(
+            narrow) != autotuner._runner_fingerprint(wide)
+        # Built alike: one key, in every process.
+        assert autotuner._runner_fingerprint(
+            narrow) == autotuner._runner_fingerprint(again)
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def narrow():
+            return [0]
+
+
+        def wide():
+            return [0, 1]
+
+
+        def factory(impl):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, kernel=impl,
+                                      **kwargs):
+                    return kernel()
+
+            return Runner
+        """)
+    fp_modules.fingerprints()
+    # An implementation bound as a default argument counts too.
+    assert autotuner._runner_fingerprint(runners.factory(
+        runners.narrow)) != autotuner._runner_fingerprint(
+            runners.factory(runners.wide))
+
+
+def test_code_fingerprint_of_a_class_another_thread_identifies(fp_modules):
+    import threading
+
+    runners = fp_modules.load("fp_runners", _CLOSURE_RUNNERS)
+    narrow = runners.factory(runners.narrow)
+    started, finish = threading.Event(), threading.Event()
+
+    def identify_elsewhere():
+        # Another thread in the middle of identifying the same class.
+        autotuner._CLASS_IDENTITIES_IN_PROGRESS.classes = {narrow}
+        started.set()
+        finish.wait()
+
+    thread = threading.Thread(target=identify_elsewhere)
+    thread.start()
+    try:
+        started.wait()
+        assert autotuner._class_identity(narrow) != autotuner._class_name(
+            narrow)
+    finally:
+        finish.set()
+        thread.join()
+
+
+def test_build_fingerprint_skips_unreadable_package_metadata(monkeypatch):
+    import importlib.metadata
+
+    class Broken:
+
+        @property
+        def metadata(self):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+
+    class Good:
+        metadata = {"Name": "good-dist"}
+        files = None
+
+        def read_text(self, name):
+            return "good\n" if name == "top_level.txt" else None
+
+    monkeypatch.setattr(importlib.metadata, "distributions",
+                        lambda: [Broken(), Good()])
+    autotuner._packages_distributions.cache_clear()
+    try:
+        assert autotuner._packages_distributions() == {"good": ["good-dist"]}
+    finally:
+        autotuner._packages_distributions.cache_clear()
+
+
+def test_build_fingerprint_follows_what_factory_runners_hold(monkeypatch):
+    import functools
+
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    key = autotuner._build_class_key
+
+    def narrow():
+        return [0]
+
+    def wide():
+        return [0, 1]
+
+    def pick(first, second):
+        return first()
+
+    def make_base(impl):
+
+        class Base:
+
+            def get_valid_tactics(self):
+                return impl()
+
+        return Base
+
+    def make(base):
+
+        class Runner(base):
+            pass
+
+        return Runner
+
+    def holding(impl):
+
+        class Runner:
+
+            def get_valid_tactics(self):
+                return impl()
+
+        return Runner
+
+    # A class built on bases that one factory builds differently.
+    assert key(make(make_base(narrow))) != key(make(make_base(wide)))
+    assert key(make(make_base(narrow))) == key(make(make_base(narrow)))
+    # A partial counts by its keyword names, not only its values' order.
+    assert key(holding(functools.partial(
+        pick, first=narrow, second=wide))) != key(
+            holding(functools.partial(pick, second=narrow, first=wide)))
+    # Constants a factory captures count.
+    assert key(holding((0, ))) != key(holding((0, 1)))
+
+    # A function wrapping a partial, and a partial that holds itself, are
+    # named without failing the lookup.
+    def wrapper():
+        return pick(narrow, wide)
+
+    wrapped = functools.wraps(functools.partial(pick, narrow, wide))(wrapper)
+    assert key(holding(wrapped)) != key(holding(narrow))
+    cyclic = functools.partial(pick, first=narrow, second=None)
+    cyclic.keywords["second"] = cyclic
+    assert key(holding(cyclic))
+
+
+def test_build_fingerprint_follows_loaded_libraries(monkeypatch, tmp_path):
+    library = tmp_path / "libcublasLt.so.13"
+    library.write_bytes(b"one")
+    native = tmp_path / "libth_common.so"
+    native.write_bytes(b"native")
+    loaded = {"paths": (str(library), )}
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: "")
+    monkeypatch.setattr(autotuner, "_native_libraries", lambda: [native])
+    monkeypatch.setattr(autotuner, "_NATIVE_FILES",
+                        {str(native): autotuner._file_identity(native)})
+    monkeypatch.setattr(autotuner, "_loaded_libraries", lambda: loaded["paths"])
+    monkeypatch.setattr(autotuner, "_EPOCH_NS", float("inf"))
+
+    def build():
+        autotuner._build_fingerprint.cache_clear()
+        autotuner._native_replaced.cache_clear()
+        return autotuner._build_fingerprint()
+
+    try:
+        first = build()
+        assert not first.startswith(autotuner._EDITED_PREFIX)
+        library.write_bytes(b"two")  # Another cuBLAS build.
+        second = build()
+        assert second != first
+        # Fingerprints taken before a library loads (cuBLAS once CUDA is
+        # initialized) are taken again once it has.
+        monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+        before = autotuner._runner_fingerprint(_TacticSpaceRunner)
+        loaded["paths"] = (str(library), str(tmp_path / "libcublas.so.13"))
+        assert autotuner._runner_fingerprint(_TacticSpaceRunner) != before
+        loaded["paths"] = (str(library), )
+        # A library replaced on disk after this process loaded it: its
+        # mapping is deleted, it is newer than the process, or (renamed over,
+        # keeping the old mtime) it is not the file found on import.
+        loaded["paths"] = (str(library) + " (deleted)", )
+        assert build().startswith(autotuner._EDITED_PREFIX)
+        loaded["paths"] = (str(library), )
+        assert not build().startswith(autotuner._EDITED_PREFIX)
+        replacement = tmp_path / "replacement.so"
+        replacement.write_bytes(b"native")
+        os.replace(replacement, native)
+        assert build().startswith(autotuner._EDITED_PREFIX)
+        monkeypatch.setattr(autotuner, "_NATIVE_FILES",
+                            {str(native): autotuner._file_identity(native)})
+        assert not build().startswith(autotuner._EDITED_PREFIX)
+        # Removed (unlinked) while the process still runs it.
+        native.unlink()
+        monkeypatch.setattr(autotuner, "_native_libraries", lambda: [])
+        assert build().startswith(autotuner._EDITED_PREFIX)
+        monkeypatch.setattr(autotuner, "_NATIVE_FILES", {})
+        assert not build().startswith(autotuner._EDITED_PREFIX)
+        monkeypatch.setattr(autotuner, "_EPOCH_NS", 0)
+        loaded["paths"] = (str(library), )
+        assert build().startswith(autotuner._EDITED_PREFIX)
+    finally:
+        autotuner._clear_fingerprints()
+
+
+def test_build_fingerprint_follows_libraries_loaded_before_a_session(
+        monkeypatch):
+    """The loaded libraries are scanned once (memoized); a tuning session
+    scans them again (_rescan_loaded_libraries), and fingerprints taken
+    before then are taken again."""
+    import functools
+    mapped = {"paths": ("/lib/libcublasLt.so.13", )}
+    monkeypatch.setattr(autotuner, "_cuda_initialized", lambda: True)
+    monkeypatch.setattr(
+        autotuner, "_mapped_libraries",
+        functools.lru_cache(maxsize=None)(lambda cuda: mapped["paths"]))
+    monkeypatch.setattr(autotuner, "_library_id", lambda path: path.name)
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    autotuner._clear_fingerprints()
+    try:
+        before = autotuner._runner_fingerprint(_TacticSpaceRunner)
+        mapped["paths"] = ("/lib/libcublasLt.so.13", "/lib/libcublas.so.13")
+        assert autotuner._runner_fingerprint(_TacticSpaceRunner) == before
+        autotuner._rescan_loaded_libraries()
+        assert autotuner._runner_fingerprint(_TacticSpaceRunner) != before
+    finally:
+        autotuner._clear_fingerprints()
+
+
+def test_candidates_fingerprint_keys_follow_the_current_gpu(monkeypatch):
+    """The GPU architecture is looked up at each key, not memoized with the
+    fingerprints: a process that switches GPUs does not serve the tactics
+    tuned on the other one."""
+    device = {"capability": "sm107"}
+    monkeypatch.setattr(autotuner, "_device_capability",
+                        lambda: device["capability"])
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+
+    def key():
+        return autotuner._key_fingerprint(
+            _TacticSpaceRunner,
+            autotuner._candidates_fingerprint((_TacticSpaceRunner, )))
+
+    on_sm107 = key()
+    device["capability"] = "sm100"
+    assert key() != on_sm107
+    own, name, device = autotuner._own_fingerprint(key())
+    assert f"{own}:{name}" == on_sm107.partition("@")[0] and device == "sm100"
+
+
+@pytest.mark.parametrize("mode", ["code", "build"])
+def test_candidates_fingerprint_follows_the_runner_a_wrapper_holds(
+        fp_modules, monkeypatch, mode):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", mode)
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Narrow(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0]
+
+
+        class Wide(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0, 1]
+
+
+        class Wrapper(Base):
+            def __init__(self, op_runner):
+                self._op_runner = op_runner
+
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return self._op_runner.get_valid_tactics(inputs, profile)
+        """)
+    fp_modules.fingerprints()
+
+    def fingerprint(runner):
+        return autotuner._candidates_fingerprint(
+            (autotuner._runner_kind(runner), ))
+
+    narrow = runners.Wrapper(runners.Narrow())
+    assert fingerprint(narrow) != fingerprint(runners.Wrapper(runners.Wide()))
+    assert fingerprint(narrow) == fingerprint(runners.Wrapper(runners.Narrow()))
+
+
+def test_candidates_fingerprint_binds_tactic_spaces_to_runners(fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Narrow(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0]
+
+
+        class Wide(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0, 1]
+
+
+        def factory(base):
+            class Runner(base):
+                def __init__(self, space):
+                    self.space = space
+
+                def unique_id(self):
+                    return ()
+
+                def tactic_space_key(self):
+                    return self.space
+
+            return Runner
+
+
+        class Winner(Base):
+            pass
+        """)
+    fp_modules.fingerprints()
+    narrow = runners.factory(runners.Narrow)
+    wide = runners.factory(runners.Wide)
+
+    def spaces(narrow_space, wide_space):
+        return autotuner._tactic_spaces(
+            [runners.Winner(),
+             narrow(narrow_space),
+             wide(wide_space)])
+
+    # Same class name and unique_id: which runner has which space counts.
+    assert spaces(("limited", ), ("all", )) != spaces(("all", ), ("limited", ))
+
+
+def test_code_fingerprint_follows_what_factory_runners_hold(fp_modules):
+    import functools
+
+    r = fp_modules.load(
+        "fp_runners", """
+        import functools
+
+        from fp_base import Base
+
+
+        def narrow():
+            return [0]
+
+
+        def wide():
+            return [0, 1]
+
+
+        def pick(first, second):
+            return first()
+
+
+        def layer(fn):
+            def wrapper():
+                return fn()
+
+            return wrapper
+
+
+        def by_default(impl):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, kernel=impl,
+                                      **kwargs):
+                    return kernel()
+
+            return Runner
+
+
+        def holding(impl):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return impl()
+
+            return Runner
+
+
+        def wrapped(impl):
+            for _ in range(5):
+                impl = layer(impl)
+            return holding(impl)
+
+
+        def ordered(preferred, fallback):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return preferred() or fallback()
+
+            return Runner
+
+
+        def constant(tactics):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return list(tactics)
+
+            return Runner
+
+
+        def flagged(wide):
+            return [0, 1] if wide else [0]
+
+
+        def deep(impl):
+            for _ in range(16):
+                impl = layer(impl)
+            return holding(impl)
+
+
+        def classed(tactics):
+            class Runner(Base):
+                TACTICS = tactics
+
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return list(self.TACTICS)
+
+            return Runner
+
+
+        def wrapped_partial(impl):
+            bound = functools.partial(impl)
+
+            @functools.wraps(bound)
+            def call():
+                return bound()
+
+            return holding(call)
+
+
+        def limited(limit):
+            def decorate(fn):
+                @functools.wraps(fn)
+                def call():
+                    return fn()[:limit]
+
+                return call
+
+            return decorate
+        """)
+    fp_modules.fingerprints()
+    fp = autotuner._code_fingerprint
+    partial = functools.partial
+    pairs = [
+        (r.by_default(r.narrow), r.by_default(r.wide)),
+        (r.holding(partial(r.narrow)), r.holding(partial(r.wide))),
+        (r.holding(partial(r.pick, first=r.narrow, second=r.wide)),
+         r.holding(partial(r.pick, second=r.narrow, first=r.wide))),
+        (r.wrapped(r.narrow), r.wrapped(r.wide)),
+        (r.ordered(r.narrow, r.wide), r.ordered(r.wide, r.narrow)),
+        (r.constant((0, )), r.constant((0, 1))),
+        (r.holding(partial(r.flagged,
+                           False)), r.holding(partial(r.flagged, True))),
+        (r.deep(r.narrow), r.deep(r.wide)),
+        (r.classed((0, )), r.classed((0, 1))),
+        (r.holding(r.limited(1)(r.wide)), r.holding(r.limited(2)(r.wide))),
+        (r.constant([0]), r.constant([0, 1])),
+        (r.wrapped_partial(r.narrow), r.wrapped_partial(r.wide)),
+    ]
+    assert [fp(a) != fp(b) for a, b in pairs] == [True] * len(pairs)
+    # Built alike, one fingerprint.
+    assert fp(r.by_default(r.narrow)) == fp(r.by_default(r.narrow))
+    # A partial that holds itself is walked once.
+    looped = partial(r.pick, first=r.narrow)
+    looped.keywords["second"] = looped
+    assert fp(r.holding(looped)) != fp(r.holding(partial(r.narrow)))
+
+
+def test_code_fingerprint_follows_fallback_imports_and_modules_passed_whole(
+        fp_modules):
+    fp_modules.load("fp_primary", "TACTICS = [0, 1]\n")
+    # The fallback source, not imported when the walk reaches it.
+    fp_modules.write("fp_backup", "TACTICS = [0]\n")
+    fp_modules.load("fp_impl", "def tactics():\n    return [0, 1]\n")
+    fp_modules.load(
+        "fp_backend",
+        "import fp_impl\n\ndef valid():\n    return fp_impl.tactics()\n")
+    fp_modules.load("fp_bundle", "import fp_backend\n")
+    runners = fp_modules.load(
+        "fp_runners", """
+        try:
+            from fp_primary import TACTICS
+        except ImportError:
+            from fp_backup import TACTICS
+        import fp_bundle
+        from fp_base import Base
+
+
+        def query(bundle):
+            return bundle.fp_backend.valid()
+
+
+        class Imported(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return TACTICS
+
+
+        class Passed(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return query(fp_bundle)
+        """)
+    classes = (runners.Imported, runners.Passed)
+    before = fp_modules.fingerprints(*classes)
+    # The fallback counts though no process path imported it.
+    fp_modules.edit("fp_backup", "[0]", "[0, 3]")
+    after = fp_modules.fingerprints(*classes)
+    assert _changed(before, after) == [True, False]
+    before = after
+    fp_modules.edit("fp_primary", "[0, 1]", "[0, 2]")
+    # A module the bundle's module imports whole uses another in turn.
+    fp_modules.edit("fp_impl", "[0, 1]", "[0, 2]")
+    assert _changed(before, fp_modules.fingerprints(*classes)) == [True, True]
+
+
+def test_code_fingerprint_follows_tables_changed_through_an_alias_or_a_call(
+        fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+        TACTICS = [0]
+        ALIAS = TACTICS
+        SECOND = ALIAS
+        SECOND.append(1)
+        OTHER = [0]
+        REBOUND = [0]
+        LATER = [0]
+        NAME = REBOUND
+        NAME.append(1)
+        NAME = LATER
+
+
+        def init(table):
+            table.append(1)
+
+
+        init(OTHER)
+
+
+        class ByAlias(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return TACTICS
+
+
+        class ByCall(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return OTHER
+
+
+        class ByRebound(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return REBOUND
+        """)
+    classes = (runners.ByAlias, runners.ByCall, runners.ByRebound)
+    before = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_runners", "SECOND.append(1)", "SECOND.append(2)")
+    fp_modules.edit("fp_runners", "table.append(1)", "table.append(2)")
+    # A change made through an alias bound again later.
+    fp_modules.edit("fp_runners", "NAME.append(1)", "NAME.append(2)")
+    assert _changed(before,
+                    fp_modules.fingerprints(*classes)) == [True, True, True]
+
+
+_HELPER_RUNNER = """
+    from fp_base import Base
+    from fp_util import helper
+
+
+    class Runner(Base):
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return helper()
+    """
+
+
+def test_code_fingerprint_follows_the_code_a_process_runs(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return [0, 1]\n")
+    runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+    # A process that still runs [0, 1] (from a stale .pyc) while the file
+    # says [0, 2], and one that runs what the file says.
+    fp_modules.edit("fp_util", "[0, 1]", "[0, 2]")
+    stale = fp_modules.fingerprints(runners.Runner)
+    fp_modules.load("fp_util", "def helper():\n    return [0, 2]\n")
+    runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+    assert fp_modules.fingerprints(runners.Runner) != stale
+    # Nor when the stale code is a module-level table the helper returns.
+    table = "T = (0, 1)\n\ndef helper():\n    return T\n"
+    fp_modules.load("fp_util", table)
+    runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+    fp_modules.edit("fp_util", "(0, 1)", "(0, 2)")
+    stale = fp_modules.fingerprints(runners.Runner)
+    fp_modules.load("fp_util", table.replace("(0, 1)", "(0, 2)"))
+    runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+    assert fp_modules.fingerprints(runners.Runner) != stale
+    # Nor a module-level list its stale .pyc builds (the source kept its
+    # mtime and size, so Python took the .pyc for current).
+    import py_compile
+    listed = "T = [0, 1]\n\ndef helper():\n    return T\n"
+    runs = []
+    for loaded, on_disk in ((listed, listed.replace("[0, 1]", "[0, 2]")),
+                            (listed.replace("[0, 1]", "[0, 2]"), ) * 2):
+        fp_modules.load("fp_util", loaded)
+        source = fp_modules.root / "fp_util.py"
+        sys.modules["fp_util"].__cached__ = py_compile.compile(
+            str(source), cfile=str(fp_modules.root / "fp_util.pyc"))
+        source.write_text(on_disk)
+        runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+        runs += fp_modules.fingerprints(runners.Runner)
+    assert runs[0] != runs[1]
+    # A helper whose source can no longer be read counts by its code, and by
+    # what that code calls.
+    unreadable = []
+    for tactics in ("[0, 1]", "[0, 3]"):
+        fp_modules.load("fp_util", f"def helper():\n    return {tactics}\n")
+        runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+        (fp_modules.root / "fp_util.py").unlink()
+        unreadable += fp_modules.fingerprints(runners.Runner)
+    assert unreadable[0] != unreadable[1]
+    fp_modules.load("fp_impl", "def tactics():\n    return [0, 1]\n")
+    fp_modules.load(
+        "fp_util",
+        "from fp_impl import tactics\n\ndef helper():\n    return tactics()\n")
+    runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+    (fp_modules.root / "fp_util.py").unlink()
+    before = fp_modules.fingerprints(runners.Runner)
+    fp_modules.edit("fp_impl", "[0, 1]", "[0, 2]")
+    assert fp_modules.fingerprints(runners.Runner) != before
+
+
+def test_code_fingerprint_keeps_no_object_a_global_held_alive(fp_modules):
+    import gc
+    import weakref
+
+    util = fp_modules.load(
+        "fp_util", """
+        class Weights:
+            pass
+
+
+        CURRENT = None
+        """)
+    runners = fp_modules.load(
+        "fp_runners", """
+        import fp_util
+        from fp_base import Base
+
+
+        class Runner(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return fp_util.CURRENT
+        """)
+    util.CURRENT = util.Weights()  # As a layer sets its weights for one call.
+    alive = weakref.ref(util.CURRENT)
+    fp_modules.fingerprints(runners.Runner)
+    util.CURRENT = None
+    gc.collect()
+    assert alive() is None
+
+
+def test_code_fingerprint_walks_a_runner_class_built_per_call_once(
+        fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def make_runner():
+            class Runner(Base):
+                pass
+
+            return Runner
+        """)
+    walks = []
+
+    class _CountingWalk(autotuner._FingerprintWalk):
+
+        def digest(self):
+            walks.append(self)
+            return super().digest()
+
+    monkeypatch.setattr(autotuner, "_FingerprintWalk", _CountingWalk)
+    first, second = runners.make_runner(), runners.make_runner()
+    assert first is not second
+    fp_modules.fingerprints()
+    assert autotuner._code_fingerprint(first) == autotuner._code_fingerprint(
+        second)
+    assert len(walks) == 1
+
+
+def test_code_fingerprint_falls_back_to_the_build_when_the_walk_fails(
+        fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Runner(Base):
+            pass
+        """)
+
+    def fail(self):
+        raise RuntimeError("walk failed")
+
+    warnings = []
+    monkeypatch.setattr(autotuner._FingerprintWalk, "digest", fail)
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: "build")
+    monkeypatch.setattr(autotuner.logger,
+                        "warning_once",
+                        lambda message, key=None: warnings.append(key))
+    [fingerprint] = fp_modules.fingerprints(runners.Runner)
+    assert fingerprint == autotuner._build_runner_fingerprint(runners.Runner)
+    assert any(key and key[0] == "autotuner_fingerprint_failed"
+               for key in warnings)
+    # As under "build", factory runners around different implementations
+    # keep their keys apart, and a replaced native library stays local.
+    factory = fp_modules.load("fp_factory", _CLOSURE_RUNNERS)
+    narrow = factory.factory(factory.narrow)
+    wide = factory.factory(factory.wide)
+    assert fp_modules.fingerprints(narrow) != fp_modules.fingerprints(wide)
+    import functools
+    monkeypatch.setattr(autotuner, "_native_replaced",
+                        functools.lru_cache(maxsize=None)(lambda: True))
+    [fingerprint] = fp_modules.fingerprints(runners.Runner)
+    assert fingerprint.startswith(autotuner._EDITED_PREFIX)
+
+
+def test_code_fingerprint_of_a_runner_in_a_fileless_main(
+        fp_modules, monkeypatch):
+    import types
+
+    main = types.ModuleType("__main__")  # As under `python -c`, or a notebook.
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    exec("from fp_base import Base\n\n\nclass Runner(Base):\n    pass\n",
+         main.__dict__)
+    assert main.Runner.__module__ == "__main__"
+    assert fp_modules.fingerprints(main.Runner)[0]
+
+
+def test_code_fingerprint_package_versions_skip_dists_without_metadata(
+        monkeypatch):
+    # An interrupted install can leave a dist-info without METADATA.
+    autotuner._package_versions.cache_clear()
+    monkeypatch.setattr(autotuner, "_packages_distributions",
+                        lambda: {"fp_pkg": ["fp-dist", None]})
+    monkeypatch.setattr(autotuner.importlib.metadata, "version",
+                        lambda dist: {"fp-dist": "1.0"}[dist])
+    try:
+        assert autotuner._package_versions("fp_pkg") == "fp-dist==1.0"
+    finally:
+        autotuner._package_versions.cache_clear()
+
+
+def test_native_library_id_is_the_elf_build_id(tmp_path):
+    import hashlib
+    import struct
+
+    build_id = bytes(range(20))
+    note = struct.pack("<III", 4, len(build_id), 3) + b"GNU\0" + build_id
+    header = bytearray(64)
+    header[:6] = b"\x7fELF\x02\x01"  # 64-bit, little-endian
+    struct.pack_into("<Q", header, 0x28, 64 + len(note))  # section headers
+    struct.pack_into("<HH", header, 0x3A, 64, 2)
+    note_section = bytearray(64)
+    struct.pack_into("<I", note_section, 4, 7)  # SHT_NOTE
+    struct.pack_into("<QQ", note_section, 0x18, 64, len(note))
+    library = tmp_path / "libfp.so"
+    library.write_bytes(bytes(header) + note + bytes(64) + note_section)
+    assert autotuner._library_id(library) == build_id.hex()
+
+    no_sections = bytearray(header)
+    for entry_size, count in ((0, 2), (64, 0)):
+        struct.pack_into("<HH", no_sections, 0x3A, entry_size, count)
+        stripped = tmp_path / f"libstripped_{entry_size}_{count}.so"
+        stripped.write_bytes(bytes(no_sections))
+        assert autotuner._library_id(stripped) == hashlib.sha256(
+            bytes(no_sections)).hexdigest()
+
+    other = tmp_path / "libother.so"
+    other.write_bytes(b"not an ELF file")
+    assert autotuner._library_id(other) == hashlib.sha256(
+        b"not an ELF file").hexdigest()
+
+
+def test_search_cache_reopens_the_comparison_when_a_loser_changes(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return 0\n")
+    runners = fp_modules.load("fp_runners", _CANDIDATE_RUNNERS)
+    cache = autotuner.AutoTuner().profiling_cache
+    winner, loser = runners.Winner(), runners.Loser()
+    key = cache.get_cache_key("test_candidates",
+                              winner,
+                              _TACTIC_SPACE_SHAPES,
+                              TuningConfig(),
+                              candidates=[winner, loser])
+    cache.cache[key] = (0, 7, 1.0)
+
+    def search(candidates):
+        return cache.search_cache("test_candidates", candidates,
+                                  _TACTIC_SPACE_SHAPES, TuningConfig())
+
+    assert search([winner, loser]) == (True, 0, 7, 1.0)
+    assert not search([winner])[0]  # Tuned among other candidates.
+    fp_modules.edit("fp_util", "return 0", "return 42")
+    fp_modules.fingerprints()  # A new process: fingerprints recomputed.
+    assert not search([winner, loser])[0]
+
+
+def test_ranks_that_fingerprint_differently_raise(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return 0\n")
+    runners = fp_modules.load("fp_runners", _CANDIDATE_RUNNERS)
+    candidates = [runners.Winner(), runners.Loser()]
+
+    profiles = [SimpleNamespace(get_opt_shapes=lambda: ((16, ), ))]
+
+    def agree(gather):
+        tuner = SimpleNamespace(_dist=SimpleNamespace(tp_cp_allgather=gather))
+        return autotuner.AutoTuner._agree_on_cache_hit(tuner, candidates, True,
+                                                       profiles, [(0, "1")]).hit
+
+    def rank(obj, **changes):
+        fields = ("hit", "fingerprint", "signature", "groups", "uids", "device",
+                  "profiles", "profile_choices")
+        values = dict(zip(fields, obj))
+        values.update(changes)
+        return tuple(values[f] for f in fields)
+
+    def edited(obj):
+        return rank(obj,
+                    fingerprint=autotuner._EDITED_PREFIX + "0123456789abcdef")
+
+    assert agree(lambda obj: [obj, obj])
+    assert not agree(lambda obj: [obj, rank(obj, hit=False)])
+    # Ranks whose entries chose differently tune again together.
+    assert not agree(lambda obj: [obj, rank(obj, profile_choices=[(1, "2")])])
+    # Ranks that may run different code must not tune or reuse together.
+    with pytest.raises(RuntimeError, match="fingerprint the code"):
+        agree(lambda obj: [rank(obj, fingerprint="other-fingerprint"), obj])
+    # Nor ranks whose sources changed after they started, even when their
+    # fingerprints match: what each loaded is no longer on disk.
+    with pytest.raises(RuntimeError, match="changed after"):
+        agree(lambda obj: [edited(obj), edited(obj)])
+    # Nor ranks that pass the candidates in another order (PARALLEL deals
+    # tactics by position) or with other tactic spaces.
+    reordered = autotuner._rank_signature(list(reversed(candidates)))
+    with pytest.raises(RuntimeError, match="different orders"):
+        agree(lambda obj: [rank(obj, signature=reordered), obj])
+
+
+class _Strategy(enum.IntEnum):
+    ONE = -1
+
+
+def test_ranks_of_one_communicator_agree_on_every_profile():
+    """AllReduce runners name their communicator (rank_group): ranks of one
+    agree on unique_id and on the tactic of every profile, ranks of another
+    (a TP subgroup under Helix CP) may choose differently, and a tactic and
+    its reloaded form (an Enum and its value) are one choice."""
+
+    class _Grouped(_TacticSpaceRunner):
+
+        def __init__(self, group, window=False):
+            super().__init__()
+            self.group, self.window = group, window
+
+        def unique_id(self):
+            return (self.group, self.window)
+
+        def rank_group(self):
+            return self.group
+
+    profiles = [
+        SimpleNamespace(get_opt_shapes=lambda shapes=shapes: shapes)
+        for shapes in (((8, ), ), ((16, ), ))
+    ]
+
+    def agree(*ranks):
+        """`ranks`: (runner, choice per profile) of each rank; the result of
+        the first."""
+        objs = []
+        for runner, choices in ranks:
+            # Collect each rank's part of the all-gather.
+            collect = SimpleNamespace(_dist=SimpleNamespace(
+                tp_cp_allgather=lambda obj: [objs.append(obj) or obj]))
+            autotuner.AutoTuner._agree_on_cache_hit(collect, [runner], True,
+                                                    profiles, choices)
+        tuner = SimpleNamespace(_dist=SimpleNamespace(
+            tp_cp_allgather=lambda obj: objs))
+        runner, choices = ranks[0]
+        return autotuner.AutoTuner._agree_on_cache_hit(tuner, [runner], True,
+                                                       profiles, choices).hit
+
+    nccl, symmetric = (0, "0"), (0, "8")
+    # Helix TP2 x CP2: subgroups [0, 2] and [1, 3] keep their own winners.
+    assert agree((_Grouped((0, 2)), [nccl, nccl]), (_Grouped(
+        (1, 3)), [symmetric, symmetric]), (_Grouped((0, 2)), [nccl, nccl]),
+                 (_Grouped((1, 3)), [symmetric, symmetric]))
+    # Within one, another profile chosen differently is tuned again, even
+    # when this call's profile agrees: native caches take every profile.
+    assert not agree((_Grouped((0, 2)), [nccl, nccl]), (_Grouped(
+        (0, 2)), [nccl, symmetric]))
+    assert not agree((_Grouped((0, 2)), [nccl, nccl]), (_Grouped(
+        (0, 2)), [nccl, None]))
+    # A profile no rank holds (an input size no lookup maps to) agrees.
+    assert agree((_Grouped((0, 2)), [nccl, None]), (_Grouped(
+        (0, 2)), [nccl, None]))
+    # Ranks of one communicator that build the runner differently raise.
+    with pytest.raises(RuntimeError, match="communicator"):
+        agree((_Grouped((0, 2)), [nccl, nccl]), (_Grouped(
+            (0, 2), window=True), [nccl, nccl]))
+    # A tactic and the value a cache file reloads it as are one choice.
+    assert autotuner._tactic_repr(_Strategy.ONE) == autotuner._tactic_repr(-1)
+
+
+def test_rank_signature_leaves_out_rank_local_unique_ids():
+    """Under Helix CP an AllReduce runner's unique_id names its rank's TP
+    subgroup; ranks of one tuning group still agree."""
+
+    class _Grouped(_TacticSpaceRunner):
+
+        def __init__(self, group):
+            super().__init__()
+            self.group = group
+
+        def unique_id(self):
+            return (self.group, )
+
+    assert autotuner._rank_signature([_Grouped(
+        (0, 2))]) == autotuner._rank_signature([_Grouped((1, 3))])
+    assert autotuner._rank_signature([_TacticSpaceRunner(
+        ("limited", ))]) != autotuner._rank_signature(
+            [_TacticSpaceRunner(("all", ))])
+
+
+def test_rank_signature_tells_factory_runners_apart(fp_modules, monkeypatch):
+    """Runners one factory builds share a class name: ranks that pass them in
+    different orders cannot tune them together (PARALLEL deals by
+    position)."""
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    runners = fp_modules.load("fp_runners", _CLOSURE_RUNNERS)
+    narrow = runners.factory(runners.narrow)()
+    wide = runners.factory(runners.wide)()
+    assert autotuner._rank_signature(
+        [narrow, wide]) != (autotuner._rank_signature([wide, narrow]))
+
+
+def test_rank_signature_under_none_leaves_out_the_build(monkeypatch):
+    """TLLM_AUTOTUNER_CACHE_KEY=none reuses one cache across builds: ranks of
+    different builds still tune together."""
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "none")
+    signatures = []
+    for build in ("one", "two"):
+        monkeypatch.setattr(autotuner, "_native_build_id", lambda: build)
+        autotuner._clear_fingerprints()
+        signatures.append(autotuner._rank_signature([_TacticSpaceRunner()]))
+    autotuner._clear_fingerprints()
+    assert signatures[0] == signatures[1]
+
+
+def test_profiles_whose_entries_chose_differently_are_tuned_again():
+    profiles = [
+        SimpleNamespace(get_opt_shapes=lambda shapes=shapes: shapes)
+        for shapes in (((1, ), ), ((2, ), ), ((3, ), ))
+    ]
+    scope = ("unique_id", "", ("()", ))
+
+    def hits(mine,
+             theirs,
+             their_scope=scope,
+             lockstep=None,
+             their_lockstep=None):
+        tuner = SimpleNamespace(_dist=SimpleNamespace(
+            tp_cp_allgather=lambda obj:
+            [obj, (their_scope, their_lockstep, obj[2], theirs)]))
+        return autotuner.AutoTuner._profile_hits_on_all_ranks(
+            tuner, profiles, mine, scope if lockstep is None else
+            ("group", lockstep), lockstep)
+
+    mine = [(0, "1"), (0, "1"), None]
+    theirs = [(0, "1"), (0, "2"), (0, "1")]
+    assert hits(mine, theirs) == [True, False, False]
+    # A rank of another scope (another communicator) may choose differently,
+    # but a profile one rank misses is still tuned by all.
+    assert hits(mine, theirs, ("group", ((1, 3), ))) == [True, True, False]
+    # Ranks of a communicator that is their TP group tune its profiles
+    # without the ranks of another, which may miss them.
+    group = ((0, 2), )
+    assert hits(theirs, [None, None, None], ("group", ((1, 3), )), group,
+                ((1, 3), )) == [True, True, True]
+
+
+def test_lockstep_scope_is_a_communicator_only_when_it_is_the_tp_group():
+    """MERGE profiling waits at a barrier over the TP group: only ranks of a
+    communicator that is that group can profile without the others."""
+
+    class _Grouped(_TacticSpaceRunner):
+
+        def rank_group(self):
+            return (0, 2)
+
+    def lockstep(tp_group):
+        tuner = SimpleNamespace(mapping=SimpleNamespace(tp_group=tp_group))
+        return autotuner.AutoTuner._lockstep_scope(tuner, [_Grouped()])
+
+    assert lockstep([2, 0]) == (0, 2)
+    assert lockstep([0, 1, 2, 3]) is None
+
+
+def test_parallel_deals_tactics_in_one_order_on_every_rank():
+    """Ranks whose get_valid_tactics lists the same tactics in different
+    orders still deal each to exactly one rank."""
+    shares = []
+    for rank, tactics in enumerate(([1, 2], [2, 1])):
+        tuner = SimpleNamespace(_is_distributed=lambda: True,
+                                _tuning_group=lambda rank=rank: (2, rank))
+        shares += autotuner.AutoTuner._maybe_parallelize_tactics(
+            tuner, tactics, DistributedTuningStrategy.PARALLEL)
+    assert sorted(shares) == [1, 2]
+
+
+@pytest.mark.parametrize("mode", ["code", "build"])
+@pytest.mark.parametrize("source,narrow_impl,wide_impl", [
+    (_FACTORY_RUNNERS, "Narrow", "Wide"),
+    (_CLOSURE_RUNNERS, "narrow", "wide"),
+],
+                         ids=["bases", "captured"])
+def test_search_cache_keeps_same_named_candidates_apart(fp_modules, monkeypatch,
+                                                        source, narrow_impl,
+                                                        wide_impl, mode):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", mode)
+    runners = fp_modules.load("fp_runners", source)
+    narrow = runners.factory(getattr(runners, narrow_impl))()
+    wide = runners.factory(getattr(runners, wide_impl))()
+    candidates = [narrow, wide]
+    cache = autotuner.AutoTuner().profiling_cache
+    cache.cache = {
+        cache.get_cache_key("test_same_named",
+                            wide,
+                            _TACTIC_SPACE_SHAPES,
+                            TuningConfig(),
+                            candidates=candidates): (1, 1, 1.0)
+    }
+    # Wide's tactic 1 stays Wide's: Narrow only runs tactic 0.
+    assert cache.search_cache("test_same_named", candidates,
+                              _TACTIC_SPACE_SHAPES,
+                              TuningConfig()) == (True, 1, 1, 1.0)
+
+
+def test_save_cache_leaves_out_entries_of_edited_sources(tmp_path):
+    src = autotuner.AutoTuner().profiling_cache
+    current = ("test_edited", "R", "()", ((16, 64), ), "0123456789abcdef")
+    edited = ("test_edited", "R", "()", ((32, 64), ),
+              autotuner._EDITED_PREFIX + "0123456789abcdef")
+    src.cache = {current: (0, 1, 1.0), edited: (0, 2, 1.0)}
+    # Nor do they reach another rank (merge, broadcast, pipeline send).
+    assert src.shareable(src.cache) == {current: (0, 1, 1.0)}
+    path = str(tmp_path / "cache.json")
+    src.save_cache(path, rank=0)
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert dst.cache == {current: (0, 1, 1.0)}
+
+
+def test_save_cache_drops_entries_another_build_keyed(tmp_path):
+    path = str(tmp_path / "cache.json")
+    old = ("test_superseded", "R", "()", ((16, 64), ), "aaaaaaaaaaaaaaaa")
+    other_shape = ("test_superseded", "R", "()", ((32, 64), ),
+                   "aaaaaaaaaaaaaaaa")
+    src = autotuner.AutoTuner().profiling_cache
+    src.cache = {old: (0, 1, 1.0), other_shape: (0, 1, 1.0)}
+    src.save_cache(path, rank=0)
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    # Tuned again here under another build: the entry it replaces goes.
+    # Entries of the same runner build tuned among other candidates, or on
+    # another GPU architecture, stay.
+    new = (*old[:4], "bbbbbbbbbbbbbbbb")
+    among_others = (*old[:4], "cccccccccccccccc/bbbbbbbbbbbbbbbb/dddddddd")
+    other_gpu = (*old[:4], "aaaaaaaaaaaaaaaa@sm100")
+    dst.cache.update({among_others: (1, 3, 1.0), other_gpu: (0, 4, 1.0)})
+    dst[new] = (0, 2, 1.0)
+    # Nor are the replaced entries exchanged with other ranks.
+    assert old not in dst.shareable(dst.cache)
+    dst.save_cache(path, rank=0)
+    final = autotuner.AutoTuner().profiling_cache
+    final.load_cache(path, rank=0)
+    assert final.cache == {
+        new: (0, 2, 1.0),
+        other_shape: (0, 1, 1.0),
+        among_others: (1, 3, 1.0),
+        other_gpu: (0, 4, 1.0)
+    }
+
+
+def test_get_cache_keys_matches_get_cache_key():
+    cache = autotuner.AutoTuner().profiling_cache
+    runner = _TacticSpaceRunner(("nvmmh", "x", 3))
+    shapes = [(torch.Size([m, 64]), ) for m in (8, 16, 32)]
+    assert cache.get_cache_keys(
+        "test_keys", runner, shapes, TuningConfig(), False) == [
+            cache.get_cache_key("test_keys",
+                                runner,
+                                s,
+                                TuningConfig(),
+                                apply_map_to_tuning_buckets=False)
+            for s in shapes
+        ]
+
+
+def test_autotune_rescans_loaded_libraries_once_per_session(monkeypatch):
+    """Libraries loaded since the fingerprints were taken are looked at when
+    a tuning session starts, every rank alike, not on each cache miss."""
+    rescans = []
+    monkeypatch.setattr(autotuner, "_rescan_loaded_libraries",
+                        lambda: rescans.append(1))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        assert rescans == [1]
+        x = torch.randn(4, 64)
+        w = torch.randn(64, 128)
+        tuner.choose_one("test_rescan", [GemmRunner()], TuningConfig(), [x, w])
+    assert rescans == [1]
+
+
+def test_clear_forgets_dropped_entries():
+    """After clear(), a save no longer removes from the file the entries
+    dropped before."""
+    cache = autotuner.AutoTunerProfilingCache.__new__(
+        autotuner.AutoTunerProfilingCache)
+    cache.cache = {}
+    key = ("test_dropped", "R", "()", ((16, 64), ), "aaaaaaaaaaaaaaaa")
+    cache.cache[key] = (0, 1, 1.0)
+    cache.drop([key])
+    assert cache._superseded()(key)
+    cache.independent_op, cache.excluded_op = set(), set()
+    cache.clear()
+    assert not cache._superseded()(key)
+
+
+def test_cache_key_mode_none_leaves_the_fingerprint_out(monkeypatch):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "none")
+    cache = autotuner.AutoTuner().profiling_cache
+    key = _tactic_space_cache_key(cache, _TacticSpaceRunner())
+    assert key == ("test_tactic_space", "_TacticSpaceRunner", "()", ((16,
+                                                                      64), ))
+    cache.cache = {key: (0, 7, 1.0)}
+    assert list(cache.entries_of("test_tactic_space", _TacticSpaceRunner)) == [
+        ("()", ((16, 64), ), (0, 7, 1.0))
+    ]
+
+
+def test_choose_one_round_trip_among_two_runner_classes():
+    """Entries tuned among two runner classes are found when serving: every
+    store and lookup keys them by both classes' code."""
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [
+        GemmRunner(),
+        GemmRunnerWithAttributes(block_size=128, num_warps=4)
+    ]
+    config = TuningConfig()
+    op = "test_two_runner_classes"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        tuned = tuner.choose_one(op, runners, config, [x, w])
+    assert tuner.profiling_cache.search_cache(op, runners, (x.shape, w.shape),
+                                              config)[0]
+    assert tuner.choose_one(op, runners, config, [x, w]) == tuned
+
+
+def test_entries_of_skips_older_key_layouts_and_fingerprints():
+    cache = autotuner.AutoTuner().profiling_cache
+    current = _tactic_space_cache_key(cache, _TacticSpaceRunner())
+    op, name, unique_id = current[:3]
+    cache.cache = {
+        current: (0, 7, 1.0),
+        (op, name, unique_id, ((32, 64), )): (0, 8, 1.0),  # Older layout.
+        (op, name, unique_id, ((48, 64), ), "0" * 16): (0, 9, 1.0),
+        ("other_op", *current[1:]): (0, 10, 1.0),
+    }
+    assert list(cache.entries_of(op, _TacticSpaceRunner)) == [
+        (unique_id, current[3], (0, 7, 1.0))
+    ]
+
+
+def test_mxfp8_sync_registers_only_entries_for_the_current_code(monkeypatch):
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops as ops
+
+    registered = []
+
+    class _NativeRunner:
+
+        def register_tactic(self, m, n, k, tactic):
+            registered.append((m, n, k, tactic))
+
+    runner_cls = ops.MXFP8GemmRunner
+    monkeypatch.setattr(runner_cls, "runner_dict", {"weights": _NativeRunner()})
+    tuner = autotuner.AutoTuner()
+    current = autotuner._key_fingerprint(
+        runner_cls, autotuner._candidates_fingerprint((runner_cls, )))
+
+    def key(m, *fingerprint):
+        return (ops._MXFP8_AUTOTUNED_OP, runner_cls.__name__, "weights",
+                ((m, 64), (m, 2), (32, 64)), *fingerprint)
+
+    tuner.profiling_cache.cache = {
+        key(16, current): (0, 3, 1.0),
+        key(32): (0, 4, 1.0),  # The key layout before code fingerprints.
+        key(48, "0" * 16): (0, 5, 1.0),  # Tuned against other code.
+    }
+    runner_cls.sync_all_tactic_caches(tuner)
+    assert registered == [(16, 32, 64, 3)]
+
+
+def _allreduce_runner(monkeypatch, group=(0, 1)):
+    """An AllReduceRunner over the communicator `group`, profiled at buckets
+    8 and 16 (the class's buckets are restored after the test)."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+    monkeypatch.setattr(AllReduceRunner, "tuning_config",
+                        AllReduceRunner.tuning_config)
+    monkeypatch.setattr(AllReduceRunner, "_registered_buckets", {})
+    AllReduceRunner._set_tuning_buckets([8, 16])
+    return AllReduceRunner(len(group), list(group), torch.bfloat16, 0, 1e-6,
+                           False)
+
+
+def test_allreduce_runner_keys_its_workspace_limit_and_communicator(
+        monkeypatch):
+    """The workspace limit decides which protocols a bucket may use, so an
+    entry tuned under another limit misses; and a communicator's members in
+    another order name the same communicator."""
+    inputs = [torch.empty(8, 64, dtype=torch.bfloat16)]  # 1 KiB.
+    monkeypatch.setenv("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE", "4096")
+    wide = _allreduce_runner(monkeypatch)
+    monkeypatch.setenv("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE", "512")
+    narrow = _allreduce_runner(monkeypatch)
+    assert wide.get_valid_tactics(inputs, None) != narrow.get_valid_tactics(
+        inputs, None)
+    assert wide.unique_id() != narrow.unique_id()
+    reordered = _allreduce_runner(monkeypatch, (1, 0))
+    assert reordered.unique_id() == narrow.unique_id()
+    assert reordered.rank_group() == narrow.rank_group() == (0, 1)
+    # The limit is read (and logged) once per setting, not per runner.
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
+    reads = []
+    torch_custom_ops._fusion_workspace_limit.cache_clear()
+    monkeypatch.setattr(
+        torch_custom_ops.CustomAllReduceHelper, "max_workspace_size_auto",
+        staticmethod(lambda *args, **kwargs: reads.append(1) or 512))
+    for _ in range(3):
+        _allreduce_runner(monkeypatch)
+    torch_custom_ops._fusion_workspace_limit.cache_clear()
+    assert len(reads) == 1
+
+
+def test_allreduce_registers_only_agreed_buckets(monkeypatch):
+    """Native registration takes only the buckets the ranks agreed on: under
+    skip_dynamic_tuning_buckets this input's; and in tuning mode a bucket
+    tuned again without a winner loses the tactic registered before."""
+    runner = _allreduce_runner(monkeypatch)
+    tuner = autotuner.AutoTuner()
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
+    calls = []
+    monkeypatch.setattr(torch.ops.trtllm, "register_allreduce_tactic",
+                        lambda *args: calls.append(args[-2:]))
+    inputs = [
+        torch.empty(8, 64, dtype=torch.bfloat16), None, None, None, None, None
+    ]
+    shapes = tuple(tuner._get_input_sizes(inputs))
+    keys = {}
+    for bucket, tactic in ((8, 0), (16, 4)):
+        keys[bucket] = tuner.profiling_cache.get_cache_key(
+            "trtllm::tunable_allreduce::allreduce",
+            runner, (torch.Size((bucket, 64)), *shapes[1:]),
+            runner.tuning_config,
+            apply_map_to_tuning_buckets=False)
+        tuner.profiling_cache.cache[keys[bucket]] = (0, tactic, 1.0)
+    tuner.is_tuning_mode = True
+    tuner.skip_dynamic_tuning_buckets = True
+    runner._register_native_tactics(inputs)
+    assert calls == [(8, 0)]
+    tuner.skip_dynamic_tuning_buckets = False
+    calls.clear()
+    runner._register_native_tactics(inputs)
+    assert calls == [(8, 0), (16, 4)]
+    # A runner keyed alike in the native cache, but with another unique_id
+    # and no entries, leaves the tactics the first registered.
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+    other = AllReduceRunner(2, [0, 1],
+                            torch.bfloat16,
+                            0,
+                            1e-6,
+                            False,
+                            exclude_nccl_symmetric=True)
+    calls.clear()
+    other._register_native_tactics(inputs)
+    assert calls == []
+    tuner.profiling_cache.drop([keys[16]])
+    calls.clear()
+    runner._register_native_tactics(inputs)
+    assert calls == [(8, 0), (16, -1)]
 
 
 def test_search_cache_misses_across_tactic_spaces():
@@ -2804,6 +5016,466 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(
     assert warnings == [], warnings
 
 
+class _NamedTactics(TunableRunner):
+    """A runner the test names, with the tactics it lists, optionally run by
+    the communicator `group`."""
+
+    def __init__(self, name, tactics, group=None):
+        self.name, self.tactics, self.group = name, tactics, group
+
+    def unique_id(self):
+        return (self.name, self.group)
+
+    def rank_group(self):
+        return self.group
+
+    def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+        return list(self.tactics)
+
+    def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+        return inputs[0]
+
+
+class _ThreadedRanks:
+    """The ranks of one tuning group, run as threads that exchange
+    tp_cp_allgather and tp_cp_broadcast through a barrier."""
+
+    def __init__(self, size):
+        self.size = size
+        self.barrier = threading.Barrier(size, timeout=60)
+        # MERGE profiling's per-tactic barrier over the TP group (here the
+        # whole group): a rank waiting there while another is in an
+        # all-gather times out instead of passing.
+        self.tp_barrier = threading.Barrier(size, timeout=60)
+        self.slots = [None] * size
+
+    def dist(self, rank):
+
+        def allgather(obj):
+            self.slots[rank] = obj
+            self.barrier.wait()
+            gathered = list(self.slots)
+            self.barrier.wait()
+            return gathered
+
+        return SimpleNamespace(
+            tp_cp_allgather=allgather,
+            tp_cp_broadcast=lambda obj, root: allgather(obj)[root],
+            tp_barrier=self.tp_barrier.wait)
+
+    def run(self, fn):
+        """fn(rank) on every rank at once; the results in rank order."""
+        results, errors = [None] * self.size, []
+
+        def target(rank):
+            try:
+                results[rank] = fn(rank)
+            except BaseException as e:  # noqa: BLE001 - raised below
+                errors.append(e)
+                self.barrier.abort()
+                self.tp_barrier.abort()
+
+        threads = [
+            threading.Thread(target=target, args=(rank, ), name=f"rank{rank}")
+            for rank in range(self.size)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+        return results
+
+
+_GROUP_OP = "autotuner_test::group"
+
+
+def _choose_on_ranks(monkeypatch,
+                     config,
+                     runners_of,
+                     entries_of,
+                     times,
+                     inputs=None,
+                     calls=1):
+    """choose_one `calls` times on each rank of a group of len(entries_of),
+    the ranks running together. `runners_of(rank)`: the rank's candidates;
+    `entries_of[rank]`: {(runner index, opt shapes[, rank]): (tactic, ms)}
+    its cache holds first (loaded from a file), keyed among the candidates
+    of `rank` (this rank's by default); `times[(runner name, tactic)]`, or
+    `times[(rank, runner name, tactic)]`: what profiling measures. Returns
+    each rank's (runner name, tactic), the (rank, runner name, tactic) of
+    each profiling, and the tuners."""
+    inputs = inputs or [torch.zeros(8, 64)]
+    profiled = []
+    lock = threading.Lock()
+
+    def measure(self, runner, inputs, tactic, tuning_config=None, **kwargs):
+        rank = self._tuning_group()[1]
+        with lock:
+            profiled.append((rank, runner.name, tactic))
+        if (tuning_config is not None
+                and tuning_config.distributed_tuning_strategy
+                == DistributedTuningStrategy.MERGE):
+            # As _profile_single_kernel does: one wait per timed pass.
+            self._dist.tp_barrier()
+            self._dist.tp_barrier()
+        return times.get((rank, runner.name, tactic),
+                         times.get((runner.name, tactic)))
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", measure)
+    size = len(entries_of)
+    group = _ThreadedRanks(size)
+    tuners = []
+    for rank in range(size):
+        tuner = autotuner.AutoTuner()
+        tuner.setup_distributed_state(Mapping(world_size=size,
+                                              rank=rank,
+                                              tp_size=size),
+                                      dist=group.dist(rank))
+        tuner.is_tuning_mode = True
+        runners = runners_of(rank)
+        for (index, shapes, *owner), (tactic, ms) in entries_of[rank].items():
+            candidates = runners_of(owner[0]) if owner else runners
+            tuner.profiling_cache.cache[tuner.profiling_cache.get_cache_key(
+                _GROUP_OP,
+                candidates[index],
+                shapes,
+                config,
+                apply_map_to_tuning_buckets=False,
+                candidates=candidates)] = (index, tactic, ms)
+        tuners.append((tuner, runners))
+
+    def choose(rank):
+        tuner, runners = tuners[rank]
+        for _ in range(calls):
+            runner, tactic = tuner.choose_one(_GROUP_OP, runners, config,
+                                              inputs)
+        return runner.name, tactic
+
+    return group.run(choose), profiled, tuners
+
+
+_SHAPES = ((8, 64), )
+
+
+def _two_runners(rank):
+    return [_NamedTactics("a", [1]), _NamedTactics("b", [7])]
+
+
+def test_broadcast_peers_take_the_roots_winner(monkeypatch):
+    """A peer that held another candidate's entry for a profile drops it
+    when the root's arrives: the lookup would find it first."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST)
+    for root_entries in ({(1, _SHAPES): (7, 0.5)}, {}):
+        results, _, _ = _choose_on_ranks(
+            monkeypatch, config, _two_runners,
+            [root_entries, {
+                (0, _SHAPES): (1, 0.5)
+            }], {
+                ("a", 1): 2.0,
+                ("b", 7): 1.0
+            })
+        assert results == [("b", 7)] * 2, (root_entries, results)
+
+
+@pytest.mark.parametrize("strategy", [
+    DistributedTuningStrategy.MERGE,
+    DistributedTuningStrategy.PARALLEL,
+])
+def test_profiles_tuned_again_compare_only_this_rounds_measurements(
+        monkeypatch, strategy):
+    """An older entry (another candidate's, or one with a faster old time on
+    a rank the PARALLEL deal leaves idle) does not win over what the ranks
+    measure when they tune the profile again."""
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+    stale = {(0, _SHAPES): (1, 0.01)}
+    results, profiled, _ = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                            [{}, stale, stale, stale], {
+                                                ("a", 1): 2.0,
+                                                ("b", 7): 1.0
+                                            })
+    assert profiled
+    assert results == [("b", 7)] * 4, results
+
+
+def test_communicators_keep_their_own_winners(monkeypatch):
+    """Ranks of different communicators (TP subgroups under Helix CP) may
+    hold different winners: a warm cache is not tuned again."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    groups = [(0, 2), (1, 3), (0, 2), (1, 3)]
+
+    def runners_of(rank):
+        return [_NamedTactics("ar", [0, 8], groups[rank])]
+
+    entries = [{
+        (0, _SHAPES): (0 if rank % 2 == 0 else 8, 1.0)
+    } for rank in range(4)]
+    results, profiled, _ = _choose_on_ranks(monkeypatch,
+                                            config,
+                                            runners_of,
+                                            entries, {},
+                                            calls=2)
+    assert profiled == []
+    assert results == [("ar", 0), ("ar", 8), ("ar", 0), ("ar", 8)]
+
+
+def test_a_cache_hit_still_agrees_on_the_other_profiles(monkeypatch):
+    """A hit on this call's profile does not skip a profile the ranks chose
+    differently: ops such as AllReduce register every profile's entry in a
+    native cache."""
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (8, 16), lambda m: 8
+                                                if m <= 8 else 16), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    small, large = ((8, 64), ), ((16, 64), )
+
+    def runners_of(rank):
+        return [_NamedTactics("ar", [0, 8])]
+
+    _, profiled, tuners = _choose_on_ranks(monkeypatch, config, runners_of, [{
+        (0, small): (0, 1.0),
+        (0, large): (0, 1.0)
+    }, {
+        (0, small): (0, 1.0),
+        (0, large): (8, 1.0)
+    }], {
+        ("ar", 0): 2.0,
+        ("ar", 8): 1.0
+    })
+    assert sorted(t for _, _, t in profiled) == [0, 0, 8, 8]
+    chosen = [
+        tuner.profiling_cache.search_cache(_GROUP_OP, runners, large, config,
+                                           False)[:3]
+        for tuner, runners in tuners
+    ]
+    assert chosen == [(True, 0, 8)] * 2, chosen
+
+
+def test_cache_excluded_ops_profile_every_profile_in_process(monkeypatch):
+    """An op whose tuning runs JIT side effects (exclude_from_cache) profiles
+    every profile in the process, though entries loaded from a file hit."""
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (8, 16), lambda m: 8 if m <= 8 else 16), ),
+                          exclude_from_cache=True)
+    profiled = []
+    monkeypatch.setattr(
+        AutoTuner, "_profile_single_kernel", lambda self, runner, inputs,
+        tactic, **kwargs: profiled.append(tactic) or float(tactic))
+    tuner = autotuner.AutoTuner()
+    tuner.is_tuning_mode = True
+    runners = [_NamedTactics("jit", [1, 2])]
+    op = "autotuner_test::excluded"
+    for shapes in (((8, 64), ), ((16, 64), )):
+        tuner.profiling_cache.cache[tuner.profiling_cache.get_cache_key(
+            op, runners[0], shapes, config,
+            apply_map_to_tuning_buckets=False)] = (0, 2, 1.0)
+    tuner.choose_one(op, runners, config, [torch.zeros(8, 64)])
+    assert sorted(profiled) == [1, 1, 2, 2]
+
+
+def test_broadcast_peers_take_the_roots_miss(monkeypatch, tmp_path):
+    """Where the root has no entry for a profile (no valid tactic), the peers
+    drop theirs too; and a loser a broadcast removes does not come back from
+    the cache file the peer saves to."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST)
+    stale = {(0, _SHAPES): (1, 0.5)}
+    results, _, tuners = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                          [{}, stale], {
+                                              ("a", 1): float("inf"),
+                                              ("b", 7): float("inf")
+                                          })
+    assert results == [("a", -1)] * 2, results
+    # Without a winner of the root's to replace it, the peer's entry stays in
+    # the cache file.
+    assert not tuners[1][0].profiling_cache.__dict__.get("_dropped_keys")
+
+    results, _, tuners = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                          [{}, stale], {
+                                              ("a", 1): 2.0,
+                                              ("b", 7): 1.0
+                                          })
+    assert results == [("b", 7)] * 2, results
+    tuner, runners = tuners[1]
+    # The file the peer saves to still holds the loser, as it loaded it.
+    path = str(tmp_path / "cache.json")
+    earlier = autotuner.AutoTunerProfilingCache()
+    earlier.add_independent_op(_GROUP_OP, DistributedTuningStrategy.BROADCAST)
+    earlier.cache = {
+        tuner.profiling_cache.get_cache_key(_GROUP_OP,
+                                            runners[0],
+                                            _SHAPES,
+                                            config,
+                                            apply_map_to_tuning_buckets=False,
+                                            candidates=runners): (0, 1, 0.5)
+    }
+    earlier.save_cache(path, rank=1)
+    tuner.profiling_cache.save_cache(path, rank=1)
+    reloaded = autotuner.AutoTunerProfilingCache()
+    reloaded.load_cache(path, rank=1)
+    assert reloaded.search_cache(_GROUP_OP, runners, _SHAPES, config,
+                                 False)[:3] == (True, 1, 7)
+
+
+def test_merge_keeps_the_fastest_winner_of_the_ranks(monkeypatch):
+    """Ranks that measured different winners keep the fastest, not the
+    first candidate's."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    results, _, _ = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                     [{}, {}], {
+                                         (0, "a", 1): 3.0,
+                                         (0, "b", 7): 4.0,
+                                         (1, "a", 1): 5.0,
+                                         (1, "b", 7): 1.0
+                                     })
+    assert results == [("b", 7)] * 2, results
+
+
+def test_another_communicators_stale_entry_does_not_win(monkeypatch):
+    """A rank of another communicator can hold an older entry of this one's
+    (from a shared cache file): it does not count when this one tunes the
+    profile again."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    groups = [(0, 2), (1, 3), (0, 2), (1, 3)]
+
+    def runners_of(rank):
+        return [_NamedTactics("ar", [0, 8], groups[rank])]
+
+    entries = [{}, {
+        (0, _SHAPES): (8, 1.0),
+        (0, _SHAPES, 0): (0, 0.01)
+    }, {}, {
+        (0, _SHAPES): (8, 1.0)
+    }]
+    results, profiled, _ = _choose_on_ranks(monkeypatch, config, runners_of,
+                                            entries, {
+                                                ("ar", 0): 2.0,
+                                                ("ar", 8): 1.0
+                                            })
+    assert results == [("ar", 8)] * 4, results
+    # The communicators are not the TP group (all four ranks), whose barrier
+    # MERGE profiling waits at: every rank profiles.
+    assert sorted({rank for rank, *_ in profiled}) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("strategy", [
+    DistributedTuningStrategy.BROADCAST,
+    DistributedTuningStrategy.PARALLEL,
+])
+def test_ranks_that_may_choose_apart_each_measure(monkeypatch, strategy):
+    """Ranks with different unique_ids, or on different GPU architectures,
+    cannot take one rank's measurements or share a deal of the tactics:
+    each measures its own."""
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+    # Not under MERGE, whose per-tactic barrier would wait for ranks that
+    # profile other pairs.
+    profiled_under = []
+    original = AutoTuner._profile_runners
+
+    def record(self, custom_op, runners, tensors, profile, tuning_config,
+               **kwargs):
+        profiled_under.append(tuning_config.distributed_tuning_strategy)
+        return original(self, custom_op, runners, tensors, profile,
+                        tuning_config, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_runners", record)
+
+    def runners_of(rank):
+        return [_NamedTactics(f"x{rank}", [1])]
+
+    results, _, _ = _choose_on_ranks(monkeypatch, config, runners_of, [{}, {}],
+                                     {
+                                         ("x0", 1): 1.0,
+                                         ("x1", 1): 1.0
+                                     })
+    assert results == [("x0", 1), ("x1", 1)], results
+    assert profiled_under and set(profiled_under) == {
+        DistributedTuningStrategy.INDEPENDENT
+    }
+    devices = {"rank0": "sm100", "rank1": "sm107"}
+    monkeypatch.setattr(
+        autotuner, "_device_capability",
+        lambda: devices.get(threading.current_thread().name, "sm100"))
+    results, _, _ = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                     [{}, {}], {
+                                         ("a", 1): 2.0,
+                                         ("b", 7): 1.0
+                                     })
+    assert results == [("b", 7)] * 2, results
+
+
+def test_ranks_agree_on_the_key_a_lookup_maps_to(monkeypatch):
+    """The entry a call returns counts in the agreement though its key is not
+    a profile (a mapping onto a size the buckets do not generate): ranks
+    holding different tactics for it tune together, and the merge leaves
+    them one."""
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (8, 16), lambda m: 12), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+
+    def runners_of(rank):
+        return [_NamedTactics("ar", [0, 8])]
+
+    mapped = ((12, 64), )
+    results, _, _ = _choose_on_ranks(monkeypatch,
+                                     config,
+                                     runners_of, [{
+                                         (0, mapped): (0, 1.0)
+                                     }, {
+                                         (0, mapped): (8, 1.0)
+                                     }], {
+                                         ("ar", 0): 2.0,
+                                         ("ar", 8): 1.0
+                                     },
+                                     inputs=[torch.zeros(10, 64)])
+    assert results[0] == results[1], results
+    # Under BROADCAST with two candidates, a peer holding the other
+    # candidate's entry for that key takes the root's.
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (8, 16), lambda m: 12), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST)
+    results, _, _ = _choose_on_ranks(monkeypatch,
+                                     config,
+                                     _two_runners, [{
+                                         (1, mapped): (7, 1.0)
+                                     }, {
+                                         (0, mapped): (1, 1.0)
+                                     }], {
+                                         ("a", 1): 2.0,
+                                         ("b", 7): 1.0
+                                     },
+                                     inputs=[torch.zeros(10, 64)])
+    assert results == [("b", 7)] * 2, results
+
+
+def test_warm_hits_reuse_the_profiles_of_the_op(monkeypatch):
+    """A warm hit in tuning mode checks every profile of the op on each call
+    without building the profiles and keys again."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    built = []
+    original = AutoTuner._optimization_profiles
+
+    def count(self, *args, **kwargs):
+        built.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_optimization_profiles", count)
+    entries = {(1, _SHAPES): (7, 1.0)}
+    results, profiled, _ = _choose_on_ranks(monkeypatch,
+                                            config,
+                                            _two_runners, [entries, entries],
+                                            {},
+                                            calls=3)
+    assert results == [("b", 7)] * 2 and profiled == []
+    assert len(built) == 2  # Once per rank.
+
+
 def test_parallel_search_cache_picks_fastest_runner():
     """After a PARALLEL merge a shape can hold one entry per runner.
 
@@ -2820,8 +5492,11 @@ def test_parallel_search_cache_picks_fastest_runner():
         config = TuningConfig(distributed_tuning_strategy=strategy)
         cache = autotuner.AutoTunerProfilingCache()
         for runner, tactic, ms in ((runners[0], 0, 2.0), (runners[1], 1, 1.0)):
-            cache[cache.get_cache_key("autotuner_test::parallel_lookup", runner,
-                                      shapes, config)] = (0, tactic, ms)
+            cache[cache.get_cache_key("autotuner_test::parallel_lookup",
+                                      runner,
+                                      shapes,
+                                      config,
+                                      candidates=runners)] = (0, tactic, ms)
         hit, runner_id, tactic, _ = cache.search_cache(
             "autotuner_test::parallel_lookup", runners, shapes, config)
         assert hit and runner_id == expected, (strategy, runner_id)

@@ -35,12 +35,21 @@ Caveats (inherited from using the low-level API):
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Tuple, Union
+from typing import Callable, Iterable, Optional, Tuple, Union
 
 import torch
 from torch.library import Library, infer_schema, register_fake
 
 _LIBS: dict[tuple[str, str], Library] = {}
+# qualname -> the Python function registered as the op's implementation.
+_PYTHON_IMPLS: dict[str, Callable] = {}
+
+
+def registered_python_impl(qualname: str) -> Optional[Callable]:
+    """The Python function ``fast_custom_op`` registered for ``qualname``
+    (``"<ns>::<name>"``), or None. ``torch.library.Library.impl`` keeps no
+    record of it that can be read back."""
+    return _PYTHON_IMPLS.get(qualname)
 
 
 def _get_library(namespace: str, kind: str = "FRAGMENT") -> Library:
@@ -82,6 +91,7 @@ def fast_custom_op(
         lib.define(schema)
         for dt in dev_types:
             lib.impl(op_name, fn, dt)
+        _PYTHON_IMPLS[qualname] = fn
         return FastCustomOp(qualname=qualname, namespace=namespace, op_name=op_name, python_fn=fn)
 
     return decorator

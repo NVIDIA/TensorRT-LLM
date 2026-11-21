@@ -124,6 +124,7 @@ public:
         return index.has_value() ? mBuckets[*index] : -1;
     }
 
+    // A negative tactic removes the bucket's tactic: lookups of it miss again.
     void insert(AllReduceTacticCacheKey key, int64_t bucket, int64_t tactic)
     {
         std::unique_lock lock(mMutex);
@@ -131,7 +132,7 @@ public:
         auto const index = getAllReduceBucketIndex(mBuckets, bucket);
         TORCH_CHECK(index.has_value() && mBuckets[*index] == bucket, "Invalid AllReduce autotuner bucket: ", bucket);
         auto const entry = mTactics.try_emplace(std::move(key), mBuckets.size()).first;
-        entry->second[*index] = tactic;
+        entry->second[*index] = tactic < 0 ? std::nullopt : std::optional<int64_t>(tactic);
     }
 
     std::optional<int64_t> find(AllReduceTacticCacheKey const& key, int64_t numTokens) const
