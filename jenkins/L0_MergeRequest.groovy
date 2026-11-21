@@ -1920,6 +1920,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/include/tensorrt_llm/runtime/utils/multiDeviceUtils.h",
         "cpp/include/tensorrt_llm/runtime/worldConfig.h",
         "cpp/tensorrt_llm/batch_manager/",
+        "cpp/tensorrt_llm/common/CMakeLists.txt",
         "cpp/tensorrt_llm/common/profiler.cpp",
         "cpp/tensorrt_llm/executor/",
         "cpp/tensorrt_llm/kernels/communicationKernels/",
