@@ -4007,7 +4007,6 @@ class _SeqParallelRows:
 # ---------------------------------------------------------------------------
 
 
-@nccl_window_tensor_scoped_module
 def _k31_residual_add_fits(*tensors: torch.Tensor) -> bool:
     """Whether ``k31_moe_residual_add`` takes these operands: contiguous 2D BF16 CUDA tensors of one shape."""
     shape = tensors[0].shape
@@ -4021,6 +4020,7 @@ def _k31_residual_add_fits(*tensors: torch.Tensor) -> bool:
     )
 
 
+@nccl_window_tensor_scoped_module
 class K31DecoderLayer(nn.Module):
     """One Kimi K3.1 decoder layer: before each sublayer the attention-residual mix of the earlier outputs and an
     RMSNorm, then the token mixer (KDA or MLA attention) and the MLP (dense on layer 0, the latent MoE elsewhere)."""

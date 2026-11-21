@@ -35,6 +35,7 @@ pytestmark = pytest.mark.cpu_only
     "model_type,expected",
     [
         ("kimi_k3", "template"),
+        ("kimi_k31", "prefer_grammar"),
         ("nemotron_h_omni", "grammar"),
         ("nemotron_h", "grammar"),
         ("qwen3", None),

@@ -31,10 +31,10 @@ class TestModelingV2KimiK31ProMxfp4Sm10xDefault(_K31Target):
 
     pytestmark = skip_not_sm103_or_sm107
     DEPLOYMENTS = {
-        "test_gsm8k": ("tep8", "dep16"),
+        "test_gsm8k": ("tep8", "dep16", "tep8_bf16kv"),
         "test_gpqa_diamond": ("dep16",),
     }
-    # On sm_103 the perf targets serve TEP8 and DEP16.
+    # On sm_103 the perf targets serve FP8 KV. BF16 KV stays on the general target.
     SM103_PERF_TARGET_DEPLOYMENTS = frozenset({"tep8", "dep16"})
 
     @pytest.mark.timeout(5400)

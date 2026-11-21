@@ -718,3 +718,21 @@ class TestKimiK3StrictGrammar:
         strict["function"]["strict"] = True
         fmt = self.build(monkeypatch, [strict])
         xgrammar.Grammar.from_structural_tag(json.dumps({"type": "structural_tag", "format": fmt}))
+
+
+def test_tool_grammar_argument_schemas_drop_negative_lower_bounds():
+    """Preserve other schema keywords when omitting negative lower bounds for xgrammar."""
+    from tensorrt_llm.serve.extensions.kimi_k31 import _without_negative_lower_bounds
+
+    schema = {
+        "type": "object",
+        "properties": {"v": {"type": "integer", "minimum": -10, "maximum": 10, "default": -1}},
+        "anyOf": [{"exclusiveMinimum": -1.5}, {"minimum": 0}],
+        "enum": [{"minimum": -3}],
+    }
+    assert _without_negative_lower_bounds(schema) == {
+        "type": "object",
+        "properties": {"v": {"type": "integer", "maximum": 10, "default": -1}},
+        "anyOf": [{}, {"minimum": 0}],
+        "enum": [{"minimum": -3}],
+    }

@@ -543,7 +543,7 @@ LLM_MODELS_ROOT=/path/to/models pytest \
 | :-- | :-- | :-- |
 | `test_gsm8k` | TEP8 / DEP16, FP8 KV cache | GSM8K 97.94 (`references/gsm8k.yaml`) |
 | `test_gpqa_diamond` | DEP16, FP8 KV cache | GPQA Diamond 91.41 (`references/gpqa_diamond.yaml`) |
-| `test_gsm8k_dflash2` | TEP8 / DEP16, DFlash2 at verify width 5 | GSM8K 97.94; acceptance length at least 4.09 (TEP8) / 4.16 (DEP16) (`references/acceptance_length.yaml`) |
+| `test_gsm8k_dflash2` | TEP8 / DEP16, DFlash2 at verify width 5 | GSM8K 97.94 on both layouts. TEP8 also checks a minimum acceptance length of 4.09 (`references/acceptance_length.yaml`) |
 
 ## Known Limitations
 

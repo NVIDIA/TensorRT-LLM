@@ -201,25 +201,3 @@ def test_processor_matches_the_engine_k3_processor_on_a_fixed_image():
     our_input, engine_input = our_extra["multimodal_input"], engine_extra["multimodal_input"]
     assert our_input.multimodal_positions == engine_input.multimodal_positions
     assert our_input.multimodal_lengths == engine_input.multimodal_lengths
-
-
-def test_tool_grammar_argument_schemas_drop_negative_lower_bounds():
-    """xgrammar's range regex for a negative lower bound admits a bare "-" and rejects in-range negative numbers, so
-    the required-tool grammar leaves negative ``minimum`` / ``exclusiveMinimum`` out of its argument schemas; the
-    values of other keywords are kept."""
-    from tensorrt_llm._torch.modeling_v2.models.kimi_k31.input_processor import (
-        _without_negative_lower_bounds,
-    )
-
-    schema = {
-        "type": "object",
-        "properties": {"v": {"type": "integer", "minimum": -10, "maximum": 10, "default": -1}},
-        "anyOf": [{"exclusiveMinimum": -1.5}, {"minimum": 0}],
-        "enum": [{"minimum": -3}],
-    }
-    assert _without_negative_lower_bounds(schema) == {
-        "type": "object",
-        "properties": {"v": {"type": "integer", "maximum": 10, "default": -1}},
-        "anyOf": [{}, {"minimum": 0}],
-        "enum": [{"minimum": -3}],
-    }

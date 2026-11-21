@@ -116,34 +116,19 @@ _STOCK_PY_REFERENCE = re.compile(
     r"modeling_v2[./]models\b|torch\.ops\.mv2_|register_fake\(\s*f?[\"']mv2_"
 )
 _STOCK_CPP_INCLUDE = re.compile(r'#\s*include\s*"tensorrt_llm/modeling_v2/')
-# Stock files that import family modules: file -> (the names they import, why). A change to
-# such a module selects only its family's tests.
-_STOCK_FAMILY_IMPORTS = {
-    "tensorrt_llm/serve/extensions/__init__.py": (
-        {f"{_MODELS_PACKAGE}.kimi_k31", f"{_MODELS_PACKAGE}.kimi_k31.input_processor"},
-        "the serving-extension registry loads the family's extension in every process that "
-        "consults it, the disaggregated router and trtllm-render included, which build no model",
-    ),
-}
 
 
 def test_stock_code_does_not_reach_modeling_v2(repo: Path = _REPO):
     """Stock code reaches modeling_v2 only through the resolver.
 
     No family import, op call or fake registration in Python, and no modeling_v2
-    header in C++. The family imports of ``_STOCK_FAMILY_IMPORTS`` are the exception.
+    header in C++.
     """
     offenders = []
     for path in sorted((repo / "tensorrt_llm").rglob("*.py")):
         if path.is_relative_to(repo / _PY):
             continue
         text = path.read_text(errors="ignore")
-        allowed = _STOCK_FAMILY_IMPORTS.get(str(path.relative_to(repo)))
-        if allowed is not None:
-            reached = {m for m in _imports(path, repo) if m.startswith(f"{_MODELS_PACKAGE}.")}
-            if reached != allowed[0]:
-                offenders.append(f"{path.relative_to(repo)} imports {sorted(reached)}")
-            continue
         if _STOCK_PY_REFERENCE.search(text) or (
             "modeling_v2" in text
             and any(

@@ -20,9 +20,9 @@ tests, which run the ``_test_*`` implementations here; the deployments are here 
 Kimi K3.1 Pro: DSA sparse attention on the MLA layers, MXFP4 routed experts, FP8 index keys and the exact radix top-k.
 A deployment is ``<layout><ranks>``: ``tep8`` (attention TP, 12 heads per rank), ``dep16`` (attention DP, 96 query
 heads per rank padded to 128 in the sparse MLA). Attention DP keeps every rank's BF16 attention, shared-expert and
-embedding weights whole, so at 8 ranks the weights alone fill a GB300 or VR200; attention DP runs 16 ranks. The gates
-run an FP8 latent KV cache (``kv_cache_config.dtype='fp8'``). On sm_103 the family routes the TEP8 and DEP16 layouts
-to its perf targets (``kimi_k31_pro_mxfp4__sm_103__tep`` / ``__dep``), so there the general target's gates skip.
+embedding weights whole, so at 8 ranks the weights alone fill a GB300 or VR200; attention DP runs 16 ranks. On sm_103
+the FP8 latent KV cache routes TEP8 and DEP16 to their perf targets. The ``tep8_bf16kv`` case uses the checkpoint's
+default BF16 latent KV cache and runs the general target.
 
 Every test passes ``modeling_v2="require"`` to ``LLM``: under ``"auto"`` a deployment that missed the target would be
 refused (Kimi K3.1 has no built-in implementation), but ``require`` names the reason. The engine also checks its step
@@ -164,14 +164,15 @@ class _K31Target(LlmapiAccuracyTestHarness):
 
     def _llm_kwargs(self, deployment: str, max_seq_len: int, rank_env: dict, **kwargs) -> dict:
         """The LLM arguments of ``deployment`` after the model path."""
+        layout = deployment.removesuffix("_bf16kv")
         return dict(
             modeling_v2="require",
             max_seq_len=max_seq_len,
             trust_remote_code=True,
-            kv_cache_config=_kv_cache_config("fp8"),
+            kv_cache_config=_kv_cache_config("auto" if deployment.endswith("_bf16kv") else "fp8"),
             sparse_attention_config=DeepSeekSparseAttentionConfig(indexer_k_dtype="fp8"),
             env_overrides=rank_env,
-            **_LAYOUTS[deployment],
+            **_LAYOUTS[layout],
             **kwargs,
         )
 
@@ -181,6 +182,8 @@ class _K31Target(LlmapiAccuracyTestHarness):
             scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
             LLM(self.MODEL_PATH, **self._llm_kwargs(deployment, 8192, rank_env)) as llm,
         ):
+            if deployment.endswith("_bf16kv"):
+                assert llm.args.quant_config.kv_cache_quant_algo is None
             if logits_processor:
                 assert_logits_processor(llm)
             GSM8K(self.MODEL_NAME).evaluate(llm)

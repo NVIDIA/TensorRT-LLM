@@ -440,6 +440,8 @@ moonshotai/Kimi-K3.1-Pro:
   - kv_cache_quant_algo: FP8
     spec_dec_algo: DFlash
     accuracy: 97.94
+  # Measured on all 1,319 questions on GB300 TEP8 with BF16 latent KV (auto) and no speculation.
+  - accuracy: 97.801
 nvidia/Kimi-K3.1-Pro-NVFP4:
   # Mean of 19 CI-form greedy GSM8K runs of this checkpoint with DFlash2 on GB300 and Rubin (TEP8, DEP16): 97.566.
   - quant_algo: MIXED_PRECISION
