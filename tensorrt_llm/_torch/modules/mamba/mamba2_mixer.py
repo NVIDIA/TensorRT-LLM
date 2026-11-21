@@ -40,6 +40,7 @@ from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
+from .exact_replay import exact_replay_forward_core
 from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
@@ -315,7 +316,9 @@ class Mamba2Mixer(nn.Module):
         #
         # Results move by up to one bf16 ulp -- the layout change is bit-exact,
         # the accumulation order is not. Set TRTLLM_MAMBA_TOKEN_MAJOR_CONV=0 to
-        # fall back to the channel-major kernel plus transposes.
+        # fall back to the channel-major kernel plus transposes. The switch does
+        # not apply to the exact-replay path of the deterministic mode, which
+        # always uses the token-major kernel (see exact_replay.py).
         self._token_major_conv = os.environ.get("TRTLLM_MAMBA_TOKEN_MAJOR_CONV",
                                                 "1") == "1"
 
@@ -506,6 +509,17 @@ class Mamba2Mixer(nn.Module):
             self.layer_idx)
         conv_states = layer_cache.conv
         ssm_states = layer_cache.temporal
+
+        if getattr(layer_cache, "replay_x", None) is not None:
+            # The cache manager bound the exact-replay state (deterministic
+            # Mamba2 kernels): prefill and decode share the chunked-scan
+            # arithmetic from each slot's last chunk boundary. The manager
+            # binds it only for a bfloat16 model without speculative decoding.
+            assert spec_metadata is None and zxbcdt.dtype == torch.bfloat16
+            exact_replay_forward_core(self, zxbcdt, attn_metadata,
+                                      mamba_metadata, layer_cache,
+                                      preallocated_ssm_out)
+            return
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)

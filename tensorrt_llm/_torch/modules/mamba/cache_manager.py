@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaLayerCache,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
+    _host_slots_to_device,
     _is_disagg_context_server,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
@@ -33,11 +34,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
     MambaHybridCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
+from .exact_replay import exact_replay_requested, pin_ssd_autotune_configs
 from .replay_metadata import ReplayMamba2Metadata
 from .replay_region import REPLAY_STATE_REGION, Mamba2ReplayRegion, ReplayLayout
 
@@ -55,6 +57,13 @@ _REPLAY_META_ROLE = DataRole("mamba2_replay_meta")
 _REPLAY_META_BYTES = 16
 _REPLAY_META_PNAT = 0
 _REPLAY_META_CACHE_BUF_IDX = 1
+# Exact replay (deterministic Mamba2 kernels): per-layer inputs of the partial
+# chunk, in Mamba2LayerCache attribute order.
+_EXACT_REPLAY_ROLES = {
+    "replay_x": DataRole("mamba2_exact_replay_x"),
+    "replay_dt": DataRole("mamba2_exact_replay_dt"),
+    "replay_B": DataRole("mamba2_exact_replay_B"),
+}
 
 
 class ReplayStateUpdateMetadata(NamedTuple):
@@ -165,6 +174,11 @@ class Mamba2LayerCache(MambaLayerCache):
     old_B: torch.Tensor | None = None
     old_dt: torch.Tensor | None = None
     old_dA_cumsum: torch.Tensor | None = None
+    # Exact replay: inputs of the partial chunk after the slot's last chunk
+    # boundary, [slot, chunk_size, ...].
+    replay_x: torch.Tensor | None = None
+    replay_dt: torch.Tensor | None = None
+    replay_B: torch.Tensor | None = None
 
 
 def mamba_seed_rank_offset(mapping: Mapping) -> int:
@@ -542,6 +556,174 @@ class ReplayHistory:
         self._pool_layers = None
 
 
+class Mamba2ExactReplayState:
+    """Boundary-state semantics of the deterministic Mamba2 kernels (see exact_replay.py).
+
+    ``temporal`` holds each slot's FP32 state at its last chunk boundary; the
+    replay buffers hold the post-conv ``x``, raw ``dt`` and post-conv ``B`` of
+    the tokens after it. They are buffers of the recurrent-state slot, so a
+    snapshot, a relocation or a suspension of the slot carries them together
+    with the boundary state. A row's position in its chunk comes from the
+    tokens its request has run, so the state keeps no counter.
+
+    Args:
+        chunk_size: Tokens per SSD chunk, which is also the number of buffered
+            positions per slot.
+    """
+
+    uses_replay = False
+    intermediate_indices = None
+    intermediate_ssm = None
+    intermediate_conv = None
+
+    def __init__(self, chunk_size: int) -> None:
+        self.chunk_size = chunk_size
+        self._pool_layers: list[dict[DataRole, torch.Tensor]] | None = None
+
+    def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+        """Per-slot shapes of one layer's partial-chunk buffers."""
+        if not context.mamba_pp_layers:
+            return {}
+        num_heads, head_dim, d_state = context.ssm_state_shape
+        dtype = context.conv_state_dtype
+        chunk = self.chunk_size
+        return {
+            _EXACT_REPLAY_ROLES["replay_x"]: (dtype, [chunk, num_heads, head_dim]),
+            _EXACT_REPLAY_ROLES["replay_dt"]: (dtype, [chunk, num_heads]),
+            _EXACT_REPLAY_ROLES["replay_B"]: (dtype, [chunk, context.n_groups_per_rank, d_state]),
+        }
+
+    def bind_replay_pool(self, layers: list[dict[DataRole, torch.Tensor]]) -> None:
+        """Take the manager's per-layer views; their first dimension is the state slot."""
+        self._pool_layers = layers
+
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        if not context.mamba_pp_layers:
+            return
+        if self._pool_layers is None:
+            raise RuntimeError("Mamba2 exact replay needs the cache manager's slot buffers")
+        pin_ssd_autotune_configs()
+
+    def reset_replay_slots(self, slots: torch.Tensor) -> None:
+        """Clear the buffers of requests that start in generation.
+
+        No prefill has cleared them, and a newly acquired slot holds arbitrary
+        bytes that a decode scan would read.
+        """
+        for views in self._pool_layers or ():
+            for role in _EXACT_REPLAY_ROLES.values():
+                views[role].index_fill_(0, slots, 0)
+
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        # A context request clears its buffers past the partial chunk when its
+        # prefill stores it; a resumed prefill keeps what it buffered.
+        return
+
+    def update(self, batch: MambaAcceptanceBatch) -> None:
+        return
+
+    def shutdown(self) -> None:
+        self._pool_layers = None
+
+    def make_layer_cache(
+        self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
+    ) -> MambaLayerCache:
+        views = self._pool_layers[layer_offset]
+        return Mamba2LayerCache(
+            conv=conv,
+            temporal=temporal,
+            **{name: views[role] for name, role in _EXACT_REPLAY_ROLES.items()},
+        )
+
+
+def _exact_replay_disabled_reason(
+    spec_config: object | None,
+    model_dtype: torch.dtype,
+    ssm_cache_dtype: torch.dtype,
+    chunk_size: int | None,
+    is_disagg: bool,
+) -> str | None:
+    """Why the deterministic mode keeps the default Mamba2 kernels, or None."""
+    sm = get_sm_version()
+    if not is_blackwell_datacenter(sm):
+        return f"it is implemented for SM100 and SM103 only (this GPU is SM{sm})"
+    if spec_config is not None:
+        return "speculative decoding is enabled"
+    if is_disagg:
+        return "disaggregated serving transfers the recurrent state without the replay buffers"
+    if model_dtype != torch.bfloat16:
+        return f"the model dtype is {model_dtype}; the replay kernels are validated for bfloat16"
+    if ssm_cache_dtype != torch.float32:
+        return f"kv_cache_config.mamba_ssm_cache_dtype is {ssm_cache_dtype}; set it to float32"
+    if not chunk_size:
+        return "the Mamba2 chunk size is unknown"
+    return None
+
+
+def _estimated_state_layout(
+    params, mapping: Mapping, local_layers: int, ssm_cache_dtype: torch.dtype, spec_config
+) -> MambaStateLayout:
+    """The recurrent geometry of a manager not yet built, for sizing replay buffers."""
+    tp_size = _mamba_effective_tp_size(mapping)
+    layer_ids = tuple(range(local_layers))
+    return MambaStateLayout(
+        layer_mask=(True,) * local_layers,
+        pp_layers=layer_ids,
+        mamba_pp_layers=layer_ids,
+        mapping=mapping,
+        conv_state_shape=(),
+        ssm_state_shape=(params.num_heads // tp_size, params.head_dim, params.state_size),
+        conv_state_dtype=params.dtype,
+        ssm_state_dtype=ssm_cache_dtype,
+        n_groups_per_rank=params.n_groups // tp_size,
+        max_batch_size=0,
+        state_index_capacity=0,
+        slot_capacity=None,
+        spec_config=spec_config,
+    )
+
+
+def _replay_layout_bytes(state, context: MambaStateLayout) -> int:
+    """Bytes of one slot of ``state``'s replay buffers across the local layers."""
+    return sum(
+        dtype.itemsize * math.prod(shape)
+        for layer_id in context.mamba_pp_layers
+        for dtype, shape in state.replay_layout(context, layer_id).values()
+    )
+
+
+def _estimate_exact_replay_bytes_per_slot(model_config, mapping: Mapping, **kwargs) -> int:
+    """Bytes the exact-replay buffers add to every recurrent-state slot of a manager not yet built."""
+    if not exact_replay_requested():
+        return 0
+    spec_config = kwargs.get("spec_config")
+    params, local_layers, _ = _get_local_mamba_cache_layout(
+        model_config,
+        mapping,
+        spec_config=spec_config,
+        is_draft=kwargs.get("is_draft", False),
+        use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+    )
+    if not local_layers:
+        return 0
+    ssm_cache_dtype = params.mamba_ssm_cache_dtype or params.dtype
+    if _exact_replay_disabled_reason(
+        spec_config,
+        params.dtype,
+        ssm_cache_dtype,
+        params.mamba_chunk_size,
+        kwargs.get("is_disagg", False),
+    ):
+        return 0
+    context = _estimated_state_layout(params, mapping, local_layers, ssm_cache_dtype, spec_config)
+    return _replay_layout_bytes(Mamba2ExactReplayState(params.mamba_chunk_size), context)
+
+
 def create_mamba2_state(
     *, spec_config: object | None, use_replay: bool, stochastic_rounding: bool = False
 ) -> Mamba2State | ReplayHistory:
@@ -601,10 +783,11 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     ``Mamba2ReplayRegion``.
     """
 
-    _speculative_state: Mamba2State | ReplayHistory
+    _speculative_state: Mamba2State | ReplayHistory | Mamba2ExactReplayState
     mamba_metadata_cls = ReplayMamba2Metadata
     _replay_region: Mamba2ReplayRegion | None = None
     _context_only = False
+    _exact_replay_is_disagg = False
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
@@ -613,11 +796,79 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         # A disaggregated context server never decodes and keeps no replay history.
         self._context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._replay_region = None
+        self._mamba_chunk_size = kwargs.pop("mamba_chunk_size", None)
+        self._exact_replay_is_disagg = bool(kwargs.get("is_disagg", False))
+        # Requests whose exact-replay buffers a prefill or a reset has cleared.
+        self._exact_replay_requests: set[int] = set()
         kwargs.setdefault("conv_state_layout", "x_b_c")
         super().__init__(*args, **kwargs)
 
+    def _exact_replay_state(self) -> Mamba2ExactReplayState | None:
+        """The deterministic replay state, or None with the reason logged."""
+        if not exact_replay_requested():
+            return None
+        reason = _exact_replay_disabled_reason(
+            self.spec_config,
+            self.conv_state_dtype,
+            self.ssm_state_dtype,
+            self._mamba_chunk_size,
+            self._exact_replay_is_disagg,
+        )
+        if reason is None:
+            logger.info_once(
+                "Deterministic Mamba2: decode replays the chunked-scan arithmetic from each "
+                "slot's last chunk boundary. Every row uses the token-major convolution "
+                "kernel, whatever TRTLLM_MAMBA_TOKEN_MAJOR_CONV selects.",
+                key="mamba2_exact_replay",
+            )
+            return Mamba2ExactReplayState(self._mamba_chunk_size)
+        logger.warning_once(
+            f"Deterministic Mamba2 keeps the default prefill and decode kernels because {reason}",
+            key="mamba2_exact_replay_disabled",
+        )
+        return None
+
+    @property
+    def mamba_exact_replay_chunk_size(self) -> int | None:
+        """Chunk size of the bound exact-replay state; None when it is not bound."""
+        state = self._speculative_state
+        return state.chunk_size if isinstance(state, Mamba2ExactReplayState) else None
+
+    @classmethod
     @override
-    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory:
+    def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        # The exact-replay buffers share every recurrent-state slot.
+        return _estimate_exact_replay_bytes_per_slot(model_config, mapping, **kwargs)
+
+    @override
+    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
+        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
+        state = self._speculative_state
+        if isinstance(state, Mamba2ExactReplayState):
+            buffers += [
+                BufferConfig(role=role, size=dtype.itemsize * math.prod(shape))
+                for role, (dtype, shape) in state.replay_layout(
+                    self._state_layout, global_layer_id
+                ).items()
+            ]
+        return buffers
+
+    @override
+    def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
+        state = self._speculative_state
+        if isinstance(state, Mamba2ExactReplayState):
+            return state.make_layer_cache(
+                self.mamba_layer_offsets[layer_idx],
+                self.get_conv_states(layer_idx),
+                self.get_ssm_states(layer_idx),
+            )
+        return super().mamba_layer_cache(layer_idx)
+
+    @override
+    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory | Mamba2ExactReplayState:
+        replay_state = self._exact_replay_state()
+        if replay_state is not None:
+            return replay_state
         if self._requested_replay is not None:
             state = create_mamba2_state(
                 spec_config=self.spec_config,
@@ -671,6 +922,21 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def _setup_model_state(self) -> None:
+        state = self._speculative_state
+        if isinstance(state, Mamba2ExactReplayState) and self.mamba_pp_layers:
+            state.bind_replay_pool(
+                [
+                    {
+                        role: self._get_state_buffer(
+                            self.layer_offsets[layer], role, dtype, list(shape)
+                        )
+                        for role, (dtype, shape) in state.replay_layout(
+                            self._state_layout, layer
+                        ).items()
+                    }
+                    for layer in self.mamba_pp_layers
+                ]
+            )
         region = self._replay_region
         if region is not None:
             region.bind(
@@ -720,6 +986,21 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
                 num_contexts,
                 self._skips_steady_state_index_upload,
             )
+        state = self._speculative_state
+        if isinstance(state, Mamba2ExactReplayState) and self.local_num_mamba_layers:
+            # A request that starts in generation (CUDA-graph padding, warmup,
+            # a one-token prompt promoted to a decode row) never runs a prefill
+            # that clears its buffers.
+            fresh = [
+                self._request_id_to_state_index[req.py_request_id]
+                for req in requests[num_contexts:]
+                if req.py_request_id not in self._exact_replay_requests
+            ]
+            if fresh:
+                state.reset_replay_slots(
+                    _host_slots_to_device(fresh, self.cuda_state_indices.device)
+                )
+            self._exact_replay_requests.update(req.py_request_id for req in requests)
 
     @override
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
@@ -741,6 +1022,7 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     def free_resources(self, request, pin_on_release: bool = False) -> None:
         if self._replay_region is not None:
             self._replay_region.release(request.py_request_id)
+        self._exact_replay_requests.discard(request.py_request_id)
         super().free_resources(request, pin_on_release)
 
     @override
@@ -795,29 +1077,10 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         use_replay, _ = _mamba2_replay_gate(spec_config, ssm_cache_dtype, stochastic_rounding)
         if not use_replay:
             return 0
-        tp_size = _mamba_effective_tp_size(mapping)
-        layer_ids = list(range(local_layers))
-        context = MambaStateLayout(
-            layer_mask=(True,) * local_layers,
-            pp_layers=tuple(layer_ids),
-            mamba_pp_layers=tuple(layer_ids),
-            mapping=mapping,
-            conv_state_shape=(),
-            ssm_state_shape=(params.num_heads // tp_size, params.head_dim, params.state_size),
-            conv_state_dtype=params.dtype,
-            ssm_state_dtype=ssm_cache_dtype,
-            n_groups_per_rank=params.n_groups // tp_size,
-            max_batch_size=0,
-            state_index_capacity=0,
-            slot_capacity=None,
-            spec_config=spec_config,
+        context = _estimated_state_layout(
+            params, mapping, local_layers, ssm_cache_dtype, spec_config
         )
-        state = ReplayHistory(spec_config.tokens_per_gen_step)
-        return sum(
-            dtype.itemsize * math.prod(shape)
-            for layer_id in layer_ids
-            for dtype, shape in state.replay_layout(context, layer_id).values()
-        )
+        return _replay_layout_bytes(ReplayHistory(spec_config.tokens_per_gen_step), context)
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state
@@ -843,12 +1106,14 @@ def get_nemotron_cache_params(config, *, spec_config=None, quant_config=None):
         target_full_attn_mask=[layer == "*" for layer in pattern],
         spec_config=spec_config,
         quant_config=quant_config,
+        chunk_size=getattr(config, "chunk_size", None),
     )
 
 
 __all__ = [
     "Mamba2LayerCache",
     "Mamba2State",
+    "Mamba2ExactReplayState",
     "ReplayHistory",
     "NemotronHybridCacheManager",
     "create_mamba2_state",

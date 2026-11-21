@@ -73,7 +73,7 @@ Every provider follows the same contract:
 | Case | Storage |
 |---|---|
 | Own slots (Mamba2, GDN Triton / CuTe / fused verify, KDA) | `replay_state` (`REQUEST`, `NEVER`) over the local recurrent layers, `fixed_slot_count = ceil(IndexMapper capacity / max_util_for_resume)` |
-| Shared slots (GDN FlashInfer ring, the Kimi K3 engine's draft records) | No region: `shared_buffers()` adds the replay buffers to the layer's `SsmLayerConfig`, and they follow the recurrent state's life cycle |
+| Shared slots (GDN FlashInfer ring, the Kimi K3 engine's draft records, Mamba2 exact replay) | No region: `shared_buffers()` adds the replay buffers to the layer's `SsmLayerConfig`, and they follow the recurrent state's life cycle |
 | Disaggregated context server | Neither: the manager creates no provider |
 
 The provider binds the replay views (`bind_replay_pool`) before the state's `bind()`, keeps each
@@ -86,6 +86,16 @@ kernels read (`replay_state_indices`), or aliases `state_indices` when the repla
 recurrent-state slots. Before the manager exists, the manager's `_estimate_fixed_region_bytes()`
 reserves the provider's fixed pool. Replay buffers are never transferred between disaggregated
 workers: the manager lists them in `get_disagg_ignored_roles()`.
+
+Mamba2 exact replay (`Mamba2ExactReplayState`, the deterministic Mamba2 kernels of
+`modules/mamba/exact_replay.py`) is the shared-slot case without a provider: it is not a
+speculative-decoding state, so `NemotronHybridCacheManager` adds its partial-chunk buffers to the
+recurrent `SsmLayerConfig` itself (`_get_recurrent_buffer_configs`), binds their views in
+`_setup_model_state` and clears the buffers of a request that starts in generation in
+`_setup_state_indices`. A snapshot, a suspension or a slot move carries them with the boundary
+state. The state keeps no bookkeeping of its own: `ReplayMamba2Metadata` derives each row's position
+in its chunk from the tokens its request has run (`num_cached_tokens_per_seq`) and moves the rows on
+in `prepare_steady_gen_step`.
 
 The Mamba2 and GDN metadata classes extend `Mamba2Metadata` side by side; they share the replay
 primitives of `modules/mamba/replay_metadata.py` (the work-item layout and builders,
