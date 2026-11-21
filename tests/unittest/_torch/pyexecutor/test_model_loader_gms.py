@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for ``LoadFormat.GMS`` loading, driven through ``ModelLoader.load``."""
 
+import sys
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -12,6 +13,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._errors import RuntimeInitError
 from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.models.checkpoints import memory_init, model_hooks
@@ -19,6 +21,7 @@ from tensorrt_llm._torch.models.checkpoints.gms import model_loading as gms_load
 from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
+from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import _broadcast_ep_unique_id
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
@@ -837,3 +840,47 @@ def test_gms_rejects_localized_weights_before_model_init(monkeypatch):
 
     memory_init.AutoModelForCausalLM.from_config.assert_not_called()
     checkpoint_loader.load_weights.assert_not_called()
+
+
+@pytest.mark.parametrize("distributed_failure", [True, False])
+def test_model_construction_retries_only_non_distributed_errors(
+    monkeypatch: pytest.MonkeyPatch, distributed_failure: bool
+) -> None:
+    """A distributed failure must not restart collectives through regular init."""
+    loader = _make_loader(monkeypatch, events=[])
+    failure = (
+        RuntimeInitError("NCCL bootstrap failed")
+        if distributed_failure
+        else RuntimeError("meta init failed")
+    )
+    regular_init = ValueError("regular init reached")
+    construct = memory_init.AutoModelForCausalLM.from_config
+    construct.side_effect = [failure, regular_init]
+    expected = failure if distributed_failure else regular_init
+    with pytest.raises(type(expected)) as raised:
+        loader.load("/ckpt", MagicMock())
+    assert raised.value is expected
+    assert construct.call_count == (1 if distributed_failure else 2)
+
+
+def test_unique_id_failure_does_not_retry_model_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Root bootstrap errors must not restart collectives after peers have failed."""
+    loader = _make_loader(monkeypatch, events=[])
+    failure = TypeError("unique ID creation failed")
+    core = SimpleNamespace(get_unique_id=MagicMock(side_effect=failure))
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(core=core))
+    monkeypatch.setitem(sys.modules, "nccl.core", core)
+    ep_mpi_comm = MagicMock()
+    ep_mpi_comm.bcast.return_value = None
+    construct = memory_init.AutoModelForCausalLM.from_config
+    construct.side_effect = lambda config: _broadcast_ep_unique_id(
+        SimpleNamespace(moe_ep_rank=0), ep_mpi_comm
+    )
+    with pytest.raises(RuntimeInitError) as raised:
+        loader.load("/ckpt", MagicMock())
+    assert raised.value.__cause__ is failure
+    construct.assert_called_once()
+    core.get_unique_id.assert_called_once()
+    ep_mpi_comm.bcast.assert_called_once_with(None, root=0)
