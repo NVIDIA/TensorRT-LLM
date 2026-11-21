@@ -2128,7 +2128,8 @@ class PyExecutor:
             self.disagg.release_transfer(request)
             return
         if self.async_transfer_manager.end_transfer(request):
-            if not self.force_terminate_ctx_for_partial_reuse:
+            if not (self.force_terminate_ctx_for_partial_reuse and getattr(
+                    request, "py_request_terminated", False) is True):
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self, merge: bool = False):
@@ -2155,8 +2156,17 @@ class PyExecutor:
             # Even when this rank has no responses we must participate in the
             # collective when ADP is enabled so that the other rank's gather
             # can complete.
-            self._enqueue_responses(responses)
-        for request in requests_to_terminate:
+            self._publish_responses_and_terminate(responses,
+                                                  requests_to_terminate)
+        else:
+            self._terminate_requests(requests_to_terminate)
+
+    def _publish_responses_and_terminate(
+            self, responses: list[tuple[int, LlmResponse]],
+            requests: Iterable[LlmRequest]) -> None:
+        """Publish at the caller's collective boundary before removing routing."""
+        self._enqueue_responses(responses)
+        for request in requests:
             self._terminate_request(request)
 
     def _flush_iter_stats_synced(self):
@@ -5788,9 +5798,7 @@ class PyExecutor:
         generation_ids = set()
         for request in active_requests:
             if (request.is_dummy or request.request_id in self.inflight_req_ids
-                    or
-                    not self.scheduler.is_request_in_schedulable_state(request)
-                ):
+                    or not self._is_request_schedulable(request)):
                 continue
             if request.state in (LlmRequestState.CONTEXT_INIT,
                                  LlmRequestState.ENCODER_INIT):
@@ -11309,7 +11317,7 @@ class PyExecutor:
                         or req.is_disagg_generation_transmission_in_progress))
 
         return sum(1 for req in self.active_requests
-                   if self.scheduler.is_request_in_schedulable_state(req))
+                   if self._is_request_schedulable(req))
 
     def _get_non_overlap_adp_forward_intent(
             self) -> tuple[int, _ADPForwardIntent]:
@@ -11322,9 +11330,8 @@ class PyExecutor:
         local_schedulable_count = 0
         local_intent = _ADPForwardIntent.NONE
         for request in self.active_requests:
-            if (request.is_attention_dp_dummy or
-                    not self.scheduler.is_request_in_schedulable_state(request)
-                ):
+            if (request.is_attention_dp_dummy
+                    or not self._is_request_schedulable(request)):
                 continue
 
             local_schedulable_count += 1
@@ -12886,9 +12893,8 @@ class PyExecutor:
             self._pending_transfer_responses = []
             pending_terminations = self._pending_response_terminations
             self._pending_response_terminations = []
-            self._enqueue_responses(pending + list(error_responses.items()))
-            for request in pending_terminations:
-                self._terminate_request(request)
+            self._publish_responses_and_terminate(
+                pending + list(error_responses.items()), pending_terminations)
 
         if not defer_termination:
             for request in failed_requests:
@@ -12917,7 +12923,46 @@ class PyExecutor:
                                                     None),
                                       background=True)
 
+    def _is_request_schedulable(self, request: LlmRequest) -> bool:
+        """State readiness before capacity admission, excluding parked requests."""
+        return (not self._is_preemption_pending(request)
+                and request.py_request_id not in getattr(
+                    self, "_pending_recompute_pause_ids", ())
+                and self.scheduler.is_request_in_schedulable_state(request))
+
+    def _is_final_response_ready(self, request: LlmRequest) -> bool:
+        """Native completion permits a final response, even during a context send."""
+        return request.is_finished and not self._is_preemption_pending(request)
+
+    def _has_pending_response(self, request: LlmRequest) -> bool:
+        return any(
+            req_id == request.py_request_id
+            for req_id, _ in getattr(self, "_pending_transfer_responses", ()))
+
+    def _can_release_request(self, request: LlmRequest) -> bool:
+        """Whether execution owners permit teardown; PP consensus is separate.
+
+        Connector loads register their deferred termination before this check.
+        Legacy connector-only saves pin detached blocks and allow early teardown;
+        V2 saves and transceiver sends retain the request's allocation itself.
+        """
+        if self._is_preemption_pending(request) or self._has_pending_response(
+                request):
+            return False
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is not None and connector.has_pending_load(request):
+            return False
+        if (getattr(self, "_is_kv_manager_v2", False)
+                or getattr(self, "kv_cache_transceiver", None) is not None):
+            transfers = getattr(self, "async_transfer_manager", None)
+            if (transfers is not None and request.py_request_id
+                    in transfers.requests_in_transfer()):
+                return False
+        return True
+
     def _terminate_request(self, request: LlmRequest) -> None:
+        if getattr(request, "py_request_terminated", False) is True:
+            return
         if self.disagg.defer_gen_termination(request) is True:
             return
         connector = getattr(self, "kv_connector_manager", None)
@@ -12925,28 +12970,31 @@ class PyExecutor:
             connector.release_unstarted_prefix_loads(request)
             if connector.defer_load_termination(request):
                 return
-        if (getattr(self, "_is_kv_manager_v2", False)
-                or getattr(self, "kv_cache_transceiver", None) is not None):
-            transfers = getattr(self, "async_transfer_manager", None)
-            if (transfers is not None and request.py_request_id
-                    in transfers.requests_in_transfer()):
-                # A transfer still holds a claim on this request's blocks.
-                # end_transfer pops the claim and the release path re-enters
-                # _terminate_request once the last owner lets go; freeing here
-                # would race the fabric and then double-free on that re-entry.
-                return
+        if self._has_pending_response(request):
+            # A second transfer owner can finish before the first owner's
+            # staged response is flushed. Keep routing until that publication.
+            if not any(req is request
+                       for req in self._pending_response_terminations):
+                self._pending_response_terminations.append(request)
+            return
+        if not self._can_release_request(request):
+            return
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
         # but the dummy ID is reused every iteration).
         if (self._disagg_pp_termination_handler is not None
-                and not request.is_dummy_request):
+                and not request.is_dummy_request
+                and getattr(request, "py_request_pp_termination_agreed",
+                            False) is not True):
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request)
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        if getattr(request, "py_request_resources_released", False) is True:
+            return
         connector = getattr(self, "kv_connector_manager", None)
         if (self.enable_attention_dp and connector is not None
                 and connector.has_pending_transfers(request.request_id)):
@@ -12975,8 +13023,14 @@ class PyExecutor:
                               "release_request_state", None)
             if release is not None:
                 release(request.py_request_id)
+        request.py_request_resources_released = True
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
+        if getattr(request, "py_request_terminated", False) is True:
+            return
+        if not self._can_release_request(request):
+            self._terminate_request(request)
+            return
         self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
@@ -12986,10 +13040,14 @@ class PyExecutor:
             request.py_encoder_output_ready_event = None
         if self.gather_all_responses or self.dist.rank == 0:
             self._response_channel.release(request.py_request_id)
+        request.py_request_terminated = True
 
     def _on_disagg_pp_termination(self, request: LlmRequest) -> None:
         """Finish a PP-synchronized termination and any deferred recompute."""
         request_id = request.py_request_id
+        # Consensus remains valid while local response or DMA owners drain;
+        # peers may already have released and must not vote a second time.
+        request.py_request_pp_termination_agreed = True
         if request_id not in self._pending_recompute_pause_ids:
             self._do_terminate_request(request)
             return
@@ -13805,8 +13863,9 @@ class PyExecutor:
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
                 request.update_perf_metrics(self.iter_counter)
 
+            final_response_ready = self._is_final_response_ready(request)
             request_done = False
-            if is_finished:
+            if final_response_ready:
                 # Guard the engine lookup -- minimal executors (unit tests)
                 # may have no engine.
                 route_capture = getattr(getattr(self, "model_engine", None),
@@ -13824,7 +13883,8 @@ class PyExecutor:
             # every earlier step only costs a native call. Requests that
             # return perf metrics keep the call: it finalizes their ctx GPU
             # totals.
-            if (should_emit and not is_finished and not request.streaming
+            if (should_emit and not final_response_ready
+                    and not request.streaming
                     and not request.return_perf_metrics):
                 should_emit = False
             if should_emit:
@@ -13833,7 +13893,7 @@ class PyExecutor:
                 if response:
                     if first_gen_emit:
                         request.py_gen_first_emitted = True
-                    request_done = request.is_finished
+                    request_done = final_response_ready
                     new_responses.append((req_id, response))
 
             if request_done:
@@ -13860,9 +13920,8 @@ class PyExecutor:
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
-        self._enqueue_responses(new_responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
+        self._publish_responses_and_terminate(new_responses,
+                                              requests_to_terminate)
         # Under multi-rank ADP the coordinator defers the error response to
         # its synced drain; an in-place tp_allgather here would desync
         # (reached from per-rank-divergent gates).
@@ -13896,6 +13955,9 @@ class PyExecutor:
     def _pause_requests(self, requests_to_pause: Iterable[LlmRequest]) -> None:
         for req in requests_to_pause:
             req.pause(self.max_input_len)
+            req.py_request_resources_released = False
+            req.py_request_terminated = False
+            req.py_request_pp_termination_agreed = False
 
     def _pause_recompute_request(self, req: LlmRequest) -> None:
         req.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
