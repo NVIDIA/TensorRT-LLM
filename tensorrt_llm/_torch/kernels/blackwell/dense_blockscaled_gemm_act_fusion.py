@@ -1584,7 +1584,13 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                     # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
-                        if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
+                        # As in the gather act-fusion kernel: 2-CTA tiles release after the first
+                        # iterations of either direction (stage 0 runs in reverse); 1-CTA tiles keep
+                        # the release at the real subtile index.
+                        release_idx = real_subtile_idx
+                        if cutlass.const_expr(self.use_2cta_instrs):
+                            release_idx = subtile_idx // 2 if self.is_gated else subtile_idx
+                        if release_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
                             with cute.arch.elect_one():
