@@ -374,8 +374,8 @@ class Authority:
         replaced = self._replaced_install_epoch
         # A newer PROPOSE can replace an INSTALL before its commit, after some ranks moved to that
         # INSTALL's resume epoch. Every round waits for every active rank, so if a survivor is still
-        # before that epoch, no rank ran a round at it. Resume there again, which keeps the ranks
-        # that installed it consistent.
+        # before that epoch, no rank finished a round at it; a rank that started one stopped in it
+        # and runs it again. Resume there again, which keeps the ranks that installed it consistent.
         if replaced and any(latest_epoch([replaced, epoch]) != epoch for epoch in epochs):
             return replaced
         # Epochs wrap, so the resume epoch follows the latest one, not the largest.
@@ -544,7 +544,7 @@ class Authority:
         waited_on = 0
         if state in expected:
             waited_on = rank_mask(
-                (r for r in active if not self._replied(reports.get(r), expected[state])),
+                (r for r in active if not self._rank_replied(r, reports, expected[state])),
                 self.world_size,
             )
         # During the startup a rank that started waits on every rank that has not.

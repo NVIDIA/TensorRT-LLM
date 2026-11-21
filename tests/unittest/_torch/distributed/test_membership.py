@@ -21,6 +21,7 @@ import contextlib
 import logging
 import os
 import random
+import resource
 import select
 import signal
 import socket
@@ -466,6 +467,29 @@ def test_stalled_joiner_left_out_early():
     assert record.state == MembershipState.PROPOSE
     assert record.active_mask == _without(2)
     assert cluster.now - stalled_s <= admission_s + 0.2
+
+
+def test_ready_joiner_not_hung_while_survivor_finishes_step():
+    """Keep a joiner whose readiness counts as READY while a survivor finishes its step.
+
+    The joiner sends no READY of its own and makes no progress, so the authority must not wait on
+    it, or its admission timeout would leave it out.
+    """
+    admission_s = 2.0
+    cluster = Cluster(admission_timeout_s=admission_s)
+    cluster.alive.discard(2)
+    cluster.run(1.0)
+    _join(cluster, 2)
+    cluster.run_until(MembershipState.PROPOSE)
+    proposed = cluster.authority.record
+    cluster.hung.update({1, 2})  # neither replies READY
+    cluster.installing.add(1)  # rank 1 still makes progress in its step
+    assert cluster.run(admission_s + 1.0) == proposed
+    _release(cluster)
+    cluster.installing.clear()
+    record = cluster.run(1.0)
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == ALL
 
 
 def test_frozen_survivor_removed_before_joiner():
@@ -1618,21 +1642,41 @@ def test_late_wakeup_keeps_live_authority(monkeypatch):
         liveness, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + skipped_s[0])
     )
     calls = []
+    readable = liveness._readable
 
-    def select_with_late_wakeup(watched, *rest):
+    def readable_with_late_wakeup(watched, timeout_s):
         calls.append(watched)
         if len(calls) > 1:
-            return select.select(watched, *rest)
+            return readable(watched, timeout_s)
         # The authority's line has arrived, but the thread wakes only after the silence timeout.
-        select.select(watched[:1], [], [])
+        readable(watched[:1], None)
         skipped_s[0] += 2 * silence_s
-        return [], [], []
+        return []
 
-    monkeypatch.setattr(liveness, "select", SimpleNamespace(select=select_with_late_wakeup))
+    monkeypatch.setattr(liveness, "_readable", readable_with_late_wakeup)
     errors = []
     with _scripted_client(errors, resend_s=0.1):
         _until(lambda: errors or len(calls) > 2)
         assert not errors
+
+
+def test_client_serves_descriptors_above_select_limit():
+    """Keep a client whose liveness socket and wake pipe are numbered above select's limit."""
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 2048:
+        pytest.skip("the open-file limit is below 2048")
+    placeholders = []
+    try:
+        while not placeholders or placeholders[-1] < 1024:
+            placeholders.append(os.open(os.devnull, os.O_RDONLY))
+        errors = []
+        with _scripted_client(errors, resend_s=0.1) as client:
+            assert client._sock.fileno() > 1024
+            time.sleep(1.0)
+            assert not errors
+            assert client._thread.is_alive()
+    finally:
+        for fd in placeholders:
+            os.close(fd)
 
 
 def test_callback_error_logged_with_traceback(monkeypatch):
