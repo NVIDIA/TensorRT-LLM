@@ -1702,6 +1702,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         return self.llm.draft_model
 
     @property
+    def spec_worker(self):
+        return self.llm.spec_worker
+
+    @property
     def model(self):
         return self.llm.model
 

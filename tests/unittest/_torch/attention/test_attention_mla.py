@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import copy
 import math
 import random
 import types
@@ -1458,6 +1459,12 @@ class _Prefixes:
     _invalidate_mla_scheduler_buffers = TrtllmAttentionMetadata._invalidate_mla_scheduler_buffers
     on_update_kv_lens = TrtllmAttentionMetadata.on_update_kv_lens
     update_for_spec_dec = TrtllmAttentionMetadata.update_for_spec_dec
+    token_major_gen_view = TrtllmAttentionMetadata.token_major_gen_view
+    is_ragged_verify = TrtllmAttentionMetadata.is_ragged_verify
+    # The hooks also read the ragged row state; every step here is uniform.
+    ragged_verify_lens = None
+    enable_ragged_verification = False
+    _attn_num_rows = 0
 
     def __init__(self, q_lens, kv_lens, num_contexts=0):
         device = torch.device("cuda")
@@ -1551,6 +1558,278 @@ def test_context_prefix_counts_tokens_not_rows():
         torch.tensor([2, 3, 7], dtype=torch.int32, device="cuda"))
     state.on_update_kv_lens()
     assert state.mla_prepare_ctx_cu_seqlens().tolist() == [0, 2, 5, 12]
+
+
+# ---------------------------------------------------------------------------
+# Ragged verification on the dense metadata: generation request i verifies
+# verify_lens[i] query tokens, and the MLA ops are handed one row per token.
+# ---------------------------------------------------------------------------
+
+
+def _ragged_metadata(monkeypatch, seq_lens, num_contexts, verify_lens):
+    """A `TrtllmAttentionMetadata` holding only what the ragged rows read.
+
+    Built through `__new__` and allocated on the host: the rows are a layout,
+    and neither a KV cache manager nor a device takes part in building it.
+    """
+
+    def allocate(buffers, shape, *, cache_name, dtype, capture_graph):
+        return torch.zeros(shape, dtype=dtype)
+
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    metadata._seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    metadata._num_contexts = num_contexts
+    metadata._num_ctx_tokens = sum(seq_lens[:num_contexts])
+    metadata._num_tokens = sum(seq_lens)
+    metadata.max_num_sequences = len(seq_lens)
+    metadata.cuda_graph_buffers = None
+    metadata.kv_cache_manager = types.SimpleNamespace(num_pools=1,
+                                                      max_blocks_per_seq=2)
+    metadata.get_empty = allocate
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.trtllm.prefer_pinned",
+        lambda: False)
+    metadata.enable_ragged_verification = True
+    # update_spec_dec_param() announces the draft ceiling that sizes the rows.
+    metadata._reserve_ragged_verification_rows(5)
+    metadata.ragged_verify_lens = verify_lens
+    return metadata
+
+
+def _prepare_ragged_rows(monkeypatch, num_contexts):
+    """One optional context request, then requests verifying 2 and 4 tokens."""
+    context = [3] if num_contexts else []
+    metadata = _ragged_metadata(monkeypatch, context + [2, 4], num_contexts,
+                                [2, 4])
+    num_seqs = num_contexts + 2
+    metadata.prompt_lens_cpu = torch.tensor(context + [100, 200],
+                                            dtype=torch.int32)
+    block_offsets = torch.arange(num_seqs * 4, dtype=torch.int32)
+    metadata.kv_cache_block_offsets = block_offsets.reshape(1, num_seqs, 2, 2)
+    # What prepare() hands the builders: KV lengths without the extra tokens.
+    kv_lens = torch.tensor(context + [102, 204], dtype=torch.int32)
+    metadata._prepare_ragged_row_kv_lens(kv_lens)
+    metadata._prepare_token_major_gen_rows(kv_lens)
+    return metadata, context, kv_lens
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_contexts", [0, 1])
+def test_ragged_rows_present_one_row_per_generation_token(
+        monkeypatch, num_contexts):
+    """A row carries its token's causal KV extent and its request's blocks."""
+    metadata, context, _ = _prepare_ragged_rows(monkeypatch, num_contexts)
+
+    rows = [101, 102, 201, 202, 203, 204]
+    assert metadata.ragged_row_kv_lens(6).tolist() == rows
+    assert metadata.row_req_idx_cuda[:6].tolist() == [0, 0, 1, 1, 1, 1]
+
+    view = metadata.token_major_gen_view()
+    assert view.num_rows == num_contexts + 6
+    # The static ceiling: (2 + draft ceiling) rows for every sequence.
+    assert view.max_num_rows == (num_contexts + 2) * 7
+    assert view.sequence_length.tolist() == context + rows
+    assert view.host_past_key_value_lengths.tolist() == context + rows
+    # One query token per generation row; a context row keeps its length.
+    assert view.host_context_lengths.tolist() == context + [1] * 6
+    assert view.prompt_lens_cuda.tolist() == context + [1] * 6
+    assert view.host_request_types.tolist() == [0] * num_contexts + [1] * 6
+    row_requests = (list(range(num_contexts)) + [num_contexts] * 2 +
+                    [num_contexts + 1] * 4)
+    assert metadata.attn_row_req_idx_cuda[:view.num_rows].tolist(
+    ) == row_requests
+    assert torch.equal(view.kv_cache_block_offsets,
+                       metadata.kv_cache_block_offsets[:, row_requests])
+    assert metadata.num_seqs == num_contexts + 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_contexts", [0, 1])
+def test_ragged_rows_follow_the_overlap_kv_len_correction(
+        monkeypatch, num_contexts):
+    """`on_update_kv_lens` rebuilds the row extents on device, in place."""
+    metadata, context, kv_lens = _prepare_ragged_rows(monkeypatch, num_contexts)
+    q_prefix, kv_prefix = metadata.mla_prepare_scheduler_buffers(NUM_HEADS)
+    assert q_prefix.tolist() == [NUM_HEADS * row for row in range(7)]
+    assert kv_prefix.tolist() == [0, 101, 203, 404, 606, 809, 1013]
+
+    view = metadata.token_major_gen_view()
+    # The overlap scheduler found 3 and 6 fewer accepted tokens than assumed.
+    metadata.kv_lens_cuda = kv_lens.clone()
+    metadata.kv_lens_cuda[num_contexts:] -= torch.tensor([3, 6],
+                                                         dtype=torch.int32)
+    metadata.on_update_kv_lens()
+
+    rows = [98, 99, 195, 196, 197, 198]
+    assert metadata.ragged_row_kv_lens(6).tolist() == rows
+    # The view taken before the correction reads the same storage.
+    assert view.sequence_length.tolist() == context + rows
+    q_prefix, kv_prefix = metadata.mla_prepare_scheduler_buffers(NUM_HEADS)
+    assert q_prefix.tolist() == [NUM_HEADS * row for row in range(7)]
+    assert kv_prefix.tolist() == [0, 98, 197, 392, 588, 785, 983]
+
+
+@pytest.mark.cpu_only
+def test_uniform_step_keeps_the_request_major_presentation(monkeypatch):
+    """Without verify windows the allocated rows stay out of the way."""
+    metadata = _ragged_metadata(monkeypatch, [2, 2], 0, None)
+    assert metadata.token_major_gen_view() is None
+    assert metadata.ragged_row_kv_lens(4) is None
+
+
+@pytest.mark.cpu_only
+def test_ragged_rows_reject_kv_caches_with_page_tables_of_their_own(
+        monkeypatch):
+    """The rows expand the block offsets only."""
+    metadata = _ragged_metadata(monkeypatch, [2, 2], 0, None)
+    metadata.fp4_mla_state = None
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+        lambda: 100)
+    metadata._validate_ragged_verification_support()
+
+    manager = metadata.kv_cache_manager
+    manager.mixed_precision_high_layers = {0: 1}
+    manager.mixed_precision_low_dtype = "nvfp4"
+    manager.mixed_precision_high_dtype = "fp8"
+    with pytest.raises(ValueError, match="NVFP4 or mixed-precision KV cache"):
+        metadata._validate_ragged_verification_support()
+
+    manager.mixed_precision_high_layers = None
+    metadata.fp4_mla_state = object()
+    with pytest.raises(ValueError, match="NVFP4 or mixed-precision KV cache"):
+        metadata._validate_ragged_verification_support()
+
+    # Metadata without the rows is not concerned.
+    metadata.enable_ragged_verification = False
+    metadata._validate_ragged_verification_support()
+
+
+@pytest.mark.cpu_only
+def test_ragged_rows_need_the_sm100_family_kernels(monkeypatch):
+    """The other kernels verify drafts in spec-decoding mode, without the rows."""
+    metadata = _ragged_metadata(monkeypatch, [2, 2], 0, None)
+    metadata.fp4_mla_state = None
+    sm_version = "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version"
+    monkeypatch.setattr(sm_version, lambda: 90)
+    with pytest.raises(ValueError, match="SM100-family attention kernels"):
+        metadata._validate_ragged_verification_support()
+
+    monkeypatch.setattr(sm_version, lambda: 103)
+    metadata._validate_ragged_verification_support()
+
+    # Metadata without the rows is not concerned.
+    monkeypatch.setattr(sm_version, lambda: 90)
+    metadata.enable_ragged_verification = False
+    metadata._validate_ragged_verification_support()
+
+
+@pytest.mark.cpu_only
+def test_verify_windows_need_the_rows_allocated(monkeypatch):
+    """Windows installed on metadata built without the rows are rejected."""
+    metadata = _ragged_metadata(monkeypatch, [2, 2], 0, [2, 2])
+    metadata.enable_ragged_verification = False
+    with pytest.raises(RuntimeError,
+                       match="without enabling ragged-verification buffers"):
+        metadata._validate_ragged_verification()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_contexts", [0, 1])
+def test_ragged_rows_map_to_and_from_a_uniform_layout(monkeypatch,
+                                                      num_contexts):
+    """Past its window a request repeats its last row; its own rows map back."""
+    metadata, _, _ = _prepare_ragged_rows(monkeypatch, num_contexts)
+    metadata._seq_lens_cuda = metadata._seq_lens.clone()
+    metadata._num_generations = 2
+
+    # Requests verifying 2 and 4 tokens, in a layout of 4 rows per request.
+    source_rows, kept_rows = metadata.ragged_uniform_rows(4)
+    assert source_rows.tolist() == [0, 1, 1, 1, 2, 3, 4, 5]
+    assert kept_rows.tolist() == [0, 1, 4, 5, 6, 7]
+
+
+@pytest.mark.cpu_only
+def test_cross_attention_copy_drops_the_ragged_state():
+    """Ragged verification is a target self-attention capability."""
+    with mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers"):
+        metadata = TrtllmAttentionMetadata(max_num_requests=2,
+                                           max_num_tokens=16,
+                                           enable_ragged_verification=True)
+        metadata.ragged_verify_lens = [2, 4]
+        cross = copy.copy(metadata)
+        # Distinct query and KV lengths are what make metadata cross-attention.
+        cross._seq_lens = torch.tensor([2, 4], dtype=torch.int32)
+        cross._seq_lens_kv = torch.tensor([7, 7], dtype=torch.int32)
+        cross.__post_init__()
+
+    assert cross.is_cross
+    assert not cross.enable_ragged_verification
+    assert cross.ragged_verify_lens is None
+    assert metadata.enable_ragged_verification
+    assert metadata.ragged_verify_lens == [2, 4]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_contexts", [0, 1])
+def test_device_selected_windows_replace_the_host_split(monkeypatch,
+                                                        num_contexts):
+    """Device re-ranking moves a token between requests; the rows follow."""
+    metadata, context, kv_lens = _prepare_ragged_rows(monkeypatch, num_contexts)
+    view = metadata.token_major_gen_view()
+    metadata._seq_lens_cuda = metadata._seq_lens.clone()
+
+    # The host split verified 2 and 4 tokens; the device ranks 3 and 3.
+    metadata.apply_device_ragged_layout(
+        verify_lens=torch.tensor([3, 3], dtype=torch.int32),
+        req_idx=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+        kv_correction=torch.tensor([-2, -1, 0, -2, -1, 0], dtype=torch.int32),
+    )
+    metadata.kv_lens_cuda = kv_lens.clone()
+    metadata.kv_lens_cuda[num_contexts:] += torch.tensor([1, -1],
+                                                         dtype=torch.int32)
+    metadata.on_update_kv_lens()
+
+    assert metadata.seq_lens_cuda.tolist() == context + [3, 3]
+    rows = [101, 102, 103, 201, 202, 203]
+    assert metadata.ragged_row_kv_lens(6).tolist() == rows
+    assert view.sequence_length.tolist() == context + rows
+    row_requests = (list(range(num_contexts)) + [num_contexts] * 3 +
+                    [num_contexts + 1] * 3)
+    assert metadata.attn_row_req_idx_cuda[:view.num_rows].tolist(
+    ) == row_requests
+    assert torch.equal(view.kv_cache_block_offsets,
+                       metadata.kv_cache_block_offsets[:, row_requests])
+
+
+@pytest.mark.cpu_only
+def test_device_window_mode_bounds_the_host_kv_extents(monkeypatch):
+    """Until the device picks the windows, the host assumes the widest one."""
+    metadata = _ragged_metadata(monkeypatch, [3, 2, 4], 1, [2, 4])
+    metadata._seq_lens_kv = None
+    metadata.kv_lens = torch.tensor([3, 102, 204], dtype=torch.int32)
+    kv_lens = metadata.kv_lens.clone()
+
+    # Host-selected windows are final: the lengths pass through untouched.
+    assert metadata._prepare_device_window_kv_lens(kv_lens) is kv_lens
+
+    metadata.device_windows_mode = True
+    bounded = metadata._prepare_device_window_kv_lens(kv_lens)
+    # The anchor and all 5 drafts for a generation request; context unchanged.
+    assert bounded.tolist() == [3, 106, 206]
+    assert kv_lens.tolist() == [3, 102, 204]
+    assert metadata.kv_lens.tolist() == [3, 106, 206]
+
+
+@pytest.mark.cpu_only
+def test_device_selected_windows_need_a_ragged_step(monkeypatch):
+    """A uniform step has no rows for the device to re-rank."""
+    metadata = _ragged_metadata(monkeypatch, [2, 4], 0, None)
+    with pytest.raises(RuntimeError,
+                       match="requires enabled ragged verification"):
+        metadata.apply_device_ragged_layout(torch.tensor([2]),
+                                            torch.tensor([0, 0]),
+                                            torch.tensor([-1, 0]))
 
 
 @pytest.mark.cpu_only

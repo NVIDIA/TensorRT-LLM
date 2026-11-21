@@ -6999,6 +6999,7 @@ class TestDSparkConfidenceScheduling:
             guided_decoding_backend=None,
             enable_lora=False,
             lora_config=None,
+            enable_locality_domains=False,
             sparse_attention_config=None,
             pipeline_parallel_size=1,
             context_parallel_size=1,
@@ -7006,12 +7007,11 @@ class TestDSparkConfidenceScheduling:
         values.update(overrides)
         return SimpleNamespace(**values)
 
-    def test_confidence_environment_rejects_standalone_dspark(self):
+    def test_confidence_environment_accepts_standalone_dspark(self):
+        # Whether the target is validated for it is the model loader's check.
         environment = self._environment(speculative_config=SimpleNamespace(
             draft_is_embedded_in_target=False))
-        with pytest.raises(ValueError,
-                           match="only the embedded DeepSeek-V4 draft"):
-            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+        TorchLlmArgs._validate_dspark_confidence_environment(environment)
 
     @pytest.mark.parametrize(
         ("overrides", "message"),
@@ -7031,6 +7031,9 @@ class TestDSparkConfidenceScheduling:
             ({
                 "enable_lora": True
             }, "does not yet support LoRA"),
+            ({
+                "enable_locality_domains": True
+            }, "does not yet support locality domains"),
             ({
                 "pipeline_parallel_size": 2
             }, "does not yet support pipeline parallelism"),

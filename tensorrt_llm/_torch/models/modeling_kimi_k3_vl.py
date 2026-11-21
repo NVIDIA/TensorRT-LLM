@@ -472,6 +472,15 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
 
     @classmethod
+    def supports_ragged_verification(cls, model_config: ModelConfig[PretrainedConfig]) -> bool:
+        """Validated with the standalone DSpark drafter.
+
+        Declared on this wrapper rather than on the text backbone, so a target that
+        subclasses the backbone and brings its own speculative worker does not inherit it.
+        """
+        return True
+
+    @classmethod
     def get_recurrent_state_spec(
         cls,
         pretrained_config: Any,

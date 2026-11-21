@@ -137,6 +137,7 @@ from .modeling_speculative import (
     _draft_moe_selection,
     _mxfp4_run_quant_config,
     build_markov_head,
+    markov_prev_embeddings,
 )
 from .modeling_utils import (
     DecoderModel,
@@ -4113,11 +4114,16 @@ class _DSparkHeadMixin:
     confidence head. The block decode has nothing in common between the shapes,
     which is why this is a mixin and not a base class.
 
-    Confidence-scheduled verification is not implemented yet: ``confidence_proj``
-    is loaded but unused, and drafting always proposes the full K tokens.
+    Drafting always proposes the full K tokens. The confidence head only scores
+    them (:meth:`draft_confidence_logits`) for the verification scheduler.
     """
 
-    def _init_dspark_heads(self, cfg) -> None:
+    def _init_dspark_heads(
+        self,
+        cfg,
+        spec_max_draft_len: Optional[int] = None,
+        spec_confidence_scheduling: bool = False,
+    ) -> None:
         # Defaults on, unlike the DFlash base: the shift_label slot layout is
         # part of what DSpark *is*, and both published drafters set
         # block_size == max_draft_len, where the DFlash layout (slots 1..K)
@@ -4140,8 +4146,14 @@ class _DSparkHeadMixin:
         # consumers treat None as "head absent".
         self.markov_w1 = None  # [vocab, rank] (nn.Embedding weight layout)
         self.markov_w2 = None  # [vocab, rank] (nn.Linear(rank->vocab) weight)
-        self.confidence_proj_weight = None  # loaded, unused (follow-up MR)
-        self.confidence_proj_bias = None
+        # Built by load_weights() from ``confidence_proj``, whose width says
+        # whether the head also reads the Markov embedding. It scores the
+        # speculative config's ``max_draft_len`` positions; a drafter config
+        # need not declare a block size.
+        self.confidence_head: Optional[DSparkConfidenceHead] = None
+        self._dspark_max_draft_len = spec_max_draft_len
+        # Whether the verification scheduler reads the head; drafting never does.
+        self._dspark_confidence_scheduling = bool(spec_confidence_scheduling)
 
         if self._dspark_markov_rank > 0 and self._dspark_markov_head_type != "vanilla":
             raise ValueError(
@@ -4158,17 +4170,70 @@ class _DSparkHeadMixin:
                 "DSpark drafter sets causal=true; the block decode only "
                 "supports the non-causal DSpark convention."
             )
-        if self._dspark_use_confidence_head:
-            logger.warning(
-                "DSpark drafter declares use_confidence_head; "
-                "confidence-scheduled verification is not implemented yet "
-                "(confidence_proj weights are loaded but unused, drafting "
-                "always proposes the full K tokens)."
-            )
 
     @property
     def has_markov_head(self) -> bool:
         return self._dspark_markov_rank > 0 and self.markov_w1 is not None
+
+    def draft_confidence_logits(
+        self,
+        block_hidden: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Raw per-position confidence logits ``[num_gens, K]`` of one drafted block.
+
+        ``block_hidden`` is the drafter's output hidden state at the K draft
+        slots (``[num_gens, K, hidden]``). A head trained with the Markov
+        feature also reads ``markov_w1`` of each position's previous token: the
+        anchor ``first_prev_tokens`` (``[num_gens]``) for position 0, then the
+        drafts ``draft_tokens`` (``[num_gens, K]``).
+        """
+        head = self.confidence_head
+        if not head.with_markov:
+            return head(block_hidden)
+        prev_tokens = torch.cat([first_prev_tokens.view(-1, 1), draft_tokens[:, :-1]], dim=1)
+        return head(
+            block_hidden, prev_embeddings=markov_prev_embeddings(prev_tokens, self.markov_w1)
+        )
+
+    def _build_confidence_head(
+        self, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> Optional[DSparkConfidenceHead]:
+        """The confidence head for a checkpoint's ``confidence_proj`` tensors.
+
+        A projection width it does not know is an error under confidence scheduling,
+        which would score drafts with the head, and builds no head (None) otherwise.
+        """
+        hidden_size = self.config.hidden_size
+        with_markov = self.has_markov_head and (
+            weight.shape[-1] == hidden_size + self._dspark_markov_rank
+        )
+        if not with_markov and weight.shape[-1] != hidden_size:
+            mismatch = (
+                f"DSpark confidence_proj.weight has shape {tuple(weight.shape)}; expected "
+                f"[1, hidden_size] = [1, {hidden_size}], or [1, hidden_size + markov_rank] = "
+                f"[1, {hidden_size + self._dspark_markov_rank}] with a Markov head."
+            )
+            if self._dspark_confidence_scheduling:
+                raise ValueError(
+                    f"{mismatch} Confidence scheduling cannot score drafts with it; set "
+                    "speculative_config.enable_confidence_scheduling=False"
+                )
+            logger.warning(f"{mismatch} The confidence head is not built.")
+            return None
+        head = DSparkConfidenceHead(
+            hidden_size=hidden_size,
+            markov_rank=self._dspark_markov_rank,
+            with_markov=with_markov,
+            bias=bias is not None,
+            block_size=self._dspark_max_draft_len or self.block_size or 0,
+        )
+        head_weights = {"proj.weight": weight}
+        if bias is not None:
+            head_weights["proj.bias"] = bias
+        head.load_weights([head_weights])
+        return head.to("cuda")
 
     def apply_markov_chain_logits(
         self,
@@ -4236,9 +4301,10 @@ class _DSparkHeadMixin:
             self.markov_w1 = dspark_weights["markov_w1.weight"].to("cuda")
             self.markov_w2 = dspark_weights["markov_w2.weight"].to("cuda")
         if "confidence_proj.weight" in dspark_weights:
-            self.confidence_proj_weight = dspark_weights["confidence_proj.weight"].to("cuda")
-        if "confidence_proj.bias" in dspark_weights:
-            self.confidence_proj_bias = dspark_weights["confidence_proj.bias"].to("cuda")
+            self.confidence_head = self._build_confidence_head(
+                dspark_weights["confidence_proj.weight"],
+                dspark_weights.get("confidence_proj.bias"),
+            )
         return weights, dspark_weights
 
 
@@ -4271,6 +4337,8 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         *,
         dflash_attention_backend: str = "AUTO",
         spec_mask_token_id: Optional[int] = None,
+        spec_max_draft_len: Optional[int] = None,
+        spec_confidence_scheduling: bool = False,
     ):
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
         # The worker embeds the speculative config's mask id when it has one, and that config also reads keys the
@@ -4282,7 +4350,9 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 f"(the drafter config resolves {self.mask_token_id})."
             )
             self.mask_token_id = int(spec_mask_token_id)
-        self._init_dspark_heads(draft_config.pretrained_config)
+        self._init_dspark_heads(
+            draft_config.pretrained_config, spec_max_draft_len, spec_confidence_scheduling
+        )
 
     def _get_attention_mask_args(self, layer_idx):
         """DSpark block attention is non-causal on every layer.
@@ -4424,14 +4494,21 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # residual add and the RMSNorm after it.
     _tp_fusions = True
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
+    def __init__(
+        self,
+        draft_config,
+        *,
+        dflash_attention_backend: str = "AUTO",
+        spec_max_draft_len: Optional[int] = None,
+        spec_confidence_scheduling: bool = False,
+    ):
         cfg = draft_config.pretrained_config
         # Pin the backbone instead of relying on the model_type-derived name
         # (the Laguna precedent in modeling_dflash.py): the checkpoint labels
         # itself "K3DSparkModel", which is registered nowhere.
         cfg.architectures = ["K3DsparkForCausalLM"]
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
-        self._init_dspark_heads(cfg)
+        self._init_dspark_heads(cfg, spec_max_draft_len, spec_confidence_scheduling)
 
         attn0 = self.model.layers[0].self_attn
         self.qk_nope_head_dim = attn0.qk_nope_head_dim
@@ -5454,14 +5531,19 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
         return MLADSparkForCausalLM(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,
+            spec_max_draft_len=model_config.spec_config.max_draft_len,
+            spec_confidence_scheduling=model_config.spec_config.enable_confidence_scheduling,
         )
     else:
         drafter_cls = GQADSparkForCausalLM
-    # The drafter's own ModelConfig has no spec_config, so the worker's mask id is handed over here.
+    # The drafter's own ModelConfig has no spec_config, so the worker's mask id,
+    # draft length and use of the confidence head are handed over here.
     return drafter_cls(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
         spec_mask_token_id=model_config.spec_config.mask_token_id,
+        spec_max_draft_len=model_config.spec_config.max_draft_len,
+        spec_confidence_scheduling=model_config.spec_config.enable_confidence_scheduling,
     )
 
 

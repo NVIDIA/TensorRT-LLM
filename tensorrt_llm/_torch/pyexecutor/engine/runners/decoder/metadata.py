@@ -213,6 +213,10 @@ class DecoderMetadata:
             return
 
         metadata = getattr(self, "attn_metadata", None)
+        if not getattr(metadata, "needs_ragged_compressor_warmup", True):
+            # Dense metadata has no KV compressor, so no such helpers to compile. Metadata
+            # that does not say so is held to the contract below.
+            return
         required_attributes = (
             "_compute_compressed_mask",
             "_compute_gen_compressed_position_ids",

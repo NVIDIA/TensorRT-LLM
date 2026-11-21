@@ -96,9 +96,19 @@ def build_attention_metadata(
         from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
             DSAtrtllmAttentionMetadata,
         )
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-        if not issubclass(attention_backend.Metadata, DSAtrtllmAttentionMetadata):
-            raise ValueError("Ragged verification requires the DSA target metadata backend")
+        # Metadata that implements the ragged rows: the dense TRTLLM metadata itself and
+        # the DSA metadata. Other subclasses lay out their own rows. Whether the target is
+        # validated is the model's own declaration, which the model loader checks.
+        metadata_type = attention_backend.Metadata
+        if metadata_type is not TrtllmAttentionMetadata and not issubclass(
+            metadata_type, DSAtrtllmAttentionMetadata
+        ):
+            raise ValueError(
+                "Ragged verification requires the dense TRTLLM or the DSA target metadata "
+                f"backend; got {metadata_type.__name__}"
+            )
         metadata_kwargs["enable_ragged_verification"] = True
     return attention_backend.Metadata(
         max_num_requests=max_batch_size,
