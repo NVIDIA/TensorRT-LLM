@@ -614,6 +614,8 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
             static_cast<void*>(comm), size);
         return NCCLWindowBuffer();
     }
+    // Recorded whatever the outcome below: every rank makes this request.
+    mBufferRequested.store(true);
 
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
@@ -1033,6 +1035,48 @@ void NCCLWindowAllocator::endTensorLeaseScope(std::vector<c10::StorageImpl const
     }
 }
 
+void NCCLWindowAllocator::releaseTensorLeaseScopeLeases(
+    std::vector<c10::StorageImpl const*> const& keptStorages, int device, cudaStream_t stream)
+{
+    std::unordered_set<c10::StorageImpl const*> const kept(keptStorages.begin(), keptStorages.end());
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const stackIt = mTensorLeaseScopeStacks.find(getTensorLeaseScopeKey(device));
+    if (stackIt == mTensorLeaseScopeStacks.end() || stackIt->second.empty())
+    {
+        static std::once_flag noScopeWarning;
+        std::call_once(noScopeWarning,
+            []
+            {
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] No NCCL window tensor lease scope is open on this thread, so no lease is released. "
+                    "Window tensors created outside a scope stay leased until their destructors quarantine their "
+                    "buffers. Run eager models inside nccl_window_tensor_scope.");
+            });
+        return;
+    }
+    auto& scope = stackIt->second.back();
+    for (auto storageIt = scope.storages.begin(); storageIt != scope.storages.end();)
+    {
+        if (kept.find(*storageIt) != kept.end())
+        {
+            ++storageIt;
+            continue;
+        }
+        auto const leaseIt = mTensorLeases.find(*storageIt);
+        TLLM_CHECK_WITH_INFO(leaseIt != mTensorLeases.end(), "NCCL window tensor scope contains an unknown storage");
+        auto const releasedLease = leaseIt->second;
+        mTensorLeases.erase(leaseIt);
+        storageIt = scope.storages.erase(storageIt);
+        releaseTensorLeaseLocked(releasedLease, stream);
+    }
+    for (auto const& detachedLease : scope.detachedLeases)
+    {
+        releaseTensorLeaseLocked(detachedLease, stream);
+    }
+    scope.detachedLeases.clear();
+}
+
 bool NCCLWindowAllocator::releaseTensorBuffer(ncclComm_t comm, c10::StorageImpl const* storage, cudaStream_t stream)
 {
     if (!comm || !storage)
@@ -1236,6 +1280,11 @@ size_t NCCLWindowAllocator::getBufferCount(ncclComm_t comm) const
     std::lock_guard<std::mutex> lock(mMutex);
     auto commIt = mBufferPool.find(comm);
     return commIt != mBufferPool.end() ? commIt->second.size() : 0;
+}
+
+bool NCCLWindowAllocator::hasRequestedBuffers() const noexcept
+{
+    return mBufferRequested.load();
 }
 
 size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const
