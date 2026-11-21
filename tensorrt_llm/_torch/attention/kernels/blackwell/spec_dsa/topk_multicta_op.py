@@ -36,8 +36,8 @@ us more (rare on real logits: none of 630 captured rows) and a batch is as slow 
 Contract: ``logits`` float32 [B, npad] with unit column stride, a row stride that is a multiple of 128 floats (the
 logits arena of the indexer kernel has 2**18) and a 16-byte aligned base, ``ctx_lens`` at most ``npad`` (the lengths
 the logits kernel was given); ``topk`` int32 [B, 512] contiguous; ``ctx_lens`` int32 [B]; all on one CUDA device. B
-is 1 to 26 rows (the batch sizes of the tail attention): a cluster of 8 / 6 / 5 / 4 CTAs serves a row for 1-12 /
-13-16 / 17-24 / 25-26 rows, and the clusters of a launch have to fit one wave of co-resident clusters on the 148 SMs.
+is 1 to 26 rows (the batch sizes of the tail attention): a cluster of 8 / 6 / 5 / 4 CTAs serves a row for 1-15 /
+16 / 17-24 / 25-26 rows, and the clusters of a launch have to fit one wave of co-resident clusters on the 148 SMs.
 The kernel reads the logits only, so both indexer K dtypes are served (``config``: either supported spec, default
 DS-V4-Flash). ``topk`` must not alias an input.
 """
@@ -63,8 +63,9 @@ __all__ = [
 
 # (largest batch size, CTAs per row): the clusters of one launch (one CTA per SM, ~170 KB of shared memory each) have to
 # co-reside in one wave. A B200 holds (measured) 15 clusters of 8 CTAs, 22 of 6, 26 of 5 and 33 of 4; these sizes put
-# 96, 96, 120 and 104 CTAs at the largest batch of each.
-_CLUSTER_LIMITS = ((12, 8), (16, 6), (24, 5), (26, 4))
+# 120, 96, 120 and 104 CTAs at the largest batch of each. The sizes are the fastest ones behind the tail attention's
+# programmatic launch (nsys, 1M-token captures: 8 CTAs beat 6 at 13 to 15 rows by 0.5 to 1.2 us).
+_CLUSTER_LIMITS = ((15, 8), (16, 6), (24, 5), (26, 4))
 MAX_BATCH = _CLUSTER_LIMITS[-1][0]
 # Compressed positions per row from which the kernel is faster than the production top-K (see the module docstring).
 MIN_PROFITABLE_ROW_LEN = 16384

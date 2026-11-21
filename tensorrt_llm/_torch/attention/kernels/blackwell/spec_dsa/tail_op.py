@@ -26,7 +26,7 @@ launch: behind the multi-CTA top-K of ``topk_multicta_op`` (which triggers the l
 ``run(trigger=True)``) the CTAs of the tail attention start while that kernel ranks the crossing bin: 0.5 us less
 per hybrid step on average over 9 to 24 rows (B200, nsys: 0.0 to 1.4 us at 15 of the 16 sizes, +0.15 us at one);
 behind a top-K kernel that never triggers early (the production one) the attribute only costs 0.7 to 0.8 us, so
-``pdl`` stays off there.
+``pdl`` stays off there. ``run_hybrid`` uses it by default up to ``PDL_MAX_BATCH`` rows (``default_pdl``).
 
 The kernel reads neither the indexer nor its K cache, so it is the same for the specs with an FP8 and an MXFP4 indexer
 K cache: one compile per device serves both, and ``config`` (default: DS-V4-Flash) only has to be a supported spec.
@@ -48,7 +48,9 @@ from . import topk_multicta_op
 from .config import SpecDsaConfig, check_device, supported_spec
 
 __all__ = [
+    "PDL_MAX_BATCH",
     "TAIL_MAX_BATCH",
+    "default_pdl",
     "is_batch_size_supported",
     "is_supported",
     "precompile",
@@ -56,6 +58,12 @@ __all__ = [
     "run_hybrid",
     "tail_cluster_size",
 ]
+
+# Largest batch size for which ``run_hybrid`` launches the tail attention programmatically by default: its clusters
+# start while the multi-CTA top-K ranks its crossing bin and hide their prologue (nsys, 1M-token captures: 0.5 to 1.8 us
+# at 9 to 24 rows). At 25 and 26 rows the 26 clusters that fit one wave are all but full: the early launch is equal
+# at 25 rows and costs ~3 us at 26 rows, the plain launches are used.
+PDL_MAX_BATCH = 24
 
 # (largest batch size, CTAs per row): the co-resident clusters of a 148-SM B200 at one CTA per SM (measured) are 26
 # clusters of 5. Clusters of 4 / 3 would fit 33 / 45 rows but win nothing over the large-batch kernels there and leave
@@ -65,6 +73,14 @@ TAIL_MAX_BATCH = _CLUSTER_LIMITS[-1][0]
 
 _lock = threading.Lock()
 _compiled: dict[tuple, object] = {}
+
+
+def default_pdl(batch_size: int) -> bool:
+    """Whether ``run_hybrid`` launches the tail attention programmatically by default (with the multi-CTA top-K) for
+    ``batch_size`` rows: up to ``PDL_MAX_BATCH``. Precompile both kernels with this value
+    (``precompile(..., pdl=default_pdl(b))``, ``topk_multicta_op.precompile(..., trigger=default_pdl(b))``) before a
+    CUDA-graph capture of ``run_hybrid`` with the default."""
+    return batch_size <= PDL_MAX_BATCH
 
 
 def tail_cluster_size(batch_size: int) -> int | None:
@@ -296,10 +312,11 @@ def run_hybrid(
     ask it with the host lengths of the step); keep the production top-K as ``topk_fn`` for the other batches. Compile
     both kernels (``precompile`` here and ``topk_multicta_op.precompile``) before a CUDA-graph capture.
 
-    ``pdl`` (default: on with the multi-CTA top-K, off with a ``topk_fn``): the multi-CTA top-K triggers the dependent
-    launch after its stream phase and the tail attention is launched with the programmatic attribute, so that its
-    prologue overlaps the end of the top-K kernel (the results are the same). Precompile both kernels with the same
-    value (``topk_multicta_op.precompile(..., trigger=pdl)``, ``precompile(..., pdl=pdl)``) before a CUDA-graph capture.
+    ``pdl`` (default: on with the multi-CTA top-K up to ``PDL_MAX_BATCH`` rows, off with a ``topk_fn`` and above): the
+    multi-CTA top-K triggers the dependent launch after its stream phase and the tail attention is launched with the
+    programmatic attribute, so that its prologue overlaps the end of the top-K kernel (the results are the same).
+    Precompile both kernels with the same value (``topk_multicta_op.precompile(..., trigger=pdl)``,
+    ``precompile(..., pdl=pdl)``; ``default_pdl(batch_size)`` is the default) before a CUDA-graph capture.
     ``pdl=True`` with a ``topk_fn`` raises ValueError.
 
     The arguments of the tail attention and ``config`` are those of ``run_attention``.
@@ -311,7 +328,7 @@ def run_hybrid(
             "pdl needs the multi-CTA top-K (topk_fn=None): a top-K kernel that never triggers early only loses time"
         )
     if pdl is None:
-        pdl = topk_fn is None
+        pdl = topk_fn is None and default_pdl(int(topk.shape[0]))
     logits = k1_logits_fn()
     if topk_fn is None:
         topk_multicta_op.run(logits, topk, ctx_lens, config=config, trigger=pdl)
