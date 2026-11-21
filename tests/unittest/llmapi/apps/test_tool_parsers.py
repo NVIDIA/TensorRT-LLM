@@ -1096,6 +1096,64 @@ class TestKimiK2StreamingMatchesWholeTextParse:
         assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
+def _render_qwen3_tool_call(tools, name, arguments):
+    """Return the tool call Qwen3-8B's chat template writes for one call.
+
+    Renders ``data/qwen3_chat_template.jinja`` with the Jinja settings that
+    ``transformers`` uses for chat templates, and returns the assistant's
+    text after the empty think block and before ``<|im_end|>``.
+    """
+    from pathlib import Path
+
+    from jinja2.ext import loopcontrols
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    def tojson(value,
+               ensure_ascii=False,
+               indent=None,
+               separators=None,
+               sort_keys=False):
+        # transformers' ``tojson``: keeps key order and does not escape HTML.
+        return json.dumps(value,
+                          ensure_ascii=ensure_ascii,
+                          indent=indent,
+                          separators=separators,
+                          sort_keys=sort_keys)
+
+    env = ImmutableSandboxedEnvironment(trim_blocks=True,
+                                        lstrip_blocks=True,
+                                        extensions=[loopcontrols])
+    env.filters["tojson"] = tojson
+    template = env.from_string(
+        (Path(__file__).parent / "data" /
+         "qwen3_chat_template.jinja").read_text(encoding="utf-8"))
+    rendered = template.render(
+        messages=[{
+            "role": "user",
+            "content": "Call a tool."
+        }, {
+            "role":
+            "assistant",
+            "content":
+            "",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }]
+        }],
+        tools=[tool.model_dump(exclude_none=True) for tool in tools],
+        add_generation_prompt=False,
+        enable_thinking=False)
+    output = rendered.rsplit("<|im_start|>assistant\n",
+                             1)[1].split("<|im_end|>", 1)[0]
+    think = "<think>\n\n</think>\n\n"
+    assert output.startswith(think)
+    return output[len(think):]
+
+
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
 
@@ -1222,9 +1280,24 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         info = func("test_function")
 
         assert isinstance(info, StructureInfo)
-        assert info.begin == '<tool_call>\n{"name":"test_function", "arguments":'
+        assert info.begin == '<tool_call>\n{"name": "test_function", "arguments": '
         assert info.end == "}\n</tool_call>"
         assert info.trigger == "<tool_call>"
+
+    def test_structure_info_matches_chat_template(self, sample_tools):
+        """The tag's begin + arguments + end must match Qwen3's chat template.
+
+        The strict-tools structural tag forces ``begin`` verbatim, so any
+        difference from the call the chat template writes forces the model
+        off the format it was trained on.
+        """
+        info = Qwen3ToolParser().structure_info()("get_weather")
+        arguments = {"location": "Tokyo", "unit": "celsius"}
+
+        template_call = _render_qwen3_tool_call(sample_tools, "get_weather",
+                                                arguments)
+
+        assert info.begin + json.dumps(arguments) + info.end == template_call
 
     def test_structure_info_different_names(self):
         """Test structure_info works with different function names."""
@@ -1242,7 +1315,7 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         """Test that Qwen3ToolParser follows the documented format structure."""
 
         # Test the exact format from the docstring
-        text = '<tool_call>\n{"name":"get_weather", "arguments":{"location":"Tokyo"}}\n</tool_call>'
+        text = '<tool_call>\n{"name": "get_weather", "arguments": {"location": "Tokyo"}}\n</tool_call>'
 
         result = parser.detect_and_parse(text, sample_tools)
 
@@ -5918,6 +5991,56 @@ class TestBuildToolStrictGuidedDecoding:
         assert tag["content"]["json_schema"]["properties"]["location"][
             "type"] == "string"
 
+    @pytest.fixture
+    def strict_tools(self, sample_tools):
+        for tool in sample_tools:
+            tool.function.strict = True
+        return sample_tools
+
+    @staticmethod
+    def _qwen3_strict_matcher(tools):
+        """Compile the qwen3 strict-tools grammar on a byte-level vocab."""
+        import xgrammar
+
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        tokenizer = xgrammar.TokenizerInfo([bytes([i])
+                                            for i in range(256)] + [b"<EOS>"],
+                                           stop_token_ids=[256])
+        compiler = xgrammar.GrammarCompiler(tokenizer)
+        return xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(result.structural_tag))
+
+    @pytest.mark.parametrize("name,arguments", [
+        ("get_weather", {
+            "location": "Tokyo",
+            "unit": "celsius"
+        }),
+        ("search_web", {
+            "query": "weather in Tokyo"
+        }),
+    ])
+    def test_qwen3_strict_grammar_matches_template_call(self, strict_tools,
+                                                        name, arguments):
+        """The strict grammar must accept the call Qwen3's template writes.
+
+        The same call without the spaces after ``"name":`` and
+        ``"arguments":`` must be rejected.
+        """
+        call = _render_qwen3_tool_call(strict_tools, name, arguments)
+        unspaced = call.replace('{"name": "',
+                                '{"name":"').replace('"arguments": ',
+                                                     '"arguments":')
+
+        matcher = self._qwen3_strict_matcher(strict_tools)
+        assert matcher.accept_string(call)
+        assert matcher.accept_token(256)
+        assert matcher.is_terminated()
+        assert not self._qwen3_strict_matcher(strict_tools).accept_string(
+            unspaced)
+
     def test_mixed_strict_and_non_strict(self):
         """Should constrain strict tools and allow any text for non-strict."""
         from tensorrt_llm.serve.openai_server import \
@@ -6092,16 +6215,32 @@ class TestBuildForcedToolCallDecoding:
         begin_prefix, guided = _build_forced_tool_call_decoding(
             tools, parser_name, "get_weather")
 
-        # ``begin_prefix`` is exactly the parser's tool-call begin string.
+        # ``begin_prefix`` is the parser's tool-call begin string, without
+        # trailing spaces.
         parser = ToolParserFactory.parsers[parser_name.lower()]()
         expected_begin = parser.structure_info()("get_weather").begin
-        assert begin_prefix == expected_begin
+        assert begin_prefix == expected_begin.rstrip(" ")
         assert "get_weather" in begin_prefix
 
         assert isinstance(guided, GuidedDecodingParams)
         assert guided.json == _SCHEMA_LOCATION
         assert guided.json_object is False
         assert guided.structural_tag is None
+
+    def test_forced_prefix_has_no_trailing_space(self):
+        """The prompt prefix must not end in a space.
+
+        The JSON grammar that follows the prefix does not accept leading
+        whitespace, so a trailing space in the prompt would be a lone token
+        the model never sees in its chat template's output.
+        """
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        begin_prefix, _ = _build_forced_tool_call_decoding(
+            tools, "qwen3", "get_weather")
+        assert begin_prefix == '<tool_call>\n{"name": "get_weather", "arguments":'
 
     def test_forced_name_no_parameters_uses_json_object(self):
         """Forced-name path falls back to ``json_object`` when no schema.
