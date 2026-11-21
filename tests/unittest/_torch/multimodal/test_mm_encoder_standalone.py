@@ -278,6 +278,60 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         f"got {num_duplicates}. Offsets: {mm_keys_offsets}")
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_attached_embeddings_reuse_only_identical_embeddings() -> None:
+    """Prompts that differ only in their attached image embeddings must not
+    share image KV blocks, while an identical request still reuses them."""
+    with open(_QWEN_3_VL_DIR / "config.json") as f:
+        config = json.load(f)
+    # Random rows stand in for encoder output: the prompt layout depends only
+    # on their shape, and the two images differ only in content.
+    width = config["text_config"]["hidden_size"] * (
+        1 + len(config["vision_config"]["deepstack_visual_indexes"]))
+    generator = torch.Generator().manual_seed(0)
+    embeddings = [
+        torch.randn(256, width, generator=generator).to(torch.bfloat16).cuda()
+        for _ in range(2)
+    ]
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=0.2,
+        use_kv_cache_manager_v2=True,
+    )
+    with LLM(model=_QWEN_3_VL_DIR,
+             kv_cache_config=kv_cache_config,
+             max_batch_size=1) as llm:
+        first, second = _load_inputs(llm, ["Describe the image."] * 2,
+                                     media=None,
+                                     mm_embeddings=embeddings)
+        sampling_params = SamplingParams(max_tokens=16)
+        llm.generate([first], sampling_params=sampling_params)
+        second_after_first = llm.generate([second],
+                                          sampling_params=sampling_params)[0]
+        first_again = llm.generate([first], sampling_params=sampling_params)[0]
+        tokens_per_block = llm.args.kv_cache_config.tokens_per_block
+
+    prompt_token_ids = list(first_again.prompt_token_ids)
+    assert list(second_after_first.prompt_token_ids) == prompt_token_ids
+    first_image_token = prompt_token_ids.index(config["image_token_id"])
+    assert second_after_first.cached_tokens <= first_image_token
+    reusable_tokens = (len(prompt_token_ids) -
+                       1) // tokens_per_block * tokens_per_block
+    assert first_again.cached_tokens >= reusable_tokens
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_attached_embedding_digest_does_not_depend_on_device(
+        dtype: torch.dtype) -> None:
+    """A CUDA embedding hashes through a host copy to the CPU digest."""
+    embedding = torch.arange(24, dtype=torch.float32).reshape(4, 6).to(dtype)
+
+    on_cuda = apply_mm_hashes({"image": [embedding.cuda()]}).hashes
+    on_cpu = apply_mm_hashes({"image": [embedding]}).hashes
+
+    assert on_cuda == on_cpu
+
+
 @pytest.fixture(
     scope="module",
     params=[

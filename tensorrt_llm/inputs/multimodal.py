@@ -11,6 +11,7 @@ Processor registration and encoder execution live outside this module.
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import partial
 from itertools import accumulate
 from operator import itemgetter
 from typing import (Any, Container, Dict, Hashable, List, NamedTuple, Optional,
@@ -28,6 +29,13 @@ from tensorrt_llm.logger import logger
 
 # Default hasher
 default_hasher = blake3
+# Attached embeddings are MiB-sized, so each one is hashed on its own pool of a
+# few threads. A fixed thread count builds the pool per hasher; BLAKE3's AUTO
+# mode would share one global pool, which hangs a child forked after it started.
+# The digest does not depend on the thread count.
+_ATTACHED_EMBEDDING_HASH_THREADS = 4
+attached_embedding_hasher = partial(
+    blake3, max_threads=_ATTACHED_EMBEDDING_HASH_THREADS)
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
@@ -975,8 +983,8 @@ class MultimodalParams:
         Each entry is a tensor of shape ``[output_rows, feature_size]`` or its
         shared-tensor handle. Item output lengths describe those rows; prompt
         lengths also count model-specific MM framing tokens. Hashes enable
-        the C++ KV-cache representation. Without hashes, only the processed
-        data is retained, as for external embeddings without KV-cache reuse.
+        the C++ KV-cache representation; without them only the processed
+        data is retained.
         """
         item_metadata.validate()
         embedding_lengths = item_metadata.output_embedding_lengths

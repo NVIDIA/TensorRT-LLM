@@ -33,7 +33,9 @@ from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -1471,9 +1473,17 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
         # positions via ``torch.isin(input_ids, mm_token_ids)`` without the
         # legacy ``vocab_size + 1`` remap.
         # Concatenate all multimodal embeddings
-        multimodal_data = {}
-        multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings,
-                                                            dim=0)
+        multimodal_data = {
+            "multimodal_embedding":
+            torch.cat(mm_embeddings, dim=0),
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(mm_embeddings))],
+                output_embedding_lengths=[
+                    len(embedding) for embedding in mm_embeddings
+                ],
+            ),
+        }
         return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
