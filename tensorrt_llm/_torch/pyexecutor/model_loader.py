@@ -397,6 +397,28 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             f"attn_backend='{model_config.attn_backend}'.")
 
 
+def release_localized_moe_weights(model: torch.nn.Module) -> None:
+    """Unmap every die-local MoE weight bank (MEGAMOE_UGPU_LAYOUT) under ``model``.
+
+    The banks are driver mappings outside PyTorch's allocator, so dropping the
+    model does not free them. Call only once no CUDA graph can replay them.
+    """
+    errors = []
+    for module in model.modules():
+        release = getattr(module, "release_ugpu_localized_weights", None)
+        if release is not None:
+            # Keep going: a module that fails must not strand the banks after it.
+            try:
+                release()
+            except Exception as error:  # noqa: BLE001 - re-raised below
+                errors.append(error)
+    for error in errors[1:]:
+        logger.error(
+            f"Releasing a localized MoE weight bank also failed: {error!r}")
+    if errors:
+        raise errors[0]
+
+
 def validate_lm_head_output_dtype(model: torch.nn.Module,
                                   requested_dtype: str) -> None:
     """Reject an explicit output dtype that the constructed LM heads ignore."""
@@ -1441,22 +1463,39 @@ class ModelLoader:
         self._metrics = {}
         # Directories _timed_load read checkpoint files from.
         self._checkpoint_dirs_read: list[str] = []
-        with timing_metric(
-                ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
-                self._metrics):
-            model, moe_load_balancer = self._timed_load(checkpoint_dir,
-                                                        checkpoint_loader)
+        # Track the model until it is returned: localized MoE banks are driver
+        # mappings that outlive it, so any failure before then must release them.
+        self._model_in_load = None
+        try:
+            with timing_metric(
+                    ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
+                    self._metrics):
+                model, moe_load_balancer = self._timed_load(
+                    checkpoint_dir, checkpoint_loader)
 
-        release_seconds = _release_checkpoint_page_cache(
-            self._checkpoint_dirs_read)
-        if release_seconds is not None:
-            self._metrics[
-                _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
+            release_seconds = _release_checkpoint_page_cache(
+                self._checkpoint_dirs_read)
+            if release_seconds is not None:
+                self._metrics[
+                    _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
 
-        metrics = ", ".join(f"{name}={value:.4f}"
-                            for name, value in self._metrics.items())
-        logger.info(
-            f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+            metrics = ", ".join(f"{name}={value:.4f}"
+                                for name, value in self._metrics.items())
+            logger.info(
+                f"Model loading metrics for rank {self.mapping.rank}: {metrics}"
+            )
+        except BaseException:
+            if self._model_in_load is not None:
+                # The load error stays the one callers see.
+                try:
+                    release_localized_moe_weights(self._model_in_load)
+                except Exception as release_error:  # noqa: BLE001 - logged
+                    logger.error(
+                        "Releasing localized MoE weights after a failed "
+                        f"load also failed: {release_error!r}")
+            raise
+        finally:
+            self._model_in_load = None
         return model, moe_load_balancer
 
     def _timed_load(
@@ -1470,6 +1509,17 @@ class ModelLoader:
             checkpoint_dir, checkpoint_loader)
         load_format = self.llm_args.load_format
         gms_loading.check_gms_locality_domain_compat(load_format, config)
+        if os.environ.get("MEGAMOE_UGPU_LAYOUT", "none") != "none":
+            if load_format == LoadFormat.GMS:
+                raise ConfigInputError(
+                    "LoadFormat.GMS is incompatible with MEGAMOE_UGPU_LAYOUT. GMS "
+                    "moves parameters into its own mappings after loading, which "
+                    "would undo the die-local MegaMoE weight placement.")
+            if self.model_weights_memory_tag is not None:
+                raise ConfigInputError(
+                    "MEGAMOE_UGPU_LAYOUT is incompatible with sleep_config. The "
+                    "localized MegaMoE expert weights are mapped outside the model "
+                    "weights memory tag, so sleep would not release them.")
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
 
@@ -1486,6 +1536,8 @@ class ModelLoader:
             # model's config gets its own name.
             model, model_config, is_meta_init = memory_init.create_model_with_meta_tensors(
                 config)
+        # load() unmaps the model's localized MoE banks if loading fails after this.
+        self._model_in_load = model
 
         validate_lm_head_output_dtype(model, self.llm_args.lm_head_output_dtype)
 
