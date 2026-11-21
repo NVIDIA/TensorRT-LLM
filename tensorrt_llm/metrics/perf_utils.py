@@ -106,7 +106,13 @@ def process_req_perf_metrics(
 
     transfer_start = req_perf_metrics_dict.get(RequestEventTiming.KV_CACHE_TRANSFER_START, 0)
     transfer_end = req_perf_metrics_dict.get(RequestEventTiming.KV_CACHE_TRANSFER_END, 0)
-    if (
+    transfer_duration = req_perf_metrics_dict.get(
+        RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_DURATION
+    )
+    if transfer_duration is not None:
+        if transfer_duration > 0 and math.isfinite(transfer_duration):
+            stat[MetricNames.KV_CACHE_TRANSFER_TIME] = transfer_duration
+    elif (
         transfer_start > 0
         and transfer_end > transfer_start
         and math.isfinite(transfer_start)

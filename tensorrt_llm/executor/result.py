@@ -1583,6 +1583,11 @@ def _build_perf_metrics_dict(
                          "kv_cache_transfer_local_size", None)
     if local_size is not None:
         metrics[RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_SIZE] = local_size
+    local_duration = getattr(req_perf_metrics.timing_metrics,
+                             "kv_cache_transfer_local_duration", None)
+    if local_duration is not None:
+        metrics[RequestEventTiming.
+                KV_CACHE_TRANSFER_LOCAL_DURATION] = local_duration
     return metrics
 
 

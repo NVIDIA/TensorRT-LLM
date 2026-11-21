@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for KvCacheTransceiverV2._sync_transfer_timing."""
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
@@ -25,21 +26,29 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
 
+def _ms(value: int) -> timedelta:
+    return timedelta(milliseconds=value)
+
+
 class _FakeRequest:
     """Minimal stand-in for LlmRequest with timing getters/setters."""
 
     def __init__(self, rid: int, start: int, end: int, kv_size: int) -> None:
         self.request_id = rid
         self.py_disaggregated_params = None  # forces get_unique_rid -> request_id
-        self._start = start
-        self._end = end
+        self._start = _ms(start)
+        self._end = _ms(end)
         self._kv_cache_size = kv_size
         self.kv_cache_transfer_local_size = kv_size
+        self.local_duration = None
 
-    def get_kv_cache_transfer_start(self) -> int:
+    def set_kv_cache_transfer_local_duration(self, duration: float) -> None:
+        self.local_duration = duration
+
+    def get_kv_cache_transfer_start(self) -> timedelta:
         return self._start
 
-    def get_kv_cache_transfer_end(self) -> int:
+    def get_kv_cache_transfer_end(self) -> timedelta:
         return self._end
 
     @property
@@ -80,16 +89,26 @@ class TestSyncTransferTiming:
 
         def fake_allgather(local_data):
             # Simulate rank 0 = local_data, rank 1 = different timing
-            rank1_data = {1: (5, 25, 200)}
+            rank1_data = {1: (_ms(5), _ms(25), 200)}
             return [local_data, rank1_data]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
         summary = tc._sync_transfer_timing([req])
 
-        assert req._start == 10
-        assert req._end == 20
+        from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
+        from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
+
+        duration = (req._end - req._start).total_seconds()
+        assert duration == (0.02 if csv_enabled else 0.01)
+        perf = {
+            RequestEventTiming.KV_CACHE_TRANSFER_START: req._start.total_seconds(),
+            RequestEventTiming.KV_CACHE_TRANSFER_END: req._end.total_seconds(),
+        }
+        if req.local_duration is not None:
+            perf[RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_DURATION] = req.local_duration
+        assert process_req_perf_metrics(perf, 0)[MetricNames.KV_CACHE_TRANSFER_TIME] == 0.01
         assert req.kv_cache_size == 100
-        assert summary == {1: (5, 25, 300) if csv_enabled else (10, 20, 100)}
+        assert summary == {1: (_ms(5), _ms(25), 300) if csv_enabled else (_ms(10), _ms(20), 100)}
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
     def test_multiple_requests_batched(self) -> None:
@@ -99,37 +118,37 @@ class TestSyncTransferTiming:
 
         def fake_allgather(local_data):
             rank1_data = {
-                1: (8, 22, 150),
-                2: (28, 45, 250),
+                1: (_ms(8), _ms(22), 150),
+                2: (_ms(28), _ms(45), 250),
             }
             return [local_data, rank1_data]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
         summary = tc._sync_transfer_timing([req_a, req_b])
 
-        assert req_a._start == 10
-        assert req_a._end == 20
+        assert req_a._start == _ms(8)
+        assert req_a._end == _ms(22)
         assert req_a.kv_cache_size == 100
 
-        assert req_b._start == 30
-        assert req_b._end == 40
+        assert req_b._start == _ms(28)
+        assert req_b._end == _ms(45)
         assert req_b.kv_cache_size == 200
-        assert summary == {1: (8, 22, 250), 2: (28, 45, 450)}
+        assert summary == {1: (_ms(8), _ms(22), 250), 2: (_ms(28), _ms(45), 450)}
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
     def test_summary_is_available_on_each_rank(self) -> None:
         req = _FakeRequest(rid=1, start=10, end=20, kv_size=100)
 
         def fake_allgather(local_data):
-            return [local_data, {1: (5, 25, 200)}]
+            return [local_data, {1: (_ms(5), _ms(25), 200)}]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
         summary = tc._sync_transfer_timing([req])
 
-        assert req._start == 10
-        assert req._end == 20
+        assert req._start == _ms(5)
+        assert req._end == _ms(25)
         assert req.kv_cache_size == 100
-        assert summary == {1: (5, 25, 300)}
+        assert summary == {1: (_ms(5), _ms(25), 300)}
 
     @patch.dict("os.environ", {}, clear=False)
     def test_skips_when_no_env(self) -> None:
@@ -145,7 +164,7 @@ class TestSyncTransferTiming:
         tc._sync_transfer_timing([req])
 
         allgather_mock.assert_not_called()
-        assert req._start == 10  # unchanged
+        assert req._start == _ms(10)
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
     def test_skips_when_single_rank(self) -> None:
@@ -157,7 +176,7 @@ class TestSyncTransferTiming:
         tc._sync_transfer_timing([req])
 
         allgather_mock.assert_not_called()
-        assert req._start == 10  # unchanged
+        assert req._start == _ms(10)
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
     def test_empty_list(self) -> None:

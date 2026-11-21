@@ -91,6 +91,7 @@ RequestPerfMetrics Serialization::deserializeRequestPerfMetrics(std::istream& is
 
     auto kvCacheSize = su::deserialize<size_t>(is);
     auto kvCacheTransferLocalSize = su::deserialize<std::optional<size_t>>(is);
+    auto kvCacheTransferLocalDuration = su::deserialize<std::optional<double>>(is);
 
     auto numTotalAllocatedBlocks = su::deserialize<SizeType32>(is);
     auto numNewAllocatedBlocks = su::deserialize<SizeType32>(is);
@@ -107,7 +108,7 @@ RequestPerfMetrics Serialization::deserializeRequestPerfMetrics(std::istream& is
     auto iter = su::deserialize<std::optional<IterationType>>(is);
 
     RequestPerfMetrics::TimingMetrics timingMetrics{arrivalTime, firstScheduledTime, firstTokenTime, lastTokenTime,
-        kvCacheTransferStart, kvCacheTransferEnd, kvCacheSize, kvCacheTransferLocalSize};
+        kvCacheTransferStart, kvCacheTransferEnd, kvCacheSize, kvCacheTransferLocalSize, kvCacheTransferLocalDuration};
     RequestPerfMetrics::KvCacheMetrics kvCacheMetrics{
         numTotalAllocatedBlocks, numNewAllocatedBlocks, numReusedBlocks, numMissedBlocks, kvCacheHitRate};
     RequestPerfMetrics::SpeculativeDecodingMetrics specDecMetrics{
@@ -126,6 +127,7 @@ void Serialization::serialize(RequestPerfMetrics const& metrics, std::ostream& o
 
     su::serialize(metrics.timingMetrics.kvCacheSize, os);
     su::serialize(metrics.timingMetrics.kvCacheTransferLocalSize, os);
+    su::serialize(metrics.timingMetrics.kvCacheTransferLocalDuration, os);
 
     su::serialize(metrics.kvCacheMetrics.numTotalAllocatedBlocks, os);
     su::serialize(metrics.kvCacheMetrics.numNewAllocatedBlocks, os);
@@ -155,6 +157,7 @@ size_t Serialization::serializedSize(RequestPerfMetrics const& metrics)
 
     totalSize += su::serializedSize(metrics.timingMetrics.kvCacheSize);
     totalSize += su::serializedSize(metrics.timingMetrics.kvCacheTransferLocalSize);
+    totalSize += su::serializedSize(metrics.timingMetrics.kvCacheTransferLocalDuration);
 
     totalSize += su::serializedSize(metrics.kvCacheMetrics.numTotalAllocatedBlocks);
     totalSize += su::serializedSize(metrics.kvCacheMetrics.numNewAllocatedBlocks);

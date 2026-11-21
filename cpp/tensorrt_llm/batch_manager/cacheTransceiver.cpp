@@ -137,6 +137,7 @@ enum class TransferConsensusState : std::uint64_t
     kCompleted = 1,
     kFailed = 2,
     kTimedOut = 3,
+    kCancelled = 4,
 };
 
 struct TransferStateCounts
@@ -144,6 +145,7 @@ struct TransferStateCounts
     int completedCount{0};
     int failedCount{0};
     int timedOutCount{0};
+    int cancelledCount{0};
 };
 
 struct TransferConsensusOutcome
@@ -151,6 +153,7 @@ struct TransferConsensusOutcome
     std::unordered_set<RequestIdType> completedRequestIds;
     std::unordered_set<RequestIdType> failedRequestIds;
     std::unordered_set<RequestIdType> timedOutRequestIds;
+    std::unordered_set<RequestIdType> backendFailedRequestIds;
 };
 
 template <typename CancelFn>
@@ -227,7 +230,8 @@ std::vector<std::uint64_t> gatherPackedTransferStates(
 TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverComm> const& comm,
     std::unordered_set<RequestIdType> const& completedRequestIds,
     std::unordered_set<RequestIdType> const& failedRequestIds,
-    std::unordered_set<RequestIdType> const& timedOutRequestIds)
+    std::unordered_set<RequestIdType> const& timedOutRequestIds,
+    std::unordered_set<RequestIdType> const& cancelledRequestIds = {})
 {
     std::vector<std::uint64_t> localStates;
     localStates.reserve((completedRequestIds.size() + failedRequestIds.size() + timedOutRequestIds.size()) * 2);
@@ -240,7 +244,9 @@ TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverCo
     }
     for (auto const requestId : failedRequestIds)
     {
-        appendPackedTransferState(localStates, requestId, TransferConsensusState::kFailed);
+        appendPackedTransferState(localStates, requestId,
+            cancelledRequestIds.count(requestId) ? TransferConsensusState::kCancelled
+                                                 : TransferConsensusState::kFailed);
     }
     for (auto const requestId : timedOutRequestIds)
     {
@@ -266,20 +272,26 @@ TransferConsensusOutcome reduceTransferStates(std::shared_ptr<CacheTransceiverCo
         case TransferConsensusState::kCompleted: counts.completedCount++; break;
         case TransferConsensusState::kFailed: counts.failedCount++; break;
         case TransferConsensusState::kTimedOut: counts.timedOutCount++; break;
+        case TransferConsensusState::kCancelled: counts.cancelledCount++; break;
         }
     }
 
     TransferConsensusOutcome outcome;
     for (auto const& [requestId, counts] : stateCounts)
     {
-        auto const terminalCount = counts.completedCount + counts.failedCount;
+        auto const terminalCount = counts.completedCount + counts.failedCount + counts.cancelledCount;
         if (counts.timedOutCount > 0)
         {
             outcome.timedOutRequestIds.insert(requestId);
         }
-        if (terminalCount == syncSize && (counts.failedCount > 0 || counts.timedOutCount > 0))
+        if (terminalCount == syncSize
+            && (counts.failedCount > 0 || counts.cancelledCount > 0 || counts.timedOutCount > 0))
         {
             outcome.failedRequestIds.insert(requestId);
+            if (counts.failedCount > 0)
+            {
+                outcome.backendFailedRequestIds.insert(requestId);
+            }
         }
         else if (counts.completedCount == syncSize)
         {
@@ -1087,6 +1099,9 @@ std::vector<executor::DisServingRequestStats> batchGenTransferSummary(
     {
         auto reqId = req->getContextPhaseParams().value().getReqId();
         auto const& entry = merged.at(reqId);
+        req->setKvCacheTransferLocalDuration(req->getKvCacheTransferTimeMS() / 1000.0);
+        req->setKvCacheTransferStart(entry.minStart);
+        req->setKvCacheTransferEnd(entry.maxEnd);
         req->setKvCacheSize(entry.totalSize);
         auto const ms = std::chrono::duration<double, std::milli>(entry.maxEnd - entry.minStart).count();
         summary.push_back({ms, entry.totalSize});
@@ -1578,9 +1593,17 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
 
     // Publish after local polling and before collectives, which may be the point at which a rank hangs.
     publishStatusSnapshot();
+    std::unordered_set<RequestIdType> cancelledRequestIds;
+    for (auto const requestId : mFailedRequesterRequestIds)
+    {
+        if (mRequesterRequestsAwaitingConsensus.at(requestId)->getKvCacheTransferCancelled())
+        {
+            cancelledRequestIds.insert(requestId);
+        }
+    }
     auto const consensusOutcome
         = reduceTransferStates(syncComm, mCompletedRequesterRequestIds, mFailedRequesterRequestIds,
-            inflightCancelEnabled ? mTimedOutRequesterIds : std::unordered_set<RequestIdType>{});
+            inflightCancelEnabled ? mTimedOutRequesterIds : std::unordered_set<RequestIdType>{}, cancelledRequestIds);
     if (inflightCancelEnabled)
     {
         for (auto const requestId : consensusOutcome.timedOutRequestIds)
@@ -1616,7 +1639,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             requestIt->second->setKvCacheTransferTimedOut();
         }
-        else
+        else if (consensusOutcome.backendFailedRequestIds.count(requestId))
         {
             requestIt->second->markKvCacheTransferFailed();
         }
