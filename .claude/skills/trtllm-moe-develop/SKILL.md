@@ -8,7 +8,7 @@ description: >-
   methods, EPLB, communication), MoE selection (moe_config.backend,
   moe_config.tactic, speculative_config.moe_tactic, MoESelection), model code
   that builds MoE layers or depends on the MoE backend, the MoE developer
-  guide, or MoE tests.
+  guide, or MoE tests, including ModelingV2 MoE paths and tests.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -21,9 +21,10 @@ answers; this skill holds only the questions, because reading the guide does
 not by itself bring all of them up. Read the guide first. For a design or a
 review, answer each question that applies with file:line evidence from the
 code; a question the code cannot answer is a finding. The section named after a
-question is where the guide answers it. Where the guide and the code disagree,
-the code wins: fix the guide in the same change or report it. In a review,
-weigh owner boundaries and testability above local style.
+question is where the guide answers it. Where the guide and the code disagree
+on facts, the code wins: fix the guide in the same change or report it. Follow
+the guide's test placement rules, and update documented test paths when tests
+move. In a review, weigh owner boundaries and testability above local style.
 
 ## Implementations and selection
 
@@ -89,3 +90,13 @@ weigh owner boundaries and testability above local style.
 15. Which tests does the change need? (Tests) When a test needs a GPU, use the
     GPU allocation and test-runner skills, and record each skipped test with
     its reason.
+
+## ModelingV2 MoE tests and review
+
+Before developing or reviewing ModelingV2 MoE changes, read and apply the
+[ModelingV2 MoE test rules](../../../tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md#modelingv2-moe-test-rules),
+including changes to model execution steps involving MoE, helpers and CI
+selection. Keep the rules in that guide. When using a review agent, provide it
+with this skill and the guide from the intended checkout, and require it to
+apply those rules to the full PR diff. Report violations with file/case evidence
+and identify unverified scope.
