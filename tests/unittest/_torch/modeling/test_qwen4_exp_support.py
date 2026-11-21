@@ -71,6 +71,116 @@ def _text_config_dict() -> dict:
     }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_periodic_ple_snapshots_bypass_prefill_graph(tmp_path, monkeypatch) -> None:
+    """A multi-snapshot context writes PLE state even when prefill graphs are enabled."""
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm._torch.modules.qwen4_exp import ple as ple_module
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
+
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1")
+    if not is_flashinfer_gdn_prefill_supported_arch():
+        pytest.skip("FlashInfer GDN prefill is unavailable on this device")
+    # The single-rank test communicator does not provide clock calibration.
+    monkeypatch.setattr(PyExecutor, "_set_global_steady_clock_offset", lambda self: None)
+    config = _text_config_dict()
+    config.update(
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        max_position_embeddings=1024,
+        layer_types=["linear_attention"] * config["num_hidden_layers"],
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    points = (64, 128, 192, 256, 320, 384)
+    source_tokens = [3 + (17 * position % 990) for position in range(448)]
+    suffix = [3 + ((29 * position + 71) % 990) for position in range(128)]
+    sampling = SamplingParams(
+        max_tokens=4, temperature=0, ignore_eos=True, end_id=2, pad_id=0, detokenize=False
+    )
+    replays = []
+    snapshot_histories = []
+    snapshot_conv_windows = []
+    replay = BreakableCUDAGraphRunner.replay
+    store = ple_module.store_ple_snapshots
+
+    def count_replay(runner, num_tokens):
+        replays.append(num_tokens)
+        return replay(runner, num_tokens)
+
+    def record_snapshots(*args, **kwargs):
+        result = store(*args, **kwargs)
+        if not snapshot_histories:
+            conv_input, conv_states, histories, slots = args[0], args[2], args[3], args[-1]
+            snapshot_histories.append(histories.index_select(0, slots.long()).cpu().tolist())
+            width = conv_states.shape[-1]
+            actual = conv_states.index_select(0, slots.long()).cpu()
+            expected = torch.stack([conv_input[p - width : p].T for p in points]).cpu()
+            snapshot_conv_windows.append((actual, expected))
+        return result
+
+    monkeypatch.setattr(BreakableCUDAGraphRunner, "replay", count_replay)
+    monkeypatch.setattr(ple_module, "store_ple_snapshots", record_snapshots)
+    with LLM(
+        model=str(tmp_path),
+        backend="pytorch",
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        tensor_parallel_size=1,
+        max_seq_len=768,
+        max_num_tokens=512,
+        max_batch_size=4,
+        enable_chunked_prefill=True,
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        attn_backend="TRTLLM",
+        return_perf_metrics=True,
+        prefill_cuda_graph_backend="breakable",
+        prefill_capture_num_tokens=[64, 128, 256, 448],
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            tokens_per_block=64,
+            free_gpu_memory_fraction=0.25,
+            mamba_ssm_cache_dtype="float32",
+            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+        ),
+    ) as llm:
+        manager = llm._executor.engine.kv_cache_manager
+        capacity = manager.periodic_snapshot_capacity
+        assert capacity >= len(points), "multi-snapshot staging was not initialized"
+
+        def generate(tokens, salt):
+            return llm.generate(
+                [{"prompt_token_ids": tokens}],
+                sampling_params=sampling,
+                use_tqdm=False,
+                cache_salt=salt,
+            )[0]
+
+        manager.periodic_snapshot_capacity = 0
+        replays.clear()
+        baseline = generate(source_tokens, "ple-graph-baseline")
+        assert baseline.ctx_num_chunks == 7
+        assert replays, "the ordinary prefill must exercise a captured graph"
+
+        manager.periodic_snapshot_capacity = capacity
+        replays.clear()
+        source = generate(source_tokens, "ple-graph-snapshot")
+        assert source.ctx_num_chunks == 1
+        assert not replays, "the multi-snapshot prefill must not replay a captured graph"
+        assert snapshot_histories == [[source_tokens[p - 2 : p] for p in points]]
+        assert len(snapshot_conv_windows) == 1
+        torch.testing.assert_close(*snapshot_conv_windows[0], rtol=0, atol=0)
+        for point in points[:3]:
+            output = generate(source_tokens[:point] + suffix, "ple-graph-snapshot")
+            assert output.cached_tokens == point
+            assert len(output.outputs[0].token_ids) == 4
+
+
 def test_config_types_are_registered_with_transformers() -> None:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 

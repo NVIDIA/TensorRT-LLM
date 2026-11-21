@@ -40,7 +40,7 @@ at process start; do not import it lazily inside hot paths.
 
 import functools
 import os
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -206,6 +206,10 @@ def chunk_gated_delta_rule(
     cu_seqlens_cpu: Optional[torch.Tensor] = None,
     use_cp: Union[Literal["auto"], bool] = "auto",
     g_is_linear: bool = False,
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts_cpu: Optional[Sequence[int]] = None,
+    checkpoint_every_n_tokens: int = 0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's chunk_gated_delta_rule.
 
@@ -224,6 +228,14 @@ def chunk_gated_delta_rule(
     ``g_is_linear`` declares that ``g`` already holds ``alpha = exp(g_log)``
     (fp32), as emitted by ``fused_gdn_post_conv(g_linear=True)``; the wrapper
     then skips its own ``torch.exp``.
+
+    When ``checkpoint_every_n_tokens`` is nonzero, write packed intermediate
+    states into ``state_checkpoints``, shaped ``[total_checkpoints, H, V, K]``
+    in float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2.
+    ``checkpoint_cu_starts`` is a CUDA int32 or int64 tensor of shape
+    ``[num_sequences + 1]`` giving per-sequence row offsets. Its CPU
+    counterpart is required when workspace capacity splits the batch into
+    multiple groups.
     """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
@@ -239,6 +251,8 @@ def chunk_gated_delta_rule(
     assert g.dtype == torch.float32, f"g must be fp32, got {g.dtype}"
     assert cu_seqlens is not None, "cu_seqlens is required (varlen mode)"
     assert initial_state is not None, "initial_state is required"
+    if checkpoint_every_n_tokens:
+        assert state_checkpoints is not None and checkpoint_cu_starts is not None
     if inplace_indexed_state_update:
         assert initial_state_indices is not None, (
             "inplace_indexed_state_update=True requires initial_state_indices"
@@ -298,6 +312,7 @@ def chunk_gated_delta_rule(
     if (
         _INDEXED_STATE_IO
         and inplace_indexed_state_update
+        and not checkpoint_every_n_tokens
         and use_cp is False
         and cu_seqlens.shape[0] - 1 <= _INDEXED_STATE_IO_MAX_SEQS
         and is_sm_100f()
@@ -395,6 +410,11 @@ def chunk_gated_delta_rule(
         offsets = cu_seqlens_cpu.tolist()
         groups = [(lo, hi, offsets[lo], offsets[hi]) for lo, hi in zip(bounds[:-1], bounds[1:])]
 
+    if checkpoint_every_n_tokens and len(groups) > 1:
+        assert checkpoint_cu_starts_cpu is not None, (
+            "checkpoint_cu_starts_cpu is required when the batch exceeds the state workspace"
+        )
+
     for seq_lo, seq_hi, tok_lo, tok_hi in groups:
         group_seqs = seq_hi - seq_lo
         if len(groups) == 1:
@@ -442,6 +462,20 @@ def chunk_gated_delta_rule(
             use_cp=use_cp,
             output=output_buf[tok_lo:tok_hi],
         )
+        if checkpoint_every_n_tokens:
+            if len(groups) == 1:
+                checkpoint_rows = state_checkpoints
+                checkpoint_offsets = checkpoint_cu_starts
+            else:
+                ck_lo = checkpoint_cu_starts_cpu[seq_lo]
+                ck_hi = checkpoint_cu_starts_cpu[seq_hi]
+                checkpoint_rows = state_checkpoints[ck_lo:ck_hi]
+                checkpoint_offsets = checkpoint_cu_starts[seq_lo : seq_hi + 1] - ck_lo
+            flashinfer_args.update(
+                state_checkpoints=checkpoint_rows,
+                checkpoint_cu_starts=checkpoint_offsets,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            )
         if need_state:
             # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
             # fp32); FlashInfer writes the final state in this dtype and the scatter

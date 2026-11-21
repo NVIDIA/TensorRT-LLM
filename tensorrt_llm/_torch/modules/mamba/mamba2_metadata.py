@@ -15,7 +15,7 @@
 
 import contextlib
 import math
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import triton
@@ -25,7 +25,13 @@ from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.multi_snapshot import (
+    PeriodicSnapshotBatch, PeriodicSnapshotReservation, snapshot_step_indices)
 from tensorrt_llm._utils import prefer_pinned
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import \
+        MambaHybridCacheManagerV2
 
 
 # num_seqs and N follow the batch; specializing them (on == 1 or % 16) would
@@ -288,6 +294,7 @@ class Mamba2Metadata:
                                            dtype=torch.int,
                                            device="cuda")
         self._arange_buffer_long = self._arange_buffer.to(torch.long)
+        self.periodic_snapshot: Optional[PeriodicSnapshotBatch] = None
         # int64 copy of the cu_seqlens prefix (query_start_loc_long).
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
@@ -303,6 +310,7 @@ class Mamba2Metadata:
         ``prepare()``: the state indices and the dummy-request mask are still
         in place, so their host walk and H2D copies are skipped; only the
         per-step bookkeeping is refreshed."""
+        self.periodic_snapshot = None
         batch_size = attn_metadata.seq_lens.shape[0]
         kv_cache_manager = attn_metadata.kv_cache_manager
 
@@ -313,6 +321,49 @@ class Mamba2Metadata:
         if flush is not None:
             flush()
 
+    def _prepare_periodic_snapshot(
+            self, attn_metadata: AttentionMetadata,
+            kv_cache_manager: "MambaHybridCacheManagerV2",
+            reservation: PeriodicSnapshotReservation) -> None:
+        """Build device indices for a single context's periodic snapshots."""
+        if attn_metadata.num_contexts != 1:
+            raise RuntimeError(
+                "Periodic snapshots require exactly one context request")
+        if int(attn_metadata.seq_lens[0]
+               ) != reservation.end - reservation.start:
+            raise RuntimeError(
+                "Periodic snapshot reservation does not match the context chunk"
+            )
+        indices = snapshot_step_indices(reservation,
+                                        kv_cache_manager.conv_state_shape[-1])
+        if indices.checkpoint_count > kv_cache_manager.periodic_snapshot_capacity:
+            raise RuntimeError("Periodic snapshot staging capacity exceeded")
+        count = len(indices.slots)
+        flat = [
+            0, indices.checkpoint_count, *indices.checkpoint_rows,
+            *indices.positions, *indices.conv_indices, *indices.slots
+        ]
+        device_values = torch.tensor(flat,
+                                     dtype=torch.long,
+                                     device=self.state_indices.device)
+        offset = 2
+        rows = device_values[offset:offset + count]
+        offset += count
+        positions = device_values[offset:offset + count]
+        offset += count
+        conv_count = count * kv_cache_manager.conv_state_shape[-1]
+        conv_indices = device_values[offset:offset + conv_count]
+        offset += conv_count
+        self.periodic_snapshot = PeriodicSnapshotBatch(
+            interval=reservation.interval,
+            checkpoint_count=indices.checkpoint_count,
+            checkpoint_cu_starts=device_values[:2],
+            checkpoint_rows=rows,
+            positions=positions,
+            conv_indices=conv_indices,
+            slots=device_values[offset:offset + count],
+        )
+
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
@@ -321,6 +372,7 @@ class Mamba2Metadata:
 
         kv_cache_manager = attn_metadata.kv_cache_manager
         request_ids = attn_metadata.request_ids
+        self.periodic_snapshot = None
 
         if (kv_cache_manager is not None
                 and hasattr(kv_cache_manager, 'get_state_indices')
@@ -443,6 +495,19 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
+
+        periodic_plans = getattr(kv_cache_manager, "periodic_snapshot_plan",
+                                 None)
+        if periodic_plans:
+            if request_ids is None or num_contexts != 1:
+                raise RuntimeError(
+                    "Periodic snapshot reservation has no matching context")
+            reservation = periodic_plans.get(request_ids[0])
+            if reservation is None:
+                raise RuntimeError(
+                    "Periodic snapshot reservation has no matching request")
+            self._prepare_periodic_snapshot(attn_metadata, kv_cache_manager,
+                                            reservation)
 
         # Complete any deferred recurrent-state block onboards scheduled by
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources

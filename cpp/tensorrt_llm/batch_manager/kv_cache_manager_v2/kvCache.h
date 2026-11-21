@@ -334,6 +334,11 @@ public:
     // Returns true on success, false when the resize ran out of pages and was rolled back.
     bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
 
+    //! Resize using free pages only, without recording a capacity sample.
+    //! On acceptance call resize(capacity) to record it; on veto restore the
+    //! original capacity with this method. SWA scratch reuse returns false.
+    bool tryResizeCapacityWithoutEviction(int capacity);
+
     // ---- Sparse history cache ----------------------------------------------
 
     //! Bound on capacity - history_length: how far capacity may outrun the watermark.
@@ -387,12 +392,23 @@ public:
     // manager has no SSM life cycle.
     std::optional<int> acquireSsmSnapshotSlot();
 
+    //! Reserve a group of pending pages for successive snapshot points in one
+    //! forward step. The returned slots must be committed in the returned order.
+    //! If the whole group cannot be reserved, no pages remain reserved.
+    std::vector<int> acquireSsmSnapshotSlots(int count);
+
+    //! Reserve only currently free pages; do not evict reusable pages.
+    std::vector<int> acquireSsmSnapshotSlotsWithoutEviction(int count);
+
     // Slot id of the pending SSM snapshot page, if any.
     std::optional<int> pendingSsmSnapshotSlot() const;
 
     // Release the pending SSM snapshot page, if any, once the work queued so far on
     // the cache stream is done. No-op without a pending page.
     void releaseSsmSnapshotSlot();
+
+    //! Release all pending snapshot pages once work on the cache stream completes.
+    void releaseSsmSnapshotSlots();
 
     // ---- Page index queries ------------------------------------------------
 
@@ -810,6 +826,9 @@ private:
     // Release the pending SSM snapshot page, if any. Its lock records the cache's finish
     // event: the current one inside a recordEventScope(), else a new one on the cache stream.
     void _dropPendingSsmSnapshot();
+    void _dropPendingSsmSnapshots();
+    std::vector<int> _acquireSsmSnapshotSlots(int count, bool allowEviction);
+    bool _resize(std::optional<int> capacity, std::optional<int> historyLength, bool allowEviction);
 
     // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
     // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the
@@ -927,12 +946,9 @@ private:
 
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     BeamBlockPages mSsmBlocks;
-    // A locked GPU SSM page (UncommittedPage at kBadBlockOrdinal), reserved by
-    // acquireSsmSnapshotSlot(), that the next forward step fills with the recurrent
-    // state at a commit point inside that step. commit(..., ssmFromPending=true) moves
-    // it into the radix tree. Exists only while the cache is active and committing is
-    // allowed.
-    std::optional<SharedPageLock> mPendingSsmSnapshot;
+    // Pending pages are kept in reverse commit order, so the next page is at the back.
+    // Each is a locked uncommitted GPU SSM page for a point inside the next step.
+    std::vector<SharedPageLock> mPendingSsmSnapshots;
     bool mNeverResumed = true;
 
     PendingStats mPendingStats;

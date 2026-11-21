@@ -90,6 +90,7 @@ from .common import (
     _mamba_snapshot_rule_counts,
     _PrefixReuseDiagnostics,
 )
+from .multi_snapshot import PeriodicSnapshotReservation
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.sampling_params import SamplingParams
 
 GB = 1 << 30
+_PERIODIC_SNAPSHOT_STAGING_BYTES = 512 << 20
 
 
 def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
@@ -126,6 +128,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    _supports_periodic_snapshots = False
+    _periodic_snapshot_requires_staging = False
+    _periodic_snapshot_supports_tp = False
+    _periodic_snapshot_supports_mixed_decode = False
+    periodic_snapshot_capacity = 0
+    periodic_snapshot_requires_consensus = False
     # Whether a decode step whose requests, SSM base blocks and dummy flags all
     # match the last upload keeps the uploaded state indices and dummy mask
     # without rebuilding them.
@@ -189,6 +197,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_estimating_kv_cache: bool = False,
         is_draft: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
+        enable_periodic_snapshots: bool = False,
+        periodic_snapshot_alignment: int = 64,
         **kwargs,
     ) -> None:
         """See the class docstring."""
@@ -233,6 +243,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         ]
 
         self._mamba_layer_mask = list(mamba_layer_mask)
+        self._periodic_snapshot_model_support = enable_periodic_snapshots
+        self._periodic_snapshot_max_tokens = kwargs.get("max_num_tokens") or max_seq_len
+        self.periodic_snapshot_alignment = periodic_snapshot_alignment
+        self.periodic_snapshot_plan: Dict[int, PeriodicSnapshotReservation] = {}
+        self.periodic_snapshot_capacity = 0
+        self.periodic_snapshot_requires_consensus = mapping.world_size > 1
+        self._periodic_snapshot_stage = None
         self.spec_config = spec_config
         self._recurrent_evicted_blocks_total = 0
         self._recurrent_onboarded_blocks_total = 0
@@ -1073,6 +1090,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._state_layout = self._state_layout.with_slot_capacity(0)
 
         self._setup_model_state()
+        self._setup_periodic_snapshots()
 
     def _get_state_buffer(
         self, local_layer_idx: int, role, dtype: torch.dtype, state_shape: List[int]
@@ -1120,6 +1138,158 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._speculative_state.bind(
                 self._state_layout, self.all_ssm_states, self.all_conv_states
             )
+
+    def _periodic_snapshot_compatible(self) -> bool:
+        """Whether the model's recurrent kernels can save intermediate states."""
+        return False
+
+    def _periodic_snapshot_staging_in_use_bytes(self) -> int:
+        return 0
+
+    def _periodic_snapshot_min_window(self) -> int:
+        return self.conv_state_shape[-1]
+
+    def _periodic_snapshot_roles(self, layer_id: int) -> tuple:
+        return (MambaRole.SSM_STATE, MambaRole.CONV_STATE)
+
+    def _setup_periodic_snapshots(self) -> None:
+        """Allocate bounded staging for supported recurrent checkpoints."""
+        interval = self.kv_cache_config.mamba_state_config.periodic_snapshot_interval
+        if not (
+            self._supports_periodic_snapshots
+            and self._periodic_snapshot_model_support
+            and self.local_num_mamba_layers > 0
+            and self.enable_block_reuse
+            and not self.is_draft
+            and not self.is_disagg
+            and self.kv_connector_manager is None
+            and self.mapping.pp_size == 1
+            and self.mapping.cp_size == 1
+            and (
+                self.mapping.world_size == 1
+                or (
+                    self.mapping.world_size == self.mapping.tp_size
+                    and self._periodic_snapshot_supports_tp
+                )
+            )
+            and not self.mapping.enable_attention_dp
+            and self.num_locality_domains == 1
+            and interval is not None
+            and interval > 0
+            and self.periodic_snapshot_alignment > 0
+            and interval % self.periodic_snapshot_alignment == 0
+            and interval % self.tokens_per_block == 0
+            and self._periodic_snapshot_compatible()
+            and interval >= self._periodic_snapshot_min_window()
+        ):
+            return
+        for layer_id in self.mamba_pp_layers:
+            local_id = LayerId(self.layer_offsets[layer_id])
+            if any(
+                self.impl.get_buffer_group_id(local_id, role) != self.ssm_layer_group_id
+                for role in self._periodic_snapshot_roles(layer_id)
+            ):
+                return
+        row_bytes = math.prod(self.ssm_state_shape) * (
+            self.local_num_mamba_layers * 4
+            if self._periodic_snapshot_requires_staging
+            else self.ssm_state_dtype.itemsize
+        )
+        available = max(
+            0, _PERIODIC_SNAPSHOT_STAGING_BYTES - self._periodic_snapshot_staging_in_use_bytes()
+        )
+        rows = min(
+            self.max_seq_len // interval,
+            self._periodic_snapshot_max_tokens // interval,
+            available // row_bytes,
+        )
+        if rows < 2:
+            return
+        if self._periodic_snapshot_requires_staging:
+            try:
+                self._periodic_snapshot_stage = torch.empty(
+                    [self.local_num_mamba_layers, rows] + self.ssm_state_shape,
+                    dtype=torch.float32,
+                    device=self.all_ssm_states[0].device,
+                )
+            except torch.OutOfMemoryError:
+                logger.warning(
+                    "Periodic snapshot staging is unavailable; using existing chunk boundaries"
+                )
+                return
+        self.periodic_snapshot_capacity = rows
+
+    def periodic_snapshot_stage_view(self, layer_idx: int, count: int) -> torch.Tensor:
+        return self._periodic_snapshot_stage[self.mamba_layer_offsets[layer_idx], :count]
+
+    def reserve_periodic_snapshots(
+        self,
+        request: LlmRequest,
+        end: int,
+        points: tuple[int, ...],
+        *,
+        without_eviction: bool = False,
+    ) -> bool:
+        """Reserve pending cache slots for the ordered points of one context step."""
+        cache = self.kv_cache_map.get(request.py_request_id)
+        if (
+            cache is None
+            or not cache.is_active
+            or cache.pending_ssm_snapshot_slot is not None
+            or cache.history_length != cache.num_committed_tokens
+            or request.py_request_id in self.periodic_snapshot_plan
+        ):
+            return False
+        slots = (
+            cache.acquire_ssm_snapshot_slots_without_eviction(len(points))
+            if without_eviction
+            else cache.acquire_ssm_snapshot_slots(len(points))
+        )
+        if not slots:
+            return False
+        self.periodic_snapshot_plan[request.py_request_id] = PeriodicSnapshotReservation(
+            request.context_current_position,
+            end,
+            self.kv_cache_config.mamba_state_config.periodic_snapshot_interval,
+            points,
+            tuple(slots),
+        )
+        return True
+
+    def release_periodic_snapshots(self, request: LlmRequest) -> None:
+        if self.periodic_snapshot_plan.pop(request.py_request_id, None) is not None:
+            cache = self.kv_cache_map.get(request.py_request_id)
+            if cache is not None and cache.is_active:
+                cache.release_ssm_snapshot_slots()
+
+    def finish_periodic_snapshots(self, scheduled_batch: ScheduledRequests) -> None:
+        for request in scheduled_batch.context_requests:
+            reservation = self.periodic_snapshot_plan.pop(request.py_request_id, None)
+            if reservation is None:
+                continue
+            cache = self.kv_cache_map[request.py_request_id]
+            try:
+                for point in reservation.points:
+                    if cache.history_length < point and not cache.resize(None, point):
+                        raise ValueError(f"Failed to advance recurrent cache history to {point}")
+                    tokens = self._augment_tokens_for_block_reuse(
+                        self._reuse_token_source(request),
+                        request,
+                        start=cache.num_committed_tokens,
+                        end=point,
+                    )
+                    cache.commit(tokens, ssm_from_pending=True)
+                    self._count_snapshot_commit(request, point)
+            except Exception as commit_error:
+                try:
+                    cache.release_ssm_snapshot_slots()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        "Unrecoverable error in the engine: periodic snapshot commit failed "
+                        f"({type(commit_error).__name__}: {commit_error}); slot cleanup failed "
+                        f"({type(cleanup_error).__name__}: {cleanup_error})"
+                    ) from commit_error
+                raise
 
     @property
     def intermediate_state_indices(self) -> torch.Tensor | None:
@@ -1454,6 +1624,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        self.release_periodic_snapshots(request)
         kv_cache = self.kv_cache_map.get(request.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             self.try_commit_blocks(request, kv_cache)
@@ -1464,6 +1635,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # A freed request ends any steady decode run.
         self._steady_state_index_key = None
         super().free_resources(request, pin_on_release)
+
+    @override
+    def revert_unexecuted_context_chunk(self, request: LlmRequest) -> None:
+        self.release_periodic_snapshots(request)
+        super().revert_unexecuted_context_chunk(request)
 
     def update_mamba_states(
         self,
@@ -1893,6 +2069,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._recurrent_buffers.clear()
         self.all_ssm_states = []
         self.all_conv_states = []
+        self._periodic_snapshot_stage = None
+        self.periodic_snapshot_capacity = 0
+        self.periodic_snapshot_plan.clear()
         self._dummy_request_mask_buffer = None
         self._dummy_request_mask_host = None
         self._generation_state_indices = None

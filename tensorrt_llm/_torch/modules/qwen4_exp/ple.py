@@ -25,6 +25,9 @@ import triton.language as tl
 from tensorrt_llm._torch.distributed import AllReduce, allgather, reducescatter
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.multi_snapshot import (
+    PeriodicSnapshotBatch,
+)
 from tensorrt_llm._utils import CUASSERT, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -44,6 +47,7 @@ from .ple_kernels import (
     ple_packed_short_conv,
     ple_short_conv_state,
 )
+from .ple_snapshot import store_ple_snapshots
 
 # SplitMix64 constants are part of the checkpoint's PLE hashing contract.
 _MASK64 = (1 << 64) - 1
@@ -178,6 +182,7 @@ class PLEMetadata:
     is_cuda_graph: bool = False
     context_row_width: int = 1  # max context chunk length, independent of generation
     generation_row_width: int = 1  # max generation chunk length, independent of context
+    periodic_snapshot: Optional[PeriodicSnapshotBatch] = None
 
     @classmethod
     def build(
@@ -1455,6 +1460,27 @@ class Qwen4ExpPLE(nn.Module):
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
+        if m.periodic_snapshot is not None:
+            positions = m.periodic_snapshot.positions
+            conv_indices = (
+                positions[:, None]
+                - self.short_conv_state_len
+                + torch.arange(self.short_conv_state_len, device=positions.device)
+            ).reshape(-1)
+            token_indices = (
+                positions[:, None]
+                - self.ngram_context_len
+                + torch.arange(self.ngram_context_len, device=positions.device)
+            ).reshape(-1)
+            store_ple_snapshots(
+                gated_value_normed,
+                m.padded_tokens[0],
+                conv_state,
+                ngram_context,
+                conv_indices,
+                token_indices,
+                m.periodic_snapshot.slots,
+            )
         conv_output = self._short_conv(gated_value_normed, metadata, conv_state)
         output = gated_value + conv_output
         output = torch.where(m.valid_tokens.unsqueeze(-1), output, torch.zeros_like(output))

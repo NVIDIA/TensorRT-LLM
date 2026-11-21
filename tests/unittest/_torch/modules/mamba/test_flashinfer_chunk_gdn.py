@@ -111,6 +111,75 @@ def _zero_initial_state(num_seqs, num_heads, head_dim, device, dtype=torch.float
     return torch.zeros(num_seqs, num_heads, head_dim, head_dim, dtype=dtype, device=device)
 
 
+@skip_unsupported
+@pytest.mark.parametrize("workspace_capacity", [None, 1])
+@pytest.mark.parametrize("lengths, offsets", [([192, 128], [0, 3, 5]), ([192, 32], [0, 3, 3])])
+def test_packed_checkpoints_match_independent_prefixes(workspace_capacity, lengths, offsets):
+    """Multiple checkpoints survive workspace grouping and match separate prefills."""
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+
+    interval = 64
+    q, k, v, g, beta, cu = _make_inputs(lengths, num_q_heads=2, num_v_heads=2, seed=73)
+    initial = torch.randn(2, 2, 128, 128, device=q.device, dtype=torch.float32) * 0.01
+    checkpoint_cu = torch.tensor(offsets, device=q.device, dtype=torch.int32)
+    checkpoints = torch.empty(offsets[-1], 2, 128, 128, device=q.device, dtype=torch.float32)
+    workspace = None
+    if workspace_capacity is not None:
+        dtype = initial.dtype if is_sm_100f() else torch.float32
+        workspace = tuple(
+            torch.empty(workspace_capacity, 2, 128, 128, device=q.device, dtype=dtype)
+            for _ in range(2)
+        )
+
+    actual, final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        state_workspace=workspace,
+        cu_seqlens_cpu=torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()]),
+        use_cp=True,
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=checkpoint_cu,
+        checkpoint_cu_starts_cpu=offsets,
+        checkpoint_every_n_tokens=interval,
+    )
+    baseline, baseline_final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        use_cp=True,
+    )
+    tol = dict(rtol=1.6e-2, atol=1e-3)
+    torch.testing.assert_close(actual, baseline, **tol)
+    torch.testing.assert_close(final, baseline_final, **tol)
+    start = 0
+    for seq, length in enumerate(lengths):
+        for checkpoint, point in enumerate(range(interval, length + 1, interval)):
+            _, expected = chunk_gated_delta_rule(
+                q[:, start : start + point],
+                k[:, start : start + point],
+                v[:, start : start + point],
+                g[:, start : start + point],
+                beta[:, start : start + point],
+                initial_state=initial[seq : seq + 1],
+                output_final_state=True,
+                cu_seqlens=torch.tensor([0, point], device=q.device, dtype=torch.int64),
+                use_cp=True,
+            )
+            torch.testing.assert_close(checkpoints[offsets[seq] + checkpoint], expected[0], **tol)
+        start += length
+
+
 # Pure-Python import smoke (no GPU required) ------------------------------
 
 

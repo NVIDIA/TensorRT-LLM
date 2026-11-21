@@ -11,6 +11,9 @@ import torch
 
 from tensorrt_llm._torch.modules.mamba import gdn_mixer
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.multi_snapshot import (
+    PeriodicSnapshotBatch,
+)
 from tensorrt_llm._utils import is_sm_100f
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -199,6 +202,107 @@ def test_mixed_decode_matches_decode_only(
             )
             torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
             torch.testing.assert_close(actual_conv, expected_conv, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_mixed_decode_keeps_periodic_prefill_snapshots(
+    state_dtype: torch.dtype,
+    preallocated: bool,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prefill can publish intermediate states while unrelated requests decode."""
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1")
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    if not gdn_mixer._use_flashinfer_gdn_prefill():
+        pytest.skip("FlashInfer GDN prefill is unavailable on this GPU")
+    gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+    request.addfinalizer(gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear)
+    monkeypatch.setattr(gdn_mixer, "_gdn_prefill_use_cp", lambda _tokens: "auto")
+
+    torch.manual_seed(2743)
+    layer = _make_layer()
+    length, num_decodes, width = 256, 2, 3
+    points, pending_slots = [64, 128, 192], [3, 4, 5]
+    projected = torch.randn(length + num_decodes, 3072, device="cuda", dtype=torch.bfloat16) * 0.1
+    gates = torch.randn(length + num_decodes, 16, device="cuda", dtype=torch.bfloat16) * 0.1
+    conv = torch.randn(6, 2048, width, device="cuda", dtype=torch.bfloat16) * 0.1
+    state = torch.randn(6, 8, 128, 128, device="cuda", dtype=state_dtype) * 0.1
+    slots = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    snapshot = PeriodicSnapshotBatch(
+        interval=64,
+        checkpoint_count=4,
+        checkpoint_cu_starts=torch.tensor([0, 4], device="cuda"),
+        checkpoint_rows=torch.tensor([0, 1, 2], device="cuda"),
+        positions=torch.tensor(points, device="cuda"),
+        conv_indices=torch.tensor(
+            [i for point in points for i in range(point - width, point)], device="cuda"
+        ),
+        slots=torch.tensor(pending_slots, device="cuda"),
+    )
+
+    def run(prefill_length: int, decodes: int, with_snapshots: bool = False):
+        count = prefill_length + decodes
+        batch = 1 + decodes
+        positions = torch.tensor(
+            [0, prefill_length, *range(prefill_length + 1, count + 1)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        new_conv, new_state = conv.clone(), state.clone()
+        kwargs = {}
+        if with_snapshots:
+            kwargs["periodic_snapshot"] = snapshot
+            kwargs["periodic_snapshot_stage"] = torch.empty(
+                4, 8, 128, 128, device="cuda", dtype=torch.float32
+            )
+        output_buffer = (
+            torch.empty(1, count, 8, 128, device="cuda", dtype=torch.bfloat16)
+            if preallocated
+            else None
+        )
+        output = layer.forward_extend(
+            new_conv,
+            new_state,
+            output=output_buffer,
+            mixed_qkv=projected[:count, :2048].clone(),
+            a=gates[:count, 8:].clone(),
+            b=gates[:count, :8].clone(),
+            batch_size=batch,
+            has_initial_states=torch.ones(batch, device="cuda", dtype=torch.bool),
+            cache_indices=slots[:batch],
+            query_start_loc=positions,
+            query_start_loc_long=positions.long(),
+            num_prefill_tokens=prefill_length,
+            num_decode_tokens=decodes,
+            state_indices_p=slots[:1],
+            state_indices_d=slots[1:batch],
+            num_prefill=1,
+            num_decodes=decodes,
+            **kwargs,
+        )
+        if output_buffer is not None:
+            assert output.data_ptr() == output_buffer.data_ptr()
+        return output, new_conv, new_state
+
+    # Warm the kernel before comparing live requests and independently run prefixes.
+    run(length, 0)
+    expected_output, expected_conv, expected_state = run(length, num_decodes)
+    actual_output, actual_conv, actual_state = run(length, num_decodes, with_snapshots=True)
+    torch.testing.assert_close(
+        actual_output[:, length:], expected_output[:, length:], rtol=0, atol=0
+    )
+    torch.testing.assert_close(actual_state[1:3], expected_state[1:3], rtol=0, atol=0)
+    torch.testing.assert_close(actual_state[0], expected_state[0], rtol=1e-2, atol=1e-3)
+    torch.testing.assert_close(actual_conv[:3], expected_conv[:3], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_output[:, :length], expected_output[:, :length], rtol=1e-2, atol=1e-3
+    )
+    for point, slot in zip(points, pending_slots):
+        _, prefix_conv, prefix_state = run(point, 0)
+        torch.testing.assert_close(actual_conv[slot], prefix_conv[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual_state[slot], prefix_state[0], rtol=1.6e-2, atol=1e-3)
 
 
 @pytest.mark.parametrize("deterministic", [True, False])
