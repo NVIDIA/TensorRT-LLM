@@ -254,6 +254,7 @@ class DSparkAttention(DSparkAttentionKernel):
         inverse_rope_dim: int = 0,
         history_page_size: int = 32,
         num_heads: int = num_heads,
+        use_pdl: bool = False,
     ):
         if num_heads not in (8, 16, 32, 64, 128):
             raise ValueError(f"DSpark num_heads must be 8, 16, 32, 64 or 128, got {num_heads}")
@@ -303,6 +304,7 @@ class DSparkAttention(DSparkAttentionKernel):
         self.history_page_size = history_page_size
         # Subdivide the 64-row loads at physical-page and cyclic-window boundaries.
         self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
+        self.use_pdl = use_pdl
         # 64 heads fill only half of the M128 tile, so two consecutive draft
         # tokens share one tile and its K/V loads, one token per CTA. The FP8
         # output epilogue stores one token per tile.

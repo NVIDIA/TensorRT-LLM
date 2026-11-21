@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._utils import is_blackwell_datacenter
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div, pad_up
 
@@ -159,8 +160,23 @@ def _device_supported() -> bool:
     return (
         IS_CUTLASS_DSL_AVAILABLE
         and torch.cuda.is_available()
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        and torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7))
     )
+
+
+def _use_pdl() -> bool:
+    """Whether the chain launches as a programmatic dependent of the draft head."""
+    from ..flashinfer_utils import get_env_enable_pdl
+
+    return is_blackwell_datacenter() and get_env_enable_pdl()
+
+
+@functools.lru_cache(maxsize=None)
+def _one_cta_smem(device_index: int) -> int:
+    """Shared memory per CTA keeping PDL-launched CTAs one per SM (0 if a block cannot have it)."""
+    props = torch.cuda.get_device_properties(device_index)
+    want = props.shared_memory_per_multiprocessor // 2 + 3072
+    return want if want <= props.shared_memory_per_block_optin else 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -178,6 +194,10 @@ def _compiled(
     vocab: int,
     nranks: int,
     num_ctas: int,
+    next_tokens: bool,
+    use_pdl: bool,
+    min_smem: int,
+    packed: bool,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -193,6 +213,10 @@ def _compiled(
         vocab=vocab,
         nranks=nranks,
         num_ctas=num_ctas,
+        next_tokens=next_tokens,
+        use_pdl=use_pdl,
+        min_smem=min_smem,
+        packed=packed,
     )
     dev = torch.device("cuda")
     base = torch.empty((batch * block, local_vocab), dtype=torch.bfloat16, device=dev)
@@ -200,6 +224,7 @@ def _compiled(
     w1 = torch.empty((vocab, dim), dtype=torch.bfloat16, device=dev)
     bonus = torch.empty((batch,), dtype=torch.int64, device=dev)
     out = torch.empty((batch, block), dtype=torch.int32, device=dev)
+    nxt = torch.empty((batch, block + 1), dtype=torch.int32, device=dev) if next_tokens else None
     ws = torch.empty((nranks + 2,), dtype=torch.int64, device=dev)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     return cute.compile(
@@ -209,6 +234,7 @@ def _compiled(
         graph_safe_from_dlpack(w1),
         graph_safe_from_dlpack(bonus, 8),
         graph_safe_from_dlpack(out, 4),
+        None if nxt is None else graph_safe_from_dlpack(nxt, 4),
         graph_safe_from_dlpack(ws),
         cutlass.Int32(0),
         cutlass.Int32(0),
@@ -223,6 +249,8 @@ def markov_chain_supported(
     if workspace is None or base.dim() != 3 or not 0 < base.shape[0] <= MAX_ROWS:
         return False
     if base.dtype != torch.bfloat16:
+        return False
+    if torch.cuda.get_device_capability(base.device) == (10, 7) and base.shape[0] > 2:
         return False
     batch, block, local_vocab = base.shape
     num_ctas = _num_ctas(local_vocab, base.device.index)
@@ -243,20 +271,28 @@ def markov_chain_fused(
     offset: int,
     vocab: int,
     workspace: MarkovWorkspace,
-) -> torch.Tensor:
+    next_tokens: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Draft tokens ``[B, K]`` int32 of the Markov chain over this rank's vocabulary shard.
 
     ``base`` ``[B, K, local_vocab]`` BF16 draft-head logits of this rank's shard (global ids
     ``offset ..``), ``w2`` ``[local_vocab, D]`` the matching Markov projection rows, ``w1``
     ``[vocab, D]`` the Markov embedding, ``bonus`` ``[B]`` the tokens preceding position 0. Every
-    rank of the workspace's TP group must call it with the same ``B`` and ``K``.
+    rank of the workspace's TP group must call it with the same ``B`` and ``K``. ``next_tokens``
+    also returns ``[bonus, tokens]`` as ``[B, K + 1]`` int32.
     """
     import cuda.bindings.driver as cuda
     import cutlass
 
     batch, block, local_vocab = base.shape
     out = torch.empty((batch, block), dtype=torch.int32, device=base.device)
+    nxt = (
+        torch.empty((batch, block + 1), dtype=torch.int32, device=base.device)
+        if next_tokens
+        else None
+    )
     num_ctas = _num_ctas(local_vocab, base.device.index)
+    use_pdl = _use_pdl()
     fn = _compiled(
         batch,
         block,
@@ -265,6 +301,10 @@ def markov_chain_fused(
         vocab,
         workspace.nranks,
         num_ctas,
+        next_tokens,
+        use_pdl,
+        _one_cta_smem(base.device.index) if use_pdl else 0,
+        is_blackwell_datacenter(),
     )
     bonus = bonus.to(torch.int64).contiguous()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -274,9 +314,10 @@ def markov_chain_fused(
         graph_safe_from_dlpack(w1),
         graph_safe_from_dlpack(bonus, 8),
         graph_safe_from_dlpack(out, 4),
+        None if nxt is None else graph_safe_from_dlpack(nxt, 4),
         graph_safe_from_dlpack(workspace.table),
         cutlass.Int32(workspace.rank),
         cutlass.Int32(offset),
         stream,
     )
-    return out
+    return (out, nxt) if next_tokens else out

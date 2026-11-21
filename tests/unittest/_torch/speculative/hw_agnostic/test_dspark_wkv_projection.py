@@ -14,6 +14,8 @@
 # limitations under the License.
 """Packed backfill WKV projection matches the per-stage projections."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -21,6 +23,7 @@ from torch import nn
 from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkDraftModel
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.mapping import Mapping
 
 
 def _make_model(
@@ -34,6 +37,7 @@ def _make_model(
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     nn.Module.__init__(model)
     model.uses_lagged_pre = True
+    model.model_config = SimpleNamespace(mapping=Mapping())
     model.checkpoint_fp8_block_size = 32
     model._attn_params = {
         "head_dim": head_dim,

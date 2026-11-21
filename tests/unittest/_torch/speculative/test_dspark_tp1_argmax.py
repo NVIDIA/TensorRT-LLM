@@ -16,6 +16,7 @@ from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import CompactTPArgmax
 from tensorrt_llm._torch.models.modeling_speculative import VanillaMarkov, markov_prev_embeddings
 from tensorrt_llm._torch.modules.embedding import LMHead
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.mxfp8_draft_head import quantize_mxfp8_rows
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -132,8 +133,11 @@ def test_fp8_head_feeds_the_chain_its_mxfp8_logits():
     if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("The MXFP8 draft head needs FlashInfer's CuTe DSL MXFP8 GEMM on SM100/SM103")
+        pytest.skip(
+            "The MXFP8 draft head needs FlashInfer's CuTe DSL MXFP8 GEMM on SM100/SM103/SM107"
+        )
     device = torch.device("cuda", torch.cuda.current_device())
     vocab, block, hidden, markov_rank, batch = 129280, 5, 5120, 256, 4
     with torch.inference_mode():
@@ -200,3 +204,68 @@ def test_fp8_head_feeds_the_chain_its_mxfp8_logits():
             dequantized = values[rows].float().view(2048, hidden // 32, 32) * scale
             bound = torch.maximum(weight.abs() * 2.0**-4, scale * 2.0**-10)
             assert bool(((dequantized - weight).abs() <= bound).all())
+
+
+def test_vocab_shard_draft_head_streams_bf16_activations(monkeypatch):
+    """A vocabulary shard of the draft head at decode rows, streamed against BF16 activations, lands
+    closer to the dequantized reference than the W8A8 GEMM; a CUDA-graph replay equals eager."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+        IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("The MXFP8 draft head needs SM100/SM103 with the CuTe DSL")
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows, vocab, hidden, markov_rank = 5, 129280, 5120, 256
+    with torch.inference_mode():
+        head = LMHead(
+            vocab,
+            hidden,
+            dtype=torch.bfloat16,
+            mapping=Mapping(world_size=8, tp_size=8, rank=3),
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
+            reduce_output=False,
+        ).to(device)
+        markov = VanillaMarkov(vocab_size=vocab, markov_rank=markov_rank).to(device)
+        generator = torch.Generator(device=device).manual_seed(4712)
+        head.weight.copy_(
+            torch.randn(head.weight.shape, device=device, dtype=torch.bfloat16, generator=generator)
+            / math.sqrt(hidden)
+        )
+        normalized = torch.randn(
+            (1, rows, hidden), device=device, dtype=torch.bfloat16, generator=generator
+        )
+        state = CompactTPArgmax()
+        state._prepare_weights(head, markov)
+        _, values, _ = state._head_fp8
+        scales = state._head_fp8_linear_scales
+        assert scales is not None
+        stream = state._fp8_head_logits(head, normalized)
+        with monkeypatch.context() as patched:
+            # Rows above the GEMV's limit take the W8A8 GEMM.
+            patched.setattr(modeling_dspark, "_HEAD_STREAM_MAX_ROWS", 0)
+            w8a8 = state._fp8_head_logits(head, normalized)
+
+        weight = values.float().view(values.shape[0], hidden // 32, 32)
+        weight = (weight * torch.exp2(scales.float() - 127)[..., None]).view(
+            values.shape[0], hidden
+        )
+        reference = normalized.reshape(rows, hidden).double() @ weight.double().t()
+        reference = reference.view(1, rows, -1)
+        # BF16 output rounding plus FP32 sums over 5120 exact products.
+        bound = reference.abs() * 2.0**-8 + 1e-3
+        assert bool(((stream.double() - reference).abs() <= bound).all())
+        assert (stream.double() - reference).abs().mean() < (w8a8.double() - reference).abs().mean()
+
+        graph, captured = _capture(lambda: state._fp8_head_logits(head, normalized))
+        normalized.copy_(
+            torch.randn(normalized.shape, device=device, dtype=torch.bfloat16, generator=generator)
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, state._fp8_head_logits(head, normalized))

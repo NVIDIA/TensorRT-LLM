@@ -23,7 +23,7 @@ Covers the three P0 guarantees:
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock, patch, sentinel
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -262,15 +262,17 @@ def test_embedded_dspark_builder_selects_under_the_targets_eplb(monkeypatch):
         moe_backend=None,
         moe_tactic=None,
     )
+    model_config.use_cuda_graph = False
     draft_config = SimpleNamespace(pretrained_config=SimpleNamespace(model_type="deepseek_v4"))
-    draft_cls = Mock(return_value=sentinel.draft)
+    built = SimpleNamespace(dspark_model=SimpleNamespace())
+    draft_cls = Mock(return_value=built)
     monkeypatch.setattr(modeling_dspark, "count_dspark_stages", lambda checkpoint_dir: NUM_STAGES)
     monkeypatch.setattr(modeling_dspark, "validate_dspark_eplb_layer_base", lambda *args: None)
     monkeypatch.setattr(modeling_dspark, "DSv4DSparkForCausalLM", draft_cls)
 
     draft = modeling_dspark._build_dspark_draft(model_config, draft_config, None, SimpleNamespace())
 
-    assert draft is sentinel.draft
+    assert draft is built
     assert draft_cls.call_args.kwargs["draft_moe_selection"] == MoESelection(
         backend="MEGAMOE_CUTEDSL"
     )

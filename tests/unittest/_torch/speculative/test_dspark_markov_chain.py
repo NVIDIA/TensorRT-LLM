@@ -7,7 +7,7 @@ summation order and the reference (float64 dot -> FP32 -> BF16, FP32 logit addit
 smallest-id argmax) must match bit for bit. The chain's dedicated exchange workspace must not interact
 with the model's all-reduce workspace: CUDA-graph replays mix batch sizes (so consecutive launches clear
 different extents), interleave library one-shot all-reduces and cross the launch-tag wrap, every value
-checked.
+checked. The chain also writes the next step's input tokens as ``dspark_next_new_tokens`` forms them.
 """
 
 import pickle
@@ -80,6 +80,20 @@ def _reference(base, bonus, w1, w2_double):
     return out
 
 
+def _next_new_tokens(bonus, tokens, gen):
+    """``dspark_next_new_tokens`` of an acceptance whose bonus tokens are ``bonus``."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.dspark.generation_prepare import (
+        dspark_next_new_tokens,
+    )
+
+    batch = bonus.shape[0]
+    num_accepted = torch.randint(1, BLOCK + 2, (batch,), generator=gen, device="cuda").int()
+    accepted = torch.randint(0, VOCAB, (batch, BLOCK + 1), generator=gen, device="cuda").int()
+    accepted[torch.arange(batch, device="cuda"), num_accepted.long() - 1] = bonus.int()
+    rows = torch.arange(batch, dtype=torch.int32, device="cuda")
+    return dspark_next_new_tokens(accepted, tokens, rows, num_accepted)
+
+
 @torch.inference_mode()
 def _run(tp_size: int, fabric: bool) -> bool:
     from tensorrt_llm._torch.speculative.dspark_markov_chain import (
@@ -113,16 +127,22 @@ def _run(tp_size: int, fabric: bool) -> bool:
 
         def fused(base, bonus):
             shard = base[:, :, offset : offset + local].contiguous()
-            assert markov_chain_supported(shard, w2_shard, w1, workspace)
-            return markov_chain_fused(shard, w2_shard, w1, bonus, offset, VOCAB, workspace)
+            supported = markov_chain_supported(shard, w2_shard, w1, workspace)
+            assert supported == (
+                torch.cuda.get_device_capability() != (10, 7) or shard.shape[0] <= 2
+            )
+            return markov_chain_fused(
+                shard, w2_shard, w1, bonus, offset, VOCAB, workspace, next_tokens=True
+            )
 
         for batch in (1, 2, 4, 8):
             for trial in range(3):
                 base, bonus = _make_inputs(batch, 100 * batch + trial, VOCAB)
-                got = fused(base, bonus).long()
+                got, nxt = fused(base, bonus)
                 torch.testing.assert_close(
-                    got, _reference(base, bonus, w1, w2_double), rtol=0, atol=0
+                    got.long(), _reference(base, bonus, w1, w2_double), rtol=0, atol=0
                 )
+                assert torch.equal(nxt, _next_new_tokens(bonus, got, gen))
 
         graphs = {}
         for batch in (1, 2, 4, 8):
@@ -132,11 +152,11 @@ def _run(tp_size: int, fabric: bool) -> bool:
             x2 = torch.zeros(3 * batch, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
             def body(shard=shard, bonus=bonus, x1=x1, x2=x2):
-                return (
-                    allreduce(x1),
-                    markov_chain_fused(shard, w2_shard, w1, bonus, offset, VOCAB, workspace),
-                    allreduce(x2),
+                y1 = allreduce(x1)
+                tokens, nxt = markov_chain_fused(
+                    shard, w2_shard, w1, bonus, offset, VOCAB, workspace, next_tokens=True
                 )
+                return y1, tokens, nxt, allreduce(x2)
 
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
@@ -151,7 +171,7 @@ def _run(tp_size: int, fabric: bool) -> bool:
         order = random.Random(99)  # same sequence on every rank
         for it in range(60):
             batch = order.choice(sorted(graphs))
-            graph, shard, bonus, x1, x2, (y1, tokens, y2) = graphs[batch]
+            graph, shard, bonus, x1, x2, (y1, tokens, nxt, y2) = graphs[batch]
             base, bonus_ids = _make_inputs(batch, 1000 + 37 * it + batch, VOCAB)
             shard.copy_(base[:, :, offset : offset + local])
             bonus.copy_(bonus_ids)
@@ -170,6 +190,7 @@ def _run(tp_size: int, fabric: bool) -> bool:
             torch.testing.assert_close(
                 tokens.long(), _reference(base, bonus_ids, w1, w2_double), rtol=0, atol=0
             )
+            assert torch.equal(nxt, _next_new_tokens(bonus_ids, tokens, gen))
             sum1, sum2 = xs1[0].float(), xs2[0].float()
             for r in range(1, tp_size):
                 sum1 = sum1 + xs1[r].float()
@@ -191,8 +212,8 @@ def _fabric_supported() -> bool:
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.device_count() < 4
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="needs 4 SM100/SM103 GPUs",
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="needs 4 SM100/SM103/SM107 GPUs",
 )
 @pytest.mark.parametrize("fabric", [False, True], ids=["ipc", "fabric"])
 @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
