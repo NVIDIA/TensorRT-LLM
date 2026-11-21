@@ -1935,12 +1935,6 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyE
     return executor
 
 
-def test_get_kv_cache_capacity_without_manager():
-    executor = _make_executor_with_kv_cache_manager(None)
-
-    assert executor.get_kv_cache_capacity() == {}
-
-
 @pytest.mark.parametrize("streaming_events", [False, True])
 def test_get_kv_cache_capacity_from_stats(streaming_events):
     """KV capacity is available without consuming iteration stats."""
