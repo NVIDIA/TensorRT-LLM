@@ -19,8 +19,11 @@ records (vn, beta * k, decay), from which the next round replays the accepted dr
 Grid (H, N, 8), cluster (1, 1, 8), 256 threads. CTA (h, n, s) owns V rows [16 s, 16 s + 16) of local head h for
 request n; warp w owns rows 16 s + 2 w and 16 s + 2 w + 1, and lane l keys k = 32 i + l (i < 4) of each.
 
+Request n has two slots: ``slots[n]`` in the state pool ``ssm`` and ``draft_slots[n]`` in the draft-record pools
+(``state_tok``, ``pending`` and the conv caches). The two pools may differ in size and the slots in value.
+
 Before ``griddepcontrol.wait`` (written by the previous verify step, or constant):
-  the slot and P, the drafts the sampler accepted last round; the starting state into registers (the pool state,
+  the slots and P, the drafts the sampler accepted last round; the starting state into registers (the pool state,
   committed after the last golden token, with P drafts replayed from their records); the raw conv inputs at positions
   -3..-1 before the first new token (conv-cache columns P..P+2) for q and k (128 channels) and v (this CTA's 16);
   the conv weights, dt_bias, A_log and the output-norm weight; the head's W_fb^T block by TMA.
@@ -31,7 +34,7 @@ Pre-compute:  warp t = verify token t: q, k = l2norm(silu(conv4(u))) (q also sca
               this CTA's 16 v channels.
 Recurrence:   sequential FP32 packed-FMA delta-rule updates over the verify tokens, unrolled; the state after
               token 0 (the golden token) is committed to the pool; token t >= 1 leaves its draft's records (vn,
-              beta * k, decay) in ``state_tok[slot]``.
+              beta * k, decay) in ``state_tok[draft slot]``.
 Epilogue:     the gated RMSNorm of the outputs over V (per-token sums of squares stored into every peer's shared
               memory, one cluster barrier), bf16 output rows; CTA 0 rewrites the q/k conv cache (the window at the
               golden token and the raw inputs of the drafts), every CTA the same for its v channels.
@@ -242,9 +245,10 @@ def k3_kda_verify_kernel(
     cs_k: cutlass.Array,
     cs_v: cutlass.Array,
     ssm: cutlass.Array,  # fp32 [pool][H][V][K] at slot stride ssm_stride: the state after the last golden token
-    state_tok: cutlass.Array,  # fp32 [pool][3][NUM_SPEC][H][K]: the records of the last round's drafts
-    slots: cutlass.Array,  # int32 [N]
-    pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
+    state_tok: cutlass.Array,  # fp32 [draft pool][3][NUM_SPEC][H][K]: the records of the last round's drafts
+    slots: cutlass.Array,  # int32 [N]: each request's slot in ssm
+    draft_slots: cutlass.Array,  # int32 [N]: each request's slot in state_tok, pending and the conv caches
+    pending: cutlass.Array,  # int32 [draft pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [T][H][V]
     proj_words: cutlass.Int32,
     ssm_stride: cutlass.Int64,  # fp32 elements between the pool's slots (the manager interleaves conv states)
@@ -364,23 +368,25 @@ def k3_kda_verify_kernel(
                 )
 
     slot = slots.load(idx=n)
-    pend = pending.load(idx=cutlass.Int64(slot) * pending_stride)
+    draft = draft_slots.load(idx=n)
+    pend = pending.load(idx=cutlass.Int64(draft) * pending_stride)
     pend = cutlass.Int32(
         cutlass.select_(pend > cutlass.Int32(NUM_SPEC), cutlass.Int32(NUM_SPEC), pend)
     )
     exp_a = cute.math.exp(a_log.load(idx=h), fastmath=True)
     row_a = v0 + warp * ROWS
     # The warp owns both rows and lane l keys 32 i + l (the arithmetic of kda_mtp_decode).
-    # The drafts' records, in each slot's region of state_tok: the row innovations vn [NUM_SPEC][H][V], then beta * k
-    # and the decay [NUM_SPEC][H][K]. The state after the accepted drafts is the pool's (the golden token's) with each
-    # accepted draft's update replayed, S = fma(decay, S, vn * (beta * k)): the recurrence's own arithmetic, so it is
-    # bit-identical to the one the drafts reached. k3_kda_attn uses the same records.
+    # The drafts' records, in each draft slot's region of state_tok: the row innovations vn [NUM_SPEC][H][V], then
+    # beta * k and the decay [NUM_SPEC][H][K]. The state after the accepted drafts is the pool's (the golden token's)
+    # with each accepted draft's update replayed, S = fma(decay, S, vn * (beta * k)): the recurrence's own arithmetic,
+    # so it is bit-identical to the one the drafts reached. k3_kda_attn uses the same records.
     CT_VN = 0
     CT_WB = NUM_SPEC * H * V
     CT_WD = CT_WB + NUM_SPEC * H * K
-    # The slot's pool state and records from their first element: the slot offset in 64 bits, once.
+    # The pool state at the slot and the records at the draft slot, from their first elements: each offset in 64 bits,
+    # once.
     pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
-    tok = state_tok.subview(cutlass.Int64(slot) * state_tok_stride)
+    tok = state_tok.subview(cutlass.Int64(draft) * state_tok_stride)
     st_base = (h * V + row_a) * K
     for r in cutlass.range_constexpr(ROWS):
         for i in cutlass.range_constexpr(VEC):
@@ -422,7 +428,7 @@ def k3_kda_verify_kernel(
         c4_q = (tidx % (K // 4)) * 4
         s_uq.store(
             _load_conv4(
-                cs_q, cutlass.Int64(slot) * cs_q_stride + (pend + m_q) * HK + ch0 + c4_q, CONV_BF16
+                cs_q, cutlass.Int64(draft) * cs_q_stride + (pend + m_q) * HK + ch0 + c4_q, CONV_BF16
             ),
             idx=m_q * K + c4_q,
             alignment=16,
@@ -432,7 +438,7 @@ def k3_kda_verify_kernel(
         c4_k = ((tidx - QH) % (K // 4)) * 4
         s_uk.store(
             _load_conv4(
-                cs_k, cutlass.Int64(slot) * cs_k_stride + (pend + m_k) * HK + ch0 + c4_k, CONV_BF16
+                cs_k, cutlass.Int64(draft) * cs_k_stride + (pend + m_k) * HK + ch0 + c4_k, CONV_BF16
             ),
             idx=m_k * K + c4_k,
             alignment=16,
@@ -443,7 +449,7 @@ def k3_kda_verify_kernel(
         s_uv.store(
             _load_conv4(
                 cs_v,
-                cutlass.Int64(slot) * cs_v_stride + (pend + m_v) * HK + ch0 + v0 + c4_v,
+                cutlass.Int64(draft) * cs_v_stride + (pend + m_v) * HK + ch0 + v0 + c4_v,
                 CONV_BF16,
             ),
             idx=m_v * V_CTA + c4_v,
@@ -788,7 +794,7 @@ def k3_kda_verify_kernel(
                 _store_conv(
                     cs_q,
                     s_uq.load(idx=(s + 1) * K + tidx),
-                    cutlass.Int64(slot) * cs_q_stride + s * HK + ch0 + tidx,
+                    cutlass.Int64(draft) * cs_q_stride + s * HK + ch0 + tidx,
                     CONV_BF16,
                 )
         else:
@@ -797,7 +803,7 @@ def k3_kda_verify_kernel(
                 _store_conv(
                     cs_k,
                     s_uk.load(idx=(s + 1) * K + ck_c),
-                    cutlass.Int64(slot) * cs_k_stride + s * HK + ch0 + ck_c,
+                    cutlass.Int64(draft) * cs_k_stride + s * HK + ch0 + ck_c,
                     CONV_BF16,
                 )
     for it in cutlass.range_constexpr((S * V_CTA + THREADS - 1) // THREADS):
@@ -808,7 +814,7 @@ def k3_kda_verify_kernel(
             _store_conv(
                 cs_v,
                 s_uv.load(idx=(s_col + 1) * V_CTA + v_col),
-                cutlass.Int64(slot) * cs_v_stride + s_col * HK + ch0 + v0 + v_col,
+                cutlass.Int64(draft) * cs_v_stride + s_col * HK + ch0 + v0 + v_col,
                 CONV_BF16,
             )
 
@@ -830,6 +836,7 @@ def k3_kda_verify(
     ssm: cute.Tensor,
     state_tok: cute.Tensor,
     slots: cute.Tensor,
+    draft_slots: cute.Tensor,
     pending: cute.Tensor,
     out: cute.Tensor,
     proj_words: cutlass.Int32,
@@ -873,7 +880,7 @@ def k3_kda_verify(
     )
     k3_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots,
-        pending, out, proj_words, ssm_stride, cs_q_stride, cs_k_stride, cs_v_stride, state_tok_stride,
+        draft_slots, pending, out, proj_words, ssm_stride, cs_q_stride, cs_k_stride, cs_v_stride, state_tok_stride,
         pending_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB, CONV_BF16, USE_PDL,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,

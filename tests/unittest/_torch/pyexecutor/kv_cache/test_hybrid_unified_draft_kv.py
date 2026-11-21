@@ -468,7 +468,8 @@ _K3_TARGET_POOL_RATIO = [0.14, 0.635, 0.205, 0.02]
 
 def _k3_draft_pool_ratio_config(pool_ratio):
     manager = object.__new__(KimiK3HybridCacheManager)
-    manager._appended_draft_layer_specs = {3: None}
+    manager._draft_layer_specs = (_draft_spec(7),)
+    manager.layer_offsets = {7: 3}
     manager.max_seq_len = _K3_MAX_SEQ_LEN
     config = KVCacheManagerConfig(
         tokens_per_block=128,
