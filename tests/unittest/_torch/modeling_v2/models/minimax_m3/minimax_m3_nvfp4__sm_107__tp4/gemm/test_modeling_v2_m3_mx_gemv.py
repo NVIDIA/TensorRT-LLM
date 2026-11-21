@@ -13,7 +13,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.mxfp8_quantize
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_mx_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_mx_gemv import (  # noqa: E501
     m3_mx_gemv as op,
 )
 
@@ -97,7 +97,7 @@ def test_guard_refuses_a_strided_weight() -> None:
 def test_qkv_split8_config(nk, m) -> None:
     """The TP4 dispatch's (split, ring) override for the QKV at decode rows: within the band of the fp64 reference,
     and the graph replay bit-identical to the eager call (one split-K order per config)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (
         modeling as dispatch,
     )
 
@@ -118,7 +118,7 @@ def test_qkv_split8_config(nk, m) -> None:
 def test_qkv_split8_config_is_bounded(monkeypatch) -> None:
     """The overrides cover only the two QKV projections (split 8) and the o_proj (strided k-tiles, rule 1b) at decode
     rows; every other call, and every call with its kill knob off, keeps the shared table."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (
         modeling as dispatch,
     )
 
@@ -141,10 +141,10 @@ def test_prebuild_covers_the_split8_config_while_frozen(nk) -> None:
     ``_linear`` can pick for this projection, the TP4 (split, ring) override included: with compiles frozen afterwards
     (as the target freezes them before warmup), every decode-row MXFP8 call at the override is served, none
     declines."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (
         modeling as dispatch,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.mx_gemv import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.mx_gemv import (  # noqa: E501
         op as mx_gemv,
     )
 

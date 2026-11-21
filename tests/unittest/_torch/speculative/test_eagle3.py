@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
+from test_common.moe_tactics import sm100f_moe_tactic_or_cutlass
 from utils.llm_data import llm_models_root
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
@@ -81,7 +82,9 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     metadata = _Metadata()
 
     @contextmanager
-    def draft_context(attn_metadata, manager):
+    def draft_context(attn_metadata,
+                      manager,
+                      enable_draft_locality_domain_forkjoin=False):
         assert attn_metadata is metadata
         assert manager is draft_manager
         events.append("switch")
@@ -96,6 +99,7 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
 
     worker = SimpleNamespace(
         is_mtp_eagle=True,
+        _draft_takes_kept_rows=False,
         draft_kv_cache_context=draft_context,
         _run_draft_forward=run_draft_forward,
         _step0_draft_layer_picks_rows=lambda draft_model, use_epilogue: False,
@@ -439,6 +443,43 @@ def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
         spec_metadata.context_prompt_lookahead_tokens[:2],
         torch.tensor([0, invalid], dtype=torch.int32, device="cuda"),
     )
+
+
+@skip_num_gpus_less_than(1)
+@pytest.mark.parametrize("fast_paths", [False, True])
+def test_mtp_eagle_generation_only_draft_input_ids(fast_paths) -> None:
+    """A generation-only step's draft input ids are the accepted tokens: read
+    in place on the speculative fast paths, else a concatenated copy."""
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    spec_metadata = Eagle3OneModelSpecMetadata(
+        max_num_requests=2,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+        spec_dec_mode=spec_config.spec_dec_mode,
+        num_layers=1,
+        hidden_size=4,
+        max_num_tokens=8,
+    )
+    spec_metadata.gather_ids = torch.tensor([3, 7],
+                                            dtype=torch.int32,
+                                            device="cuda")
+    spec_metadata.runtime_draft_len = 3
+    accepted = torch.arange(8, dtype=torch.int32, device="cuda").view(2, 4)
+    worker = MTPEagleWorker(spec_config, spec_decode_fast_paths=fast_paths)
+    draft_inputs = worker.prepare_1st_drafter_inputs(
+        input_ids=torch.zeros(8, dtype=torch.int32, device="cuda"),
+        position_ids=torch.arange(8, dtype=torch.int32,
+                                  device="cuda").unsqueeze(0),
+        hidden_states=torch.zeros((8, 4), device="cuda"),
+        accepted_tokens=accepted,
+        attn_metadata=SimpleNamespace(num_contexts=0, num_ctx_tokens=0),
+        spec_metadata=spec_metadata,
+        draft_model=SimpleNamespace(),
+    )
+    input_ids = draft_inputs["input_ids"]
+    assert input_ids.dtype == torch.int32
+    assert torch.equal(input_ids, accepted.flatten())
+    assert (input_ids.data_ptr() == accepted.data_ptr()) == fast_paths
 
 
 @skip_num_gpus_less_than(1)
@@ -1220,22 +1261,25 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 
+    moe_tactic = sm100f_moe_tactic_or_cutlass("trtllm_gen")
     llm_common_config = dict(
         model=model_path,
         tensor_parallel_size=8,
         moe_expert_parallel_size=8,
         pipeline_parallel_size=1,
-        moe_config=MoeConfig(backend="TRTLLM"),
+        moe_config=MoeConfig(tactic=moe_tactic),
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_seq_len=8192,
     )
+    # The target's tactic does not reach the MTP layers, so they pin it too.
     spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
                                     use_dynamic_tree=True,
                                     dynamic_tree_max_topK=10,
-                                    max_total_draft_tokens=31)
+                                    max_total_draft_tokens=31,
+                                    moe_tactic=moe_tactic)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     prompt = llm_spec.tokenizer.apply_chat_template(

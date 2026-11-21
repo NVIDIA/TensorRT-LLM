@@ -429,6 +429,8 @@ def drafter(kind, num_slots=4):
 def executor_for_preemption(p, reqs, scheduler):
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
+    # As the base scheduler: no request lost its KV pages to a failed remote cache level.
+    scheduler.take_lost_kv_requests.return_value = []
     executor = SimpleNamespace(
         _gen_preemption=p,
         scheduler=scheduler,

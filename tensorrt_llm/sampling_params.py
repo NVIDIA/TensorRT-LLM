@@ -107,6 +107,10 @@ class LogprobMode(StrEnum):
     RAW = "raw"
     """
     Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+    For single-beam requests, they exclude the embedding bias, the repetition, presence and frequency penalties, the
+    token bans (bad words, no-repeat n-grams and min_length), temperature, and top-k/top-p. Guided decoding and
+    logits processors still apply. Requests with a beam width above 1 return the log probabilities recorded in
+    their beam search history, so these exclusions do not apply to them.
     """
     PROCESSED = "processed"
     """
@@ -438,6 +442,14 @@ class SamplingParams:
                 f"TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 "
                 f"under the greedy decoding."
             )
+
+        # An empty stop string tokenizes to no tokens, and the sampler rejects a
+        # stop word without tokens while setting up the request, which fails
+        # every request in flight with it instead of just this one.
+        if self.stop is not None:
+            stop_strings = [self.stop] if isinstance(self.stop, str) else self.stop
+            if any(stop_string == "" for stop_string in stop_strings):
+                raise ValueError("stop must not contain an empty string")
 
         self.logprobs_mode = LogprobMode(self.logprobs_mode)
 

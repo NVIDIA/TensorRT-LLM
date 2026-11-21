@@ -15,18 +15,29 @@ unbound against a minimal fake ``self`` and check that:
   executor is idle;
 * an interval of 1 still builds a record on every iteration;
 * KV-cache iteration deltas are keyed on the record's construction iteration,
-  so they still line up with sampled records under the overlap scheduler.
+  so they still line up with sampled records under the overlap scheduler;
+* completions of first-token close-outs, which run no batch, are recorded by
+  an iteration without a batch under the same rules, once, and under
+  attention DP through rank 0.
 """
 
 from __future__ import annotations
 
+import json
+import threading
 import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
+from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
+from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 pytestmark = pytest.mark.cpu_only
 
@@ -42,6 +53,7 @@ def _build_fake_self(interval: int, *, enabled: bool = True):
     fake.active_requests = []
     fake._pending_num_new_active_requests = 0
     fake._pending_num_completed_requests = 0
+    fake._has_close_outs_pending_iter_stats = False
     fake._latest_host_step_time_ms = None
     fake._latest_prev_device_step_time_ms = None
     # _get_init_iter_stats: no spec-decode resource manager / spec config.
@@ -216,6 +228,148 @@ def test_interval_one_never_flushes_unsampled_batch():
     fake._append_iter_stats.assert_not_called()
 
 
+def test_overlap_record_excludes_the_batch_already_running():
+    """The running batch reaches the queued-work scan through both hops."""
+    current_batch = MagicMock()
+    current_batch.all_requests.return_value = []
+
+    fake = _build_fake_self(interval=1)
+    fake.previous_batch = MagicMock()
+    PyExecutor._process_previous_batch(fake, current_batch)
+    assert fake._process_iter_stats.call_args.kwargs == {"current_batch": current_batch}
+
+    fake = _build_fake_self(interval=1)
+    batch_state = BatchState(
+        scheduled_requests=MagicMock(),
+        sample_state=MagicMock(),
+        iter_start_time=0.0,
+        iter_stats=_run_iteration(fake, 0, num_new=0),
+        iter_id=0,
+    )
+    PyExecutor._process_iter_stats(fake, [], [], batch_state, current_batch=current_batch)
+    assert fake._update_iter_stats.call_args.kwargs == {"current_batch": current_batch}
+
+
+# ---------------------------------------------------------------------------
+# _process_close_out_iter_stats
+# ---------------------------------------------------------------------------
+
+
+def _with_close_outs(fake: MagicMock, num_closed: int) -> MagicMock:
+    """``fake`` after first-token close-outs left ``num_closed`` completions pending."""
+    fake._process_iter_stats = types.MethodType(PyExecutor._process_iter_stats, fake)
+    fake._pending_num_completed_requests += num_closed
+    fake._has_close_outs_pending_iter_stats = True
+    return fake
+
+
+def _run_iteration_without_batch(fake: MagicMock, iter_counter: int) -> None:
+    fake.iter_counter = iter_counter
+    PyExecutor._process_close_out_iter_stats(fake, fake._init_iter_stats_if_sampled(0), 0.0)
+
+
+def _record_completed(
+    stats: IterationStats, _iter_latency_ms: float, num_completed_requests: int, *_args, **_kwargs
+) -> IterationStats:
+    stats.num_completed_requests = num_completed_requests
+    return stats
+
+
+def test_close_outs_are_recorded_once_by_an_iteration_without_a_batch() -> None:
+    fake = _with_close_outs(_build_fake_self(interval=1), num_closed=2)
+    _run_iteration_without_batch(fake, 5)
+    _run_iteration_without_batch(fake, 6)
+    assert [(stats.iter, completed) for stats, completed in _emitted(fake)] == [(5, 2)]
+
+
+def test_close_outs_in_an_unsampled_iteration_follow_the_interval_rules() -> None:
+    """Carried while requests remain active, then reported by the next sampled
+    iteration; with no active request left, a drain record reports them at once."""
+    fake = _with_close_outs(_build_fake_self(interval=4), num_closed=2)
+    fake.active_requests = [MagicMock()]
+    _run_iteration_without_batch(fake, 1)
+    assert _emitted(fake) == []
+    _run_iteration_without_batch(fake, 4)
+    assert [(stats.iter, completed) for stats, completed in _emitted(fake)] == [(4, 2)]
+
+    drained = _with_close_outs(_build_fake_self(interval=4), num_closed=3)
+    _run_iteration_without_batch(drained, 1)
+    _run_iteration_without_batch(drained, 2)
+    assert [(stats.iter, completed) for stats, completed in _emitted(drained)] == [(1, 3)]
+
+
+def test_close_outs_under_attention_dp_are_fanned_out_once_through_rank0() -> None:
+    """Only rank 0 reports them, as it owns the completion counts. Its record
+    is fanned out once the next exchange has collected the other rank's zero
+    payload, and never again."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    for rank, buffer in enumerate(buffers):
+        fake = _build_fake_self(interval=1)
+        fake.enable_attention_dp = True
+        fake.dist.rank = rank
+        fake._adp_iter_stats = buffer
+        fake._latest_kv_iter_stats = None
+        fake._update_iter_stats.side_effect = _record_completed
+        if PyExecutor._reports_completions.fget(fake):
+            _with_close_outs(fake, num_closed=2)
+        _run_iteration_without_batch(fake, 9)
+
+    def exchange() -> list:
+        states = []
+        for rank, buffer in enumerate(buffers):
+            payload = buffer.next_payload()
+            states.append(
+                RankState(rank=rank)
+                if payload is None
+                else RankState(rank=rank, iter_stats=payload)
+            )
+        return [buffer.finalize(states, is_rank0=rank == 0) for rank, buffer in enumerate(buffers)]
+
+    first, second, third = exchange(), exchange(), exchange()
+    assert first == [[], []]
+    rank0_rows, rank1_rows = second
+    assert rank1_rows == []
+    assert [
+        (row["attentionDpRank"], row["iter"], row["numCompletedRequests"])
+        for row in map(json.loads, rank0_rows)
+    ] == [(0, 9, 2), (1, 9, 0)]
+    assert third == [[], []]
+
+
+def test_close_out_record_is_not_replaced_by_the_queue_snapshot_of_its_iteration() -> None:
+    """The tail of an iteration without a batch also takes a queue snapshot.
+    The close-out record already is that iteration's record: under attention
+    DP a snapshot of the same iteration would replace it before its fanout,
+    and its completions with it."""
+    fake = _with_close_outs(_build_fake_self(interval=1), num_closed=2)
+    fake.enable_attention_dp = True
+    fake.is_shutdown = False
+    fake.dist.rank = 0
+    fake._adp_iter_stats = ADPIterStatsBuffer()
+    fake._latest_kv_iter_stats = None
+    fake._update_iter_stats.side_effect = _record_completed
+    fake._quiescent_stats_iter = None
+
+    _run_iteration_without_batch(fake, 9)
+    PyExecutor._maybe_emit_quiescent_stats(fake, engine_idle=False)
+
+    fake._build_quiescent_stats.assert_not_called()
+    payload = fake._adp_iter_stats.next_payload()
+    rows = fake._adp_iter_stats.finalize([RankState(rank=0, iter_stats=payload)], is_rank0=True)
+    assert [
+        (row["iter"], row["numCompletedRequests"], "isQueueSnapshot" in row)
+        for row in map(json.loads, rows)
+    ] == [(9, 2, False)]
+
+    # Without a record (an unsampled iteration that keeps the completions
+    # pending), the iteration's snapshot is still due.
+    carried = _with_close_outs(_build_fake_self(interval=4), num_closed=1)
+    carried.active_requests = [MagicMock()]
+    carried._quiescent_stats_iter = None
+    _run_iteration_without_batch(carried, 1)
+    assert carried._quiescent_stats_iter is None
+
+
 # ---------------------------------------------------------------------------
 # _update_iter_stats: KV-cache iteration stats interval
 # ---------------------------------------------------------------------------
@@ -234,13 +388,19 @@ def _kv_update_fake(kv_interval: int):
         missed_blocks=4,
         cache_hit_rate=0.0,
     )
-    kv_cache_manager.get_iteration_stats.return_value = {32: "deltas"}
+    delta = KvCacheIterationStats()
+    delta.iter_reused_blocks = 3
+    kv_cache_manager.get_iteration_stats.return_value = {32: delta}
 
     fake = MagicMock()
+    fake._perf_metrics = PerfMetricsCollector()
+    fake.dist.rank = 0
+    fake.global_rank = 0
     fake.max_num_active_requests = 8
     fake.enable_attention_dp = False
     fake.executor_request_queue.get_request_queue_size.return_value = 0
     fake.executor_request_queue.get_request_queue.return_value.queue = []
+    fake.waiting_queue = FCFSWaitingQueue()
     fake.resource_manager.resource_managers.get.return_value = kv_cache_manager
     fake._kv_iter_stats_interval = kv_interval
     fake._last_kv_iter_stats_fetch_iter = None
@@ -248,7 +408,7 @@ def _kv_update_fake(kv_interval: int):
     return fake, kv_cache_manager
 
 
-def _update(fake, stats_iter: int):
+def _update(fake, stats_iter: int, **kwargs):
     stats = IterationStats()
     stats.inflight_batching_stats = InflightBatchingStats()
     stats.iter = stats_iter
@@ -271,6 +431,7 @@ def _update(fake, stats_iter: int):
             num_completed_requests=0,
             scheduled_batch=scheduled_batch,
             micro_batch_id=0,
+            **kwargs,
         )
     return fake._latest_kv_iter_stats
 
@@ -283,7 +444,10 @@ def test_kv_iteration_stats_follow_construction_iter_not_live_counter():
         # Live counter one ahead, as under the overlap scheduler.
         fake.iter_counter = stats_iter + 1
         fetched[stats_iter] = _update(fake, stats_iter)
-    assert fetched == {0: {32: "deltas"}, 4: {32: "deltas"}, 8: {32: "deltas"}}
+    assert fetched == {
+        iteration: kv_cache_manager.get_iteration_stats.return_value for iteration in (0, 4, 8)
+    }
+    assert fake._perf_metrics.latest_rank["kvCacheIterationStats"]["32"]["iterReusedBlocks"] == 3
     assert kv_cache_manager.get_iteration_stats.call_count == 3
 
 
@@ -291,7 +455,94 @@ def test_kv_iteration_stats_skip_non_interval_records_and_duplicates():
     fake, kv_cache_manager = _kv_update_fake(kv_interval=4)
     fake.iter_counter = 100
     assert _update(fake, 6) is None
-    assert _update(fake, 8) == {32: "deltas"}
+    assert _update(fake, 8) is kv_cache_manager.get_iteration_stats.return_value
     # A second record for the same iteration must not drain the deltas again.
     assert _update(fake, 8) is None
     assert kv_cache_manager.get_iteration_stats.call_count == 1
+
+
+def test_queue_snapshot_leaves_kv_iteration_stats_to_measured_records():
+    """A snapshot neither fetches the KV deltas nor clears or advances the fetch state."""
+    fake, kv_cache_manager = _kv_update_fake(kv_interval=4)
+    deltas = kv_cache_manager.get_iteration_stats.return_value
+    fake.iter_counter = 100
+    assert _update(fake, 4) is deltas
+    rank_snapshot = fake._perf_metrics.latest_rank
+
+    # On an interval iteration a snapshot must not fetch (fetching resets the
+    # native deltas); off the interval it must not clear the latest stats.
+    fake._fill_kv_host_stats.reset_mock()
+    fake._take_scheduling_counters.reset_mock()
+    for stats_iter in (8, 9):
+        assert _update(fake, stats_iter, consume_deltas=False) is deltas
+    assert kv_cache_manager.get_iteration_stats.call_count == 1
+    assert fake._last_kv_iter_stats_fetch_iter == 4
+    # Nor does it take the other counters that reset when read.
+    assert [call.args[2] for call in fake._fill_kv_host_stats.call_args_list] == [False, False]
+    fake._take_scheduling_counters.assert_not_called()
+    # Nor does it collect a new rank snapshot, which would carry iteration 4's deltas again.
+    assert fake._perf_metrics.latest_rank is rank_snapshot
+
+    # The measured record of iteration 8 still gets its fetch.
+    assert _update(fake, 8) is deltas
+    assert fake._perf_metrics.latest_rank["batchIter"] == 8
+    assert kv_cache_manager.get_iteration_stats.call_count == 2
+    assert fake._last_kv_iter_stats_fetch_iter == 8
+    assert fake._fill_kv_host_stats.call_args.args[2] is True
+    fake._take_scheduling_counters.assert_called_once()
+
+
+@pytest.mark.parametrize("consume_deltas", [True, False])
+def test_page_table_counters_are_taken_only_by_measured_records(consume_deltas):
+    """Reading the page-table counters resets them; the slab size is a plain gauge."""
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.host_slab_bytes.return_value = 4096
+    kv_cache_manager.take_page_table_stats.return_value = (1, 2, 3, 4.5)
+    kv_stats = types.SimpleNamespace(num_page_table_reuses=0)
+
+    PyExecutor._fill_kv_host_stats(
+        types.SimpleNamespace(_is_kv_manager_v2=True), kv_stats, kv_cache_manager, consume_deltas
+    )
+
+    assert kv_stats.host_slab_bytes == 4096
+    assert kv_cache_manager.take_page_table_stats.call_count == int(consume_deltas)
+    assert kv_stats.num_page_table_reuses == int(consume_deltas)
+
+
+def test_zero_duration_row_does_not_repeat_the_latest_kv_iteration_stats():
+    """A queue snapshot must not repeat the KV deltas of the last measured record."""
+    fake = types.SimpleNamespace(
+        enable_attention_dp=False,
+        enable_iter_perf_stats=True,
+        disable_overlap_scheduler=True,
+        dist=types.SimpleNamespace(pp_size=1, tp_size=1),
+        max_stats_len=1000,
+        stats=[],
+        stats_lock=threading.Lock(),
+        _latest_kv_iter_stats={32: "deltas"},
+        _latest_host_step_time_ms=6.0,
+        _latest_prev_device_step_time_ms=4.0,
+        _take_mm_encoder_stats=lambda: None,
+    )
+    fake._stats_scheduler_mode = PyExecutor._stats_scheduler_mode.__get__(fake)
+    stats = IterationStats()
+
+    PyExecutor._append_iter_stats(fake, stats)
+    snapshot = PyExecutor._zero_duration_stats_row(fake, stats)
+
+    (measured,) = fake.stats
+    assert measured == IterationStatsRecord(
+        stats,
+        kv_iteration_stats={32: "deltas"},
+        host_step_time_ms=6.0,
+        prev_device_step_time_ms=4.0,
+        scheduler_mode="non_overlap",
+    )
+    assert snapshot == IterationStatsRecord(
+        stats,
+        host_step_time_ms=0.0,
+        prev_device_step_time_ms=0.0,
+        scheduler_mode="non_overlap",
+        gpu_forward_time_ms=0.0,
+        is_queue_snapshot=True,
+    )

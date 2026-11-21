@@ -230,6 +230,7 @@ class TestSingleNodeSpawnLocalRank:
             patch(
                 "tensorrt_llm._torch.visual_gen.executor._detect_external_launch", return_value=None
             ),
+            patch("tensorrt_llm._torch.visual_gen.executor.dist.TCPStore"),
             patch("tensorrt_llm._torch.visual_gen.executor._get_mp_context", return_value=mock_ctx),
             patch("tensorrt_llm._torch.visual_gen.executor._Thread") as mock_thread_cls,
             patch("tensorrt_llm._torch.visual_gen.executor._Event", side_effect=pre_set_event),

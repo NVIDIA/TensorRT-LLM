@@ -48,7 +48,7 @@ from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
-                      NonNegativeInt, PositiveInt, field_validator,
+                      NonNegativeInt, PositiveInt, PrivateAttr, field_validator,
                       model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -377,6 +377,21 @@ class ConversationParams(OpenAIBaseModel):
         description=("Server-private parent-session id for sub-agent routing "
                      "affinity; forwarded to workers as a header, never in the "
                      "body."))
+
+    # The server generated conversation_id for one request; it never recurs.
+    _generated_for_one_request: bool = PrivateAttr(default=False)
+
+    @classmethod
+    def for_one_request(cls, conversation_id: str) -> "ConversationParams":
+        """Params with a ``conversation_id`` generated for one request."""
+        params = cls(conversation_id=conversation_id)
+        params._generated_for_one_request = True
+        return params
+
+    @property
+    def generated_for_one_request(self) -> bool:
+        """Whether ``conversation_id`` was generated for one request."""
+        return self._generated_for_one_request
 
     @field_validator("conversation_id", mode="before")
     @classmethod
@@ -1561,7 +1576,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
             check_logprobs_limit("top_logprobs", top_logprobs)
-            if not data.get("logprobs"):
+            if top_logprobs > 0 and not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
         return data
@@ -2535,8 +2550,10 @@ class MediaReferenceItem(OpenAIBaseModel):
         description="The reference payload, in the form declared by ``format``."
     )
     format: Literal["path", "url", "base64"] = Field(description=(
-        "Wire form of ``content``: ``path`` (a file readable by the server; a "
-        "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
+        "Wire form of ``content``: ``path`` (a server-side file under the "
+        "directory named by ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR``; a ``file://`` "
+        "URI is also accepted; at most 200 MiB per file and 512 MiB across "
+        "the ``path`` references of one request), ``url`` (``http(s)``, fetched "
         "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
         "also accepted). Raw bytes reach the server as a multipart upload, "
         "which carries no ``format`` of its own. Distinct from the top-level "
@@ -2778,7 +2795,7 @@ class StartProfileRequest(OpenAIBaseModel):
         default=None,
         description="Directory where chrome traces are written. Defaults "
         "to the TLLM_TORCH_PROFILER_DIR environment variable, "
-        "then /tmp.")
+        "then a temporary directory.")
     num_steps: Optional[PositiveInt] = Field(
         default=None,
         description="Number of iterations to profile. Must be >= 1 if "

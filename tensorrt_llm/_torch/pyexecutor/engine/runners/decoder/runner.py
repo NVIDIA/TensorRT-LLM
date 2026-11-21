@@ -19,6 +19,8 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
+from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
+from tensorrt_llm._torch.models.modeling_multimodal_utils import needs_multimodal_encoder
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.context_logits import context_logits_heads, context_logits_scope
 from tensorrt_llm._torch.moe.fused_moe import moe_warmup_placement
@@ -330,7 +332,10 @@ class DecoderRunner(ScheduledModelRunner):
         self, mm_item_scheduler: MultimodalItemScheduler | None
     ) -> DecoderInputPreparer:
         """Build the input preparer over this runner's buffers."""
-        return DecoderInputPreparer(**self._input_preparer_kwargs(mm_item_scheduler))
+        return DecoderInputPreparer(
+            **self._input_preparer_kwargs(mm_item_scheduler),
+            attention_runtime_features=self._attention_runtime_features,
+        )
 
     def _make_cuda_graphs(self) -> DecoderCudaGraphs:
         """Build the CUDA graph component; call after the input preparer."""
@@ -514,6 +519,7 @@ class DecoderRunner(ScheduledModelRunner):
         return cuda_graph_runner
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
+        sampling_variants = getattr(self._config.cuda_graph_config, "sampling_variants", None)
         return CUDAGraphRunnerConfig(
             use_cuda_graph=self._config.cuda_graph_config is not None,
             cuda_graph_padding_enabled=self._config.cuda_graph_padding_enabled,
@@ -536,6 +542,7 @@ class DecoderRunner(ScheduledModelRunner):
             prioritize_decode_graphs=self.runtime_hooks.prioritize_decode_graphs,
             stage_decode_inputs=self.runtime_hooks.stage_decode_inputs,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
+            sampling_variants=None if sampling_variants is None else frozenset(sampling_variants),
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
             static_input_ids=(
@@ -695,7 +702,7 @@ class DecoderRunner(ScheduledModelRunner):
         # through the padding exchange (sync_group_all_greedy_sample).
         sampling_mode = None
         if samples_from_adp_head_shards(spec_metadata, self._mapping):
-            sampling_mode = one_model_sampling_mode(graph_requests.all_requests())
+            sampling_mode = one_model_sampling_mode(graph_requests.all_requests(), spec_metadata)
         with self._graphs.pad_batch(
             graph_requests, resource_manager, runtime_draft_len, sampling_mode=sampling_mode
         ) as padded_graph_requests:
@@ -752,6 +759,13 @@ class DecoderRunner(ScheduledModelRunner):
                 and context_plan is None
                 and not (ced_enabled and scheduled_requests.num_context_requests > 0)
             )
+            if (
+                key is None
+                and not is_dummy
+                and spec_metadata is not None
+                and scheduled_requests.num_context_requests == 0
+            ):
+                self._graphs.warn_uncaptured_sampling_variant(spec_metadata)
             if can_run_graph:
                 attn_metadata = selection.attn_metadata
                 spec_metadata = selection.spec_metadata
@@ -863,6 +877,10 @@ class DecoderRunner(ScheduledModelRunner):
 
             graph_key = key if can_run_graph else None
             captures_model_body = self._graphs.captures_model_body(graph_key)
+            # The encoder can hold the GIL while it waits on the device, so the host functions of
+            # the previous graph replay must run first.
+            if needs_multimodal_encoder(inputs.get("multimodal_params")):
+                drain_captured_hostfuncs()
             with (
                 self._maybe_bypass_torch_compile(bypass=context_plan is not None),
                 context_logits_scope(context_plan),
@@ -948,8 +966,14 @@ class DecoderRunner(ScheduledModelRunner):
         is_dummy: bool,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
+        # Lets a model start work that reads only graph inputs beside the input corrections.
         inputs = self._inputs.preprocess_inputs(
-            inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
+            inputs,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            mark_prologue_start=getattr(
+                getattr(self._model, "model", None), "mark_prologue_start", None
+            ),
         )
         spec_metadata = inputs.get("spec_metadata")
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
