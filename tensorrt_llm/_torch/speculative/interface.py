@@ -66,7 +66,8 @@ from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
 from .vocab_parallel import (VocabParallelHead, VocabShardedLogits,
                              is_vocab_sharded_lm_head, key_exchange_takes,
-                             sharded_greedy_argmax, tp_pair_exchange)
+                             sharded_greedy_argmax, tp_pair_exchange,
+                             vocab_parallel_temperature_enabled)
 
 
 def _watermark_active(spec_metadata) -> bool:
@@ -97,7 +98,8 @@ def supports_sharded_target_sampling(spec_config, mapping) -> bool:
 def _temperature_only(spec_metadata, temperature_capable: bool) -> bool:
     """Graph key bit of the temperature-only variant: the variant is captured,
     the batch samples, every sampled row can be drawn on the sharded logits
-    (temperature only, no seed of its own), and the batch takes neither
+    (temperature only, no seed of its own, a temperature at or above the
+    greedy threshold), and the batch takes neither
     rejection sampling nor penalties. Seeded rows keep main's per-row Philox
     streams on the stock sampler."""
     return bool(spec_metadata.temperature_only_graphs and temperature_capable
@@ -1641,8 +1643,12 @@ class SpecMetadata:
 
             has_non_greedy_requests |= not params.is_greedy
             all_temperature_only &= params.is_greedy or params.is_shard_sampleable
+            # The key exchange draws rows below the greedy threshold by
+            # argmax (the lowest id of tied maxima), while the stock sampler
+            # still samples them (tied maxima evenly): such rows keep it.
             if (temperature_graphs and not params.is_greedy
-                    and not params.is_shard_sampleable):
+                    and not (params.is_shard_sampleable and params.temperature
+                             >= GREEDY_TEMPERATURE_THRESHOLD)):
                 temperature_capable = False
 
             per_request_normalized.append(
@@ -2035,9 +2041,9 @@ class SpecWorkerBase(nn.Module, ABC):
     #: in only if its other uses of the logits are dtype-safe too.
     reads_lm_head_dtype_logits: bool = False
 
-    # Whether the worker's acceptance reads the target logits of a greedy
-    # batch only through ``_sample_tokens_for_batch``, so that
-    # ``target_logits`` may hand it this rank's vocab shard instead (see
+    # Whether the worker's acceptance reads the target logits of a greedy or
+    # temperature-only batch only through ``_sample_tokens_for_batch``, so
+    # that ``target_logits`` may hand it this rank's vocab shard instead (see
     # ``enable_vocab_parallel_argmax``). The tree workers (their verification
     # reads every tree node's logits) and DFlash / DSpark (their own
     # VocabParallelHead selection) leave it False.
@@ -2243,13 +2249,19 @@ class SpecWorkerBase(nn.Module, ABC):
     def enable_vocab_parallel_argmax(self, lm_head, key_exchange) -> bool:
         """Select the greedy target tokens of this worker from the vocab
         shard of ``lm_head`` (and greedy draft tokens of a vocab-sharded draft
-        head through ``key_exchange``) instead of the gathered logits.
+        head through ``key_exchange``) instead of the gathered logits. With a
+        key exchange and ``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1`` (opt-in),
+        the target tokens of temperature-only batches are drawn on the shard
+        too (Gumbel-max in the exchange, see
+        :meth:`_sample_sharded_temperature`), unless the acceptance reads more
+        than the selected target tokens.
 
         Collective over the TP group: every rank calls it at construction,
         with the same arguments. ``key_exchange`` is the TP group's
-        ``ll_exchange.TPKeyExchange`` or None; the NCCL pair exchange takes
-        the rows it cannot. Returns whether the worker takes the path; it
-        does not for a worker whose acceptance reads the logits otherwise
+        ``ll_exchange.TPKeyExchange`` or None (its setup agrees on failure
+        across the group); the NCCL pair exchange takes the greedy rows it
+        cannot. Returns whether the worker takes the path; it does not for a
+        worker whose acceptance reads the logits otherwise
         (``verifies_on_target_shard``) or a head that is not vocab-sharded.
         """
         if not (self.verifies_on_target_shard
@@ -2264,13 +2276,26 @@ class SpecWorkerBase(nn.Module, ABC):
         self._target_pair_exchange = tp_pair_exchange(lm_head.mapping,
                                                       AllReduceStrategy.NCCL)
         self._vocab_parallel_argmax = True
+        if (self.key_exchange is not None
+                and vocab_parallel_temperature_enabled()
+                and self._verifies_target_by_argmax()):
+            self._samples_sharded_temperature = True
         logger.info(
             f"{type(self).__name__}: vocab-parallel greedy argmax enabled "
             f"(tp={lm_head.mapping.tp_size}, shard={lm_head.out_features}, "
             f"key exchange="
-            f"{'none' if self.key_exchange is None else self.key_exchange.transport})"
-        )
+            f"{'none' if self.key_exchange is None else self.key_exchange.transport}, "
+            f"temperature-only sampling on the shard="
+            f"{self._samples_sharded_temperature})")
         return True
+
+    @property
+    def samples_sharded_temperature(self) -> bool:
+        """Whether temperature-only batches may draw their target tokens on
+        the vocab shard, so the engine captures the temperature-only CUDA
+        graph variant (``SpecMetadata.temperature_only_graphs``). Identical
+        on every TP rank."""
+        return self._samples_sharded_temperature
 
     def _shard_selection_allowed(self, spec_metadata) -> bool:
         """Whether this batch's sampling lets the target tokens come from the
