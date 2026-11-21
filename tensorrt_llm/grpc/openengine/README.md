@@ -395,6 +395,14 @@ public protobuf adapter. Dynamo forwards the reference unchanged.
 For the optional shared-file backend, set `TRTLLM_OPENENGINE_ENCODER_CACHE_DIR`
 to the same private directory on the encoder and its consuming PD or P engine.
 They must run on the same host and use the same checkpoint path.
+Cache files are isolated in `.trtllm-encoder-cache-v1` beneath that directory;
+empty paths and symlinked cache directories are rejected.
+
+Both native backends default to 1 GiB per encoded output and 4 GiB retained.
+Set `TRTLLM_ENCODER_MAX_TENSOR_BYTES` and `TRTLLM_ENCODER_MAX_CACHE_BYTES`
+on each engine to change these budgets. The cache budget must cover one output.
+NIXL CUDA staging uses dedicated allocations compatible with expandable segments;
+received buffers are copied into PyTorch-owned storage before native CUDA IPC.
 
 The engine materializes native encoder exports into safetensors storage; tensor
 contents never pass through Dynamo. This baseline adds CPU copies and storage I/O.

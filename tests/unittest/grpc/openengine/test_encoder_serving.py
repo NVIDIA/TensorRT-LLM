@@ -336,7 +336,7 @@ async def test_cancelled_encode_reclaims_native_exports(encoder_inference, tmp_p
     assert outcomes == [("encode", "cancelled")]
     assert handle.disaggregated_params.multimodal_embedding_handles is None
     assert handle.disaggregated_params.mrope_position_ids_handle is None
-    assert not list(tmp_path.glob("*.safetensors"))
+    assert not list(inference._encoder_cache.root.glob("*.safetensors"))
     assert not inference._encoder_cleanup_tasks
 
 
@@ -538,7 +538,7 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(
     rpc = asyncio.create_task(consume())
     try:
         await asyncio.wait_for(entered.wait(), 2)
-        assert list(tmp_path.glob("*.safetensors"))
+        assert list(inference._encoder_cache.root.glob("*.safetensors"))
         if cancel_path == "rpc":
             rpc.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -562,7 +562,7 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(
         release.set()
         await asyncio.gather(rpc, return_exceptions=True)
     await asyncio.wait_for(reclaimed.wait(), 2)
-    assert not list(tmp_path.glob("*.safetensors"))
+    assert not list(inference._encoder_cache.root.glob("*.safetensors"))
     assert inference._encoder_cleanup_failed is (cancel_path == "discard_failure")
     assert inference.active_request_count() == 0
     if cancel_path == "reservation":
@@ -625,7 +625,7 @@ async def test_abandoned_publication_keeps_rpc_loop_live_and_cleanup_tracked(
         await asyncio.wait_for(drain, 2)
         await asyncio.gather(rpc, return_exceptions=True)
         assert discarded == [True]
-        assert not list(tmp_path.glob("*.safetensors"))
+        assert not list(inference._encoder_cache.root.glob("*.safetensors"))
         assert not inference._encoder_cleanup_tasks
         assert inference.active_request_count() == 0
         assert inference._media_admission._value == available
@@ -875,7 +875,7 @@ async def test_release_encoder_cache_over_real_grpc(tmp_path):
             for _ in range(2):
                 response = await stub.ReleaseEncodedMedia(req, timeout=2)
                 assert isinstance(response, encoding_pb2.ReleaseEncodedMediaResponse)
-        assert not list(tmp_path.glob("*.safetensors"))
+        assert not list(cache.root.glob("*.safetensors"))
     finally:
         await server.stop(0)
 
@@ -915,7 +915,7 @@ async def test_encoder_service_shares_control_abort_and_releases_outputs(
             else:
                 response = await call
                 assert response.request_id == "encode" and response.encoded_media.opaque_state
-                assert list(tmp_path.glob("*.safetensors"))
+                assert list(inference._encoder_cache.root.glob("*.safetensors"))
                 for _ in range(2):
                     await encoder.ReleaseEncodedMedia(
                         encoding_pb2.ReleaseEncodedMediaRequest(
@@ -923,7 +923,7 @@ async def test_encoder_service_shares_control_abort_and_releases_outputs(
                         ),
                         timeout=2,
                     )
-                assert not list(tmp_path.glob("*.safetensors"))
+                assert not list(inference._encoder_cache.root.glob("*.safetensors"))
             assert not server._inference.active_request_count()
     finally:
         await server.stop(grace=0)

@@ -2703,7 +2703,7 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
         assert responses[-1].usage.completion_tokens > 0
         assert len(calls) == 1
         assert len(received) == 1 and torch.equal(received[0], expected)
-        assert not list(tmp_path.glob("*.safetensors"))
+        assert not list((tmp_path / ".trtllm-encoder-cache-v1").glob("*.safetensors"))
     finally:
         for channel in channels:
             await channel.close()
