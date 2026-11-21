@@ -159,6 +159,7 @@ l0_b200:
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
+  - unittest/_torch/modules/test_logits_cast.py
   # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2 (decode / route fronts below).
   - unittest/_torch/moe/test_moe_nvfp4_engine.py
   - unittest/_torch/moe/test_moe_bf16_engine.py
