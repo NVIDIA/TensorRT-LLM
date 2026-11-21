@@ -127,6 +127,78 @@ def build_gemma_attention_mask(
     return output
 
 
+# Conservative long-prefill cutoff: two dense bool masks cost 128 MiB at 8K.
+# Routing uses the batch's token-weighted length, not its longest request;
+# even [8192, 1] stays dense.
+_MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS = 8192
+
+
+def _use_compact_image_mask_for_lengths(context_lengths: list[int]) -> bool:
+    """Select compact masks using sum(length squared) / sum(length)."""
+    total_tokens = sum(context_lengths)
+    return total_tokens > 0 and sum(
+        length * length for length in context_lengths
+    ) >= _MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS * total_tokens
+
+
+def build_gemma_context_variable_window(
+    mm_token_type_ids: torch.Tensor,
+    effective_sliding_window: int | None = None,
+    prefix_len: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build inclusive sequence-local KV bounds; vision types 1/2 form blobs.
+
+    Call separately for each packed request so adjacent vision runs never cross
+    request boundaries. Gemma3 maps its boolean image flags to type 1.
+
+    Args:
+        mm_token_type_ids: One-dimensional integer modality IDs for new tokens.
+        effective_sliding_window: Number of visible causal keys including the
+            query, or None for global attention.
+        prefix_len: Number of cached tokens preceding the new tokens.
+
+    Returns:
+        Two contiguous int32 vectors of inclusive start and end positions,
+        one entry per new token.
+    """
+    extend_len = mm_token_type_ids.numel()
+    positions = torch.arange(
+        prefix_len,
+        prefix_len + extend_len,
+        device=mm_token_type_ids.device,
+        dtype=torch.int32,
+    )
+    if effective_sliding_window is None:
+        starts = torch.zeros_like(positions)
+    else:
+        starts = torch.clamp(positions - effective_sliding_window + 1, min=0)
+    ends = positions.clone()
+
+    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+    previous_types = torch.cat((mm_token_type_ids.new_full(
+        (1, ), -1), mm_token_type_ids[:-1]))
+    next_types = torch.cat(
+        (mm_token_type_ids[1:], mm_token_type_ids.new_full((1, ), -1)))
+    blob_starts = is_vision & (mm_token_type_ids != previous_types)
+    blob_ends = is_vision & (mm_token_type_ids != next_types)
+
+    local_positions = torch.arange(extend_len,
+                                   device=mm_token_type_ids.device,
+                                   dtype=torch.int32)
+    start_candidates = torch.where(blob_starts, local_positions, -1)
+    vision_starts = torch.cummax(start_candidates, dim=0).values + prefix_len
+    end_candidates = torch.where(blob_ends, local_positions, extend_len)
+    vision_ends = (torch.flip(
+        torch.cummin(torch.flip(end_candidates, dims=(0, )), dim=0).values,
+        dims=(0, ),
+    ) + prefix_len)
+
+    starts = torch.where(is_vision, torch.minimum(starts, vision_starts),
+                         starts)
+    ends = torch.where(is_vision, torch.maximum(ends, vision_ends), ends)
+    return starts.contiguous(), ends.contiguous()
+
+
 class Gemma3TextScaledWordEmbedding(Embedding):
 
     def __init__(
@@ -346,6 +418,9 @@ class Gemma3TextModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         local_attention_mask_data: Optional[torch.Tensor] = None,
         global_attention_mask_data: Optional[torch.Tensor] = None,
+        local_variable_window_token_starts: Optional[torch.Tensor] = None,
+        global_variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -366,6 +441,11 @@ class Gemma3TextModel(DecoderModel):
                 attention_mask_data=local_attention_mask_data
                 if decoder_layer.self_attn.is_sliding else
                 global_attention_mask_data,
+                variable_window_token_starts=(
+                    local_variable_window_token_starts
+                    if decoder_layer.self_attn.is_sliding else
+                    global_variable_window_token_starts),
+                variable_window_token_ends=variable_window_token_ends,
                 **kwargs,
             )
 
@@ -416,6 +496,25 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                               length, length)
 
     # Image blobs cannot be split by chunked prefill or partial prefix reuse.
+    @staticmethod
+    def _get_image_context_lengths(
+            attn_metadata: AttentionMetadata) -> list[int]:
+        num_contexts = attn_metadata.num_contexts
+        assert num_contexts > 0, "There should be at least one context request in the batch for custom mask."
+
+        context_lens = attn_metadata.seq_lens[:num_contexts].tolist()
+        cached_token_lens = (
+            attn_metadata.kv_cache_params.
+            num_cached_tokens_per_seq[:num_contexts]
+            if attn_metadata.kv_cache_params is not None and
+            attn_metadata.kv_cache_params.num_cached_tokens_per_seq is not None
+            else [0] * num_contexts)
+        assert not any(cached_token_lens), (
+            "cached_token_lens should be 0 for context requests since chunked prefill "
+            "and kv cache reuse must be disabled.")
+
+        return context_lens
+
     def get_attention_mask(
             self,
             image_token_mask: torch.BoolTensor,
@@ -440,19 +539,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             A flattened boolean mask of shape (sum(q_len[i] * k_len[i] for i in range(batch_size)).
         """
 
-        num_contexts = attn_metadata.num_contexts
-        assert num_contexts > 0, "There should be at least one context request in the batch for custom mask."
-
-        context_lens = attn_metadata.seq_lens[:num_contexts].tolist()
-        cached_token_lens = (
-            attn_metadata.kv_cache_params.
-            num_cached_tokens_per_seq[:num_contexts]
-            if attn_metadata.kv_cache_params is not None and
-            attn_metadata.kv_cache_params.num_cached_tokens_per_seq is not None
-            else [0] * num_contexts)
-        assert not any(cached_token_lens), (
-            "cached_token_lens should be 0 for context requests since chunked prefill "
-            "and kv cache reuse must be disabled.")
+        context_lens = self._get_image_context_lengths(attn_metadata)
+        cached_token_lens = [0] * len(context_lens)
 
         # Create masks for context requests.
         return build_gemma_attention_mask(image_token_mask, context_lens,
@@ -473,17 +561,40 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
 
         local_attention_mask_data = None
         global_attention_mask_data = None
+        local_variable_window_token_starts = None
+        global_variable_window_token_starts = None
+        variable_window_token_ends = None
         if image_token_mask is not None:
-            global_attention_mask_data = self.get_attention_mask(
-                image_token_mask=image_token_mask,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=None,
-            )
-            local_attention_mask_data = self.get_attention_mask(
-                image_token_mask=image_token_mask,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=self.config.sliding_window,
-            )
+            context_lens = self._get_image_context_lengths(attn_metadata)
+            # Both global and sliding layers consume bounds; each backend must
+            # support them under its current per-layer quantization settings.
+            if (_use_compact_image_mask_for_lengths(context_lens) and all(
+                    layer.self_attn.attn.supports_variable_window(attn_metadata)
+                    for layer in self.model.layers)):
+                local_starts, ends = [], []
+                offset = 0
+                for length in context_lens:
+                    starts, stop = build_gemma_context_variable_window(
+                        image_token_mask[offset:offset + length].to(
+                            torch.int32), self.config.sliding_window)
+                    local_starts.append(starts)
+                    ends.append(stop)
+                    offset += length
+                local_variable_window_token_starts = torch.cat(local_starts)
+                global_variable_window_token_starts = torch.zeros_like(
+                    local_variable_window_token_starts)
+                variable_window_token_ends = torch.cat(ends)
+            else:
+                global_attention_mask_data = self.get_attention_mask(
+                    image_token_mask=image_token_mask,
+                    attn_metadata=attn_metadata,
+                    effective_sliding_window=None,
+                )
+                local_attention_mask_data = self.get_attention_mask(
+                    image_token_mask=image_token_mask,
+                    attn_metadata=attn_metadata,
+                    effective_sliding_window=self.config.sliding_window,
+                )
 
         output = self.model(
             input_ids=input_ids,
@@ -492,6 +603,11 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             inputs_embeds=inputs_embeds,
             local_attention_mask_data=local_attention_mask_data,
             global_attention_mask_data=global_attention_mask_data,
+            local_variable_window_token_starts=
+            local_variable_window_token_starts,
+            global_variable_window_token_starts=
+            global_variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
             **kwargs,
         )
 
