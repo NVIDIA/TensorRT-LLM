@@ -13851,22 +13851,93 @@ class PyExecutor:
             self.inflight_req_ids.erase(req_id)
         scheduled_requests.added_inflight_req_ids = []
 
+    def _release_padding_dummies_for_reuse_reset(self) -> List[Tuple[int, int]]:
+        """Release the CUDA graph padding dummies before a V2 reuse reset.
+
+        KVCacheManagerV2.clear_reusable_blocks() refuses to run while any KV
+        cache is open, and a padding dummy keeps one open between steps, so
+        every reset after a weight update failed on an engine that had padded
+        a batch. Releasing goes through CUDAGraphRunner.release_padding_dummy,
+        which frees the dummy in every manager holding it.
+
+        Returns the released ``(draft_len, variant)`` pairs, which
+        ``_restore_padding_dummies_after_reuse_reset`` re-creates.
+        """
+        if not self._is_kv_manager_v2:
+            return []
+        runner = getattr(getattr(self, "model_engine", None),
+                         "cuda_graph_runner", None)
+        if runner is None:
+            return []
+        released = sorted(
+            (draft_len, variant)
+            for variant, cache in enumerate(runner._padding_dummy_caches())
+            for draft_len in cache)
+        for draft_len in sorted({draft_len for draft_len, _ in released}):
+            runner.release_padding_dummy(self.resource_manager, draft_len)
+        return released
+
+    def _restore_padding_dummies_after_reuse_reset(
+            self, released: List[Tuple[int, int]]) -> None:
+        """Re-create the padding dummies released for a V2 reuse reset.
+
+        Conditional attention-DP execution reserves the draft-length-0 dummy
+        as its idle execution row, and ``_can_queue`` requires it on every
+        rank, so it must be back before the next scheduling step. The other
+        dummies are re-created here too: right after a reset the KV pool is
+        at its emptiest, while a later padded step may find it full, as at
+        warmup (see ``preallocate_padding_dummies``).
+
+        A dummy that cannot be re-created stays missing, and the next padded
+        step retries it. The reserved execution row is not retried: the next
+        ``_can_queue`` finds it missing and stops every rank together. Nothing
+        raises here, since the reset itself may already be raising.
+        """
+        if not released:
+            return
+        runner = self.model_engine.cuda_graph_runner
+        remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
+        # Low-row dummies first, so the reserved execution row comes first.
+        for draft_len, variant in sorted(released,
+                                         key=lambda pair: (pair[1], pair[0])):
+            if runner._get_or_create_padding_dummy(self.resource_manager,
+                                                   draft_len,
+                                                   variant=variant) is not None:
+                continue
+            if remote_tail_adp and draft_len == 0 and variant == 0:
+                logger.error(
+                    "Could not re-create the reserved conditional "
+                    "attention-DP execution row after a prefix-cache reset; "
+                    "every rank stops at the next scheduling step.")
+                continue
+            logger.warning(
+                "Could not re-create the CUDA graph padding dummy request "
+                f"(draft_len={draft_len}, variant={variant}) after a "
+                "prefix-cache reset; falling back to lazy re-creation.")
+
     def reset_prefix_cache(self):
-        # Invalidate routes after the native V2 clear returns, even when a
-        # later reset step fails. A precondition rejection keeps them intact.
-        route_capture = getattr(getattr(self, "model_engine", None),
-                                "route_capture", None)
-        clear_routes_in_manager = (route_capture is not None and isinstance(
-            self.kv_cache_manager, KVCacheManagerV2))
-        if clear_routes_in_manager:
-            self.kv_cache_manager.reset_reuse_state(
-                on_cleared=route_capture.clear_shared)
-        else:
-            self.kv_cache_manager.reset_reuse_state()
-        if self.enable_joint_kv_cache_reuse:
-            self.draft_kv_cache_manager.reset_reuse_state()
-        if route_capture is not None and not clear_routes_in_manager:
-            route_capture.clear_shared()
+        released_dummies = self._release_padding_dummies_for_reuse_reset()
+        try:
+            # Invalidate routes after the native V2 clear returns, even when a
+            # later reset step fails. A precondition rejection keeps them
+            # intact.
+            route_capture = getattr(getattr(self, "model_engine", None),
+                                    "route_capture", None)
+            clear_routes_in_manager = (route_capture is not None and isinstance(
+                self.kv_cache_manager, KVCacheManagerV2))
+            if clear_routes_in_manager:
+                self.kv_cache_manager.reset_reuse_state(
+                    on_cleared=route_capture.clear_shared)
+            else:
+                self.kv_cache_manager.reset_reuse_state()
+            if self.enable_joint_kv_cache_reuse:
+                self.draft_kv_cache_manager.reset_reuse_state()
+            if route_capture is not None and not clear_routes_in_manager:
+                route_capture.clear_shared()
+        finally:
+            # A rejected reset leaves the engine serving, so restore them then
+            # too.
+            self._restore_padding_dummies_after_reuse_reset(released_dummies)
 
     def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
         """Reject runtime-memory tags unsupported by the active KV manager."""
