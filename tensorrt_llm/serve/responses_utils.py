@@ -159,6 +159,53 @@ def _is_context_only(request: ResponsesRequest) -> bool:
     return params is not None and params.request_type == "context_only"
 
 
+def name_responses_reply(request: ResponsesRequest, request_id: int) -> bool:
+    """Name the reply to ``request`` ``resp_<request_id>_<16 hex digits>``.
+
+    The reply keeps the server's id for the request, so it can be matched with
+    the server's records of the same request, as an Anthropic message can (see
+    ``anthropic_message_id``); the hex digits keep the id unique across server
+    restarts, which restart the count.
+
+    A single server passes the executor client id (``RequestOutput.request_id``),
+    which the perf metrics, the post-processor hook records and the disconnect
+    log carry; PyExecutor numbers its requests on its own, so its log lines
+    carry a different id. A disaggregated server passes its disaggregated
+    request id.
+
+    The hex digits are the first 16 of the random id a request has by default,
+    so every copy of a request gets the same name: a postprocessing worker
+    builds the reply from a copy of the request made before the executor gave
+    the request its id, and names that copy itself.
+
+    A ``request_id`` that is set, by the client or by a disaggregated server,
+    is kept. Naming a request sets it, so naming it again changes nothing.
+
+    Args:
+        request: The request whose ``request_id`` names its reply.
+        request_id: The server's id for the request.
+
+    Returns:
+        Whether ``request`` was named here.
+    """
+    if "request_id" in request.model_fields_set:
+        return False
+    # The default id is "resp_" and 32 random hex digits.
+    random_hex = request.request_id[len("resp_"):][:16]
+    request.request_id = f"resp_{request_id}_{random_hex}"
+    return True
+
+
+def rename_responses_reply(request: ResponsesRequest, request_id: int) -> None:
+    """Rename a reply ``name_responses_reply`` named after ``request_id``.
+
+    Only the id part of the name changes; the hex digits stay, so renaming a
+    reply after the id it already carries changes nothing.
+    """
+    random_hex = request.request_id.rsplit("_", 1)[1]
+    request.request_id = f"resp_{request_id}_{random_hex}"
+
+
 _harmony_encoding = None
 
 
@@ -378,6 +425,30 @@ class ConversationHistoryStore:
             self.conversation_to_response[conversation_id] = resp_id
             self._trim_conversation(conversation_id)
             self._update_visited_conversation(conversation_id)
+
+    async def rename_response(self, old_resp_id: str, new_resp_id: str) -> None:
+        """File the conversation stored under ``old_resp_id`` under ``new_resp_id``.
+
+        A request's input messages are stored under its ``request_id`` before
+        the server names its reply (see ``name_responses_reply``); the reply,
+        and a later request that continues from it, use the new name.
+
+        Args:
+            old_resp_id: str, the id the messages were stored under.
+            new_resp_id: str, the id of the reply.
+
+        Returns:
+            None
+        """
+        async with self.conversations_lock:
+            conversation_id = self.response_to_conversation.pop(
+                old_resp_id, None)
+            if conversation_id is None:
+                return
+            self.response_to_conversation[new_resp_id] = conversation_id
+            if self.conversation_to_response.get(
+                    conversation_id) == old_resp_id:
+                self.conversation_to_response[conversation_id] = new_resp_id
 
     async def get_conversation_history(
             self, resp_id: str
