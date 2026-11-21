@@ -123,6 +123,17 @@ TEST(AllReduceTacticCache, ReconfigurationAndInvalidRegistration)
     EXPECT_EQ(cache.mapToBucket(4096), 4096);
 }
 
+TEST(AllReduceTacticCache, NegativeTacticRemovesTheBucket)
+{
+    AllReduceTacticCache cache;
+    cache.configure(4096);
+    cache.insert(makeKey(), 16, 8);
+    cache.insert(makeKey(), 32, 0);
+    cache.insert(makeKey(), 16, -1);
+    EXPECT_FALSE(cache.find(makeKey(), 16).has_value());
+    EXPECT_EQ(cache.find(makeKey(), 32), 0);
+}
+
 TEST(AllReduceTacticCache, CompatibleOperationsShareOnlyMeasuredRange)
 {
     AllReduceTacticCache cache;

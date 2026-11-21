@@ -268,7 +268,7 @@ def test_prime_cached_tactics_after_parallel_cache_merge(monkeypatch) -> None:
     JitGemmRunner.kernel_cache.clear()
     JitGemmRunner.calls.clear()
 
-    def merge_remote_winners(strategy, custom_op) -> None:
+    def merge_remote_winners(strategy, custom_op, tuned_again=()) -> None:
         assert strategy == DistributedTuningStrategy.PARALLEL
         for m, tactic in ((3, 0), (20, 1)):
             cache_key = tuner.profiling_cache.get_cache_key(
@@ -2843,6 +2843,12 @@ def test_candidates_fingerprint_keys_same_named_runners_apart(fp_modules):
     alone = autotuner._candidates_fingerprint((narrow, ))
     assert autotuner._own_fingerprint(autotuner._key_fingerprint(
         narrow, alone))[0] == alone
+    # Their names tell which runner an entry is for: they are not one runner
+    # under two builds.
+    assert autotuner._own_fingerprint(autotuner._key_fingerprint(
+        narrow, alone))[1] != autotuner._own_fingerprint(
+            autotuner._key_fingerprint(
+                wide, autotuner._candidates_fingerprint((wide, ))))[1]
 
 
 def test_candidates_fingerprint_tells_factory_runners_apart_by_build(
@@ -3047,7 +3053,14 @@ def test_build_fingerprint_follows_loaded_libraries(monkeypatch, tmp_path):
         monkeypatch.setattr(autotuner, "_NATIVE_FILES",
                             {str(native): autotuner._file_identity(native)})
         assert not build().startswith(autotuner._EDITED_PREFIX)
+        # Removed (unlinked) while the process still runs it.
+        native.unlink()
+        monkeypatch.setattr(autotuner, "_native_libraries", lambda: [])
+        assert build().startswith(autotuner._EDITED_PREFIX)
+        monkeypatch.setattr(autotuner, "_NATIVE_FILES", {})
+        assert not build().startswith(autotuner._EDITED_PREFIX)
         monkeypatch.setattr(autotuner, "_EPOCH_NS", 0)
+        loaded["paths"] = (str(library), )
         assert build().startswith(autotuner._EDITED_PREFIX)
     finally:
         autotuner._clear_fingerprints()
@@ -3070,8 +3083,8 @@ def test_candidates_fingerprint_keys_follow_the_current_gpu(monkeypatch):
     on_sm107 = key()
     device["capability"] = "sm100"
     assert key() != on_sm107
-    assert autotuner._own_fingerprint(key()) == (on_sm107.partition("@")[0],
-                                                 "sm100")
+    own, name, device = autotuner._own_fingerprint(key())
+    assert f"{own}:{name}" == on_sm107.partition("@")[0] and device == "sm100"
 
 
 @pytest.mark.parametrize("mode", ["code", "build"])
@@ -3272,6 +3285,7 @@ def test_code_fingerprint_follows_what_factory_runners_hold(fp_modules):
         (r.deep(r.narrow), r.deep(r.wide)),
         (r.classed((0, )), r.classed((0, 1))),
         (r.holding(r.limited(1)(r.wide)), r.holding(r.limited(2)(r.wide))),
+        (r.constant([0]), r.constant([0, 1])),
     ]
     assert [fp(a) != fp(b) for a, b in pairs] == [True] * len(pairs)
     # Built alike, one fingerprint.
@@ -3333,6 +3347,11 @@ def test_code_fingerprint_follows_tables_changed_through_an_alias_or_a_call(
         SECOND = ALIAS
         SECOND.append(1)
         OTHER = [0]
+        REBOUND = [0]
+        LATER = [0]
+        NAME = REBOUND
+        NAME.append(1)
+        NAME = LATER
 
 
         def init(table):
@@ -3350,12 +3369,20 @@ def test_code_fingerprint_follows_tables_changed_through_an_alias_or_a_call(
         class ByCall(Base):
             def get_valid_tactics(self, inputs, profile, **kwargs):
                 return OTHER
+
+
+        class ByRebound(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return REBOUND
         """)
-    classes = (runners.ByAlias, runners.ByCall)
+    classes = (runners.ByAlias, runners.ByCall, runners.ByRebound)
     before = fp_modules.fingerprints(*classes)
     fp_modules.edit("fp_runners", "SECOND.append(1)", "SECOND.append(2)")
     fp_modules.edit("fp_runners", "table.append(1)", "table.append(2)")
-    assert _changed(before, fp_modules.fingerprints(*classes)) == [True, True]
+    # A change made through an alias bound again later.
+    fp_modules.edit("fp_runners", "NAME.append(1)", "NAME.append(2)")
+    assert _changed(before,
+                    fp_modules.fingerprints(*classes)) == [True, True, True]
 
 
 _HELPER_RUNNER = """
@@ -3388,6 +3415,21 @@ def test_code_fingerprint_follows_the_code_a_process_runs(fp_modules):
     fp_modules.load("fp_util", table.replace("(0, 1)", "(0, 2)"))
     runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
     assert fp_modules.fingerprints(runners.Runner) != stale
+    # Nor a module-level list its stale .pyc builds (the source kept its
+    # mtime and size, so Python took the .pyc for current).
+    import py_compile
+    listed = "T = [0, 1]\n\ndef helper():\n    return T\n"
+    runs = []
+    for loaded, on_disk in ((listed, listed.replace("[0, 1]", "[0, 2]")),
+                            (listed.replace("[0, 1]", "[0, 2]"), ) * 2):
+        fp_modules.load("fp_util", loaded)
+        source = fp_modules.root / "fp_util.py"
+        sys.modules["fp_util"].__cached__ = py_compile.compile(
+            str(source), cfile=str(fp_modules.root / "fp_util.pyc"))
+        source.write_text(on_disk)
+        runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+        runs += fp_modules.fingerprints(runners.Runner)
+    assert runs[0] != runs[1]
     # A helper whose source can no longer be read counts by its code, and by
     # what that code calls.
     unreadable = []
@@ -3593,11 +3635,11 @@ def test_ranks_that_fingerprint_differently_raise(fp_modules):
     def agree(gather):
         tuner = SimpleNamespace(_dist=SimpleNamespace(tp_cp_allgather=gather))
         return autotuner.AutoTuner._agree_on_cache_hit(tuner, candidates, True,
-                                                       (0, "1"))
+                                                       (0, "1")).hit
 
     def rank(obj, **changes):
         fields = ("hit", "fingerprint", "signature", "choice", "groups", "uids",
-                  "profiles", "profile_choices")
+                  "device", "profiles", "profile_choices")
         values = dict(zip(fields, obj))
         values.update(changes)
         return tuple(values[f] for f in fields)
@@ -3666,7 +3708,7 @@ def test_ranks_of_one_communicator_agree_on_every_profile():
         runner, choice, choices = ranks[0]
         return autotuner.AutoTuner._agree_on_cache_hit(tuner, [runner], True,
                                                        choice, profiles,
-                                                       choices)
+                                                       choices).hit
 
     nccl, symmetric = (0, "0"), (0, "8")
     # Helix TP2 x CP2: subgroups [0, 2] and [1, 3] keep their own winners.
@@ -3718,12 +3760,25 @@ def test_rank_signature_tells_factory_runners_apart(fp_modules, monkeypatch):
         [narrow, wide]) != (autotuner._rank_signature([wide, narrow]))
 
 
+def test_rank_signature_under_none_leaves_out_the_build(monkeypatch):
+    """TLLM_AUTOTUNER_CACHE_KEY=none reuses one cache across builds: ranks of
+    different builds still tune together."""
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "none")
+    signatures = []
+    for build in ("one", "two"):
+        monkeypatch.setattr(autotuner, "_native_build_id", lambda: build)
+        autotuner._clear_fingerprints()
+        signatures.append(autotuner._rank_signature([_TacticSpaceRunner()]))
+    autotuner._clear_fingerprints()
+    assert signatures[0] == signatures[1]
+
+
 def test_profiles_whose_entries_chose_differently_are_tuned_again():
     profiles = [
         SimpleNamespace(get_opt_shapes=lambda shapes=shapes: shapes)
         for shapes in (((1, ), ), ((2, ), ), ((3, ), ))
     ]
-    scope = ("unique_id", ("()", ))
+    scope = ("", ("unique_id", ("()", )))
 
     def hits(mine, theirs, their_scope=scope):
         tuner = SimpleNamespace(_dist=SimpleNamespace(
@@ -3736,7 +3791,16 @@ def test_profiles_whose_entries_chose_differently_are_tuned_again():
     assert hits(mine, theirs) == [True, False, False]
     # A rank of another scope (another communicator) may choose differently,
     # but a profile one rank misses is still tuned by all.
-    assert hits(mine, theirs, ("group", ((1, 3), ))) == [True, True, False]
+    assert hits(mine, theirs,
+                ("", ("group", ((1, 3), )))) == [True, True, False]
+    # Ranks of one communicator tune their profiles without the ranks of
+    # another, which may miss them.
+    group = ("", ("group", ((0, 2), )))
+    tuner = SimpleNamespace(_dist=SimpleNamespace(
+        tp_cp_allgather=lambda obj:
+        [obj, (("", ("group", ((1, 3), ))), obj[1], [None, None, None])]))
+    assert autotuner.AutoTuner._profile_hits_on_all_ranks(
+        tuner, profiles, theirs, group) == [True, True, True]
 
 
 def test_parallel_deals_tactics_in_one_order_on_every_rank():
@@ -3898,6 +3962,72 @@ def test_mxfp8_sync_registers_only_entries_for_the_current_code(monkeypatch):
     }
     runner_cls.sync_all_tactic_caches(tuner)
     assert registered == [(16, 32, 64, 3)]
+
+
+def _allreduce_runner(monkeypatch, group=(0, 1)):
+    """An AllReduceRunner over the communicator `group`, profiled at buckets
+    8 and 16 (the class's buckets are restored after the test)."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+    monkeypatch.setattr(AllReduceRunner, "tuning_config",
+                        AllReduceRunner.tuning_config)
+    monkeypatch.setattr(AllReduceRunner, "_registered_buckets", {})
+    AllReduceRunner._set_tuning_buckets([8, 16])
+    return AllReduceRunner(len(group), list(group), torch.bfloat16, 0, 1e-6,
+                           False)
+
+
+def test_allreduce_runner_keys_its_workspace_limit_and_communicator(
+        monkeypatch):
+    """The workspace limit decides which protocols a bucket may use, so an
+    entry tuned under another limit misses; and a communicator's members in
+    another order name the same communicator."""
+    inputs = [torch.empty(8, 64, dtype=torch.bfloat16)]  # 1 KiB.
+    monkeypatch.setenv("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE", "4096")
+    wide = _allreduce_runner(monkeypatch)
+    monkeypatch.setenv("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE", "512")
+    narrow = _allreduce_runner(monkeypatch)
+    assert wide.get_valid_tactics(inputs, None) != narrow.get_valid_tactics(
+        inputs, None)
+    assert wide.unique_id() != narrow.unique_id()
+    reordered = _allreduce_runner(monkeypatch, (1, 0))
+    assert reordered.unique_id() == narrow.unique_id()
+    assert reordered.rank_group() == narrow.rank_group() == (0, 1)
+
+
+def test_allreduce_registers_only_agreed_buckets(monkeypatch):
+    """Native registration takes only the buckets the ranks agreed on: under
+    skip_dynamic_tuning_buckets this input's; and in tuning mode a bucket
+    tuned again without a winner loses the tactic registered before."""
+    runner = _allreduce_runner(monkeypatch)
+    tuner = autotuner.AutoTuner()
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
+    calls = []
+    monkeypatch.setattr(torch.ops.trtllm, "register_allreduce_tactic",
+                        lambda *args: calls.append(args[-2:]))
+    inputs = [
+        torch.empty(8, 64, dtype=torch.bfloat16), None, None, None, None, None
+    ]
+    shapes = tuple(tuner._get_input_sizes(inputs))
+    keys = {}
+    for bucket, tactic in ((8, 0), (16, 4)):
+        keys[bucket] = tuner.profiling_cache.get_cache_key(
+            "trtllm::tunable_allreduce::allreduce",
+            runner, (torch.Size((bucket, 64)), *shapes[1:]),
+            runner.tuning_config,
+            apply_map_to_tuning_buckets=False)
+        tuner.profiling_cache.cache[keys[bucket]] = (0, tactic, 1.0)
+    tuner.is_tuning_mode = True
+    tuner.skip_dynamic_tuning_buckets = True
+    runner._register_native_tactics(inputs)
+    assert calls == [(8, 0)]
+    tuner.skip_dynamic_tuning_buckets = False
+    calls.clear()
+    runner._register_native_tactics(inputs)
+    assert calls == [(8, 0), (16, 4)]
+    tuner.profiling_cache.drop([keys[16]])
+    calls.clear()
+    runner._register_native_tactics(inputs)
+    assert calls == [(8, 0), (16, -1)]
 
 
 def test_search_cache_misses_across_tactic_spaces():
@@ -4723,7 +4853,7 @@ class _ThreadedRanks:
                 self.barrier.abort()
 
         threads = [
-            threading.Thread(target=target, args=(rank, ))
+            threading.Thread(target=target, args=(rank, ), name=f"rank{rank}")
             for rank in range(self.size)
         ]
         for thread in threads:
@@ -4747,18 +4877,22 @@ def _choose_on_ranks(monkeypatch,
                      calls=1):
     """choose_one `calls` times on each rank of a group of len(entries_of),
     the ranks running together. `runners_of(rank)`: the rank's candidates;
-    `entries_of[rank]`: {(runner index, opt shapes): (tactic, ms)} its cache
-    holds first (loaded from a file); `times[(runner name, tactic)]`: what
-    profiling measures. Returns each rank's (runner name, tactic), the
-    (rank, runner name, tactic) of each profiling, and the tuners."""
+    `entries_of[rank]`: {(runner index, opt shapes[, rank]): (tactic, ms)}
+    its cache holds first (loaded from a file), keyed among the candidates
+    of `rank` (this rank's by default); `times[(runner name, tactic)]`, or
+    `times[(rank, runner name, tactic)]`: what profiling measures. Returns
+    each rank's (runner name, tactic), the (rank, runner name, tactic) of
+    each profiling, and the tuners."""
     inputs = inputs or [torch.zeros(8, 64)]
     profiled = []
     lock = threading.Lock()
 
     def measure(self, runner, inputs, tactic, **kwargs):
+        rank = self._tuning_group()[1]
         with lock:
-            profiled.append((self._tuning_group()[1], runner.name, tactic))
-        return times[(runner.name, tactic)]
+            profiled.append((rank, runner.name, tactic))
+        return times.get((rank, runner.name, tactic),
+                         times.get((runner.name, tactic)))
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", measure)
     size = len(entries_of)
@@ -4772,14 +4906,15 @@ def _choose_on_ranks(monkeypatch,
                                       dist=group.dist(rank))
         tuner.is_tuning_mode = True
         runners = runners_of(rank)
-        for (index, shapes), (tactic, ms) in entries_of[rank].items():
+        for (index, shapes, *owner), (tactic, ms) in entries_of[rank].items():
+            candidates = runners_of(owner[0]) if owner else runners
             tuner.profiling_cache.cache[tuner.profiling_cache.get_cache_key(
                 _GROUP_OP,
-                runners[index],
+                candidates[index],
                 shapes,
                 config,
                 apply_map_to_tuning_buckets=False,
-                candidates=runners)] = (index, tactic, ms)
+                candidates=candidates)] = (index, tactic, ms)
         tuners.append((tuner, runners))
 
     def choose(rank):
@@ -4910,6 +5045,142 @@ def test_cache_excluded_ops_profile_every_profile_in_process(monkeypatch):
             apply_map_to_tuning_buckets=False)] = (0, 2, 1.0)
     tuner.choose_one(op, runners, config, [torch.zeros(8, 64)])
     assert sorted(profiled) == [1, 1, 2, 2]
+
+
+def test_broadcast_peers_take_the_roots_miss(monkeypatch, tmp_path):
+    """Where the root has no entry for a profile (no valid tactic), the peers
+    drop theirs too; and a loser a broadcast removes does not come back from
+    the cache file the peer saves to."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST)
+    stale = {(0, _SHAPES): (1, 0.5)}
+    results, _, _ = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                     [{}, stale], {
+                                         ("a", 1): float("inf"),
+                                         ("b", 7): float("inf")
+                                     })
+    assert results == [("a", -1)] * 2, results
+
+    results, _, tuners = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                          [{}, stale], {
+                                              ("a", 1): 2.0,
+                                              ("b", 7): 1.0
+                                          })
+    assert results == [("b", 7)] * 2, results
+    tuner, runners = tuners[1]
+    # The file the peer saves to still holds the loser, as it loaded it.
+    path = str(tmp_path / "cache.json")
+    earlier = autotuner.AutoTunerProfilingCache()
+    earlier.add_independent_op(_GROUP_OP, DistributedTuningStrategy.BROADCAST)
+    earlier.cache = {
+        tuner.profiling_cache.get_cache_key(_GROUP_OP,
+                                            runners[0],
+                                            _SHAPES,
+                                            config,
+                                            apply_map_to_tuning_buckets=False,
+                                            candidates=runners): (0, 1, 0.5)
+    }
+    earlier.save_cache(path, rank=1)
+    tuner.profiling_cache.save_cache(path, rank=1)
+    reloaded = autotuner.AutoTunerProfilingCache()
+    reloaded.load_cache(path, rank=1)
+    assert reloaded.search_cache(_GROUP_OP, runners, _SHAPES, config,
+                                 False)[:3] == (True, 1, 7)
+
+
+def test_merge_keeps_the_fastest_winner_of_the_ranks(monkeypatch):
+    """Ranks that measured different winners keep the fastest, not the
+    first candidate's."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    results, _, _ = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                     [{}, {}], {
+                                         (0, "a", 1): 3.0,
+                                         (0, "b", 7): 4.0,
+                                         (1, "a", 1): 5.0,
+                                         (1, "b", 7): 1.0
+                                     })
+    assert results == [("b", 7)] * 2, results
+
+
+def test_another_communicators_stale_entry_does_not_win(monkeypatch):
+    """A rank of another communicator can hold an older entry of this one's
+    (from a shared cache file): it does not count when this one tunes the
+    profile again, and that communicator is not tuned again."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    groups = [(0, 2), (1, 3), (0, 2), (1, 3)]
+
+    def runners_of(rank):
+        return [_NamedTactics("ar", [0, 8], groups[rank])]
+
+    entries = [{}, {
+        (0, _SHAPES): (8, 1.0),
+        (0, _SHAPES, 0): (0, 0.01)
+    }, {}, {
+        (0, _SHAPES): (8, 1.0)
+    }]
+    results, profiled, _ = _choose_on_ranks(monkeypatch, config, runners_of,
+                                            entries, {
+                                                ("ar", 0): 2.0,
+                                                ("ar", 8): 1.0
+                                            })
+    assert results == [("ar", 8)] * 4, results
+    assert sorted({rank for rank, *_ in profiled}) == [0, 2]
+
+
+@pytest.mark.parametrize("strategy", [
+    DistributedTuningStrategy.BROADCAST,
+    DistributedTuningStrategy.PARALLEL,
+])
+def test_ranks_that_may_choose_apart_each_measure(monkeypatch, strategy):
+    """Ranks with different unique_ids, or on different GPU architectures,
+    cannot take one rank's measurements or share a deal of the tactics:
+    each measures its own."""
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+
+    def runners_of(rank):
+        return [_NamedTactics(f"x{rank}", [1])]
+
+    results, _, _ = _choose_on_ranks(monkeypatch, config, runners_of, [{}, {}],
+                                     {
+                                         ("x0", 1): 1.0,
+                                         ("x1", 1): 1.0
+                                     })
+    assert results == [("x0", 1), ("x1", 1)], results
+    devices = {"rank0": "sm100", "rank1": "sm107"}
+    monkeypatch.setattr(
+        autotuner, "_device_capability",
+        lambda: devices.get(threading.current_thread().name, "sm100"))
+    results, _, _ = _choose_on_ranks(monkeypatch, config, _two_runners,
+                                     [{}, {}], {
+                                         ("a", 1): 2.0,
+                                         ("b", 7): 1.0
+                                     })
+    assert results == [("b", 7)] * 2, results
+
+
+def test_warm_hits_reuse_the_profiles_of_the_op(monkeypatch):
+    """A warm hit in tuning mode checks every profile of the op on each call
+    without building the profiles and keys again."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    built = []
+    original = AutoTuner._optimization_profiles
+
+    def count(self, *args, **kwargs):
+        built.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_optimization_profiles", count)
+    entries = {(1, _SHAPES): (7, 1.0)}
+    results, profiled, _ = _choose_on_ranks(monkeypatch,
+                                            config,
+                                            _two_runners, [entries, entries],
+                                            {},
+                                            calls=3)
+    assert results == [("b", 7)] * 2 and profiled == []
+    assert len(built) == 2  # Once per rank.
 
 
 def test_parallel_search_cache_picks_fastest_runner():
