@@ -62,7 +62,6 @@ def test_wide_ep_immediate_fatal_patterns(message):
     [
         "NCCL timeout",
         "AlltoAll timeout waiting for completion_flags[3][7]",
-        "AlltoAll watchdog timed out waiting for peer rank 7",
         "completion_flags timeout",
         "NCCL operation timed out during all_reduce",
         "deep_ep buffer barrier hang",

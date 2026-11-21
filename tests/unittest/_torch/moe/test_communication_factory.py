@@ -59,6 +59,7 @@ def _make_model_config(
         use_cuda_graph=False,
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
+        enable_wide_ep_fault_tolerance=False,
     )
 
 
@@ -572,6 +573,100 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     )
 
     assert isinstance(strategy, AllGatherReduceScatter)
+
+
+def _create_one_sided(model_config, forced: bool):
+    if forced:
+        return communication_factory.CommunicationFactory._create_forced_method(
+            "NVLINK_ONE_SIDED",
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            payload_in_workspace=False,
+            alltoall_result_do_sum=True,
+            hidden_size=4096,
+        )
+    return communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+@pytest.mark.parametrize("forced", [False, True])
+def test_one_sided_runs_rank_mask_kernels_only_with_fault_tolerance(
+    monkeypatch: pytest.MonkeyPatch, forced: bool, fault_tolerance: bool
+):
+    """NVLinkOneSided runs the rank-mask kernels exactly when the model is fault tolerant."""
+    model_config = _make_model_config()
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+    one_sided = Mock()
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
+
+    assert _create_one_sided(model_config, forced) is one_sided.return_value
+    assert one_sided.call_args.kwargs["enable_wide_ep_fault_tolerance"] is fault_tolerance
+
+
+def test_fault_tolerance_reports_one_sided_error(monkeypatch: pytest.MonkeyPatch):
+    """Fault tolerance runs only on NVLinkOneSided, so its construction error is not swallowed."""
+    model_config = _make_model_config(torch.float16)
+    model_config.enable_wide_ep_fault_tolerance = True
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+
+    with pytest.raises(ValueError, match="requires the NVLinkOneSided.*strategy unavailable"):
+        _create_one_sided(model_config, forced=False)
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+@pytest.mark.parametrize(
+    ("name", "value", "warned"),
+    [
+        ("TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S", "5", "the all-to-all watchdog was removed"),
+        ("TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S", "1", "the all-to-all watchdog was removed"),
+        ("TLLM_FAULT_TOLERANCE_MODE", "1", "set enable_wide_ep_fault_tolerance=True"),
+        ("TLLM_FAULT_TOLERANCE_MODE", "0", None),
+    ],
+    ids=["watchdog-timeout", "watchdog-poll-interval", "mode-1", "mode-0"],
+)
+def test_removed_fault_tolerance_setting_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+    warned: str | None,
+    fault_tolerance: bool,
+):
+    """Every strategy selection warns about a set variable of the earlier fault tolerance mode."""
+    for removed in (
+        *communication_factory._REMOVED_WATCHDOG_ENVS,
+        communication_factory._FAULT_TOLERANCE_MODE_ENV,
+    ):
+        monkeypatch.delenv(removed, raising=False)
+    monkeypatch.setenv(name, value)
+    warnings = []
+    monkeypatch.setattr(
+        communication_factory.logger,
+        "warning_once",
+        lambda message, key: warnings.append((key, message)),
+    )
+    # Without attention DP the factory selects no all-to-all at all.
+    model_config = _make_model_config()
+    model_config.mapping.enable_attention_dp = False
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+
+    assert _create_one_sided(model_config, forced=False) is None
+    if warned is None:
+        assert warnings == []
+    else:
+        assert [key for key, _ in warnings] == [f"removed_env_{name}"]
+        assert warned in warnings[0][1]
 
 
 _NCCL_EP_QUANT_ALGOS = [

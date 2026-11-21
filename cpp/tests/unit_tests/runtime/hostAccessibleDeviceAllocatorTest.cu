@@ -16,10 +16,15 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <numeric>
+#include <string>
 #include <vector>
 
 namespace tensorrt_llm::runtime::unit_tests
@@ -51,6 +56,42 @@ __global__ void writeDataOnDevice(int* devPtr, int size)
     }
 }
 
+namespace
+{
+
+//! Set an environment variable for the scope of a test and restore its previous value after.
+class ScopedEnv
+{
+public:
+    ScopedEnv(char const* name, char const* value)
+        : mName(name)
+    {
+        char const* previous = std::getenv(name);
+        mHadPrevious = previous != nullptr;
+        mPrevious = mHadPrevious ? previous : "";
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnv()
+    {
+        if (mHadPrevious)
+        {
+            setenv(mName.c_str(), mPrevious.c_str(), 1);
+        }
+        else
+        {
+            unsetenv(mName.c_str());
+        }
+    }
+
+private:
+    std::string mName;
+    bool mHadPrevious;
+    std::string mPrevious;
+};
+
+} // namespace
+
 class HostAccessibleDeviceAllocatorTest : public ::testing::Test
 {
 protected:
@@ -70,6 +111,15 @@ protected:
         // Decrement the reference count.
         // The allocator will be shut down when the count reaches zero.
         allocator->DecRefCount();
+    }
+
+    // Initialize the allocator again with GDRCopy forced, so a test runs on GDRCopy wherever gdrdrv is loaded, even
+    // where GPU memory is a NUMA node. Test bodies are subclasses, which the allocator's friendship does not reach.
+    void reopenWithGdrCopyForced()
+    {
+        allocator->DecRefCount();
+        ScopedEnv const forceGdrcopy("TRTLLM_EPLB_FORCE_GDRCOPY", "1");
+        allocator->IncRefCount();
     }
 
     HostAccessibleDeviceAllocator* allocator;
@@ -264,7 +314,7 @@ TEST_F(HostAccessibleDeviceAllocatorTest, ManagedMemoryFallbackWithoutGdrCopy)
     void* hostPtr = allocator->getHostPtr(devPtr);
     ASSERT_NE(hostPtr, nullptr);
 
-    // 1. Copy from the host with memcpyToDevice, as the online EPLB weight updates do, then verify on the device.
+    // 1. Copy from the host with memcpyToDevice, then verify on the device.
     std::vector<int> pattern(numInts);
     std::iota(pattern.begin(), pattern.end(), 0);
     allocator->memcpyToDevice(hostPtr, pattern.data(), allocSize);
@@ -287,6 +337,92 @@ TEST_F(HostAccessibleDeviceAllocatorTest, ManagedMemoryFallbackWithoutGdrCopy)
     }
 
     allocator->free(devPtr);
+}
+
+// With fault tolerance, the online EPLB weight updates copy each row at its device address. Check that this writes the
+// bytes that a copy through the row's host pointer writes, for a row inside the allocation.
+TEST_F(HostAccessibleDeviceAllocatorTest, MemcpyToDeviceAddressMatchesMemcpyToDevice)
+{
+    if (!allocator->isSupported())
+    {
+        GTEST_SKIP() << "Host accessible memory is not supported on this system.";
+    }
+
+    constexpr size_t numInts = 256;
+    constexpr size_t allocSize = numInts * sizeof(int);
+    constexpr size_t rowOffset = 64;
+    constexpr size_t rowInts = 96;
+    std::vector<int> pattern(rowInts);
+    std::iota(pattern.begin(), pattern.end(), 7);
+
+    char* byHostPtr = static_cast<char*>(allocator->allocate(allocSize));
+    char* byDeviceAddress = static_cast<char*>(allocator->allocate(allocSize));
+    ASSERT_NE(byHostPtr, nullptr);
+    ASSERT_NE(byDeviceAddress, nullptr);
+    ASSERT_NE(allocator->getHostPtr(byHostPtr), nullptr);
+    ASSERT_NE(allocator->getHostPtr(byDeviceAddress), nullptr);
+    TLLM_CUDA_CHECK(cudaMemset(byHostPtr, 0, allocSize));
+    TLLM_CUDA_CHECK(cudaMemset(byDeviceAddress, 0, allocSize));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+
+    allocator->memcpyToDevice(static_cast<char*>(allocator->getHostPtr(byHostPtr)) + rowOffset * sizeof(int),
+        pattern.data(), rowInts * sizeof(int));
+    allocator->memcpyToDeviceAddress(byDeviceAddress + rowOffset * sizeof(int), pattern.data(), rowInts * sizeof(int));
+
+    std::vector<int> expected(numInts);
+    std::vector<int> actual(numInts);
+    TLLM_CUDA_CHECK(cudaMemcpy(expected.data(), byHostPtr, allocSize, cudaMemcpyDeviceToHost));
+    TLLM_CUDA_CHECK(cudaMemcpy(actual.data(), byDeviceAddress, allocSize, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(actual[rowOffset], 7);
+    EXPECT_EQ(actual[rowOffset - 1], 0);
+
+    allocator->free(byHostPtr);
+    allocator->free(byDeviceAddress);
+}
+
+// With GDRCopy, a copy at a device address splits across adjacent host mappings, as the chunks of a backed spare slot
+// are mapped one by one, and is refused outside every mapping.
+TEST_F(HostAccessibleDeviceAllocatorTest, MemcpyToDeviceAddressSplitsAcrossMappings)
+{
+    reopenWithGdrCopyForced();
+    if (!allocator->isSupported() || !allocator->usesGdrCopy())
+    {
+        GTEST_SKIP() << "Device memory is not mapped for the host with GDRCopy on this system.";
+    }
+
+    constexpr size_t kPageSize = 1UL << 16;
+    void* raw = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&raw, 4 * kPageSize));
+    auto* const base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(raw) + kPageSize - 1) & ~(kPageSize - 1));
+    TLLM_CUDA_CHECK(cudaMemset(base, 0, 3 * kPageSize));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    allocator->mapDeviceMemory(base, kPageSize);
+    allocator->mapDeviceMemory(base + kPageSize, kPageSize);
+    ASSERT_NE(allocator->getHostPtr(base), nullptr);
+    ASSERT_NE(allocator->getHostPtr(base + kPageSize), nullptr);
+
+    // A row that ends 256 bytes into the second mapping.
+    constexpr size_t kRowBytes = 1024;
+    char* const row = base + kPageSize - (kRowBytes - 256);
+    std::vector<uint8_t> pattern(kRowBytes);
+    std::iota(pattern.begin(), pattern.end(), 1);
+    allocator->memcpyToDeviceAddress(row, pattern.data(), kRowBytes);
+    std::vector<uint8_t> written(kRowBytes + 2);
+    TLLM_CUDA_CHECK(cudaMemcpy(written.data(), row - 1, written.size(), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(written.front(), 0);
+    EXPECT_EQ(written.back(), 0);
+    EXPECT_TRUE(std::equal(pattern.begin(), pattern.end(), written.begin() + 1));
+
+    // The third page is not mapped for the host.
+    EXPECT_THROW(allocator->memcpyToDeviceAddress(base + 2 * kPageSize, pattern.data(), kRowBytes),
+        tensorrt_llm::common::TllmException);
+    EXPECT_THROW(allocator->memcpyToDeviceAddress(base + 2 * kPageSize - 256, pattern.data(), kRowBytes),
+        tensorrt_llm::common::TllmException);
+
+    allocator->unmapDeviceMemory(base);
+    allocator->unmapDeviceMemory(base + kPageSize);
+    TLLM_CUDA_CHECK(cudaFree(raw));
 }
 
 } // namespace tensorrt_llm::runtime::unit_tests

@@ -464,6 +464,87 @@ def test_per_layer_dynamic_eplb_filters_backends_by_declared_capability():
     assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
 
 
+def test_spare_slots_filter_backends_by_declared_capability():
+    """With spare EPLB slots, selection turns down a backend that does not declare them."""
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=_deepgemm_environment(),
+        eplb_enabled=True,
+        eplb_mode="standard",
+    )
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES), dtype_act=torch.bfloat16
+    )
+    accepted = resolve_moe_impl(
+        _deepgemm_model_config(),
+        problem=problem,
+        deployment=deployment,
+        impl_id=_DEEPGEMM_IMPL_ID,
+    )
+    assert impl_class_for(accepted) is DeepgemmCudaFp8BlockScalesImpl
+
+    rejected = resolve_moe_impl(
+        _deepgemm_model_config(),
+        problem=problem,
+        deployment=dataclasses.replace(deployment, spare_slots_enabled=True),
+        impl_id=_DEEPGEMM_IMPL_ID,
+    )
+    assert rejected.winner is None
+    assert [item.reason for item in rejected.rejected] == [MoERejectReason.SPARE_SLOTS_UNSUPPORTED]
+    assert "enable_wide_ep_fault_tolerance=False" in rejected.rejected[0].detail
+
+
+def test_spare_slots_fall_back_from_a_backend_literal_and_fail_a_pin(monkeypatch):
+    """A backend literal whose leaf lacks spare EPLB slots falls back with one warning for every
+    layer, which names fault tolerance and the reason; a pin of that leaf fails."""
+    logger = moe_resolution.logger
+    log = MagicMock()
+    monkeypatch.setattr(logger, "log", log)
+    monkeypatch.setattr(logger, "_appeared_keys", set())
+    config = _cutedsl_model_config(None)
+    deployment = dataclasses.replace(
+        _single_rank_deployment(_cutedsl_environment()),
+        eplb_enabled=True,
+        eplb_mode="standard",
+        spare_slots_enabled=True,
+    )
+    for layer_idx in (3, 4):
+        by_literal = resolve_moe_impl(config, deployment=deployment, layer_idx=layer_idx)
+        assert impl_class_for(by_literal) is TrtllmCutlassUnquantizedImpl
+        # EPLB turns down the B12x leaf first, before its format gate.
+        assert {
+            rejection.legacy_backend: rejection.reason
+            for rejection in by_literal.requested_rejections
+        }[TrtllmCutedslGroupedGemmBf16Impl.__name__] is MoERejectReason.SPARE_SLOTS_UNSUPPORTED
+
+    # One line for the process, the same for every layer.
+    [warning] = [call.args[1] for call in log.call_args_list if call.args[0] == logger.WARNING]
+    assert (
+        "Wide-EP fault tolerance: TrtllmCutedslGroupedGemmBf16Impl does not support spare EPLB "
+        "slots" in warning
+    )
+    assert f"running {TrtllmCutlassUnquantizedImpl.__name__} instead" in warning
+
+    pinned = resolve_moe_impl(config, deployment=deployment, impl_id=_CUTEDSL_GROUPED_GEMM_IDS[1])
+    with pytest.raises(ValueError, match="Wide-EP fault tolerance: TrtllmCutedslGroupedGemmBf16"):
+        impl_class_for(pinned)
+
+
+@pytest.mark.parametrize("adds_spare_slots", [False, True])
+def test_deployment_takes_spare_slots_from_the_load_balancer(monkeypatch, adds_spare_slots):
+    balancer = SimpleNamespace(adds_spare_slots=adds_spare_slots)
+    monkeypatch.setattr(moe_resolution, "get_moe_load_balancer", lambda: balancer)
+    deployment = moe_resolution.build_moe_deployment(
+        ModelConfig(), num_experts=8, environment=MoEEnvironment(sm=100)
+    )
+    assert deployment.eplb_enabled
+    assert deployment.spare_slots_enabled is adds_spare_slots
+
+
 def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
     """A pin that cannot run must fail, not widen to the sibling that can.
 
@@ -2202,6 +2283,7 @@ _CUTEDSL_DECLARATIONS = (
             supports_eplb=True,
             supports_apply_router_weight_on_input=True,
             supports_deep_ep_direct_metadata=True,
+            supports_spare_slots=True,
         ),
         MoEActivationSupport(
             kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
@@ -3515,6 +3597,7 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         use_cuda_graph=False,
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
+        enable_wide_ep_fault_tolerance=False,
     )
     constructors = {}
     for name in (
@@ -3527,7 +3610,6 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
     ):
         constructors[name] = MagicMock(name=name)
         monkeypatch.setattr(communication_factory, name, constructors[name])
-    monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, 60, 1))
     backend = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
     # __new__ skips __init__, which normally sets quant_config from model_config.
     backend.quant_config = config.quant_config
