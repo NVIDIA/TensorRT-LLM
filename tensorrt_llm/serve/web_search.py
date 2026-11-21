@@ -74,7 +74,6 @@ Environment
 import asyncio
 import html
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence
@@ -83,6 +82,7 @@ from urllib.parse import quote_plus, urlparse
 import aiohttp
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 
 DEFAULT_MAX_RESULTS = 5
 DEFAULT_TIMEOUT_S = 15.0
@@ -136,7 +136,7 @@ class WebSearchConfig:
 
 def _env(suffix: str) -> Optional[str]:
     """Read one ``TRTLLM_WEB_SEARCH*`` setting."""
-    return os.environ.get(f"TRTLLM_WEB_SEARCH{suffix}")
+    return getattr(envs, f"TRTLLM_WEB_SEARCH{suffix}")
 
 
 def _env_float(suffix: str, default: float) -> float:
@@ -176,13 +176,13 @@ def load_web_search_config() -> WebSearchConfig:
         retries=_env_int("_RETRIES", DEFAULT_RETRIES),
     )
     if provider == "brave":
-        config.api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+        config.api_key = envs.BRAVE_SEARCH_API_KEY
         config.endpoint = "https://api.search.brave.com/res/v1/web/search"
     elif provider == "tavily":
-        config.api_key = os.environ.get("TAVILY_API_KEY")
+        config.api_key = envs.TAVILY_API_KEY
         config.endpoint = "https://api.tavily.com/search"
     elif provider == "searxng":
-        config.endpoint = os.environ.get("SEARXNG_URL")
+        config.endpoint = envs.SEARXNG_URL
     return config
 
 

@@ -17,7 +17,6 @@ Extracted from ``router.py`` so the surface routers there can share a single
 implementation of block hashing without importing the whole router module.
 """
 
-import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Union
@@ -32,6 +31,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     sequence_to_blockchain_keys,
 )
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
     uses_harmony_tokenization,
@@ -176,9 +176,9 @@ class BlockHashMixin:
         model_path: Optional[str] = None,
         enable_tokenization_cache: bool = False,
     ) -> None:
-        env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
+        env_tokens_per_block = envs.TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK
         if env_tokens_per_block is not None:
-            tokens_per_block = int(env_tokens_per_block)
+            tokens_per_block = env_tokens_per_block
         self._tpb_auto = tokens_per_block is None
         self._tokens_per_block = 32 if tokens_per_block is None else tokens_per_block
         self._tokenizers: dict = {}
