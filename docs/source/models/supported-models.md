@@ -290,6 +290,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 |---|---|
 | `black-forest-labs/FLUX.1-dev` | Text-to-Image |
 | `black-forest-labs/FLUX.2-dev` | Text-to-Image |
+| `black-forest-labs/flux-3-image-klein-base` | Text-to-Image, Image-to-Image |
+| `black-forest-labs/flux-3-image-klein` | Text-to-Image, Image-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | Image-to-Video |
@@ -318,6 +320,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 |---|---|---|---|---|---|---|---|---|---|--|--|--|---|
 | **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX 3 Klein Base** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
+| **FLUX 3 Klein** | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No |

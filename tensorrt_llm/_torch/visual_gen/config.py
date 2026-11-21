@@ -684,6 +684,18 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             for component_name, component_config_path in components.items():
                 with open(component_config_path) as f:
                     component_config_dicts[component_name] = json.load(f)
+            if model_index.get("_class_name") in (
+                "Flux3ModularPipeline",
+                "Flux3DistilledModularPipeline",
+            ):
+                from .models.flux3.variants import apply_variant_quantization
+
+                component_config_dicts = apply_variant_quantization(
+                    str(checkpoint_path),
+                    component_config_dicts,
+                    resolved_pipeline_config.get("variant"),
+                    args.quant_config if args else None,
+                )
 
             config_dict = component_config_dicts[component]
             pretrained_config = SimpleNamespace(**config_dict)
