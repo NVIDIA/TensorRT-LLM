@@ -1201,6 +1201,7 @@ def _softmax_row(
     sink_ptr,
     out_addr: Int64,
     scale_log2: Float32,
+    wide_store: cutlass.Constexpr = False,
 ):
     # Same arithmetic as att_row (online softmax with sinks, P in E4M3 scaled by 448), with S read
     # from TMEM once per tile and the PV of the previous tile running underneath.
@@ -1340,14 +1341,32 @@ def _softmax_row(
                     (norm, norm), (Float32(o[2 * pi]), Float32(o[2 * pi + 1])), ftz=False, rnd="rn"
                 )
                 ob.append(_pack_bf16x2(fp[0], fp[1]))
-            for k in cutlass.range_constexpr(4):
-                dst = cutlass.inttoptr(
-                    out_base + Int64((v * SLICE + hc * 32 + k * 8) * 2), mem_space=1, dtype=Int32
-                )
-                dst.store(
-                    cutlass.Vector.from_elements(tuple((ob[4 * k + i] for i in range(4))), Int32),
-                    alignment=16,
-                )
+            if cutlass.const_expr(wide_store):
+                for k in cutlass.range_constexpr(2):
+                    dst = cutlass.inttoptr(
+                        out_base + Int64((v * SLICE + hc * 32 + k * 16) * 2),
+                        mem_space=1,
+                        dtype=Int32,
+                    )
+                    dst.store(
+                        cutlass.Vector.from_elements(
+                            tuple((ob[8 * k + i] for i in range(8))), Int32
+                        ),
+                        alignment=32,
+                    )
+            else:
+                for k in cutlass.range_constexpr(4):
+                    dst = cutlass.inttoptr(
+                        out_base + Int64((v * SLICE + hc * 32 + k * 8) * 2),
+                        mem_space=1,
+                        dtype=Int32,
+                    )
+                    dst.store(
+                        cutlass.Vector.from_elements(
+                            tuple((ob[4 * k + i] for i in range(4))), Int32
+                        ),
+                        alignment=16,
+                    )
     # O has been read: the next row's first PV (after its P-ready barrier) may overwrite it.
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
@@ -1379,7 +1398,15 @@ def _issue_kv_tile(slot_base, mbar_base, tma_swa, tma_cmp, use_swa, gidx_t, wl, 
 
 
 class AttentionTail:
-    def __init__(self, config: SpecDsaConfig | None = None, exit_early: bool = False):
+    def __init__(
+        self,
+        config: SpecDsaConfig | None = None,
+        exit_early: bool = False,
+        wide_store: bool = False,
+    ):
+        # wide_store: the output epilogue writes 32-byte stores (st.global.v8) instead of 16-byte ones, half the store
+        # instructions of a row; it needs ``out`` to be 32-byte aligned
+        self.wide_store = bool(wide_store)
         require_built_for(
             config, SPEC_FP4 if config is not None and config.index_k_dtype == "fp4" else SPEC
         )
@@ -1573,6 +1600,7 @@ class AttentionTail:
                     sinks.iterator.raw_ptr() + b * Int32(HEADS),
                     out_addr,
                     scale_log2,
+                    self.wide_store,
                 )
                 t = t + Int32(NTILES)
                 n = n + Int32(1)

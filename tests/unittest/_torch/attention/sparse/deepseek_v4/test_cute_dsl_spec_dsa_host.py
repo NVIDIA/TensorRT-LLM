@@ -471,7 +471,8 @@ def test_fp8_knob_tables_are_the_pr_head_tables():
 
 
 def test_large_batch_knob_tables():
-    """FP8: one knob set, no variants, no tail knobs. FP4: its knobs, the variants (60 / 192 / 768 rows), exit_early."""
+    """FP8: one knob set, no variants, no tail knobs. FP4: its knobs, the variants (from the first large-batch size,
+    192 and 768 rows), the tail knobs."""
     assert op._KNOBS[FLASH.kernel_key] == op._KERNEL_CONFIG
     assert FLASH.kernel_key not in op._VARIANTS and FLASH.kernel_key not in op._TAIL_KNOBS
     assert FLASH.kernel_key not in op._SEG_UNITS
@@ -503,7 +504,7 @@ def test_large_batch_knob_tables():
         assert all(over[k] != fp4[k] for k in over), (
             "a variant that changes nothing is a second compile for nothing"
         )
-    assert op._TAIL_KNOBS[FLASH_FP4.kernel_key] == {"exit_early": True}
+    assert op._TAIL_KNOBS[FLASH_FP4.kernel_key] == {"exit_early": True, "wide_store": True}
 
 
 def _three_term_loop(start, num_kv, q_is_end, end_kv_idx):

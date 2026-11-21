@@ -714,6 +714,26 @@ def test_rejects_unsupported_arguments():
         op.prepare(torch.full((128,), 4096, dtype=torch.int32), sinks, state)
 
 
+@pytest.mark.parametrize("offset_elems", [0, 8, 16, 24])
+def test_out_alignment(offset_elems, idx):
+    """The FP4 attention tail writes its output with 32-byte stores into a 32-byte aligned ``out``; an ``out`` that is
+    only 16-byte aligned (offset 8 and 24 bf16 elements) runs the narrow compile and gives the same result."""
+    op = _op()
+    batch = 48
+    inp, bases = _make_case(batch, _plain(LENGTHS), seed=83, idx=idx)
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=_spec_of(idx))
+    topk, _ = _new_outputs(batch)
+    n = batch * H_ATT * D_ATT
+    buf = torch.zeros(n + 64, dtype=torch.bfloat16, device=topk.device)
+    out = buf[offset_elems : offset_elems + n].view(batch, H_ATT * D_ATT)
+    assert out.data_ptr() % 16 == 0 and (out.data_ptr() % 32 == 0) == (offset_elems % 16 == 0)
+    _launch(op, state, inp, topk, out)
+    torch.cuda.synchronize()
+    assert int(op.error_bits(state)[0]) == 0
+    _check_rows(inp, bases, topk, out, "realistic")
+    assert bool((buf[:offset_elems] == 0).all()) and bool((buf[offset_elems + n :] == 0).all())
+
+
 def test_fp4_arguments_are_checked():
     """An FP4 launch needs the query scales and FP4-sized K pages; the FP8 spec takes no scales."""
     op = _op()

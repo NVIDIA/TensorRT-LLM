@@ -28,7 +28,9 @@ Contract:
 - A state belongs to one batch size and one caller. Its workspace (ready queue, selection scratch) is reset by the
   kernels at the end of every launch, so launches that share a state, and ``prepare`` calls that refresh it, must be
   stream-ordered.
-- ``topk`` and ``out`` must not alias any input.
+- ``topk`` and ``out`` must not alias any input. ``out`` should be 32-byte aligned (every torch allocation is): the
+  attention epilogue of an FP4 spec writes 32-byte stores into it, and an ``out`` that is only 16-byte aligned runs the
+  narrower epilogue, a little slower.
 - The indexer launch is persistent and needs all 148 SMs; it fails at launch on a partitioned device (MPS limits,
   green contexts).
 - Block tables must be contiguous int32 and hold valid page ids for every page a row touches: ``ceil(n / 32)``
@@ -139,19 +141,24 @@ _KNOBS = {
 }
 
 # Batch-size ranges that run the indexer kernel with other knobs: (first batch size, overrides), the last range whose
-# first batch size is not above the batch size wins. A range is a second compile of the same kernel class. The four
-# selector warps poll the candidate rings every sel_idle_ns: from 60 rows on the polls compete with the TMA / MMA
-# barriers of the SM and with the power budget (a 1.5 us sleep is 1 - 2 % faster at 100 - 150 rows and 4 - 7 % from 192
-# rows on), and six K stages (12 tiles in flight instead of 16) share the HBM more evenly between the SMs (the slowest
-# SMs set the end of the call). Below that the longer sleep delays the drain at the end of a piece. At 512 rows and
-# more the SM clock sits at about 1.4 GHz (power cap) and the stream is bound by the ~290 SM cycles a math warp spends
-# per 128-position tile (hand-offs, the 64-head epilogue, floor read, compare, loop control), more than the HBM time of
-# a tile (184 ns): the loop-control, lockstep and floor-read knobs take instructions off that chain (from 60 rows, a
-# 16 times rarer floor read from 192 rows), and from 768 rows the selector warps sleep 3 us between polls and the K
-# stages are eight again (in the nsys protocol six stages are better at 384 - 767 rows, eight at 768 and more).
+# first batch size is not above the batch size wins. A range is a second compile of the same kernel class. The first
+# range starts at the first large-batch size, so the base knobs above only serve launches forced below it. The four
+# selector warps poll the candidate rings every sel_idle_ns: the polls compete with the TMA / MMA barriers of the SM and
+# with the power budget (a 1.5 us sleep is 1 - 2 % faster at 100 - 150 rows and 4 - 7 % from 192 rows on), and six K
+# stages (12 tiles in flight instead of 16) share the HBM more evenly between the SMs (the slowest SMs set the end of
+# the call): with the loop-control and lockstep knobs that is 0.9 - 2 % faster than the base knobs at 27 - 56 rows
+# (eight stages with those knobs are 3 - 4 % slower at 47 - 64 rows). At 512 rows and more the SM clock sits at about
+# 1.4 GHz (power cap) and the stream is bound by the ~290 SM cycles a math warp spends per 128-position tile
+# (hand-offs, the 64-head epilogue, floor read, compare, loop control), more than the HBM time of a tile (184 ns): the
+# loop-control, lockstep and floor-read knobs take instructions off that chain (a 16 times rarer floor read from 192
+# rows), and from 768 rows the selector warps sleep 3 us between polls and the K stages are eight again (in the nsys
+# protocol six stages are better at 384 - 767 rows, eight at 768 and more).
 _VARIANTS = {
     DS_V4_FLASH_FP4.kernel_key: (
-        (60, dict(sel_idle_ns=1536, kv_stages=6, lim_loop=True, lim_loop2=True, nolock=True)),
+        (
+            DS_V4_FLASH_FP4.megakernel_max_batch + 1,
+            dict(sel_idle_ns=1536, kv_stages=6, lim_loop=True, lim_loop2=True, nolock=True),
+        ),
         (
             192,
             dict(
@@ -172,7 +179,10 @@ _VARIANTS = {
 
 # Knobs of the attention kernel per spec (kernel_key); no entry = the shipped kernel. exit_early: the "last CTA to leave
 # resets the ready queue" accounting runs right after the CTA's final claim, off the critical path of the last row.
-_TAIL_KNOBS: dict = {DS_V4_FLASH_FP4.kernel_key: dict(exit_early=True)}
+# wide_store: the output epilogue writes 32-byte stores, half the store instructions of 16-byte ones (the epilogue is
+# ~3 us of the ~13 us row latency that ends every call); it needs a 32-byte aligned ``out``, so a second compile without
+# it serves an ``out`` that is only 16-byte aligned.
+_TAIL_KNOBS: dict = {DS_V4_FLASH_FP4.kernel_key: dict(exit_early=True, wide_store=True)}
 
 _lock = threading.Lock()
 _engines: dict[tuple, dict] = {}
@@ -219,6 +229,7 @@ def _engine(device: torch.device, config: SpecDsaConfig | None = None) -> dict:
         if key not in _engines:
             lb, _ = _kernel_modules()
             knobs = _KNOBS[config.kernel_key]
+            tail_knobs = _TAIL_KNOBS.get(config.kernel_key, {})
             _engines[key] = {
                 "indexer": lb.IndexerKernel(num_sms=NUM_SMS, config=config, **knobs),
                 "indexer_fn": None,
@@ -231,8 +242,15 @@ def _engine(device: torch.device, config: SpecDsaConfig | None = None) -> dict:
                     ]
                     for first, over in _VARIANTS.get(config.kernel_key, ())
                 ],
-                "tail": lb.AttentionTail(config=config, **_TAIL_KNOBS.get(config.kernel_key, {})),
+                "tail": lb.AttentionTail(config=config, **tail_knobs),
                 "tail_fn": None,
+                # the tail for an ``out`` that is not 32-byte aligned (only with wide_store)
+                "tail_narrow": (
+                    lb.AttentionTail(config=config, **{**tail_knobs, "wide_store": False})
+                    if tail_knobs.get("wide_store")
+                    else None
+                ),
+                "tail_narrow_fn": None,
             }
         return _engines[key]
 
@@ -241,6 +259,7 @@ def _not_compiled(e: dict) -> bool:
     return (
         e["indexer_fn"] is None
         or e["tail_fn"] is None
+        or (e.get("tail_narrow") is not None and e.get("tail_narrow_fn") is None)
         or any(v[2] is None for v in e.get("variants", ()))
     )
 
@@ -267,6 +286,8 @@ def precompile(device: torch.device, config: SpecDsaConfig | None = None) -> Non
                     v[2] = lb.compile_indexer(v[1])
             if e["tail_fn"] is None:
                 e["tail_fn"] = lb.compile_tail(e["tail"])
+            if e.get("tail_narrow") is not None and e.get("tail_narrow_fn") is None:
+                e["tail_narrow_fn"] = lb.compile_tail(e["tail_narrow"])
 
 
 @dataclass
@@ -559,7 +580,7 @@ def run(
         swa_pool: float8_e4m3fn [..., 512], sliding-window KV rows (128 rows per page); bt_swa: int32 [B, pages].
         c_pool: float8_e4m3fn [..., 512], compressed KV rows (32 rows per page); bt_c: int32 [B, pages].
         topk: int32 [B, 512] output, the selected compressed positions (in no particular order).
-        out: bfloat16 [B, 64 * 512] output.
+        out: bfloat16 [B, 64 * 512] output (32-byte aligned for the fastest epilogue; 16 bytes is enough).
         softmax_scale: attention softmax scale (default: ``1 / sqrt(kv_dim)`` of the spec).
         q_scale: int32 [B, 64] (or [B, 1, 64]), the four UE8M0 query scales of each head in one int32 (FP4 specs only).
 
@@ -646,7 +667,10 @@ def run(
             else ()
         ),
     )
-    e["tail_fn"](
+    tail_fn = e["tail_fn"]
+    if e.get("tail_narrow") is not None and out.data_ptr() % 32:
+        tail_fn = e["tail_narrow_fn"]
+    tail_fn(
         q_att8,
         swa8,
         c8,
