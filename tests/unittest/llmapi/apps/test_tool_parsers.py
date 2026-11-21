@@ -7041,6 +7041,74 @@ class TestForcedToolChoicePostprocessing:
             "forced call leaked content: "
             f"{[d.get('content') for d in deltas if d.get('content')]}")
 
+    # Reasoning parsers, with the template kwargs that select it, that read
+    # output without a closing tag as reasoning, because their templates
+    # leave the prompt inside an open reasoning block.
+    REASONING_AT_START_PARSERS = [
+        pytest.param("deepseek-r1", None, id="deepseek-r1"),
+        pytest.param("qwen3_5", None, id="qwen3_5"),
+        pytest.param("nemotron-v3", None, id="nemotron-v3"),
+        pytest.param("kimi_k25", None, id="kimi_k25"),
+        pytest.param("deepseek_v4", {"thinking": True}, id="deepseek_v4"),
+    ]
+
+    @pytest.mark.parametrize("reasoning_parser,chat_template_kwargs",
+                             REASONING_AT_START_PARSERS)
+    def test_forced_choice_reasoning_at_start_keeps_arguments(
+            self, sample_tools, reasoning_parser, chat_template_kwargs):
+        """The constrained arguments value is never read as reasoning.
+
+        The prompt ends inside the forced tool call, so the generated text is
+        the arguments value even when the template also left a reasoning
+        block open before it.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        args.reasoning_parser = reasoning_parser
+        args.chat_template_kwargs = chat_template_kwargs
+        rsp = self._fake_response('{"location": "NYC"}')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert choice.finish_reason == "tool_calls"
+        assert len(choice.message.tool_calls) == 1
+        function = choice.message.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert json.loads(function.arguments) == {"location": "NYC"}
+        assert not choice.message.reasoning_content
+
+    @pytest.mark.parametrize("reasoning_parser,chat_template_kwargs",
+                             REASONING_AT_START_PARSERS)
+    def test_forced_choice_streaming_reasoning_at_start_keeps_arguments(
+            self, sample_tools, reasoning_parser, chat_template_kwargs):
+        """Streamed constrained arguments are never read as reasoning."""
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        args.reasoning_parser = reasoning_parser
+        args.chat_template_kwargs = chat_template_kwargs
+        payloads = self._stream_deltas(args, ['{"location"', ': "NYC"}'])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        tool_deltas = [d for d in deltas if d.get("tool_calls")]
+        arguments = "".join(
+            d["tool_calls"][0]["function"].get("arguments") or ""
+            for d in tool_deltas)
+        assert json.loads(arguments) == {"location": "NYC"}
+        assert tool_deltas[0]["tool_calls"][0]["function"][
+            "name"] == "get_weather"
+        assert not any(d.get("reasoning_content") for d in deltas)
+        finish_reasons = [
+            p["choices"][0].get("finish_reason") for p in payloads
+            if p["choices"]
+        ]
+        assert finish_reasons[-1] == "tool_calls"
+
     def test_forced_choice_k3_streaming_extracts(self, sample_tools):
         """Extract the forced call from a streamed K3 response.
 

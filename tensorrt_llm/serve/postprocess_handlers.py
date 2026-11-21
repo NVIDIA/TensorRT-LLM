@@ -492,15 +492,21 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
         has_token_delta = bool(output.token_ids_diff)
         delta_text = output.text_diff
-        delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args,
-            i,
-            delta_text,
-            True,
-            finished=(output.finish_reason is not None))
-
         forced_tool = _forced_tool_choice(args)
-        if forced_tool and not _forced_choice_uses_tool_parser(args):
+        constrained_forced_call = (forced_tool is not None and
+                                   not _forced_choice_uses_tool_parser(args))
+        # A constrained forced call skips the reasoning parser: the prompt ends
+        # inside the tool call and guided decoding allows only the arguments
+        # value, so none of the output is reasoning.
+        if not constrained_forced_call:
+            delta_text, reasoning_delta_text = apply_reasoning_parser(
+                args,
+                i,
+                delta_text,
+                True,
+                finished=(output.finish_reason is not None))
+
+        if constrained_forced_call:
             # Forced call constrained by JSON-schema guided decoding: the
             # deltas stream the arguments value. Buffer them so the stream can
             # stop at the end of that value -- generation starts inside the
@@ -687,11 +693,18 @@ def chat_response_post_processor(
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
     for output in rsp.outputs:
-        text, reasoning_text = apply_reasoning_parser(args, output.index,
-                                                      output.text, False)
-
         forced_tool = _forced_tool_choice(args)
-        if forced_tool and not _forced_choice_uses_tool_parser(args):
+        constrained_forced_call = (forced_tool is not None and
+                                   not _forced_choice_uses_tool_parser(args))
+        if constrained_forced_call:
+            # The prompt ends inside the tool call and guided decoding allows
+            # only the arguments value, so none of the output is reasoning.
+            text, reasoning_text = output.text, ""
+        else:
+            text, reasoning_text = apply_reasoning_parser(
+                args, output.index, output.text, False)
+
+        if constrained_forced_call:
             # Forced call constrained by JSON-schema guided decoding: the text
             # is the arguments value. Keep only that value -- guided decoding
             # should already stop generation there, but a model that overruns
