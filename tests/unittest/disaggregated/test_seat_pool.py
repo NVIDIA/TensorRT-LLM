@@ -198,6 +198,35 @@ def test_pool_heaps_stay_bounded_under_a_queue_that_never_drains(cap):
     assert len(pool) == live
 
 
+def test_pool_deadline_heap_stays_bounded_without_draining():
+    """Late deadlines must not retain granted or cancelled waiters behind a live one."""
+    clock = _Clock()
+    pool = SeatPool(1, clock=clock, kv_transfer_timeout_s=60.0)
+    pool.add(1, 0.0, None, None)
+    clock.now = 1.0
+    pool.add(2, 0.0, None, None)
+    # An unbounded waiter must neither count as a live deadline nor expire.
+    pool.kv_transfer_timeout_s = None
+    pool.add(3, 0.0, None, None)
+    pool.kv_transfer_timeout_s = 60.0
+
+    for rid in range(4, 204):
+        pool.add(rid, 1.0, None, None)
+        if rid % 2:
+            waiter, _ = pool.pick(["s"])
+            pool.record_grant(waiter)
+        else:
+            pool.remove(rid)
+
+    assert len(pool) == 3
+    assert len(pool._deadlines) <= 2 * 2 + 64
+    clock.now = 57.0
+    assert [waiter.rid for waiter in pool.expire()] == [1]
+    clock.now += 1.0
+    assert [waiter.rid for waiter in pool.expire()] == [2]
+    assert [waiter.rid for waiter in pool.waiters()] == [3]
+
+
 def test_pool_skips_excluded_server():
     pool = SeatPool(1, clock=_Clock())
     pool.add(1, 0.9, "s0", None)
