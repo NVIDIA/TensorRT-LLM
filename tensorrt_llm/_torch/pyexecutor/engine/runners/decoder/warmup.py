@@ -342,6 +342,12 @@ class DecoderWarmup:
         try:
             # Retain a partial summary when a phase raises.
             with self._warmup_timer:
+                disagg_role = os.getenv("TRTLLM_DISAGG_ROLE", "").lower()
+                if not (
+                    self._config.is_disagg
+                    and (disagg_role == "context" or disagg_role.startswith("ctx"))
+                ):
+                    self._inputs.warmup_speculative_inputs()
                 return self._warmup_scheduled(resource_manager, kv_cache_manager)
         finally:
             # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage

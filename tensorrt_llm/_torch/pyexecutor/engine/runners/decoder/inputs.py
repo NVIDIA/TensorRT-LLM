@@ -526,6 +526,35 @@ class DecoderInputPreparer:
                 and not mapping.has_cp_helix()
             )
 
+    def warmup_speculative_inputs(self) -> None:
+        """Initialize staged speculative copies before serving, without reading request data."""
+        if not self._spec_overlap_staging:
+            return
+        buffers = self._buffers
+        source = buffers.input_ids_cuda[:1]
+        num_slots = (
+            self._config.max_batch_size
+            if self._config.num_seq_slots is None
+            else self._config.num_seq_slots
+        )
+        stage_spec_overlap_inputs(
+            source,
+            (0, 0, 0, 0, 0, 0),
+            buffers.input_ids_cuda,
+            buffers.draft_tokens_cuda,
+            buffers.draft_tokens_cuda,
+            buffers.previous_batch_indices_cuda,
+            buffers.position_ids_cuda,
+            buffers.gather_ids_cuda,
+            buffers.previous_pos_id_offsets_cuda,
+            buffers.previous_kv_lens_offsets_cuda,
+            source.as_strided((1, 1, 1), (num_slots, 1, 1)),
+            source.as_strided((1, 1), (max(1, self._config.max_total_draft_tokens), 1)),
+            source,
+            0,
+            self.get_runtime_tokens_per_gen_step(self._config.max_draft_len),
+        )
+
     def _new_extra_inputs(self) -> ExtraInputsCollector:
         """Return the collector of this pass's model inputs beyond the decoder's own."""
         return _NO_EXTRA_INPUTS

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
@@ -30,7 +31,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
-from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
@@ -43,12 +43,14 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     _zero_fill_row_spans,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.spec_overlap_inputs import _stage_kernel
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
-from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
+from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec, SpecSampler
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -61,7 +63,12 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig,
     SamplingParams,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    KvCacheConfig,
+    PrefillCudaGraphBackend,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import CpType, Mapping
 
 if TYPE_CHECKING:
@@ -78,6 +85,10 @@ if TYPE_CHECKING:
 # side of a test, so that the stream it blocks is still pending when the other stream reads.
 _SIDE_STREAM_DELAY_CYCLES = 2_000_000_000
 _ORDER_NOT_EXERCISED = "the delayed stream finished before the other stream read"
+
+
+class _StagedInputModel(DummyModel):
+    runtime_hooks = RuntimeHooks(stage_decode_inputs=True)
 
 
 @pytest.mark.cpu_only
@@ -716,52 +727,93 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
         self.assertEqual(kernel_path[0][:num_tokens].tolist(), expected_input_ids.tolist())
 
+    def test_staged_speculative_inputs_warmup_respects_serving_role(self) -> None:
+        for is_disagg, role, expected_launches in (
+            (True, "context", 0),
+            (True, "ctx0", 0),
+            (True, "CONTEXT", 0),
+            (True, "generation", 1),
+            (False, "context", 1),
+        ):
+            with (
+                self.subTest(is_disagg=is_disagg, role=role),
+                patch.dict(os.environ, {"TRTLLM_DISAGG_ROLE": role}),
+                create_model_engine_and_kvcache(
+                    llm_args=TorchLlmArgs(
+                        model="dummy",
+                        max_batch_size=5,
+                        max_num_tokens=64,
+                        cuda_graph_config=None,
+                        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL")
+                        if is_disagg
+                        else None,
+                    ),
+                    spec_config=SADecodingConfig(max_draft_len=3),
+                    model=_StagedInputModel(torch.float16),
+                ) as (model_engine, kv_cache_manager),
+                patch.object(_stage_kernel, "run", wraps=_stage_kernel.run) as stage_launch,
+            ):
+                resource_manager = ResourceManager(
+                    {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
+                )
+                uploader = model_engine._runner._inputs._host_uploader
+                assert uploader is not None
+                with (
+                    patch.object(uploader, "upload", wraps=uploader.upload) as upload,
+                    patch.object(
+                        model_engine._runner._warmup, "_warmup_scheduled", return_value=None
+                    ),
+                ):
+                    model_engine.warmup(resource_manager)
+                torch.cuda.synchronize()
+                self.assertEqual(stage_launch.call_count, expected_launches)
+                upload.assert_not_called()
+
     def test_staged_speculative_overlap_inputs_match_per_buffer_copies(self) -> None:
+        self._check_staged_speculative_inputs(tokens_per_step=3)
+
+    def test_staged_speculative_packed_drafts_match_per_buffer_copies(self) -> None:
+        self._check_staged_speculative_inputs(tokens_per_step=4)
+
+    def _check_staged_speculative_inputs(self, tokens_per_step: int) -> None:
         """One slab upload and one staging launch write the same inputs as the
         per-buffer copies: a context row, a request without a previous step,
         requests verifying in-flight drafts in permuted slots, and a dummy."""
         model_engine, kv_cache_manager = self.enterContext(
-            create_model_engine_and_kvcache(spec_config=SADecodingConfig(max_draft_len=3))
+            create_model_engine_and_kvcache(
+                spec_config=SADecodingConfig(max_draft_len=tokens_per_step - 1),
+                model=_StagedInputModel(torch.float16),
+            )
         )
         preparer = model_engine._runner._inputs
         buffers = preparer._buffers
         resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
-        tokens_per_step = 4
-        slots = 6
+        slots = model_engine.max_num_seq_slots
         generator = torch.Generator(device="cuda").manual_seed(0)
-        previous = SampleStateTensorsSpec(
-            new_tokens=torch.randint(
-                0,
-                1000,
-                (tokens_per_step, slots, 1),
-                dtype=torch.int32,
-                device="cuda",
-                generator=generator,
-            ),
-            new_tokens_lens=torch.randint(
-                1,
-                tokens_per_step + 1,
-                (slots,),
-                dtype=torch.int32,
-                device="cuda",
-                generator=generator,
-            ),
-            next_draft_tokens=torch.randint(
-                0,
-                1000,
-                (slots, tokens_per_step - 1),
-                dtype=torch.int32,
-                device="cuda",
-                generator=generator,
-            ),
+        store = SpecSampler.Store.allocate(
+            num_slots=slots,
+            accepted_len=tokens_per_step,
+            draft_len=tokens_per_step - 1,
+            beam_width=1,
         )
+        store.next_new_tokens.random_(0, 1000, generator=generator)
+        store.new_tokens_lens.random_(1, tokens_per_step + 1, generator=generator)
+        store.next_draft_tokens.random_(0, 1000, generator=generator)
+        unaligned = store.new_tokens_lens if tokens_per_step == 3 else store.next_draft_tokens
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+        previous = SampleStateTensorsSpec(
+            new_tokens=store.next_new_tokens,
+            new_tokens_lens=store.new_tokens_lens,
+            next_draft_tokens=store.next_draft_tokens,
+        )
+        context_length = 7 if tokens_per_step == 4 else tokens_per_step
 
         def batch() -> ScheduledRequests:
-            context = _create_request_with_tokens(list(range(100, 107)), 1)
+            context = _create_request_with_tokens(list(range(100, 100 + context_length)), 1)
             context.py_seq_slot = 0
             fresh = _create_request_with_tokens([50, 51, 52, 53, 54], 2)
             fresh.py_seq_slot = 1
-            fresh.py_draft_tokens = [7, 8, 9]
+            fresh.py_draft_tokens = list(range(7, 7 + tokens_per_step - 1))
             verifying = []
             for request_id, (seq_slot, previous_slot) in enumerate(((2, 4), (3, 2)), start=3):
                 request = _create_request_with_tokens(list(range(20 + request_id)), request_id)
@@ -770,7 +822,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                 verifying.append(request)
             dummy = _create_request_with_tokens([1, 1, 1], 6)
             dummy.py_seq_slot = 5
-            dummy.py_draft_tokens = [1, 1, 1]
+            dummy.py_draft_tokens = [1] * (tokens_per_step - 1)
             dummy.is_cuda_graph_dummy = True
             scheduled = ScheduledRequests()
             scheduled.context_requests_last_chunk = [context]
@@ -786,19 +838,32 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             "previous_pos_id_offsets_cuda",
             "previous_kv_lens_offsets_cuda",
         )
-        # The staging runs for models that opt in (RuntimeHooks.stage_decode_inputs).
-        preparer._host_uploader = HostUploader()
+        self.assertTrue(preparer._spec_overlap_staging)
+        self.enterContext(patch.dict(_stage_kernel.device_caches, clear=True))
+        stage_launch = self.enterContext(
+            patch.object(_stage_kernel, "run", wraps=_stage_kernel.run)
+        )
         results = []
         for staging in (True, False):
             preparer._spec_overlap_staging = staging
             preparer._staged_previous_batch_indices = None
             preparer._staged_previous_pos_indices = None
+            if staging:
+                with patch.object(
+                    model_engine._runner._warmup, "_warmup_scheduled", return_value=None
+                ):
+                    model_engine.warmup(resource_manager)
+                self.assertEqual(stage_launch.call_count, 1)
+            compiled = set(_stage_kernel.device_caches[torch.cuda.current_device()][0])
+            if staging:
+                self.assertTrue(compiled)
             for name in written:
                 getattr(buffers, name).fill_(-7)
             attn_metadata = AttentionMetadata(
                 max_num_requests=8, max_num_tokens=64, kv_cache_manager=kv_cache_manager
             )
             attn_metadata.is_cuda_graph = False
+            launches_before = stage_launch.call_count
             inputs = preparer.prepare_inputs(
                 scheduled_requests=batch(),
                 kv_cache_manager=kv_cache_manager,
@@ -810,12 +875,17 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                 is_dummy=False,
             ).kwargs
             torch.cuda.synchronize()
+            self.assertEqual(stage_launch.call_count - launches_before, int(staging))
+            if staging:
+                self.assertEqual(
+                    set(_stage_kernel.device_caches[torch.cuda.current_device()][0]), compiled
+                )
             results.append(
                 {
                     "input_ids": inputs["input_ids"].cpu(),
                     "position_ids": inputs["position_ids"].cpu(),
                     "gather_ids": preparer._gather_ids_buffer.tensor.cpu(),
-                    "draft_tokens": buffers.draft_tokens_cuda[:9].cpu(),
+                    "draft_tokens": buffers.draft_tokens_cuda.cpu(),
                     "previous_slots": buffers.previous_batch_indices_cuda[:2].cpu(),
                     "position_offsets": buffers.previous_pos_id_offsets_cuda.cpu(),
                     "kv_lens_offsets": buffers.previous_kv_lens_offsets_cuda.cpu(),
@@ -827,7 +897,11 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         # The verifying rows take the previous step's tokens and corrections.
         lens = previous.new_tokens_lens.cpu()
         self.assertEqual(staged["previous_slots"].tolist(), [4, 2])
-        self.assertEqual(staged["input_ids"][11:15].tolist(), previous.new_tokens[:, 4, 0].tolist())
+        verified_start = context_length + tokens_per_step
+        self.assertEqual(
+            staged["input_ids"][verified_start : verified_start + tokens_per_step].tolist(),
+            previous.new_tokens[:, 4, 0].tolist(),
+        )
         self.assertEqual(
             staged["kv_lens_offsets"][:4].tolist(),
             [0, lens[4].item() - tokens_per_step, lens[2].item() - tokens_per_step, 0],

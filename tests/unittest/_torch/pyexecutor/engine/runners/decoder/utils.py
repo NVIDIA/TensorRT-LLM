@@ -215,7 +215,7 @@ def decoder_warmup(
         metadata=Mock(),
         dummy_requests=dummy_requests,
         graphs=graphs,
-        inputs=SimpleNamespace(guided_decoder=guided_decoder),
+        inputs=SimpleNamespace(guided_decoder=guided_decoder, warmup_speculative_inputs=Mock()),
         forward_warmup=forward_warmup,
         torch_compile_bypass=nullcontext,
         context_warmups_supported=True,
