@@ -71,7 +71,11 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
-from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, _prepare_qwen_vl_vision_attn_metadata
+from .modeling_qwen2vl import (
+    Qwen2_5_VLVisionAttention,
+    _prepare_qwen_vl_vision_attn_metadata,
+    _set_item_grid_metadata,
+)
 from .modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModelBase,
@@ -473,6 +477,10 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
         )
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        # The aggregated model also calls this forward. Only the standalone
+        # encoder returns embedding handles.
+        if self.model_config.mm_encoder_only:
+            _set_item_grid_metadata(multimodal_params)
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 

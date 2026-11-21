@@ -38,9 +38,11 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     type: Required[Literal["video_url"]]
 
 
-class ImageEmbedsData(TypedDict):
+class ImageEmbedsData(TypedDict, total=False):
     """Type definition for serialized image embeddings structure."""
     data: Required[str]
+    # Image grid (t, h, w) from the image processor. mRoPE models need it.
+    image_grid_thw: List[int]
 
 
 class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
@@ -173,9 +175,13 @@ def parse_chat_message_content_part(
 
     if part_type == "image_embeds":
         str_content = cast(str, content)
+        image_grid_thw = cast(dict, part)["image_embeds"].get("image_grid_thw")
 
         async def decode_image_embeds():
-            return load_base64_image_embeds(str_content)
+            embeds = load_base64_image_embeds(str_content)
+            if image_grid_thw is None:
+                return embeds
+            return {"mm_embeddings": embeds, "image_grid_thw": image_grid_thw}
 
         return MultimodalData(modality="image",
                               data=decode_image_embeds(),

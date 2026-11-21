@@ -13,6 +13,7 @@ import pytest
 import torch
 import yaml
 from PIL import Image
+from transformers import AutoProcessor
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import encode_base64_image
@@ -216,10 +217,17 @@ def test_single_chat_session_image_embeds(
 
     image_content = messages[0]["content"][1]
     assert image_content["type"] == "image_url"
+    # mRoPE needs the image grid; take it from the model's image processor.
+    image_processor = AutoProcessor.from_pretrained(
+        get_model_path(model_name)).image_processor
+    image = Image.open(image_content["image_url"]["url"]).convert("RGB")
+    image_grid_thw = image_processor(
+        images=image, return_tensors="pt")["image_grid_thw"][0].tolist()
     image_content.clear()
     image_content["type"] = "image_embeds"
     image_content["image_embeds"] = {
-        "data": b64encode(mm_embed_bytes).decode("ascii")
+        "data": b64encode(mm_embed_bytes).decode("ascii"),
+        "image_grid_thw": image_grid_thw,
     }
 
     chat_completion_embeds = client.chat.completions.create(
