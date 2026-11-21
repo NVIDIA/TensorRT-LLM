@@ -18,11 +18,17 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.math_utils import ceil_div
 
 from .block_select import PUBLISH_BLOCK, block_select_supported
-from .params import CSA2BackendForwardArgs, CSA2Layer, CSA2MetadataParams, CSA2Mode
+from .params import (
+    CSA2BackendForwardArgs,
+    CSA2Layer,
+    CSA2MetadataParams,
+    CSA2Mode,
+    select_csa2_backend,
+)
 
 if TYPE_CHECKING:
     from .....pyexecutor.llm_request import LlmRequest
@@ -347,6 +353,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # CSA2 never reads the generic MLA chunked-context tables.
         self.enable_context_mla_with_cached_kv = False
         super().__post_init__()
+
+    def _validate_swa_scratch_reuse(self) -> None:
+        """CSA2 resolves scratch pages before its hardware-selected attention helper."""
+        select_csa2_backend(get_sm_version())
 
     @property
     def tokens_per_block(self) -> int:
