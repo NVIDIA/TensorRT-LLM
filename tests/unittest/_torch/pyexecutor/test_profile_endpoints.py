@@ -472,6 +472,7 @@ def test_profile_step_collects_with_source_and_logging_gates(
     monkeypatch.setenv(profiling.PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
     monkeypatch.delenv(profiling.PROFILE_START_STOP_ENV_VAR_NAME, raising=False)
     monkeypatch.setattr(profiling.torch.cuda, "Event", Mock())
+    monkeypatch.setattr(profiling, "current_cuda_stream", Mock(return_value=None))
     monkeypatch.setattr(profiling, "get_calibrator", Mock(return_value=Mock()))
     monkeypatch.setattr(
         profiling,

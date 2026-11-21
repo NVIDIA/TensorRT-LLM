@@ -39,6 +39,7 @@ from tensorrt_llm._startup_errors import (StartupErrorInfo,
                                           wrap_worker_startup_error)
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.llm_request import release_undelivered_response
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
@@ -909,6 +910,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             # late responses instead of crashing with a KeyError.
             result = self._results.get(client_id)
             if result is None:
+                release_undelivered_response(res)
                 return
             queue = result.queue
             if isinstance(queue, _SyncQueue):

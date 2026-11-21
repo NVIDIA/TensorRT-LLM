@@ -36,6 +36,7 @@ from tensorrt_llm._torch.attention.backends.interface import PredefinedAttention
 from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_gemma4
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import build_gemma_attention_mask
 from tensorrt_llm._torch.models.modeling_gemma4 import (
@@ -1588,6 +1589,21 @@ class TestGemma4HFComparison(unittest.TestCase):
             config_dict,
             attn_backend="TRTLLM",
         )
+
+    @torch.no_grad()
+    def test_kv_sharing_real_headdim_config(self):
+        """FlashInfer backend: Q-only H256/H512 KV-shared layers (fused q_norm + RoPE) match HF."""
+        config_dict = deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG)
+        config_dict["num_hidden_layers"] = 12
+        config_dict["num_kv_shared_layers"] = 4
+        fused = modeling_gemma4.gemma4_fused_qkv_norm_rope_quant
+        with unittest.mock.patch.object(
+            modeling_gemma4, "gemma4_fused_qkv_norm_rope_quant", wraps=fused
+        ) as spy:
+            self._run_full_model_comparison(config_dict)
+        # The KV-shared layers take the fused Q-only path (num_kv_heads=0), for both head dims.
+        q_only_head_dims = {c.args[8] for c in spy.call_args_list if c.args[7] == 0}
+        self.assertEqual(q_only_head_dims, {256, 512})
 
     @torch.no_grad()
     def test_diff_kv_heads_config(self):

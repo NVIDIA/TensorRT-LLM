@@ -21,7 +21,7 @@ for the overall CBTS architecture.
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template, developer-assistant, and agent-skill (`skills/`) folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
 
 ## PythonFormattingRule
 
@@ -550,10 +550,12 @@ including at the repository root or under `scripts/` and `jenkins/`.
 | `scripts/templates/precommit-legacy-files.j2`, `scripts/templates/pyproject-format-exclude.j2`, `scripts/templates/ruff-legacy.toml.j2` | Lint configuration templates |
 
 `OUT_OF_SCOPE_PREFIXES` covers the complete root directories
-`.github/ISSUE_TEMPLATE/`, `.codex/`, and `.claude/`, including new files and all
-file types. The trailing slash preserves the directory boundary: sibling paths
-such as `.github/workflows/` and `.claude-extra/`, and nested paths such as
-`nested/.codex/`, are not exempt. Markdown, reStructuredText, and Python
+`.github/ISSUE_TEMPLATE/`, `.codex/`, `.claude/`, and `skills/`, including new
+files and all file types. `skills/` holds agent skills published to the NVIDIA
+skills catalog; NVSkills CI validates and signs them instead of L0. The trailing
+slash preserves the directory boundary: sibling paths such as
+`.github/workflows/`, `.claude-extra/`, and `skills-extra/`, and nested paths
+such as `nested/.codex/` and `nested/skills/`, are not exempt. Markdown, reStructuredText, and Python
 docstrings inside exempt subtrees do not contribute a docs stage. The input
 loader leaves those Python files available for `OutOfScopeRule` to claim.
 

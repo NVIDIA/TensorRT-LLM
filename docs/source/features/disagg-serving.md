@@ -102,6 +102,14 @@ The disaggregated server generates this ID itself as a **snowflake** — a self-
 
 Global disaggregated IDs occupy the range `[1 << 40, 2**63)`; worker-local and warm-up request IDs occupy the disjoint range `[0, 1 << 40)`, so the two never collide. If a client supplies its own positive `disagg_request_id`, that value is used verbatim and must be globally unique; when unset, the server mints a snowflake ID as above.
 
+If a request to a worker fails, the disaggregated server handles it as follows:
+
+- **Context requests** are retried under a new ID, up to `max_retries` times (up to 5 for a connection reset or server disconnect). A streaming request that a worker answers with an error status is not retried.
+- **Generation requests** are re-sent, with the same ID, only if they cannot have reached the generation server (connection refused, or reset while being written). Any later failure fails the request, because the generation server may already hold the one-shot KV-cache handoff.
+- **Streams** that fail before the first chunk get an HTTP error status for chat and completions, and an `error` event for Responses and Anthropic Messages.
+
+Set `TRTLLM_DISAGG_NO_RETRY=1` to disable retries. A context request whose frontend-affinity port refuses the connection still moves once to the shared port.
+
 ## Usage
 
 ### Dynamo

@@ -3538,6 +3538,8 @@ _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
     prioritize_decode_graphs=True,
     loop_on_execution_stream=True,
     prompts_to_owners=True,
+    skip_adp_count_gather=True,
+    skip_verify_row_gather=True,
 )
 
 

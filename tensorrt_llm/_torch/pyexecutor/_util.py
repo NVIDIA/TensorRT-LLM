@@ -90,7 +90,7 @@ from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .runtime_hooks import runtime_hooks_of
-from .sampler import EarlyStopWithMMResult, TorchSampler
+from .sampler import TorchSampler
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
@@ -4927,9 +4927,9 @@ def _create_kv_cache_manager(
             kda_extra_kwargs["pretrained_config"] = config
         if is_glm5_next:
             from ..attention.backends.sparse.glm_kpool import \
-                glm_kpool_cache_row_dim
-            kda_extra_kwargs["index_state_dim"] = glm_kpool_cache_row_dim(
-                int(text_config.index_head_dim))
+                glm_kpool_index_state_dim
+            kda_extra_kwargs["index_state_dim"] = glm_kpool_index_state_dim(
+                _model_config)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -6034,7 +6034,6 @@ def instantiate_sampler(
     *,
     max_batch_size: int,
     max_beam_width: int,
-    mm_encoder_only: bool,
     speculative_config: SpeculativeConfig,
     max_num_sequences: Optional[int] = None,
 ):
@@ -6074,16 +6073,6 @@ def instantiate_sampler(
                 )
         return sampler
 
-    if mm_encoder_only:
-        # NOTE: handle model outputs specially for mm encoder executor/engine.
-        # Only export results on ranks whose responses reach the frontend
-        # (see PyExecutor._enqueue_responses): rank 0, plus the attention-DP
-        # ranks gathered into it. A CUDA IPC handle exported on any other rank
-        # is never opened, so PyTorch would never release its allocation.
-        returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
-                                                  and 0 in mapping.tp_group)
-        return EarlyStopWithMMResult(return_mm_results=returns_responses,
-                                     max_num_tokens=engine.max_num_tokens)
     return TorchSampler(sampler_args)
 
 

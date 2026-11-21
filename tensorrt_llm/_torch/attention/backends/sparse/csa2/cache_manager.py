@@ -34,6 +34,7 @@ from tensorrt_llm._utils import (
     CUASSERT,
     TensorWrapper,
     convert_to_torch_tensor,
+    current_cuda_stream,
     nvtx_range,
     prefer_pinned,
 )
@@ -1025,7 +1026,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             inputs = (self._batch_rows, caches, list(page_versions), scratch, swa_out)
             if _same_conversion_inputs(inputs, self._batch_conversion_inputs):
                 # The previous conversion recorded this event.
-                torch.cuda.current_stream().wait_event(self._base_rows_read[self._base_rows_slot])
+                current_cuda_stream().wait_event(self._base_rows_read[self._base_rows_slot])
                 self._num_page_table_reuses += 1
                 return None
         changed = _changed_rows(inputs, self._batch_conversion_inputs)

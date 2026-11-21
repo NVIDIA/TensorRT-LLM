@@ -89,6 +89,8 @@ _TABLE_RE = re.compile(r"^\s*(\[\[?)([\w.-]+)(\]\]?)\s*(?:#.*)?$")
 # - .github/ISSUE_TEMPLATE/           : issue intake forms and guidance.
 # - .codex/ and .claude/              : developer assistant configuration,
 #   instructions, and local tooling.
+# - skills/                           : agent skills published to the
+#   NVIDIA skills catalog; validated and signed by NVSkills CI, not by L0.
 # - tests/integration/test_lists/qa/   : QA test lists, run by separate
 #   nightly QA workflows.
 # - tests/integration/test_lists/dev/  : developer-side artifacts, not
@@ -109,6 +111,7 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     ".github/ISSUE_TEMPLATE/",
     ".codex/",
     ".claude/",
+    "skills/",
     "tests/integration/test_lists/qa/",
     "tests/integration/test_lists/dev/",
     "tests/integration/defs/.test_durations",

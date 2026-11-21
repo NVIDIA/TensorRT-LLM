@@ -179,21 +179,24 @@ def _helix_sanitize_empty_kv(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
     zero_kv_mask: Optional[torch.Tensor],
+    is_lse: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Force zero-local-KV rows to a no-op contribution for the Helix combine.
 
     A CP rank that owns no KV blocks for a token attends to zero keys, so the
     attention kernel normalizes by a zero softmax sum and yields NaN. The combine
     weights each rank by sum * exp(max - global_max), so such rows must contribute
-    softmax_stats of (-inf, 0) and a zeroed partial_o to act as a no-op. The rows
+    softmax_stats of (-inf, 0), or base-2 LSE of -inf, and a zeroed partial_o. The rows
     are selected by zero_kv_mask, which is robust regardless of what the kernel
     wrote. Passing None disables sanitization.
 
     Args:
         partial_o: Partial attention output, shape [num_tokens, ...].
-        softmax_stats: Per (token, head) (max, sum), shape [num_tokens, num_heads, 2].
+        softmax_stats: Per (token, head) (max, sum), shape [num_tokens, num_heads, 2],
+            or base-2 LSE with final dimension 1.
         zero_kv_mask: Bool tensor of shape [num_tokens], True where this rank has
             zero local KV.
+        is_lse: Whether softmax_stats contains compact base-2 LSE.
     """
     if zero_kv_mask is None:
         return partial_o, softmax_stats
@@ -202,6 +205,9 @@ def _helix_sanitize_empty_kv(
     # masked_fill overwrites masked rows regardless of their current (possibly NaN)
     # value and is CUDA-graph safe due to static shapes.
     partial_o = partial_o.masked_fill(mask, 0.0)
+    if is_lse:
+        return partial_o, softmax_stats.masked_fill(mask.unsqueeze(-1),
+                                                    float("-inf"))
     sm_max = softmax_stats[..., 0].masked_fill(mask, float("-inf"))
     sm_sum = softmax_stats[..., 1].masked_fill(mask, 0.0)
     softmax_stats = torch.stack([sm_max, sm_sum], dim=-1)
@@ -256,6 +262,7 @@ def _helix_nccl_pre_alltoall(
     softmax_stats: torch.Tensor,
     zero_kv_mask: Optional[torch.Tensor],
     cp_size: int,
+    is_lse: bool = False,
 ) -> List[torch.Tensor]:
     """Sanitize zero-local-KV rows and reformat into the alltoall send layout.
 
@@ -266,7 +273,7 @@ def _helix_nccl_pre_alltoall(
     """
     partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o,
                                                         softmax_stats,
-                                                        zero_kv_mask)
+                                                        zero_kv_mask, is_lse)
     chunks = []
     for t in (partial_o, softmax_stats):
         t = t.transpose(1, 0).contiguous()
@@ -318,6 +325,7 @@ def _helix_post_process(
     ln_events: Optional[list] = None,
     zero_kv_mask: Optional[torch.Tensor] = None,
     is_cuda_graph: bool = False,
+    is_lse: bool = False,
 ) -> torch.Tensor:
     """Helix CP post-processing: all-to-all exchange and combine partial
     attention outputs across CP ranks.
@@ -326,6 +334,9 @@ def _helix_post_process(
     dimension that differs between the two callers is *value_dim*
     (``head_dim`` for MHA; for MLA ``kv_lora_rank``, or ``v_head_dim`` when
     the V up-projection runs before the exchange).
+
+    All ranks use the same normalizer format: natural-log max/sum pairs by
+    default, or compact base-2 LSE with final dimension one when is_lse=True.
 
     zero_kv_mask marks tokens this CP rank owns no KV for; those rows are forced
     to a no-op contribution before the exchange, exactly once per backend:
@@ -343,6 +354,7 @@ def _helix_post_process(
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
     separate CUDA streams for better performance.
     """
+    stats_width = 1 if is_lse else 2
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL path. Sanitize is folded into _helix_nccl_pre_alltoall so
         # inductor can fuse it into the reformat.
@@ -355,10 +367,10 @@ def _helix_post_process(
             pre_alltoall = _helix_nccl_pre_alltoall
             post_alltoall = _helix_nccl_post_alltoall
         chunks = pre_alltoall(partial_o, softmax_stats, zero_kv_mask,
-                              mapping.cp_size)
+                              mapping.cp_size, is_lse)
         gathered = post_alltoall(alltoall_helix(chunks, mapping.cp_group))
         return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
-                                                   1.0)
+                                                   1.0, is_lse)
     else:
         # FIFO-based implementation using MNNVL workspace.
         helix = HelixAllToAllNative.get(mapping)
@@ -368,7 +380,7 @@ def _helix_post_process(
 
         if fifo_version == 1:
             partial_o, softmax_stats = _helix_sanitize_empty_kv(
-                partial_o, softmax_stats, zero_kv_mask)
+                partial_o, softmax_stats, zero_kv_mask, is_lse)
 
             def reshape_o():
                 return partial_o.view(num_tokens, cp_size, num_heads_tp_cp,
@@ -376,7 +388,8 @@ def _helix_post_process(
 
             def reshape_s():
                 return softmax_stats.view(num_tokens, cp_size, num_heads_tp_cp,
-                                          2).transpose(1, 2).contiguous()
+                                          stats_width).transpose(
+                                              1, 2).contiguous()
 
             if aux_stream is not None and ln_events is not None:
                 partial_o, softmax_stats = maybe_execute_in_parallel(
@@ -391,9 +404,9 @@ def _helix_post_process(
                 softmax_stats = reshape_s()
 
             partial_o_out, softmax_stats_out = helix.alltoall_native(
-                partial_o, softmax_stats)
+                partial_o, softmax_stats, is_lse=is_lse)
             return torch.ops.trtllm.helix_post_process_native(
-                partial_o_out, softmax_stats_out, 1.0, 2)
+                partial_o_out, softmax_stats_out, 1.0, 2, is_lse)
         else:
             # fifo_v2: one entry is one token, and the sender already streams
             # every byte through shared memory, so the sanitize rides along
@@ -401,16 +414,19 @@ def _helix_post_process(
             partial_o = partial_o.view(num_tokens, cp_size,
                                        num_heads_tp_cp * value_dim)
             softmax_stats = softmax_stats.view(num_tokens, cp_size,
-                                               num_heads_tp_cp * 2)
+                                               num_heads_tp_cp * stats_width)
             partial_o_out, softmax_stats_out = helix.alltoall_native(
-                partial_o, softmax_stats,
-                None if zero_kv_mask is None else zero_kv_mask[:num_tokens])
+                partial_o,
+                softmax_stats,
+                None if zero_kv_mask is None else zero_kv_mask[:num_tokens],
+                is_lse=is_lse)
             gathered_o = partial_o_out.view(num_tokens, cp_size,
                                             num_heads_tp_cp, value_dim)
             gathered_stats = softmax_stats_out.view(num_tokens, cp_size,
-                                                    num_heads_tp_cp, 2)
+                                                    num_heads_tp_cp,
+                                                    stats_width)
             return torch.ops.trtllm.helix_post_process_native(
-                gathered_o, gathered_stats, 1.0, 1)
+                gathered_o, gathered_stats, 1.0, 1, is_lse)
 
 
 def _helix_cp_pad(tensor: torch.Tensor, num_tokens: int,

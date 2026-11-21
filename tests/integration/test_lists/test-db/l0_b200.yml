@@ -267,7 +267,12 @@ l0_b200:
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp8_quant.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp8_quant.py
+  - unittest/_torch/kernels/fused_ops/test_soft_cap_logits.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
+  - unittest/_torch/modeling/test_gemma4_fused_ops.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_swiglu_nvfp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
@@ -296,6 +301,7 @@ l0_b200:
   - unittest/_torch/modules/dwdp/test_dwdp_moe_construction_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
+  - unittest/_torch/moe/test_trtllm_gen_bf16_moe_inplace_refit.py
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/test_moe_comm_timeout_guard.py
@@ -491,6 +497,8 @@ l0_b200:
   - unittest/_torch/kernels/parallel_hw_agnostic/test_rotate_rows.py
   - unittest/_torch/kernels/parallel_hw_agnostic/test_scatter_kv_slots.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_wino_vae.py
+  - unittest/_torch/visual_gen/test_wino_vae_kernels.py
   - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py

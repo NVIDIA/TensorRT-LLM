@@ -172,6 +172,7 @@ class DecoderMetadata:
         )
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
         self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        self.spec_metadata.skip_verify_row_gather = self.runtime_hooks.skip_verify_row_gather
         if self.runtime_hooks.pack_spec_rng_uploads:
             logger.info(
                 "Sampled-step Philox uploads: written by the steady MTP stager on its steps, "

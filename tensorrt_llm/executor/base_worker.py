@@ -33,7 +33,8 @@ from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
 from .._torch.pyexecutor.iteration_stats import IterationStatsRecord
-from .._torch.pyexecutor.llm_request import LlmResponse
+from .._torch.pyexecutor.llm_request import (LlmResponse,
+                                             release_undelivered_response)
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
@@ -1625,6 +1626,7 @@ class AwaitResponseHelper:
             elif _drop_refused_response(self.worker, response):
                 continue
             elif self.worker._has_background_error():
+                release_undelivered_response(response)
                 response = self.worker._create_error_response(response)
             elif response.has_error():
                 # Convert to ErrorResponse, because tllm.Response cannot be
@@ -1850,6 +1852,7 @@ def _drop_refused_response(worker, response: LlmResponse) -> bool:
         return False
     if response.has_error() or response.result.is_final:
         worker._refused_client_ids.discard(response.client_id)
+    release_undelivered_response(response)
     return True
 
 
@@ -1867,7 +1870,13 @@ def _maybe_wrap_response(
             worker.abort_request(response.client_id)
         return ErrorResponse(response.client_id, str(error),
                              response.request_id)
-    req_perf_metrics = get_metrics_dict(response)
+    # Reading perf metrics deserializes the whole result, and the executor fills
+    # them only for requests that asked; an untracked request is always read.
+    generation_result = worker._results.get(response.client_id)
+    req_perf_metrics = None
+    if (generation_result is None
+            or generation_result.sampling_params.return_perf_metrics):
+        req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
     return response

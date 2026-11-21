@@ -50,6 +50,7 @@ from typing import Callable, Dict, Iterator, List, Optional
 
 import torch
 
+from tensorrt_llm._utils import current_cuda_stream, wait_event
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.logging import LoggerExposure
 from tensorrt_llm.metrics.perf import PerfMetricsRecord
@@ -938,14 +939,14 @@ class PyExecutorProfileManager:
                 if one_timing_event:
                     pass
                 elif it % 2 == 0:
-                    end_event_1.record()
+                    end_event_1.record(current_cuda_stream())
                     if start_event_2 is not None:
-                        end_event_2.synchronize()
+                        wait_event(end_event_2)
                         prev_device_step_time = start_event_2.elapsed_time(end_event_2)
                 else:
-                    end_event_2.record()
+                    end_event_2.record(current_cuda_stream())
                     if start_event_1 is not None:
-                        end_event_1.synchronize()
+                        wait_event(end_event_1)
                         prev_device_step_time = start_event_1.elapsed_time(end_event_1)
 
                 host_step_time = (end_time - start_time) * 1000  # ms
@@ -1006,11 +1007,11 @@ class PyExecutorProfileManager:
                 if it % 2 == 0:
                     if start_event_1 is None:
                         start_event_1 = torch.cuda.Event(enable_timing=True)
-                    start_event_1.record()
+                    start_event_1.record(current_cuda_stream())
                 else:
                     if start_event_2 is None:
                         start_event_2 = torch.cuda.Event(enable_timing=True)
-                    start_event_2.record()
+                    start_event_2.record(current_cuda_stream())
 
         with controller.iterations():
             yield profile_step_fn

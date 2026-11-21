@@ -3890,11 +3890,12 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         contexts = [
             request for request in scheduled_requests.context_requests if not request.is_dummy
         ]
-        contexts.extend(
-            request
-            for request in scheduled_requests.generation_requests
-            if not request.is_dummy and request.py_request_id in promoted_context_request_ids
-        )
+        if promoted_context_request_ids:
+            contexts.extend(
+                request
+                for request in scheduled_requests.generation_requests
+                if not request.is_dummy and request.py_request_id in promoted_context_request_ids
+            )
         if not contexts:
             return
         lookback = provider.config.max_ngram_size - 1
