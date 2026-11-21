@@ -39,6 +39,7 @@ CONTRACTS = (
         name="render core has no HTTP or executor dependency",
         importers=(
             "tensorrt_llm.serve.render.chat",
+            "tensorrt_llm.serve.render.control_tokens",
             "tensorrt_llm.serve.render.resources",
             "tensorrt_llm.serve.render.fingerprint",
             "tensorrt_llm.serve.render.prompt_types",

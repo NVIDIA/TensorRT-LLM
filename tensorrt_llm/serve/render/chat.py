@@ -26,6 +26,10 @@ the multimodal encoder route and the standalone renderer. The pipeline is:
 :func:`render_conversation` is steps 2-4 for a caller that already parsed the
 conversation (the chat route overlaps media loading with rendering).
 :func:`render_chat` runs the whole pipeline for a caller that has only a request.
+
+Control-token spellings in the messages, tools or documents are encoded as text
+(see :mod:`.control_tokens`). Such a prompt comes back as token ids, with no
+``text``, also from a caller that did not ask for tokenization.
 """
 
 from __future__ import annotations
@@ -42,11 +46,14 @@ from tensorrt_llm.inputs.utils import (
     _has_python_chat_template,
     apply_chat_template,
     async_apply_chat_template,
+    rendered_hf_chat_template_source,
 )
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.serving_extensions import ServingExtension
+from tensorrt_llm.tokenizer import TransformersTokenizer
 
+from .control_tokens import ControlTokens, control_tokens, encode_as_text
 from .prompt_types import (
     HarmonyConversionError,
     RenderedPrompt,
@@ -197,6 +204,89 @@ def _finish(
     )
 
 
+def _control_tokens(res: RenderResources, kwargs: Dict[str, Any]) -> Optional[ControlTokens]:
+    """The control tokens the inputs of this render spell, or None if they spell none.
+
+    Only for prompts whose ids can replace the text: text-only, rendered by a Jinja template,
+    and tokenized by the default text tokenizer of a Hugging Face fast tokenizer.
+    """
+    if not res.control_tokens_as_text or res.use_harmony:
+        return None
+    conversation = kwargs["conversation"]
+    if any(message.get("media") for message in conversation) or any(
+        kwargs["mm_placeholder_counts"] or ()
+    ):
+        return None
+    if res.input_processor is not None:
+        # Deferred: the registry module is heavy and only needed to check the kind.
+        from tensorrt_llm.inputs.registry import DefaultInputProcessor
+
+        if not isinstance(res.input_processor, DefaultInputProcessor):
+            return None
+    tokenizer = getattr(res.tokenizer, "tokenizer", res.tokenizer)
+    # The engine encodes with ``res.tokenizer``: a custom wrapper may encode differently.
+    if res.tokenizer is not tokenizer and type(res.tokenizer) is not TransformersTokenizer:
+        return None
+    if _has_python_chat_template(tokenizer):
+        return None
+    # None for a renderer without a Jinja template (passthrough models, the DeepSeek tokenizers).
+    template = rendered_hf_chat_template_source(
+        tokenizer=res.tokenizer,
+        processor=res.processor,
+        chat_template=kwargs["chat_template"],
+        tools=kwargs["tools"],
+        model_type=kwargs["model_type"],
+    )
+    if template is None:
+        return None
+    tokens = control_tokens(tokenizer, template)
+    if tokens is None or not tokens.found_in(conversation, kwargs["tools"], kwargs["documents"]):
+        return None
+    return tokens
+
+
+def _encode_control_tokens_as_text(
+    res: RenderResources,
+    kwargs: Dict[str, Any],
+    rendered: str,
+    tokens: ControlTokens,
+    *,
+    forced_prefix: Optional[str],
+    add_special_tokens: bool,
+    truncate_prompt_tokens: Optional[int],
+) -> Optional[RenderedPrompt]:
+    """The prompt with the inputs' control-token spellings encoded as text, as token ids.
+
+    None when nothing is left to mark (see :func:`.control_tokens.encode_as_text`); the
+    plain ``rendered`` then stands.
+    """
+
+    def render(conversation: Any, tools: Any, documents: Any) -> str:
+        return apply_chat_template(
+            **{**kwargs, "conversation": conversation, "tools": tools, "documents": documents}
+        )
+
+    encoded = encode_as_text(
+        tokens,
+        getattr(res.tokenizer, "tokenizer", res.tokenizer),
+        render,
+        rendered,
+        (kwargs["conversation"], kwargs["tools"], kwargs["documents"]),
+        # The forced prefix is written by the server, so it is encoded as usual.
+        suffix=forced_prefix or "",
+        add_special_tokens=add_special_tokens,
+        truncate_prompt_tokens=truncate_prompt_tokens,
+    )
+    if encoded is None:
+        return None
+    template_text, token_ids = encoded
+    return RenderedPrompt(
+        template_text=template_text,
+        token_ids=token_ids,
+        prefix_applied=forced_prefix is not None,
+    )
+
+
 async def render_conversation(
     res: RenderResources,
     *,
@@ -214,7 +304,11 @@ async def render_conversation(
     truncate_prompt_tokens: Optional[int] = None,
     encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
 ) -> RenderedPrompt:
-    """Render an already-parsed conversation without blocking the event loop."""
+    """Render an already-parsed conversation without blocking the event loop.
+
+    ``add_special_tokens`` and ``truncate_prompt_tokens`` apply when ``tokenize`` is set, and
+    to a prompt that comes back as ids because control-token text was encoded as text.
+    """
     # A tokenizer-native template tokenizes segment by segment, so control-token strings inside
     # user or tool text stay text. Encoding the finished string would turn them into special
     # tokens, so keep the tokenizer's own ids when nothing is added after the template.
@@ -224,20 +318,34 @@ async def render_conversation(
         and truncate_prompt_tokens is None
         and _has_python_chat_template(getattr(res.tokenizer, "tokenizer", res.tokenizer))
     )
-    rendered = await async_apply_chat_template(
-        **_template_kwargs(
-            res,
-            conversation=conversation,
-            mm_placeholder_counts=mm_placeholder_counts,
-            add_generation_prompt=add_generation_prompt,
-            tools=tools,
-            documents=documents,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            injected_chat_template_kwargs=injected_chat_template_kwargs,
-            enable_tokenize=native_ids,
-        )
+    kwargs = _template_kwargs(
+        res,
+        conversation=conversation,
+        mm_placeholder_counts=mm_placeholder_counts,
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
+        documents=documents,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        injected_chat_template_kwargs=injected_chat_template_kwargs,
+        enable_tokenize=native_ids,
     )
+    rendered = await async_apply_chat_template(**kwargs)
+    tokens = _control_tokens(res, kwargs) if isinstance(rendered, str) else None
+    if tokens is not None:
+        # Renders again and tokenizes: CPU work that scales with the prompt.
+        as_text = await asyncio.to_thread(
+            _encode_control_tokens_as_text,
+            res,
+            kwargs,
+            rendered,
+            tokens,
+            forced_prefix=forced_prefix,
+            add_special_tokens=add_special_tokens,
+            truncate_prompt_tokens=truncate_prompt_tokens,
+        )
+        if as_text is not None:
+            return as_text
     if tokenize:
         # Tokenization is CPU work that scales with the prompt; keep it off the loop.
         return await asyncio.to_thread(
@@ -397,29 +505,41 @@ def render_chat(
     # Nothing here loads media; close the coroutine instead of leaving it to be reported
     # as never awaited.
     mm_coroutine.close()
-    rendered = apply_chat_template(
-        **_template_kwargs(
-            res,
-            conversation=conversation,
-            mm_placeholder_counts=mm_placeholder_counts,
-            add_generation_prompt=request.add_generation_prompt,
-            tools=prepared.tool_dicts,
-            documents=request.documents,
-            chat_template=request.chat_template,
-            chat_template_kwargs=request.chat_template_kwargs,
-            injected_chat_template_kwargs=request.injected_chat_template_kwargs,
-            enable_tokenize=False,
-        )
-    )
-    result = _finish(
+    kwargs = _template_kwargs(
         res,
-        rendered,
-        forced_prefix=None,
-        tokenize=tokenize,
-        add_special_tokens=request.add_special_tokens,
-        truncate_prompt_tokens=request.truncate_prompt_tokens,
-        encode_rendered=encode_rendered,
+        conversation=conversation,
+        mm_placeholder_counts=mm_placeholder_counts,
+        add_generation_prompt=request.add_generation_prompt,
+        tools=prepared.tool_dicts,
+        documents=request.documents,
+        chat_template=request.chat_template,
+        chat_template_kwargs=request.chat_template_kwargs,
+        injected_chat_template_kwargs=request.injected_chat_template_kwargs,
+        enable_tokenize=False,
     )
+    rendered = apply_chat_template(**kwargs)
+    tokens = _control_tokens(res, kwargs) if isinstance(rendered, str) else None
+    result = None
+    if tokens is not None:
+        result = _encode_control_tokens_as_text(
+            res,
+            kwargs,
+            rendered,
+            tokens,
+            forced_prefix=None,
+            add_special_tokens=request.add_special_tokens,
+            truncate_prompt_tokens=request.truncate_prompt_tokens,
+        )
+    if result is None:
+        result = _finish(
+            res,
+            rendered,
+            forced_prefix=None,
+            tokenize=tokenize,
+            add_special_tokens=request.add_special_tokens,
+            truncate_prompt_tokens=request.truncate_prompt_tokens,
+            encode_rendered=encode_rendered,
+        )
     result.context = preparation_context(request, res, result)
     return result
 

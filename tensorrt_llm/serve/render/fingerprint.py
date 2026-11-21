@@ -16,11 +16,12 @@
 
 Two processes produce the same prompt token ids for the same request only if
 they render with the same chat template, tokenizer, model type, model-specific
-extension and input processor. The fingerprint is a digest over exactly those
-inputs, so a router or a worker can check that it may trust ids rendered
-elsewhere. The chat template is the one the renderer resolves, not every place
-one could come from. Settings that do not change the ids (the tool parser, for
-example) are listed for information but excluded from the digest.
+extension, input processor and ``control_tokens_as_text`` setting. The
+fingerprint is a digest over exactly those inputs, so a router or a worker can
+check that it may trust ids rendered elsewhere. The chat template is the one
+the renderer resolves, not every place one could come from. Settings that do
+not change the ids (the tool parser, for example) are listed for information
+but excluded from the digest.
 """
 
 from __future__ import annotations
@@ -219,6 +220,9 @@ def compute_fingerprint(res: "RenderResources") -> Dict[str, Any]:
                 "input_processor": input_processor_kind,
                 "templates": _resolved_templates(res),
                 "tokenizer": _tokenizer_digest(res.tokenizer),
+                # A process on code without this setting gets a different fingerprint, as
+                # intended: it encodes control-token text in the inputs as control tokens.
+                "control_tokens_as_text": res.control_tokens_as_text,
             }
         )
     return {
