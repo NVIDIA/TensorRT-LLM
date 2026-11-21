@@ -2603,7 +2603,7 @@ def test_candidates_fingerprint_covers_every_candidate(fp_modules):
     assert _changed(before, fingerprints()) == [False, False, True, True]
 
 
-def test_code_fingerprint_warns_about_sources_edited_after_start(
+def test_code_fingerprint_marks_sources_edited_after_start(
         fp_modules, monkeypatch):
     runners = fp_modules.load(
         "fp_runners", """
@@ -2619,9 +2619,48 @@ def test_code_fingerprint_warns_about_sources_edited_after_start(
                         "warning_once",
                         lambda message, key=None: warnings.append(key))
     monkeypatch.setattr(autotuner, "_EPOCH_NS", 0)
-    # The same key on every rank, whenever each imported the tuner.
-    assert fp_modules.fingerprints(runners.Runner) == [unchanged_since_start]
+    # The process may run other code than the disk holds: its key matches no
+    # entry a process that loaded the edited file writes, and is not saved.
+    [edited_since_start] = fp_modules.fingerprints(runners.Runner)
+    assert edited_since_start == autotuner._EDITED_PREFIX + unchanged_since_start
+    assert autotuner._edited_key(("op", "Runner", "()", (), edited_since_start))
     assert any(key and key[0] == "autotuner_source_edited" for key in warnings)
+
+
+def test_code_fingerprint_tells_factory_built_runner_classes_apart(fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Narrow(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0]
+
+
+        class Wide(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0, 1]
+
+
+        def factory(base):
+            class Runner(base):
+                pass
+
+            return Runner
+        """)
+    narrow = runners.factory(runners.Narrow)
+    wide = runners.factory(runners.Wide)
+    assert narrow.__qualname__ == wide.__qualname__
+    fp_modules.fingerprints()
+    cached = [autotuner._code_fingerprint(k) for k in (narrow, wide)]
+    walked = [autotuner._FingerprintWalk(k).digest() for k in (narrow, wide)]
+    assert cached == walked and cached[0] != cached[1]
+    assert autotuner._candidates_fingerprint(
+        (narrow, )) != autotuner._candidates_fingerprint((wide, ))
+    # Built again on the same base, it is the same runner.
+    assert autotuner._code_fingerprint(runners.factory(
+        runners.Narrow)) == cached[0]
 
 
 def test_code_fingerprint_keeps_no_object_a_global_held_alive(fp_modules):
@@ -2790,24 +2829,33 @@ def test_search_cache_reopens_the_comparison_when_a_loser_changes(fp_modules):
     assert not search([winner, loser])[0]
 
 
-def test_ranks_adopt_the_tuning_group_roots_fingerprint(fp_modules):
+def test_ranks_that_fingerprint_differently_raise(fp_modules):
     fp_modules.load("fp_util", "def helper():\n    return 0\n")
     runners = fp_modules.load("fp_runners", _CANDIDATE_RUNNERS)
     candidates = [runners.Winner(), runners.Loser()]
-    classes = (runners.Winner, runners.Loser)
 
     def agree(gather):
         tuner = SimpleNamespace(_dist=SimpleNamespace(tp_cp_allgather=gather))
         return autotuner.AutoTuner._agree_on_cache_hit(tuner, candidates, True)
 
-    # Ranks that agree keep their keys and their hits.
-    mine = autotuner._candidates_fingerprint(classes)
     assert agree(lambda obj: [obj, obj])
-    # A rank that fingerprints differently tunes again under the root's key.
-    assert not agree(lambda obj: [(True, "root-fingerprint"), obj])
-    assert autotuner._candidates_fingerprint(classes) == "root-fingerprint"
-    assert mine != "root-fingerprint"
-    assert agree(lambda obj: [(True, "root-fingerprint"), obj])
+    assert not agree(lambda obj: [obj, (False, obj[1])])
+    # Ranks that may run different code must not tune or reuse together.
+    with pytest.raises(RuntimeError, match="fingerprint the code"):
+        agree(lambda obj: [(True, "other-fingerprint"), obj])
+
+
+def test_save_cache_leaves_out_entries_of_edited_sources(tmp_path):
+    src = autotuner.AutoTuner().profiling_cache
+    current = ("test_edited", "R", "()", ((16, 64), ), "0123456789abcdef")
+    edited = ("test_edited", "R", "()", ((32, 64), ),
+              autotuner._EDITED_PREFIX + "0123456789abcdef")
+    src.cache = {current: (0, 1, 1.0), edited: (0, 2, 1.0)}
+    path = str(tmp_path / "cache.json")
+    src.save_cache(path, rank=0)
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert dst.cache == {current: (0, 1, 1.0)}
 
 
 def test_cache_key_mode_none_leaves_the_fingerprint_out(monkeypatch):

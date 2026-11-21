@@ -372,8 +372,12 @@ _FAST_CUSTOM_OP_MODULE = "tensorrt_llm._torch.custom_ops.fast_custom_op"
 # torch.ops / torch.classes namespaces that torch itself registers.
 _TORCH_NAMESPACES = ("aten", "prim", "prims")
 # When this module was imported: a tracked source file changed after it may
-# not hold the code this process runs, which is worth a warning.
+# not hold the code this process runs.
 _EPOCH_NS = time.time_ns()
+# Marks the fingerprint of a runner whose sources changed after _EPOCH_NS.
+# Entries under it serve this process only: save_cache leaves them out, and
+# no cache file holds an entry this process could hit with it.
+_EDITED_PREFIX = "edited-"
 # TLLM_AUTOTUNER_CACHE_KEY: "code" keys cache entries by the code fingerprint
 # of their candidate runners; "none" leaves it out, as before fingerprints.
 _CACHE_KEY_MODES = ("code", "none")
@@ -1069,6 +1073,7 @@ class _FingerprintWalk:
         self.sources: Dict[str, str] = {}
         self.packages: Set[str] = set()
         self.native = False
+        self.edited = False
         self.seen: Set[int] = set()
         self.seen_names: Set[str] = set()
 
@@ -1084,7 +1089,7 @@ class _FingerprintWalk:
         digest = hashlib.sha256()
         for label in sorted(self.sources):
             digest.update(f"{label}\0{self.sources[label]}\0".encode())
-        return digest.hexdigest()[:16]
+        return (_EDITED_PREFIX if self.edited else "") + digest.hexdigest()[:16]
 
     def counts(self, module: str) -> bool:
         return _tracked(module) or module in self.homes
@@ -1097,13 +1102,14 @@ class _FingerprintWalk:
     def index(self, obj) -> Optional[_SourceIndex]:
         index = _index_of(obj)
         if index is not None and index.mtime_ns > _EPOCH_NS:
-            # Keys follow the file on disk. They are not made this process's
-            # own: ranks would then disagree on them depending on when each
-            # imported this module.
+            # The disk may not hold the code this process runs: tactics tuned
+            # here must neither be saved under that code's key nor be served
+            # from a cache file written for it.
+            self.edited = True
             logger.warning_once(
                 f"[Autotuner] {index.path} changed after this process started; "
-                "autotuner cache keys describe it as it is on disk, which this "
-                "process may not be running.",
+                "autotuner cache entries of the runners that use it are kept in "
+                "this process only.",
                 key=("autotuner_source_edited", index.path))
         return index
 
@@ -1308,15 +1314,52 @@ class _FingerprintWalk:
 
 
 # (module, qualname) -> code fingerprint of that runner class.
-_FINGERPRINTS: Dict[Tuple[str, str], str] = {}
-# Names of a set of candidate runner classes -> its fingerprint; and the one
-# the ranks of a tuning group adopted for it when theirs differed.
-_CANDIDATE_FINGERPRINTS: Dict[Tuple[Tuple[str, str], ...], str] = {}
-_AGREED_FINGERPRINTS: Dict[Tuple[Tuple[str, str], ...], str] = {}
+_FINGERPRINTS: Dict[Tuple, str] = {}
+# Identities of a set of candidate runner classes -> its fingerprint.
+_CANDIDATE_FINGERPRINTS: Dict[Tuple, str] = {}
+_LOCAL_CLASS_IDENTITIES: "weakref.WeakKeyDictionary[type, Tuple]" = (
+    weakref.WeakKeyDictionary())
 
 
 def _class_name(cls: type) -> Tuple[str, str]:
     return cls.__module__, cls.__qualname__
+
+
+def _class_identity(cls: type) -> Tuple:
+    """What tells runner classes apart for the fingerprint caches. A class of
+    a module counts by its name. A class a function builds (`<locals>` in
+    its name) can be built again, alike or not: it also counts by what the
+    walk follows in it, its bases and the classes and code of its namespace,
+    so classes one factory builds alike share a fingerprint (walked once),
+    and classes it builds on different bases do not."""
+    if "<locals>" not in cls.__qualname__:
+        return _class_name(cls)
+    identity = _LOCAL_CLASS_IDENTITIES.get(cls)
+    if identity is None:
+        members = []
+        for key, value in sorted(vars(cls).items()):
+            if isinstance(value, (staticmethod, classmethod)):
+                value = value.__func__
+            values = ((value.fget, value.fset,
+                       value.fdel) if isinstance(value, property) else
+                      (value, ))
+            for value in values:
+                if inspect.isclass(value):
+                    members.append((key, _class_identity(value)))
+                elif callable(value):
+                    try:
+                        code = getattr(inspect.unwrap(value), "__code__", None)
+                    except ValueError:
+                        code = None
+                    if code is not None:
+                        members.append((key, code))
+        identity = _LOCAL_CLASS_IDENTITIES[cls] = (*_class_name(cls),
+                                                   tuple(
+                                                       map(
+                                                           _class_identity,
+                                                           cls.__bases__)),
+                                                   tuple(members))
+    return identity
 
 
 def _coarse_fingerprint(runner_cls: type) -> str:
@@ -1357,13 +1400,17 @@ def _code_fingerprint(runner_cls: type) -> str:
     A TRT-LLM change thus re-tunes only the runners whose code it touches; a
     module that cannot be narrowed counts whole. Sources are read from disk,
     so every process running the same files computes the same fingerprint.
-    It is cached by the runner's module and qualified name, not by the class,
-    so a runner class built per call is walked once and not kept alive. If
+    It is cached by the class's identity (_class_identity), not by the class
+    object, so a runner class a function builds alike on every call is walked
+    once and not kept alive. A source changed after this module was imported
+    may not be the code this process runs: the fingerprint is then marked as
+    this process's (_EDITED_PREFIX), and entries under it are not saved. If
     the walk fails, the runner is keyed by the TensorRT-LLM build instead.
     """
-    name = _class_name(runner_cls)
-    fingerprint = _FINGERPRINTS.get(name)
+    identity = _class_identity(runner_cls)
+    fingerprint = _FINGERPRINTS.get(identity)
     if fingerprint is None:
+        name = _class_name(runner_cls)
         try:
             fingerprint = _FingerprintWalk(runner_cls).digest()
         except Exception as e:  # noqa: BLE001 - must not fail the op it keys
@@ -1373,7 +1420,7 @@ def _code_fingerprint(runner_cls: type) -> str:
                 "the TensorRT-LLM build instead.",
                 key=("autotuner_fingerprint_failed", name))
             fingerprint = _coarse_fingerprint(runner_cls)
-        _FINGERPRINTS[name] = fingerprint
+        _FINGERPRINTS[identity] = fingerprint
     return fingerprint
 
 
@@ -1385,30 +1432,28 @@ def _candidates_fingerprint(runner_classes) -> Optional[str]:
     leaves fingerprints out of keys."""
     if _CACHE_KEY_MODE == "none":
         return None
-    names = tuple(dict.fromkeys(map(_class_name, runner_classes)))
-    fingerprint = (_AGREED_FINGERPRINTS.get(names)
-                   or _CANDIDATE_FINGERPRINTS.get(names))
+    identities = tuple(dict.fromkeys(map(_class_identity, runner_classes)))
+    fingerprint = _CANDIDATE_FINGERPRINTS.get(identities)
     if fingerprint is None:
         fingerprints = sorted({_code_fingerprint(k) for k in runner_classes})
-        fingerprint = (fingerprints[0]
-                       if len(fingerprints) == 1 else hashlib.sha256(
-                           "\0".join(fingerprints).encode()).hexdigest()[:16])
-        _CANDIDATE_FINGERPRINTS[names] = fingerprint
+        fingerprint = fingerprints[0]
+        if len(fingerprints) > 1:
+            edited = any(f.startswith(_EDITED_PREFIX) for f in fingerprints)
+            fingerprint = (_EDITED_PREFIX if edited else "") + hashlib.sha256(
+                "\0".join(fingerprints).encode()).hexdigest()[:16]
+        _CANDIDATE_FINGERPRINTS[identities] = fingerprint
     return fingerprint
 
 
-def _adopt_fingerprint(runner_classes, fingerprint: Optional[str]) -> None:
-    """Key entries tuned among `runner_classes` by `fingerprint` from now on
-    in this process (the one a tuning group agreed on)."""
-    names = tuple(dict.fromkeys(map(_class_name, runner_classes)))
-    if fingerprint is not None:
-        _AGREED_FINGERPRINTS[names] = fingerprint
+def _edited_key(key: Tuple) -> bool:
+    """Whether a cache key carries a fingerprint marked _EDITED_PREFIX."""
+    return (len(key) > 4 and isinstance(key[4], str)
+            and key[4].startswith(_EDITED_PREFIX))
 
 
 def _clear_fingerprints() -> None:
     _FINGERPRINTS.clear()
     _CANDIDATE_FINGERPRINTS.clear()
-    _AGREED_FINGERPRINTS.clear()
 
 
 # What lru_cache offered, for tests that model a new process.
@@ -2058,6 +2103,8 @@ class AutoTunerProfilingCache:
         serializable_cache = {}
 
         for key, value in cache.items():
+            if _edited_key(key):
+                continue  # Tuned against code the disk may no longer hold.
             # Convert any simple object to string for JSON compatibility
             key_str = str(key)
             runner_id, tactic, min_time = value
@@ -3845,29 +3892,29 @@ class AutoTuner:
 
     def _agree_on_cache_hit(self, runners: List[TunableRunner],
                             is_cache_hit: bool) -> bool:
-        """Whether every rank of the tuning group has the entry, once their
-        keys for ``runners`` agree (one host all-gather).
+        """Whether every rank of the tuning group has the entry (one host
+        all-gather of each rank's hit and code fingerprint for ``runners``).
 
-        Ranks running the same code can still fingerprint it differently (a
-        source one node cannot read). Their keys would then differ, so the
-        entries they merge or broadcast would not meet and each would keep
-        its own tactic, which for a collective op diverges across ranks. They
-        adopt the tuning group root's fingerprint instead, and tune again.
+        Ranks that fingerprint the runners differently may be running
+        different code, with different valid tactics: their keys would not
+        meet in the merge or broadcast, and tuning them together could pick a
+        tactic some rank cannot run. Every rank sees the same gathered values,
+        so they all raise here, before the collective profiling.
         """
         classes = tuple(type(r) for r in runners)
-        fingerprint = _candidates_fingerprint(classes)
-        gathered = self._dist.tp_cp_allgather(obj=(bool(is_cache_hit),
-                                                   fingerprint))
-        root = gathered[0][1]
-        if any(other != root for _, other in gathered):
+        gathered = self._dist.tp_cp_allgather(
+            obj=(bool(is_cache_hit), _candidates_fingerprint(classes)))
+        fingerprints = {fingerprint for _, fingerprint in gathered}
+        if len(fingerprints) > 1:
             names = sorted({".".join(_class_name(k)) for k in classes})
-            logger.warning_once(
-                f"[Autotuner] Ranks fingerprint the code of {names} "
-                "differently; using the tuning group root's fingerprint and "
-                "tuning again.",
-                key=("autotuner_fingerprint_disagreement", tuple(names)))
-            _adopt_fingerprint(classes, root)
-            return False
+            raise RuntimeError(
+                f"[Autotuner] The ranks of a tuning group fingerprint the code "
+                f"of {names} differently ({sorted(fingerprints, key=str)}): "
+                "they may be running different TensorRT-LLM sources (a file "
+                "edited while they started, or one a node cannot read; see the "
+                "warnings). Run every rank on the same files, or set "
+                "TLLM_AUTOTUNER_CACHE_KEY=none to key the cache without code "
+                "fingerprints.")
         return all(hit for hit, _ in gathered)
 
     def _profile_hits_on_all_ranks(self, profiles: List[OptimizationProfile],
