@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1993-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 1993-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,9 @@
 #include "tensorrt_llm/common/config.h"
 #include <cstddef>
 #include <cstdint>
+
+// Workspace for cuBLAS GEMM: 32 MiB.
+#define CUBLAS_WORKSPACE_SIZE 33554432
 
 TRTLLM_NAMESPACE_BEGIN
 

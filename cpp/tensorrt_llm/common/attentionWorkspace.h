@@ -17,8 +17,10 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+
+#include <cuda_fp8.h>
+#include <vector_types.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +70,20 @@ struct AttentionContextWorkspaceSizes
     size_t sageKMean{};
     size_t sageKMeanSum{};
     size_t fmhaMultiCtasKvScratch{};
+};
+
+//! Geometry and element size for padded unfused context attention buffers.
+struct AttentionUnfusedContextWorkspaceParams
+{
+    size_t elementSize{};
+    size_t batchSize{};
+    size_t querySequenceLength{};
+    size_t kvSequenceLength{};
+    size_t crossKvLength{}; //!< Encoder sequence extent; zero for self-attention.
+    size_t packedTokenCount{};
+    int numQueryHeads{};
+    int numAttnKvHeads{};
+    int headSize{};
 };
 
 struct AttentionContextWorkspaceLayout
@@ -221,6 +237,12 @@ struct AttentionXqaWorkspaceLayout
 class AttentionWorkspaceManager
 {
 public:
+    //! Size padded Q/K/V and score buffers, sequence metadata, and packed-token metadata.
+    //! Q/K/V and score buffers use padded counts because padding removal can make the packed token count smaller
+    //! than batch size times the maximum context query length.
+    [[nodiscard]] static AttentionContextWorkspaceSizes buildUnfusedContextSizes(
+        AttentionUnfusedContextWorkspaceParams const& params) noexcept;
+
     static AttentionContextWorkspaceLayout buildContextLayout(
         AttentionContextWorkspaceSizes const& sizes, uintptr_t alignment = common::kCudaMemAlign)
     {
