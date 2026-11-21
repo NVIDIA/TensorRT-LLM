@@ -39,6 +39,7 @@ from cutlass.cutlass_dsl import T as mlir_types
 from cutlass.cutlass_dsl import dsl_user_op
 
 from . import gvr_topk_decode_self_sampling as gvr
+from .gvr_topk_decode_self_sampling_host import PCW_VECTOR_ELEMENTS
 
 # ---- small key-span refine ----
 
@@ -1731,7 +1732,7 @@ class GvrPackedClampWindowKernel:
         """Launches ``rows * parts`` CTAs on ``stream``, as clusters of ``parts`` with ``cluster``.
 
         Args:
-            logits: [rows, npad] BFloat16, row-major with 8-byte aligned rows; ``npad % 64 == 0`` is
+            logits: [rows, npad] BFloat16, row-major with 8-byte aligned rows; ``npad % 4 == 0`` is
                 asserted when static.
             pre_idx: [rows, K] Int32. Only its width K is read; ``K % 4 == 0`` with
                 ``packed_sample_bf16``.
@@ -1749,7 +1750,7 @@ class GvrPackedClampWindowKernel:
         assert kv_lens.element_type == cutlass.Int32
         assert out.element_type == cutlass.Int32
         if cutlass.const_expr(cute.is_static(logits.shape[1])):
-            assert logits.shape[1] % 64 == 0
+            assert logits.shape[1] % PCW_VECTOR_ELEMENTS == 0
         if cutlass.const_expr(self.packed_sample_bf16):
             assert pre_idx.shape[1] % 4 == 0
         shared_bytes = self.required_smem_bytes
