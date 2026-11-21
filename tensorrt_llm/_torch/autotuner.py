@@ -416,12 +416,15 @@ class _SourceIndex(NamedTuple):
     eager: Dict[str, Tuple[str, ...]]
     # Every name a definition loads, its body included.
     loads: Dict[str, Tuple[str, ...]]
-    # name -> (level, module, attr) of each module-level `from` import.
-    imports: Dict[str, Tuple[int, str, str]]
+    # name -> (level, module, attr) of each module-level `from` import that
+    # binds it, last first (`try: from .a import T` / `except: from .b ...`).
+    imports: Dict[str, Tuple[Tuple[int, str, str], ...]]
     # name -> (digest, loads) of the statements that change, rather than
     # bind, the value of a name when the file runs: `TABLE[k] = v`,
     # `Cls.attr = v`, `X += v`, `del TABLE[k]`, `TABLE.update(...)`.
     mutations: Dict[str, Tuple[str, Tuple[str, ...]]]
+    # name -> the module a module-level `import a.b [as c]` binds it to.
+    modules: Dict[str, str]
 
 
 class _Alias(NamedTuple):
@@ -490,9 +493,15 @@ def _mutated_names(node) -> List[str]:
         targets = [node.target]
     elif isinstance(node, ast.Delete):
         targets = node.targets
-    elif (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
-          and isinstance(node.value.func, ast.Attribute)):
-        targets = [node.value.func.value]  # TABLE.update(...)
+    elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        call = node.value
+        # TABLE.update(...), and init(TABLE), which can change its argument.
+        targets = [call.func.value] if isinstance(call.func,
+                                                  ast.Attribute) else []
+        targets += [
+            a for a in (*call.args, *(k.value for k in call.keywords))
+            if isinstance(a, (ast.Name, ast.Attribute, ast.Subscript))
+        ]
     else:
         return []
     return [n for n in map(_root_name, targets) if n is not None]
@@ -548,7 +557,9 @@ def _source_index(path: str) -> _SourceIndex:
     spans: Dict[str, List[str]] = {}
     eager: Dict[str, List[str]] = {}
     loads: Dict[str, List[str]] = {}
-    imports: Dict[str, Tuple[int, str, str]] = {}
+    imports: Dict[str, List[Tuple[int, str, str]]] = {}
+    modules: Dict[str, str] = {}
+    aliases: Dict[str, str] = {}
     mutations: Dict[str, List[Tuple[ast.AST, Tuple]]] = {}
 
     def text_of(node, headers):
@@ -600,11 +611,20 @@ def _source_index(path: str) -> _SourceIndex:
                 for target in targets:
                     if isinstance(target, ast.Name):
                         add(prefix + target.id, child, value, value, headers)
+                        if not prefix and isinstance(child.value, ast.Name):
+                            # ALIAS = TABLE: what changes ALIAS changes TABLE.
+                            aliases[target.id] = child.value.id
             elif isinstance(child, ast.ImportFrom) and not prefix:
                 for alias in child.names:
-                    imports[alias.asname
-                            or alias.name] = (child.level, child.module
-                                              or "", alias.name)
+                    imports.setdefault(alias.asname or alias.name, []).insert(
+                        0, (child.level, child.module or "", alias.name))
+            elif isinstance(child, ast.Import) and not prefix:
+                for alias in child.names:
+                    if alias.asname:
+                        modules[alias.asname] = alias.name
+                    else:
+                        top = alias.name.partition(".")[0]
+                        modules[top] = top
             blocks = _blocks(child)
             if blocks is None:
                 visit(ast.iter_child_nodes(child), prefix, headers)
@@ -614,6 +634,9 @@ def _source_index(path: str) -> _SourceIndex:
                           (*headers, (header, tuple(header_nodes))))
 
     visit(ast.parse(text).body, "", ())
+    for alias, target in aliases.items():
+        if alias in mutations and alias != target:
+            mutations.setdefault(target, []).extend(mutations[alias])
     index = _SourceIndex(path, st.st_mtime_ns, st.st_size, _digest(text), {
         k: _digest("".join(v))
         for k, v in spans.items()
@@ -623,13 +646,16 @@ def _source_index(path: str) -> _SourceIndex:
     }, {
         k: tuple(dict.fromkeys(v))
         for k, v in loads.items()
-    }, imports, {
+    }, {
+        k: tuple(v)
+        for k, v in imports.items()
+    }, {
         k: (_digest("".join(text_of(n, h) for n, h in v)),
             tuple(
                 _dotted_loads([n for n, _ in v] +
                               [g for _, h in v for g in header_loads(h)])))
         for k, v in mutations.items()
-    })
+    }, modules)
     _SOURCE_INDEXES[path] = index
     return index
 
@@ -966,15 +992,42 @@ def _captured(fn):
             continue
 
 
+# Joins the label of a function to what it holds: a captured variable, a
+# default argument, or a partial's function and arguments.
+_HELD_LABEL = ".<held>."
+# How deep the names and identities of what functions hold are followed.
+_HELD_DEPTH = 12
+
+
+def _held(fn):
+    """(variable, value) for what a function a factory builds holds: its
+    closure (_captured) and its default arguments (`default.0`, or the
+    keyword-only argument's name)."""
+    yield from _captured(fn)
+    yield from ((f"default.{i}", v)
+                for i, v in enumerate(_attribute(fn, "__defaults__") or ()))
+    yield from sorted((_attribute(fn, "__kwdefaults__") or {}).items())
+
+
+def _is_immutable_literal(obj, depth: int = 0) -> bool:
+    """Whether `obj` is a constant, or a tuple or frozenset of them: a value
+    that cannot change after a function captures it."""
+    if isinstance(obj, _CONSTANT_TYPES):
+        return True
+    if depth > 4 or not isinstance(obj, (tuple, frozenset)):
+        return False
+    return all(_is_immutable_literal(v, depth + 1) for v in obj)
+
+
 def _captured_definitions(fn):
-    """(name, object) for the definitions `fn` captures (functions, classes,
-    modules, and kernel objects that name their own definition), which a
-    factory can vary from one built function to the next. Captured plain
-    values are not counted, as a class attribute's value is not."""
-    for var, value in _captured(fn):
+    """(name, object) for the definitions `fn` holds (functions, classes,
+    modules, partials, and kernel objects that name their own definition) in
+    its closure or as default arguments, which a factory can vary from one
+    built function to the next. Plain values count through _held_values."""
+    for var, value in _held(fn):
         if (inspect.isfunction(value) or inspect.isclass(value)
                 or inspect.ismodule(value) or isinstance(value, partial)):
-            yield f"{fn.__module__}.{fn.__qualname__}.<closure>.{var}", value
+            yield f"{fn.__module__}.{fn.__qualname__}{_HELD_LABEL}{var}", value
         elif callable(value):
             own_module = _attribute(value, "__module__")
             own_name = _attribute(value, "__qualname__")
@@ -982,27 +1035,76 @@ def _captured_definitions(fn):
                 yield f"{own_module}.{own_name}", value
 
 
+def _held_values(fn) -> Dict[str, str]:
+    """label -> repr of each constant `fn` holds (_is_immutable_literal): a
+    factory can build functions alike around different tactic tables."""
+    return {
+        f"{fn.__module__}.{fn.__qualname__}{_HELD_LABEL}{var}":
+        _stable_repr(value)
+        for var, value in _held(fn) if _is_immutable_literal(value)
+    }
+
+
+def _held_identity(value, depth: int) -> Any:
+    """The identity of what a function holds, for _function_identity."""
+    if depth > _HELD_DEPTH:
+        return "..."
+    if inspect.isclass(value):
+        return _class_identity(value)
+    if inspect.ismodule(value):
+        return value.__name__
+    if isinstance(value, partial):
+        return ("partial", _held_identity(value.func, depth + 1),
+                tuple(_held_identity(v, depth + 1) for v in value.args),
+                tuple((k, _held_identity(v, depth + 1))
+                      for k, v in sorted(value.keywords.items())))
+    if callable(value):
+        identity = _function_identity(value, depth + 1)
+        if identity[0] is None:  # A kernel object: its own name.
+            identity = (_attribute(value, "__module__"),
+                        _attribute(value, "__qualname__"))
+        return identity
+    if _is_immutable_literal(value):
+        return _stable_repr(value)
+    return type(value)
+
+
 def _function_identity(fn, depth: int = 0) -> Tuple:
-    """A function's code and the identities of the definitions it captures:
-    what tells apart functions one factory builds."""
+    """A function's code and the identities of what it holds (_held): what
+    tells apart functions one factory builds."""
     try:
         fn = inspect.unwrap(fn)
     except ValueError:
         pass
-    captured = []
-    if depth < 4:
-        for var, value in _captured(fn):
-            if inspect.isclass(value):
-                captured.append((var, _class_identity(value)))
-            elif inspect.ismodule(value):
-                captured.append((var, value.__name__))
-            elif callable(value):
-                identity = _function_identity(value, depth + 1)
-                if identity[0] is None:  # A kernel object: its own name.
-                    identity = (_attribute(value, "__module__"),
-                                _attribute(value, "__qualname__"))
-                captured.append((var, identity))
-    return getattr(fn, "__code__", None), tuple(captured)
+    held = ()
+    if depth <= _HELD_DEPTH:
+        held = tuple(
+            (var, _held_identity(value, depth)) for var, value in _held(fn))
+    return getattr(fn, "__code__", None), held
+
+
+def _code_digest(code: types.CodeType) -> str:
+    """A digest of a code object's bytecode, names and constants, nested code
+    included: the code a function runs, the same in every process."""
+    parts = [code.co_code.hex(), repr(code.co_names)]
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            parts.append(_code_digest(const))
+        elif _is_literal(const):
+            parts.append(_stable_repr(const))
+        else:
+            parts.append(type(const).__qualname__)
+    return _digest("\0".join(parts))[:16]
+
+
+def _resolve_import(level: int, source: str,
+                    package: Optional[str]) -> Optional[str]:
+    """The module a `from` import names, or None."""
+    try:
+        return (importlib.util.resolve_name("." * level + source, package)
+                if level else source)
+    except (ImportError, ValueError):
+        return None
 
 
 def _function_refs(fn) -> Tuple[Tuple[str, Any], ...]:
@@ -1146,30 +1248,84 @@ def _library_id(path: Path) -> str:
         return ""
 
 
+def _native_libraries() -> List[Path]:
+    """TensorRT-LLM's native libraries, which hold its C++ kernels."""
+    root = Path(tensorrt_llm.__file__).parent
+    return sorted([*root.glob("*.so"), *(root / "libs").glob("*.so")])
+
+
 @lru_cache(maxsize=None)
 def _native_build_id() -> str:
-    """IDs of TensorRT-LLM's native libraries, which hold its C++ kernels."""
-    root = Path(tensorrt_llm.__file__).parent
-    libraries = sorted([*root.glob("*.so"), *(root / "libs").glob("*.so")])
-    return "\n".join(f"{path.name}:{_library_id(path)}" for path in libraries)
+    """IDs of TensorRT-LLM's native libraries."""
+    return "\n".join(f"{path.name}:{_library_id(path)}"
+                     for path in _native_libraries())
 
 
-def _loaded_library_ids() -> str:
-    """IDs of the libraries named by _LOADED_LIBRARY_PREFIXES that this
-    process has loaded (TensorRT-LLM's and torch's native code link them, so
-    they are loaded on import), wherever they were installed from."""
+_DELETED = " (deleted)"
+
+
+@lru_cache(maxsize=None)
+def _loaded_libraries() -> Tuple[str, ...]:
+    """The paths of the libraries named by _LOADED_LIBRARY_PREFIXES that this
+    process has loaded, wherever they were installed from (a path ending in
+    _DELETED was replaced on disk after it was loaded). TensorRT-LLM's and
+    torch's native code link them; a cuBLAS handle is made first when CUDA is
+    up, so that a process that loads cuBLAS lazily has it loaded too."""
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        try:
+            torch.cuda.current_blas_handle()
+        except RuntimeError:
+            pass
     try:
         with open("/proc/self/maps") as f:
             paths = {
-                line.split(None, 5)[5].strip()
-                for line in f if len(line.split(None, 5)) == 6
+                fields[5].rstrip("\n")
+                for fields in (line.split(None, 5) for line in f)
+                if len(fields) == 6
             }
     except OSError:
+        return ()
+    return tuple(
+        sorted(path for path in paths
+               if Path(path).name.startswith(_LOADED_LIBRARY_PREFIXES)))
+
+
+def _loaded_library_ids() -> str:
+    """IDs of the libraries of _loaded_libraries."""
+    return "\n".join(
+        f"{Path(path).name}:replaced" if path.
+        endswith(_DELETED) else f"{Path(path).name}:{_library_id(Path(path))}"
+        for path in _loaded_libraries())
+
+
+@lru_cache(maxsize=None)
+def _native_replaced() -> bool:
+    """Whether a native library this process loaded (TensorRT-LLM's, or one
+    of _loaded_libraries) was replaced on disk afterwards, so that its build
+    ID on disk may not be the one of the code this process runs."""
+    replaced = [path for path in _loaded_libraries() if path.endswith(_DELETED)]
+    for path in [*_native_libraries(), *map(Path, _loaded_libraries())]:
+        try:
+            if os.stat(path).st_mtime_ns > _EPOCH_NS:
+                replaced.append(str(path))
+        except OSError:
+            continue
+    for path in replaced:
+        logger.warning_once(
+            f"[Autotuner] {path} changed after this process started; "
+            "autotuner cache entries of the runners keyed by it are kept in "
+            "this process only.",
+            key=("autotuner_library_replaced", str(path)))
+    return bool(replaced)
+
+
+def _device_capability() -> str:
+    """The architecture of the current GPU ('' without one): a tactic tuned
+    on one may not run on another."""
+    if not torch.cuda.is_available():
         return ""
-    libraries = sorted(
-        Path(path) for path in paths
-        if Path(path).name.startswith(_LOADED_LIBRARY_PREFIXES))
-    return "\n".join(f"{path.name}:{_library_id(path)}" for path in libraries)
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm{major}{minor}"
 
 
 class _FingerprintWalk:
@@ -1199,7 +1355,11 @@ class _FingerprintWalk:
             if versions:
                 self.sources[f"<package>:{top}"] = versions
         if self.native:
-            self.sources["<native>"] = _native_build_id()
+            self.sources["<native>"] = (_native_build_id() + "\n" +
+                                        _loaded_library_ids())
+            if _native_replaced():
+                self.edited = True
+        self.sources["<device>"] = _device_capability()
         digest = hashlib.sha256()
         for label in sorted(self.sources):
             digest.update(f"{label}\0{self.sources[label]}\0".encode())
@@ -1247,10 +1407,10 @@ class _FingerprintWalk:
             self.visit_operator(getattr(obj, "overloadpacket", obj))
             return
         if isinstance(obj, partial):
-            self.todo.append((f"{name}[func]", obj.func))
+            self.todo.append((f"{name}{_HELD_LABEL}func", obj.func))
             self.todo.extend(
-                (f"{name}[{i}]", v)
-                for i, v in enumerate((*obj.args, *obj.keywords.values())))
+                (f"{name}{_HELD_LABEL}{k}", v)
+                for k, v in (*enumerate(obj.args), *obj.keywords.items()))
         elif callable(obj) and not inspect.isclass(obj):
             try:
                 obj = inspect.unwrap(obj)
@@ -1278,7 +1438,8 @@ class _FingerprintWalk:
         """Record that global `name` refers to `target`, so swapping which
         definition two names refer to changes the digest even though every
         definition's source stays the same."""
-        if target != name and name.rpartition(".")[0] in sys.modules:
+        if target != name and (name.rpartition(".")[0] in sys.modules
+                               or _HELD_LABEL in name):
             self.sources[f"<ref>:{name}"] = target
 
     def visit_operator(self, packet) -> None:
@@ -1318,6 +1479,13 @@ class _FingerprintWalk:
         if not self.counts(module):
             self.add_package(module)
             return
+        if inspect.isfunction(obj):
+            # The code this process runs, which a stale .pyc or a source that
+            # cannot be read would hide from the source digests.
+            self.sources[f"{module}:{obj.__qualname__}<code>"] = _code_digest(
+                obj.__code__)
+            self.todo.extend(_captured_definitions(obj))
+            self.sources.update(_held_values(obj))
         index = self.index(obj)
         if index is None:
             self.native = self.native or _is_extension(obj)
@@ -1329,6 +1497,16 @@ class _FingerprintWalk:
             self.sources[f"{module}:<module>"] = index.digest
             self.todo.extend((f"{module}.{k}", v) for k, v in vars(obj).items()
                              if k in index.definitions or k in index.imports)
+            # A module it imports whole (`import a.b as c`), which a caller can
+            # reach through it too, counts by its file.
+            for local in index.modules:
+                imported = vars(obj).get(local)
+                if (inspect.ismodule(imported)
+                        and self.counts(imported.__name__)):
+                    imported_index = self.index(imported)
+                    if imported_index is not None:
+                        self.sources[f"{imported.__name__}:<module>"] = (
+                            imported_index.digest)
             return
         self.sources[f"{module}:{obj.__qualname__}"] = _definition_digest(
             obj, index)
@@ -1340,7 +1518,6 @@ class _FingerprintWalk:
             _resolve_loads(index.eager.get(obj.__qualname__, ()), globals_))
         if inspect.isfunction(obj):
             self.todo.extend(_function_refs(obj))
-            self.todo.extend(_captured_definitions(obj))
             return
         self.todo.extend((f"{module}.{obj.__qualname__}.{k}", v)
                          for k, v in vars(obj).items())
@@ -1361,13 +1538,20 @@ class _FingerprintWalk:
             if (index is None or attr in index.definitions
                     or attr not in index.imports):
                 return module, attr, index
-            level, source, attr = index.imports[attr]
-            try:
-                module = (importlib.util.resolve_name(
-                    "." * level + source, sys.modules[module].__package__)
-                          if level else source)
-            except (ImportError, ValueError):
+            package = sys.modules[module].__package__
+            (level, source, attr), *others = index.imports[attr]
+            # The other modules it may be imported from (a fallback import in
+            # an `except` branch) count too: either may have bound the name.
+            for other_level, other_source, other_attr in others:
+                other = _resolve_import(other_level, other_source, package)
+                if other in sys.modules:
+                    self.todo.append((f"{other}.{other_attr}",
+                                      _attribute(sys.modules[other],
+                                                 other_attr)))
+            resolved = _resolve_import(level, source, package)
+            if resolved is None:
                 return module, attr, None
+            module = resolved
         return module, attr, None
 
     def add_mutations(self, module: str, name: str,
@@ -1472,16 +1656,37 @@ def _class_identity(cls: type) -> Tuple:
         in_progress.discard(cls)
 
 
+def _held_name(value, depth: int) -> str:
+    """A name for what a function holds that is the same in every process:
+    a definition's (_definition_name), a constant's repr, else its type's."""
+    if callable(value) or inspect.ismodule(value):
+        return _definition_name(value, depth)
+    if _is_immutable_literal(value):
+        return _stable_repr(value)
+    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+
+
 def _definition_name(value, depth: int = 0) -> str:
     """A name of a definition that is the same in every process: its module
     and qualified name. A function a factory builds (`<locals>` in its name)
-    adds the names of the definitions it captures or takes as defaults, so
-    the functions a factory builds around different implementations differ."""
+    adds what it holds (_held), and a partial its function and arguments, so
+    the functions a factory builds around different implementations or
+    constants differ."""
+    if depth > _HELD_DEPTH:
+        return "..."
+    if inspect.isfunction(value):
+        try:
+            value = inspect.unwrap(value)  # Possibly into a partial.
+        except ValueError:
+            pass
     if isinstance(value, partial):
-        parts = [value.func, *value.args, *value.keywords.values()]
-        return "partial(" + ", ".join(
-            _definition_name(v, depth)
-            for v in parts if callable(v) or inspect.ismodule(v)) + ")"
+        parts = [
+            _definition_name(value.func, depth + 1),
+            *(_held_name(v, depth + 1) for v in value.args),
+            *(f"{k}={_held_name(v, depth + 1)}"
+              for k, v in sorted(value.keywords.items()))
+        ]
+        return "partial(" + ", ".join(parts) + ")"
     if inspect.ismodule(value):
         return value.__name__
     module = _attribute(value, "__module__")
@@ -1489,29 +1694,18 @@ def _definition_name(value, depth: int = 0) -> str:
     if not (isinstance(module, str) and isinstance(name, str)):
         module, name = type(value).__module__, type(value).__qualname__
     text = f"{module}.{name}"
-    if inspect.isfunction(value) and "<locals>" in name and depth < 4:
-        try:
-            value = inspect.unwrap(value)
-        except ValueError:
-            pass
-        held = [v for _, v in _captured(value)]
-        held += [
-            *(value.__defaults__ or ()), *(value.__kwdefaults__ or {}).values()
-        ]
-        names = [
-            _definition_name(v, depth + 1) for v in held
-            if callable(v) or inspect.ismodule(v)
-        ]
-        if names:
-            text += "[" + ", ".join(names) + "]"
+    if inspect.isfunction(value) and "<locals>" in name:
+        held = [f"{var}={_held_name(v, depth + 1)}" for var, v in _held(value)]
+        if held:
+            text += "[" + ", ".join(held) + "]"
     return text
 
 
 def _build_class_key(cls: type) -> Tuple:
     """What tells runner classes apart under "build", the same in every
     process: a class of a module counts by its name; a class a function
-    builds also by the names of its bases and of the definitions its members
-    are, capture or take as defaults (_definition_name)."""
+    builds also by the keys of its bases, the names of the definitions its
+    members are and hold (_definition_name), and its constant attributes."""
     if "<locals>" not in cls.__qualname__:
         return _class_name(cls)
     key = _LOCAL_CLASS_NAMES.get(cls)
@@ -1523,11 +1717,15 @@ def _build_class_key(cls: type) -> Tuple:
             values = ((value.fget, value.fset,
                        value.fdel) if isinstance(value, property) else
                       (value, ))
-            members += [(name, _definition_name(v)) for v in values
-                        if callable(v)]
+            for v in values:
+                if callable(v):
+                    members.append((name, _definition_name(v)))
+                elif v is not None and _is_immutable_literal(v):
+                    members.append((name, _stable_repr(v)))
         key = _LOCAL_CLASS_NAMES[cls] = (*_class_name(cls),
-                                         tuple(".".join(_class_name(b))
-                                               for b in cls.__bases__),
+                                         tuple(
+                                             map(_build_class_key,
+                                                 cls.__bases__)),
                                          tuple(members))
     return key
 
@@ -1565,37 +1763,45 @@ def _coarse_fingerprint(runner_cls: type) -> str:
     every rank."""
     text = "\0".join(
         (*_class_name(runner_cls), tensorrt_llm.__version__, torch.__version__,
-         _native_build_id()))
+         _native_build_id(), _device_capability()))
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def _code_fingerprint(runner_cls: type) -> str:
     """A digest of the code a runner's tactics depend on, in its cache keys
     under TLLM_AUTOTUNER_CACHE_KEY=code. It is best effort: what Python code
-    reaches only at run time (a callable a runner instance holds, getattr) is
-    not followed.
+    reaches only at run time (getattr, a callable a runner instance holds) is
+    not followed; a runner a runner instance holds is (_runner_kind).
 
     It starts from the runner and its TunableRunner bases and follows, one
     definition at a time, what they reach by name in tensorrt_llm code
     (TensorRT-LLM itself, and the modules that define the runner):
 
-    * a function counts by its source, the globals, module attributes and
-      imports its code loads, and the names its decorators and defaults
-      evaluate;
+    * a function counts by its source and its bytecode (the code this process
+      runs), the globals, module attributes and imports its code loads, the
+      names its decorators and defaults evaluate, and what it holds in its
+      closure or default arguments (definitions, partials, and constants);
     * a class by its source, its bases, its attributes, and the names its body
       evaluates;
     * any other value (a constant, table, kernel object or instance) by the
       source that defines it, following `from` imports to the module that
-      does, and by the names that source loads; a value without a source
-      definition counts by its own repr when it is a literal;
+      does (every module a name may be imported from), and by the names that
+      source loads; a value without a source definition counts by its own repr
+      when it is a literal;
     * a value, class or function also by the module-level statements that
       change it after it is bound (`TABLE[k] = v`, `Cls.attr = v`,
-      `TABLE.update(...)`), and the names those load;
+      `TABLE.update(...)`, `init(TABLE)`, and those through a module-level
+      alias), and the names those load;
+    * a module reached whole by its file, its definitions, what it imports
+      with `from`, and the files of the modules it imports whole;
     * a torch.ops operator by its Python implementation, else by the build IDs
-      of TensorRT-LLM's native libraries, as does a native module or class;
+      of TensorRT-LLM's native libraries and the loaded cuBLAS libraries, as
+      does a native module or class;
     * code outside tensorrt_llm by the installed version of its package; such
       modules are neither imported nor looked into for a key;
-    * each global name used, by the definition it refers to.
+    * each global name used, and each variable or argument a function holds,
+      by the definition it refers to;
+    * the GPU architecture.
 
     A TRT-LLM change thus re-tunes only the runners whose code it touches; a
     module that cannot be narrowed counts whole. Sources are read from disk,
@@ -1627,87 +1833,137 @@ def _code_fingerprint(runner_cls: type) -> str:
 @lru_cache(maxsize=None)
 def _build_fingerprint() -> str:
     """A digest of the TensorRT-LLM build: its version, its native libraries'
-    build IDs, the build IDs of the loaded cuBLAS libraries, and the installed
-    versions of torch and the kernel packages.
+    build IDs, the build IDs of the loaded cuBLAS libraries, the installed
+    versions of torch and the kernel packages, and the GPU architecture.
     It is the same on every rank of an installation, and changes with a
-    rebuild (even under the same version string) or a package upgrade."""
+    rebuild (even under the same version string), a package upgrade or
+    another GPU architecture. It is marked _EDITED_PREFIX when a native
+    library was replaced after this process loaded it."""
     parts = [
         f"tensorrt_llm=={tensorrt_llm.__version__}",
         f"torch=={torch.__version__}",
         _native_build_id(),
         _loaded_library_ids(),
         *map(_package_versions, _KERNEL_PACKAGES),
+        _device_capability(),
     ]
-    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+    digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+    return (_EDITED_PREFIX if _native_replaced() else "") + digest
 
 
-def _runner_fingerprint(runner_cls: type) -> str:
-    """A runner class's own fingerprint: under TLLM_AUTOTUNER_CACHE_KEY=code
-    its code fingerprint; else the build fingerprint and _build_class_key."""
+def _held_runners(runner, depth: int = 0) -> Tuple[type, ...]:
+    """The classes of the runners `runner` holds in its attributes (a wrapper
+    delegating to an underlying runner), and of the runners those hold."""
+    held: List[type] = []
+    if depth < 4:
+        for value in getattr(runner, "__dict__", {}).values():
+            if isinstance(value, TunableRunner) and value is not runner:
+                held += [type(value), *_held_runners(value, depth + 1)]
+    return tuple(held)
+
+
+def _runner_kind(runner):
+    """What a candidate's fingerprint covers: its class, and with the classes
+    of the runners it holds (_held_runners), a tuple of them."""
+    held = _held_runners(runner)
+    return (type(runner), *held) if held else type(runner)
+
+
+def _combine(fingerprints) -> str:
+    """One fingerprint over several, marked _EDITED_PREFIX if any is."""
+    fingerprints = list(fingerprints)
+    edited = any(f.startswith(_EDITED_PREFIX) for f in fingerprints)
+    return (_EDITED_PREFIX if edited else "") + hashlib.sha256(
+        "\0".join(fingerprints).encode()).hexdigest()[:16]
+
+
+def _runner_fingerprint(kind) -> str:
+    """A runner's own fingerprint (`kind` is a class or a _runner_kind):
+    under TLLM_AUTOTUNER_CACHE_KEY=code its classes' code fingerprints; else
+    the build fingerprint and their _build_class_key."""
+    if isinstance(kind, tuple):
+        return _combine(map(_runner_fingerprint, kind))
     if _CACHE_KEY_MODE == "code":
-        return _code_fingerprint(runner_cls)
-    key = _build_class_key(runner_cls)
+        return _code_fingerprint(kind)
+    key = _build_class_key(kind)
     fingerprint = _BUILD_RUNNER_FINGERPRINTS.get(key)
     if fingerprint is None:
-        fingerprint = _BUILD_RUNNER_FINGERPRINTS[key] = hashlib.sha256(
-            "\0".join(
-                (_build_fingerprint(), repr(key))).encode()).hexdigest()[:16]
+        build = _build_fingerprint()
+        prefix = _EDITED_PREFIX if build.startswith(_EDITED_PREFIX) else ""
+        fingerprint = _BUILD_RUNNER_FINGERPRINTS[key] = prefix + hashlib.sha256(
+            "\0".join((build, repr(key))).encode()).hexdigest()[:16]
     return fingerprint
 
 
-def _candidates_fingerprint(runner_classes) -> Optional[str]:
-    """The fingerprint in the key of an entry tuned among the runners of
-    `runner_classes`: the runner's own when it was the only candidate, else a
-    digest over every candidate's, so that a change to a runner that lost
-    also re-opens the comparison. None when TLLM_AUTOTUNER_CACHE_KEY=none
-    leaves fingerprints out of keys."""
+def _candidates_fingerprint(kinds) -> Optional[str]:
+    """The fingerprint in the key of an entry tuned among the candidates of
+    `kinds` (classes, or _runner_kind of each): the runner's own when it was
+    the only candidate, else a digest over every candidate's, so that a
+    change to a runner that lost also re-opens the comparison. None when
+    TLLM_AUTOTUNER_CACHE_KEY=none leaves fingerprints out of keys."""
     if _CACHE_KEY_MODE == "none":
         return None
     class_key = (_class_identity
                  if _CACHE_KEY_MODE == "code" else _build_class_key)
-    identities = (_CACHE_KEY_MODE,
-                  *dict.fromkeys(map(class_key, runner_classes)))
+
+    def kind_key(kind):
+        return (tuple(map(class_key, kind))
+                if isinstance(kind, tuple) else class_key(kind))
+
+    identities = (_CACHE_KEY_MODE, *dict.fromkeys(map(kind_key, kinds)))
     fingerprint = _CANDIDATE_FINGERPRINTS.get(identities)
     if fingerprint is None:
-        fingerprints = sorted({_runner_fingerprint(k) for k in runner_classes})
+        fingerprints = sorted({_runner_fingerprint(k) for k in kinds})
         fingerprint = fingerprints[0]
         if len(fingerprints) > 1:
-            edited = any(f.startswith(_EDITED_PREFIX) for f in fingerprints)
-            fingerprint = (_EDITED_PREFIX if edited else "") + hashlib.sha256(
-                "\0".join(fingerprints).encode()).hexdigest()[:16]
+            fingerprint = _combine(fingerprints)
         _CANDIDATE_FINGERPRINTS[identities] = fingerprint
     return fingerprint
 
 
-def _tactic_spaces(candidates) -> str:
-    """For several candidates of which any has a tactic space key, a digest
-    of every candidate's, by class name and unique_id; else ''. A runner that
-    lost and then widens its tactic space re-opens the comparison."""
+def _tactic_spaces(candidates, kinds=None) -> str:
+    """For several candidates, a digest of each one's fingerprint, unique_id
+    and tactic space key (`kinds`: their _runner_kind, if known); else ''.
+    A runner that lost and then changes what it tunes (its unique_id or
+    tactic space) re-opens the comparison, and so do two runners that trade
+    tactic spaces."""
     if len(candidates) < 2:
         return ""
-    spaces = [r.tactic_space_key() for r in candidates]
-    if all(space is None for space in spaces):
-        return ""
+    kinds = kinds or tuple(map(_runner_kind, candidates))
     text = repr(
-        sorted((_class_name(type(r)), str(r.unique_id()), repr(space))
-               for r, space in zip(candidates, spaces)))
+        sorted((_runner_fingerprint(kind), str(r.unique_id()),
+                repr(r.tactic_space_key()))
+               for r, kind in zip(candidates, kinds)))
     return hashlib.sha256(text.encode()).hexdigest()[:8]
 
 
-def _key_fingerprint(runner_cls: type,
+def _key_fingerprint(kind,
                      set_fingerprint: Optional[str],
                      tactic_spaces: str = "") -> Optional[str]:
-    """The fingerprint in the key of `runner_cls`'s entry, tuned among runners
-    whose set has `set_fingerprint`: the set's, and the runner's own where it
-    differs, then the candidates' tactic spaces (_tactic_spaces) if any. Two candidates of one set can share a class name and
-    unique_id; their own fingerprints keep their entries apart where they
-    differ (always under "code"; under "build", when the module or qualified
-    name does)."""
+    """The fingerprint in the key of the entry of a runner (of _runner_kind
+    `kind`) tuned among runners whose set has `set_fingerprint`: the set's,
+    and the runner's own where it differs, then the candidates'
+    _tactic_spaces if any. Two candidates of one set can share a class name
+    and unique_id; their own fingerprints keep their entries apart."""
     if set_fingerprint is None:
         return None
-    own = _runner_fingerprint(runner_cls)
+    own = _runner_fingerprint(kind)
     fingerprint = own if own == set_fingerprint else f"{set_fingerprint}/{own}"
     return fingerprint + (f"/{tactic_spaces}" if tactic_spaces else "")
+
+
+def _rank_signature(runners) -> str:
+    """What every rank of a tuning group must pass alike to choose_one: the
+    candidates in order (PARALLEL deals tactics by position), each by its
+    classes (_runner_kind) and tactic space key. unique_id is left out: it
+    may name the rank's own communicator (a TP subgroup under Helix CP)."""
+    signature = []
+    for r in runners:
+        kind = _runner_kind(r)
+        classes = kind if isinstance(kind, tuple) else (kind, )
+        signature.append((tuple(".".join(_class_name(k))
+                                for k in classes), repr(r.tactic_space_key())))
+    return hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
 
 
 def _edited_key(key: Tuple) -> bool:
@@ -1718,6 +1974,8 @@ def _edited_key(key: Tuple) -> bool:
 
 def _clear_fingerprints() -> None:
     _build_fingerprint.cache_clear()
+    _native_replaced.cache_clear()
+    _loaded_libraries.cache_clear()
     _FINGERPRINTS.clear()
     _CANDIDATE_FINGERPRINTS.clear()
     _BUILD_RUNNER_FINGERPRINTS.clear()
@@ -1989,6 +2247,7 @@ class AutoTunerProfilingCache:
 
     def __setitem__(self, cache_key: Tuple, value: Tuple) -> None:
         self.cache[cache_key] = value
+        self._mark_current(cache_key)
 
     def __getitem__(self, cache_key: Tuple) -> Tuple:
         return self.cache[cache_key]
@@ -2000,6 +2259,7 @@ class AutoTunerProfilingCache:
         self.cache.clear()
         self.independent_op.clear()
         self.excluded_op.clear()
+        self.__dict__.pop("_current_keys", None)
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -2037,17 +2297,19 @@ class AutoTunerProfilingCache:
         parallel = (tuning_config.distributed_tuning_strategy ==
                     DistributedTuningStrategy.PARALLEL)
         found = None
-        set_fingerprint = _candidates_fingerprint(
-            tuple(type(r) for r in runners))
-        tactic_spaces = _tactic_spaces(runners)
+        kinds = tuple(map(_runner_kind, runners))
+        set_fingerprint = _candidates_fingerprint(kinds)
+        tactic_spaces = ("" if set_fingerprint is None else _tactic_spaces(
+            runners, kinds))
         for idx, r in enumerate(runners):
             if (cache_key := self._cache_key(
                     custom_op, r, input_shapes, tuning_config,
                     apply_map_to_tuning_buckets,
-                    _key_fingerprint(type(r), set_fingerprint,
+                    _key_fingerprint(kinds[idx], set_fingerprint,
                                      tactic_spaces))) in self.cache:
                 # Return the current index in runners list, not the cached runner_id
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
+                self._mark_current(cache_key)
                 if not parallel:
                     return True, idx, tactic, min_time
                 if found is None or min_time < found[3]:
@@ -2074,12 +2336,13 @@ class AutoTunerProfilingCache:
         and is left out under "none"."""
         candidates = candidates or [runner]
         set_fingerprint = _candidates_fingerprint(
-            tuple(type(r) for r in candidates))
+            tuple(map(_runner_kind, candidates)))
         return self._cache_key(
             custom_op, runner, input_shapes, tuning_config,
             apply_map_to_tuning_buckets,
-            _key_fingerprint(type(runner), set_fingerprint,
-                             _tactic_spaces(candidates)))
+            _key_fingerprint(
+                _runner_kind(runner), set_fingerprint,
+                "" if set_fingerprint is None else _tactic_spaces(candidates)))
 
     def _cache_key(self, custom_op: str, runner: TunableRunner,
                    input_shapes: Tuple[torch.Size], tuning_config: TuningConfig,
@@ -2219,6 +2482,15 @@ class AutoTunerProfilingCache:
         try:
             # Partition cache into shared (non-INDEPENDENT) and rank-specific (INDEPENDENT)
             shared_cache, rank_cache = self._partition_cache_by_strategy()
+            superseded = self._superseded()
+            shared_cache = {
+                k: v
+                for k, v in shared_cache.items() if not superseded(k)
+            }
+            rank_cache = {
+                k: v
+                for k, v in rank_cache.items() if not superseded(k)
+            }
 
             serialized_shared_cache = self._serialize_cache_data(shared_cache)
             serialized_rank_cache = self._serialize_cache_data(rank_cache)
@@ -2229,6 +2501,8 @@ class AutoTunerProfilingCache:
                 # Merge shared cache entries (non-INDEPENDENT ops)
                 if self.SHARED_CACHE_KEY not in current_cache:
                     current_cache[self.SHARED_CACHE_KEY] = {}
+                self._drop_superseded(current_cache[self.SHARED_CACHE_KEY],
+                                      superseded)
                 current_cache[self.SHARED_CACHE_KEY].update(
                     serialized_shared_cache)
 
@@ -2241,6 +2515,7 @@ class AutoTunerProfilingCache:
                 rank_key = f"rank_{rank}"
                 if rank_key not in current_cache:
                     current_cache[rank_key] = {}
+                self._drop_superseded(current_cache[rank_key], superseded)
                 current_cache[rank_key].update(serialized_rank_cache)
 
                 self._atomic_write_json(file_path, current_cache)
@@ -2250,6 +2525,39 @@ class AutoTunerProfilingCache:
         except Exception as e:
             logger.error(f"[AutoTuner] Failed to save cache with JSON: {e}")
             raise
+
+    def _mark_current(self, cache_key: Tuple) -> None:
+        """Record an entry this process stored or hit: one keyed under the
+        current build and code (_superseded)."""
+        # A cache made without __init__ (in tests) starts the set here.
+        self.__dict__.setdefault("_current_keys", set()).add(cache_key)
+
+    def _superseded(self) -> Callable[[Tuple], bool]:
+        """Whether an entry is superseded: this process stored or hit one of
+        the same op, runner class name, unique_id and shapes under another
+        fingerprint, so the entry was keyed by another build or code. Saving
+        drops these, or a cache file reused across builds would keep an
+        entry per build, read and exchanged by every later run."""
+        current = {
+            key
+            for key in self.__dict__.get("_current_keys", ())
+            if len(key) > 4 and not _edited_key(key)
+        }
+        prefixes = {key[:4] for key in current}
+        return lambda key: (len(key) > 4 and key[:4] in prefixes and key not in
+                            current)
+
+    def _drop_superseded(self, saved: Dict[str, Any],
+                         superseded: Callable[[Tuple], bool]) -> None:
+        """Drop the `superseded` entries from a serialized slot of a cache
+        file."""
+        for key_str in list(saved):
+            try:
+                key = ast.literal_eval(key_str)
+            except (ValueError, SyntaxError):
+                continue
+            if isinstance(key, tuple) and superseded(key):
+                del saved[key_str]
 
     @staticmethod
     def _lock_path_for(file_path: Path) -> Path:
@@ -2537,7 +2845,7 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
-        self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
+        self._primed_cached_tactics: set[tuple[str, str, str, str, int]] = set()
         # Cache keys whose runner ran in this process (so any JIT it drives
         # has happened here), as opposed to keys loaded from disk or peers.
         self._keys_profiled_in_process: set[Tuple] = set()
@@ -2804,7 +3112,8 @@ class AutoTuner:
         # caches from a shared file: tune unless every rank has the entry.
         if self._needs_rank_agreement(
                 tuning_config.distributed_tuning_strategy):
-            is_cache_hit = self._agree_on_cache_hit(runners, is_cache_hit)
+            is_cache_hit = self._agree_on_cache_hit(
+                runners, is_cache_hit, (best_runner_id, repr(best_tactic)))
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
@@ -2837,23 +3146,28 @@ class AutoTuner:
         strategy = tuning_config.distributed_tuning_strategy
         if self._should_current_rank_tune(strategy):
 
-            def is_cached(p: OptimizationProfile) -> bool:
-                return self.profiling_cache.search_cache(
+            def cached_choice(p: OptimizationProfile) -> Optional[Tuple]:
+                hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
                     custom_op,
                     runners,
                     p.get_opt_shapes(),
                     tuning_config,
                     apply_map_to_tuning_buckets=False,
-                )[0]
+                )
+                return (runner_id, repr(tactic)) if hit else None
 
-            # Every rank profiles under MERGE / PARALLEL, so they agree on the profiles to tune.
+            def is_cached(p: OptimizationProfile) -> bool:
+                return cached_choice(p) is not None
+
+            # Every rank profiles under MERGE / PARALLEL, so they agree on the
+            # profiles to tune: those some rank misses, or chose differently.
             agreed_hits = None
             if (self._needs_rank_agreement(strategy)
                     and strategy != DistributedTuningStrategy.BROADCAST):
                 agreed_hits = dict(
                     zip([p.get_opt_shapes() for p in profiles],
                         self._profile_hits_on_all_ranks(
-                            profiles, [is_cached(p) for p in profiles])))
+                            profiles, [cached_choice(p) for p in profiles])))
 
             def is_pending(p: OptimizationProfile) -> bool:
                 if agreed_hits is not None:
@@ -3117,8 +3431,10 @@ class AutoTuner:
             runner = runners[runner_id]
             if type(runner) not in jit_classes:
                 continue
+            # Two runner classes can share a name and unique_id, each with its
+            # own kernel cache to fill.
             key = (custom_op, type(runner).__name__, str(runner.unique_id()),
-                   str(tactic))
+                   str(tactic), id(type(runner).kernel_cache))
             if key in self._primed_cached_tactics:
                 continue
             tensors = self._prepare_input_tensors(profile, inputs)
@@ -4172,69 +4488,77 @@ class AutoTuner:
         return (strategy != DistributedTuningStrategy.INDEPENDENT
                 and self._is_distributed() and not self._profiling_depth)
 
-    def _agree_on_cache_hit(self, runners: List[TunableRunner],
-                            is_cache_hit: bool) -> bool:
-        """Whether every rank of the tuning group has the entry (one host
-        all-gather of each rank's hit, and the fingerprint and tactic spaces
-        of ``runners``).
+    def _agree_on_cache_hit(self,
+                            runners: List[TunableRunner],
+                            is_cache_hit: bool,
+                            choice: Any = None) -> bool:
+        """Whether every rank of the tuning group has the entry and chose the
+        same runner and tactic from it (one host all-gather of each rank's
+        hit and ``choice``, and of the fingerprint and _rank_signature of
+        ``runners``).
 
         Ranks that fingerprint the runners differently may be running
         different code, with different valid tactics: their keys would not
         meet in the merge or broadcast, and tuning them together could pick a
-        tactic some rank cannot run. So may ranks whose sources changed after
+        tactic some rank cannot run. So may ranks whose code changed after
         they started (an `edited-` fingerprint), even with equal fingerprints:
-        the disk no longer tells what each rank loaded. Every rank sees the
-        same gathered values, so they all raise here, before the collective
-        profiling.
+        the disk no longer tells what each rank loaded. And ranks that pass
+        different candidates (in order) or tactic spaces cannot tune them
+        together: PARALLEL deals the (runner, tactic) pairs by position.
+        Every rank sees the same gathered values, so they all raise here,
+        before the collective profiling. Ranks whose entries chose
+        differently (loaded from different files) tune again together.
         """
-        classes = tuple(type(r) for r in runners)
-        spaces = hashlib.sha256(
-            repr(
-                sorted((".".join(_class_name(type(r))), str(r.unique_id()),
-                        repr(r.tactic_space_key()))
-                       for r in runners)).encode()).hexdigest()[:8]
+        kinds = tuple(map(_runner_kind, runners))
         gathered = self._dist.tp_cp_allgather(
-            obj=(bool(is_cache_hit), _candidates_fingerprint(classes), spaces))
-        fingerprints = {fingerprint for _, fingerprint, _ in gathered}
-        names = sorted({".".join(_class_name(k)) for k in classes})
+            obj=(bool(is_cache_hit), _candidates_fingerprint(kinds),
+                 _rank_signature(runners), choice if is_cache_hit else None))
+        fingerprints = {fingerprint for _, fingerprint, _, _ in gathered}
+        names = sorted({".".join(_class_name(type(r))) for r in runners})
         if any(
                 isinstance(f, str) and f.startswith(_EDITED_PREFIX)
                 for f in fingerprints):
             raise RuntimeError(
-                f"[Autotuner] TensorRT-LLM sources used by {names} changed "
-                "after the ranks of a tuning group started, so their loaded "
-                "code cannot be compared (see the warnings). Restart the "
-                "workers, or set TLLM_AUTOTUNER_CACHE_KEY=none to key the "
-                "cache without code fingerprints.")
+                f"[Autotuner] TensorRT-LLM sources or native libraries used by "
+                f"{names} changed after the ranks of a tuning group started, "
+                "so their loaded code cannot be compared (see the warnings). "
+                "Restart the workers, or set TLLM_AUTOTUNER_CACHE_KEY=none to "
+                "key the cache without fingerprints.")
         if len(fingerprints) > 1:
             raise RuntimeError(
                 f"[Autotuner] The ranks of a tuning group fingerprint the code "
                 f"of {names} differently ({sorted(fingerprints, key=str)}): "
-                "they may be running different TensorRT-LLM sources (a file "
-                "edited while they started, or one a node cannot read; see the "
-                "warnings). Run every rank on the same files, or set "
-                "TLLM_AUTOTUNER_CACHE_KEY=none to key the cache without code "
+                "they may be running different TensorRT-LLM builds or sources "
+                "(a file edited while they started, or one a node cannot read; "
+                "see the warnings). Run every rank on the same installation, "
+                "or set TLLM_AUTOTUNER_CACHE_KEY=none to key the cache without "
                 "fingerprints.")
-        if len({space for _, _, space in gathered}) > 1:
+        if len({signature for _, _, signature, _ in gathered}) > 1:
             raise RuntimeError(
-                f"[Autotuner] The ranks of a tuning group give the candidates "
-                f"{names} different tactic spaces (tactic_space_key): a tactic "
-                "one rank tunes may not be valid on another. Configure every "
-                "rank alike.")
-        return all(hit for hit, _, _ in gathered)
+                f"[Autotuner] The ranks of a tuning group pass the candidates "
+                f"{names} in different orders or with different tactic spaces "
+                "(tactic_space_key): they cannot tune them together. Build the "
+                "candidates alike on every rank.")
+        return (all(hit for hit, _, _, _ in gathered)
+                and len({c
+                         for _, _, _, c in gathered}) == 1)
 
     def _profile_hits_on_all_ranks(self, profiles: List[OptimizationProfile],
-                                   hits: List[bool]) -> List[bool]:
-        """Per profile, whether every rank that builds it has it cached (one host all-gather).
+                                   hits: List[Any]) -> List[bool]:
+        """Per profile, whether every rank that builds it has it cached, with
+        the same choice where ``hits`` holds choices (one host all-gather).
+        A hit is a choice, or True; a miss None or False.
 
         Ranks build their profiles from their own input shapes (attention DP), so the lists may differ.
         """
         keys = [p.get_opt_shapes() for p in profiles]
         missed = set()
+        choices: Dict[Any, Any] = {}
         for rank_keys, rank_hits in self._dist.tp_cp_allgather(
-                obj=(keys, [bool(hit) for hit in hits])):
-            missed.update(key for key, hit in zip(rank_keys, rank_hits)
-                          if not hit)
+                obj=(keys, [hit if hit else None for hit in hits])):
+            for key, hit in zip(rank_keys, rank_hits):
+                if hit is None or choices.setdefault(key, hit) != hit:
+                    missed.add(key)
         return [key not in missed for key in keys]
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,

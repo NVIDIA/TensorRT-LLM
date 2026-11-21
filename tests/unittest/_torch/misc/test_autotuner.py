@@ -2777,10 +2777,10 @@ def test_candidates_fingerprint_covers_the_losers_tactic_spaces(fp_modules):
         return autotuner._key_fingerprint(runners.Winner, set_fingerprint,
                                           spaces)
 
-    # A loser that widens its tactic space re-opens the comparison.
+    # A loser that widens its tactic space re-opens the comparison, and so
+    # does one that changes its unique_id without a tactic space key.
     assert key(runners.Spaced(("limited", ))) != key(runners.Spaced(("all", )))
-    assert key(runners.Spaced()) == autotuner._key_fingerprint(
-        runners.Winner, set_fingerprint)
+    assert key(runners.Spaced(uid=(1, ))) != key(runners.Spaced(uid=(2, )))
 
     # So does one of the same class as the winner, which it tells apart by
     # unique_id.
@@ -2929,6 +2929,372 @@ def test_build_fingerprint_skips_unreadable_package_metadata(monkeypatch):
         assert autotuner._packages_distributions() == {"good": ["good-dist"]}
     finally:
         autotuner._packages_distributions.cache_clear()
+
+
+def test_build_fingerprint_follows_what_factory_runners_hold(monkeypatch):
+    import functools
+
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    key = autotuner._build_class_key
+
+    def narrow():
+        return [0]
+
+    def wide():
+        return [0, 1]
+
+    def pick(first, second):
+        return first()
+
+    def make_base(impl):
+
+        class Base:
+
+            def get_valid_tactics(self):
+                return impl()
+
+        return Base
+
+    def make(base):
+
+        class Runner(base):
+            pass
+
+        return Runner
+
+    def holding(impl):
+
+        class Runner:
+
+            def get_valid_tactics(self):
+                return impl()
+
+        return Runner
+
+    # A class built on bases that one factory builds differently.
+    assert key(make(make_base(narrow))) != key(make(make_base(wide)))
+    assert key(make(make_base(narrow))) == key(make(make_base(narrow)))
+    # A partial counts by its keyword names, not only its values' order.
+    assert key(holding(functools.partial(
+        pick, first=narrow, second=wide))) != key(
+            holding(functools.partial(pick, second=narrow, first=wide)))
+    # Constants a factory captures count.
+    assert key(holding((0, ))) != key(holding((0, 1)))
+
+    # A function wrapping a partial, and a partial that holds itself, are
+    # named without failing the lookup.
+    def wrapper():
+        return pick(narrow, wide)
+
+    wrapped = functools.wraps(functools.partial(pick, narrow, wide))(wrapper)
+    assert key(holding(wrapped)) != key(holding(narrow))
+    cyclic = functools.partial(pick, first=narrow, second=None)
+    cyclic.keywords["second"] = cyclic
+    assert key(holding(cyclic))
+
+
+def test_build_fingerprint_follows_loaded_libraries_and_the_gpu(
+        monkeypatch, tmp_path):
+    library = tmp_path / "libcublasLt.so.13"
+    library.write_bytes(b"one")
+    loaded = {"paths": (str(library), )}
+    device = {"capability": "sm100"}
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: "")
+    monkeypatch.setattr(autotuner, "_native_libraries", lambda: [])
+    monkeypatch.setattr(autotuner, "_loaded_libraries", lambda: loaded["paths"])
+    monkeypatch.setattr(autotuner, "_device_capability",
+                        lambda: device["capability"])
+    monkeypatch.setattr(autotuner, "_EPOCH_NS", float("inf"))
+
+    def build():
+        autotuner._build_fingerprint.cache_clear()
+        autotuner._native_replaced.cache_clear()
+        return autotuner._build_fingerprint()
+
+    try:
+        first = build()
+        library.write_bytes(b"two")  # Another cuBLAS build.
+        second = build()
+        assert second != first
+        device["capability"] = "sm107"
+        assert build() != second
+        # A library replaced on disk after this process loaded it.
+        loaded["paths"] = (str(library) + " (deleted)", )
+        assert build().startswith(autotuner._EDITED_PREFIX)
+        loaded["paths"] = (str(library), )
+        monkeypatch.setattr(autotuner, "_EPOCH_NS", 0)
+        assert build().startswith(autotuner._EDITED_PREFIX)
+    finally:
+        autotuner._build_fingerprint.cache_clear()
+        autotuner._native_replaced.cache_clear()
+
+
+@pytest.mark.parametrize("mode", ["code", "build"])
+def test_candidates_fingerprint_follows_the_runner_a_wrapper_holds(
+        fp_modules, monkeypatch, mode):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", mode)
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Narrow(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0]
+
+
+        class Wide(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0, 1]
+
+
+        class Wrapper(Base):
+            def __init__(self, op_runner):
+                self._op_runner = op_runner
+
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return self._op_runner.get_valid_tactics(inputs, profile)
+        """)
+    fp_modules.fingerprints()
+
+    def fingerprint(runner):
+        return autotuner._candidates_fingerprint(
+            (autotuner._runner_kind(runner), ))
+
+    narrow = runners.Wrapper(runners.Narrow())
+    assert fingerprint(narrow) != fingerprint(runners.Wrapper(runners.Wide()))
+    assert fingerprint(narrow) == fingerprint(runners.Wrapper(runners.Narrow()))
+
+
+def test_candidates_fingerprint_binds_tactic_spaces_to_runners(fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Narrow(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0]
+
+
+        class Wide(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0, 1]
+
+
+        def factory(base):
+            class Runner(base):
+                def __init__(self, space):
+                    self.space = space
+
+                def unique_id(self):
+                    return ()
+
+                def tactic_space_key(self):
+                    return self.space
+
+            return Runner
+
+
+        class Winner(Base):
+            pass
+        """)
+    fp_modules.fingerprints()
+    narrow = runners.factory(runners.Narrow)
+    wide = runners.factory(runners.Wide)
+
+    def spaces(narrow_space, wide_space):
+        return autotuner._tactic_spaces(
+            [runners.Winner(),
+             narrow(narrow_space),
+             wide(wide_space)])
+
+    # Same class name and unique_id: which runner has which space counts.
+    assert spaces(("limited", ), ("all", )) != spaces(("all", ), ("limited", ))
+
+
+def test_code_fingerprint_follows_what_factory_runners_hold(fp_modules):
+    import functools
+
+    r = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def narrow():
+            return [0]
+
+
+        def wide():
+            return [0, 1]
+
+
+        def pick(first, second):
+            return first()
+
+
+        def layer(fn):
+            def wrapper():
+                return fn()
+
+            return wrapper
+
+
+        def by_default(impl):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, kernel=impl,
+                                      **kwargs):
+                    return kernel()
+
+            return Runner
+
+
+        def holding(impl):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return impl()
+
+            return Runner
+
+
+        def wrapped(impl):
+            for _ in range(5):
+                impl = layer(impl)
+            return holding(impl)
+
+
+        def ordered(preferred, fallback):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return preferred() or fallback()
+
+            return Runner
+
+
+        def constant(tactics):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return list(tactics)
+
+            return Runner
+        """)
+    fp_modules.fingerprints()
+    fp = autotuner._code_fingerprint
+    partial = functools.partial
+    pairs = [
+        (r.by_default(r.narrow), r.by_default(r.wide)),
+        (r.holding(partial(r.narrow)), r.holding(partial(r.wide))),
+        (r.holding(partial(r.pick, first=r.narrow, second=r.wide)),
+         r.holding(partial(r.pick, second=r.narrow, first=r.wide))),
+        (r.wrapped(r.narrow), r.wrapped(r.wide)),
+        (r.ordered(r.narrow, r.wide), r.ordered(r.wide, r.narrow)),
+        (r.constant((0, )), r.constant((0, 1))),
+    ]
+    assert [fp(a) != fp(b) for a, b in pairs] == [True] * len(pairs)
+    # Built alike, one fingerprint.
+    assert fp(r.by_default(r.narrow)) == fp(r.by_default(r.narrow))
+
+
+def test_code_fingerprint_follows_fallback_imports_and_modules_passed_whole(
+        fp_modules):
+    fp_modules.load("fp_primary", "TACTICS = [0, 1]\n")
+    fp_modules.load("fp_backup", "TACTICS = [0]\n")
+    fp_modules.load("fp_backend", "def valid():\n    return [0, 1]\n")
+    fp_modules.load("fp_bundle", "import fp_backend\n")
+    runners = fp_modules.load(
+        "fp_runners", """
+        try:
+            from fp_primary import TACTICS
+        except ImportError:
+            from fp_backup import TACTICS
+        import fp_bundle
+        from fp_base import Base
+
+
+        def query(bundle):
+            return bundle.fp_backend.valid()
+
+
+        class Imported(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return TACTICS
+
+
+        class Passed(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return query(fp_bundle)
+        """)
+    classes = (runners.Imported, runners.Passed)
+    before = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_primary", "[0, 1]", "[0, 2]")
+    fp_modules.edit("fp_backend", "[0, 1]", "[0, 2]")
+    assert _changed(before, fp_modules.fingerprints(*classes)) == [True, True]
+
+
+def test_code_fingerprint_follows_tables_changed_through_an_alias_or_a_call(
+        fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+        TACTICS = [0]
+        ALIAS = TACTICS
+        ALIAS.append(1)
+        OTHER = [0]
+
+
+        def init(table):
+            table.append(1)
+
+
+        init(OTHER)
+
+
+        class ByAlias(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return TACTICS
+
+
+        class ByCall(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return OTHER
+        """)
+    classes = (runners.ByAlias, runners.ByCall)
+    before = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_runners", "ALIAS.append(1)", "ALIAS.append(2)")
+    fp_modules.edit("fp_runners", "table.append(1)", "table.append(2)")
+    assert _changed(before, fp_modules.fingerprints(*classes)) == [True, True]
+
+
+_HELPER_RUNNER = """
+    from fp_base import Base
+    from fp_util import helper
+
+
+    class Runner(Base):
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return helper()
+    """
+
+
+def test_code_fingerprint_follows_the_code_a_process_runs(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return [0, 1]\n")
+    runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+    # A process that still runs [0, 1] (from a stale .pyc) while the file
+    # says [0, 2], and one that runs what the file says.
+    fp_modules.edit("fp_util", "[0, 1]", "[0, 2]")
+    stale = fp_modules.fingerprints(runners.Runner)
+    fp_modules.load("fp_util", "def helper():\n    return [0, 2]\n")
+    runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+    assert fp_modules.fingerprints(runners.Runner) != stale
+    # A helper whose source can no longer be read counts by its code.
+    unreadable = []
+    for tactics in ("[0, 1]", "[0, 3]"):
+        fp_modules.load("fp_util", f"def helper():\n    return {tactics}\n")
+        runners = fp_modules.load("fp_runners", _HELPER_RUNNER)
+        (fp_modules.root / "fp_util.py").unlink()
+        unreadable += fp_modules.fingerprints(runners.Runner)
+    assert unreadable[0] != unreadable[1]
 
 
 def test_code_fingerprint_keeps_no_object_a_global_held_alive(fp_modules):
@@ -3108,17 +3474,57 @@ def test_ranks_that_fingerprint_differently_raise(fp_modules):
 
     assert agree(lambda obj: [obj, obj])
     assert not agree(lambda obj: [obj, (False, *obj[1:])])
+    # Ranks whose entries chose differently tune again together.
+    assert not agree(lambda obj: [obj, (*obj[:3], (1, "2"))])
     # Ranks that may run different code must not tune or reuse together.
     with pytest.raises(RuntimeError, match="fingerprint the code"):
-        agree(lambda obj: [(True, "other-fingerprint", obj[2]), obj])
+        agree(lambda obj: [(True, "other-fingerprint", *obj[2:]), obj])
     # Nor ranks whose sources changed after they started, even when their
     # fingerprints match: what each loaded is no longer on disk.
-    edited = (True, autotuner._EDITED_PREFIX + "0123456789abcdef", "")
+    edited = (True, autotuner._EDITED_PREFIX + "0123456789abcdef", "", None)
     with pytest.raises(RuntimeError, match="changed after"):
         agree(lambda obj: [edited, edited])
-    # Nor ranks that give the candidates different tactic spaces.
-    with pytest.raises(RuntimeError, match="tactic spaces"):
-        agree(lambda obj: [(*obj[:2], "other-spaces"), obj])
+    # Nor ranks that pass the candidates in another order (PARALLEL deals
+    # tactics by position) or with other tactic spaces.
+    reordered = autotuner._rank_signature(list(reversed(candidates)))
+    with pytest.raises(RuntimeError, match="different orders"):
+        agree(lambda obj: [(*obj[:2], reordered, obj[3]), obj])
+
+
+def test_rank_signature_leaves_out_rank_local_unique_ids():
+    """Under Helix CP an AllReduce runner's unique_id names its rank's TP
+    subgroup; ranks of one tuning group still agree."""
+
+    class _Grouped(_TacticSpaceRunner):
+
+        def __init__(self, group):
+            super().__init__()
+            self.group = group
+
+        def unique_id(self):
+            return (self.group, )
+
+    assert autotuner._rank_signature([_Grouped(
+        (0, 2))]) == autotuner._rank_signature([_Grouped((1, 3))])
+    assert autotuner._rank_signature([_TacticSpaceRunner(
+        ("limited", ))]) != autotuner._rank_signature(
+            [_TacticSpaceRunner(("all", ))])
+
+
+def test_profiles_whose_entries_chose_differently_are_tuned_again():
+    profiles = [
+        SimpleNamespace(get_opt_shapes=lambda shapes=shapes: shapes)
+        for shapes in (((1, ), ), ((2, ), ), ((3, ), ))
+    ]
+
+    def hits(mine, theirs):
+        tuner = SimpleNamespace(_dist=SimpleNamespace(
+            tp_cp_allgather=lambda obj: [obj, (obj[0], theirs)]))
+        return autotuner.AutoTuner._profile_hits_on_all_ranks(
+            tuner, profiles, mine)
+
+    assert hits([(0, "1"), (0, "1"), None], [(0, "1"), (0, "2"),
+                                             (0, "1")]) == [True, False, False]
 
 
 @pytest.mark.parametrize("mode", ["code", "build"])
@@ -3162,6 +3568,25 @@ def test_save_cache_leaves_out_entries_of_edited_sources(tmp_path):
     dst = autotuner.AutoTuner().profiling_cache
     dst.load_cache(path, rank=0)
     assert dst.cache == {current: (0, 1, 1.0)}
+
+
+def test_save_cache_drops_entries_another_build_keyed(tmp_path):
+    path = str(tmp_path / "cache.json")
+    old = ("test_superseded", "R", "()", ((16, 64), ), "aaaaaaaaaaaaaaaa")
+    other_shape = ("test_superseded", "R", "()", ((32, 64), ),
+                   "aaaaaaaaaaaaaaaa")
+    src = autotuner.AutoTuner().profiling_cache
+    src.cache = {old: (0, 1, 1.0), other_shape: (0, 1, 1.0)}
+    src.save_cache(path, rank=0)
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    # Tuned again here under another build: the entry it replaces goes.
+    new = (*old[:4], "bbbbbbbbbbbbbbbb")
+    dst[new] = (0, 2, 1.0)
+    dst.save_cache(path, rank=0)
+    final = autotuner.AutoTuner().profiling_cache
+    final.load_cache(path, rank=0)
+    assert final.cache == {new: (0, 2, 1.0), other_shape: (0, 1, 1.0)}
 
 
 def test_cache_key_mode_none_leaves_the_fingerprint_out(monkeypatch):
