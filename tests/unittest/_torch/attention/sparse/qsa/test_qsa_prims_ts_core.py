@@ -3,10 +3,12 @@
 
 import itertools
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import qsa_sparse_gqa_reference
 from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
@@ -301,6 +303,48 @@ def test_route_offsets_follow_layout_changes_without_replanning() -> None:
         fi_metadata._prepare_q_token_kv_block_sparse_attention = original
     torch.cuda.synchronize()
     assert prepares == 1
+    for out, ref in zip(outputs, expected):
+        assert torch.equal(out, ref)
+
+
+def test_repeat_runs_skip_wrapper_validation() -> None:
+    _requires_prims_ts()
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+    )
+    cases = [_make_case([36, 92], seed=60 + i) for i in range(2)]
+    k_cache, v_cache, block_table = cases[0][1], cases[0][2], cases[0][3]
+    other = _make_case([40, 100], seed=70)
+
+    def run(case):
+        q, _, _, _, block_ids, request_indices, positions, _, _ = case
+        return prims_ts_sparse_gqa(
+            q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+        )
+
+    expected = [run(case).clone() for case in cases]
+    validated = []
+    wrapper_cls = fi_metadata.QTokenKvBlockSparsePagedTSWrapper
+    original = wrapper_cls.run
+
+    def recorded(self, *args, validate=True, **kw):
+        validated.append(validate)
+        return original(self, *args, validate=validate, **kw)
+
+    wrapper_cls.run = recorded
+    try:
+        # Fresh core so the first run is the eager, validated one.
+        core = prims_ts_core._PrimsTSSparseCore()
+        with mock.patch.object(prims_ts_core, "_CORE", core):
+            outputs = [run(case).clone() for case in cases]
+            run(other)
+    finally:
+        wrapper_cls.run = original
+    torch.cuda.synchronize()
+    # Same plan key and ABI skips validation; a new plan key validates again.
+    assert validated == [True, False, True]
     for out, ref in zip(outputs, expected):
         assert torch.equal(out, ref)
 
