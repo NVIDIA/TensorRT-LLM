@@ -14,6 +14,8 @@
 
 """Experimental task-scheduled attention entry points."""
 
+from . import _worktile_scope  # noqa: F401  (first: scopes task scheduling's WorkTileInfo rebind)
+
 from .block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,

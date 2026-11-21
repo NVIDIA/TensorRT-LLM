@@ -22,7 +22,8 @@ from ..utils import (get_model_extra_attrs,
                      set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .utils import (get_capture_piecewise_cuda_graph_flag,
-                    get_optional_trtllm_op, is_call_function)
+                    get_optional_trtllm_op, is_call_function,
+                    minimax_m31_target_op_names)
 
 # TLLM_PWCG_NVTX_PROBE=1 brackets every piecewise runner call in an NVTX range
 # (host-side attribution of the glue between graph launches in nsys traces).
@@ -37,6 +38,7 @@ def _piecewise_boundary_ops():
         "gdn_custom_op_inplace",
         "mamba2_custom_op_inplace",
         "minimax_m3_attn_custom_op_inplace",
+        *minimax_m31_target_op_names("attn_custom_op_inplace"),
     ]
     return [
         op for op in (get_optional_trtllm_op(op_name) for op_name in op_names)

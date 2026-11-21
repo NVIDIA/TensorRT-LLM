@@ -287,7 +287,15 @@ def _make_worker():
         calls["base"] += 1
         return ("base", None)
 
-    def _rej(logits, draft_tokens, draft_probs, num_contexts, batch_size, spec_metadata):
+    def _rej(
+        logits,
+        draft_tokens,
+        draft_probs,
+        num_contexts,
+        batch_size,
+        spec_metadata,
+        draft_probs_slot_rows=None,
+    ):
         calls["rejection"] += 1
         return ("rejection", None)
 

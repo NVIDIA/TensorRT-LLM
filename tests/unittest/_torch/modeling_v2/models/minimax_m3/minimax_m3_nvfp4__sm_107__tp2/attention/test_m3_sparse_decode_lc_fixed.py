@@ -1,19 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The family library's fixed copy of the sm_107 tp2 long-context sparse decode (LC2,
-``minimax_m3_sm107_tp2_sparse_decode_lc``), which the MiniMax-M3 tp2 target now calls.
+"""The split form of the family library's sm_107 tp2 long-context sparse decode (LC2,
+``minimax_m3_sm107_tp2_sparse_decode_lc``).
 
-Its fix moves the query reads after ``griddepcontrol.wait``; on inputs that are complete before the launch it writes
-what ``torch.ops.trtllm.minimax_m3_sm107_tp2_sparse_decode_lc`` writes, byte for byte, for every variant (linear
-softmax, pre-wait block-table staging, MXFP8 hand-off) on the tiny and four-request cases (the long and short cases at
-the served variant only), with ``allow_split=False`` (the MiniMax-M3 callers) and
-with ``allow_split=True`` (the split form the MiniMax-M3.1-Flash callers may take).
+With ``allow_split=True`` (the form the MiniMax-M3.1-Flash callers may take) the op writes what it writes with
+``allow_split=False`` (the MiniMax-M3 callers), byte for byte, for every variant (linear softmax, pre-wait block-table
+staging, MXFP8 hand-off) on the tiny, four-request and 40-row cases (the long, short and 128-row cases at the served
+variant only). The 40- and 128-row cases fall in the 33..448-row range that takes the split kernel.
 """
 
 import pytest
 import torch
 
-import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 PAGE, DIM, TOPK, GROUP, KV_HEADS = 128, 128, 16, 16, 2
@@ -128,6 +126,9 @@ _CASES = {
     "b2-short": dict(seq_lens=[130, 5000]),
     "b1-tiny": dict(seq_lens=[4]),
     "b4": dict(seq_lens=[165521, 120000, 80000, 30000]),
+    # 33..448 query rows: the range in which allow_split=True takes the split kernel.
+    "b10-split": dict(seq_lens=[165521, 120000, 80000, 30000, 5000, 130, 64000, 9000, 40000, 2000]),
+    "b16-dql8-split": dict(seq_lens=[20000 + 7000 * i for i in range(16)], dql=8),
 }
 
 
@@ -139,29 +140,28 @@ def _variants():
     """Every linear / prewait / MXFP8 variant on b4 and b1-tiny; the long and short cases at the served variant."""
     flags = (False, True)
     for name in _CASES:
-        full = name in ("b4", "b1-tiny")
-        for allow_split in flags:
-            for mxfp8 in flags if full else (True,):
-                for prewait in flags if full else (True,):
-                    for linear in flags if full else (False,):
-                        yield pytest.param(
-                            name,
-                            linear,
-                            prewait,
-                            mxfp8,
-                            allow_split,
-                            id=f"{allow_split}-{mxfp8}-{prewait}-{linear}-{name}",
-                        )
+        full = name in ("b4", "b1-tiny", "b10-split")
+        for mxfp8 in flags if full else (True,):
+            for prewait in flags if full else (True,):
+                for linear in flags if full else (False,):
+                    yield pytest.param(
+                        name,
+                        linear,
+                        prewait,
+                        mxfp8,
+                        id=f"{mxfp8}-{prewait}-{linear}-{name}",
+                    )
 
 
-@pytest.mark.parametrize("name, linear, prewait, mxfp8, allow_split", list(_variants()))
-def test_the_fixed_copy_writes_the_stock_bytes(name, linear, prewait, mxfp8, allow_split):
+@pytest.mark.parametrize("name, linear, prewait, mxfp8", list(_variants()))
+def test_the_split_form_writes_the_unsplit_bytes(name, linear, prewait, mxfp8):
     c = _case(seed=3, **_CASES[name])
+    if name.endswith("-split"):
+        assert 33 <= c["q"].shape[0] <= 448, "a split case must take the split kernel"
     flags = dict(linear=linear, prewait=prewait, mxfp8=mxfp8, use_pdl=False)
-    stock = _run(torch.ops.trtllm.minimax_m3_sm107_tp2_sparse_decode_lc, c, **flags)
-    fixed = _run(
-        family_ops().minimax_m3_sm107_tp2_sparse_decode_lc, c, **flags, allow_split=allow_split
-    )
+    op = family_ops().minimax_m3_sm107_tp2_sparse_decode_lc
+    unsplit = _run(op, c, **flags, allow_split=False)
+    split = _run(op, c, **flags, allow_split=True)
     torch.cuda.synchronize()
-    for want, got in zip(stock, fixed):
+    for want, got in zip(unsplit, split):
         assert _same(want, got)

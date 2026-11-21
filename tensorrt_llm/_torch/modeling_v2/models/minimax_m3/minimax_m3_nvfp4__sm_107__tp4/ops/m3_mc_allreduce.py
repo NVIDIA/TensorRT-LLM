@@ -61,8 +61,8 @@ _OPT_ONESHOT_CLUSTER = 32
 _OPT_ROW_CARVEOUT = 64
 
 # Option 128: the drafter boundary (option 16) on the 8-CTA cluster kernel instead of the world-4 row kernel (routing
-# only; mcAllreduceNormTp4.cu invoke). Exact-class to the row kernel's FlashInfer order: the RMS statistic is the
-# cluster's sum (modeling.DRAFT_MC_AR_CLUSTER).
+# only; csrc/m3/sm107Tp4McAllreduceNorm.cu invoke). Exact-class to the row kernel's FlashInfer order: the RMS statistic
+# is the cluster's sum (modeling.DRAFT_MC_AR_CLUSTER).
 _OPT_DRAFTER_CLUSTER = 128
 
 # Option 2 is also the safe ordering of the cluster RMS exchange: its stores into peer CTAs' shared memory follow a

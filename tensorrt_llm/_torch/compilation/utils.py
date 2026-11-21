@@ -37,10 +37,36 @@ def is_call_function(node: Node, target: Union[List[Callable], Callable]):
 
 
 def get_optional_trtllm_op(op_name: str) -> Optional[Callable]:
+    """The default overload of ``op_name``, or None when it is not registered.
+
+    ``op_name`` is looked up in ``torch.ops.trtllm`` unless it is qualified as
+    ``"<namespace>::<name>"`` (a modeling_v2 target registers its ops in a
+    namespace of its own, and only once the target is imported).
+    """
+    namespace, _, name = op_name.rpartition("::")
     try:
-        return getattr(torch.ops.trtllm, op_name).default
+        return getattr(getattr(torch.ops, namespace or "trtllm"), name).default
     except AttributeError:
         return None
+
+
+# The modeling_v2 MiniMax-M3.1 sm_107 targets that copy the MiniMax-M3
+# attention boundary op and fused sparse QKV producer into their own op
+# namespaces (``modeling_v2._native.namespace_of``).
+_MINIMAX_M31_TARGET_OPS = (
+    ("mv2_minimax_m3_minimax_m3_1_flash_nvfp4_sm_107_tp2ctx",
+     "m31_tp2ctx_sm107"),
+    ("mv2_minimax_m3_minimax_m3_1_flash_nvfp4_sm_107_dep2ctx",
+     "m31_dep2ctx_sm107"),
+)
+
+
+def minimax_m31_target_op_names(op_suffix: str) -> List[str]:
+    """The qualified names of every M3.1 target's copy of ``op_suffix``."""
+    return [
+        f"{namespace}::{prefix}_{op_suffix}"
+        for namespace, prefix in _MINIMAX_M31_TARGET_OPS
+    ]
 
 
 _enable_piecewise_cuda_graph_capture = False
@@ -237,6 +263,23 @@ def inplace_info():
             2: "kv_cache",
             3: "index_k_cache",
             4: "kv_scale_cache"
+        },
+        # The MiniMax-M3.1 targets' own copies of the two ops above (each
+        # registered only when its target is imported); without these entries
+        # the functionalization clones the whole paged caches.
+        **{
+            name: {
+                1: "output"
+            }
+            for name in minimax_m31_target_op_names("attn_custom_op_inplace")
+        },
+        **{
+            name: {
+                2: "kv_cache",
+                3: "index_k_cache",
+                4: "kv_scale_cache"
+            }
+            for name in minimax_m31_target_op_names("fused_sparse_qkv_producer")
         },
         "fused_sigmoid_mul_inplace": {
             1: "attention_output"

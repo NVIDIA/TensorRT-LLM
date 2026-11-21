@@ -65,6 +65,27 @@ _SchedulerResult = TypeVar("_SchedulerResult")
 AllocationFence = Callable[[Iterable[int]], None]
 
 
+def _is_dummy_request(request: LlmRequest) -> bool:
+    """Whether ``request`` is a placeholder with no prompt of its own.
+
+    Attention DP pads idle ranks with these, and they carry nothing a connector
+    could load or save. Reads ``is_dummy_request``, which the C++ ``LlmRequest``
+    binds and so is readable on the base class some callers hand over, and the
+    Python-only ``is_attention_dp_dummy``. Each is compared against True, since
+    a mock request answers every attribute truthily and is not a dummy.
+
+    Args:
+        request: The request to classify.
+
+    Returns:
+        True when either dummy flag is set.
+    """
+    return (
+        getattr(request, "is_dummy_request", False) is True
+        or getattr(request, "is_attention_dp_dummy", False) is True
+    )
+
+
 # Used to store data for a single inflight request.
 @dataclass
 class RequestData:
@@ -372,6 +393,10 @@ class KvCacheConnectorScheduler(ABC):
     # ADP creates one adapter per rank. Adapters may connect to the same
     # logical storage pool; their request and allocation state stays local.
     supports_attention_dp: bool = False
+    # Whether ``request_finished`` reads its page-index arguments. A scheduler
+    # that sets this False lets a disaggregated context server skip gathering
+    # them for every finished request.
+    uses_finished_block_ids: bool = True
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -416,6 +441,22 @@ class KvCacheConnectorScheduler(ABC):
             The number of tokens that can be loaded from remote KV cache.
             Whether the tokens will be loaded asynchronously.
         """
+
+    def probe_num_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Optional[int]:
+        """Estimate what ``get_num_new_matched_tokens`` would offer, without its effects.
+
+        Used to rank queued context requests, so it may run long before the
+        request's own query, or for a request that is never queried. It must
+        not start a transfer, record an offer, or change what a later query
+        answers.
+
+        Returns:
+            Tokens beyond ``num_computed_tokens`` the connector could supply
+            now, or None when it cannot tell without querying.
+        """
+        return None
 
     def reserve_prefix(
         self, request: LlmRequest, num_computed_tokens: int, reservation_id: int
@@ -683,8 +724,9 @@ class KvCacheConnectorSchedulerOutputRequest:
 
 
 class KvCacheConnectorSchedulerOutputManager:
-    def __init__(self, *, enable_attention_dp: bool = False) -> None:
+    def __init__(self, *, enable_attention_dp: bool = False, context_only: bool = False) -> None:
         self.enable_attention_dp = enable_attention_dp
+        self.context_only = context_only
         self.requests = defaultdict(KvCacheConnectorSchedulerOutputRequest)
         self.external_loads = dict()
 
@@ -720,6 +762,12 @@ class KvCacheConnectorSchedulerOutputManager:
         for req in scheduled_batch.generation_requests:
             if self.enable_attention_dp and req.is_dummy_request:
                 continue
+            if self.context_only:
+                raise RuntimeError(
+                    f"KV connector is configured context_only, but generation request "
+                    f"{req.request_id} reached it. Only a disaggregated context server, "
+                    "which never runs a generation step, may declare context_only."
+                )
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager
             )
@@ -766,6 +814,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         scheduler: Optional[KvCacheConnectorScheduler],
         *,
         enable_attention_dp: bool = False,
+        context_only: bool = False,
     ) -> None:
         assert (scheduler is not None) == (enable_attention_dp or mpi_rank() == 0), (
             "A scheduler is required on every attention-DP owner, or only rank 0 for TP."
@@ -783,6 +832,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         #: because this disables most of the per-request path, which is too
         #: much to infer from a merely truthy value.
         self.capacity_only = worker.capacity_only is True
+        #: The server runs context phases only (a disaggregated context server);
+        #: see `KvCacheConnectorConfig.context_only`.
+        self.context_only = context_only is True
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -799,7 +851,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._scheduler_output = None
         self._allocation_fence: Optional[AllocationFence] = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager(
-            enable_attention_dp=enable_attention_dp
+            enable_attention_dp=enable_attention_dp, context_only=self.context_only
         )
         self.prefix_reservations_enabled = False
         self._prefix_capability = None
@@ -1089,6 +1141,32 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         finished = self._finished_load_terminations
         self._finished_load_terminations = []
         return finished
+
+    def probe_num_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Optional[int]:
+        """The leader's side-effect-free estimate of a request's connector prefix.
+
+        See `KvCacheConnectorScheduler.probe_num_matched_tokens`. Without
+        attention DP this is a leader broadcast, so every tensor-parallel rank
+        must call it for the same requests in the same order. A leader-side
+        failure answers None rather than raising: raising on the leader alone
+        would leave the other ranks waiting in the broadcast.
+        """
+        if _is_dummy_request(request) or self.capacity_only:
+            return None
+
+        def probe() -> Optional[int]:
+            try:
+                return self.scheduler.probe_num_matched_tokens(request, num_computed_tokens)
+            except Exception as error:  # noqa: BLE001 - see the docstring
+                logger.warning(
+                    f"KV connector prefix probe failed for request {request.request_id}; "
+                    f"ranking it on the local cache only: {type(error).__name__}: {error}"
+                )
+                return None
+
+        return self._run_on_leader(probe)
 
     def query_num_new_matched_tokens(
         self, request: LlmRequest, num_computed_tokens: int

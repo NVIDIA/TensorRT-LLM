@@ -1417,15 +1417,18 @@ class FusedCommMoEScheduler(MoEScheduler):
     def routes_from_logit_partials(self, routing_aux: Optional[torch.Tensor]) -> bool:
         """The fused launch routes this forward whenever ``_try_fused_route_quant`` admits it: no
         routing aux, router weight on the input, dynamic balancer or per-layer dynamic replica
-        plan, and a backend that fuses."""
+        plan, a backend that fuses, and the chunk gate ``_may_fuse_route_quant`` holds (no REPLAY
+        calibration, and the backend maps expert slots itself under a load balancer)."""
         moe = self.moe
+        uses_replica_plan = moe._load_balancer_uses_replica_plan()
         return (
             routing_aux is None
             and not moe.apply_router_weight_on_input
             and not moe._using_dynamic_load_balancer()
-            and not moe._load_balancer_uses_replica_plan()
+            and not uses_replica_plan
             and moe.backend.fused_route_quant_enabled
             and moe.backend.takes_router_logit_partials()
+            and self._may_fuse_route_quant(routing_aux, uses_replica_plan)
         )
 
     def forward(
@@ -1711,6 +1714,28 @@ class FusedCommMoEScheduler(MoEScheduler):
             outputs.append(out_chunk)
         return outputs
 
+    def _may_fuse_route_quant(
+        self, routing_aux: Optional[torch.Tensor], uses_replica_plan: bool
+    ) -> bool:
+        """Whether the backend may be offered ``try_fused_route_quant`` for this chunk.
+
+        A fused result stands for ``routing_method.apply`` plus ``quantize_input``. It
+        cannot take an auxiliary routing input, a load balancer's slot layout (unless the
+        backend maps expert IDs to slots itself) or the perfect router's expert ids, it
+        would be stale once a REPLAY calibrator swaps the slots after routing, and a
+        backend that prepares its own input has no ``quantize_input`` for it to replace.
+        ``_try_fused_route_quant`` then applies the backend-independent conditions.
+        """
+        moe = self.moe
+        return (
+            routing_aux is None
+            and not uses_replica_plan
+            and (not moe._using_load_balancer() or getattr(moe.backend, "maps_expert_slots", False))
+            and not getattr(moe, "_enable_perfect_router_expert_ids", False)
+            and get_calibrator().mode != CalibratorMode.REPLAY
+            and not getattr(moe.backend, "supports_fused_prepare", lambda: False)()
+        )
+
     def _forward_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -1794,7 +1819,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # ----- routing -----
         # int32 matches the EPLB stats kernel contract used by the external-comm
         # path; the fused-comm backend casts to int64 internally. A replica plan
-        # remaps the routes after routing, so its layers route separately.
+        # remaps the routes after routing, so its layers route separately (see
+        # _may_fuse_route_quant).
         fused_result = (
             self._try_fused_route_quant(
                 x_chunk_real,
@@ -1802,7 +1828,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 routing_aux,
                 moe._warmup_placement_route_counters(row_offset),
             )
-            if num_tokens > 0 and not uses_replica_plan
+            if num_tokens > 0 and self._may_fuse_route_quant(routing_aux, uses_replica_plan)
             else None
         )
         if (

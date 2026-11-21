@@ -25,6 +25,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -101,9 +102,20 @@ std::optional<LocalSlotIndex> SlotIdMap::localIndex(SlotId slotId) const noexcep
 // SlotAllocator
 // ---------------------------------------------------------------------------
 
+bool SlotAllocator::lazyScrubEnabled() noexcept
+{
+    static bool const enabled = []
+    {
+        char const* env = std::getenv("TRTLLM_KVCM2_DISABLE_LAZY_SCRUB");
+        return env == nullptr || std::strcmp(env, "1") != 0;
+    }();
+    return enabled;
+}
+
 SlotAllocator::SlotAllocator(
     SlotCount capacity, SlotIdMap const* slotMap, std::optional<LocalityDomainId> localityDomainId)
-    : mCapacity(capacity)
+    : mLazyScrub(lazyScrubEnabled())
+    , mCapacity(capacity)
     , mTargetCapacity(capacity)
     , mNumActiveSlots(0)
     , mNumReadyRecycledSlots(0)
@@ -118,6 +130,11 @@ SlotAllocator::~SlotAllocator()
     // Mirrors Python SlotAllocator.__del__ (assert_critical checks).
     if (TLLM_UNLIKELY(gDebug))
     {
+        if (mLazyScrub)
+        {
+            // A lazy scrub leaves completed events uncounted until the next allocate(); count them first.
+            poisonOnExcept(__PRETTY_FUNCTION__, [&]() { scrubEvents(); });
+        }
         KVCM2_CHECK_FATAL_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
             "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
         KVCM2_CHECK_FATAL_WITH_INFO(mTargetCapacity == mCapacity && mOverflowSlots.empty(),
@@ -160,8 +177,9 @@ Slot SlotAllocator::allocate()
     }
     // Readiness only decides between a fresh id and the front recycled slot, so scan (one
     // cuEventQuery per call) only while a fresh id is left and no recycled slot is known ready.
+    // Without the lazy scrub every allocate() polls, as release() then does too.
     bool const freshAvailable = mNumActiveSlots < std::min(mCapacity, mTargetCapacity);
-    if (freshAvailable && mNumReadyRecycledSlots == 0)
+    if (!mLazyScrub || (freshAvailable && mNumReadyRecycledSlots == 0))
     {
         scrubEvents();
     }
@@ -239,7 +257,12 @@ void SlotAllocator::release(Slot slot)
         mOverflowSlots.push_back(std::move(slot));
     }
     // Readiness is scanned at the next allocation: a request releases all its slots under one
-    // event, which would otherwise be queried once per slot.
+    // event, which would otherwise be queried once per slot. The lazy-scrub off switch restores
+    // the per-release poll.
+    if (!mLazyScrub)
+    {
+        scrubEvents();
+    }
     TLLM_CHECK_DEBUG(check());
 }
 
@@ -259,6 +282,11 @@ void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
     TLLM_CHECK_DEBUG(check());
     TLLM_CHECK_DEBUG(mTargetCapacity == mCapacity);
     TLLM_CHECK_DEBUG(newNumSlots < mCapacity);
+    if (mLazyScrub)
+    {
+        // Bring the ready count to what the eager scrub would have counted before it is partitioned.
+        scrubEvents();
+    }
     decltype(mRecycledSlots) newRecycled;
     SlotCount newNumReady = 0;
     SlotCount const oldNumReady = mNumReadyRecycledSlots;

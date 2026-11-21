@@ -442,6 +442,16 @@ class RequestScheduler(ABC):
             probe: Whether cancelled receives still retain local resources.
         """
 
+    def set_unprocessed_context(self, request_ids: frozenset[int]) -> None:
+        """Record the context requests of a batch the executor keeps unprocessed.
+
+        Only schedulers with context-only preemption use it; the default is a
+        no-op.
+
+        Args:
+            request_ids: Their request ids; empty once no batch is held back.
+        """
+
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
         decoder-tail hold passes, and requests whose final window was held."""
@@ -811,6 +821,10 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def set_unprocessed_context(self, request_ids: frozenset[int]) -> None:
+        """Forward the held-back context requests to the wrapped scheduler."""
+        self.scheduler.set_unprocessed_context(request_ids)
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         return self.scheduler.take_decision_counters()

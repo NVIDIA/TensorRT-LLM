@@ -185,3 +185,17 @@ def test_explicit_configure_modes_are_left_to_the_caller(build_wheel, tmp_path, 
     # the way (and must not fire on a mismatch it did not need to handle).
     _record(build_wheel, tmp_path, "old")
     assert _reason(build_wheel, tmp_path, "cur", **{mode: True}) is None
+
+
+@pytest.mark.parametrize(
+    "extra_cmake_vars, flag, expected",
+    [
+        (["BUILD_MSA_AOT=OFF", "BUILD_MSA_AOT=ON"], False, True),  # ON override without the flag
+        (["BUILD_MSA_AOT=ON", "FOO=1;BUILD_MSA_AOT:BOOL=OFF"], True, False),  # OFF override
+        (["BUILD_MSA_AOT=ON", "FOO=1"], True, True),  # no override
+    ],
+)
+def test_effective_cmake_bool_takes_the_last_definition(
+    build_wheel, extra_cmake_vars, flag, expected
+):
+    assert build_wheel._effective_cmake_bool(extra_cmake_vars, "BUILD_MSA_AOT", flag) is expected

@@ -115,6 +115,23 @@ def _cmake_define_name(arg: str) -> Optional[str]:
     return name or None
 
 
+def _effective_cmake_bool(extra_cmake_vars: Sequence[str], key: str,
+                          default: bool) -> bool:
+    """Effective boolean of ``key`` among ``KEY[:TYPE]=value`` definitions.
+
+    Each entry may hold several ``;``-separated definitions, as
+    ``--extra-cmake-vars`` allows; the last definition of ``key`` wins, as in
+    cmake.
+    """
+    value = default
+    for var in extra_cmake_vars:
+        for definition in var.split(";"):
+            name, _, raw = definition.partition("=")
+            if name.split(":", 1)[0].strip() == key:
+                value = raw.strip().upper() in ("ON", "1", "TRUE", "YES", "Y")
+    return value
+
+
 def configure_args_fingerprint(args: Sequence[str]) -> str:
     """Stable sha256 hex digest over the configure-affecting cmake arguments.
 
@@ -949,6 +966,7 @@ def main(*,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
          micro_benchmarks: bool = False,
+         msa_aot: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
@@ -1038,6 +1056,14 @@ def main(*,
 
     cmake_def_args = []
     cmake_generator = ""
+
+    # The opt-in ahead-of-time build of the MiniMax-M3.1 MSA kernels. Set either way, so a build
+    # without --msa_aot does not inherit ON from the CMake cache of an earlier one; first, so an
+    # explicit --extra-cmake-vars BUILD_MSA_AOT=... still wins.
+    extra_cmake_vars = [f"BUILD_MSA_AOT={'ON' if msa_aot else 'OFF'}"
+                        ] + list(extra_cmake_vars)
+    # The value CMake configures with, which decides whether the modules are installed.
+    msa_aot = _effective_cmake_bool(extra_cmake_vars, "BUILD_MSA_AOT", msa_aot)
 
     if on_windows:
         # Windows does not support multi-device currently.
@@ -1576,6 +1602,16 @@ def main(*,
             build_dir / "tensorrt_llm" / "flash_mla" / "python" / "flash_mla",
             pkg_dir / "flash_mla")
 
+    # The MSA modules of the opt-in ahead-of-time build (--msa_aot): the minimax_m3 modeling_v2
+    # family's vendored MSA kernels load them from tensorrt_llm/libs/msa_fmha_sm100 before
+    # compiling at run time. Without that build nothing is installed and they compile at run time.
+    msa_aot_dir = (build_dir / "tensorrt_llm" / "modeling_v2" / "minimax_m3" /
+                   "msa_aot" / "msa_fmha_sm100")
+    if (lib_dir / "msa_fmha_sm100").exists():
+        rmtree(lib_dir / "msa_fmha_sm100")
+    if msa_aot and msa_aot_dir.is_dir():
+        install_tree(msa_aot_dir, lib_dir / "msa_fmha_sm100")
+
     # Stage the FetchContent-patched MSA package for setup.py packaging.
     msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
     cutlass_src = build_dir / "_deps" / "cutlass-src"
@@ -1872,6 +1908,11 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--micro_benchmarks",
                         action="store_true",
                         help="Build the micro benchmarks for C++ components")
+    parser.add_argument(
+        "--msa_aot",
+        action="store_true",
+        help="Build the MiniMax-M3.1 MSA kernels ahead of time into the wheel "
+        "(BUILD_MSA_AOT); by default they compile at run time")
     parser.add_argument("--nvtx",
                         action="store_true",
                         help="Enable NVTX profiling features")

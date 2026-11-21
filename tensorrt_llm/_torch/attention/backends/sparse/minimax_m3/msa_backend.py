@@ -923,6 +923,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
             buf[start:].fill_(-1)
 
+    def _kv_update_with_tail(self):
+        """The policy's kv_update_tail when this step's update is sure to call it with a tail to fill past the live
+        rows (total_q <= start < len(msa_out_cache_loc)); None otherwise, and the tail is filled on its own first."""
+        tail_update = self.msa_policy.kv_update_tail
+        if tail_update is None or not self._msa_fields_ready or not self._msa_kv_lens_dynamic:
+            return None
+        total_q = int(self.num_tokens)
+        start, buf = self._msa_tail_start, self.msa_out_cache_loc
+        if int(self.num_seqs) <= 0 or total_q <= 0 or start is None or buf is None:
+            return None
+        return tail_update if total_q <= start < buf.shape[0] else None
+
     def on_update_kv_lens(self) -> None:
         """Re-derive lengths, slots and valid-block counts from the corrected kv_lens_cuda.
 
@@ -944,7 +956,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """
         # A new forward: the first dense layer that reads the sub-page table expands it again (msa_subpage_rows).
         self._msa_subpage_expanded = False
-        self._fill_tail_in_forward()
+        # MsaRuntimePolicy.kv_update_tail fills the tail in the update's own launch below.
+        tail_update = self._kv_update_with_tail()
+        if tail_update is None:
+            self._fill_tail_in_forward()
         super().on_update_kv_lens()
         if not self._msa_fields_ready or not self._msa_kv_lens_dynamic:
             return
@@ -958,8 +973,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             if self._msa_prefill_n_valid_blocks is not None
             else self.msa_n_valid_blocks
         )
-        kv_update = self.msa_policy.kv_update
-        if kv_update is not None and kv_update(
+        update_args = (
             self.kv_lens_cuda,
             self.msa_kv_lens_staged,
             self.seq_lens_cuda,
@@ -973,7 +987,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             None if self.msa_cu_kv_lens is None else self.msa_cu_kv_lens[: batch + 1],
             self.msa_out_cache_loc,
             None if n_valid_buf is None else n_valid_buf[:total_q],
-        ):
+        )
+        if tail_update is not None:
+            if tail_update(*update_args, self._msa_tail_start):
+                logger.info_once(
+                    "[M3 host] MSA out_cache_loc tail filled by the kv-update launch",
+                    key="msa_tail_in_kv_update",
+                )
+                return
+            self._fill_tail_in_forward()
+        kv_update = self.msa_policy.kv_update
+        if kv_update is not None and kv_update(*update_args):
             return
         # kv_lens_cuda is the attended length (no num_extra_kv_tokens), the same
         # domain as the staged bound and msa_seq_lens_cuda.

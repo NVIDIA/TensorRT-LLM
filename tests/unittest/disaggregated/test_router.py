@@ -1821,6 +1821,451 @@ async def test_conversation_router_session_affinity_and_fallbacks():
 
 
 @pytest.mark.asyncio
+async def test_conversation_router_inflight_cap_keeps_and_spills():
+    """max_inflight_per_server: keep the pin under the cap, spill at the cap, re-pin."""
+    servers = ["server1", "server2"]
+    # Under the cap (2): a second concurrent turn stays on the pinned server.
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                max_inflight_per_server=2)
+    a1 = _make_request(conversation_id="sess-A")
+    pinned, _ = await router.get_next_server(a1)
+    a2 = _make_request(conversation_id="sess-A")
+    s, _ = await router.get_next_server(a2)
+    assert s == pinned
+    await router.finish_request(a1)
+    await router.finish_request(a2)
+
+    # At the cap (1): the pinned server is busy, so the turn spills to the
+    # least-loaded server and the conversation is re-pinned there.
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                max_inflight_per_server=1)
+    a1 = _make_request(conversation_id="sess-A")
+    pinned, _ = await router.get_next_server(a1)
+    a2 = _make_request(conversation_id="sess-A")
+    spilled, _ = await router.get_next_server(a2)
+    assert spilled != pinned
+    await router.finish_request(a1)
+    await router.finish_request(a2)
+    a3 = _make_request(conversation_id="sess-A")
+    s, _ = await router.get_next_server(a3)
+    assert s == spilled
+    await router.finish_request(a3)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_session_ttl(monkeypatch):
+    """session_ttl_s: each routed turn renews the pin; an idle one expires."""
+    import tensorrt_llm.serve.router as router_mod
+
+    now = [1000.0]
+    monkeypatch.setattr(router_mod.time, "monotonic", lambda: now[0])
+    servers = ["server1", "server2"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                session_ttl_s=240)
+    a1 = _make_request(conversation_id="sess-A")
+    pinned, _ = await router.get_next_server(a1)
+    await router.finish_request(a1)
+    # Load the pinned server so least-loaded placement would pick the other.
+    busy = _make_request(conversation_id="sess-B", prompt="the " * 400)
+    b_server, _ = await router.get_next_server(busy)
+    if b_server != pinned:
+        await router.finish_request(busy)
+        busy = _make_request(conversation_id="sess-C", prompt="the " * 400)
+        b_server, _ = await router.get_next_server(busy)
+    assert b_server == pinned
+    # Within the TTL the pin holds even though the pinned server is busier.
+    now[0] += 200
+    a2 = _make_request(conversation_id="sess-A")
+    s, _ = await router.get_next_server(a2)
+    assert s == pinned
+    await router.finish_request(a2)
+    # A routed turn renews the TTL: +400 s from creation, but only 200 s after a2.
+    now[0] += 200
+    a2b = _make_request(conversation_id="sess-A")
+    s, _ = await router.get_next_server(a2b)
+    assert s == pinned
+    await router.finish_request(a2b)
+    # Idle longer than the TTL: the pin expires and least-loaded placement wins.
+    now[0] += 241
+    a3 = _make_request(conversation_id="sess-A")
+    s, _ = await router.get_next_server(a3)
+    assert s != pinned
+    await router.finish_request(a3)
+    await router.finish_request(busy)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_coordinator_path_inflight_cap():
+    """The coordinator-delegated path applies the same in-flight cap."""
+    servers = ["server1", "server2"]
+    # No content following: a plain conversation_id key places a new
+    # conversation without a content round trip.
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                max_inflight_per_server=1,
+                                new_conversation_min_match_blocks=0)
+    first, _, _ = await router.get_next_server_by_key("sess-A", req_id=1)
+    spilled, _, _ = await router.get_next_server_by_key("sess-A", req_id=2)
+    assert spilled != first
+    await router.finish_request_by_id(1)
+    await router.finish_request_by_id(2)
+    s, _, _ = await router.get_next_server_by_key("sess-A", req_id=3)
+    assert s == spilled
+    await router.finish_request_by_id(3)
+
+
+# The late-bind tests disable content following
+# (new_conversation_min_match_blocks=0) so that a new conversation_id is
+# queued without first hashing its request in a worker thread, which keeps
+# the queue order deterministic after a single event-loop turn.
+
+
+def _active(router):
+    return {
+        s: router._server_state[s]._num_active_requests
+        for s in router._servers
+    }
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_waits_for_first_free_server():
+    """late_bind: with every server at the cap, a turn waits and goes to the first server that frees."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    a1 = _make_request(conversation_id="sess-A")
+    pin_a, _ = await router.get_next_server(a1)
+    b1 = _make_request(conversation_id="sess-B")
+    pin_b, _ = await router.get_next_server(b1)
+    assert pin_a != pin_b and _active(router) == {pin_a: 1, pin_b: 1}
+    a2 = _make_request(conversation_id="sess-A")
+    task = asyncio.create_task(router.get_next_server(a2))
+    await asyncio.sleep(0)
+    assert not task.done(
+    )  # both servers busy: a2 waits instead of queueing on its busy pin
+    await router.finish_request(b1)  # sess-B's server frees first
+    server, _ = await asyncio.wait_for(task, 1)
+    assert server == pin_b  # first free server, re-pinned there
+    assert _active(router) == {pin_a: 1, pin_b: 1}
+    await router.finish_request(a1)
+    await router.finish_request(a2)
+    assert _active(router) == {pin_a: 0, pin_b: 0}
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_cancel_leaves_no_pin():
+    """late_bind: a new conversation cancelled while waiting for a seat keeps no pin or content entry."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                max_inflight_per_server=1,
+                                late_bind=True)
+    a1 = _make_request(conversation_id="sess-A")
+    b1 = _make_request(conversation_id="sess-B")
+    await router.get_next_server(a1)
+    await router.get_next_server(b1)
+    task = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-C")))
+    for _ in range(50):  # placement hashes the content in a worker thread
+        if router._waiters:
+            break
+        await asyncio.sleep(0.01)
+    assert router._waiters and "sess-C" in router._session_table
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert "sess-C" not in router._session_table
+    assert "sess-C" not in router._conv_content
+    assert not router._waiters
+    assert sum(_active(router).values()) == 2
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_last_cancelled_waiter_drops_the_pin(
+):
+    """late_bind: the last cancelled waiter of a never-seated conversation drops its pin.
+
+    The pin the first waiting turn made survives its cancellation while a second turn waits,
+    and goes with the second's cancellation.
+    """
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                max_inflight_per_server=1,
+                                late_bind=True)
+    await router.get_next_server(_make_request(conversation_id="sess-A"))
+    await router.get_next_server(_make_request(conversation_id="sess-B"))
+    first = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-C")))
+    for _ in range(50):  # placement hashes the content in a worker thread
+        if router._waiters:
+            break
+        await asyncio.sleep(0.01)
+    assert router._waiters and "sess-C" in router._session_table
+    second = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-C")))
+    for _ in range(50):
+        if len(router._waiters) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert len(router._waiters) == 2
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert "sess-C" in router._session_table  # the second turn still waits
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    assert "sess-C" not in router._session_table
+    assert "sess-C" not in router._conv_content
+    assert "sess-C" not in router._late_bind_placements
+    assert not router._waiters
+    assert sum(_active(router).values()) == 2
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_rejects_coordinator_placement():
+    """late_bind needs the request to wait on; the coordinator's by-key placement refuses it instead of ignoring it."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    with pytest.raises(ValueError, match="late_bind"):
+        await router.get_next_server_by_key("sess-A", req_id=1)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_rejects_exclusion_of_every_server(
+):
+    """A turn that excludes the only server fails like the ordinary path instead of waiting forever."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    with pytest.raises(ValueError, match="after excluding server1"):
+        await router.get_next_server(_make_request(conversation_id="sess-A"),
+                                     exclude_server="server1")
+    server, _ = await router.get_next_server(
+        _make_request(conversation_id="sess-B"))
+    assert server == "server1"  # nothing was left queued
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_head_waiting_for_another_server_does_not_block(
+):
+    """A head waiting for a busy server does not hold back a waiter that can take the server the head excluded.
+
+    Removing the server the head waits for then fails it at once.
+    """
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    held = [_make_request(conversation_id=f"hold-{i}") for i in range(2)]
+    placed = {}
+    for r in held:
+        placed[(await router.get_next_server(r))[0]] = r
+    head = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-A"),
+                               exclude_server="server1"))
+    await asyncio.sleep(0)
+    behind_req = _make_request(conversation_id="sess-B")
+    behind = asyncio.create_task(router.get_next_server(behind_req))
+    await asyncio.sleep(0)
+    await router.finish_request(placed["server1"])
+    server, _ = await asyncio.wait_for(behind, 1)
+    assert server == "server1"  # not held back by the head, which waits for server2
+    assert not head.done()
+    await router.remove_server("server2")
+    with pytest.raises(ValueError, match="after excluding server1"):
+        await asyncio.wait_for(head, 1)
+    await router.finish_request(behind_req)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_server_from_metadata_takes_a_waiter(
+        monkeypatch):
+    """A server the metadata monitor discovers takes a queued turn without waiting for another request event."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    held = _make_request(conversation_id="hold")
+    assert (await router.get_next_server(held))[0] == "server1"
+    waiter = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-A")))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    async def fetch_live_servers():
+        return {"k1": "server1", "k2": "server2"}
+
+    async def check_servers_health(server_key_map):
+        return list(server_key_map.values())
+
+    async def prepare_server(server):
+        return None
+
+    monkeypatch.setattr(router, "fetch_live_servers", fetch_live_servers)
+    monkeypatch.setattr(router, "check_servers_health", check_servers_health)
+    monkeypatch.setattr(router, "_filter_servers_by_role",
+                        lambda servers, server_key_map: servers)
+    monkeypatch.setattr(router, "_prepare_server", prepare_server)
+    monitor = asyncio.create_task(router._monitor_servers(poll_interval=3600))
+    try:
+        server, _ = await asyncio.wait_for(waiter, 1)
+        assert server == "server2"
+    finally:
+        monitor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await monitor
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_prefers_pin_when_it_frees():
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    a1 = _make_request(conversation_id="sess-A")
+    pin_a, _ = await router.get_next_server(a1)
+    b1 = _make_request(conversation_id="sess-B")
+    await router.get_next_server(b1)
+    a2 = _make_request(conversation_id="sess-A")
+    task = asyncio.create_task(router.get_next_server(a2))
+    await asyncio.sleep(0)
+    await router.finish_request(a1)
+    server, _ = await asyncio.wait_for(task, 1)
+    assert server == pin_a
+    await router.finish_request(a2)
+    await router.finish_request(b1)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_fifo_no_starvation():
+    """A queued pinned conversation is served before later arrivals (FIFO hand-off)."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    held = [_make_request(conversation_id=f"hold-{i}") for i in range(2)]
+    for r in held:
+        await router.get_next_server(r)
+    first = _make_request(
+        conversation_id="hold-0")  # pinned conversation, queued first
+    t_first = asyncio.create_task(router.get_next_server(first))
+    await asyncio.sleep(0)
+    later = [_make_request(conversation_id=f"new-{i}") for i in range(3)]
+    t_later = [asyncio.create_task(router.get_next_server(r)) for r in later]
+    await asyncio.sleep(0)
+    assert not t_first.done() and not any(t.done() for t in t_later)
+    await router.finish_request(held[1]
+                                )  # one slot frees: goes to the oldest waiter
+    await asyncio.wait_for(t_first, 1)
+    assert not any(t.done() for t in t_later)
+    await router.finish_request(held[0])
+    done, _ = await asyncio.wait(t_later,
+                                 timeout=1,
+                                 return_when=asyncio.FIRST_COMPLETED)
+    assert t_later[0] in done and not t_later[1].done(
+    )  # FIFO among later arrivals too
+    for t in t_later:
+        if not t.done():
+            t.cancel()
+    await asyncio.gather(*t_later, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_cancel_while_queued():
+    """A waiter cancelled while queued leaves the queue; the next free slot goes to the next waiter."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    r0 = _make_request(conversation_id="sess-0")
+    await router.get_next_server(r0)
+    gone = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-1")))
+    nxt_req = _make_request(conversation_id="sess-2")
+    nxt = asyncio.create_task(router.get_next_server(nxt_req))
+    await asyncio.sleep(0)
+    gone.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await gone
+    assert len(router._waiters) == 1
+    await router.finish_request(r0)
+    server, _ = await asyncio.wait_for(nxt, 1)
+    assert server == "server1" and _active(router) == {"server1": 1}
+    await router.finish_request(nxt_req)
+    assert _active(router) == {"server1": 0} and not router._waiters
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_cancel_after_handoff_releases_slot(
+):
+    """A waiter cancelled after its slot was handed over releases the slot to the next waiter."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1"],
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    r0 = _make_request(conversation_id="sess-0")
+    await router.get_next_server(r0)
+    w1 = asyncio.create_task(
+        router.get_next_server(_make_request(conversation_id="sess-1")))
+    w2_req = _make_request(conversation_id="sess-2")
+    w2 = asyncio.create_task(router.get_next_server(w2_req))
+    await asyncio.sleep(0)
+    await router.finish_request(
+        r0)  # hands the slot to w1 (registered on its behalf)
+    w1.cancel()  # client disconnects before w1 resumes
+    with pytest.raises(asyncio.CancelledError):
+        await w1
+    server, _ = await asyncio.wait_for(w2, 1)  # the released slot passed to w2
+    assert server == "server1" and _active(router) == {"server1": 1}
+    await router.finish_request(w2_req)
+    assert _active(router) == {"server1": 0} and not router._waiters
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_late_bind_rotates_among_tied_free_servers():
+    """late_bind: tied free servers take new conversations in turn, not always the first in list order."""
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                max_inflight_per_server=1,
+                                late_bind=True,
+                                new_conversation_min_match_blocks=0)
+    chosen = []
+    for i in range(len(servers)):
+        req = _make_request(conversation_id=f"sess-{i}")
+        server, _ = await router.get_next_server(req)
+        chosen.append(server)
+        await router.finish_request(req)  # every server back at load 0
+    assert sorted(chosen) == servers
+
+
+@pytest.mark.parametrize("args", [
+    dict(late_bind=True),
+    dict(session_ttl_s=0),
+    dict(max_inflight_per_server=0),
+])
+def test_conversation_router_rejects_invalid_limits(args):
+    with pytest.raises(ValueError):
+        ConversationRouter(server_role=None, servers=["s"], **args)
+
+
+@pytest.mark.asyncio
 async def test_conversation_router_load_balancing():
     """New sessions with distinct prompts are load-balanced across servers."""
     servers = ["server1", "server2", "server3"]
@@ -3250,6 +3695,30 @@ def test_conversation_router_rejects_unknown_follow_mode():
         ConversationRouter(server_role=None,
                            servers=["server1"],
                            new_conversation_follow="sometimes")
+
+
+@pytest.mark.parametrize("pin_args", [
+    dict(max_inflight_per_server=2),
+    dict(max_inflight_per_server=2, late_bind=True),
+])
+def test_conversation_router_follow_always_rejects_inflight_cap(pin_args):
+    # The cap counts requests; under "always" server load is in tokens.
+    with pytest.raises(ValueError, match="new_conversation_follow='always'"):
+        ConversationRouter(server_role=None,
+                           servers=["server1"],
+                           **_FOLLOW_ALWAYS_ARGS,
+                           **pin_args)
+    # The session TTL alone does not use the load, and following can be off.
+    ConversationRouter(server_role=None,
+                       servers=["server1"],
+                       session_ttl_s=60.0,
+                       **_FOLLOW_ALWAYS_ARGS)
+    ConversationRouter(server_role=None,
+                       servers=["server1"],
+                       tokens_per_block=16,
+                       new_conversation_min_match_blocks=0,
+                       new_conversation_follow="always",
+                       **pin_args)
 
 
 @pytest.mark.asyncio

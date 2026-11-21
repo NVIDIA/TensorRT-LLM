@@ -15,7 +15,7 @@ world size is a runtime argument of the kernel and no cell's spec names one, so
 the cells are certified at the world size of the job (``_rank_job.WORLD_SIZES``).
 
 Op: the entries call the image's op by default and this target's own copy
-(``trtllm::minimax_m3_sm107_tp8_mc_allreduce_norm``) with ``own_op``, which is
+(``mv2_minimax_m3::minimax_m3_sm107_tp8_mc_allreduce_norm``) with ``own_op``, which is
 what the target's boundaries call when it is loaded. Every cell is driven
 through each op the build has.
 

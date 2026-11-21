@@ -30,6 +30,9 @@ the two means giving the provider one class that holds these methods and
 having a leaf inherit it, which touches every kernel call site.
 """
 
+import functools
+import importlib.util
+import os
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 import torch
@@ -37,6 +40,35 @@ import torch
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
 from .impl_contract import EngineRouting, MoERoutingTables, PreroutedRouting
+
+# Large-M BF16 NVFP4 activation quantization goes to FlashInfer's TMA kernel, byte-exact with the
+# TRT op: on from FLASHINFER_FP4_QUANTIZE_MIN_ROWS rows when FlashInfer is installed, unless the
+# disable switch is 1. Read at import.
+FLASHINFER_FP4_QUANTIZE_DISABLE_ENV = "TRTLLM_MOE_DISABLE_FLASHINFER_FP4_QUANTIZE"
+FLASHINFER_FP4_QUANTIZE_MIN_ROWS_ENV = "TRTLLM_MOE_FLASHINFER_FP4_QUANTIZE_MIN_ROWS"
+_FLASHINFER_FP4_QUANTIZE = (
+    os.environ.get(FLASHINFER_FP4_QUANTIZE_DISABLE_ENV) != "1"
+    and importlib.util.find_spec("flashinfer") is not None
+)
+_FLASHINFER_FP4_QUANTIZE_MIN_ROWS = int(
+    os.environ.get(FLASHINFER_FP4_QUANTIZE_MIN_ROWS_ENV, "4096")
+)
+
+
+@functools.cache
+def _flashinfer_fp4_recipe_is_native() -> bool:
+    """Whether FlashInfer's NVFP4 quantizer runs the native recipe (no NVFP4 recipe knob set).
+
+    A recipe knob changes the quantized bits, so the TRT op serves the input instead.
+    """
+    try:
+        from flashinfer.quantization import fp4_quantization
+    except ImportError:
+        return True  # a FlashInfer without the module has no recipe knobs
+    return not any(
+        os.environ.get(name) for name in getattr(fp4_quantization, "NVFP4_QUANT_ENV_VARS", ())
+    )
+
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
@@ -249,6 +281,33 @@ class TRTLLMOpBackend(MoEOpBackend):
         is_sf_8x4_layout: bool = False,
         enable_pdl: Optional[bool] = None,
     ):
+        if (
+            _FLASHINFER_FP4_QUANTIZE
+            and global_scale is not None
+            and input.dim() == 2
+            and input.dtype == torch.bfloat16
+            and input.shape[0] >= _FLASHINFER_FP4_QUANTIZE_MIN_ROWS
+            and input.shape[1] % 64 == 0
+            and sf_vec_size == 16
+            and not sf_use_ue8m0
+            and input.is_contiguous()
+            and _flashinfer_fp4_recipe_is_native()
+        ):
+            from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
+
+            # Like the TRT op: PDL on SM90+ (FlashInfer's own default) unless TRTLLM_ENABLE_PDL=0.
+            q, sf = _flashinfer_fp4_quantize(
+                input,
+                global_scale,
+                16,
+                False,
+                is_sf_swizzled_layout,
+                enable_pdl=False if os.environ.get("TRTLLM_ENABLE_PDL") == "0" else None,
+                backend="cuda",
+            )
+            return q.view(torch.uint8).view(input.shape[0], input.shape[1] // 2), sf.view(
+                torch.uint8
+            ).reshape(-1)
         return torch.ops.trtllm.fp4_quantize(
             input, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled_layout
         )

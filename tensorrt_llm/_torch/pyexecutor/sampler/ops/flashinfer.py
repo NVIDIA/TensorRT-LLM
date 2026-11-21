@@ -65,6 +65,66 @@ else:
 
 SeedOrTensor = Union[int, torch.Tensor]
 
+# Optional replacements of three FlashInfer sampling calls, installed by a model
+# at load time. Each returns its result, or None to keep the stock call for that
+# input; None (the default) leaves every op below unchanged.
+#
+# ``flashinfer.sampling.top_p_renorm_probs`` with per-row ``top_p`` tensors:
+_TOP_P_RENORM_OVERRIDE: Optional[Callable[[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]] = (
+    None
+)
+# ``flashinfer.sampling.softmax(logits, temperature)``:
+_SOFTMAX_OVERRIDE: Optional[
+    Callable[[torch.Tensor, Optional[torch.Tensor]], Optional[torch.Tensor]]
+] = None
+# ``flashinfer.sampling.sampling_from_probs(probs, deterministic=True)`` with
+# ``seed`` / ``offset`` tensors, returning the int32 tokens:
+_SAMPLING_FROM_PROBS_OVERRIDE: Optional[
+    Callable[[torch.Tensor, torch.Tensor, torch.Tensor], Optional[torch.Tensor]]
+] = None
+
+
+def set_top_p_renorm_override(
+    fn: Optional[Callable[[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]],
+) -> None:
+    """Install (or, with None, remove) the top-p renorm override used by
+    ``top_p_renorm_probs_op`` and ``compute_probs_from_logits_op``."""
+    global _TOP_P_RENORM_OVERRIDE
+    _TOP_P_RENORM_OVERRIDE = fn
+
+
+def set_softmax_override(
+    fn: Optional[Callable[[torch.Tensor, Optional[torch.Tensor]], Optional[torch.Tensor]]],
+) -> None:
+    """Install (or, with None, remove) the softmax override used by
+    ``softmax_op`` and ``compute_probs_from_logits_op``."""
+    global _SOFTMAX_OVERRIDE
+    _SOFTMAX_OVERRIDE = fn
+
+
+def set_sampling_from_probs_override(
+    fn: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], Optional[torch.Tensor]]],
+) -> None:
+    """Install (or, with None, remove) the override ``sampling_from_probs_op``
+    consults when it is called with ``seed`` / ``offset`` tensors, no generator
+    and no NaN check."""
+    global _SAMPLING_FROM_PROBS_OVERRIDE
+    _SAMPLING_FROM_PROBS_OVERRIDE = fn
+
+
+def _overridden_softmax(
+    logits: torch.Tensor, temperature: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    return None if _SOFTMAX_OVERRIDE is None else _SOFTMAX_OVERRIDE(logits, temperature)
+
+
+def _top_p_renorm_probs(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    if _TOP_P_RENORM_OVERRIDE is not None:
+        overridden = _TOP_P_RENORM_OVERRIDE(probs, top_p)
+        if overridden is not None:
+            return overridden
+    return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+
 
 @_compiler_disable
 def radix_topk_op(
@@ -167,6 +227,16 @@ def sampling_from_probs_op(
     Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
     see module docstring for the full contract.
     """
+    if (
+        _SAMPLING_FROM_PROBS_OVERRIDE is not None
+        and generator is None
+        and not check_nan
+        and isinstance(seed, torch.Tensor)
+        and isinstance(offset, torch.Tensor)
+    ):
+        overridden = _SAMPLING_FROM_PROBS_OVERRIDE(probs, seed, offset)
+        if overridden is not None:
+            return overridden
     tokens: torch.Tensor = flashinfer.sampling.sampling_from_probs(
         probs,
         deterministic=True,
@@ -243,6 +313,9 @@ def softmax_op(
     logits: torch.Tensor,
     temperature: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    overridden = _overridden_softmax(logits, temperature)
+    if overridden is not None:
+        return overridden
     probs: torch.Tensor = flashinfer.sampling.softmax(
         logits, temperature, enable_pdl=get_env_enable_pdl()
     )
@@ -272,7 +345,7 @@ def top_p_renorm_probs_op(
     probs: torch.Tensor,
     top_p: torch.Tensor,
 ) -> torch.Tensor:
-    renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    renormed: torch.Tensor = _top_p_renorm_probs(probs, top_p)
     return renormed
 
 
@@ -291,11 +364,11 @@ def compute_probs_from_logits_op(
     """
     if top_k is not None:
         logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
-    probs: torch.Tensor = flashinfer.sampling.softmax(
-        logits, temperatures, enable_pdl=get_env_enable_pdl()
-    )
+    probs = _overridden_softmax(logits, temperatures)
+    if probs is None:
+        probs = flashinfer.sampling.softmax(logits, temperatures, enable_pdl=get_env_enable_pdl())
     if top_p is not None:
-        probs = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+        probs = _top_p_renorm_probs(probs, top_p)
     return probs
 
 

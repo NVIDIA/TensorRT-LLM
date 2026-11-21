@@ -344,6 +344,14 @@ class TunableRunner(ABC):
         """
         return None
 
+    def tactic_name(self, tactic: Any) -> Optional[str]:
+        """A name of ``tactic`` that stays the same across builds (e.g. its kernel or config), or None.
+
+        Tactic caches shipped with a model key entries by this name rather than by the tactic value, which may be
+        an index into a list that a rebuild reorders. None means the runner has no such name.
+        """
+        return None
+
 
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True,
@@ -596,6 +604,11 @@ class AutoTunerProfilingCache:
         # from choose_one when an excluded op is first seen.
         self.excluded_op: Set[str] = set()
 
+        # Entries loaded from a name-keyed tactic bundle that have not been
+        # looked up yet: cache key -> the tactic's name (TunableRunner.tactic_name).
+        # The first lookup checks the stored tactic against the name.
+        self.bundled_names: Dict[Tuple, str] = dict()
+
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
         self.creation_timestamp = time.time()
@@ -616,6 +629,7 @@ class AutoTunerProfilingCache:
         self.cache.clear()
         self.independent_op.clear()
         self.excluded_op.clear()
+        self.bundled_names.clear()
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -694,7 +708,17 @@ class AutoTunerProfilingCache:
         self.cache.update(cache_data)
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
-        return {k: v for k, v in self.cache.items() if k[0] == custom_op}
+        """The entries of ``custom_op``, without bundled entries not looked up yet.
+
+        Such an entry's tactic has not been checked against its bundled name
+        (``bundled_names``), so it is neither shared with other ranks nor
+        registered in a runner's own tactic cache.
+        """
+        return {
+            k: v
+            for k, v in self.cache.items()
+            if k[0] == custom_op and k not in self.bundled_names
+        }
 
     def add_independent_op(self, custom_op: str,
                            strategy: DistributedTuningStrategy) -> None:
@@ -723,7 +747,10 @@ class AutoTunerProfilingCache:
             - shared_cache: entries for non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL)
             - rank_cache: entries for INDEPENDENT ops
             Entries belonging to `self.excluded_op` are dropped from both
-            partitions so they never reach disk.
+            partitions so they never reach disk. Bundle entries still in
+            `self.bundled_names` are dropped too: their tactic index has not
+            been checked against the bundled name yet, and on disk the name
+            would be lost.
         """
         shared_cache = {}
         rank_cache = {}
@@ -731,6 +758,8 @@ class AutoTunerProfilingCache:
         for key, value in self.cache.items():
             custom_op = key[0]  # First element of cache key is custom_op name
             if custom_op in self.excluded_op:
+                continue
+            if key in self.bundled_names:
                 continue
             if custom_op not in self.independent_op:
                 rank_cache[key] = value
@@ -863,8 +892,9 @@ class AutoTunerProfilingCache:
             IOError: If file cannot be read
 
         Note:
-            Loading will replace the current cache contents. The cache is loaded
-            from JSON format.
+            Loading replaces the current cache contents, except bundled entries
+            the file does not cover, which are kept. The cache is loaded from
+            JSON format.
         """
         file_path = Path(file_path)
         if not file_path.exists():
@@ -877,9 +907,15 @@ class AutoTunerProfilingCache:
             self._deserialize_metadata(
                 current_cache_contents.get("metadata", {}))
 
+            # Bundled entries the file does not cover are kept below.
+            bundled = {
+                key: (self.cache[key], name)
+                for key, name in self.bundled_names.items() if key in self.cache
+            }
             # Start with empty cache and independent ops set
             self.cache = {}
             self.independent_op = set()
+            self.bundled_names.clear()
 
             # Load shared cache entries (non-INDEPENDENT ops)
             if self.SHARED_CACHE_KEY in current_cache_contents:
@@ -902,6 +938,12 @@ class AutoTunerProfilingCache:
                 logger.debug(
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
+
+            # A persisted entry wins over the bundle; an unresolved bundled entry keeps its name.
+            for key, (value, name) in bundled.items():
+                if key not in self.cache:
+                    self.cache[key] = value
+                    self.bundled_names[key] = name
 
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
@@ -1099,6 +1141,9 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
+        # Told about bundled entries no tactic matches and about shapes a bundle
+        # did not cover (``unresolved(cache_key, name)`` / ``retune(custom_op, shapes)``).
+        self.bundle_reporter: Optional[Any] = None
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         # Cache keys whose runner ran in this process (so any JIT it drives
         # has happened here), as opposed to keys loaded from disk or peers.
@@ -1325,11 +1370,16 @@ class AutoTuner:
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
         is_cache_hit, best_runner_id, best_tactic, min_time = (
-            self.profiling_cache.search_cache(custom_op,
-                                              runners,
-                                              input_shapes,
-                                              tuning_config,
-                                              apply_map_to_tuning_buckets=True))
+            self._search_cache_resolving_bundles(
+                custom_op,
+                runners,
+                input_shapes,
+                tuning_config,
+                True,
+                inputs,
+                None,
+                **kwargs,
+            ))
         if (tuning_config.exclude_from_cache and self.is_tuning_mode
                 and is_cache_hit and self.profiling_cache.get_cache_key(
                     custom_op,
@@ -1400,12 +1450,15 @@ class AutoTuner:
         if self._should_current_rank_tune(strategy):
 
             def is_cached(p: OptimizationProfile) -> bool:
-                return self.profiling_cache.search_cache(
+                return self._search_cache_resolving_bundles(
                     custom_op,
                     runners,
                     p.get_opt_shapes(),
                     tuning_config,
-                    apply_map_to_tuning_buckets=False,
+                    False,
+                    inputs,
+                    p,
+                    **kwargs,
                 )[0]
 
             # Every rank profiles under MERGE / PARALLEL, so they agree on the profiles to tune.
@@ -1425,6 +1478,9 @@ class AutoTuner:
             def profile_one(p: OptimizationProfile) -> None:
                 nonlocal new_tuning_failure_occurred
                 if is_pending(p):
+                    if self.bundle_reporter is not None:
+                        self.bundle_reporter.retune(custom_op,
+                                                    p.get_opt_shapes())
                     tensors = self._prepare_input_tensors(p, inputs)
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
@@ -1667,13 +1723,9 @@ class AutoTuner:
         if not jit_classes:
             return
         for profile in self._optimization_profiles(tuning_config, inputs):
-            hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
-                custom_op,
-                runners,
-                profile.get_opt_shapes(),
-                tuning_config,
-                apply_map_to_tuning_buckets=False,
-            )
+            hit, runner_id, tactic, _ = self._search_cache_resolving_bundles(
+                custom_op, runners, profile.get_opt_shapes(), tuning_config,
+                False, inputs, profile, **kwargs)
             if not hit:
                 continue
             runner = runners[runner_id]
@@ -1705,6 +1757,73 @@ class AutoTuner:
                     f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
                     f"runner={type(runner).__name__}, tactic={tactic}, "
                     f"shapes={profile.get_opt_shapes()}. Error: {e}")
+
+    def _search_cache_resolving_bundles(
+            self, custom_op: str, runners: List[TunableRunner],
+            input_shapes: Tuple[torch.Size], tuning_config: TuningConfig,
+            apply_map_to_tuning_buckets: bool, inputs: List[torch.Tensor],
+            profile: Optional[OptimizationProfile],
+            **kwargs) -> Tuple[bool, int, Any, float]:
+        """``search_cache`` whose hit, when loaded from a name-keyed bundle, is checked by ``_resolve_bundled``.
+
+        A hit that does not resolve is dropped from the cache, so the search repeats and may find another
+        runner's entry (PARALLEL keeps one per runner); with none left it returns the fallback entry.
+        """
+        while True:
+            result = self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                input_shapes,
+                tuning_config,
+                apply_map_to_tuning_buckets=apply_map_to_tuning_buckets)
+            is_cache_hit, runner_id = result[0], result[1]
+            if not is_cache_hit or not self.profiling_cache.bundled_names:
+                return result
+            cache_key = self.profiling_cache.get_cache_key(
+                custom_op, runners[runner_id], input_shapes, tuning_config,
+                apply_map_to_tuning_buckets)
+            if self._resolve_bundled(cache_key, runners[runner_id], inputs,
+                                     profile, **kwargs):
+                _, tactic, min_time = self.profiling_cache.cache[cache_key]
+                return True, runner_id, tactic, min_time
+
+    def _resolve_bundled(self,
+                         cache_key: Tuple,
+                         runner: TunableRunner,
+                         inputs: List[torch.Tensor],
+                         profile: Optional[OptimizationProfile] = None,
+                         **kwargs) -> bool:
+        """Check a cache entry loaded from a name-keyed bundle on its first lookup.
+
+        True when the stored tactic still carries the bundled name, or when another valid tactic of ``runner``
+        does (that tactic replaces the stored one). Otherwise the entry is dropped, the reporter is told, and
+        False sends the caller to the miss path (tuning, or the fallback outside tuning). With ``profile``
+        given, the valid tactics are enumerated for that profile's shapes rather than for ``inputs``.
+        """
+        name = self.profiling_cache.bundled_names.pop(cache_key, None)
+        if name is None or cache_key not in self.profiling_cache.cache:
+            return cache_key in self.profiling_cache.cache
+
+        def name_of(tactic: Any) -> Optional[str]:
+            try:
+                return runner.tactic_name(tactic)
+            except (RuntimeError, IndexError, ValueError, TypeError):
+                return None
+
+        runner_id, tactic, min_time = self.profiling_cache.cache[cache_key]
+        if name_of(tactic) == name:
+            return True
+        if profile is not None:
+            inputs = self._prepare_input_tensors(profile, inputs)
+        for candidate in runner.get_valid_tactics(inputs, profile, **kwargs):
+            if name_of(candidate) == name:
+                self.profiling_cache.cache[cache_key] = (runner_id, candidate,
+                                                         min_time)
+                return True
+        del self.profiling_cache.cache[cache_key]
+        if self.bundle_reporter is not None:
+            self.bundle_reporter.unresolved(cache_key, name)
+        return False
 
     def _profile_runners(
         self,

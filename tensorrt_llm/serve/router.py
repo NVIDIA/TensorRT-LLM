@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import asyncio
+import os
 import sys
 import time
 from abc import ABC, abstractmethod
 from array import array
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
@@ -408,6 +409,14 @@ class Router(ABC):
             new_servers: The new server list
         """
 
+    async def _after_servers_updated(self) -> None:
+        """Called after a server list change, with the lock held.
+
+        Runs after the preparation attempts of the new servers. Override in
+        subclasses that hold requests waiting for a server. As in routing, a
+        server stays eligible when its preparation fails.
+        """
+
     @property
     def servers(self) -> List[str]:
         return self._servers
@@ -496,6 +505,7 @@ class Router(ABC):
                 old_servers = self._servers.copy()
                 self._servers = [*old_servers, server]
                 self._on_servers_updated(old_servers, self._servers)
+                await self._after_servers_updated()
         logger.debug(
             f"Added server {server}, {self._server_role.name} current server list: {self._servers}"
         )
@@ -511,6 +521,7 @@ class Router(ABC):
                 old_server for old_server in old_servers if old_server != server
             ]
             self._on_servers_updated(old_servers, self._servers)
+            await self._after_servers_updated()
         self._prepared_ready_servers.discard(server)
         self._server_info.pop(server, None)
         logger.debug(
@@ -615,6 +626,7 @@ class Router(ABC):
                             if server not in old_servers:
                                 await self._prepare_server(server)
                                 logger.info(f"Server {server} is added")
+                        await self._after_servers_updated()
                     else:
                         logger.debug(
                             f"No change in {self._server_role} server list: {len(self._servers)} servers"
@@ -1791,6 +1803,30 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             ``CONVERSATION_CONTENT_STRIDE`` blocks.  ``0`` disables
             following: new conversation_ids go to the least-loaded server
             and request content is never hashed for them.
+        session_ttl_s: If set, a ``conversation_id`` pin expires once the
+            conversation has been idle (no routed request) for this many
+            seconds; its next request goes to the least-loaded server and is
+            re-pinned there. ``None`` (default) keeps pins until LRU
+            eviction.
+        max_inflight_per_server: If set, a ``conversation_id`` pin is only
+            honored while the pinned server has fewer than this many
+            in-flight requests; otherwise the request spills to the
+            least-loaded server and is re-pinned there. ``None`` (default)
+            always honors the pin.
+        late_bind: Requires ``max_inflight_per_server``. When a
+            ``conversation_id`` request finds every server at the in-flight
+            cap, it waits in a FIFO queue instead of being placed on a busy
+            server; each finished request hands its slot to the oldest
+            waiter, which goes to its pinned server if that one has room and
+            otherwise to the least-loaded server below the cap. The wait thus
+            ends on the first server to free up. A waiter that is cancelled
+            (client disconnect) leaves the queue, and a slot already handed to
+            it passes to the next waiter. Not supported with the disaggregated
+            coordinator. ``False`` (default) never waits.
+
+    Setting ``TLLM_ROUTER_SPILL_LOG=1`` logs one INFO line per live pin that
+    is not honored, plus a periodic honored/spilled/waited count every
+    ``TLLM_ROUTER_SPILL_LOG_S`` seconds (default 60).
     """
 
     CHAR_PER_TOKEN = 5  # approximately 4 characters per token + 1 space
@@ -1809,6 +1845,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  enable_tokenization_cache: bool = False,
                  new_conversation_min_match_blocks: int = 32,
                  new_conversation_follow: str = "specific",
+                 session_ttl_s: Optional[float] = None,
+                 max_inflight_per_server: Optional[int] = None,
+                 late_bind: bool = False,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -1823,6 +1862,48 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         if new_conversation_follow not in ("specific", "always"):
             raise ValueError("new_conversation_follow must be 'specific' or "
                              f"'always', got {new_conversation_follow!r}")
+        if session_ttl_s is not None and session_ttl_s <= 0:
+            raise ValueError(f"session_ttl_s must be > 0, got {session_ttl_s}")
+        if max_inflight_per_server is not None and max_inflight_per_server < 1:
+            raise ValueError("max_inflight_per_server must be >= 1, got "
+                             f"{max_inflight_per_server}")
+        if late_bind and max_inflight_per_server is None:
+            raise ValueError("late_bind requires max_inflight_per_server")
+        if (new_conversation_follow == "always"
+                and new_conversation_min_match_blocks > 0
+                and (max_inflight_per_server is not None or late_bind)):
+            # The in-flight cap counts requests in _server_content_load, which
+            # holds uncached tokens under "always".
+            raise ValueError(
+                "max_inflight_per_server and late_bind are not supported with "
+                "new_conversation_follow='always', which counts server load "
+                "in tokens rather than requests")
+        self._session_ttl_s = session_ttl_s
+        self._max_inflight_per_server = max_inflight_per_server
+        self._late_bind = late_bind
+        # FIFO of late-bind waiters:
+        # (future, conv_id, request, weight, exclude, req_id, t0).
+        self._waiters: deque = deque()
+        # conversation_id -> token of the late-bind request that pinned it by
+        # content before waiting for a seat; dropped once any request of the
+        # conversation is seated (see _undo_unseated_placement).
+        self._late_bind_placements: dict[str, object] = {}
+        # Round-robin position among tied free servers in _late_bind_pick;
+        # separate from the mixin's _rr_counter so that interleaved
+        # _select_least_loaded picks cannot alias the late-bind rotation into
+        # a fixed stride.
+        self._late_bind_rr = 0
+        # conversation_id -> monotonic time of its last routed request
+        # (maintained only when session_ttl_s is set).
+        self._session_last_seen: dict[str, float] = {}
+        # Opt-in pin diagnostics (see the class docstring).
+        self._spill_log = os.environ.get("TLLM_ROUTER_SPILL_LOG") == "1"
+        self._spill_log_period_s = float(
+            os.environ.get("TLLM_ROUTER_SPILL_LOG_S", "60"))
+        self._pins_honored = 0
+        self._pins_spilled = 0
+        self._pins_waited = 0
+        self._spill_log_last = time.monotonic()
         self._match_threshold = match_threshold
         self._use_token_ids = use_token_ids
         self._hash_skip_count = hash_skip_count
@@ -1920,10 +2001,231 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         return self._server_content_load.get(server, 0)
 
     def _get_server_load(self, server: str) -> int:
-        """Use content weight so ``_select_least_loaded`` balances by
-        estimated tokens rather than request count.
-        """
+        """Balance ``_select_least_loaded`` by estimated tokens, not request count."""
         return self._get_content_load(server)
+
+    # ── pin policy: session TTL and per-server in-flight cap ──
+
+    def _pin_usable(self, conv_id: str, inflight: int) -> bool:
+        """Whether a ``conversation_id`` pin is honored with *inflight* requests on its server.
+
+        With both ``session_ttl_s`` and ``max_inflight_per_server`` unset
+        (the default) a live pin is always honored.
+        """
+        if self._session_ttl_s is not None:
+            last = self._session_last_seen.get(conv_id)
+            if (last is not None
+                    and time.monotonic() - last > self._session_ttl_s):
+                return False
+        if (self._max_inflight_per_server is not None
+                and inflight >= self._max_inflight_per_server):
+            return False
+        return True
+
+    def _touch_session(self, conv_id: str) -> None:
+        if self._session_ttl_s is not None:
+            self._session_last_seen[conv_id] = time.monotonic()
+
+    def _spill_conversation(self, conv_id: str,
+                            exclude_server: Optional[str]) -> str:
+        """Re-pin *conv_id*, whose live pin is not honored, to the least-loaded server.
+
+        Call with ``self._lock`` held.
+        """
+        server = self._select_least_loaded(exclude_server)
+        if server is None:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
+        self._update_session(conv_id, server, [])
+        return server
+
+    def _log_spill(self,
+                   conv_id: str,
+                   req_id: Optional[int],
+                   pinned: str,
+                   chosen: str,
+                   inflight: int,
+                   wait_ms: Optional[float] = None) -> None:
+        self._pins_spilled += 1
+        waited = "" if wait_ms is None else f" wait_ms={wait_ms:.1f}"
+        logger.info(f"[conv_router] spill conv={conv_id} req={req_id} "
+                    f"pinned={pinned} chosen={chosen} inflight={inflight}"
+                    f"{waited} t={time.time():.3f}")
+        self._maybe_log_pin_counts()
+
+    def _maybe_log_pin_counts(self) -> None:
+        now = time.monotonic()
+        if now - self._spill_log_last >= self._spill_log_period_s:
+            self._spill_log_last = now
+            logger.info(
+                f"[conv_router] pins honored={self._pins_honored} "
+                f"spilled={self._pins_spilled} waited={self._pins_waited}")
+
+    # ── late binding (opt-in): wait for the first server below the cap ──
+
+    def _below_cap(self, server: str) -> bool:
+        return (self._server_state[server]._num_active_requests
+                < self._max_inflight_per_server)
+
+    def _late_bind_placeable(self, exclude_server: Optional[str]) -> bool:
+        """Whether a waiter could ever be placed: a live server other than *exclude_server* exists."""
+        return any(s != exclude_server and s in self._server_state
+                   for s in self._servers)
+
+    def _late_bind_pick(self, conv_id: str,
+                        exclude_server: Optional[str]) -> Optional[str]:
+        """Pick the pinned server if usable and below the cap, else the least-loaded one below it.
+
+        Returns None when every server is at the cap. Caller holds the lock.
+        """
+        entry = self._session_table.get(conv_id)
+        if (entry is not None and entry[0] in self._server_state
+                and entry[0] != exclude_server and self._below_cap(entry[0])
+                and self._pin_usable(conv_id, 0)):
+            return entry[0]
+        free = [
+            s for s in self._servers if s != exclude_server
+            and s in self._server_state and self._below_cap(s)
+        ]
+        if not free:
+            return None
+        # Round-robin among the least-loaded, as in _select_least_loaded: at a
+        # cap of 1 every free server is at load 0, and min() alone would send
+        # every spill to the first one in list order.
+        loads = {s: self._get_server_load(s) for s in free}
+        min_load = min(loads.values())
+        tied = [s for s in free if loads[s] == min_load]
+        server = tied[self._late_bind_rr % len(tied)]
+        self._late_bind_rr += 1
+        return server
+
+    async def _late_bind_place(self, server: str, conv_id: str, request,
+                               weight: int, req_id: Optional[int],
+                               wait_ms: Optional[float]):
+        """Register *request* on *server* and update the pin.
+
+        Caller holds the lock.
+        """
+        entry = self._session_table.get(conv_id)
+        pinned = entry[0] if entry is not None else None
+        self._late_bind_placements.pop(conv_id, None)
+        await self._register_request(server, request)
+        self._add_content_load(server, request, weight)
+        if pinned == server:
+            self._session_table.move_to_end(conv_id)
+        else:
+            self._update_session(conv_id, server, [])
+        self._touch_session(conv_id)
+        if self._spill_log:
+            if wait_ms is not None:
+                self._pins_waited += 1
+                logger.info(
+                    f"[conv_router] latebind conv={conv_id} req={req_id} "
+                    f"pinned={pinned} chosen={server} "
+                    f"wait_ms={wait_ms:.1f} queue={len(self._waiters)} "
+                    f"t={time.time():.3f}")
+            if pinned is not None and pinned != server:
+                self._log_spill(
+                    conv_id, req_id, pinned, server,
+                    self._server_state[pinned]._num_active_requests
+                    if pinned in self._server_state else -1, wait_ms)
+            elif pinned == server:
+                self._pins_honored += 1
+                self._maybe_log_pin_counts()
+
+    async def _late_bind_route(self, conv_id: str, request, weight: int,
+                               exclude_server: Optional[str],
+                               req_id: Optional[int]) -> str:
+        async with self._lock:
+            if not self._late_bind_placeable(exclude_server):
+                # No server can ever take it: waiting would block the queue
+                # behind it.
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
+            if not self._waiters:
+                server = self._late_bind_pick(conv_id, exclude_server)
+                if server is not None:
+                    await self._late_bind_place(server, conv_id, request,
+                                                weight, req_id, None)
+                    return server
+            fut = asyncio.get_running_loop().create_future()
+            self._waiters.append(
+                (fut, conv_id, request, weight, exclude_server, req_id,
+                 time.monotonic()))
+            # The waiters ahead may all be waiting for busy servers this turn
+            # does not need: place it now if it can take one, after them in
+            # FIFO order.
+            await self._late_bind_dispatch()
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            async with self._lock:
+                self._waiters = deque(w for w in self._waiters
+                                      if w[0] is not fut)
+                if fut.done() and not fut.cancelled():
+                    # A slot was already handed to this waiter: release it.
+                    await self._unregister_request(request)
+                    self._remove_content_load(fut.result(), request)
+                # A cancelled head of the queue may have been holding back the
+                # waiters behind it.
+                await self._late_bind_dispatch()
+            raise
+
+    def _undo_unseated_placement(self, conv_id: str, placement: object) -> None:
+        """Drop the pin a cancelled late-bind request made before any request of
+        *conv_id* got a seat, so a conversation that never ran holds no pin or
+        content entry. Kept while another request of it waits. Call with
+        ``self._lock`` held.
+        """
+        if self._late_bind_placements.get(conv_id) is not placement:
+            return
+        if any(w[1] == conv_id for w in self._waiters):
+            return
+        del self._late_bind_placements[conv_id]
+        entry = self._session_table.pop(conv_id, None)
+        self._session_last_seen.pop(conv_id, None)
+        if entry is not None:
+            self._hash_trie.remove(conv_id, entry[1])
+            sessions = self._server_sessions.get(entry[0])
+            if sessions is not None:
+                sessions.discard(conv_id)
+        self._forget_conversation_content(conv_id)
+
+    async def _late_bind_dispatch(self) -> None:
+        """Hand free slots to waiters in FIFO order. Caller holds the lock.
+
+        A waiter with no free candidate stays queued without holding back the
+        waiters behind it: all of its candidates are at the cap, so a later
+        waiter can only take a server the earlier one excluded, and FIFO
+        order holds among waiters that compete for the same servers.
+        """
+        kept: deque = deque()
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            fut, conv_id, request, weight, exclude, req_id, t0 = waiter
+            if fut.done():  # cancelled while queued
+                continue
+            if not self._late_bind_placeable(exclude):
+                # A server removal left it no candidate: fail it instead of
+                # keeping it queued forever.
+                fut.set_exception(
+                    ValueError(
+                        f"No available servers after excluding {exclude}"))
+                continue
+            server = self._late_bind_pick(conv_id, exclude)
+            if server is None:
+                kept.append(waiter)
+                continue
+            await self._late_bind_place(server, conv_id, request, weight,
+                                        req_id, (time.monotonic() - t0) * 1e3)
+            fut.set_result(server)
+        self._waiters = kept
+
+    async def _after_servers_updated(self) -> None:
+        if self._late_bind:
+            # A new server can take waiters now; waiters left without a
+            # candidate fail now rather than at the next completion.
+            await self._late_bind_dispatch()
 
     def _on_servers_updated(self, old_servers, new_servers):
         """Rebuild reverse index and evict stale sessions.
@@ -1950,6 +2252,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         for removed in removed_servers:
             for conv_id in list(self._server_sessions.get(removed, ())):
                 entry = self._session_table.pop(conv_id, None)
+                self._session_last_seen.pop(conv_id, None)
                 if entry is not None:
                     self._hash_trie.remove(conv_id, entry[1])
                 self._forget_conversation_content(conv_id)
@@ -2096,6 +2399,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     def _evict_oldest_session(self):
         """Remove the least-recently-used session from all indices."""
         conv_id, (server, hashes) = self._session_table.popitem(last=False)
+        self._session_last_seen.pop(conv_id, None)
         self._hash_trie.remove(conv_id, hashes)
         if server in self._server_sessions:
             self._server_sessions[server].discard(conv_id)
@@ -2242,6 +2546,20 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             return num_tokens
         return max(num_tokens - previous, self._tokens_per_block)
 
+    def _repin_conversation_tokens(self, conv_id: str,
+                                   num_tokens: Optional[int]) -> Optional[int]:
+        """Backlog of a request whose conversation is re-pinned by a spill.
+
+        The new server holds none of the conversation, so, as when placing
+        it, the request counts its whole prompt and its entry is restarted.
+        None without *num_tokens*. Call with ``self._lock`` held.
+        """
+        if num_tokens is None:
+            return None
+        self._conv_tokens_setter.pop(conv_id, None)
+        self._conv_num_tokens[conv_id] = num_tokens
+        return num_tokens
+
     def _place_conversation(
             self,
             conv_id: str,
@@ -2314,7 +2632,6 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                               request: OpenAIRequest,
                               exclude_server: Optional[str] = None,
                               req_id: Optional[int] = None) -> tuple[str, dict]:
-        del req_id
         self._validate_servers_available()
 
         conv_id = self._get_conversation_id(request)
@@ -2335,13 +2652,57 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if self._needs_content(conv_id, exclude_server):
                 content_hashes = await asyncio.to_thread(
                     self._conversation_content_hashes, request)
+            if self._late_bind:
+                placement = None
+                if content_hashes is not None:
+                    async with self._lock:
+                        if not self._is_routable_session(
+                                conv_id, exclude_server):
+                            # Pin it by content first; the late-bind pick
+                            # takes the pin when that server is below the cap.
+                            self._place_conversation(conv_id, content_hashes,
+                                                     exclude_server)
+                            placement = object()
+                            self._late_bind_placements[conv_id] = placement
+                try:
+                    server = await self._late_bind_route(
+                        conv_id, request, weight, exclude_server, req_id)
+                except (asyncio.CancelledError, ValueError):
+                    async with self._lock:
+                        # Another request of the conversation may have made
+                        # the placement; the last of them to leave unseated
+                        # drops it.
+                        token = (placement if placement is not None else
+                                 self._late_bind_placements.get(conv_id))
+                        if token is not None:
+                            self._undo_unseated_placement(conv_id, token)
+                    raise
+                return server, {
+                    "server_info": self._server_info.get(server, {})
+                }
             async with self._lock:
-                if self._is_routable_session(conv_id, exclude_server):
+                live_pin = self._is_routable_session(conv_id, exclude_server)
+                pinned = self._session_table[conv_id][0] if live_pin else None
+                pinned_inflight = (
+                    self._server_state[pinned]._num_active_requests
+                    if live_pin else 0)
+                if live_pin and self._pin_usable(conv_id, pinned_inflight):
                     # Sticky hit: keep the pinned server, refresh LRU only.
-                    server = self._session_table[conv_id][0]
+                    server = pinned
                     self._session_table.move_to_end(conv_id)
                     previous = self._conv_num_tokens.get(conv_id)
                     load = self._known_conversation_load(conv_id, num_tokens)
+                    if self._spill_log:
+                        self._pins_honored += 1
+                        self._maybe_log_pin_counts()
+                elif live_pin:
+                    # Pin expired or its server is at the in-flight cap.
+                    server = self._spill_conversation(conv_id, exclude_server)
+                    previous = None
+                    load = self._repin_conversation_tokens(conv_id, num_tokens)
+                    if self._spill_log:
+                        self._log_spill(conv_id, req_id, pinned, server,
+                                        pinned_inflight)
                 else:
                     # New conversation_id (or its server is gone/excluded).
                     # Placing it drops its entry: the server holds none of it.
@@ -2355,6 +2716,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 await self._register_request(server, request)
                 self._add_content_load(server, request,
                                        weight if load is None else load)
+                self._touch_session(conv_id)
                 return server, {
                     "server_info": self._server_info.get(server, {})
                 }
@@ -2401,6 +2763,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = await self._unregister_request(request)
             self._remove_content_load(server, request)
             self._finish_conversation_tokens(id(request), success)
+            if self._late_bind:
+                await self._late_bind_dispatch()
             loads = {s: self._get_content_load(s) for s in self._servers}
             logger.debug(f"ConversationRouter: FINISH server={server}, "
                          f"content_loads={loads}")
@@ -2448,6 +2812,13 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         nothing, when a ``routing_key()`` names a conversation_id whose
         placement needs the request content.
         """
+        if self._late_bind:
+            # The coordinator places by key without the request, so a turn
+            # cannot wait for a free server here.
+            raise ValueError(
+                "ConversationRouter late_bind is not supported with the "
+                "disaggregated coordinator; unset late_bind or route through "
+                "the orchestrator")
         conv_id = routing_key
         content_hashes = num_tokens = block_tokens = None
         if isinstance(routing_key, dict):
@@ -2458,11 +2829,28 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._validate_servers_available()
         async with self._lock:
             load = previous = None
-            if conv_id and self._is_routable_session(conv_id, exclude_server):
-                server = self._session_table[conv_id][0]
+            live_pin = bool(conv_id) and self._is_routable_session(
+                conv_id, exclude_server)
+            pinned = self._session_table[conv_id][0] if live_pin else None
+            # Request-count load: the coordinator has no request object. (The
+            # in-flight cap is rejected with new_conversation_follow="always",
+            # under which this load is in tokens.)
+            pinned_inflight = (self._server_content_load.get(pinned, 0)
+                               if live_pin else 0)
+            if live_pin and self._pin_usable(conv_id, pinned_inflight):
+                server = pinned
                 self._session_table.move_to_end(conv_id)
                 previous = self._conv_num_tokens.get(conv_id)
                 load = self._known_conversation_load(conv_id, num_tokens)
+                if self._spill_log:
+                    self._pins_honored += 1
+                    self._maybe_log_pin_counts()
+            elif live_pin:
+                server = self._spill_conversation(conv_id, exclude_server)
+                load = self._repin_conversation_tokens(conv_id, num_tokens)
+                if self._spill_log:
+                    self._log_spill(conv_id, req_id, pinned, server,
+                                    pinned_inflight)
             elif conv_id:
                 if (content_hashes is None
                         and self._needs_content(conv_id, exclude_server)):
@@ -2478,6 +2866,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                         f"No available servers after excluding {exclude_server}"
                     )
                 load = num_tokens
+            if conv_id:
+                self._touch_session(conv_id)
             # The backlog when the key carries a token count, else 1
             # (request-count load: there is no request object at the
             # coordinator). Keyed by the disagg req_id -- the sole id crossing

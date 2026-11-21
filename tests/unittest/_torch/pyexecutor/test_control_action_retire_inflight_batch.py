@@ -69,6 +69,10 @@ class _Rank:
         self.iter_counter = 7
         self.calls = []
         self.gathers = 0  # attention-DP collectives this rank takes part in
+        self.unprocessed_reports = []
+
+    def _report_unprocessed_context(self, batch):
+        self.unprocessed_reports.append(batch)
 
     def _update_requests(self, sample_state):
         self.calls.append("update_requests")
@@ -90,7 +94,10 @@ class _Rank:
     def _wait_for_model_engine_input_copy(self):
         self.calls.append("wait_input_copy")
 
-    def _process_previous_batch(self):
+    def _response_gpu_times_cache(self):
+        return None
+
+    def _process_previous_batch(self, gpu_times_cache=None):
         self.calls.append("process_previous_batch")
         self.gathers += 1  # _handle_responses -> one _enqueue_responses gather
 
@@ -115,7 +122,11 @@ class TestRetireInflightBatch:
             "process_previous_batch",
         ]
         assert rank.previous_batch is None
-        rank.perf_manager.compute_batch_gpu_times.assert_called_once_with(["r1", "r2"])
+        # The retired batch no longer holds context requests back from preemption.
+        assert rank.unprocessed_reports == [None]
+        rank.perf_manager.compute_batch_gpu_times.assert_called_once_with(
+            ["r1", "r2"], gpu_times_cache=None
+        )
         assert rank.has_previous_draft_tokens is False
 
 

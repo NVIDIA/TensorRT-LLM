@@ -182,6 +182,7 @@ add_th_common_family(
   dynamicTreeOp.cpp
   loraOp.cpp
   inplaceSliceCopyOp.cpp
+  globaltimerStampOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
 

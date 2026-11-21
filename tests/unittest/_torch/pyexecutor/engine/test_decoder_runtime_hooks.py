@@ -123,3 +123,79 @@ def test_an_msa_policy_reaches_the_metadata_and_the_cache():
     assert metadata.attn_metadata.msa_policy is policy
     assert manager.skip_unchanged_block_offsets is True
     assert manager.reuse_pool_views is False
+
+
+# -- MsaRuntimePolicy.kv_update_tail ----------------------------------------------------------
+
+
+def _tail_metadata(tail_update, *, num_tokens=3, tail_start=3, buffer_rows=8):
+    """Only what MiniMaxM3MsaSparseAttentionMetadata._kv_update_with_tail reads."""
+    import torch
+
+    return SimpleNamespace(
+        msa_policy=MsaRuntimePolicy(kv_update_tail=tail_update),
+        _msa_fields_ready=True,
+        _msa_kv_lens_dynamic=True,
+        num_tokens=num_tokens,
+        num_seqs=1,
+        _msa_tail_start=tail_start,
+        msa_out_cache_loc=torch.zeros(buffer_rows, dtype=torch.int64),
+    )
+
+
+def _tail_op(*args):
+    return True
+
+
+def test_the_tail_update_is_taken_only_with_a_tail_to_fill():
+    take = MiniMaxM3MsaSparseAttentionMetadata._kv_update_with_tail
+
+    assert take(_tail_metadata(_tail_op)) is _tail_op
+    assert take(_tail_metadata(None)) is None
+    # No tail past the live rows, or a tail start inside them.
+    assert take(_tail_metadata(_tail_op, tail_start=8)) is None
+    assert take(_tail_metadata(_tail_op, num_tokens=4, tail_start=3)) is None
+    assert take(_tail_metadata(_tail_op, tail_start=None)) is None
+    static = _tail_metadata(_tail_op)
+    static._msa_kv_lens_dynamic = False
+    assert take(static) is None
+
+
+# -- RuntimeHooks.spec_slot_ids_changed_only ---------------------------------------------------
+
+
+@pytest.mark.parametrize("changed_only", [False, True])
+def test_slot_ids_are_uploaded_again_only_when_they_change(monkeypatch, changed_only):
+    import torch
+
+    from tensorrt_llm._torch.speculative import interface
+
+    copies = []
+    meta = SimpleNamespace(slot_ids_changed_only=changed_only, _batch_slot_ids_last=[None, None])
+    buffer = torch.zeros(4, dtype=torch.long)
+
+    class _Buffer:
+        """batch_slot_ids, recording every copy into it."""
+
+        def __getitem__(self, index):
+            view = buffer[index]
+            original = view.copy_
+
+            def copy_(src, non_blocking=False):
+                copies.append(src.tolist())
+                return original(src)
+
+            view.copy_ = copy_
+            return view
+
+    meta.batch_slot_ids = _Buffer()
+    monkeypatch.setattr(interface, "prefer_pinned", lambda: False)
+    upload = interface.SpecMetadata._upload_batch_slot_ids
+
+    upload(meta, [2, 0])
+    upload(meta, [2, 0])
+    upload(meta, [1, 3])
+
+    expected = [[2, 0], [1, 3]] if changed_only else [[2, 0], [2, 0], [1, 3]]
+    assert copies == expected
+    assert buffer[:2].tolist() == [1, 3]

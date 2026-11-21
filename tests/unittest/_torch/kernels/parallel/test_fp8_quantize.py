@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -301,6 +304,87 @@ def test_mxfp8_quantize_tiny_block_is_finite(dtype, is_sf_swizzled_layout):
         # 2x the threshold is representable in bfloat16 (it flushes to zero in half).
         assert block_heads[
             4] != 0, "a block just above the threshold lost its value"
+
+
+# Runs mxfp8_quantize with TRTLLM_DISABLE_MXFP8_QUANT_TILE128X4=1 and
+# TRTLLM_DISABLE_MXFP8_QUANT_16ELT=1 (the 8-element path) on the saved inputs.
+# The switches are read once per process, so the reference needs its own
+# process.
+_MXFP8_8ELT_CHILD = """
+import sys
+import torch
+import tensorrt_llm  # noqa: F401
+cases = torch.load(sys.argv[1])
+out = {}
+for name, (x, swizzled, alignment) in cases.items():
+    q, sf = torch.ops.trtllm.mxfp8_quantize(x.cuda(), swizzled, alignment)
+    out[name] = (q.view(torch.uint8).cpu(), sf.view(torch.uint8).cpu())
+torch.save(out, sys.argv[2])
+"""
+
+
+def _mxfp8_edge_inputs():
+    """Normal, all-zero-block, E8M0-underflow (tiny) and +-inf inputs.
+
+    Includes padded rows and scale columns. On SM107 the 128x4 tile path runs
+    for 1024 x 8192 and 2049 x 4096 (swizzled); the 16-element path runs from
+    4096 rows on the shapes the SM107 row path does not take; the smaller
+    shapes check the rows left on the 8-element path.
+    """
+    gen = torch.Generator().manual_seed(0)
+    cases = {}
+    for m, k in [(1, 6144), (127, 8192), (1024, 8192), (2049, 4096),
+                 (4096, 2080), (4127, 1568)]:
+        base = torch.randn((m, k), generator=gen) * 16
+        for dtype, tiny_scale, huge_scale in [(torch.bfloat16, 2.0**-130,
+                                               2.0**120),
+                                              (torch.float16, 2.0**-20, 1e3)]:
+            zeros = base.clone()
+            zeros[::7] = 0
+            zeros[:, 64:96] = 0
+            huge = (base * huge_scale).to(dtype)
+            huge.view(-1)[::4099] = float("inf")
+            huge.view(-1)[7::8191] = float("-inf")
+            inputs = {
+                "normal": base.to(dtype),
+                "zeros": zeros.to(dtype),
+                "tiny": (base * tiny_scale).to(dtype),
+                "huge": huge,
+            }
+            for kind, x in inputs.items():
+                for swizzled in (True, False):
+                    for alignment in (32, 64):
+                        name = f"{dtype}_{m}x{k}_{kind}_{swizzled}_{alignment}"
+                        cases[name] = (x, swizzled, alignment)
+    return cases
+
+
+@skip_pre_blackwell_unittest
+@pytest.mark.skipif(os.environ.get("TRTLLM_DISABLE_MXFP8_QUANT_16ELT") == "1",
+                    reason="the 16-element path is disabled in this process")
+def test_mxfp8_quantize_16elt_matches_8elt(tmp_path):
+    """The tile and 16-element MXFP8 paths write the 8-element path's bytes."""
+    cases = _mxfp8_edge_inputs()
+    torch.save(cases, tmp_path / "in.pt")
+    subprocess.run(
+        [
+            sys.executable, "-c", _MXFP8_8ELT_CHILD,
+            str(tmp_path / "in.pt"),
+            str(tmp_path / "ref.pt")
+        ],
+        env={
+            **os.environ, "TRTLLM_DISABLE_MXFP8_QUANT_TILE128X4": "1",
+            "TRTLLM_DISABLE_MXFP8_QUANT_16ELT": "1"
+        },
+        check=True,
+        timeout=900,
+    )
+    ref = torch.load(tmp_path / "ref.pt")
+    for name, (x, swizzled, alignment) in cases.items():
+        q, sf = torch.ops.trtllm.mxfp8_quantize(x.cuda(), swizzled, alignment)
+        ref_q, ref_sf = ref[name]
+        assert torch.equal(q.view(torch.uint8).cpu(), ref_q), name
+        assert torch.equal(sf.view(torch.uint8).cpu(), ref_sf), name
 
 
 def _run_megamoe_prepare(hidden_states, token_selected_experts,

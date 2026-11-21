@@ -23,18 +23,19 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 from tensorrt_llm._torch.modules import logits_processor as _logits_processor
 from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as _sampler_flashinfer
 from tensorrt_llm._torch.speculative import dspark as _spec_dspark
 from tensorrt_llm._torch.speculative import interface as _spec_interface
+from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.logger import logger
 
-from .. import runtime_hooks_compat
+from .. import m31_pins
 from ..msa import engine as _msa_engine
 from ..ops import add_rmsnorm as _native_norm
 from ..ops import native_swiglu as _swiglu
 from ..ops import step_hooks as _step_hooks
 from ..ops.moe.megamoe_local import local_impl as _megamoe_local
-from ..runtime_hooks_compat import MsaRuntimePolicy, RuntimeHooks
 from . import corun_band as _cb
 from . import drafter_mxfp8 as _mxd
 from . import gumbel_draft as _gumbel
@@ -84,17 +85,19 @@ _KERNEL = (
 def dep_runtime_hooks() -> Optional[RuntimeHooks]:
     """The target's step-loop hooks: the sm_107 TP targets' hooks wherever this target's path takes them, each under
     the TP targets' kill switch, in four groups, plus the late-compile detector (it only logs), the cross-rank
-    tactic merge, the tactic persistence, the int32 prompt tokens and the disaggregated draft window. They are built
-    for this engine (``runtime_hooks_compat``): a requested hook the engine does not have is dropped and logged.
+    tactic merge, the tactic bundle and the disaggregated draft window.
 
     * Tactic merge (``TRTLLM_M31_DISABLE_DEP_TACTIC_PIN=1`` keeps the per-rank choice): every attention-DP rank tunes
       its GEMMs on its own, and rank-local profiling noise otherwise leaves the ranks serving different tactics for
       one shape (CUTLASS on some ranks, FlashInfer on others); the slowest rank then sets every MoE collective. The
       merge keeps the fastest tuned tactic per shape on every rank. The sm_107 MXFP8 GEMM backends write the same
       bits, so the merge changes timing only.
-    * Tactic persistence (``TRTLLM_M31_DISABLE_DEP_TACTIC_BUNDLE=1`` keeps it off): a tuning run
-      (``TLLM_AUTOTUNER_CACHE_PATH`` set) also saves the FlashInfer MXFP8 tactics of the warmup and decode-graph passes
-      into that cache, so a restart reuses them for every pass.
+    * Tactic bundle (``TRTLLM_M31_DISABLE_DEP_TACTIC_BUNDLE=1`` tunes every shape): before the warmup tuning pass,
+      each rank loads its bundled pins of topology ``dep<N>``, N being the generation worker's world size
+      (``m31_pins``: ``m31_tuning/sm107/dep<N>/rank_<n>.json``, or ``TRTLLM_M31_PIN_DIR``), so the shapes the bundle
+      covers are served its tactics instead of being tuned again. Without a bundle file nothing is loaded. A tuning
+      run (``TLLM_AUTOTUNER_CACHE_PATH`` set, which loads no bundle) also saves the FlashInfer MXFP8 tactics of the
+      warmup and decode-graph passes into that cache, so a bundle converted from it covers every pass.
     * Step loop (``DEP_STEP_HOOKS``), in two halves:
 
       - Ordering and timing: the overlap loop runs on the execution stream, the sampler copies its store to the host
@@ -105,16 +108,14 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
       - Input path (``DEP_STEP_INPUTS``): a decode step's small input copies go out as one pack, scattered in parallel
         by the decode graph's prologue from a window uploaded on a side stream; uploads whose values the device already
         holds are skipped and a changed packed table stages only its changed span; the MSA KV lengths are derived once
-        per speculative step; the spec sampler's Philox seeds / offsets and slot ids ride the pack, and the
-        accepted-draft counts are not uploaded (nothing on this target's path reads
-        ``spec_metadata.num_accepted_draft_tokens``); the drafter's batch map and block table are copied only on change
-        (a few changed page indices patched from the host). The same values are meant to reach the device, but these
-        items change which copies carry them.
+        per speculative step; the spec sampler's Philox seeds / offsets and slot ids ride the pack; the drafter's block
+        table is copied only on change (a few changed page indices patched from the host). The same values are meant
+        to reach the device, but these items change which copies carry them.
 
-      Item switches as on the TP targets: HOSTTAIL (its six items), SKIP_ACCEPTED_UPLOAD, BATCH_CHANGED_ONLY,
-      HOST_D2H_SIDE, SMALL_H2D, PHILOX_PACK, KV_LENS_ONCE, PACK_PSCATTER, PACK_IN_GRAPH, PACK_EARLY_COPY,
-      H2D_CHANGED_SPAN, BLOCKOFF_GUARD, BLOCKOFF_PATCH. SLOT_IDS_CHANGED (the spec sampler's slot ids re-uploaded only
-      on change) stays opt-in (``TRTLLM_M31_ENABLE_SLOT_IDS_CHANGED=1``, with the input path), as on the TP8 target.
+      Item switches as on the TP targets: HOSTTAIL (its four items), HOST_D2H_SIDE, SMALL_H2D, PHILOX_PACK,
+      KV_LENS_ONCE, PACK_PSCATTER, PACK_IN_GRAPH, PACK_EARLY_COPY, H2D_CHANGED_SPAN, BLOCKOFF_GUARD, BLOCKOFF_PATCH.
+      SLOT_IDS_CHANGED (the spec sampler's slot ids re-uploaded only on change) stays opt-in
+      (``TRTLLM_M31_ENABLE_SLOT_IDS_CHANGED=1``, with the input path), as on the TP8 target.
     * Native step launches (``DEP_STEP_NATIVE``, inside the step loop; ``TRTLLM_M31_DISABLE_DEP_STEP_NATIVE=1`` restores
       the engine's own lines, as the group switch does): the sm_107 TP targets' four step-glue launches, from the
       family module ``ops.step_hooks`` (CUDA C++ ops, no Triton), each writing what the line it replaces writes:
@@ -125,16 +126,11 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
       (``pack_cpp_scatter``, no switch): without the one-launch prologue the pack is issued before the replay by the
       native serial scatter.
     * MSA metadata (``DEP_MSA_POLICY``, inside the step loop's input path): block-table copies with unchanged inputs
-      skipped, pool views built once, block-id tables copied from the page-index views, and the sub-page expansion
-      done inside the forward. The tables a forward reads are the same.
+      skipped and pool views built once. The tables a forward reads are the same.
     * Kernels (``DEP_KERNEL_HOOKS``): FlashInfer's CuTe DSL MXFP8 GEMM above 32 rows at its pinned tactics (bitwise
       the default tactic's output) and the sampler tail without its no-op bookkeeping launches (TAIL_BOOKKEEP, bitwise).
-    * Fixes (``DEP_FIX_HOOKS``): the MSA cache's E4M3 writes saturate as the CUDA FP8 writers do (bitwise for every
-      finite in-range value), the MSA KV pools are zeroed at allocation and priced at their real footprint, and the
-      standalone drafter's pool takes its sizing / resize fixes and its per-step reserve with a guard page.
-    * Prompt tokens: every request's prompt reaches
-      LlmRequest as the executor request's int32 array instead of a list. The shared context-only scope is extended to
-      every request type, since this generation worker's requests are generation-only. The tokens are the same.
+    * Fixes (``DEP_FIX_HOOKS``): the standalone drafter's pool takes its sizing / resize fixes and its per-step
+      reserve with a guard page.
     * Draft window (``DEP_DISAGG_DRAFT_KV``): the drafter's prompt window travels with the target's KV, so this
       worker's drafter starts from the prompt instead of an empty window. That changes the drafts and so the
       acceptance length, not the target's distribution. A request whose context worker ships no window starts from an
@@ -167,8 +163,8 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
     )
     kernels = not m31_disabled("DEP_KERNEL_HOOKS")
     fixes = not m31_disabled("DEP_FIX_HOOKS")
-    persist_tactics = not m31_disabled("DEP_TACTIC_BUNDLE")
-    hooks = dict(
+    bundle = not m31_disabled("DEP_TACTIC_BUNDLE")
+    return RuntimeHooks(
         sparse_attention=_msa_engine.sparse_attention_classes(),
         late_compile_detect=True,
         merge_tuned_tactics_across_ranks=not m31_disabled("DEP_TACTIC_PIN"),
@@ -187,8 +183,6 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
         loop_on_execution_stream=step,
         pack_spec_rng_uploads=spec_inputs and not m31_disabled("PHILOX_PACK"),
         spec_small_h2d=spec_inputs and not m31_disabled("SMALL_H2D"),
-        skip_accepted_draft_upload=spec_inputs and not m31_disabled("SKIP_ACCEPTED_UPLOAD"),
-        spec_batch_map_changed_only=spec_inputs and not m31_disabled("BATCH_CHANGED_ONLY"),
         spec_slot_ids_changed_only=inputs and m31_enabled("SLOT_IDS_CHANGED"),
         sampler_d2h_side_stream=host_tail and not m31_disabled("HOST_D2H_SIDE"),
         skip_unchanged_draft_block_offsets=draft_offsets,
@@ -196,26 +190,34 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
         iteration_timing_one_event=step,
         mxfp8_pinned_tactics=kernels,
         spec_tail_bookkeep=kernels and not m31_disabled("TAIL_BOOKKEEP"),
-        fp8_saturating_casts=fixes,
-        msa_kv_cache_fixes=fixes,
         draft_pool_fixes=fixes,
         draft_kv_reserve_guard=fixes,
+        context_onehot_index_fill=True,
+        dflash_host_ctx_alloc=True,
+        kv_fabric_write=True,
+        bounce_scatter_on_order_stream=True,
+        # Generation worker: each admitted request's decode headroom reserved (no tier below GPU), and the
+        # executor thread on two dedicated cores.
+        disagg_gen_completion_reservation=True,
+        executor_thread_pin_cores=2,
         disagg_draft_kv=not m31_disabled("DEP_DISAGG_DRAFT_KV"),
         defer_gen_reuse_commit=step and not m31_disabled("DEP_DEFER_REUSE_COMMIT"),
-        context_token_array=True,
-        token_array_all_requests=True,
         ctx_batch_wait_skip=True,
+        postlaunch_admission=True,
         gpu_timestamps=True,
-        persist_flashinfer_mxfp8_tactics=persist_tactics,
+        install_tactic_pins=_install_tactic_bundle if bundle else None,
+        persist_flashinfer_mxfp8_tactics=bundle,
+        msa=MsaRuntimePolicy(
+            skip_unchanged_block_offsets=msa,
+            reuse_pool_views=msa,
+            kv_update=_step_hooks.msa_kv_update if kv_update else None,
+        ),
     )
-    msa_policy = dict(
-        skip_unchanged_block_offsets=msa,
-        reuse_pool_views=msa,
-        block_ids_from_views=msa,
-        forward_staging=msa,
-        kv_update=_step_hooks.msa_kv_update if kv_update else None,
-    )
-    return runtime_hooks_compat.build(hooks, msa=msa_policy, target=__name__)
+
+
+def _install_tactic_bundle(rank: int) -> Optional[m31_pins.PinReporter]:
+    """Load ``rank``'s bundled tactic pins of topology ``dep<N>``, N the generation worker's world size."""
+    return m31_pins.install(f"dep{mpi_world_size()}", rank)
 
 
 def armed_hooks(hooks: Optional[RuntimeHooks]) -> List[str]:
@@ -275,6 +277,10 @@ def _install_sampler_overrides() -> None:
         setters["TOPP_DET"][0](_topp.top_p_renorm_det)
     if setters["DEP_PAD_FILL"] and _pad_fill.DEP_PAD_FILL:
         setters["DEP_PAD_FILL"][0](_pad_fill.pad_rows_fill)
+    # Padding rows of the decode graphs get a one-hot logits row and uniform probs, so the sampler's
+    # filters converge on them at once; their outputs are discarded.
+    if not m31_disabled("DEP_CHEAP_PAD_ROWS"):
+        _spec_interface.set_cheap_padding_rows(True)
     if (
         setters["DEP_REJ_MC_FI"]
         and _rej.DEP_REJ_MC_FI

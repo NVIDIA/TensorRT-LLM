@@ -53,6 +53,7 @@ from tensorrt_llm._utils import (
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import EmbeddingBias
 
+from ..host_stall import sampler_event
 from ..llm_request import LlmRequest
 from .sampler_common import DEFAULT_BEAM_IDX
 
@@ -810,7 +811,7 @@ class AsyncWorkerMixin:
         side_stream_event, if given, is forwarded so SamplerEvent.synchronize
         also awaits the side-stream copies host-side.
         """
-        cuda_event = torch.cuda.Event()
+        cuda_event = sampler_event()
         cuda_event.record()
 
         # Transfer ownership to worker_futures and re-initialize

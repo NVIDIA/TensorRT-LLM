@@ -2403,6 +2403,29 @@ if IS_MEGAMOE_OP_AVAILABLE:
         global _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE
         _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE = cache
 
+    # The runner class the op builds on this thread, set by a backend around its op
+    # calls and workspace probes; unset (None) selects ``Sm100MegaMoENvfp4Runner``.
+    def _new_thread_local():
+        # Imported here so the host definitions of this module run without its module-level imports.
+        import threading
+
+        return threading.local()
+
+    _ACTIVE_MEGAMOE_RUNNER = _new_thread_local()
+
+    def _active_megamoe_runner_class() -> Optional[type]:
+        return getattr(_ACTIVE_MEGAMOE_RUNNER, "runner_class", None)
+
+    def set_active_megamoe_runner_class(runner_class: Optional[type]) -> Optional[type]:
+        """Set (``None`` clears) this thread's ``Sm100MegaMoENvfp4Runner`` subclass for the op and
+        ``query_megamoe_kernel_properties``, e.g. one overriding ``_default_tactic``.
+
+        Returns the previous value, which the caller restores when its scope ends.
+        """
+        previous = _active_megamoe_runner_class()
+        _ACTIVE_MEGAMOE_RUNNER.runner_class = runner_class
+        return previous
+
     def set_active_megamoe_profiling_scratch(regions) -> None:
         """Set (``None`` clears) the :class:`MegaMoeSymmRegions` used for
         AutoTuner profiling on the current call (set by the backend around
@@ -2491,10 +2514,32 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 combine_format=combine_format,
             )
-            tactic = _default_megamoe_tactic_for_key(
-                problem_key,
-                num_tokens=max_tokens_per_rank,
-            )
+            runner_class = _active_megamoe_runner_class()
+            if runner_class is None:
+                tactic = _default_megamoe_tactic_for_key(
+                    problem_key,
+                    num_tokens=max_tokens_per_rank,
+                )
+            else:
+                tactic = runner_class(
+                    world_size=world_size,
+                    local_rank=0,
+                    num_topk=num_topk,
+                    num_experts_per_rank=num_experts_per_rank,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=intermediate_size_per_partition,
+                    expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
+                    max_tokens_per_rank=max_tokens_per_rank,
+                    output_dtype=torch.bfloat16,
+                    apply_topk_in_fc1=apply_topk_in_fc1,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                    gate_up_clamp=gate_up_clamp,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                    combine_format=combine_format,
+                )._default_tactic(max_tokens_per_rank)
 
         def build(candidate: Tuple):
             validate_megamoe_tactic(candidate, sm_version=sm_version)
@@ -3111,6 +3156,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 self.weight_evict_first,
             )
 
+        def _default_tactic(self, num_tokens: int) -> Tuple:
+            """Default tactic of this runner; a subclass with its own kernels overrides it."""
+            return _default_megamoe_tactic_for_key(self._tactic_lookup_key(), num_tokens=num_tokens)
+
         def _resolve_kernel_descriptor(
             self, tactic: Tuple, *, allow_fallback: bool
         ) -> Tuple[Any, Tuple]:
@@ -3140,11 +3189,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             del kwargs
             use_default_tactic = tactic == -1 or tactic is None
             if use_default_tactic:
-                num_tokens = int(inputs[0].shape[0])
-                tactic_t = _default_megamoe_tactic_for_key(
-                    self._tactic_lookup_key(),
-                    num_tokens=num_tokens,
-                )
+                tactic_t = self._default_tactic(int(inputs[0].shape[0]))
             elif isinstance(tactic, list):
                 tactic_t = tuple(tactic)
             else:
@@ -3448,8 +3493,31 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 and getattr(kernel, "use_pdl", False)
             ):
                 compiled = self._eager_compiled(cache_key, kernel, runtime_kwargs)
-            compiled(**runtime_kwargs)
+            self._launch_compiled(
+                compiled,
+                runtime_kwargs,
+                kernel=kernel,
+                local_workspace=local_workspace,
+                fence_key=_fkey,
+            )
             return combine_output
+
+        def _launch_compiled(
+            self,
+            compiled: Any,
+            runtime_kwargs: dict,
+            *,
+            kernel: Any,
+            local_workspace: torch.Tensor,
+            fence_key: Tuple,
+        ) -> None:
+            """Launch ``compiled`` with ``runtime_kwargs``; a subclass may also record the launch.
+
+            ``kernel`` is the resolved kernel, ``local_workspace`` its local workspace and
+            ``fence_key`` the barrier-fenced (local, shared) workspace pairing of the launch.
+            """
+            del kernel, local_workspace, fence_key
+            compiled(**runtime_kwargs)
 
         def _eager_compiled(self, cache_key: Tuple, kernel: Any, runtime_kwargs: dict) -> Any:
             """The kernel compiled without PDL, for launches outside graph capture."""
@@ -3485,12 +3553,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count,
         shared_intermediate_size=None,
         shared_gate_up_clamp=None,
+        runner_class=None,
     ):
         """Reuse a runner by its complete constructor key.
 
+        ``runner_class`` (None: ``Sm100MegaMoENvfp4Runner``) is the class to build; it is part of the key.
         Reset profiling scratch on reuse; each op call supplies fresh READY inputs.
         """
+        runner_class = runner_class or Sm100MegaMoENvfp4Runner
         args = (
+            runner_class,
             world_size,
             local_rank,
             num_topk,
@@ -3515,7 +3587,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         )
 
         def _make():
-            return Sm100MegaMoENvfp4Runner(
+            return runner_class(
                 world_size=world_size,
                 local_rank=local_rank,
                 num_topk=num_topk,
@@ -3673,6 +3745,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             helper_expert_count,
             shared_intermediate_size=shared_intermediate_size,
             shared_gate_up_clamp=shared_gate_up_clamp,
+            runner_class=_active_megamoe_runner_class(),
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.

@@ -4,9 +4,9 @@
 
 The family's backend (:class:`~.msa_backend.MiniMaxM31MsaSparseAttention`), its step metadata and its KV cache
 manager (:class:`~.cache_manager.MiniMaxM31KVCacheManagerV2`) derive from main's MiniMax-M3 MSA classes. A target
-builds its attention layers from the family backend only when the engine can be told to build the matching step
-metadata and KV cache manager (``RuntimeHooks.sparse_attention``); on an engine without that hook the targets keep
-main's classes, which run the same tokens without the family's MSA paths.
+builds its attention layers from the family backend and tells the engine to build the matching step metadata and KV
+cache manager (``RuntimeHooks.sparse_attention``); with TRTLLM_M31_DISABLE_FAMILY_MSA=1 the targets keep main's
+classes, which run the same tokens without the family's MSA paths.
 
 Either way the targets run the packaged fmha_sm100 (the msa dependency, patched for both MiniMax-M3 and
 MiniMax-M3.1): main's classes and the family's import the same module.
@@ -21,8 +21,6 @@ from typing import Any, Optional
 import torch
 
 from tensorrt_llm.logger import logger
-
-from .. import runtime_hooks_compat
 
 __all__ = [
     "arm_target_paths",
@@ -44,20 +42,15 @@ def _switch_off() -> bool:
 
 
 def family_msa_enabled() -> bool:
-    """Whether the targets build the family's MSA classes: the engine takes them and the switch is not set."""
-    if _switch_off():
-        return False
-    return runtime_hooks_compat.has_hook("sparse_attention")
+    """Whether the targets build the family's MSA classes: the switch is not set."""
+    return not _switch_off()
 
 
 def sparse_attention_classes() -> Optional[Any]:
-    """The ``RuntimeHooks.sparse_attention`` value naming the family's classes, or None on an engine without it."""
+    """The ``RuntimeHooks.sparse_attention`` value naming the family's classes, or None when the switch is set."""
     if not family_msa_enabled():
         return None
-    try:
-        from tensorrt_llm._torch.pyexecutor.runtime_hooks import SparseAttentionClasses
-    except ImportError:
-        return None
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import SparseAttentionClasses
 
     from .cache_manager import MiniMaxM31KVCacheManagerV2
     from .msa_backend import MiniMaxM31MsaSparseAttention

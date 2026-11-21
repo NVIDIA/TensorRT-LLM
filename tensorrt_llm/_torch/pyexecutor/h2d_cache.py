@@ -45,6 +45,8 @@ class H2DSkipCache:
 
     # A changed-span upload is used only while it moves at most this fraction of the view's bytes.
     CHANGED_SPAN_MAX_FRACTION = 0.5
+    # Class-level defaults: a cache built without __init__ never stages a span.
+    changed_span = False
 
     def __init__(self, changed_span: bool = False) -> None:
         self.changed_span = changed_span

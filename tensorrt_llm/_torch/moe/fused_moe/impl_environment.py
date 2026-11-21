@@ -133,6 +133,11 @@ _ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
 #: export it, since setting it no longer changes which TRTLLM-Gen leaf runs.
 _REMOVED_TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
 
+# Flags outside ``MoEEnvFlag`` that an out-of-tree MoE leaf reads in ``can_implement``
+# (``register_optional_env_flag``). Collected only when set, so leaving them unset leaves the
+# environment and its fingerprint exactly as they are without them.
+_OPTIONAL_ENV_FLAGS: Tuple[str, ...] = ()
+
 _CACHED_ENVIRONMENT: Optional[MoEEnvironment] = None
 _OVERRIDE_ENVIRONMENT: Optional[MoEEnvironment] = None
 
@@ -171,6 +176,20 @@ def _is_oss_cutlass_moe() -> bool:
     return bool(query())
 
 
+def register_optional_env_flag(name: str) -> None:
+    """Collect the environment variable ``name`` into the MoE environment whenever it is set.
+
+    For a leaf registered from outside this package whose ``can_implement`` reads a switch of its
+    own from ``MoEDeployment.env.env_flags``. Drops the cached environment so the next collection
+    sees the flag. Idempotent.
+    """
+    global _OPTIONAL_ENV_FLAGS, _CACHED_ENVIRONMENT
+    if name in _OPTIONAL_ENV_FLAGS or any(flag.value == name for flag in MoEEnvFlag):
+        return
+    _OPTIONAL_ENV_FLAGS = _OPTIONAL_ENV_FLAGS + (name,)
+    _CACHED_ENVIRONMENT = None
+
+
 def collect_moe_environment(force: bool = False) -> MoEEnvironment:
     """Collect and cache the frozen MoE selection environment."""
     global _CACHED_ENVIRONMENT
@@ -187,8 +206,11 @@ def collect_moe_environment(force: bool = False) -> MoEEnvironment:
     )
     env_flags = tuple(
         sorted(
-            (flag.value, os.environ.get(flag.value, default))
-            for flag, default in _ENV_FLAG_DEFAULTS.items()
+            [
+                (flag.value, os.environ.get(flag.value, default))
+                for flag, default in _ENV_FLAG_DEFAULTS.items()
+            ]
+            + [(name, os.environ[name]) for name in _OPTIONAL_ENV_FLAGS if name in os.environ]
         )
     )
     if force:

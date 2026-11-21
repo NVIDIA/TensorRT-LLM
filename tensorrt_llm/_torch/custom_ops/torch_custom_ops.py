@@ -48,10 +48,11 @@ from .mxfp8_gemm import MXFP8_DEFAULT_BACKENDS, MXFP8GemmUnifiedRunner
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer import SfLayout
-    from flashinfer import autotune as _flashinfer_autotune
     from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
+
+    from ..flashinfer_autotune_cache import autotune as _flashinfer_autotune
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_2in_kernel, silu_and_mul_kernel
@@ -677,12 +678,20 @@ class MXFP8GemmRunner(TunableRunner):
         """Return the generic fallback followed by every compiled tactic."""
         return [-1, *range(self.mxfp8_gemm_runner.get_num_configs())]
 
+    def tactic_name(self, tactic: int) -> Optional[str]:
+        """The CUTLASS config of a native tactic; "fallback" for -1."""
+        if tactic == -1:
+            return "fallback"
+        return self.mxfp8_gemm_runner.get_config_name(int(tactic))
+
     @classmethod
     def sync_all_tactic_caches(cls, tuner: AutoTuner) -> None:
         """Register every profiled MXFP8 tactic in the native serving cache."""
         cache = tuner.profiling_cache.get_specific_custom_op(
             _MXFP8_AUTOTUNED_OP)
         runners = {str(key): runner for key, runner in cls.runner_dict.items()}
+        # The cache leaves out bundle entries not looked up yet (their tactic
+        # index is unchecked); the native runner keeps its default tactic there.
         for cache_key, (_runner_id, tactic, _min_time) in cache.items():
             _, cached_runner_name, cached_unique_id, profile = cache_key
             if cached_runner_name != cls.__name__:

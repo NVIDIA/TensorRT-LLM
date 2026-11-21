@@ -14,10 +14,13 @@
 
 import copy
 import dataclasses
+import math
 import os
+import types
 from contextlib import ExitStack
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
+import numpy as np
 import torch
 
 import tensorrt_llm
@@ -49,6 +52,7 @@ from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.sparse.params import \
     get_indexer_mqa_logits_workspace_bytes
+from ..disaggregation.draft_kv import select_disagg_draft_kv_cache_manager
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..distributed.communicator import Distributed, ReduceOp
@@ -76,13 +80,15 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
                            resolve_vocab_size, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .disagg_gen_prefetch import disagg_gen_prefetch_leases
 from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
 from .engine.multimodal import is_multimodal, use_mrope
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
-from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
-                                           KVCacheManagerV2, Role,
-                                           _resolve_v2_max_attention_window_vec)
+from .kv_cache.kv_cache_manager_v2 import (
+    DRAFT_KV_OPT_IN_KWARGS, KVCacheLayerOwner, KVCacheLayerSpec,
+    KVCacheManagerV2, Role, _resolve_v2_max_attention_window_vec,
+    set_gen_completion_reservation_default)
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -94,7 +100,7 @@ from .py_executor import PyExecutor, PyExecutorResources
 from .resource_manager import (BaseResourceManager, KVCacheCompressionManager,
                                KVCacheManager, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
-from .runtime_hooks import runtime_hooks_of
+from .runtime_hooks import override_sparse_attention_class, runtime_hooks_of
 from .sampler import TorchSampler
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -1226,6 +1232,37 @@ def _fit_draft_pool_ratio(
         draft_kv_config.pool_ratio = [1.0]
 
 
+def _draft_kv_opt_ins(hooks) -> dict:
+    """The standalone-drafter KV-cache options ``hooks`` opt into, as keyword
+    arguments for the draft ``KVCacheManagerV2`` and its sizing classmethods
+    (``DRAFT_KV_OPT_IN_KWARGS``). Empty for a model that declares none, so
+    such a model builds and sizes its managers exactly as before.
+    ``TRTLLM_DISABLE_DRAFT_KV_RESERVE_GUARD=1`` drops the reserve-and-guard
+    opt-in."""
+    killed = {"draft_kv_reserve_guard"} if os.environ.get(
+        "TRTLLM_DISABLE_DRAFT_KV_RESERVE_GUARD", "").strip() == "1" else set()
+    return {
+        name: True
+        for name in DRAFT_KV_OPT_IN_KWARGS
+        if getattr(hooks, name, False) and name not in killed
+    }
+
+
+def _with_draft_kv_opt_ins(manager_cls, opt_ins: dict, kwargs: dict) -> dict:
+    """``kwargs`` plus the draft opt-ins when ``manager_cls`` is a V2 manager,
+    which is the only one that takes them; other managers run without."""
+    if not opt_ins:
+        return kwargs
+    if not (isinstance(manager_cls, type)
+            and issubclass(manager_cls, KVCacheManagerV2)):
+        logger.warning(
+            f"The model asks for the draft KV cache options {sorted(opt_ins)}, "
+            f"which {getattr(manager_cls, '__name__', manager_cls)} does not "
+            "provide; running without them.")
+        return kwargs
+    return {**kwargs, **opt_ins}
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -1239,6 +1276,9 @@ class KvCacheCreator:
     # it to both constructors; the managers must not re-derive it.
     _joint_kv_cache_reuse = False
     _gen_preemption_headroom: int = 0
+    # The model's standalone-drafter KV-cache opt-ins (``_draft_kv_opt_ins``);
+    # none without a drafter.
+    _draft_kv_opt_ins: types.MappingProxyType = types.MappingProxyType({})
 
     # This rank's donation (remote_cache_config.donor), started before the
     # estimation so that clients do not wait out the warmup; the final target
@@ -1271,6 +1311,11 @@ class KvCacheCreator:
         gen_preemption_headroom: int = 0,
     ):
         self._model_engine = model_engine
+        # Per-creator, applied to the draft manager it builds only; only a
+        # speculative engine builds one.
+        if speculative_config is not None:
+            self._draft_kv_opt_ins = _draft_kv_opt_ins(
+                runtime_hooks_of(model_engine.model))
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
@@ -1392,6 +1437,13 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
+        # A model's own subclass of the sparse attention KV cache manager (RuntimeHooks.sparse_attention).
+        sparse_classes = runtime_hooks_of(
+            self._model_engine.model).sparse_attention
+        if (model_config.sparse_attention_config is not None
+                and sparse_classes is not None):
+            cls = override_sparse_attention_class(
+                cls, sparse_classes.kv_cache_manager, "kv_cache_manager")
         if is_hybrid_linear(model_config.pretrained_config):
             logger.info_once(
                 f"Selected hybrid KV cache manager: {cls.__name__}",
@@ -1525,6 +1577,10 @@ class KvCacheCreator:
                            self._kv_cache_config)
         if tokens_per_block is None:
             tokens_per_block = self._tokens_per_block
+        if is_draft:
+            extra_kwargs = _with_draft_kv_opt_ins(manager_cls,
+                                                  self._draft_kv_opt_ins,
+                                                  extra_kwargs)
         if not is_draft and self._should_unify_dflash_kv_cache():
             extra_kwargs = dict(extra_kwargs)
             extra_kwargs[
@@ -1727,6 +1783,15 @@ class KvCacheCreator:
                 draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
+                if self._is_standalone_draft_pool():
+                    per_token_cost = self._standalone_draft_per_token_cost(
+                        draft_kv_cache_manager_cls, effective_draft_config,
+                        draft_kv_cache_config, draft_mapping,
+                        draft_tokens_per_block)
+                    return scaled(
+                        self._standalone_draft_pool_cost(
+                            per_token_cost, kv_cache_config,
+                            draft_tokens_per_block))
                 return scaled(
                     self._per_manager_cache_cost(
                         draft_kv_cache_manager_cls,
@@ -2650,6 +2715,10 @@ class KvCacheCreator:
                            is not None else self._kv_cache_config)
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             kv_cache_config)
+        # The model's opt-in, read by the target KV cache manager built below.
+        set_gen_completion_reservation_default(
+            runtime_hooks_of(
+                self._model_engine.model).disagg_gen_completion_reservation)
 
         # When using separate draft KV cache in one-model speculative decoding,
         # use layer_mask to include only target layers. The draft layers should
@@ -3567,6 +3636,166 @@ class KvCacheCreator:
             self._get_num_draft_layers(),
         )
 
+    def _is_standalone_draft_pool(self) -> bool:
+        """Whether the separate draft pool is funded as a standalone drafter's.
+
+        True for the DFlash/DSpark drafter whose model opts into the draft
+        pool fixes (``RuntimeHooks.draft_pool_fixes``), unless
+        TRTLLM_DISABLE_STANDALONE_DRAFT_POOL_SIZING=1. Its pool mirrors the
+        target per request (``KVCacheManagerV2._prepare_draft_resources``) and
+        is never shared between requests: block reuse lets the target hold a
+        prompt prefix once for every request that matches it, while each mirror
+        stores the drafter's K/V for that prefix privately. The target's
+        per-token funding therefore does not bound the mirrors, and the pool is
+        funded as a fixed cost for the mirrors that can be resident at once
+        (``_standalone_draft_pool_cost``). The opt-in matters because only with
+        it does a mirror release its stale window pages before a context chunk
+        is allocated (``_resize_draft_context``), which the windowed funding
+        relies on.
+        """
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
+            return False
+        if not self._draft_kv_opt_ins.get("draft_pool_fixes", False):
+            return False
+        return os.environ.get("TRTLLM_DISABLE_STANDALONE_DRAFT_POOL_SIZING",
+                              "").strip() != "1"
+
+    def _standalone_draft_mirror_window(
+            self, kv_cache_config: KvCacheConfig) -> Optional[int]:
+        """The largest attention window the standalone drafter's pool keeps,
+        as the manager will hold it, or None when a layer attends to the whole
+        context.
+
+        The manager extends sliding windows by the reuse-match backoff under
+        block reuse (``KVCacheManagerV2.__init__``), so the funded window
+        does the same.
+        """
+        from .kv_cache.kv_cache_manager_v2 import _extend_swa_windows_for_reuse
+        windows = self._get_draft_max_attention_window(self._max_seq_len,
+                                                       kv_cache_config)
+        if windows is None:
+            return None
+        if kv_cache_config.enable_block_reuse:
+            windows = _extend_swa_windows_for_reuse(
+                windows,
+                draft_prompt_lookahead(self._speculative_config) or 0,
+                self._max_seq_len)
+        if any(window is None or window >= self._max_seq_len
+               for window in windows):
+            return None
+        return max(windows)
+
+    def _standalone_draft_per_token_cost(self, manager_cls, model_config,
+                                         draft_kv_cache_config: KvCacheConfig,
+                                         mapping,
+                                         tokens_per_block: int) -> CacheCost:
+        """The standalone drafter's KV bytes per token, as a pure slope.
+
+        Costed with its windows, the drafter's pool is a window-sized fixed
+        cost with no per-token slope (``get_cache_size_per_token`` charges a
+        sliding-window layer per request, not per token), which is not what
+        ``_standalone_draft_pool_cost`` multiplies by. The same layers costed
+        without windows give the bytes one token of drafter K/V occupies, on
+        the same manager class and dtype path the pool is allocated with.
+        """
+        return self._per_manager_cache_cost(
+            manager_cls,
+            model_config,
+            draft_kv_cache_config.model_copy(
+                update={"max_attention_window": None}),
+            mapping=mapping,
+            tokens_per_block=tokens_per_block,
+            is_draft=True)
+
+    def _standalone_draft_pool_cost(self, per_token_cost: CacheCost,
+                                    kv_cache_config: KvCacheConfig,
+                                    tokens_per_block: int) -> CacheCost:
+        """Funding for the standalone drafter's pool.
+
+        ``per_token_cost`` is the drafter's KV cost per token
+        (``_standalone_draft_per_token_cost``): a slope and no fixed part.
+
+        The pool carries the drafter's attention windows, so a mirror's live
+        pages are bounded by what its window keeps plus what it is computing:
+        the manager releases pages below ``history + 1 - window`` on every
+        resize (``AttnLifeCycle::getStaleRange``), and the mirror carries the
+        chunk start as its history on each context resize and the generated
+        length on each generation update. The chunk is at most
+        ``max_num_tokens``; the generation headroom is counted twice because
+        the first generation step grows the mirror by another step before
+        ``update_resources`` advances its history; one page covers the live
+        interval straddling page boundaries at both ends. The number of such
+        mirrors is the number of requests that can hold KV at once
+        (``KVCacheManagerV2.max_admissible_sequences``, see
+        ``_compute_index_mapper_capacity``). The same bound holds with or
+        without block reuse.
+
+        Without a window a mirror keeps its whole context. Then the target's
+        per-token funding bounds the mirrors as long as the target holds every
+        token itself, and under block reuse the pool is funded for that many
+        full-length mirrors instead.
+        """
+        from .kv_cache.kv_cache_manager_v2 import (
+            _compute_index_mapper_capacity, _get_generation_kv_capacity)
+        if per_token_cost.slope <= 0 or per_token_cost.intercept != 0:
+            # A windowed cost (slope 0, fixed part) would fund the pool with
+            # zero bytes and the executor would fail to create the KV cache.
+            raise ValueError(
+                "Standalone draft pool funding needs the drafter's bytes per "
+                f"token as a pure slope, got {per_token_cost}.")
+        _, headroom = _get_generation_kv_capacity(
+            self._speculative_config,
+            is_draft=True,
+            draft_kv_reserve_guard=self._draft_kv_opt_ins.get(
+                "draft_kv_reserve_guard", False))
+        num_mirrors, _ = _compute_index_mapper_capacity(
+            self._max_batch_size,
+            self._mapping,
+            is_disagg=self._is_disagg,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
+            num_reserved_index_slots=0,
+            has_guard_page=False,
+            gen_preemption_headroom=self._gen_preemption_headroom,
+            prefetch_headroom=disagg_gen_prefetch_leases(
+                is_disagg=self._is_disagg, mapping=self._mapping))
+        window = self._standalone_draft_mirror_window(kv_cache_config)
+        if window is None:
+            if not kv_cache_config.enable_block_reuse:
+                return per_token_cost
+            tokens_per_mirror = self._max_seq_len + headroom
+            reason = ("block reuse lets the target share prompt tokens the "
+                      "drafter stores per request")
+        else:
+            tokens_per_mirror = (window + self._max_num_tokens + 2 * headroom +
+                                 tokens_per_block)
+            reason = (f"the drafter's {window}-token window bounds what a "
+                      "mirror keeps beyond the chunk it is computing")
+        cost = self.standalone_draft_pool_worst_case_cost(
+            per_token_cost.slope, tokens_per_block, tokens_per_mirror,
+            num_mirrors, kv_cache_config.max_util_for_resume)
+        logger.info_once(
+            "Separate draft KV cache of the standalone drafter is funded for "
+            f"{num_mirrors} mirrors of {tokens_per_mirror} tokens "
+            f"({cost.intercept / GB:.2f} GiB): {reason} "
+            "(TRTLLM_DISABLE_STANDALONE_DRAFT_POOL_SIZING=1 disables).",
+            key="draft_pool_funding")
+        return cost
+
+    @staticmethod
+    def standalone_draft_pool_worst_case_cost(
+            bytes_per_token: int, tokens_per_block: int,
+            tokens_per_request: int, num_mirrors: int,
+            max_util_for_resume: float) -> CacheCost:
+        """``num_mirrors`` mirrors of ``tokens_per_request`` tokens, page
+        rounded per request and scaled to the resume watermark like the
+        manager's fixed costs (``KVCacheManagerV2.get_cache_size_per_token``)."""
+        pages = num_mirrors * math.ceil(tokens_per_request / tokens_per_block)
+        resume_util = float(np.float32(max_util_for_resume))
+        return CacheCost(slope=0,
+                         intercept=math.ceil(pages / resume_util) *
+                         tokens_per_block * bytes_per_token)
+
     def _get_one_model_draft_kv_cache_config(
         self,
         kv_cache_config: KvCacheConfig,
@@ -3697,6 +3926,7 @@ class KvCacheCreator:
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             remote_donor=remote_donor,
+            draft_kv_opt_ins=self._draft_kv_opt_ins,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -3804,8 +4034,11 @@ class KvCacheCreator:
             draft_bytes_per_mirror = (draft_kv.quota_per_request
                                       if draft_kv.quota_per_request is not None
                                       else draft_kv.bytes_per_request)
-            max_useful_draft_bytes = (self._max_batch_size *
-                                      draft_bytes_per_mirror)
+            # A disaggregated generation worker that prefetches KV holds that
+            # many more mirrors at once (disagg_gen_prefetch; 0 by default).
+            num_mirrors = self._max_batch_size + disagg_gen_prefetch_leases(
+                is_disagg=self._is_disagg, mapping=self._mapping)
+            max_useful_draft_bytes = num_mirrors * draft_bytes_per_mirror
             draft_slope_share = min(draft_slope_share, max_useful_draft_bytes)
         if draft_kv.quota_per_request is not None:
             if draft_kv.quota_per_request > slope_budget:
@@ -4734,10 +4967,14 @@ def _create_kv_cache_manager(
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
         remote_donor: Optional["RemoteMemDonor"] = None,
-        gen_preemption_headroom: int = 0) -> KVCacheManager:
+        gen_preemption_headroom: int = 0,
+        draft_kv_opt_ins: Optional[dict] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
+
+    ``draft_kv_opt_ins`` (the draft manager only) carries the model's
+    standalone-drafter KV-cache opt-ins (``_draft_kv_opt_ins``).
     """
     if cold_page_codec_provider is not None and not issubclass(
             kv_cache_manager_cls, KVCacheManagerV2):
@@ -4898,6 +5135,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "shared_draft_block_width"] = shared_draft_block_width
         manager_extra_kwargs["remote_donor"] = remote_donor
+        if draft_kv_opt_ins:
+            manager_extra_kwargs.update(draft_kv_opt_ins)
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:
@@ -5484,6 +5723,31 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
         "shortfall means one of them was re-derived from max_batch_size.")
 
 
+def engage_disagg_gen_init_window(model, draft_kv_cache_manager) -> bool:
+    """Size a disagg generation worker's gen-init draft mirrors for their window.
+
+    Only for a model that opts in (RuntimeHooks.disagg_draft_kv) with a separate V2 draft pool
+    and a drafter that can start from an empty window; every other model keeps the stock mirror
+    path. Without it a windowed standalone draft pool is resized for the whole prompt and fails
+    past its funding.
+    """
+    if not isinstance(draft_kv_cache_manager, KVCacheManagerV2) or not hasattr(
+            draft_kv_cache_manager, "engage_disagg_gen_init_window"):
+        return False
+    if not runtime_hooks_of(model).disagg_draft_kv:
+        return False
+    worker = getattr(model, "spec_worker", None)
+    if worker is None or not hasattr(worker, "seed_disagg_empty_window"):
+        return False
+    worker.engage_disagg_gen_init_window()
+    draft_kv_cache_manager.engage_disagg_gen_init_window(
+        worker.seed_disagg_empty_window)
+    logger.info(
+        "Disagg: gen-init draft mirrors hold the drafter window behind the prompt end"
+    )
+    return True
+
+
 def create_py_executor_resources(
     *,
     dist,
@@ -5770,6 +6034,7 @@ def create_py_executor_resources(
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
+        model_hooks = runtime_hooks_of(model_engine.model)
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         scheduler_policy = (scheduler_config.capacity_scheduler_policy
@@ -5805,8 +6070,11 @@ def create_py_executor_resources(
             max_gen_init_admissions_per_pass=(
                 scheduler_config.max_gen_init_admissions_per_pass
                 if scheduler_config is not None else None),
-            exact_context_demotion=runtime_hooks_of(
-                model_engine.model).exact_context_demotion,
+            exact_context_demotion=model_hooks.exact_context_demotion,
+            store_aware_ranking=model_hooks.ctx_store_aware_ranking,
+            store_lease_touch=model_hooks.store_lease_touch,
+            enable_context_only_preemption=model_hooks.ctx_only_preemption,
+            preempt_least_prefill_progress=model_hooks.ctx_only_preemption,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
@@ -5903,13 +6171,45 @@ def create_py_executor_resources(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # A standalone drafter's context window ships with the prompt KV only for a
+    # model that opts in (RuntimeHooks.disagg_draft_kv) and has a separate draft
+    # pool; every other model passes None and keeps the target-only transfer.
+    # The generation side's window sizing does not depend on the transfer: it
+    # is engaged first.
+    disagg_draft_kv_cache_manager = None
+    if is_disagg:
+        # Transfer options the model opts into; both sides must apply them before
+        # the transceiver exports its pools and creates its transfer agent.
+        from ..disaggregation.native import fabric_writer
+        from ..disaggregation.nixl import bounce_knobs
+        transfer_hooks = runtime_hooks_of(model_engine.model)
+        fabric_writer.set_model_default(transfer_hooks.kv_fabric_write)
+        bounce_knobs.set_model_scatter_on_order_stream(
+            transfer_hooks.bounce_scatter_on_order_stream)
+        draft_kv_cache_manager = resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        engage_disagg_gen_init_window(model_engine.model,
+                                      draft_kv_cache_manager)
+        disagg_draft_kv_cache_manager = select_disagg_draft_kv_cache_manager(
+            model_engine.model, draft_kv_cache_manager)
     # Disaggregated serving's KV transfer buffers are allocated in C++ with
     # no size exposed to Python; the memory monitor names them by measuring.
     with monitor_startup.region(monitor_names.REGION_KV_TRANSFER_BUFFERS,
                                 per_executor=True):
-        kv_cache_transceiver = create_kv_cache_transceiver(
-            mapping, dist, kv_cache_manager, attention_type,
-            cache_transceiver_config, mamba_cache_manager)
+        if disagg_draft_kv_cache_manager is None:
+            kv_cache_transceiver = create_kv_cache_transceiver(
+                mapping, dist, kv_cache_manager, attention_type,
+                cache_transceiver_config, mamba_cache_manager)
+        else:
+            kv_cache_transceiver = create_kv_cache_transceiver(
+                mapping,
+                dist,
+                kv_cache_manager,
+                attention_type,
+                cache_transceiver_config,
+                mamba_cache_manager,
+                draft_kv_cache_manager=disagg_draft_kv_cache_manager,
+                draft_ctx_owner=model_engine.model.spec_worker)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

@@ -14,8 +14,9 @@
 # limitations under the License.
 """Host planning of the MiniMax-M3.1 MegaMoE local backend (``TrtllmCutedslMegaMoeLocalNvfp4Impl``).
 
-The switches of the backend and its levers, the shared-expert placement around its launches (serial after the launch,
-or beside it on the aux stream with an optional pinned GEMM), and the deployments the backend cannot serve.
+The switches of the backend and its levers, the default tactics of its launches, the shared-expert placement around
+its launches (serial after the launch, or beside it on the aux stream with an optional pinned GEMM), and the deployments
+the backend cannot serve.
 
 Pure Python with no torch dependency: everything here is integer bookkeeping that has to be identical on every rank.
 """
@@ -57,6 +58,86 @@ LEVERS = (
 )
 
 NUM_DOMAINS = 2
+
+#: ``1`` keeps the generic default tactic for the DEP2 context-phase launch at the 16384-row bucket.
+CTX_T16K_DISABLE_ENV = "TRTLLM_M31_DISABLE_CTX_MOE_T16K"
+#: ``1`` keeps phase-interleave hint 3 for the DEP8 generation-phase launch at the 128-row bucket.
+HINT8_DISABLE_ENV = "TRTLLM_M31_DISABLE_MEGAMOE_HINT8"
+#: ``1`` leaves the padding ids of the generation-phase FC1 gather index as allocated.
+GATHER_FILL_DISABLE_ENV = "TRTLLM_M31_DISABLE_MEGAMOE_GATHER_FILL"
+#: ``1`` sends every eager launch through the op instead of relaunching a recorded one.
+FASTLAUNCH_DISABLE_ENV = "TRTLLM_M31_DISABLE_MEGAMOE_FASTLAUNCH"
+
+
+def _shape_key(problem_key: Tuple) -> Tuple:
+    """The fields of a MegaMoE problem key that pick a tactic here: shape, bucket, output dtype, top-k placement,
+    reduce form and combine format. The activation constants do not change the schedule."""
+    return tuple(problem_key[:10]) + tuple(problem_key[13:15])
+
+
+#: MiniMax-M3.1 NVFP4 MegaMoE launches whose default tactic differs from the shared tables, by ``_shape_key``:
+#: (disable switch, tactic). Each tactic keeps the tile and reduce form of the shared default, so the outputs are
+#: bitwise the same; only the work schedule (and at 16384 rows the token-back warps and FC2 store) changes.
+DEFAULT_TACTICS: Dict[Tuple, Tuple[str, Tuple]] = {
+    # DEP8 generation phase, bucket 128: the shared bucket tactic with phase-interleave hint 8.
+    (107, 8, 4, 16, 6144, 3072, 6144, 128, "torch.bfloat16", False, False, "bf16"): (
+        HINT8_DISABLE_ENV,
+        (
+            [256, 256, 256],
+            [4, 1, 1],
+            None,
+            ("phase_interleave", 8),
+            "atomic_counter",
+            "epi_warps",
+            True,
+            1,
+            1,
+            (1, 4),
+            "expert",
+            False,
+        ),
+    ),
+    # DEP2 context phase, bucket 16384: grouped schedule, standalone token-back warps and the FC2 TMA store.
+    (107, 2, 4, 64, 6144, 3072, 6144, 16384, "torch.bfloat16", False, False, "bf16"): (
+        CTX_T16K_DISABLE_ENV,
+        (
+            [256, 256, 256],
+            [2, 1, 1],
+            None,
+            ("grouped", 512),
+            "grid_stride",
+            "standalone_warps",
+            True,
+            None,
+            1,
+            (2, 4),
+            "expert",
+            False,
+        ),
+    ),
+}
+
+
+def switch_set(environ: Mapping[str, str], name: str) -> bool:
+    """Whether the kill switch ``name`` is set: ``1`` / ``true`` / ``on`` / ``yes`` set it; unset, empty, ``0`` /
+    ``false`` / ``off`` / ``no`` leave it unset; any other value raises, naming the variable."""
+    word = (environ.get(name) or "").strip().lower()
+    if word in ("1", "true", "on", "yes"):
+        return True
+    if word in ("", "0", "false", "off", "no"):
+        return False
+    raise ValueError(
+        f"{name}={environ[name]!r}: expected 1 / true / on / yes (set) or 0 / false / off / no / empty (unset)"
+    )
+
+
+def default_tactic(problem_key: Tuple, environ: Mapping[str, str]) -> Optional[Tuple[str, Tuple]]:
+    """``(disable switch, tactic)`` of the M3.1 default tactic for a MegaMoE problem key, or None when the shared
+    tables decide: no entry for the shape, a launch with helper experts, or the entry's switch set."""
+    entry = DEFAULT_TACTICS.get(_shape_key(problem_key))
+    if entry is None or problem_key[17] != 0 or switch_set(environ, entry[0]):
+        return None
+    return entry
 
 
 def megamoe_local_requested(environ: Mapping[str, str]) -> bool:

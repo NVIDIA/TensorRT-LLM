@@ -289,6 +289,16 @@ FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
 # The MiniMax-M3.1 MSA index scorer and sparse prefill (Python packages).
 FetchContent_MakeAvailable(msa_vllm)
 
+# The opt-in ahead-of-time build of the MSA kernels the minimax_m3 modeling_v2
+# family vendors (its csrc/msa_aot). Off by default: they compile at run time.
+# Its BF16X / E4M3X prefill needs CUTLASS 4.8 (cutlass_msa); the rest of
+# TensorRT-LLM keeps its CUTLASS.
+option(BUILD_MSA_AOT
+       "Build the MiniMax-M3.1 MSA kernels ahead of time into the wheel" OFF)
+if(BUILD_MSA_AOT)
+  FetchContent_MakeAvailable(cutlass_msa)
+endif()
+
 # cppzmq (header-only) is the bounce v2 control-plane dependency AND the UCX
 # bootstrap dependency. Make it available whenever NIXL (-> bounce) or UCX is
 # enabled, so bounce does NOT require UCX (its real deps are NIXL + zmq,

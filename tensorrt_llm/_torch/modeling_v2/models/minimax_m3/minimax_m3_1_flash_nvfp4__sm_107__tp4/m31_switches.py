@@ -29,7 +29,6 @@ _UNSET = frozenset(("", "0", "false", "off", "no"))
 # Item id -> what TRTLLM_M31_DISABLE_<id>=1 restores.
 ITEMS: Dict[str, str] = {
     "ADV_PAR": "the serial drafter context advance (instead of the parallel advance + read view)",
-    "BATCH_CHANGED_ONLY": "the every-step copies of the drafter's batch indices and batch-to-slot map",
     "BLOCKOFF_GUARD": "the drafter KV cache manager's block-table copy on every step",
     "BLOCKOFF_PATCH": "the full-width block-table copy on steps that change one page index per row",
     "CTXNORMQ": "the fused all-reduce + norm and the consumers' own quantize at large prefill layer boundaries",
@@ -84,7 +83,6 @@ ITEMS: Dict[str, str] = {
     "S9BVR": "AllReduce(AUTO) for the drafter's row-parallel all-reduces at every row count",
     "SELECT_EARLY": "the long-row select's sparse-decode trigger at the select's exit",
     "SILU_VEC": "the stock Triton silu_and_mul everywhere",
-    "SKIP_ACCEPTED_UPLOAD": "the stock per-step upload of the accepted-draft counts",
     "SM107_DRAFT_FMHA_SM100F": "the drafter attention on thop.attention's in-tree runner",
     "SOFTMAX_MC": "the stock FlashInfer softmax",
     "STEP_GATHER_FUSED": "the engine's eager previous-batch input gathers at the step boundary",
