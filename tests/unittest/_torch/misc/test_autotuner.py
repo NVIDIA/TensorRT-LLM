@@ -1940,7 +1940,8 @@ def _tactic_space_cache_key(cache, runner):
                                _TACTIC_SPACE_SHAPES, TuningConfig())
 
 
-def test_tactic_space_key_extends_the_cache_key():
+def test_tactic_space_key_extends_the_cache_key(monkeypatch):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
     cache = autotuner.AutoTuner().profiling_cache
     default = _tactic_space_cache_key(cache, _TacticSpaceRunner())
     assert default == ("test_tactic_space", "_TacticSpaceRunner", "()",
@@ -2753,11 +2754,12 @@ def test_candidates_fingerprint_covers_the_losers_tactic_spaces(fp_modules):
 
 
         class Spaced(Base):
-            def __init__(self, space=None):
+            def __init__(self, space=None, uid=()):
                 self.space = space
+                self.uid = uid
 
             def unique_id(self):
-                return ()
+                return self.uid
 
             def tactic_space_key(self):
                 return self.space
@@ -2779,6 +2781,23 @@ def test_candidates_fingerprint_covers_the_losers_tactic_spaces(fp_modules):
     assert key(runners.Spaced(("limited", ))) != key(runners.Spaced(("all", )))
     assert key(runners.Spaced()) == autotuner._key_fingerprint(
         runners.Winner, set_fingerprint)
+
+    # So does one of the same class as the winner, which it tells apart by
+    # unique_id.
+    alike = autotuner._candidates_fingerprint((runners.Spaced, ))
+
+    def alike_key(winner_space, loser_space):
+        candidates = [
+            runners.Spaced(winner_space, uid=(0, )),
+            runners.Spaced(loser_space, uid=(1, ))
+        ]
+        return autotuner._key_fingerprint(runners.Spaced, alike,
+                                          autotuner._tactic_spaces(candidates))
+
+    assert alike_key(("all", ), ("limited", )) != alike_key(("all", ),
+                                                            ("all", ))
+    assert alike_key(("all", ), ("limited", )) != alike_key(("limited", ),
+                                                            ("all", ))
 
 
 def test_code_fingerprint_of_a_factory_runner_that_names_itself(fp_modules):
@@ -2815,6 +2834,101 @@ def test_candidates_fingerprint_keys_same_named_runners_apart(fp_modules):
     # A runner tuned alone keeps the key it had.
     alone = autotuner._candidates_fingerprint((narrow, ))
     assert autotuner._key_fingerprint(narrow, alone) == alone
+
+
+def test_candidates_fingerprint_tells_factory_runners_apart_by_build(
+        fp_modules, monkeypatch):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    for source, narrow_impl, wide_impl in (
+        (_FACTORY_RUNNERS, "Narrow", "Wide"),
+        (_CLOSURE_RUNNERS, "narrow", "wide"),
+    ):
+        runners = fp_modules.load("fp_runners", source)
+        narrow, wide, again = (runners.factory(getattr(runners, impl))
+                               for impl in (narrow_impl, wide_impl,
+                                            narrow_impl))
+        fp_modules.fingerprints()
+        # Built around different bases or implementations: their names differ.
+        assert autotuner._runner_fingerprint(
+            narrow) != autotuner._runner_fingerprint(wide)
+        # Built alike: one key, in every process.
+        assert autotuner._runner_fingerprint(
+            narrow) == autotuner._runner_fingerprint(again)
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def narrow():
+            return [0]
+
+
+        def wide():
+            return [0, 1]
+
+
+        def factory(impl):
+            class Runner(Base):
+                def get_valid_tactics(self, inputs, profile, kernel=impl,
+                                      **kwargs):
+                    return kernel()
+
+            return Runner
+        """)
+    fp_modules.fingerprints()
+    # An implementation bound as a default argument counts too.
+    assert autotuner._runner_fingerprint(runners.factory(
+        runners.narrow)) != autotuner._runner_fingerprint(
+            runners.factory(runners.wide))
+
+
+def test_code_fingerprint_of_a_class_another_thread_identifies(fp_modules):
+    import threading
+
+    runners = fp_modules.load("fp_runners", _CLOSURE_RUNNERS)
+    narrow = runners.factory(runners.narrow)
+    started, finish = threading.Event(), threading.Event()
+
+    def identify_elsewhere():
+        # Another thread in the middle of identifying the same class.
+        autotuner._CLASS_IDENTITIES_IN_PROGRESS.classes = {narrow}
+        started.set()
+        finish.wait()
+
+    thread = threading.Thread(target=identify_elsewhere)
+    thread.start()
+    try:
+        started.wait()
+        assert autotuner._class_identity(narrow) != autotuner._class_name(
+            narrow)
+    finally:
+        finish.set()
+        thread.join()
+
+
+def test_build_fingerprint_skips_unreadable_package_metadata(monkeypatch):
+    import importlib.metadata
+
+    class Broken:
+
+        @property
+        def metadata(self):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+
+    class Good:
+        metadata = {"Name": "good-dist"}
+        files = None
+
+        def read_text(self, name):
+            return "good\n" if name == "top_level.txt" else None
+
+    monkeypatch.setattr(importlib.metadata, "distributions",
+                        lambda: [Broken(), Good()])
+    autotuner._packages_distributions.cache_clear()
+    try:
+        assert autotuner._packages_distributions() == {"good": ["good-dist"]}
+    finally:
+        autotuner._packages_distributions.cache_clear()
 
 
 def test_code_fingerprint_keeps_no_object_a_global_held_alive(fp_modules):
@@ -2993,24 +3107,30 @@ def test_ranks_that_fingerprint_differently_raise(fp_modules):
         return autotuner.AutoTuner._agree_on_cache_hit(tuner, candidates, True)
 
     assert agree(lambda obj: [obj, obj])
-    assert not agree(lambda obj: [obj, (False, obj[1])])
+    assert not agree(lambda obj: [obj, (False, *obj[1:])])
     # Ranks that may run different code must not tune or reuse together.
     with pytest.raises(RuntimeError, match="fingerprint the code"):
-        agree(lambda obj: [(True, "other-fingerprint"), obj])
+        agree(lambda obj: [(True, "other-fingerprint", obj[2]), obj])
     # Nor ranks whose sources changed after they started, even when their
     # fingerprints match: what each loaded is no longer on disk.
-    edited = (True, autotuner._EDITED_PREFIX + "0123456789abcdef")
+    edited = (True, autotuner._EDITED_PREFIX + "0123456789abcdef", "")
     with pytest.raises(RuntimeError, match="changed after"):
         agree(lambda obj: [edited, edited])
+    # Nor ranks that give the candidates different tactic spaces.
+    with pytest.raises(RuntimeError, match="tactic spaces"):
+        agree(lambda obj: [(*obj[:2], "other-spaces"), obj])
 
 
+@pytest.mark.parametrize("mode", ["code", "build"])
 @pytest.mark.parametrize("source,narrow_impl,wide_impl", [
     (_FACTORY_RUNNERS, "Narrow", "Wide"),
     (_CLOSURE_RUNNERS, "narrow", "wide"),
 ],
                          ids=["bases", "captured"])
-def test_search_cache_keeps_same_named_candidates_apart(fp_modules, source,
-                                                        narrow_impl, wide_impl):
+def test_search_cache_keeps_same_named_candidates_apart(fp_modules, monkeypatch,
+                                                        source, narrow_impl,
+                                                        wide_impl, mode):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", mode)
     runners = fp_modules.load("fp_runners", source)
     narrow = runners.factory(getattr(runners, narrow_impl))()
     wide = runners.factory(getattr(runners, wide_impl))()

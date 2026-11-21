@@ -29,6 +29,7 @@ import json
 import os
 import struct
 import sys
+import threading
 import time
 import types
 import weakref
@@ -380,9 +381,11 @@ _EPOCH_NS = time.time_ns()
 _EDITED_PREFIX = "edited-"
 # TLLM_AUTOTUNER_CACHE_KEY: what a cache key's fingerprint covers.
 # "build" (default): the TensorRT-LLM build and installed kernel packages, the
-# same on every rank of an installation. "code": also the Python code each
-# runner reaches (_code_fingerprint), best effort. "none": no fingerprint, the
-# key as before fingerprints.
+# same on every rank of an installation. "code": instead of the build, the
+# code each runner reaches (_code_fingerprint), best effort; a runner re-tunes
+# only when that code changes, so a rebuild of native code it does not reach
+# leaves its key as it was. "none": no fingerprint, the key as before
+# fingerprints.
 _CACHE_KEY_MODES = ("build", "code", "none")
 _CACHE_KEY_MODE = os.environ.get("TLLM_AUTOTUNER_CACHE_KEY", "build").lower()
 if _CACHE_KEY_MODE not in _CACHE_KEY_MODES:
@@ -390,7 +393,12 @@ if _CACHE_KEY_MODE not in _CACHE_KEY_MODES:
                    f"is not one of {_CACHE_KEY_MODES}; using 'build'.")
     _CACHE_KEY_MODE = "build"
 # Packages whose kernels runners launch; their versions are part of a build.
-_KERNEL_PACKAGES = ("cuda", "cutlass", "deep_gemm", "flashinfer", "triton")
+# "nvidia" holds the CUDA library wheels (cuBLAS, cuDNN, NCCL, ...).
+_KERNEL_PACKAGES = ("cuda", "cutlass", "deep_gemm", "flashinfer", "nvidia",
+                    "triton")
+# Shared libraries the process loads from outside TensorRT-LLM whose builds
+# rank tactics: cuBLASLt's heuristic list is indexed by tactic.
+_LOADED_LIBRARY_PREFIXES = ("libcublas", )
 
 
 class _SourceIndex(NamedTuple):
@@ -1030,9 +1038,38 @@ def _stable_repr(obj) -> str:
     return repr(obj)
 
 
+def _top_level_names(dist) -> List[str]:
+    """The top-level packages a distribution provides."""
+    declared = (dist.read_text("top_level.txt") or "").split()
+    if declared:
+        return declared
+    names = set()
+    for file in dist.files or ():
+        name = (file.parts[0]
+                if len(file.parts) > 1 else inspect.getmodulename(file.name))
+        if name and name.isidentifier():
+            names.add(name)
+    return sorted(names)
+
+
 @lru_cache(maxsize=None)
 def _packages_distributions() -> Dict[str, List[str]]:
-    return importlib.metadata.packages_distributions()
+    """Top-level package -> the distributions that provide it. A distribution
+    whose metadata cannot be read is left out, with a warning."""
+    mapping: Dict[str, List[str]] = {}
+    for dist in importlib.metadata.distributions():
+        try:
+            name = dist.metadata["Name"]
+            tops = _top_level_names(dist) if name else ()
+        except (OSError, ValueError, KeyError) as e:
+            logger.warning_once(
+                f"[Autotuner] Could not read the metadata of {dist!r} ({e!r}); "
+                "autotuner cache keys leave it out.",
+                key=("autotuner_unreadable_distribution", repr(dist)))
+            continue
+        for top in tops:
+            mapping.setdefault(top, []).append(name)
+    return mapping
 
 
 @lru_cache(maxsize=None)
@@ -1114,6 +1151,24 @@ def _native_build_id() -> str:
     """IDs of TensorRT-LLM's native libraries, which hold its C++ kernels."""
     root = Path(tensorrt_llm.__file__).parent
     libraries = sorted([*root.glob("*.so"), *(root / "libs").glob("*.so")])
+    return "\n".join(f"{path.name}:{_library_id(path)}" for path in libraries)
+
+
+def _loaded_library_ids() -> str:
+    """IDs of the libraries named by _LOADED_LIBRARY_PREFIXES that this
+    process has loaded (TensorRT-LLM's and torch's native code link them, so
+    they are loaded on import), wherever they were installed from."""
+    try:
+        with open("/proc/self/maps") as f:
+            paths = {
+                line.split(None, 5)[5].strip()
+                for line in f if len(line.split(None, 5)) == 6
+            }
+    except OSError:
+        return ""
+    libraries = sorted(
+        Path(path) for path in paths
+        if Path(path).name.startswith(_LOADED_LIBRARY_PREFIXES))
     return "\n".join(f"{path.name}:{_library_id(path)}" for path in libraries)
 
 
@@ -1379,9 +1434,12 @@ _FINGERPRINTS: Dict[Tuple, str] = {}
 _CANDIDATE_FINGERPRINTS: Dict[Tuple, str] = {}
 _LOCAL_CLASS_IDENTITIES: "weakref.WeakKeyDictionary[type, Tuple]" = (
     weakref.WeakKeyDictionary())
-_CLASS_IDENTITIES_IN_PROGRESS: "weakref.WeakSet[type]" = weakref.WeakSet()
-# (module, qualname) -> a runner class's fingerprint under "build".
-_BUILD_RUNNER_FINGERPRINTS: Dict[Tuple[str, str], str] = {}
+# The local classes whose _class_identity this thread is computing.
+_CLASS_IDENTITIES_IN_PROGRESS = threading.local()
+_LOCAL_CLASS_NAMES: "weakref.WeakKeyDictionary[type, Tuple]" = (
+    weakref.WeakKeyDictionary())
+# _build_class_key -> a runner class's fingerprint under "build".
+_BUILD_RUNNER_FINGERPRINTS: Dict[Tuple, str] = {}
 
 
 def _class_name(cls: type) -> Tuple[str, str]:
@@ -1399,16 +1457,79 @@ def _class_identity(cls: type) -> Tuple:
     if "<locals>" not in cls.__qualname__:
         return _class_name(cls)
     identity = _LOCAL_CLASS_IDENTITIES.get(cls)
-    if identity is None and cls in _CLASS_IDENTITIES_IN_PROGRESS:
+    if identity is not None:
+        return identity
+    in_progress = getattr(_CLASS_IDENTITIES_IN_PROGRESS, "classes", None)
+    if in_progress is None:
+        in_progress = _CLASS_IDENTITIES_IN_PROGRESS.classes = set()
+    if cls in in_progress:
         # A method that names its own class (`Runner.tactics`) captures it.
         return _class_name(cls)
-    if identity is None:
-        _CLASS_IDENTITIES_IN_PROGRESS.add(cls)
+    in_progress.add(cls)
+    try:
+        return _local_class_identity(cls)
+    finally:
+        in_progress.discard(cls)
+
+
+def _definition_name(value, depth: int = 0) -> str:
+    """A name of a definition that is the same in every process: its module
+    and qualified name. A function a factory builds (`<locals>` in its name)
+    adds the names of the definitions it captures or takes as defaults, so
+    the functions a factory builds around different implementations differ."""
+    if isinstance(value, partial):
+        parts = [value.func, *value.args, *value.keywords.values()]
+        return "partial(" + ", ".join(
+            _definition_name(v, depth)
+            for v in parts if callable(v) or inspect.ismodule(v)) + ")"
+    if inspect.ismodule(value):
+        return value.__name__
+    module = _attribute(value, "__module__")
+    name = _attribute(value, "__qualname__")
+    if not (isinstance(module, str) and isinstance(name, str)):
+        module, name = type(value).__module__, type(value).__qualname__
+    text = f"{module}.{name}"
+    if inspect.isfunction(value) and "<locals>" in name and depth < 4:
         try:
-            identity = _local_class_identity(cls)
-        finally:
-            _CLASS_IDENTITIES_IN_PROGRESS.discard(cls)
-    return identity
+            value = inspect.unwrap(value)
+        except ValueError:
+            pass
+        held = [v for _, v in _captured(value)]
+        held += [
+            *(value.__defaults__ or ()), *(value.__kwdefaults__ or {}).values()
+        ]
+        names = [
+            _definition_name(v, depth + 1) for v in held
+            if callable(v) or inspect.ismodule(v)
+        ]
+        if names:
+            text += "[" + ", ".join(names) + "]"
+    return text
+
+
+def _build_class_key(cls: type) -> Tuple:
+    """What tells runner classes apart under "build", the same in every
+    process: a class of a module counts by its name; a class a function
+    builds also by the names of its bases and of the definitions its members
+    are, capture or take as defaults (_definition_name)."""
+    if "<locals>" not in cls.__qualname__:
+        return _class_name(cls)
+    key = _LOCAL_CLASS_NAMES.get(cls)
+    if key is None:
+        members = []
+        for name, value in sorted(vars(cls).items()):
+            if isinstance(value, (staticmethod, classmethod)):
+                value = value.__func__
+            values = ((value.fget, value.fset,
+                       value.fdel) if isinstance(value, property) else
+                      (value, ))
+            members += [(name, _definition_name(v)) for v in values
+                        if callable(v)]
+        key = _LOCAL_CLASS_NAMES[cls] = (*_class_name(cls),
+                                         tuple(".".join(_class_name(b))
+                                               for b in cls.__bases__),
+                                         tuple(members))
+    return key
 
 
 def _local_class_identity(cls: type) -> Tuple:
@@ -1506,13 +1627,15 @@ def _code_fingerprint(runner_cls: type) -> str:
 @lru_cache(maxsize=None)
 def _build_fingerprint() -> str:
     """A digest of the TensorRT-LLM build: its version, its native libraries'
-    build IDs, and the installed versions of torch and the kernel packages.
+    build IDs, the build IDs of the loaded cuBLAS libraries, and the installed
+    versions of torch and the kernel packages.
     It is the same on every rank of an installation, and changes with a
     rebuild (even under the same version string) or a package upgrade."""
     parts = [
         f"tensorrt_llm=={tensorrt_llm.__version__}",
         f"torch=={torch.__version__}",
         _native_build_id(),
+        _loaded_library_ids(),
         *map(_package_versions, _KERNEL_PACKAGES),
     ]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
@@ -1520,15 +1643,15 @@ def _build_fingerprint() -> str:
 
 def _runner_fingerprint(runner_cls: type) -> str:
     """A runner class's own fingerprint: under TLLM_AUTOTUNER_CACHE_KEY=code
-    its code fingerprint; else the build fingerprint and its module and
-    qualified name."""
+    its code fingerprint; else the build fingerprint and _build_class_key."""
     if _CACHE_KEY_MODE == "code":
         return _code_fingerprint(runner_cls)
-    name = _class_name(runner_cls)
-    fingerprint = _BUILD_RUNNER_FINGERPRINTS.get(name)
+    key = _build_class_key(runner_cls)
+    fingerprint = _BUILD_RUNNER_FINGERPRINTS.get(key)
     if fingerprint is None:
-        fingerprint = _BUILD_RUNNER_FINGERPRINTS[name] = hashlib.sha256(
-            "\0".join((_build_fingerprint(), *name)).encode()).hexdigest()[:16]
+        fingerprint = _BUILD_RUNNER_FINGERPRINTS[key] = hashlib.sha256(
+            "\0".join(
+                (_build_fingerprint(), repr(key))).encode()).hexdigest()[:16]
     return fingerprint
 
 
@@ -1540,7 +1663,8 @@ def _candidates_fingerprint(runner_classes) -> Optional[str]:
     leaves fingerprints out of keys."""
     if _CACHE_KEY_MODE == "none":
         return None
-    class_key = _class_identity if _CACHE_KEY_MODE == "code" else _class_name
+    class_key = (_class_identity
+                 if _CACHE_KEY_MODE == "code" else _build_class_key)
     identities = (_CACHE_KEY_MODE,
                   *dict.fromkeys(map(class_key, runner_classes)))
     fingerprint = _CANDIDATE_FINGERPRINTS.get(identities)
@@ -1557,15 +1681,15 @@ def _candidates_fingerprint(runner_classes) -> Optional[str]:
 
 def _tactic_spaces(candidates) -> str:
     """For several candidates of which any has a tactic space key, a digest
-    of every candidate's; else ''. A runner that lost and then widens its
-    tactic space re-opens the comparison."""
+    of every candidate's, by class name and unique_id; else ''. A runner that
+    lost and then widens its tactic space re-opens the comparison."""
     if len(candidates) < 2:
         return ""
     spaces = [r.tactic_space_key() for r in candidates]
     if all(space is None for space in spaces):
         return ""
     text = repr(
-        sorted((_class_name(type(r)), repr(space))
+        sorted((_class_name(type(r)), str(r.unique_id()), repr(space))
                for r, space in zip(candidates, spaces)))
     return hashlib.sha256(text.encode()).hexdigest()[:8]
 
@@ -1574,19 +1698,16 @@ def _key_fingerprint(runner_cls: type,
                      set_fingerprint: Optional[str],
                      tactic_spaces: str = "") -> Optional[str]:
     """The fingerprint in the key of `runner_cls`'s entry, tuned among runners
-    whose set has `set_fingerprint`: that alone for a runner tuned alone,
-    else the set's, the runner's own and the candidates' tactic spaces
-    (_tactic_spaces). Two candidates of one set can share a class name and
+    whose set has `set_fingerprint`: the set's, and the runner's own where it
+    differs, then the candidates' tactic spaces (_tactic_spaces) if any. Two candidates of one set can share a class name and
     unique_id; their own fingerprints keep their entries apart where they
     differ (always under "code"; under "build", when the module or qualified
     name does)."""
     if set_fingerprint is None:
         return None
     own = _runner_fingerprint(runner_cls)
-    if own == set_fingerprint:
-        return own
-    return f"{set_fingerprint}/{own}" + (f"/{tactic_spaces}"
-                                         if tactic_spaces else "")
+    fingerprint = own if own == set_fingerprint else f"{set_fingerprint}/{own}"
+    return fingerprint + (f"/{tactic_spaces}" if tactic_spaces else "")
 
 
 def _edited_key(key: Tuple) -> bool:
@@ -1600,6 +1721,7 @@ def _clear_fingerprints() -> None:
     _FINGERPRINTS.clear()
     _CANDIDATE_FINGERPRINTS.clear()
     _BUILD_RUNNER_FINGERPRINTS.clear()
+    _LOCAL_CLASS_NAMES.clear()
 
 
 # What lru_cache offered, for tests that model a new process.
@@ -4053,7 +4175,8 @@ class AutoTuner:
     def _agree_on_cache_hit(self, runners: List[TunableRunner],
                             is_cache_hit: bool) -> bool:
         """Whether every rank of the tuning group has the entry (one host
-        all-gather of each rank's hit and code fingerprint for ``runners``).
+        all-gather of each rank's hit, and the fingerprint and tactic spaces
+        of ``runners``).
 
         Ranks that fingerprint the runners differently may be running
         different code, with different valid tactics: their keys would not
@@ -4065,9 +4188,14 @@ class AutoTuner:
         profiling.
         """
         classes = tuple(type(r) for r in runners)
+        spaces = hashlib.sha256(
+            repr(
+                sorted((".".join(_class_name(type(r))), str(r.unique_id()),
+                        repr(r.tactic_space_key()))
+                       for r in runners)).encode()).hexdigest()[:8]
         gathered = self._dist.tp_cp_allgather(
-            obj=(bool(is_cache_hit), _candidates_fingerprint(classes)))
-        fingerprints = {fingerprint for _, fingerprint in gathered}
+            obj=(bool(is_cache_hit), _candidates_fingerprint(classes), spaces))
+        fingerprints = {fingerprint for _, fingerprint, _ in gathered}
         names = sorted({".".join(_class_name(k)) for k in classes})
         if any(
                 isinstance(f, str) and f.startswith(_EDITED_PREFIX)
@@ -4087,7 +4215,13 @@ class AutoTuner:
                 "warnings). Run every rank on the same files, or set "
                 "TLLM_AUTOTUNER_CACHE_KEY=none to key the cache without code "
                 "fingerprints.")
-        return all(hit for hit, _ in gathered)
+        if len({space for _, _, space in gathered}) > 1:
+            raise RuntimeError(
+                f"[Autotuner] The ranks of a tuning group give the candidates "
+                f"{names} different tactic spaces (tactic_space_key): a tactic "
+                "one rank tunes may not be valid on another. Configure every "
+                "rank alike.")
+        return all(hit for hit, _, _ in gathered)
 
     def _profile_hits_on_all_ranks(self, profiles: List[OptimizationProfile],
                                    hits: List[bool]) -> List[bool]:
