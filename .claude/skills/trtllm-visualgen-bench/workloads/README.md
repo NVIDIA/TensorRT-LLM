@@ -72,7 +72,9 @@ off the wire entirely.
 
 The server opens that path itself, so the run directory has to sit on storage the server reads at
 the same path — one filesystem, or a share both sides mount alike. A client-only path reaches the
-server as a name it cannot open.
+server as a name it cannot open. The server also has to be started with
+`TRTLLM_MEDIA_ALLOWED_INPUT_DIR` naming a directory that holds the file; it refuses every other
+local path.
 
 ## Checking a workload against a loaded model
 

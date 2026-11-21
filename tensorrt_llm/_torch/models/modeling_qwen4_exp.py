@@ -15,13 +15,14 @@
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
+    from ...models.modeling_utils import QuantConfig
     from ..speculative.interface import SpecWorkerBase
 
 from ...inputs import (
@@ -37,16 +38,28 @@ from ..distributed import AllReduce, AllReduceParams, allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fla.cache_manager import get_gdn_cache_params
+from ..modules.fla.gdn_metadata import GDNMambaMetadata, gdn_metadata_for_batch
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.mamba.layernorm_gated import rms_norm_gated_token_major
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.qwen4_exp.cache_manager import get_qwen4_exp_ple_layer_mask
+from ..modules.qwen4_exp.cache_manager import (
+    PLE_CONV_STATE,
+    PLE_NGRAM_CONTEXT,
+    extract_qwen4_exp_ple_cache_params,
+    get_qwen4_exp_ple_layer_mask,
+)
 from ..modules.qwen4_exp.hyper_connection import HCResidual, Qwen4ExpHyperConnection
 from ..modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
+from ..recurrent_state_spec import (
+    RecurrentStateSpec,
+    StatePlaneSpec,
+    recurrent_state_spec_from_mamba_params,
+)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .checkpoints.base_weight_mapper import BaseWeightMapper
@@ -790,16 +803,7 @@ class Qwen4ExpModel(DecoderModel):
                 "same time, and must specify either one"
             )
 
-        # Refresh mamba metadata for the batch size, mirroring Qwen3NextModel.
-        mamba_metadata = getattr(attn_metadata, "mamba_metadata", None)
-        if (
-            mamba_metadata is not None
-            and getattr(mamba_metadata, "max_batch_size", None) != attn_metadata.max_num_requests
-        ):
-            attn_metadata.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests, chunk_size=128
-            )
-            mamba_metadata = attn_metadata.mamba_metadata
+        mamba_metadata = gdn_metadata_for_batch(attn_metadata)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1143,6 +1147,9 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
     recurrent one-model MTP layer.
     """
 
+    # The GDN layers' Mamba metadata, whichever cache manager serves the model.
+    mamba_metadata_cls = GDNMambaMetadata
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         _normalize_qwen35_exclude_modules(model_config)
         _normalize_qwen35_quant_config_dict(model_config)
@@ -1202,6 +1209,41 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
         """Prefer KV cache manager V2 for the hybrid recurrent-state layout."""
         return "V2"
 
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
+    ) -> RecurrentStateSpec:
+        """Declare the GDN state of the linear-attention layers and the PLE state.
+
+        The PLE planes belong to the decoder layer that runs PLE; every rank holds them whole.
+        """
+        params = get_gdn_cache_params(pretrained_config, quant_config=quant_config)
+        ple = extract_qwen4_exp_ple_cache_params(pretrained_config)
+        ple_planes = (
+            StatePlaneSpec(
+                role=PLE_CONV_STATE,
+                shape=(ple.short_conv_channels, ple.short_conv_state_len),
+                dtype=ple.conv_state_dtype,
+            ),
+            StatePlaneSpec(
+                role=PLE_NGRAM_CONTEXT,
+                shape=(ple.ngram_context_len,),
+                dtype=torch.int64,
+            ),
+        )
+        return recurrent_state_spec_from_mamba_params(
+            params,
+            conv_sections="q_k_v",
+            extra_planes={
+                layer_idx: ple_planes
+                for layer_idx, has_ple in enumerate(ple.ple_layer_mask)
+                if has_ple
+            },
+        )
+
     def load_weights(
         self,
         weights: dict,
@@ -1259,6 +1301,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
     supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
+    # The inner decoder's GDN layers read it.
+    mamba_metadata_cls = Qwen4ExpForCausalLM.mamba_metadata_cls
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
@@ -1269,6 +1313,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
         cls, pretrained_config: object | None = None
     ) -> Literal["V2"]:
         return "V2"
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
+    ) -> RecurrentStateSpec:
+        """Return the text core's declaration, read from ``text_config``."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return Qwen4ExpForCausalLM.get_recurrent_state_spec(text_config, quant_config=quant_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs) -> None:
         kwargs["vision_model_class"] = Qwen3VisionModel

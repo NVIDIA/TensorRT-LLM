@@ -29,19 +29,43 @@
 # proceeding un-BOLTed would let premerge "pass" while actually testing the wrong
 # binary, so every failure here is fatal (distinct non-zero codes for triage):
 #   1  usage / input artifact missing
-#   2  apply_bolt failed (bundle present but did not apply cleanly)
+#   2  the netrc could not be removed after the pull, llvm-bolt could not be
+#      staged, or apply_bolt failed (bundle present but did not apply cleanly)
 #   3  no bundle promoted for the branch (cold start / new branch): nothing to
 #      consume -- await/trigger a postmerge BoltProfileGen (PROMOTE=true), or turn
 #      BOLT_CONSUME off for this build.
+#   4  the profile store could not be read: a location refused the request or the
+#      read failed, so whether a bundle is promoted is unknown. Trying another
+#      branch would fail the same way.
 #
 # Usage: apply_latest.sh <branch> <triple> <in_artifact> <out_bolted_artifact>
 #        <in_artifact> is a release tarball or a .whl.
-# Requires: llvm-bolt on PATH; urm-artifactory-creds for artifactory.sh pull-latest.
+# Requires: llvm-bolt on PATH (staged here when it is missing); and, for
+#           artifactory.sh pull-latest, the environment that
+#           jenkins/scripts/fetch_build_artifact.sh reads: LLM_ARTIFACTS_PRIMARY,
+#           ARTIFACTORY_NETRC (a netrc file with the credential for the aws
+#           location), and ARTIFACTORY_CREDENTIAL_ID.
+#
+# The credential is for the pull alone. Once the bundle is pulled, the script
+# unsets ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID, so nothing it starts
+# afterwards inherits them. With ARTIFACTORY_NETRC_REMOVE_AFTER_READ=1 it also
+# removes the netrc file at that point: a caller sets this when the file is this
+# call's own, so that llvm-bolt's staging and the apply cannot read the
+# credential. A pull that found no bundle leaves the file, for a caller that
+# tries another branch with it; so does a pull that could not read the store,
+# and the caller removes the file. ARTIFACTORY_NETRC names a regular file. A
+# caller keeps the staged llvm-bolt off PATH until this script adds it, so that
+# the pull runs none of the downloaded release's programs.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../scripts/bolt/internal
 TOOLKIT="$(dirname "$HERE")"                            # .../scripts/bolt
+
+# Exit statuses that this script shares with artifactory.sh pull-latest: no
+# bundle is promoted, and the profile store could not be read.
+BOLT_NO_BUNDLE=3
+BOLT_STORE_UNREADABLE=4
 
 BRANCH="${1:?apply_latest: <branch> <triple> <in_artifact> <out_bolted_artifact>}"
 TRIPLE="${2:?triple required}"
@@ -56,7 +80,38 @@ fi
 DEST="$(mktemp -d)"
 trap 'rm -rf "$DEST"' EXIT
 
-# 0) Put llvm-bolt on PATH. No-op when the caller already staged it (the Jenkins
+# 1) Pull the branch `latest` bundle, or the one BOLT_PROFILE_REF pins. A missing
+#    bundle is fatal here (see header): consumption was requested but there is
+#    nothing promoted to consume. A store that could not be read keeps its own
+#    status, so that a caller can tell it from a branch without a bundle; any
+#    other failure of the pull counts as no bundle.
+PULL_STATUS=0
+bash "$HERE/artifactory.sh" pull-latest "$BRANCH" "$TRIPLE" "$DEST" || PULL_STATUS=$?
+if [ "$PULL_STATUS" -eq "$BOLT_STORE_UNREADABLE" ]; then
+    echo "[apply_latest] FATAL: the BOLT profile store could not be read for ${BRANCH}/${TRIPLE}." >&2
+    echo "[apply_latest]   a location refused the request or the read failed; the messages above say why." >&2
+    exit "$BOLT_STORE_UNREADABLE"
+elif [ "$PULL_STATUS" -ne 0 ]; then
+    echo "[apply_latest] FATAL: no promoted bundle for ${BRANCH}/${TRIPLE}." >&2
+    echo "[apply_latest]   run/await a postmerge BoltProfileGen (PROMOTE=true) or unset BOLT_CONSUME." >&2
+    exit "$BOLT_NO_BUNDLE"
+fi
+
+# 2) Take the credential away: nothing below asks the profile store for anything,
+#    and what runs below handles the artifact with tools from outside this
+#    checkout (llvm-bolt, the interpreter and its packages). A netrc that the
+#    caller asked to have removed and that is still there is fatal, because the
+#    apply would run with the credential readable.
+if [ "${ARTIFACTORY_NETRC_REMOVE_AFTER_READ:-}" = 1 ] && [ -n "${ARTIFACTORY_NETRC:-}" ]; then
+    rm -f -- "$ARTIFACTORY_NETRC" || true
+    if [ -e "$ARTIFACTORY_NETRC" ]; then
+        echo "[apply_latest] FATAL: could not remove the netrc after the pull: $ARTIFACTORY_NETRC" >&2
+        exit 2
+    fi
+fi
+unset ARTIFACTORY_NETRC ARTIFACTORY_CREDENTIAL_ID
+
+# 3) Put llvm-bolt on PATH. No-op when the caller already staged it (the Jenkins
 #    build pods do), which keeps this free for them and lets callers that cannot
 #    stage it themselves -- notably the image build, where this runs inside a
 #    docker layer -- just call apply_latest.sh and get a working toolchain.
@@ -65,15 +120,7 @@ if ! . "$HERE/stage_llvm_bolt.sh"; then
     exit 2
 fi
 
-# 1) Pull the branch `latest` bundle. A missing bundle is fatal here (see header):
-#    consumption was requested but there is nothing promoted to consume.
-if ! bash "$HERE/artifactory.sh" pull-latest "$BRANCH" "$TRIPLE" "$DEST"; then
-    echo "[apply_latest] FATAL: no promoted bundle for ${BRANCH}/${TRIPLE}." >&2
-    echo "[apply_latest]   run/await a postmerge BoltProfileGen (PROMOTE=true) or unset BOLT_CONSUME." >&2
-    exit 3
-fi
-
-# 2) Apply the pulled profiles. Fatal on failure -- do NOT fall back to the
+# 4) Apply the pulled profiles. Fatal on failure -- do NOT fall back to the
 #    un-BOLTed artifact (that would silently test/ship the wrong binary).
 #    --manifest verifies ELF hashes against the release layout, which only the
 #    tarball has; a standalone wheel has no tree to walk, so it is omitted there.

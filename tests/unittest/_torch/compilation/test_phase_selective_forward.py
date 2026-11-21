@@ -15,7 +15,10 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    AutotunerWarmupMode,
+    DecoderWarmup,
+)
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
@@ -255,6 +258,8 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
 
     def observe(phase):
         def forward(*args, **kwargs):
+            if phase == "_run_autotuner_warmup":
+                assert kwargs == {"mode": AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION}
             observed.append((phase, model.use_compiled_forward()))
 
         return forward
@@ -279,6 +284,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         "_run_attention_warmup",
         "_run_autotuner_warmup",
         "_run_mamba_hybrid_warmup",
+        "_prewarm_lowm_mma_row_buckets",
         "_general_warmup",
     ):
         monkeypatch.setattr(warmup, method, observe(method))
@@ -308,6 +314,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),
         ("_run_mamba_hybrid_warmup", not enabled),
+        ("_prewarm_lowm_mma_row_buckets", True),
         ("_run_cuda_graph_warmup", True),
         ("_run_cuda_graph_warmup", True),
         ("_general_warmup", not enabled),

@@ -27,7 +27,8 @@ rank has read launch ``e + 1``'s packets, which it wrote after reading launch ``
 
 Each program pushes its words of this rank's shard to every rank, then waits for the same words
 from every rank and writes them to the output. Programs never wait for other programs of the same
-launch, and the grid stays within one wave.
+launch, and the grid stays within one wave. ``gather_pair(x0, x1)`` gathers two equally shaped
+shards in one launch, the two travelling as one shard of twice the size.
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ _BLOCK = 128
 def _ll_allgather_kernel(
     src_ptr,
     out_ptr,
+    src1_ptr,
+    out1_ptr,
     state_ptr,
     peers_ptr,
     shard_words,
@@ -57,6 +60,7 @@ def _ll_allgather_kernel(
     NRANKS: tl.constexpr,
     SLOT_WORDS: tl.constexpr,
     BLOCK: tl.constexpr,
+    PAIR: tl.constexpr,
 ):
     """``state_ptr``: int32 ``[2]`` (epoch, arrival ticket); ``peers_ptr``: int64 ``[NRANKS]``
     receive buffers (two slots of ``SLOT_WORDS`` 8-byte packets, source-rank major). Program ``p``
@@ -69,7 +73,16 @@ def _ll_allgather_kernel(
     for block in range(program, num_blocks, stride):
         w = block * BLOCK + tl.arange(0, BLOCK)
         ok = w < shard_words
-        words = tl.load(src_ptr + w, mask=ok, other=0)
+        if PAIR:
+            second = w >= shard_words // 2
+            local = tl.where(second, w - shard_words // 2, w)
+            words = tl.where(
+                second,
+                tl.load(src1_ptr + local, mask=ok & second, other=0),
+                tl.load(src_ptr + local, mask=ok & ~second, other=0),
+            )
+        else:
+            words = tl.load(src_ptr + w, mask=ok, other=0)
         packet = (tag | words.to(tl.uint32, bitcast=True).to(tl.uint64)).to(tl.int64, bitcast=True)
         for peer in tl.static_range(NRANKS):
             dst = tl.load(peers_ptr + peer).to(tl.uint64).to(tl.pointer_type(tl.int64))
@@ -90,10 +103,19 @@ def _ll_allgather_kernel(
             got = tl.load(mine + offs, mask=mask, other=0, volatile=True)
             waiting = tl.sum(((((got >> 32).to(tl.int32)) != epoch) & mask).to(tl.int32))
         # Output row t holds every rank's row t side by side (all-gather along the last dim).
-        row = w // row_words
-        col = w % row_words
-        out_offs = row[None, :] * (NRANKS * row_words) + src[:, None] * row_words + col[None, :]
-        tl.store(out_ptr + out_offs, got.to(tl.int32), mask=mask)
+        if PAIR:
+            second = w >= shard_words // 2
+            local = tl.where(second, w - shard_words // 2, w)
+            row = local // row_words
+            col = local % row_words
+            out_offs = row[None, :] * (NRANKS * row_words) + src[:, None] * row_words + col[None, :]
+            tl.store(out_ptr + out_offs, got.to(tl.int32), mask=mask & ~second[None, :])
+            tl.store(out1_ptr + out_offs, got.to(tl.int32), mask=mask & second[None, :])
+        else:
+            row = w // row_words
+            col = w % row_words
+            out_offs = row[None, :] * (NRANKS * row_words) + src[:, None] * row_words + col[None, :]
+            tl.store(out_ptr + out_offs, got.to(tl.int32), mask=mask)
 
     # The last program of the launch advances the epoch (every program read it above).
     ticket = tl.atomic_add(state_ptr + 1, 1, sem="acq_rel", scope="gpu")
@@ -169,31 +191,82 @@ class LowLatencyAllGather:
         shard_words = x.numel() * x.element_size() // 4
         return row_bytes % 4 == 0 and shard_words <= self.max_shard_words
 
+    def supports_pair(self, x0: torch.Tensor, x1: torch.Tensor) -> bool:
+        """Whether :meth:`gather_pair` takes these shards."""
+        return (
+            self.supports(x0)
+            and self.supports(x1)
+            and x0.shape == x1.shape
+            and x0.dtype == x1.dtype
+            and x0.device == x1.device
+            and 2 * (x0.numel() * x0.element_size() // 4) <= self.max_shard_words
+        )
+
     def gather(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         """``[rows, nranks * width]``: every rank's ``[rows, width]`` shard in rank order, or None
         when the shard is unsupported (then no rank may launch: the shapes agree across ranks)."""
         if not self.supports(x):
             return None
-        rows, width = x.shape
-        out = torch.empty((rows, self.nranks * width), dtype=x.dtype, device=x.device)
-        shard_words = x.numel() * x.element_size() // 4
-        num_blocks = triton.cdiv(shard_words, _BLOCK)
+        out = self._output(x)
+        self._launch(x, out, x, out, pair=False)
+        return out
+
+    def gather_pair(
+        self, x0: torch.Tensor, x1: torch.Tensor, max_programs: Optional[int] = None
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """``(gather(x0), gather(x1))`` in one launch; None when :meth:`supports_pair` refuses the
+        shards (then no rank may launch). ``max_programs`` caps the grid."""
+        if not self.supports_pair(x0, x1):
+            return None
+        out0, out1 = self._output(x0), self._output(x1)
+        self._launch(x0, out0, x1, out1, pair=True, max_programs=max_programs)
+        return out0, out1
+
+    def pair_programs(
+        self, x0: torch.Tensor, x1: torch.Tensor, max_programs: Optional[int] = None
+    ) -> int:
+        """The grid :meth:`gather_pair` launches for these shards and ``max_programs``."""
+        return self._programs(2 * (x0.numel() * x0.element_size() // 4), max_programs)
+
+    def _programs(self, shard_words: int, max_programs: Optional[int]) -> int:
         # At most one wave, so every program of the launch is resident while it waits.
-        _ll_allgather_kernel[(min(num_blocks, self._num_sms),)](
-            x.view(torch.int32),
-            out.view(torch.int32),
+        programs = min(triton.cdiv(shard_words, _BLOCK), self._num_sms)
+        if max_programs is not None:
+            programs = max(1, min(programs, max_programs))
+        return programs
+
+    def _output(self, x: torch.Tensor) -> torch.Tensor:
+        rows, width = x.shape
+        return torch.empty((rows, self.nranks * width), dtype=x.dtype, device=x.device)
+
+    def _launch(
+        self,
+        x0: torch.Tensor,
+        out0: torch.Tensor,
+        x1: torch.Tensor,
+        out1: torch.Tensor,
+        pair: bool,
+        max_programs: Optional[int] = None,
+    ) -> None:
+        shard_words = x0.numel() * x0.element_size() // 4 * (2 if pair else 1)
+        num_blocks = triton.cdiv(shard_words, _BLOCK)
+        _ll_allgather_kernel[(self._programs(shard_words, max_programs),)](
+            x0.view(torch.int32),
+            out0.view(torch.int32),
+            x1.view(torch.int32),
+            out1.view(torch.int32),
             self._state,
             self._peers,
             shard_words,
-            width * x.element_size() // 4,
+            x0.shape[1] * x0.element_size() // 4,
             num_blocks,
             self.rank,
             NRANKS=self.nranks,
             SLOT_WORDS=self.nranks * self.max_shard_words,
             BLOCK=_BLOCK,
+            PAIR=pair,
             num_warps=4,
         )
-        return out
 
 
 __all__ = ["LowLatencyAllGather"]

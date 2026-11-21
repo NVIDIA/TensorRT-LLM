@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.distributed.communicator import Distributed
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -57,6 +58,8 @@ class _LockstepDist:
                 dist.barrier.wait()
                 return np.array(rows, dtype=np.int64)
 
+            tp_cp_allgather_int64 = tp_allgather_int64
+
         return _Proxy()
 
 
@@ -69,7 +72,7 @@ def _make_batch(num_generation, num_context=0):
     return batch
 
 
-def _make_runner(dist, max_batch=64, dummy_ok=True):
+def _make_runner(dist, max_batch=64, dummy_ok=True, rank=0):
     runner = object.__new__(CUDAGraphRunner)
     runner.enabled = True
     runner.padding_enabled = True
@@ -77,13 +80,16 @@ def _make_runner(dist, max_batch=64, dummy_ok=True):
     runner.enable_encoder_decoder_mixed_cuda_graph = False
     runner.config = SimpleNamespace(
         enable_attention_dp=True,
-        mapping=SimpleNamespace(tp_size=2),
+        mapping=SimpleNamespace(tp_size=2, tp_rank=rank),
         dist=dist,
         batch_size=max_batch,
         use_mrope=False,
         enable_in_graph_sampling=False,
+        skip_adp_count_gather=False,
     )
     runner._sample_type_resolver = None
+    runner.kv_regime_resolver = None
+    runner.packed_split_resolver = None
     runner._round_up_batch_size_with_draft_len = lambda bs, draft_len: 4 if bs <= 4 else 8
     dummy = SimpleNamespace(py_request_id=-1) if dummy_ok else None
     runner._get_or_create_padding_dummy = lambda rm, draft_len: dummy
@@ -100,14 +106,14 @@ def _run_iteration(runner, batch):
     return padding, result
 
 
-def _run_two_ranks(dist, batches, runner_kwargs=({}, {})):
+def _run_two_ranks(dist, batches, runner_kwargs=({}, {}), run_iteration=_run_iteration):
     """Run one iteration on both ranks concurrently; surface a hang or a rank failure."""
     results = {}
 
     def run(rank):
         try:
             runner = _make_runner(dist.for_rank(rank), **runner_kwargs[rank])
-            results[rank] = _run_iteration(runner, batches[rank])
+            results[rank] = run_iteration(runner, batches[rank])
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             results[rank] = exc
 
@@ -124,6 +130,97 @@ def _run_two_ranks(dist, batches, runner_kwargs=({}, {})):
 
 
 _FULL = SampleType.FULL.value
+
+
+@pytest.mark.parametrize(
+    "variant", ["same", "missing_capture", "tokens", "tier", "kv_regime", "packed_split", "pard"]
+)
+def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str) -> None:
+    dist = _LockstepDist()
+
+    def iteration(runner: CUDAGraphRunner, batch: ScheduledRequests) -> tuple:
+        rank = runner.config.mapping.tp_rank
+        runtime_draft_len = (
+            4 if variant == "pard" else 2 if rank == 1 and variant == "tokens" else 1
+        )
+        tokens_per_step = 2 * runtime_draft_len if variant == "pard" else runtime_draft_len + 1
+        key = KeyType(
+            batch_size=4,
+            draft_len=tokens_per_step - 1,
+            sample_type=SampleType.FULL if rank == 1 and variant == "tier" else SampleType.FAST,
+            kv_regime=16384 if rank == 1 and variant == "kv_regime" else 8192,
+            packed_split=rank == 1 and variant == "packed_split",
+        )
+        for request in batch.generation_requests:
+            request.py_draft_tokens = [1] * key.draft_len
+        tokens = 4 * (key.draft_len + 1)
+        runner.config.skip_adp_count_gather = True
+        runner.config.enable_in_graph_sampling = True
+        runner.config.sampling_variants = None
+        runner._capture_allowed = False
+        runner._capture_sample_type = None
+        runner._capture_kv_regime = None
+        runner._capture_packed_split = None
+        runner.supported_batch_sizes = [4]
+        runner.max_beam_width = 1
+        runner._sample_type_resolver = Mock(return_value=key.sample_type)
+        runner.kv_regime_resolver = Mock(return_value=(key.kv_regime,))
+        runner.packed_split_resolver = SimpleNamespace(
+            variants=Mock(return_value=(key.packed_split,))
+        )
+        runner._can_run_cuda_graph_batch = lambda _: True
+        runner._get_seq_len_mode = Mock(return_value=False)
+        runner.get_graph_key = types.MethodType(CUDAGraphRunner.get_graph_key, runner)
+        attention = SimpleNamespace(
+            is_cuda_graph=True,
+            get_adp_token_counts=lambda: [tokens],
+            set_adp_token_counts=lambda columns: columns[0],
+        )
+        spec = SimpleNamespace(
+            dp_num_tokens=lambda: tokens,
+            seq_lens=[key.draft_len + 1] * 4,
+            num_generations=4,
+            runtime_draft_len=runtime_draft_len,
+            runtime_tokens_per_gen_step=tokens_per_step,
+        )
+        runner.graph_metadata = (
+            {}
+            if rank == 1 and variant == "missing_capture"
+            else {key: {"attn_metadata": attention, "spec_metadata": spec}}
+        )
+        runner.maybe_get_cuda_graph(
+            batch, enable_spec_decode=True, attn_metadata=attention, spec_metadata=spec
+        )
+        runner._sample_type_resolver.assert_called_once()
+        runner.kv_regime_resolver.assert_called_once()
+        runner.packed_split_resolver.variants.assert_called_once()
+        inputs = SimpleNamespace(
+            _config=runner.config,
+            mapping=Mapping(world_size=2, tp_size=2, rank=rank, enable_attention_dp=True),
+            dist=runner.config.dist,
+            cuda_graph_runner=runner,
+        )
+        prepare = DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts
+        first = prepare(inputs, attention, spec)
+        assert len(dist.calls[rank]) == (1 if variant in ("same", "pard") else 2)
+        # Without another negotiation, the consumed agreement cannot skip this exchange.
+        second = prepare(inputs, attention, spec)
+        return first, second
+
+    results = _run_two_ranks(
+        dist,
+        (_make_batch(4), _make_batch(4)),
+        runner_kwargs=({"rank": 0}, {"rank": 1}),
+        run_iteration=iteration,
+    )
+
+    counts = [32, 32] if variant == "pard" else [8, 12] if variant == "tokens" else [8, 8]
+    draft_lens = [4, 4] if variant == "pard" else [1, 2] if variant == "tokens" else [1, 1]
+    expected = (counts, [counts, [4, 4], [4, 4], draft_lens])
+    assert results == ((expected, expected), (expected, expected))
+    for calls in dist.calls.values():
+        assert len(calls) == (2 if variant in ("same", "pard") else 3)
+        assert len(calls[-1]) == 5
 
 
 def _assert_payload_types(dist):

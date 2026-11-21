@@ -29,6 +29,8 @@ def jit(monkeypatch, tmp_path):
     import fmha_sm100.jit as jit
 
     monkeypatch.setattr(jit, "_jit_target_value", jit._JIT_TARGET_UNSET)
+    # The OnlyScore proxy modes resolve from the current device; pin them so the faked devices are not queried.
+    monkeypatch.setattr(jit, "_proxy_modes_cache", (False, False))
     monkeypatch.setattr(jit, "CACHE_BASE", tmp_path)
     monkeypatch.setenv(ARCH_ENV, "")
     return jit

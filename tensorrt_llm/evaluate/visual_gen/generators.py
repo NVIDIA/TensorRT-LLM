@@ -29,10 +29,14 @@ class VisualGenGeneratorBackend:
         self.close()
 
 
-def build_visual_generator(model: str, config_path: str | None):
+def build_visual_generator(model: str, config_path: str | dict[str, Any] | None):
     from tensorrt_llm.visual_gen import VisualGenArgs
 
-    config = load_yaml_mapping(config_path, param_hint="--visual_gen_args")
+    config = (
+        config_path
+        if isinstance(config_path, dict)
+        else load_yaml_mapping(config_path, param_hint="--visual_gen_args")
+    )
     visual_gen_args_config, generation_params_config = split_generator_config(config)
     visual_gen_args = (
         VisualGenArgs.from_dict(visual_gen_args_config) if visual_gen_args_config else None

@@ -181,7 +181,7 @@
 /tensorrt_llm/_torch/modules/linear.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/quantization @NVIDIA/trt-llm-models-devs
-/tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/accuracy/ @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-qa-function
 /tests/unittest/_torch/modeling @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/models @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
@@ -364,6 +364,7 @@
 /tests/microbenchmarks/compare_moe_comm.py @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/cute_dsl_kernels/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/cute_dsl_kernels/moe_workload_generator.py @NVIDIA/trt-llm-moe-devs
+/tests/test_common/moe_tactics.py @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/moe @NVIDIA/trt-llm-moe-devs
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
 
@@ -458,6 +459,7 @@
 /cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
 /docker/common/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/scripts/check_cpp_licenses.py @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /pyproject.toml @NVIDIA/trt-llm-oss-compliance
 /requirements-dev.txt @NVIDIA/trt-llm-oss-compliance
 /requirements-grpc-smg.txt @NVIDIA/trt-llm-oss-compliance
@@ -529,10 +531,10 @@
 /tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
 
-# GLM-5.3-Flash (glm5_next)
-/tensorrt_llm/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
-/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
-/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia
+# GLM-5.3-Flash (glm5_next): routing, targets with their native code, and tests
+/tensorrt_llm/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia @kaiyux
+/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia @kaiyux
+/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia @kaiyux
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval
