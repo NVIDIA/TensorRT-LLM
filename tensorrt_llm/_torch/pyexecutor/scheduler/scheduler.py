@@ -126,11 +126,11 @@ class SchedulerOutput(
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
     """Return whether decoder-context scheduling is blocked on encoder output."""
-    if not req.is_context_init_state:
-        return False
-
+    # The attribute is unset outside encoder-decoder models; read it before the state binding.
     ready_event = getattr(req, "py_encoder_output_ready_event", None)
-    return ready_event is not None and not ready_event.query()
+    if ready_event is None or not req.is_context_init_state:
+        return False
+    return not ready_event.query()
 
 
 def drop_decoder_context_requests_waiting_for_encoder_output(

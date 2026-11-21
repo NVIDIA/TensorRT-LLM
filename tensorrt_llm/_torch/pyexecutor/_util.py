@@ -90,7 +90,7 @@ from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .runtime_hooks import runtime_hooks_of
-from .sampler import EarlyStopWithMMResult, TorchSampler
+from .sampler import TorchSampler
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
@@ -222,6 +222,18 @@ def kv_cache_manager_v2_incompatible_features(
     # validated by KvCacheCreator before constructing the manager.
     # V2's native allocations are not tracked by release_with_tag.
     return ["SleepConfig"] if enable_sleep else []
+
+
+def _sparse_attn_has_v1_kv_cache_manager(
+        sparse_attn_config: SparseAttentionConfig) -> bool:
+    """Whether a sparse algorithm also has a V1 KV cache manager to select."""
+    try:
+        manager_cls = get_sparse_attn_kv_cache_manager(
+            sparse_attn_config, use_kv_cache_manager_v2=False)
+    except ValueError:
+        # The algorithm has no manager for V1.
+        return False
+    return not issubclass(manager_cls, KVCacheManagerV2)
 
 
 def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
@@ -1423,12 +1435,22 @@ class KvCacheCreator:
                 # that support both managers, fallback would ignore the user's
                 # explicit manager selection.
                 if uses_sparse_kv_cache_manager:
+                    # Sleep mode is the one feature here that the V1 managers
+                    # serve, so name V1 for the algorithms that have one.
+                    v1_hint = ""
+                    if (incompat == ["SleepConfig"]
+                            and _sparse_attn_has_v1_kv_cache_manager(
+                                sparse_attn_config)):
+                        v1_hint = (
+                            ", or set "
+                            "kv_cache_config.use_kv_cache_manager_v2=False to "
+                            "use this algorithm's V1 KV cache manager")
                     raise NotImplementedError(
                         f"KVCacheManagerV2 for sparse-attention models "
                         f"(algorithm={sparse_attn_config.algorithm!r}) is not "
                         f"supported with "
                         f"{incompat_str}. Disable the incompatible features to "
-                        f"run sparse-attention models.")
+                        f"run sparse-attention models{v1_hint}.")
                 if _has_variable_kv_cache_geometry(model_config):
                     raise NotImplementedError(
                         f"Variable per-layer KV geometry requires KVCacheManagerV2, "
@@ -4905,9 +4927,9 @@ def _create_kv_cache_manager(
             kda_extra_kwargs["pretrained_config"] = config
         if is_glm5_next:
             from ..attention.backends.sparse.glm_kpool import \
-                glm_kpool_cache_row_dim
-            kda_extra_kwargs["index_state_dim"] = glm_kpool_cache_row_dim(
-                int(text_config.index_head_dim))
+                glm_kpool_index_state_dim
+            kda_extra_kwargs["index_state_dim"] = glm_kpool_index_state_dim(
+                _model_config)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -6012,7 +6034,6 @@ def instantiate_sampler(
     *,
     max_batch_size: int,
     max_beam_width: int,
-    mm_encoder_only: bool,
     speculative_config: SpeculativeConfig,
     max_num_sequences: Optional[int] = None,
 ):
@@ -6052,16 +6073,6 @@ def instantiate_sampler(
                 )
         return sampler
 
-    if mm_encoder_only:
-        # NOTE: handle model outputs specially for mm encoder executor/engine.
-        # Only export results on ranks whose responses reach the frontend
-        # (see PyExecutor._enqueue_responses): rank 0, plus the attention-DP
-        # ranks gathered into it. A CUDA IPC handle exported on any other rank
-        # is never opened, so PyTorch would never release its allocation.
-        returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
-                                                  and 0 in mapping.tp_group)
-        return EarlyStopWithMMResult(return_mm_results=returns_responses,
-                                     max_num_tokens=engine.max_num_tokens)
     return TorchSampler(sampler_args)
 
 
