@@ -286,54 +286,72 @@ __launch_bounds__(BLOCK_SIZE, 8)
         }
     }
 
-    // Phase 1: warp-reduce sum/sum-of-squares → mean and rstd (LayerNorm, not RMSNorm).
+    // Phase 1: mean, followed by centered variance from the cached values.
     float localSum = 0.0f;
-    float localSqSum = 0.0f;
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i)
     {
         localSum += xVals[i];
-        localSqSum += xVals[i] * xVals[i];
     }
-
-    // Warp-level reduction.
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
     {
         localSum += __shfl_xor_sync(0xffffffff, localSum, offset);
-        localSqSum += __shfl_xor_sync(0xffffffff, localSqSum, offset);
     }
-
     if (laneId == 0)
     {
         warpSums[warpId] = localSum;
-        warpSqSums[warpId] = localSqSum;
     }
     __syncthreads();
-
-    // Cross-warp reduction in warp 0.
     if (warpId == 0)
     {
         float s = (laneId < NUM_WARPS) ? warpSums[laneId] : 0.0f;
-        float s2 = (laneId < NUM_WARPS) ? warpSqSums[laneId] : 0.0f;
 #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2)
         {
             s += __shfl_xor_sync(0xffffffff, s, offset);
-            s2 += __shfl_xor_sync(0xffffffff, s2, offset);
         }
         if (laneId == 0)
         {
-            float const invD = 1.0f / static_cast<float>(D);
-            float const mean = s * invD;
-            float const var = s2 * invD - mean * mean;
-            meanRstd[0] = mean;
-            meanRstd[1] = rsqrtf(var + p.eps);
+            meanRstd[0] = s * (1.0f / static_cast<float>(D));
         }
     }
     __syncthreads();
 
     float const mean = meanRstd[0];
+    float localCenteredSqSum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ELEMS_PER_THREAD; ++i)
+    {
+        float const centered = xVals[i] - mean;
+        localCenteredSqSum += centered * centered;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
+        localCenteredSqSum += __shfl_xor_sync(0xffffffff, localCenteredSqSum, offset);
+    }
+    if (laneId == 0)
+    {
+        warpSqSums[warpId] = localCenteredSqSum;
+    }
+    __syncthreads();
+    if (warpId == 0)
+    {
+        float s2 = (laneId < NUM_WARPS) ? warpSqSums[laneId] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            s2 += __shfl_xor_sync(0xffffffff, s2, offset);
+        }
+        if (laneId == 0)
+        {
+            float const var = s2 * (1.0f / static_cast<float>(D));
+            meanRstd[1] = rsqrtf(var + p.eps);
+        }
+    }
+    __syncthreads();
+
     float const rstd = meanRstd[1];
 
     // Pre-read sf_scale scalar (HAS_QUANT only).
