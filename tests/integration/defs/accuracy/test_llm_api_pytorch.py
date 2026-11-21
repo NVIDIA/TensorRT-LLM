@@ -17,13 +17,13 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from unittest import mock
 
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from datasets import load_dataset
+from datasets import DownloadConfig, load_dataset
 from defs.conftest import get_sm_version, is_sm_100f, is_sm_120f
 from mpi4py.futures import MPIPoolExecutor
 from pytest_mock import MockerFixture
@@ -6161,6 +6161,122 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @staticmethod
+    def _reasoning_replay_prompt(dataset_path: Path) -> str:
+        """Build the repeated chemistry question from the local GPQA cache."""
+        assert dataset_path.is_dir(
+        ), f"Missing cached GPQA dataset: {dataset_path}"
+        dataset = load_dataset(
+            str(dataset_path),
+            "gpqa_diamond",
+            split="train",
+            download_config=DownloadConfig(local_files_only=True),
+        )
+        question_prefix = "1,3-dibromoadamantane is heated to 240C"
+        matches = [
+            row for row in dataset
+            if row["Question"].startswith(question_prefix)
+        ]
+        assert len(matches) == 1, (
+            "Expected exactly one GPQA replay question beginning with "
+            f"{question_prefix!r}; found {len(matches)}")
+        row = matches[0]
+        ordered_choices = ("triplet of triplets", "doublet of triplets",
+                           "triplet", "pentet")
+        cached_choices = {
+            row[field]
+            for field in ("Correct Answer", "Incorrect Answer 1",
+                          "Incorrect Answer 2", "Incorrect Answer 3")
+        }
+        assert cached_choices == set(ordered_choices), (
+            "Cached GPQA answer choices differ from the replay choices")
+        return (
+            "Answer the following multiple choice question. The last line of "
+            "your response should be in the following format: "
+            "'Answer: A/B/C/D' (e.g. 'Answer: A').\n\n" + row["Question"] +
+            "\n\n" +
+            "\n".join(f"{letter}) {choice}"
+                      for letter, choice in zip("ABCD", ordered_choices)))
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_device_not_contain(["B200", "B300", "GB200", "GB300"])
+    @pytest.mark.parametrize("mode", ["baseline", "mtp3", "dflash7"])
+    def test_reasoning_replay(
+        self,
+        mode: Literal["baseline", "mtp3", "dflash7"],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exercise eleven unseeded long-reasoning requests with GDN replay off.
+
+        Natural stops and token-budget stops are valid replay outcomes.
+        Accuracy and repetition quality require separate evaluation. The
+        pipeline records duration and resource usage.
+        """
+        model_root = Path(llm_models_root())
+        model_path = Path(self.MODEL_PATH)
+        assert model_path.is_dir(), f"Missing target checkpoint: {model_path}"
+        prompt = self._reasoning_replay_prompt(model_root / "datasets/gpqa")
+        max_tokens = 131072
+        repeats = 11
+
+        spec_config = None
+        if mode == "mtp3":
+            spec_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                            use_rejection_sampling=False)
+        elif mode == "dflash7":
+            draft_path = model_root / "Qwen3.6-35B-A3B-DFlash"
+            assert draft_path.is_dir(
+            ), f"Missing DFlash checkpoint: {draft_path}"
+            spec_config = DFlashDecodingConfig(
+                speculative_model=str(draft_path), max_draft_len=7)
+
+        monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+        with LLM(
+                str(model_path),
+                trust_remote_code=True,
+                tensor_parallel_size=1,
+                moe_expert_parallel_size=1,
+                max_batch_size=16,
+                max_seq_len=262144,
+                max_num_tokens=8192,
+                enable_chunked_prefill=True,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                  max_batch_size=16),
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.9,
+                    dtype="fp8",
+                    mamba_ssm_cache_dtype="bfloat16",
+                    use_kv_cache_manager_v2=False,
+                ),
+                moe_config=MoeConfig(backend="TRTLLM"),
+                speculative_config=spec_config,
+        ) as llm:
+            formatted_prompt = llm.tokenizer.apply_chat_template(
+                [{
+                    "role": "user",
+                    "content": prompt
+                }],
+                tokenize=True,
+                return_dict=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for _ in range(repeats):
+                result = llm.generate_async(
+                    formatted_prompt,
+                    sampling_params=SamplingParams(temperature=1.0,
+                                                   top_p=0.95,
+                                                   max_tokens=max_tokens),
+                ).result()
+                assert len(result.outputs) == 1
+                output = result.outputs[0]
+                assert output.token_ids
+                assert output.finish_reason in ("stop", "length"), (
+                    f"Unexpected generation finish: "
+                    f"finish_reason={output.finish_reason}, "
+                    f"generated_tokens={len(output.token_ids)}")
 
 
 @skip_pre_blackwell
