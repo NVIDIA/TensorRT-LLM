@@ -147,6 +147,7 @@ class _ControlExecutor:
     _control_drain_ready = PyExecutor._control_drain_ready
     _has_pending_connector_transfers = PyExecutor._has_pending_connector_transfers
     _has_pending_context_retirement = PyExecutor._has_pending_context_retirement
+    _pop_sleep_wakeup_abort = PyExecutor._pop_sleep_wakeup_abort
     _dist_size = staticmethod(PyExecutor._dist_size)
 
     def __init__(self, *, drain, active=(), transfers=0, connector=None):
@@ -169,9 +170,6 @@ class _ControlExecutor:
 
     def _num_inflight_kv_transfers(self):
         return self._transfers
-
-    def _pop_sleep_wakeup_abort(self, control_id):
-        return None
 
     def _retire_inflight_batch_for_control(self):
         self.order.append("retire")

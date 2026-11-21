@@ -26,10 +26,12 @@ import pytest
 from test_common.serve.routes import (
     CONFIGS,
     VISUAL_GEN_CONFIGS,
+    build_reference_data,
     compare,
     format_failure,
     read_reference,
     snapshot_config,
+    write_reference,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -57,8 +59,18 @@ def test_reference_configuration_names(reference):
 
 
 @pytest.mark.parametrize("name", [config.name for config in CONFIGS])
-def test_routes_match_reference(name, reference, live_snapshots):
-    recorded = reference["configs"][name]
+def test_routes_match_reference(name, reference, live_snapshots, tmp_path):
+    recorded = reference["configs"].get(name)
+    if recorded is None:
+        candidate = write_reference(
+            build_reference_data(tmp_path / "apps"), tmp_path / "trtllm_serve_routes.yaml"
+        )
+        pytest.fail(
+            f"Configuration '{name}' is missing from the committed reference. "
+            "Review and commit the generated candidate; it is not accepted automatically.\n"
+            f"BEGIN GENERATED ROUTE REFERENCE\n{candidate.read_text()}"
+            "END GENERATED ROUTE REFERENCE"
+        )
     live = live_snapshots[name]
     assert recorded.get("error") == live.get("error"), (
         f"Configuration '{name}' now fails with {live.get('error')!r} instead of "

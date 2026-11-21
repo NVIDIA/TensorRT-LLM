@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for ExecutorRequestQueue class.
 
 This module tests the ExecutorRequestQueue class functionality including:
@@ -8,6 +10,7 @@ This module tests the ExecutorRequestQueue class functionality including:
 """
 
 import datetime
+import pickle
 import queue
 import threading
 import time
@@ -19,6 +22,9 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestAdmissionState,
     RequestQueueItem)
+from tensorrt_llm._torch.pyexecutor.request_inputs import (ExecutorRequest,
+                                                           PythonRequestInputs)
+from tensorrt_llm.bindings.executor import Request, SamplingConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -70,6 +76,100 @@ def test_executor_queue_init(executor_queue, mock_dist):
     assert executor_queue.get_admission_state() is RequestAdmissionState.RUNNING
     assert isinstance(executor_queue.request_queue, queue.Queue)
     assert isinstance(executor_queue.enqueue_lock, type(threading.Lock()))
+
+
+def test_checkpoint_rejects_public_requests_and_competing_controls(
+        executor_queue):
+    """Protect the checkpoint independently of memory sleep and control sentinels."""
+    executor_queue.close_checkpoint_admission("source")
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match="Checkpoint"):
+        executor_queue.enqueue_request(Mock())
+    with pytest.raises(RuntimeError, match="Checkpoint"):
+        executor_queue.begin_sleep_transition(["kv_cache"])
+    with pytest.raises(RuntimeError, match="Checkpoint"):
+        executor_queue.enqueue_control_request()
+    with pytest.raises(RuntimeError, match="Profiling"):
+        executor_queue.enqueue_profile_start_request({})
+    executor_queue.enqueue_control_request(checkpoint_session="source")
+    assert executor_queue.request_queue.get_nowait().is_control_request
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_checkpoint_private_permit_is_single_use(executor_queue, legacy):
+    """One internal token admits one request, never an arbitrary batch or replay."""
+    executor_queue.close_checkpoint_admission("source")
+    executor_queue.bind_checkpoint_restore("source", "restore")
+    executor_queue.set_checkpoint_validation("restore", "private")
+    native = Request(input_token_ids=[1, 2],
+                     max_tokens=2,
+                     sampling_config=SamplingConfig())
+    if legacy:
+        native.py_checkpoint_validation_token = "private"
+        native.py_prompt_trimmed_prefix = 1
+        request = ExecutorRequest.adapt(native)
+    else:
+        request = ExecutorRequest(
+            native,
+            PythonRequestInputs(checkpoint_validation_token="private",
+                                prompt_trimmed_prefix=1))
+    request = pickle.loads(pickle.dumps(request))
+    assert request.py_checkpoint_validation_token == "private"
+    assert request.py_prompt_trimmed_prefix == 1
+    with pytest.raises(RuntimeError):
+        executor_queue.enqueue_requests([request, request])
+    with patch.object(executor_queue, "_generate_child_request_ids"):
+        executor_queue.enqueue_request(request)
+    with pytest.raises(RuntimeError):
+        executor_queue.enqueue_request(request)
+    assert not executor_queue.can_enqueue_request()
+    executor_queue.open_checkpoint_admission("restore")
+    assert executor_queue.can_enqueue_request()
+
+
+def test_memory_completion_cannot_clear_checkpoint_gate(executor_queue):
+    """A memory-ready update is not checkpoint serving authorization."""
+    executor_queue.close_checkpoint_admission("source")
+    executor_queue.admission_state = RequestAdmissionState.WAKING
+    executor_queue.complete_wakeup_transition()
+    assert executor_queue.get_admission_state() == RequestAdmissionState.RUNNING
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match="Stale"):
+        executor_queue.open_checkpoint_admission("other")
+
+
+def test_checkpoint_failure_cannot_be_activated(executor_queue):
+    """A failed native transition requires host cleanup, not an activation retry."""
+    executor_queue.close_checkpoint_admission("source")
+    executor_queue.fail_checkpoint()
+    with pytest.raises(RuntimeError):
+        executor_queue.open_checkpoint_admission("source")
+    assert not executor_queue.can_enqueue_request()
+
+
+@pytest.mark.parametrize("first", ["checkpoint", "sleep_wakeup"])
+def test_failure_reason_survives_repeated_cleanup(
+        executor_queue: ExecutorRequestQueue, first: str) -> None:
+    """Later cleanup must not relabel the operation that first failed admission.
+
+    Args:
+        executor_queue: Real request queue with an isolated distributed boundary.
+        first: Failure category that owns the permanent admission latch.
+    """
+    failures = {
+        "checkpoint": executor_queue.fail_checkpoint,
+        "sleep_wakeup": executor_queue.fail_sleep_wakeup_transition,
+    }
+    failures[first]()
+    for fail in failures.values():
+        fail()
+    assert executor_queue.get_memory_status() == (RequestAdmissionState.FAILED,
+                                                  frozenset(), first)
+    executor_queue.abort_sleep_transition()
+    executor_queue.abort_wakeup_transition()
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match=rf"admission is failed \({first}\)"):
+        executor_queue.enqueue_request(Mock())
 
 
 def test_enqueue_requests(executor_queue):
@@ -225,6 +325,7 @@ def test_memory_status_snapshot_tracks_partial_restore(executor_queue):
     assert executor_queue.get_memory_status() == (
         RequestAdmissionState.RUNNING,
         frozenset(),
+        None,
     )
 
     executor_queue.begin_sleep_transition(["model", "kv_cache"])
@@ -232,6 +333,7 @@ def test_memory_status_snapshot_tracks_partial_restore(executor_queue):
     assert executor_queue.get_memory_status() == (
         RequestAdmissionState.PARKED,
         frozenset({"model", "kv_cache"}),
+        None,
     )
 
     executor_queue.begin_wakeup_transition(["kv_cache"])
@@ -239,6 +341,7 @@ def test_memory_status_snapshot_tracks_partial_restore(executor_queue):
     assert executor_queue.get_memory_status() == (
         RequestAdmissionState.PARKED,
         frozenset({"model"}),
+        None,
     )
 
 

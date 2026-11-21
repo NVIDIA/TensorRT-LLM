@@ -5174,7 +5174,7 @@ class ExecutorMemoryType(StrEnum):
 
 
 class RuntimeMemoryStatus(StrictBaseModel):
-    """Status of runtime memory managed by sleep and wakeup."""
+    """Runtime-memory admission state and its terminal failure category."""
 
     state: Literal["running", "parking", "parked", "waking", "failed"] = Field(
         description="Current runtime-memory admission state.")
@@ -5182,6 +5182,11 @@ class RuntimeMemoryStatus(StrictBaseModel):
         default_factory=list,
         description=
         "Memory tags that remain released, sorted lexicographically by value.")
+    failure_reason: Literal["checkpoint", "sleep_wakeup"] | None = Field(
+        default=None,
+        description="Operation category that first closed admission permanently. "
+        "None means no recorded terminal failure; this is not serving readiness."
+    )
 
     @field_validator("parked_tags")
     @classmethod
