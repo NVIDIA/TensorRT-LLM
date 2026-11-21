@@ -258,6 +258,27 @@ def test_sampling_override_cli_wins_on_temperature_and_top_p():
     assert out.stop == ["</s>"]
 
 
+@pytest.mark.parametrize(
+    "sampling_override,expected_temperature,expected_top_p",
+    [
+        (False, 0.0, 1.0),
+        (True, 1.0, 0.95),
+    ],
+)
+def test_sampling_override_with_zero_seed(
+    sampling_override: bool, expected_temperature: float, expected_top_p: float
+) -> None:
+    """Resolve conflicting task defaults while retaining a zero sampling seed."""
+    sampling_params = SamplingParams(temperature=1.0, top_p=0.95, seed=0)
+    wrapper = _make_lm_eval_wrapper(
+        sampling_params=sampling_params, sampling_override=sampling_override
+    )
+    effective = wrapper._get_sampling_params({"temperature": 0.0, "top_p": 1.0})
+    assert effective.temperature == expected_temperature
+    assert effective.top_p == expected_top_p
+    assert effective.seed == 0
+
+
 def test_sampling_override_still_respects_max_tokens_from_yaml():
     """sampling_override only touches temperature / top_p.
 
