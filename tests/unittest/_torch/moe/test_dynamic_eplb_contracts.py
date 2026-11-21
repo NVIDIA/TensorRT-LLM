@@ -908,6 +908,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor.hang_detector = SimpleNamespace(detected=lambda: False)
     executor.worker_thread = SimpleNamespace(join=lambda: events.append("worker_join"))
     executor.kv_connector_manager = None
+    executor.store_host_donor = None
     executor.enable_attention_dp = False
     executor._kv_connector_failed = False
     executor.dist = SimpleNamespace(pp_size=1)

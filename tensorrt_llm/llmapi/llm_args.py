@@ -33,8 +33,8 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, TypeAdapter, field_validator,
-                      model_validator)
+                      PrivateAttr, StrictInt, TypeAdapter, ValidationInfo,
+                      field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -3576,6 +3576,230 @@ class KvCacheConnectorConfig(StrictBaseModel):
                 "mooncake_store describes a Mooncake pool, but this config "
                 f"resolves to connector_module={self.connector_module!r}. "
                 "Set connector: mooncake-store, or drop mooncake_store.")
+        return self
+
+
+class StoreHostDonorLateAutoConfig(StrictBaseModel):
+    """Size the late donation per GPU from a host-memory budget.
+
+    After warmup each GPU (rank) lends
+    ``max(0, host_budget_per_gpu - store_per_gpu - peak - margin_per_gpu
+    - startup)``, where ``peak`` is ``head_process_peak_per_gpu`` on the head
+    node (the node that runs the pool master and the frontend) and
+    ``process_peak_per_gpu`` elsewhere, and ``startup`` is the node's
+    ``startup_size_per_node`` over its ranks. The result is cut to the job's
+    memory limit and rounded down to ``granularity`` per NUMA node.
+    """
+    host_budget_per_gpu: Union[StrictInt, str] = Field(
+        status="prototype",
+        telemetry=False,
+        description="Host memory one GPU may account for (store plus "
+        "process), e.g. a quarter of the node's memory on a 4-GPU node.")
+    store_per_gpu: Union[StrictInt, str] = Field(
+        status="prototype",
+        telemetry=False,
+        description="Host store this GPU already holds outside the donor "
+        "(the KV connector's global segment). Checked against "
+        "global_segment_size in $MOONCAKE_CONFIG_PATH when that file is "
+        "readable.")
+    process_peak_per_gpu: Union[StrictInt, str] = Field(
+        status="prototype",
+        telemetry=False,
+        description="Peak process memory per GPU on a node without the "
+        "frontend, measured over a full run.")
+    head_process_peak_per_gpu: Union[StrictInt, str] = Field(
+        status="prototype",
+        telemetry=False,
+        description="Peak process memory per GPU on the head node, frontend "
+        "included, measured over a full run.")
+    margin_per_gpu: Union[StrictInt, str] = Field(
+        "2560MiB",
+        status="prototype",
+        telemetry=False,
+        description="Memory per GPU kept out of the donation.")
+    head_hosts: Optional[List[str]] = Field(
+        None,
+        status="prototype",
+        telemetry=False,
+        description="Host names that count as head nodes. Default: the node "
+        "the pool master runs on. A node whose role cannot be determined "
+        "counts as a head node.")
+    granularity: Union[StrictInt, str] = Field(
+        "1GiB",
+        status="prototype",
+        telemetry=False,
+        description="Each NUMA node's late share is rounded down to a "
+        "multiple of this.")
+    job_memory_limit: Optional[Union[StrictInt, str]] = Field(
+        None,
+        status="prototype",
+        telemetry=False,
+        description="Memory limit of this job on the node. Default: the "
+        "tightest cgroup v2 memory.max above this process.")
+
+    @field_validator("host_budget_per_gpu",
+                     "store_per_gpu",
+                     "process_peak_per_gpu",
+                     "head_process_peak_per_gpu",
+                     "margin_per_gpu",
+                     "granularity",
+                     "job_memory_limit",
+                     mode="after")
+    @classmethod
+    def _check_size(cls, value, info: ValidationInfo):
+        if value is None:
+            return value
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(
+                f"store_host_donor.late_auto.{info.field_name}: {exc}")
+        if parsed < 0:
+            raise ValueError(f"store_host_donor.late_auto.{info.field_name}: "
+                             f"{value!r} is negative")
+        if info.field_name in ("host_budget_per_gpu", "granularity",
+                               "job_memory_limit") and parsed == 0:
+            raise ValueError(
+                f"store_host_donor.late_auto.{info.field_name} must be > 0")
+        return value
+
+    @field_validator("head_hosts", mode="after")
+    @classmethod
+    def _check_head_hosts(cls, value):
+        if value is not None and (not value or not all(value)):
+            raise ValueError("store_host_donor.late_auto.head_hosts must be a "
+                             f"nonempty list of names, got {value}")
+        return value
+
+
+class StoreHostDonorConfig(StrictBaseModel):
+    """Plain host memory this server lends to a Mooncake store pool.
+
+    The worker itself registers the memory with the pool's master, so no KV
+    connector and no helper process is needed; a server that also runs the
+    'mooncake-store' connector keeps its connector client separate. Each
+    node-level size is split evenly over the node's CPU NUMA nodes and one
+    rank per NUMA node registers that share with its memory bound there.
+    TLLM_DISABLE_STORE_HOST_DONOR=1 turns it off.
+    """
+    master: Optional[str] = Field(
+        None,
+        status="prototype",
+        telemetry=False,
+        description="The pool master's 'host:port'. Defaults to "
+        "$MOONCAKE_MASTER, then to master_server_address in "
+        "$MOONCAKE_CONFIG_PATH.")
+    protocol: Literal["rdma", "tcp"] = Field(
+        "rdma",
+        status="prototype",
+        telemetry=False,
+        description="Transport the pool reaches this memory over.")
+    device_name: Optional[str] = Field(
+        None,
+        status="prototype",
+        telemetry=False,
+        description="RDMA devices, comma separated. Defaults to every active "
+        "InfiniBand device at the host's highest link rate.")
+    startup_size_per_node: Union[StrictInt, str] = Field(
+        0,
+        status="prototype",
+        telemetry=False,
+        description="Host bytes per node registered while the model loads, as "
+        "a binary size ('512GiB') or a byte count.")
+    late_size_per_node: Union[StrictInt, str] = Field(
+        0,
+        status="prototype",
+        telemetry=False,
+        description="Host bytes per node registered after every rank has "
+        "finished warmup and CUDA graph capture, when memory used only during "
+        "startup has been released. 'auto' sizes it per GPU from the "
+        "late_auto budget.")
+    numa_nodes: Optional[List[NonNegativeInt]] = Field(
+        None,
+        status="prototype",
+        telemetry=False,
+        description="CPU NUMA nodes to split each node's sizes over. Defaults "
+        "to every NUMA node with CPUs that this process may allocate on.")
+    local_buffer_size: Union[StrictInt, str] = Field(
+        "1GiB",
+        status="prototype",
+        telemetry=False,
+        description="Transfer buffer of each donor client, on top of the "
+        "lent sizes.")
+    local_hostname: Optional[str] = Field(
+        None,
+        status="prototype",
+        telemetry=False,
+        description="Address the segments are registered under. Defaults to "
+        "the interface that routes to the master.")
+    late_mode: Literal["auto", "same_client", "new_client"] = Field(
+        "auto",
+        status="prototype",
+        telemetry=False,
+        description="How the late size is registered: mounted on the startup "
+        "client ('same_client'), through a second client ('new_client'), or "
+        "the former when the Mooncake bindings support it ('auto').")
+    late_delay_seconds: NonNegativeFloat = Field(
+        0.0,
+        status="prototype",
+        telemetry=False,
+        description="0 registers the late size after warmup, before the "
+        "executor starts serving. A positive value registers it that many "
+        "seconds after the executor started, on a background thread.")
+    late_auto: Optional[StoreHostDonorLateAutoConfig] = Field(
+        None,
+        status="prototype",
+        telemetry=False,
+        description="Budget the late size is computed from when "
+        "late_size_per_node is 'auto'.")
+
+    @field_validator("startup_size_per_node",
+                     "late_size_per_node",
+                     "local_buffer_size",
+                     mode="after")
+    @classmethod
+    def _check_size(cls, value, info: ValidationInfo):
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        if info.field_name == "late_size_per_node" and value == "auto":
+            return value
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(f"store_host_donor.{info.field_name}: {exc}")
+        if parsed < 0:
+            raise ValueError(f"store_host_donor.{info.field_name}: {value!r} "
+                             "is negative")
+        if info.field_name == "local_buffer_size" and parsed == 0:
+            raise ValueError("store_host_donor.local_buffer_size must be > 0")
+        return value
+
+    @field_validator("numa_nodes", mode="after")
+    @classmethod
+    def _check_numa_nodes(cls, value):
+        if value is not None and (not value or len(set(value)) != len(value)):
+            raise ValueError("store_host_donor.numa_nodes must be a nonempty "
+                             f"list without duplicates, got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _check_lends_something(self) -> "StoreHostDonorConfig":
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        auto = self.late_size_per_node == "auto"
+        if auto != (self.late_auto is not None):
+            raise ValueError(
+                "store_host_donor: late_size_per_node 'auto' and late_auto go "
+                "together; set both or neither.")
+        if auto:
+            return self
+        if (parse_size(self.startup_size_per_node, strict_units=True) == 0 and
+                parse_size(self.late_size_per_node, strict_units=True) == 0):
+            raise ValueError(
+                "store_host_donor lends nothing: set startup_size_per_node "
+                "and/or late_size_per_node, or drop store_host_donor.")
         return self
 
 
@@ -9013,6 +9237,14 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="The config for KV cache connector.",
         status="prototype",
+    )
+
+    store_host_donor: Optional[StoreHostDonorConfig] = Field(
+        default=None,
+        description="Host memory this server lends to a Mooncake store pool, "
+        "registered by the worker itself; needs no KV connector.",
+        status="prototype",
+        telemetry=False,
     )
 
     mm_encoder_only: bool = Field(

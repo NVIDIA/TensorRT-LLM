@@ -34,20 +34,27 @@ Each server joins the pool the master's manifest describes::
 
 Every rank that joins contributes `segment_size`, so capacity is the sum over
 participating ranks. `role` governs traffic only; see `config.StoreRole`.
-`ledger.format_pool_report` totals up what each rank recorded.
+A node whose servers run no connector can still lend memory, through a donor
+that holds a segment and nothing else; see `donor.py`::
+
+    trtllm-serve mooncake_donor --pool_file /shared/pool.json --segment_size 768GiB
+
+`ledger.format_pool_report` totals up what each rank and donor recorded.
 """
 
+from .donor import donate_segment
 from .ledger import format_pool_report
 from .master import maybe_provision_pool, running_master
 from .scheduler import MooncakeStoreConnectorScheduler
 from .worker import MooncakeStoreConnectorWorker
 
 # What reaches this package from outside it: the two classes `registry.py`
-# resolves by name, and the three entry points `trtllm-serve` calls. Everything
+# resolves by name, and the four entry points `trtllm-serve` calls. Everything
 # else is imported from the submodule that defines it.
 __all__ = [
     "MooncakeStoreConnectorScheduler",
     "MooncakeStoreConnectorWorker",
+    "donate_segment",
     "format_pool_report",
     "maybe_provision_pool",
     "running_master",

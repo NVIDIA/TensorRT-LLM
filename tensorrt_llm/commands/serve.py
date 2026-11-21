@@ -52,7 +52,8 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      apply_config_overrides,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
-from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
+from tensorrt_llm.commands.mooncake import (mooncake_donor, mooncake_master,
+                                            mooncake_pool_report)
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -3650,7 +3651,9 @@ main = DefaultGroup(
         "mm_embedding_serve": serve_encoder,
         "embeddings": serve_embedding,
         # The part of a Mooncake pool that outlives and is shared by every
-        # server, and the report of what they collectively contributed to it.
+        # server, a donor lending a node's memory to it, and the report of
+        # what they collectively contributed to it.
+        "mooncake_donor": mooncake_donor,
         "mooncake_master": mooncake_master,
         "mooncake_pool_report": mooncake_pool_report,
         "rerank": serve_rerank,

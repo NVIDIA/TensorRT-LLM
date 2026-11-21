@@ -35,6 +35,7 @@ from tensorrt_llm.logger import logger
 from .config import SEGMENTS_DIR_NAME
 
 __all__ = [
+    "DONOR_ROLE",
     "SegmentRecord",
     "format_pool_report",
     "read_segments",
@@ -43,6 +44,10 @@ __all__ = [
 ]
 
 _GIB = 1 << 30
+
+#: The role a `trtllm-serve mooncake_donor` records. A donor lends a node's
+#: memory beside the servers' ranks, so it is not one of them.
+DONOR_ROLE = "donor"
 
 #: The master's own glog line for a block placement. `segment` names the client
 #: process that owns the memory the block landed in, as `host:port`.
@@ -168,12 +173,16 @@ def _roles_by_host(records: Sequence[SegmentRecord]) -> Dict[str, str]:
 
 
 def _capacity_lines(records: Sequence[SegmentRecord]) -> List[str]:
-    """Total capacity, how it splits by role, and whether it is uniform."""
+    """Total capacity, how it splits by role, and whether the ranks' share is uniform."""
+    ranks = [record for record in records if record.role != DONOR_ROLE]
+    donors = [record for record in records if record.role == DONOR_ROLE]
     total = sum(record.segment_size for record in records)
-    lines = [
-        f"ranks         : {len(records)} across {len({r.host for r in records})} host(s)",
-        f"capacity      : {total / _GIB:.1f} GiB",
-    ]
+    lines = [f"ranks         : {len(ranks)} across {len({r.host for r in ranks})} host(s)"]
+    if donors:
+        lines.append(
+            f"donors        : {len(donors)} across {len({r.host for r in donors})} host(s)"
+        )
+    lines.append(f"capacity      : {total / _GIB:.1f} GiB")
 
     by_role: Dict[str, List[SegmentRecord]] = {}
     for record in records:
@@ -187,11 +196,12 @@ def _capacity_lines(records: Sequence[SegmentRecord]) -> List[str]:
         )
 
     # Each server names its own segment_size and can see no other's, so this
-    # is the only vantage point a mismatch is visible from.
-    sizes = sorted({record.segment_size for record in records})
+    # is the only vantage point a mismatch is visible from. Donors size their
+    # segments on their own, so only the ranks are held to one size.
+    sizes = sorted({record.segment_size for record in ranks})
     if len(sizes) == 1:
         lines.append(f"per rank      : {sizes[0] / _GIB:.1f} GiB, uniform")
-    else:
+    elif sizes:
         spelled = ", ".join(f"{size / _GIB:.1f} GiB" for size in sizes)
         lines.append(
             f"per rank      : NOT UNIFORM. {len(sizes)} distinct sizes ({spelled})."
