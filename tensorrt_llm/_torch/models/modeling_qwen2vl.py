@@ -33,7 +33,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
-    MultimodalItemPartition, MultimodalParams)
+    MultimodalItemPartition, MultimodalParams, hash_mm_embeddings)
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1331,7 +1331,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             "tensor_size": tuple(image_embedding.shape)
         } for image_embedding in image_embeddings]
         prompt_token_ids, multimodal_params = build_disagg_prefill_multimodal_inputs(
-            inputs, mm_handles)
+            inputs, mm_handles, mm_hashes=hash_mm_embeddings(image_embeddings))
 
         # ``build_disagg_prefill_multimodal_inputs`` already emits the in-vocab
         # ``image_token_id`` at mm positions (no legacy OOV remap), so
@@ -1354,7 +1354,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         multimodal_data = multimodal_params.multimodal_data
         multimodal_data["multimodal_embedding"] = image_embeddings
         multimodal_data["mrope_config"] = mrope_config
-        return prompt_token_ids, {"multimodal_data": multimodal_data}
+        return prompt_token_ids, {
+            "multimodal_data": multimodal_data,
+            "multimodal_input": multimodal_params.multimodal_input,
+        }
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
     @torch.inference_mode()
