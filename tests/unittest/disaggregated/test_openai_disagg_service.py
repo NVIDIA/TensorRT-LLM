@@ -350,6 +350,48 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
     assert gen_request.conversation_params.conversation_id == "conv-chat"
 
 
+@pytest.mark.parametrize("chat", [True, False], ids=["chat", "completion"])
+def test_gen_request_keeps_multimodal_handoff_on_the_wire(chat):
+    """The context worker's cache identity and mRoPE reach the generation worker unchanged."""
+    from dataclasses import asdict
+
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+    from tensorrt_llm.serve.openai_client import _encode_request_body
+
+    handoff = {
+        "multimodal_input": asdict(
+            MultimodalInput.from_components([[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], ["image-id"])
+        ),
+        "mrope_position_ids_handle": SharedTensorContainer.from_tensor_bytes(
+            torch.arange(12).reshape(3, 1, 4)
+        ).dump_to_dict(),
+        "mrope_position_deltas_handle": SharedTensorContainer.from_tensor_bytes(
+            torch.tensor([-2], dtype=torch.int32)
+        ).dump_to_dict(),
+    }
+    service = _make_service("context_first")
+    if chat:
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hello"}]
+        )
+        ctx_response = _make_chat_response(finish_reason="length")
+    else:
+        request = CompletionRequest(model="test-model", prompt="hello")
+        ctx_response = _make_completion_response("", finish_reason="length")
+    # The context server's JSON reply, as the router parses it.
+    ctx_json = ctx_response.model_dump(mode="json")
+    ctx_json["choices"][0]["disaggregated_params"].update(handoff)
+    ctx_response = type(ctx_response).model_validate(ctx_json)
+
+    gen_request = service._get_gen_request(request, ctx_response, 42)
+    wire = msgspec.msgpack.decode(_encode_request_body(gen_request))
+    received = type(request).model_validate(wire).disaggregated_params
+
+    assert received.request_type == "generation_only"
+    assert received.model_dump(include=set(handoff)) == handoff
+
+
 def test_get_ctx_request_preserves_conversation_params_on_wire():
     service = _make_service("context_first")
     request = CompletionRequest(

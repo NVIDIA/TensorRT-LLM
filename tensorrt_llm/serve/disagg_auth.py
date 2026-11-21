@@ -25,7 +25,7 @@ from tensorrt_llm.serve.conversation_id import (
     get_request_conversation_id,
     get_request_subagent_affinity_id,
 )
-from tensorrt_llm.serve.openai_protocol import UCompletionRequest
+from tensorrt_llm.serve.openai_protocol import _MULTIMODAL_HANDOFF_FIELDS, UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
 SUBAGENT_AFFINITY_AUTH_HEADER = "x-trtllm-subagent-affinity-auth"
@@ -40,7 +40,7 @@ _MISSING_AUTH_KEY_WARNING = (
 
 
 def get_internal_disagg_auth_fields() -> tuple[str, ...]:
-    return _INTERNAL_DISAGG_AUTH_FIELDS
+    return _INTERNAL_DISAGG_AUTH_FIELDS + _MULTIMODAL_HANDOFF_FIELDS
 
 
 def _warn_missing_auth_key() -> None:
@@ -67,9 +67,16 @@ def _auth_payload(request: UCompletionRequest) -> bytes:
         field_name: _canonical_ctx_info_endpoint(value)
         if field_name == "ctx_info_endpoint"
         else value
-        for field_name in get_internal_disagg_auth_fields()
+        for field_name in _INTERNAL_DISAGG_AUTH_FIELDS
         for value in [getattr(disaggregated_params, field_name)]
     }
+    # The multimodal handoff is signed only when present, so other requests
+    # keep the signature that older routers and workers compute.
+    payload.update(
+        disaggregated_params.model_dump(
+            mode="json", include=set(_MULTIMODAL_HANDOFF_FIELDS), exclude_none=True
+        )
+    )
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
