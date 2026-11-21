@@ -15,7 +15,7 @@
 """Connector prefix reservation, allocation and legacy final-batch query tests."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -103,6 +103,7 @@ class FakeRequest:
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
+        self.py_connector_load_failed = False
         self.py_served_prefix_end = 0
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
@@ -273,6 +274,7 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager.conversation_manager = None
     manager._spec_recompute_tail = 0
     manager._has_cp_helix = False
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
@@ -533,6 +535,106 @@ class TestConnectorReuseStats:
         assert not serve(manager, FakeRequest(), kv_cache)
 
         assert kv_cache.connector_reuse_calls == []
+
+
+class TestRetainContextAllocation:
+    """A skipped step keeps the allocation a connector already holds pages of."""
+
+    @pytest.mark.parametrize("is_draft", [False, True])
+    def test_capacity_stays_and_the_revert_marker_is_cleared(self, is_draft):
+        manager = make_manager(FakeConnectorManager(num_matched=0))
+        manager.is_draft = is_draft
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+        manager.kv_cache_map = {1: kv_cache}
+        req = FakeRequest()
+        req.py_ctx_pre_resize_cap = 64
+        req.py_draft_ctx_pre_resize_cap = 64
+
+        manager.keep_context_allocation(req)
+
+        assert kv_cache.resize_calls == []
+        assert kv_cache.capacity == PROMPT_LEN
+        marker = "py_draft_ctx_pre_resize_cap" if is_draft else "py_ctx_pre_resize_cap"
+        other = "py_ctx_pre_resize_cap" if is_draft else "py_draft_ctx_pre_resize_cap"
+        assert getattr(req, marker) is None
+        assert getattr(req, other) == 64
+
+
+class TestRetainedGenerationAllocation:
+    """A retried step reuses the allocation a skipped step kept, sized for its draft width."""
+
+    @staticmethod
+    def make(retained, draft_slots, resize_ok=True):
+        manager = make_manager(FakeConnectorManager(num_matched=0))
+        kv_cache = Mock(is_active=True, capacity=100)
+        kv_cache.resize.return_value = resize_ok
+        manager.kv_cache_map = {5: kv_cache}
+        manager._retained_generation_allocations = {5: retained}
+        manager._allocated_draft_lens = {}
+        manager._inflight_draft_lens = {}
+        manager._ensure_generation_beam_width = Mock(return_value=True)
+        manager._generation_draft_slots = Mock(return_value=draft_slots)
+        manager._fill_fresh_kv_pages = Mock()
+        return manager, kv_cache
+
+    def test_a_wider_retry_grows_by_the_difference(self):
+        manager, kv_cache = self.make(retained=1, draft_slots=3)
+
+        assert manager.try_allocate_generation(SimpleNamespace(py_request_id=5))
+
+        kv_cache.resize.assert_called_once_with(102)
+        assert manager._allocated_draft_lens == {5: 3}
+        assert manager._inflight_draft_lens == {5: [3]}
+        assert manager._retained_generation_allocations == {}
+
+    @pytest.mark.parametrize("draft_slots", [1, 3])
+    def test_an_equal_or_narrower_retry_keeps_the_allocation(self, draft_slots):
+        manager, kv_cache = self.make(retained=3, draft_slots=draft_slots)
+
+        assert manager.try_allocate_generation(SimpleNamespace(py_request_id=5))
+
+        kv_cache.resize.assert_not_called()
+        assert manager._allocated_draft_lens == {5: 3}
+        assert manager._inflight_draft_lens == {5: [3]}
+
+    def test_a_failed_growth_keeps_the_retained_allocation_for_the_next_try(self):
+        manager, _ = self.make(retained=1, draft_slots=3, resize_ok=False)
+
+        assert not manager.try_allocate_generation(SimpleNamespace(py_request_id=5))
+
+        assert manager._retained_generation_allocations == {5: 1}
+        assert manager._allocated_draft_lens == {}
+        assert manager._inflight_draft_lens == {}
+
+
+class TestSkippedGenerationStepUndo:
+    """Keeping and reverting a skipped step unwind a subclass's per-step state alike."""
+
+    @pytest.mark.parametrize("keep", [True, False])
+    def test_both_paths_run_the_undo_hook(self, keep):
+        manager, _ = TestRetainedGenerationAllocation.make(retained=1, draft_slots=1)
+        manager._retained_generation_allocations = {}
+        manager._allocated_draft_lens = {5: 1}
+        manager._inflight_draft_lens = {5: [1]}
+        manager._undo_generation_step = Mock()
+        req = SimpleNamespace(py_request_id=5, is_dummy_request=False)
+
+        if keep:
+            manager.keep_generation_allocation(req)
+        else:
+            manager.revert_allocate_generation(req)
+
+        manager._undo_generation_step.assert_called_once_with(req)
+
+    def test_kda_replay_drops_the_pending_acceptance(self):
+        from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+
+        manager = object.__new__(KimiK3HybridCacheManager)
+        manager._kda_replay = SimpleNamespace(acceptance_pending={5, 6})
+
+        manager._undo_generation_step(SimpleNamespace(py_request_id=5))
+
+        assert manager._kda_replay.acceptance_pending == {6}
 
 
 class TestUnchunkedIsPureShrink:
@@ -1147,3 +1249,25 @@ def test_final_admission_rejects_an_invalid_local_allocation() -> None:
     assert req.py_served_prefix_end == 0
     manager.release_unused_connector_reservations(set())
     assert connector.releases == [(1, 0, 64)]
+
+
+@pytest.mark.parametrize("load_async", [False, True])
+def test_restarted_request_ignores_stale_prefix_without_losing_transfer_ownership(
+    load_async: bool,
+) -> None:
+    connector = FakeConnectorManager(num_matched=64, load_async=load_async)
+    manager = make_manager(connector)
+    request = FakeRequest()
+    request.py_connector_load_failed = True
+    cache = FakeKvCache(committed=32, capacity=PROMPT_LEN)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning_once"
+    ) as warning:
+        assert not serve(manager, request, cache)
+    assert warning.call_count == int(load_async)
+    if load_async:
+        assert warning.call_args.kwargs["key"] == "kv_connector_async_reload_after_failure"
+    assert request.context_current_position == 32
+    assert connector.queries == [(request.py_request_id, 32)]
+    assert connector.commits == [(request.py_request_id, 0, load_async)]

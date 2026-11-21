@@ -690,6 +690,8 @@ class SparseOffloadCacheMixin:
         return super().try_allocate_generation(req)
 
     def revert_allocate_generation(self, req: llm_request.LlmRequest) -> None:
+        # Only the revert shrinks the cache; keeping a skipped step's
+        # allocation frees no page the published batch reads.
         if self._sparse_batch is not None:
             self._sparse_batch.wait_published()
         super().revert_allocate_generation(req)

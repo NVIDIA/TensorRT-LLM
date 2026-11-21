@@ -109,6 +109,7 @@ def manager(monkeypatch):
 def req():
     return SimpleNamespace(
         request_id=7,
+        is_dummy_request=False,
         state=LlmRequestState.CONTEXT_INIT,
         cache_salt="tenant",
         get_tokens=lambda beam: list(range(128)),
@@ -319,8 +320,17 @@ def test_ranks_that_disagree_about_capacity_only_are_rejected(
     """A split would hang in the first collective capacity_only gates."""
     manager._prefix_capability = None
     manager.capacity_only = local_capacity_only
-    monkeypatch.setattr(connector, "mpi_allgather", lambda value: [value, (value[0], not value[1])])
-    with pytest.raises(ValueError, match="capacity_only must be the same on every rank"):
+    monkeypatch.setattr(
+        connector, "mpi_allgather", lambda value: [value, (value[0], not value[1], *value[2:])]
+    )
+    declaring_rank = 0 if local_capacity_only else 1
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"capacity_only must be the same on every rank, but only "
+            rf"rank\(s\) \[{declaring_rank}\] of 2 declare it\. .*get_finished allgather"
+        ),
+    ):
         manager.configure_prefix_reservations(True)
 
 
@@ -419,3 +429,29 @@ def test_allocation_fence_is_the_cache_managers(manager):
     manager.build_scheduler_output(ScheduledRequests(), None)
     manager.handle_metadata()
     assert manager.worker.get_allocation_fence() is None
+
+
+@pytest.mark.parametrize(
+    "index, declaration",
+    [
+        (2, "requires_block_aligned_reuse"),
+        (3, "drops_reuse_match_backoff"),
+        (4, "requires_completion_reservation"),
+        (5, "reports_failed_loads"),
+    ],
+)
+def test_tp_admission_declarations_must_agree(
+    manager: connector.KvCacheConnectorManager,
+    monkeypatch: pytest.MonkeyPatch,
+    index: int,
+    declaration: str,
+) -> None:
+    def gather(value: tuple[bool, ...]) -> list[tuple[bool, ...]]:
+        remote = list(value)
+        remote[index] = not remote[index]
+        return [value, tuple(remote)]
+
+    manager._prefix_capability = None
+    monkeypatch.setattr(connector, "mpi_allgather", gather)
+    with pytest.raises(ValueError, match=declaration):
+        manager.configure_prefix_reservations(True)
