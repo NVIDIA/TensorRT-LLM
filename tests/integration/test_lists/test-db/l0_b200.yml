@@ -146,6 +146,8 @@ l0_b200:
   - unittest/_torch/debugger
   - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
   - unittest/_torch/kv_cache_compression
+  - unittest/_torch/pyexecutor/connectors/mooncake_store/test_mooncake_store_codec_gpu.py
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_cross_engine_prefix_reuse_with_nvfp4_cold_pages
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
   # Locality domains via mock localization: per-domain KV pools on one GPU.

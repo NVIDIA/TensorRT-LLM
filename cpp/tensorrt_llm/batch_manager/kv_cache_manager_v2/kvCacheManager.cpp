@@ -950,6 +950,13 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
     return mStorage->poolGroupDescs();
 }
 
+// ---- Cold-page codec for external storage ----------------------------------
+
+IKvCacheColdPageCodec& KvCacheManager::coldPageCodec() noexcept
+{
+    return *mStorage->mColdPageCodec;
+}
+
 // ---- Query / info ---------------------------------------------------------
 
 int KvCacheManager::tokensPerBlock() const noexcept
