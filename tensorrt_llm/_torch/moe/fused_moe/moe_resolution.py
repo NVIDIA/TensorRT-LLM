@@ -57,6 +57,7 @@ from .impl_contract import (
     canonical_routing,
     identity_quant_of,
     normalize_quant,
+    spare_slots_rejection,
 )
 from .impl_environment import collect_moe_environment
 from .impl_identity import MOE_IMPL_REGISTRY, MoEImplDescriptor, MoEImplId, MoEImplQuery
@@ -364,7 +365,8 @@ def build_moe_deployment(
     # MoE._init_load_balancer only adopts the config's slot count once a
     # balancer is registered; without one the layer keeps num_slots ==
     # num_experts, so the deployment must say the same.
-    eplb_enabled = get_moe_load_balancer() is not None
+    balancer = get_moe_load_balancer()
+    eplb_enabled = balancer is not None
     balancer_config = getattr(model_config, "moe_load_balancer", None)
     eplb_mode = getattr(balancer_config, "mode", "standard") if eplb_enabled else "disabled"
     num_slots = getattr(balancer_config, "num_slots", None) if eplb_enabled else None
@@ -384,6 +386,7 @@ def build_moe_deployment(
         # Registered balancer only; config alone does not enable EPLB.
         eplb_enabled=eplb_enabled,
         eplb_mode=eplb_mode,
+        spare_slots_enabled=eplb_enabled and balancer.adds_spare_slots,
         # Routed-expert LoRA only; attention-only LoRA stays False.
         moe_lora_enabled=has_moe_lora_targets(lora_config),
         force_dynamic_quantization=model_config.force_dynamic_quantization,
@@ -1019,6 +1022,16 @@ def resolve_moe_impl(
             )
             continue
         # After can_implement, so a backend's own more specific reason wins.
+        spare_slots = spare_slots_rejection(candidate, deployment)
+        if spare_slots is not None:
+            rejected.append(
+                MoERejection(
+                    _legacy_backend_name(candidate),
+                    spare_slots.reject_reason,
+                    spare_slots.detail,
+                )
+            )
+            continue
         activation_rejection = _reject_unsupported_activation(candidate, problem)
         if activation_rejection is not None:
             rejected.append(activation_rejection)
@@ -1055,6 +1068,17 @@ def resolve_moe_impl(
             f" Each candidate's reason: {report.describe_rejections()}"
         )
 
+    # Spare slots are checked after the format, SM and dtype gates, so this
+    # rejection names a requested impl that serves the layer otherwise; with
+    # EPLB on, ``degraded_from`` may name another family member's EPLB gate.
+    spare_slots_cause = next(
+        (
+            rejection
+            for rejection in report.requested_rejections
+            if rejection.reason is MoERejectReason.SPARE_SLOTS_UNSUPPORTED
+        ),
+        None,
+    )
     if winner_cls is None:
         # Gates abstain rather than raise, so with all of them abstaining this
         # is the only place the individual reasons surface: ``describe()``
@@ -1064,6 +1088,19 @@ def resolve_moe_impl(
             f"No MoE implementation can serve this layer{location} "
             f"(requested {requested}). Each candidate's reason: "
             f"{report.describe_rejections()}"
+        )
+    elif report.degraded and spare_slots_cause is not None:
+        # Every MoE layer of a fault-tolerant deployment falls back the same way, so the
+        # process logs it once.
+        logger.warning_once(
+            f"MoE backend {requested} cannot serve the MoE layers "
+            f"({spare_slots_cause.describe()}); running {winner_cls.__name__} instead.",
+            key=(
+                "moe_spare_slots_fallback",
+                requested,
+                winner_cls,
+                MoERejectReason.SPARE_SLOTS_UNSUPPORTED,
+            ),
         )
     elif report.degraded:
         cause = report.degraded_from
