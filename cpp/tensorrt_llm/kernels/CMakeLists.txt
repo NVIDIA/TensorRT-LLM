@@ -101,10 +101,6 @@ list(FILTER SRC_CU EXCLUDE REGEX
 # library below.
 list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107(Tp[248])?/.*")
 
-if(NOT ENABLE_MULTI_DEVICE)
-  list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
-endif()
-
 # Lower CUDA optimization level when FAST_BUILD is enabled to speed up
 # compilation. CMake by default adds -O3 to CMAKE_CUDA_FLAGS_RELEASE. We
 # override it here before creating the target to avoid the "incompatible

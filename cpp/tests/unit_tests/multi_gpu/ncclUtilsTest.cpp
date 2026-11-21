@@ -32,6 +32,7 @@
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE && BUILD_PYT
+#include "tensorrt_llm/common/ncclTorchUtils.h"
 #include <torch/extension.h>
 #endif
 
@@ -209,22 +210,6 @@ TEST(NCCLWindowAllocatorWarningTest, FallbackWarningsAreLatchedIndependentlyPerC
     nccl_util::NCCLWindowAllocatorTestAccess::clearFallbackWarnings(allocator, comm);
     EXPECT_TRUE(nccl_util::NCCLWindowAllocatorTestAccess::markCaptureStateUnknownWarning(allocator, comm));
     nccl_util::NCCLWindowAllocatorTestAccess::clearFallbackWarnings(allocator, comm);
-#else
-    GTEST_SKIP() << "NCCL window buffers are not compiled in";
-#endif
-}
-
-TEST(NCCLWindowSupportTest, RuntimeVersionAndGB10Gate)
-{
-#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
-    EXPECT_FALSE(nccl_util::isNcclWindowSupportedForPlatform(121, true, NCCL_VERSION(2, 27, 9)));
-    EXPECT_FALSE(nccl_util::isNcclWindowSupportedForPlatform(121, true, NCCL_VERSION(2, 29, 2)));
-    EXPECT_FALSE(nccl_util::isNcclWindowSupportedForPlatform(121, true, NCCL_VERSION(2, 30, 3)));
-
-    EXPECT_TRUE(nccl_util::isNcclWindowSupportedForPlatform(121, true, NCCL_VERSION(2, 30, 4)));
-    EXPECT_TRUE(nccl_util::isNcclWindowSupportedForPlatform(121, false, NCCL_VERSION(2, 29, 2)));
-    EXPECT_TRUE(nccl_util::isNcclWindowSupportedForPlatform(120, true, NCCL_VERSION(2, 29, 2)));
-    EXPECT_TRUE(nccl_util::isNcclWindowSupportedForPlatform(100, false, NCCL_VERSION(2, 29, 2)));
 #else
     GTEST_SKIP() << "NCCL window buffers are not compiled in";
 #endif

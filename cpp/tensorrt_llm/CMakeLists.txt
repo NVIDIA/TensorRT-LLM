@@ -303,6 +303,16 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Cluster launch helpers must use the CUDA runtime that registered the kernel.
+  set(CUTLASS_RUNTIME_SYMBOLS_MAP
+      "${PROJECT_SOURCE_DIR}/cmake/templates/cutlass_runtime_symbols.map")
+  target_link_options(${SHARED_TARGET} PRIVATE
+                      "LINKER:--version-script,${CUTLASS_RUNTIME_SYMBOLS_MAP}")
+  set_property(TARGET ${SHARED_TARGET} APPEND
+               PROPERTY LINK_DEPENDS "${CUTLASS_RUNTIME_SYMBOLS_MAP}")
+endif()
+
 # Keep statically linked NVRTC symbols local so they cannot be interposed by a
 # dynamic NVRTC loaded elsewhere in the process.
 if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
@@ -323,6 +333,8 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_environment
     tllm_common_error
     tllm_common_logging
+    tllm_common_nccl
+    tllm_common_nccl_comm
     tllm_common_profiler
     tllm_context_transfer_consensus
     tllm_executor_agent_name
@@ -340,6 +352,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_distributed
     tllm_runtime_gdr
     tllm_runtime_host_accessible_memory
+    tllm_runtime_ipc
     tllm_runtime_locality
     tllm_runtime_lora
     tllm_runtime_lora_cache

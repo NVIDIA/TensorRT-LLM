@@ -20,7 +20,7 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
-#include "tensorrt_llm/common/ncclUtils.h"
+#include "tensorrt_llm/common/ncclTorchUtils.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
