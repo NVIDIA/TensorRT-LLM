@@ -165,6 +165,7 @@ class TestModelInfo:
         [
             "LlamaForCausalLM",
             "Cosmos3EdgeForConditionalGeneration",
+            "Inkling2ForConditionalGeneration",
             "MuseSparkForConditionalGeneration",
         ],
     )
