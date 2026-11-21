@@ -37,7 +37,7 @@ def test_exact_conversion_and_odd_tails(conversion_modules, length):
     assert torch.equal(converted.view(torch.uint8), raw.float().view(torch.uint8))
 
 
-def test_ops_use_the_built_conversions_with_identical_bytes(conversion_modules):
+def test_ops_use_the_built_conversions_with_identical_bytes(conversion_modules, monkeypatch):
     """``ops.output_cast`` and the quantize inside ``ops.attention_projection`` on the built kernels."""
     import tensorrt_llm  # noqa: F401  -- registers the trtllm operators
     from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_fp8__sm_107__u1 import ops
@@ -48,11 +48,25 @@ def test_ops_use_the_built_conversions_with_identical_bytes(conversion_modules):
 
     quant, cast, factors, _ = conversion_modules
     device = torch.cuda.current_device()
-    assert conversion._MODULES[device] == (quant, cast)
+    monkeypatch.setitem(conversion._MODULES, device, (quant, cast))
+    built_calls = {"quantize": 0, "cast": 0}
+    quantize_config, cast_kernel = quant.quantize_config, cast.cast
+
+    def counted_quantize(*args):
+        built_calls["quantize"] += 1
+        return quantize_config(*args)
+
+    def counted_cast(*args):
+        built_calls["cast"] += 1
+        return cast_kernel(*args)
+
+    monkeypatch.setattr(quant, "quantize_config", counted_quantize)
+    monkeypatch.setattr(cast, "cast", counted_cast)
     gen = torch.Generator(device="cuda").manual_seed(7)
     length, hidden_dim, qk = 2049, 5376, 7168
     hidden = torch.randn((1, length, hidden_dim), generator=gen, device="cuda").to(torch.bfloat16)
     assert torch.equal(ops.output_cast(hidden).view(torch.uint8), hidden.float().view(torch.uint8))
+    assert built_calls == {"quantize": 0, "cast": 1}
 
     projection_residual.compile_kernel(
         device,
@@ -91,10 +105,9 @@ def test_ops_use_the_built_conversions_with_identical_bytes(conversion_modules):
         )
 
     built = run()
-    conversion._MODULES[device] = (None, None)
-    try:
-        installed = run()
-    finally:
-        conversion._MODULES[device] = (quant, cast)
+    assert built_calls == {"quantize": 1, "cast": 1}
+    monkeypatch.setitem(conversion._MODULES, device, (None, None))
+    installed = run()
+    assert built_calls == {"quantize": 1, "cast": 1}
     for a, b in zip(built, installed):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))

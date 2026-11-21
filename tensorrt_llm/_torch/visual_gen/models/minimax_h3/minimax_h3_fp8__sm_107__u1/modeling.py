@@ -311,8 +311,8 @@ class Fp8Transformer(ScenarioTransformer):
             [block.attn.to_out[0].input_scale.detach().reshape(1) for block in blocks]
         )
         _, _, factors, self.fp8_kernel_qualification = prepare(scales, kernel_cache)
-        # Everything that can fail runs before the weights change, so a failed load leaves the
-        # checkpoint layout in place.
+        # The kernels are built before any weight changes, so a failed build leaves the checkpoint
+        # layout in place; the packing below can be repeated after a failure part-way through.
         gate_up_swiglu._get_compiled(device.index)
         table_dtype = blocks[0].adaln_proj.linear.dtype
         for width, gate in (

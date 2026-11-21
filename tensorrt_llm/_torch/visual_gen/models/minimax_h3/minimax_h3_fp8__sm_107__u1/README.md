@@ -70,14 +70,17 @@ The built kernels and the installed operators produce the same bytes, so the
 toolchain changes speed, not output. `transformer.fp8_kernel_qualification`
 reports which one is active and why, and the loader logs a warning when the
 built kernels are not used (shown with `TLLM_LOG_LEVEL=warning`). `python -O`
-also uses the installed operators. With the tools present, a build failure or a
-built kernel that does not match the installed operators fails the load.
+also uses the installed operators, as does a failed build or a failed inspection
+of the built binaries. A built kernel whose output differs from the installed
+operators fails the load.
 
 Model loading compiles the CuTe DSL kernels (GateUp and the two projections)
 and prepares packed GateUp weights and reciprocal scales before `torch.compile`
 wraps the blocks; the Triton kernels compile during the loader's warmup request.
-The denoise loop compiles nothing: a projection input outside the compiled
-kernel's dtypes, layout or 256-byte alignment takes the unfused cuBLAS path.
+The denoise loop compiles no projection kernel: an input outside the compiled
+kernel's dtypes, layout or 256-byte alignment takes the unfused cuBLAS path
+(whose Triton AdaLN variant compiles on first use; the blocks' own tensors
+never take it).
 The packed GateUp weights replace the checkpoint layout in place, so the
 model's `state_dict()` no longer holds that weight in checkpoint order.
 

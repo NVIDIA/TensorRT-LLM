@@ -4,8 +4,9 @@
 
 The kernels (BF16 -> FP8 with a static scale, BF16 -> FP32) replace installed operators with fixed
 launch shapes. They are used only after this module has built them and shown them bit-identical to
-those operators on this device; when they cannot be built or do not qualify, the callers keep the
-installed operators, so the result is the same either way.
+those operators on this device. When they cannot be built or inspected here, the callers keep the
+installed operators, so the result is the same either way; a built kernel whose output differs from
+the installed operators is an error.
 """
 
 from __future__ import annotations
@@ -189,10 +190,11 @@ def prepare(
     This preparation runs before request timing and is repeated for each new process.
 
     Returns ``(quant, cast, factors, proof)``. ``quant`` and ``cast`` are None when the kernels
-    cannot be built and checked in this process: a build tool is missing, or Python runs with
-    ``-O`` so the qualification asserts are off. The reason is logged and the callers use the
-    installed operators. With the tools present, a failing build or a kernel that does not match
-    the installed operators raises.
+    cannot be built and checked in this process: a build tool is missing, Python runs with ``-O``
+    so the qualification asserts are off, or the build or the inspection of its binaries fails
+    (an unwritable cache, a compiler without this target, another instruction selection). The
+    reason is logged and the callers use the installed operators. A built kernel that does not
+    match the installed operators raises.
     """
     if __debug__:
         missing = missing_build_tools()
@@ -201,7 +203,18 @@ def prepare(
         reason = "Python runs with -O, which disables the qualification asserts"
     if reason is None:
         with torch.cuda.device(scales.device):
-            return _prepare(scales, cache)
+            try:
+                built = _build(cache)
+            except (
+                AssertionError,
+                ImportError,
+                OSError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as error:
+                reason = f"the build or its inspection failed: {type(error).__name__}: {error}"
+            else:
+                return _prepare(scales, cache, *built)
     logger.warning(
         "MiniMax-H3 static FP8: the optional conversion kernels are not used "
         f"({reason}); the installed operators run instead, with identical results"
@@ -210,9 +223,22 @@ def prepare(
     return None, None, torch.reciprocal(scales), dict(unary_qualified=False, reason=reason)
 
 
+def _build(cache: Path) -> tuple[ModuleType, ModuleType, dict]:
+    """Compile both extensions and inspect their binaries; nothing is launched."""
+    quant, cast = build("staticQuant", cache), build("sharedCast", cache)
+    resources = {
+        "quant": inspect_kernel(quant, 0, pdl=True),
+        "factor": inspect_kernel(quant, 3, pdl=True, vector=False),
+        "expression_factor": inspect_kernel(quant, 4, pdl=True, vector=False),
+        "cast": inspect_kernel(cast, 1, pdl=False),
+    }
+    return quant, cast, resources
+
+
 def _prepare(
-    scales: torch.Tensor, cache: Path
+    scales: torch.Tensor, cache: Path, quant: ModuleType, cast: ModuleType, resources: dict
 ) -> tuple[ModuleType, ModuleType, torch.Tensor, dict]:
+    """Run the built kernels against the installed operators; any difference raises."""
     properties = torch.cuda.get_device_properties(scales.device)
     assert (
         torch.cuda.get_device_capability(scales.device) == (10, 7)
@@ -221,13 +247,6 @@ def _prepare(
     assert scales.is_cuda and scales.dtype == torch.float32 and scales.shape == (50,)
     assert scales.is_contiguous() and bool(scales.isfinite().all()) and bool((scales > 0).all())
     pdl = os.environ.get("TRTLLM_ENABLE_PDL") != "0"
-    quant, cast = build("staticQuant", cache), build("sharedCast", cache)
-    resources = {
-        "quant": inspect_kernel(quant, 0, pdl=True),
-        "factor": inspect_kernel(quant, 3, pdl=True, vector=False),
-        "expression_factor": inspect_kernel(quant, 4, pdl=True, vector=False),
-        "cast": inspect_kernel(cast, 1, pdl=False),
-    }
     factors = quant.factors(scales, True, pdl)
     expression_factors = quant.factors(scales, False, pdl)
     assert same(factors, expression_factors)

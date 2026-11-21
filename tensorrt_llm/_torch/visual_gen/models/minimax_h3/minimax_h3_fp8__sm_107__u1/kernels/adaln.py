@@ -114,6 +114,7 @@ def launch(x, a, w, mod, idx, scale, eps, gate_col, scale_col, shift_col):
     a2 = a.reshape_as(x2) if has_res else x2
     if x2.stride(-1) != 1 or a2.stride(-1) != 1 or mod.stride(-1) != 1:
         raise ValueError("The FP8 AdaLN kernel needs unit-stride rows")
+    idx = idx.contiguous()  # the kernel reads the indices at unit stride
     if idx.numel() != sequence:
         raise ValueError(
             f"The modulation index has {idx.numel()} entries for a sequence of {sequence}"

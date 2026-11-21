@@ -854,7 +854,7 @@ def supports(a, w, x, mod, idx, gate_column):
 
     Nothing is compiled here: a shape, gate or dtype without a compiled kernel, or a tensor
     outside the kernel's layout and alignment contract, takes the caller's unfused path."""
-    if not (a.is_cuda and a.ndim == w.ndim == mod.ndim == 2):
+    if not (a.is_cuda and a.ndim == w.ndim == mod.ndim == 2 and idx.ndim == 1):
         return False
     m, n = a.shape[0], w.shape[0]
     key = (a.device.index, n, a.shape[1], gate_column, mod.dtype, idx.dtype)

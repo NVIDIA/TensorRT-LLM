@@ -1094,12 +1094,13 @@ class LifecycleContracts(unittest.TestCase):
                         "missing_build_tools": lambda: [],
                         "logger": SimpleNamespace(warning=state["calls"].append),
                         "_MODULES": {},
-                        "_prepare": lambda scales, cache: inner(cache),
+                        "_build": lambda cache: ("quant", "cast", "resources"),
+                        "_prepare": lambda scales, cache, *built: inner(cache),
                     },
                 )
                 scales = SimpleNamespace(device=target)
                 if failure:
-                    # with the tools present, a failed build or qualification is an error
+                    # a built kernel that fails its comparison with the installed operators is an error
                     with self.assertRaisesRegex(RuntimeError, "inner context"):
                         namespace["prepare"](scales, Path("cache"))
                     self.assertEqual(namespace["_MODULES"], {})
@@ -1110,15 +1111,84 @@ class LifecycleContracts(unittest.TestCase):
                 self.assertEqual(state["current"], 0)
 
     def test_initialize_compiles_before_packing_and_packs_once(self):
-        source = (FP8 / "modeling.py").read_text()
-        body = source[source.index("def _initialize_fp8") :]
-        self.assertLess(body.index("compile_kernel("), body.index("pack_weight("))
-        self.assertLess(body.index("_get_compiled("), body.index("pack_weight("))
-        self.assertLess(body.index("prepare(scales"), body.index("pack_weight("))
-        self.assertLess(
-            body.index("if not isinstance(gate_up.quant_method, PackedGateUpMethod)"),
-            body.index("pack_weight("),
+        tree = ast.parse((FP8 / "modeling.py").read_text())
+        cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Fp8Transformer"
         )
+        function = next(
+            n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_initialize_fp8"
+        )
+
+        def calls(node, name):
+            return [
+                n
+                for n in ast.walk(node)
+                if isinstance(n, ast.Call)
+                and (getattr(n.func, "attr", None) or getattr(n.func, "id", None)) == name
+            ]
+
+        packs = calls(function, "pack_weight")
+        self.assertEqual(len(packs), 1)
+        # every step that builds a kernel is a statement that ends before the packing loop starts
+        loop = next(n for n in function.body if isinstance(n, ast.For) and calls(n, "pack_weight"))
+        for name in ("prepare", "_get_compiled", "compile_kernel"):
+            built = calls(function, name)
+            self.assertTrue(built, name)
+            self.assertTrue(all(call.end_lineno < loop.lineno for call in built), name)
+        # the packing is the body of "if not isinstance(gate_up.quant_method, PackedGateUpMethod)"
+        guard = next(
+            n
+            for n in ast.walk(loop)
+            if isinstance(n, ast.If) and any(call is packs[0] for call in calls(n, "pack_weight"))
+        )
+        self.assertEqual(
+            ast.unparse(guard.test),
+            "not isinstance(gate_up.quant_method, PackedGateUpMethod)",
+        )
+        self.assertFalse(guard.orelse)
+        self.assertIn("gate_up.quant_method = PackedGateUpMethod()", ast.unparse(guard))
+
+    def test_failed_build_or_inspection_keeps_installed_operators(self):
+        for error in (
+            OSError("read-only cache"),
+            RuntimeError("nvcc: unknown -arch"),
+            AssertionError("no LDG.128 in SASS"),
+            subprocess.TimeoutExpired("cuobjdump", 90),
+        ):
+            with self.subTest(error=type(error).__name__):
+                warnings = []
+
+                def failing_build(cache, error=error):
+                    raise error
+
+                @contextmanager
+                def device_context(device):
+                    yield
+
+                namespace = _source_definitions(
+                    FP8 / "kernels/conversion.py",
+                    {"prepare"},
+                    {
+                        "torch": SimpleNamespace(
+                            cuda=SimpleNamespace(device=device_context),
+                            reciprocal=lambda scales: "reciprocal",
+                        ),
+                        "subprocess": subprocess,
+                        "missing_build_tools": lambda: [],
+                        "logger": SimpleNamespace(warning=warnings.append),
+                        "_MODULES": {},
+                        "_build": failing_build,
+                        "_prepare": lambda *args: self.fail("ran kernels that were not built"),
+                    },
+                )
+                scales = SimpleNamespace(device=SimpleNamespace(type="cuda", index=1))
+                result = namespace["prepare"](scales, Path("cache"))
+                self.assertEqual(result[:3], (None, None, "reciprocal"))
+                self.assertFalse(result[3]["unary_qualified"])
+                self.assertIn("the build or its inspection failed", result[3]["reason"])
+                self.assertIn(type(error).__name__, result[3]["reason"])
+                self.assertEqual(namespace["_MODULES"], {1: (None, None)})
+                self.assertEqual(len(warnings), 1)
 
     def test_missing_build_tools_keep_installed_operators_without_building(self):
         warnings = []
@@ -1130,7 +1200,8 @@ class LifecycleContracts(unittest.TestCase):
                 "missing_build_tools": lambda: ["ninja", "cuobjdump"],
                 "logger": SimpleNamespace(warning=warnings.append),
                 "_MODULES": {},
-                "_prepare": lambda scales, cache: self.fail("built without the tools"),
+                "_build": lambda cache: self.fail("built without the tools"),
+                "_prepare": lambda *args: self.fail("built without the tools"),
             },
         )
         scales = SimpleNamespace(device=SimpleNamespace(type="cuda", index=1))
@@ -1169,7 +1240,7 @@ class LifecycleContracts(unittest.TestCase):
             },
         )
         with self.assertRaises(StopProbe):
-            namespace["_prepare"](SimpleNamespace(device=target), Path("cache"))
+            namespace["_prepare"](SimpleNamespace(device=target), Path("cache"), None, None, {})
         self.assertEqual(queries, [("properties", target), ("capability", target)])
 
     def test_route_device_queries_use_same_current_device(self):

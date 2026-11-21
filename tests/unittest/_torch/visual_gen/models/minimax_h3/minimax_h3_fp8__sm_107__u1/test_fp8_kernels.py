@@ -105,17 +105,24 @@ def _inputs(length, rows):
     }
 
 
-def _fused(scenario, activation, weight, x, gate):
-    """True when the op will run the fused projection kernel for these tensors."""
-    projection_residual = scenario[3]
-    return projection_residual.supports(
-        activation,
-        weight,
-        x["hidden"],
-        x["modulation"],
-        x["indices"],
-        getattr(projection_residual, gate),
-    )
+@pytest.fixture
+def branch(scenario, monkeypatch):
+    """Counts the projection ops' calls into the fused kernel and into the unfused cuBLAS GEMM."""
+    ops, _, _, projection_residual = scenario
+    counts = {"fused": 0, "unfused": 0}
+    run, gemm = projection_residual.run, ops._cublas_scaled_mm
+
+    def fused(*args, **kwargs):
+        counts["fused"] += 1
+        return run(*args, **kwargs)
+
+    def unfused(*args, **kwargs):
+        counts["unfused"] += 1
+        return gemm(*args, **kwargs)
+
+    monkeypatch.setattr(projection_residual, "run", fused)
+    monkeypatch.setattr(ops, "_cublas_scaled_mm", unfused)
+    return counts
 
 
 def _scale(value):
@@ -137,15 +144,13 @@ def test_adaln_to_fp8_is_bit_identical(scenario, length):
 
 @pytest.mark.parametrize("length", LENGTHS)
 @pytest.mark.parametrize("rows", [3, 6])
-def test_attention_projection_residual_and_codes(scenario, weights, length, rows):
+def test_attention_projection_residual_and_codes(scenario, weights, branch, length, rows):
     ops, fused_adaln, _, _ = scenario
     x = _inputs(length, rows)
     weight, weight_scale = weights["out"]
     raw = x["randn"](length, QK, std=1.5).to(BF16).reshape(1, length, QK)
     input_scale, input_reciprocal = _scale(0.02)
     up_scale, up_reciprocal = _scale(0.027)
-    activation = _quantize(raw.reshape(length, QK), input_scale)
-    assert _fused(scenario, activation, weight, x, "ATTENTION_OUTPUT_GATE")
     residual, codes = ops.attention_projection(
         raw,
         weight,
@@ -159,6 +164,7 @@ def test_attention_projection_residual_and_codes(scenario, weights, length, rows
         input_reciprocal,
         EPS,
     )
+    assert branch == {"fused": 1, "unfused": 0}
     projected = _gemm(
         _quantize(raw.reshape(length, QK), input_scale), weight, input_scale, weight_scale
     )
@@ -205,22 +211,24 @@ def test_gate_up_swiglu_to_fp8(scenario, weights, length):
     assert _relative_l2(codes, reference) < 0.02
     # No element is off by more than one FP8 step, and no row is wrong as a whole.
     got, ref = codes.view(torch.uint8).int(), reference.view(torch.uint8).int()
-    magnitude = ((got & 0x7F) - (ref & 0x7F)).abs()
+    got_m, ref_m = got & 0x7F, ref & 0x7F
+    assert bool((got_m != 0x7F).all()) and bool((ref_m != 0x7F).all())  # no NaN code
     same_sign = (got & 0x80) == (ref & 0x80)
-    around_zero = ((got & 0x7F) <= 1) & ((ref & 0x7F) <= 1)
-    assert bool(((magnitude <= 1) & (same_sign | around_zero)).all())
-    assert float((got == ref).double().mean(dim=1).min()) > 0.9
+    one_step = ((got_m - ref_m).abs() <= 1) & same_sign
+    zero_and_smallest = (torch.minimum(got_m, ref_m) == 0) & (torch.maximum(got_m, ref_m) <= 1)
+    assert bool((one_step | zero_and_smallest).all())
+    if length > 1:
+        assert float((got == ref).double().mean(dim=1).min()) > 0.9
 
 
 @pytest.mark.parametrize("length", LENGTHS)
 @pytest.mark.parametrize("rows", [3, 6])
-def test_down_gated_residual(scenario, weights, length, rows):
+def test_down_gated_residual(scenario, weights, branch, length, rows):
     ops = scenario[0]
     x = _inputs(length, rows)
     weight, weight_scale = weights["down"]
     down_scale, _ = _scale(0.05)
     activation = _quantize(x["randn"](length, UP, std=2.0).to(BF16), down_scale)
-    assert _fused(scenario, activation, weight, x, "DOWN_GATE")
     residual = ops.down(
         activation,
         weight,
@@ -230,6 +238,7 @@ def test_down_gated_residual(scenario, weights, length, rows):
         x["modulation"],
         x["indices"],
     )
+    assert branch == {"fused": 1, "unfused": 0}
     projected = _gemm(activation, weight, down_scale, weight_scale).reshape_as(x["hidden"])
     gate = x["modulation"][:, 5 * D : 6 * D].index_select(0, x["indices"])
     expected = torch.addcmul(x["hidden"].float(), gate.float(), projected.float()).to(BF16)
@@ -239,7 +248,7 @@ def test_down_gated_residual(scenario, weights, length, rows):
         assert torch.equal(residual.view(torch.uint8), expected.view(torch.uint8))
 
 
-def test_one_projection_kernel_serves_every_length(scenario, weights):
+def test_one_projection_kernel_serves_every_length(scenario, weights, branch):
     ops, _, _, projection_residual = scenario
     weight, weight_scale = weights["down"]
     down_scale, _ = _scale(0.05)
@@ -247,7 +256,6 @@ def test_one_projection_kernel_serves_every_length(scenario, weights):
     for length in (7, 513, 2049):
         x = _inputs(length, rows=3)
         activation = _quantize(x["randn"](length, UP).to(BF16), down_scale)
-        assert _fused(scenario, activation, weight, x, "DOWN_GATE")
         ops.down(
             activation,
             weight,
@@ -258,6 +266,7 @@ def test_one_projection_kernel_serves_every_length(scenario, weights):
             x["indices"],
         )
     assert projection_residual._compiled == before
+    assert branch == {"fused": 3, "unfused": 0}
 
 
 def _misaligned(tensor):
@@ -270,66 +279,72 @@ def _misaligned(tensor):
 
 
 @pytest.mark.parametrize("length", (300, 4097))
-@pytest.mark.parametrize("case", ("misaligned_hidden", "int32_indices"))
-def test_down_outside_the_kernel_contract_takes_the_unfused_path(scenario, weights, length, case):
+@pytest.mark.parametrize("case", ("misaligned_hidden", "int32_indices", "fp32_modulation"))
+def test_down_outside_the_kernel_contract_takes_the_unfused_path(
+    scenario, weights, branch, length, case
+):
+    """Inputs the compiled kernel does not serve give the fused kernel's result through cuBLAS."""
     ops, _, _, projection_residual = scenario
     x = _inputs(length, rows=3)
     weight, weight_scale = weights["down"]
     down_scale, _ = _scale(0.05)
     activation = _quantize(x["randn"](length, UP, std=2.0).to(BF16), down_scale)
-    hidden, indices = x["hidden"], x["indices"]
+    hidden, modulation, indices = x["hidden"], x["modulation"], x["indices"]
+    fused = ops.down(activation, weight, down_scale, weight_scale, hidden, modulation, indices)
+    assert branch == {"fused": 1, "unfused": 0}
     if case == "misaligned_hidden":
         hidden = _misaligned(hidden)
-    else:
+    elif case == "int32_indices":
         indices = indices.int()
-    assert not projection_residual.supports(
-        activation, weight, hidden, x["modulation"], indices, projection_residual.DOWN_GATE
-    )
+    else:
+        modulation = modulation.float()
     before = dict(projection_residual._compiled)
-    residual = ops.down(
-        activation, weight, down_scale, weight_scale, hidden, x["modulation"], indices
-    )
-    assert projection_residual._compiled == before  # nothing compiles at run time
-    projected = _gemm(activation, weight, down_scale, weight_scale).reshape_as(hidden)
-    gate = x["modulation"][:, 5 * D : 6 * D].index_select(0, x["indices"])
-    expected = torch.addcmul(hidden.float(), gate.float(), projected.float()).to(BF16)
-    assert torch.equal(residual.view(torch.uint8), expected.view(torch.uint8))
+    unfused = ops.down(activation, weight, down_scale, weight_scale, hidden, modulation, indices)
+    assert branch == {"fused": 1, "unfused": 1}
+    assert projection_residual._compiled == before  # no projection kernel compiles at run time
+    assert unfused.shape == fused.shape and unfused.dtype == fused.dtype
+    assert _relative_l2(unfused, fused) < 1e-4
+    assert _same_fraction(unfused, fused) > 0.999
+    if length >= 1000:
+        assert torch.equal(unfused.view(torch.uint8), fused.view(torch.uint8))
 
 
 @pytest.mark.parametrize("length", (300, 4097))
 def test_attention_projection_outside_the_kernel_contract_takes_the_unfused_path(
-    scenario, weights, length
+    scenario, weights, branch, length
 ):
-    ops, fused_adaln, _, projection_residual = scenario
+    ops, fused_adaln, _, _ = scenario
     x = _inputs(length, rows=3)
     weight, weight_scale = weights["out"]
     raw = x["randn"](length, QK, std=1.5).to(BF16).reshape(1, length, QK)
     input_scale, input_reciprocal = _scale(0.02)
     up_scale, up_reciprocal = _scale(0.027)
-    hidden = _misaligned(x["hidden"])
-    activation = _quantize(raw.reshape(length, QK), input_scale)
-    assert not projection_residual.supports(
-        activation,
-        weight,
-        hidden,
-        x["modulation"],
-        x["indices"],
-        projection_residual.ATTENTION_OUTPUT_GATE,
+
+    def run(hidden):
+        return ops.attention_projection(
+            raw,
+            weight,
+            input_scale,
+            weight_scale,
+            hidden,
+            x["norm_weight"],
+            x["modulation"],
+            x["indices"],
+            up_reciprocal,
+            input_reciprocal,
+            EPS,
+        )
+
+    fused_residual, fused_codes = run(x["hidden"])
+    assert branch == {"fused": 1, "unfused": 0}
+    residual, codes = run(_misaligned(x["hidden"]))
+    assert branch == {"fused": 1, "unfused": 1}
+    assert _relative_l2(residual, fused_residual) < 1e-4
+    assert _same_fraction(residual, fused_residual) > 0.999
+    assert _same_fraction(codes, fused_codes) > 0.999
+    projected = _gemm(
+        _quantize(raw.reshape(length, QK), input_scale), weight, input_scale, weight_scale
     )
-    residual, codes = ops.attention_projection(
-        raw,
-        weight,
-        input_scale,
-        weight_scale,
-        hidden,
-        x["norm_weight"],
-        x["modulation"],
-        x["indices"],
-        up_reciprocal,
-        input_reciprocal,
-        EPS,
-    )
-    projected = _gemm(activation, weight, input_scale, weight_scale)
     expected_residual, expected_norm = fused_adaln.h3_gate_res_norm_mod(
         x["hidden"],
         projected.reshape_as(x["hidden"]),
@@ -342,8 +357,17 @@ def test_attention_projection_outside_the_kernel_contract_takes_the_unfused_path
         3,
     )
     assert _relative_l2(residual, expected_residual) < 1e-4
-    assert _same_fraction(residual, expected_residual) > 0.999
     assert _same_fraction(codes, _quantize(expected_norm, up_scale)) > 0.999
+
+
+def test_a_weight_the_kernel_cannot_tile_is_rejected_at_compile(scenario):
+    projection_residual = scenario[3]
+    before = dict(projection_residual._compiled)
+    with pytest.raises(ValueError, match="does not tile"):
+        projection_residual.compile_kernel(
+            torch.cuda.current_device(), 5000, UP, projection_residual.DOWN_GATE, BF16, torch.int64
+        )
+    assert projection_residual._compiled == before
 
 
 def test_non_finite_values_saturate_in_adaln(scenario):
