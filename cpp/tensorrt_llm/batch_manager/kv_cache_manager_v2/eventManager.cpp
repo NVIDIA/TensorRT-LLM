@@ -128,6 +128,12 @@ void EventManager::setLayerGroupWindowSizes(std::map<int, int> windowSizes)
     mWindowSizeByLayerGroup = std::move(windowSizes);
 }
 
+void EventManager::setLayerGroupKinds(std::map<int, std::string> kinds)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mKindByLayerGroup = std::move(kinds);
+}
+
 void EventManager::addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId)
 {
     if (data.blocks.empty() || mMaxKvEventEntries <= 0)
@@ -394,8 +400,8 @@ KVCacheEvent& EventManager::addEventUnlocked(KVCacheEventData data, EventLayerGr
     {
         flushAllRemovedEventsUnlocked();
     }
-    mPendingEvents.push_back(KVCacheEvent{
-        mNextEventId++, std::move(data), getWindowSize(layerGroupId), mHashAlgoName, mAttentionDpRank, layerGroupId});
+    mPendingEvents.push_back(KVCacheEvent{mNextEventId++, std::move(data), getWindowSize(layerGroupId), mHashAlgoName,
+        mAttentionDpRank, layerGroupId, getLayerGroupKind(layerGroupId)});
     if (!std::holds_alternative<KVCacheStoredData>(mPendingEvents.back().data))
     {
         mLatestStoredEventIds.erase(layerGroupId);
@@ -502,6 +508,20 @@ int EventManager::getWindowSize(EventLayerGroupId layerGroupId) const
     }
     auto const windowSize = mWindowSizeByLayerGroup.find(*layerGroupId);
     return windowSize == mWindowSizeByLayerGroup.end() ? mWindowSize : windowSize->second;
+}
+
+std::optional<std::string> EventManager::getLayerGroupKind(EventLayerGroupId layerGroupId) const
+{
+    if (!layerGroupId.has_value())
+    {
+        return std::nullopt;
+    }
+    auto const kind = mKindByLayerGroup.find(*layerGroupId);
+    if (kind == mKindByLayerGroup.end())
+    {
+        return std::nullopt;
+    }
+    return kind->second;
 }
 
 uint64_t EventManager::truncateDigestToInt64(Digest const& digest)

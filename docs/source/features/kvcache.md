@@ -682,6 +682,18 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
+**Recurrent-state checkpoints (hybrid models, prototype).** A hybrid model (Mamba2, Gated
+DeltaNet or KDA layers next to attention) can resume a cached prefix only at a block that also
+holds a recurrent-state snapshot (see `mamba_state_config`). With
+`KVEventsConfig(publish_recurrent_checkpoints=True)` each such snapshot is published as an
+extra `BlockStored` carrying `group_idx` (1-based over the recurrent layer groups) and
+`kv_cache_spec_kind="mamba"`, with an empty `token_ids` list and the same block hash as the
+attention block it sits on; evicting the snapshot publishes a `BlockRemoved` with the same tags.
+Attention events are unchanged, so consumers that ignore the tags behave as before. Only
+snapshots that cover a full block are published, so set `periodic_snapshot_interval` to a
+multiple of `tokens_per_block`. The buffered path reports the same information through the
+`layer_group_kind` field of every event (`attention`, `sliding_window` or `mamba`).
+
 **Limitations.** Pipeline and context parallelism are unsupported. Buffered polling returns
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
 events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
