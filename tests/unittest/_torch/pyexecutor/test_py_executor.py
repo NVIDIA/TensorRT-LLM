@@ -29,6 +29,7 @@ from engine_test_utils import DummyModel
 from test_common.host_cache_manager import make_host_cache_manager
 from test_common.host_executor import make_host_executor
 from test_common.interface_checks import mock_target, verify_instance
+from test_common.llm_request_stubs import make_llm_request_mock, make_llm_request_stub
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from tensorrt_llm._torch import models as torch_models
@@ -787,18 +788,11 @@ def _make_admission_executor(model, requests):
 
 
 def _make_admission_request(request_id: int) -> types.SimpleNamespace:
-    request = types.SimpleNamespace(
-        py_lora_ckpt_source=None,
+    return make_llm_request_stub(
         request_id=request_id,
         py_disaggregated_params=None,
         sampling_config=None,
-        kv_cache_retention_config=None,
         raise_if_validation_failed=Mock(),
-    )
-    return verify_instance(
-        request,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
 
 
@@ -3357,7 +3351,7 @@ def _make_adp_request(
     is_child=False,
     parent_request_id=None,
 ):
-    req = Mock()
+    req = make_llm_request_mock()
     req.state = state
     req.state_value = (
         state.value
@@ -3380,13 +3374,7 @@ def _make_adp_request(
     req.is_context_init_state = state == LlmRequestState.CONTEXT_INIT
     req.is_generation_in_progress_state = state == _STATE_GENERATION_IN_PROGRESS
     req.py_encoder_output_ready_event = None
-    req.kv_cache_retention_config = None
-    req.py_lora_ckpt_source = None
-    return verify_instance(
-        req,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
-    )
+    return req
 
 
 def _make_adp_executor(
@@ -5288,15 +5276,9 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
     )
 
     if loop == "overlap":
-        previous_batch = object.__new__(BatchState)
-        previous_batch.scheduled_requests = batch
-        previous_batch.sample_state = SampleState(requests=[])
-        verify_instance(
-            previous_batch,
-            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-            members_only=True,
+        executor.previous_batch = BatchState(
+            scheduled_requests=batch, sample_state=SampleState(requests=[])
         )
-        executor.previous_batch = previous_batch
         executor.enable_early_first_token_response = False
         executor._process_previous_batch()
     else:
@@ -5350,7 +5332,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         "ctx_usage": None,
         **disagg_params,
     }
-    request = types.SimpleNamespace(
+    request = make_llm_request_stub(
         py_request_id=rid,
         py_decoding_iter=1,
         py_batch_idx=None,
@@ -5364,13 +5346,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
     request.create_response = lambda: LlmResponse(request_id=rid, result=LlmResult(b"", py_result))
-    request.kv_cache_retention_config = None
-    request.py_lora_ckpt_source = None
-    return verify_instance(
-        request,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
-    )
+    return request
 
 
 def _first_token_executor(*, overlap: bool) -> PyExecutor:

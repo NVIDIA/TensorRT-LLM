@@ -18,11 +18,12 @@ from unittest.mock import Mock
 
 import pytest
 from test_common.interface_checks import verify_instance
+from test_common.llm_request_stubs import make_llm_request_stub
 
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
 pytestmark = pytest.mark.cpu_only
@@ -80,9 +81,7 @@ def test_connector_save_leg_is_noop_without_connector() -> None:
 
 
 def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
-    request = SimpleNamespace(
-        kv_cache_retention_config=None,
-        py_lora_ckpt_source=None,
+    return make_llm_request_stub(
         is_context_only_request=True,
         is_context_finished=True,
         is_finished_due_to_length=False,
@@ -92,11 +91,6 @@ def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
         request_id=request_id,
         py_request_id=request_id,
         py_kv_transfer_start_time=None,
-    )
-    return verify_instance(
-        request,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
 
 
@@ -115,22 +109,9 @@ def test_connector_save_uses_previous_batch_with_overlap_scheduler() -> None:
     executor = _connector_executor()
     executor.disable_overlap_scheduler = False
     prev_req = SimpleNamespace(is_finished=True, request_id=2, py_request_id=2)
-    executor.previous_batch = verify_instance(
-        SimpleNamespace(
-            scheduled_requests=SimpleNamespace(all_requests=lambda: [prev_req]),
-            sample_state=None,
-            iter_start_time=0,
-            iter_stats=None,
-            iter_id=None,
-            scheduled_batch_stats=None,
-            gpu_forward_start_event=None,
-            gpu_forward_end_event=None,
-            gpu_forward_events_from_perf_pool=False,
-            guided_batch_id=None,
-            guided_failures=None,
-        ),
-        "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-        members_only=True,
+    executor.previous_batch = BatchState(
+        scheduled_requests=SimpleNamespace(all_requests=lambda: [prev_req]),
+        sample_state=None,
     )
     current_req = SimpleNamespace(is_finished=True, request_id=3, py_request_id=3)
 

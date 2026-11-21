@@ -149,12 +149,12 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         indexer=indexer,
     )
     backend._native_slot_mapping = lambda logical: CSA2TrtllmAttention._native_slot_mapping(
-        (backend),
+        backend,
         logical,
     )
     backend._resolve_sparse_inputs = lambda count, args: (
         CSA2TrtllmAttention._resolve_sparse_inputs(
-            (backend),
+            backend,
             count,
             args,
         )
@@ -164,7 +164,7 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         start = forward_args.sparse_backend_args.query_start
         calls.append((forward_args.attention_input_type, start, query.shape[0]))
         selected = CSA2TrtllmAttention.prepare_sparse_inputs(
-            (backend),
+            backend,
             query,
             metadata,
             forward_args,
@@ -1055,7 +1055,7 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
     monkeypatch.setattr(
         csa2_module,
         "csa2_side_stream",
-        (lambda device, index=0: side_streams.append(index) or side_stream(device, index)),
+        lambda device, index=0: side_streams.append(index) or side_stream(device, index),
     )
     metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
     metadata.request_ids = [request.py_request_id]
@@ -1150,7 +1150,7 @@ def test_small_step_query_amax_word_decode_and_graph(monkeypatch, module_cache, 
     monkeypatch.setattr(
         CSA2TrtllmAttention,
         "direct_decode_serves",
-        (lambda *args: False),
+        lambda *args: False,
     )
     torch.manual_seed(949)
     manager, request = module_cache
@@ -1247,7 +1247,7 @@ def test_fp8_query_projection_decode_and_graph(monkeypatch, module_cache, overla
     monkeypatch.setattr(
         CSA2TrtllmAttention,
         "direct_decode_serves",
-        (lambda *args: False),
+        lambda *args: False,
     )
     torch.manual_seed(948)
     manager, request = module_cache
@@ -1453,7 +1453,7 @@ def test_fused_compression_step_matches_native(monkeypatch, ratio):
             torch.randn(pages, page_size, width),
             torch.randn(pages, page_size, width),
         )
-        fused = (native[0].clone(), native[1].clone())
+        fused = native[0].clone(), native[1].clone()
         kv_pages, score_pages = (torch.randperm(pages).int().view(2, 8) for _ in range(2))
 
     def ints(values):
@@ -1486,13 +1486,13 @@ def test_fused_compression_step_matches_native(monkeypatch, ratio):
         monkeypatch.setattr(
             CSA2Compressor,
             "_fuses",
-            (lambda *args: False),
+            lambda *args: False,
         )
         latent_ref, index_ref = compressor.project(x, batch(native), index_wk)
         monkeypatch.setattr(
             CSA2Compressor,
             "_fuses",
-            (fuses),
+            fuses,
         )
         assert compressor._fuses(x, batch(fused), index_wk.weight)
         latent, index_k = compressor.project(x, batch(fused), index_wk)

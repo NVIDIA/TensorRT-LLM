@@ -24,10 +24,11 @@ those associations alongside normal type checking against the
 **current source**. There is no central binding list or saved interface baseline.
 Production files do not need decorators, imports, or other changes.
 
-The `type-check` pre-commit hook runs both checks. Mock checks scan all registered
-tests even for production-only changes, and also run for checker/config-only
-changes. Their diagnostics bypass diff-line and path/module filtering so changes
-to a production interface can expose incompatible mocks in unchanged tests.
+The `type-check` pre-commit hook and direct wrapper runs scan all registered
+mocks for product, test, checker, and configuration inputs. The Jenkins
+full-project scan also checks registered mocks. Their diagnostics bypass
+diff-line and path/module filtering so changes to a production interface can
+expose incompatible mocks in unchanged tests.
 Results are saved under `mock_interfaces` in
 `pyrefly_final_report.json`; mock diagnostics also appear in `result.errors`.
 File-list checks print diagnostics, while full-project checks print only the
@@ -236,12 +237,11 @@ mismatches, or `2` for analysis errors or incomplete verification. A mismatch ca
 also carry incomplete diagnostics; in that case the exit status is `2` and the
 JSON retains both findings.
 
-The combined `type-check` hook accepts changed filenames for ordinary Pyrefly
-checks, but scans **all registrations** for mock compatibility. It runs the mock checker with the installed `python3`.
-Discrepancies and incomplete checks remain visible in the terminal and combined
-JSON report, but the hook returns success. The `mock_interfaces.check_exit_code`
-field records the mock check status. Use `scripts/run_pyrefly.sh --strict` with
-file paths to fail on diagnostics or incomplete checks.
+The wrapper runs the static mock scan with the installed `python3`. Discrepancies
+and incomplete checks appear in the combined JSON report. The
+`mock_interfaces.check_exit_code` field records the mock check status. Use
+`scripts/run_pyrefly.sh --strict` with file paths to fail on diagnostics or
+incomplete checks.
 
 ## Current analysis boundaries
 

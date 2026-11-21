@@ -20,7 +20,7 @@
 # to also disable Pyrefly's configured project and import exclusions.
 # Product and test checks use separate configurations to isolate import resolution.
 # Registered mock interfaces are checked across all tests, without diff filtering,
-# and included in the same report. Checker/config-only changes run this pass too.
+# and included in the same report. Use --no-mock-interfaces for Pyrefly alone.
 
 set -euo pipefail
 
@@ -28,6 +28,7 @@ FULL_PROJECT=0
 DIFF_BASE=""
 DIFF_FILTER=1
 PATH_MODULE_FILTER=1
+MOCK_CHECK_ENABLED=1
 STRICT=0
 while (( $# > 0 )); do
     case "$1" in
@@ -52,6 +53,7 @@ Options:
   --strict                 Fail file-list checks on diagnostics or check failures.
   --no-diff-filter         Keep diagnostics from all lines in supplied files.
   --no-path-module-filter  Include diagnostics from excluded paths and modules.
+  --no-mock-interfaces      Run only Pyrefly.
 
 Path and module exclusions and diff-line filtering are enabled by default.
 PYREFLY_REPORT_PATH overrides the report path (default: project root).
@@ -66,6 +68,10 @@ EOF
             ;;
         --no-path-module-filter)
             PATH_MODULE_FILTER=0
+            shift
+            ;;
+        --no-mock-interfaces)
+            MOCK_CHECK_ENABLED=0
             shift
             ;;
         *)
@@ -102,7 +108,8 @@ MOCK_CHECK=0
 cleanup() {
     local status=$?
     local mock_status=0
-    if (( MOCK_CHECK )); then
+    trap - EXIT
+    if (( MOCK_CHECK && status != 130 && status != 143 )); then
         python3 "$WORKFLOW_SCRIPT" check-mock-interfaces "$REPORT_FILE" "$PROJECT_DIR" \
             || mock_status=$?
         if (( mock_status > status )); then
@@ -118,8 +125,10 @@ cleanup() {
     if [[ -n "$CHECK_DIR" ]]; then
         rm -rf "$CHECK_DIR" || true
     fi
+    if (( status == 130 || status == 143 )); then
+        exit "$status"
+    fi
     if (( SKIP_CHECK )); then
-        trap - EXIT
         exit 0
     fi
     if (( FULL_PROJECT )); then
@@ -127,7 +136,6 @@ cleanup() {
     else
         python3 "$WORKFLOW_SCRIPT" print-diagnostics "$REPORT_FILE" >&3 || true
     fi
-    trap - EXIT
     if (( STRICT )); then
         printf 'Pyrefly check exit status: %s\n' "$status" >&3 || true
         exit "$status"
@@ -142,6 +150,8 @@ cleanup() {
 
 exec 3>&1
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cd "$PROJECT_DIR"
 
 if (( FULL_PROJECT && $# > 0 )); then
@@ -169,19 +179,22 @@ for argument in "$@"; do
     FILTERED_ARG_COUNT=$((FILTERED_ARG_COUNT + 1))
 done
 
-MOCK_CHECK=$FULL_PROJECT
-for argument in "$@"; do
-    argument="${argument#"$PROJECT_DIR/"}"
-    argument="${argument#./}"
-    case "$argument" in
-        tensorrt_llm/*.py|tensorrt_llm/*.pyi|tests/*.py|tests/*.pyi|\
-        scripts/check_mock_interfaces.py|\
-        scripts/pyrefly_workflow.py|scripts/pyrefly_exclusion.py|scripts/run_pyrefly.sh|\
-        pyproject.toml|.pre-commit-config.yaml)
-            MOCK_CHECK=1
-            ;;
-    esac
-done
+if (( MOCK_CHECK_ENABLED )); then
+    MOCK_CHECK=$FULL_PROJECT
+    for argument in "$@"; do
+        argument="${argument#"$PROJECT_DIR/"}"
+        argument="${argument#./}"
+        case "$argument" in
+            tensorrt_llm/*.py|tensorrt_llm/*.pyi|tests/*.py|tests/*.pyi|\
+            scripts/check_mock_interfaces.py|\
+            scripts/pyrefly_workflow.py|scripts/pyrefly_exclusion.py|scripts/run_pyrefly.sh|\
+            pyproject.toml|.pre-commit-config.yaml)
+                MOCK_CHECK=1
+                break
+                ;;
+        esac
+    done
+fi
 
 if (( FULL_PROJECT || FILTERED_ARG_COUNT > 0 )); then
     printf '{"tool":"pyrefly","report_error":"Pyrefly check did not complete"}\n' > "$REPORT_FILE"
@@ -214,7 +227,7 @@ fi
 
 if (( ! FULL_PROJECT && FILTERED_ARG_COUNT == 0 )); then
     if (( MOCK_CHECK )); then
-        printf '{"tool":"pyrefly","pyrefly_exit_code":0,"result":{"errors":[]}}\n' \
+        printf '{"tool":"pyrefly","pyrefly_skipped":true,"result":{"errors":[]}}\n' \
             > "$REPORT_FILE"
         exit 0
     fi
@@ -264,6 +277,9 @@ for scope in tensorrt_llm tests; do
     PASS_STATUS=0
     pyrefly "${PYREFLY_ARGS[@]}" > "$CHECK_DIR/$scope.raw.json" \
         2> "$CHECK_DIR/$scope.stderr" || PASS_STATUS=$?
+    if (( PASS_STATUS == 130 || PASS_STATUS == 143 )); then
+        exit "$PASS_STATUS"
+    fi
     if (( PASS_STATUS > PYREFLY_STATUS )); then
         PYREFLY_STATUS=$PASS_STATUS
     fi

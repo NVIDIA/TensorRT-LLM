@@ -1295,7 +1295,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
             def send(self, payload, dest, tag):
                 sent_acks.append(payload)
 
-        # Minimal PyExecutor shell — only the fields the listener loop touches.
+        # Populate the fields used by the listener loop.
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         executor = object.__new__(PyExecutor)

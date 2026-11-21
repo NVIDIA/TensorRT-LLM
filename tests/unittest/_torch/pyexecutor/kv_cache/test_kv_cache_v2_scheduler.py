@@ -24,6 +24,7 @@ from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
 from test_common.interface_checks import verify_instance
+from test_common.llm_request_stubs import make_llm_request_mock
 
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -31,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
     MAX_WAIT_PASSES,
     MIN_GAIN_BLOCKS,
@@ -233,14 +234,7 @@ DISAGG_CTX_COMPLETE = LlmRequestState.DISAGG_CONTEXT_COMPLETE.value  # 22
 # Mock factories
 # ---------------------------------------------------------------------------
 def _scheduler_request() -> Mock:
-    req = Mock()
-    req.kv_cache_retention_config = None
-    req.py_lora_ckpt_source = None
-    return verify_instance(
-        req,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
-    )
+    return make_llm_request_mock()
 
 
 def make_gen_request(
@@ -3166,22 +3160,9 @@ class TestPEFT:
         )
         engine.active_requests = active.copy()
         engine._pending_response_terminations = [held] if pending_termination else []
-        engine.previous_batch = verify_instance(
-            SimpleNamespace(
-                scheduled_requests=SimpleNamespace(context_requests=[held]),
-                sample_state=None,
-                iter_start_time=0,
-                iter_stats=None,
-                iter_id=None,
-                scheduled_batch_stats=None,
-                gpu_forward_start_event=None,
-                gpu_forward_end_event=None,
-                gpu_forward_events_from_perf_pool=False,
-                guided_batch_id=None,
-                guided_failures=None,
-            ),
-            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-            members_only=True,
+        engine.previous_batch = BatchState(
+            scheduled_requests=SimpleNamespace(context_requests=[held]),
+            sample_state=None,
         )
         engine._cancelled_disagg_model_request_ids = lambda: set() if pending_termination else {0}
 

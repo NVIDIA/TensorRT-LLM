@@ -12,7 +12,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from test_common.interface_checks import mock_target, verify_instance
+from test_common.interface_checks import mock_target
+from test_common.llm_request_stubs import make_llm_request_stub
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
@@ -5305,20 +5306,13 @@ def _fake_context_request(
     expect_snapshot_points=None,
     is_disagg_generation_init_state=False,
 ):
-    request = SimpleNamespace(
-        kv_cache_retention_config=None,
-        py_lora_ckpt_source=None,
+    return make_llm_request_stub(
         py_request_id=rid,
         prompt_len=prompt_len,
         context_current_position=context_current_position,
         is_dummy_request=is_dummy_request,
         is_disagg_generation_init_state=is_disagg_generation_init_state,
         expect_snapshot_points=list(expect_snapshot_points or []),
-    )
-    return verify_instance(
-        request,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
 
 

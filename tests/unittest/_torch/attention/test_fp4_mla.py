@@ -165,7 +165,7 @@ def test_fp4_mla_missing_v_scale_pool_only_for_context_only_cache(
 
     if supported:
         assert Fp4MlaFmha._is_supported(
-            (fmha),
+            fmha,
             torch.empty(1, 4),
             k,
             v,
@@ -175,7 +175,7 @@ def test_fp4_mla_missing_v_scale_pool_only_for_context_only_cache(
     else:
         with pytest.raises(RuntimeError, match="requires the V-scale pool"):
             Fp4MlaFmha._is_supported(
-                (fmha),
+                fmha,
                 torch.empty(1, 4),
                 k,
                 v,
@@ -214,7 +214,7 @@ def test_fp4_mla_helix_validates_softmax_stats(
         match="FP4 MLA Helix requires.*softmax stats|requires softmax_stats_tensor",
     ):
         Fp4MlaFmha._is_supported(
-            (fmha),
+            fmha,
             torch.empty(num_tokens, 4),
             None,
             None,
@@ -272,7 +272,7 @@ def test_fp4_mla_generation_forwards_helix_softmax_stats(monkeypatch) -> None:
 
     Fp4MlaFmha.run_mla_generation(
         None,
-        (params),
+        params,
     )
 
     assert len(calls) == 1
@@ -335,11 +335,11 @@ def test_fp4_mla_rope_generation_forwards_helix_cache_ownership(
 
     def run_rope_generation() -> dict:
         trtllm_backend.TrtllmAttention._fp4_mla_rope_generation(
-            (attn),
+            attn,
             fused_q,
             q_pe,
             latent_cache,
-            (metadata),
+            metadata,
             fuse_q_quant=True,
         )
         args, kwargs = calls[-1]
@@ -395,7 +395,7 @@ def test_validate_fp4_mla_config_accepts_only_helix_context_parallelism(
     monkeypatch.setattr(
         model_loader,
         "supports_fp4_mla_attention",
-        (lambda config: True),
+        lambda config: True,
     )
 
     def _mock_cutedsl_backend_available() -> bool:
@@ -405,7 +405,7 @@ def test_validate_fp4_mla_config_accepts_only_helix_context_parallelism(
     monkeypatch.setattr(
         model_loader,
         "get_sm_version",
-        (lambda: sm_version),
+        lambda: sm_version,
     )
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
     model_config = ModelConfig(
@@ -463,12 +463,12 @@ def test_validate_fp4_mla_config_keeps_standalone_drafter_kv_cache(
     monkeypatch.setattr(
         model_loader,
         "supports_fp4_mla_attention",
-        (lambda config: True),
+        lambda config: True,
     )
     monkeypatch.setattr(
         model_loader,
         "get_sm_version",
-        (lambda: 103),
+        lambda: 103,
     )
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     assert spec_config.spec_dec_mode.use_one_engine()
@@ -514,7 +514,7 @@ def test_fp4_mla_generation_hp_page_ids_skip_mixed_batch_context_rows() -> None:
         ),
     )
 
-    page_ids = fp4_mla_backend._fp4_mla_generation_hp_page_ids((metadata), 3)
+    page_ids = fp4_mla_backend._fp4_mla_generation_hp_page_ids(metadata, 3)
 
     torch.testing.assert_close(page_ids, torch.arange(6, 15, dtype=torch.int32))
 
@@ -549,7 +549,7 @@ def test_fp4_mla_cuda_graph_generation_lengths_records_capture_once(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "is_current_stream_capturing",
-        (lambda: True),
+        lambda: True,
     )
     monkeypatch.setattr(
         fp4_mla_metadata,
@@ -557,8 +557,8 @@ def test_fp4_mla_cuda_graph_generation_lengths_records_capture_once(monkeypatch)
         populate_generation_lengths,
     )
 
-    first = fp4_mla_backend._fp4_mla_uniform_generation_lengths((metadata), 4, 2)
-    second = fp4_mla_backend._fp4_mla_uniform_generation_lengths((metadata), 4, 2)
+    first = fp4_mla_backend._fp4_mla_uniform_generation_lengths(metadata, 4, 2)
+    second = fp4_mla_backend._fp4_mla_uniform_generation_lengths(metadata, 4, 2)
 
     assert len(populate_calls) == 1
     args, kwargs = populate_calls[0]
@@ -744,7 +744,7 @@ def test_dense_fp4_mla_declares_fp8_context_workspace(
     monkeypatch.setattr(
         trtllm_backend,
         "get_sm_version",
-        (lambda: 100),
+        lambda: 100,
     )
     requested = {}
 
@@ -903,11 +903,11 @@ def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
     output = torch.empty(tokens, heads * v_dim)
 
     result = MLA.forward_context_with_chunked_prefill_fp4(
-        (module),
+        module,
         q,
         torch.zeros(tokens, rank),
         latent,
-        (metadata),
+        metadata,
         output,
     )
 
@@ -994,11 +994,11 @@ def test_fp4_mla_disagg_import_skips_hybrid_linear_attention_layers(monkeypatch)
     monkeypatch.setattr(
         fp4_mla_v_cache,
         "_rebuild_fp4_mla_v_scales_from_k_scales",
-        (lambda *_args, **_kwargs: None),
+        lambda *_args, **_kwargs: None,
     )
 
     assert fp4_mla_backend.rebuild_fp4_mla_disagg_imported_cache(
-        (manager),
+        manager,
         request_ids=[41],
         prompt_lens=[FP4_MLA_TOKENS_PER_BLOCK + 1],
     )
@@ -3252,7 +3252,7 @@ def test_fp4_mla_attention_decode_cutedsl_4x_falls_back_to_packed(
     monkeypatch.setattr(
         fp4_mla_decode_4x,
         "_run_cutedsl_4x_decode",
-        (lambda *a, **k: calls.append("4x")),
+        lambda *a, **k: calls.append("4x"),
     )
     monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
     _assert_fp4_mla_attention_decode_accuracy(
@@ -3297,14 +3297,14 @@ def test_fp4_mla_attention_decode_cutedsl_4x_unavailable_device_runs_packed(monk
     monkeypatch.setattr(
         fp4_mla_decode_4x,
         "_run_cutedsl_4x_decode",
-        (lambda *a, **k: calls.append("4x")),
+        lambda *a, **k: calls.append("4x"),
     )
     monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
     monkeypatch.setattr(host_4x, "device_unsupported_reason", unsupported)
     monkeypatch.setattr(
         fp4_mla_decode_4x,
         "_fp4_mla_4x_record",
-        (lambda why, *a, **k: recorded.append(why)),
+        lambda why, *a, **k: recorded.append(why),
     )
     # the "h128-q4" case of test_fp4_mla_attention_decode_cutedsl_4x_matches_reference: 4x takes it otherwise
     _assert_fp4_mla_attention_decode_accuracy(

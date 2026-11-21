@@ -26,7 +26,7 @@ from unittest.mock import Mock
 
 import pytest
 from test_common.host_cache_manager import make_host_cache_manager
-from test_common.interface_checks import verify_instance
+from test_common.llm_request_stubs import make_llm_request_stub
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
@@ -355,18 +355,11 @@ def test_timeout_description_selects_local_session_without_polling(context: bool
     session.wait_complete = Mock(side_effect=AssertionError("timeout description must not poll"))
     transceiver = _make_transceiver({16: session} if context else {})
     transceiver._recv_sessions = {} if context else {16: session}
-    req = SimpleNamespace(
+    req = make_llm_request_stub(
         py_request_id=16,
-        kv_cache_retention_config=None,
-        py_lora_ckpt_source=None,
         request_id=16,
         py_disaggregated_params=None,
         is_context_only_request=context,
-    )
-    verify_instance(
-        req,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
     assert transceiver._describe_transfer_timeout(req) == progress
     session._timeout_progress_description.assert_called_once_with()
@@ -1517,9 +1510,7 @@ class _RecvFetch:
 
 
 def _gen_request(rid: int) -> SimpleNamespace:
-    request = SimpleNamespace(
-        kv_cache_retention_config=None,
-        py_lora_ckpt_source=None,
+    return make_llm_request_stub(
         py_request_id=rid,
         request_id=rid,
         state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
@@ -1527,11 +1518,6 @@ def _gen_request(rid: int) -> SimpleNamespace:
         set_kv_cache_transfer_start=lambda _t: None,
         set_kv_cache_transfer_end=lambda _t: None,
         set_kv_cache_size=lambda _s: None,
-    )
-    return verify_instance(
-        request,
-        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
-        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
 
 

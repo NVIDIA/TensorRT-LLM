@@ -18,9 +18,9 @@ limitations under the License.
 # Static Type Checking
 
 TensorRT-LLM uses Pyrefly to check Python code under `tensorrt_llm/` and `tests/`.
-The `type-check` pre-commit hook checks supplied files and registered mock
-interfaces. It is advisory: a passing hook does not necessarily mean that no
-errors were found. Read its diagnostics and report before committing.
+The advisory `type-check` pre-commit hook runs Pyrefly on supplied files and
+checks registered mock interfaces. Read its diagnostics and report before
+committing.
 
 ## Prepare a local environment once
 
@@ -89,11 +89,9 @@ each change:
 tracked files. Pre-commit skips the `type-check` hook when none of the selected
 files match its file pattern.
 
-When the hook runs, the wrapper scans all registered mocks if it receives a
-Python source or stub file under `tensorrt_llm/` or `tests/`, or a recognized
-checker or configuration file. An unrelated Python file outside those directories
-can trigger the hook without triggering a mock scan. To scan registered mocks
-regardless of the staged files, run `bash scripts/run_pyrefly.sh --full-project`.
+The hook scans registered mocks for product, test, checker, and configuration
+inputs. A direct full-project run also includes the mock scan. Pass
+`--no-mock-interfaces` to the wrapper for a Pyrefly-only run.
 
 ## Other check modes
 
@@ -144,6 +142,7 @@ and print only the report's absolute path.
   error names and descriptions. Mock diagnostics have the `mock-interface/`
   prefix and `source = "mock-interface"`.
 - `remaining_diagnostic_count` counts the diagnostics after the applicable filters.
+- `pyrefly_skipped` is set when a direct run checks only mock interfaces.
 - `mock_interfaces.results` contains details only for checks with diagnostics or
   incomplete verification. Successful and cleanly skipped checks are omitted.
   `mock_interfaces.registrations` and `counts` still summarize all checks;
@@ -269,10 +268,10 @@ bash scripts/run_pyrefly.sh --no-path-module-filter --no-diff-filter tests/unitt
 
 ## Check mocks against production interfaces
 
-When the [mock scan runs](#check-changed-files-before-committing), it checks all
-registered mock interfaces, including those in unchanged tests. These diagnostics
-bypass ordinary diff-line and path/module filters because a production change
-can invalidate a test double elsewhere in the repository.
+Pre-commit, direct, and Jenkins runs scan all registered mock interfaces,
+including those in unchanged tests. These diagnostics bypass ordinary diff-line
+and path/module filters because a production change can invalidate a test double
+elsewhere in the repository.
 
 Use `@mock_target("module:ClassOrFunction")` for a named mock class or function.
 Use `verify_instance(value, "module:Class")` after setting up a namespace or an

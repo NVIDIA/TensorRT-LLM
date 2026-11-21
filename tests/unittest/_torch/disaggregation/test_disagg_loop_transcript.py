@@ -42,7 +42,7 @@ from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
     PyExecutorRequestRegistry,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ScheduledRequests,
@@ -416,22 +416,8 @@ def test_overlap_close_out_stats_wait_for_a_deferred_previous_batch(
     executor._maybe_emit_quiescent_stats = Mock()
     deferred = previous_batch == "deferred"
     if deferred:
-        executor.previous_batch = verify_instance(
-            SimpleNamespace(
-                scheduled_requests=ScheduledRequests(),
-                sample_state=Mock(),
-                iter_start_time=0,
-                iter_stats=None,
-                iter_id=None,
-                scheduled_batch_stats=None,
-                gpu_forward_start_event=None,
-                gpu_forward_end_event=None,
-                gpu_forward_events_from_perf_pool=False,
-                guided_batch_id=None,
-                guided_failures=None,
-            ),
-            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-            members_only=True,
+        executor.previous_batch = BatchState(
+            scheduled_requests=ScheduledRequests(), sample_state=Mock()
         )
     executor._can_queue.return_value = (False, deferred)
 
@@ -451,24 +437,8 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
 ) -> None:
     """Buffered V2 events occupy the same collective slot despite rank-local batch state."""
 
-    def make_previous_batch() -> SimpleNamespace:
-        return verify_instance(
-            SimpleNamespace(
-                scheduled_requests=ScheduledRequests(),
-                sample_state=Mock(),
-                iter_start_time=0,
-                iter_stats=None,
-                iter_id=None,
-                scheduled_batch_stats=None,
-                gpu_forward_start_event=None,
-                gpu_forward_end_event=None,
-                gpu_forward_events_from_perf_pool=False,
-                guided_batch_id=None,
-                guided_failures=None,
-            ),
-            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
-            members_only=True,
-        )
+    def make_previous_batch() -> BatchState:
+        return BatchState(scheduled_requests=ScheduledRequests(), sample_state=Mock())
 
     def make_cache_manager(rank: int, gather: Callable[[list], list]) -> KVCacheManagerV2:
         manager = object.__new__(KVCacheManagerV2)

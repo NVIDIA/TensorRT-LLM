@@ -26,6 +26,7 @@ import ast
 import copy
 import inspect
 import json
+import os
 import re
 import sys
 import sysconfig
@@ -99,12 +100,33 @@ class Source:
             return self.qualified(node.value) + "." + node.attr
         return UNKNOWN
 
+    def import_module(self, node: ast.ImportFrom) -> str:
+        module = node.module or ""
+        if not node.level:
+            return module
+        parts = self.module.split(".")
+        if not self.path.name.startswith("__init__."):
+            parts.pop()
+        parts = parts[: len(parts) - node.level + 1]
+        if module:
+            parts.append(module)
+        return ".".join(parts)
+
     def bindings(self, scope: ast.AST) -> dict[str, set[ast.AST]]:
         """Collect lexical bindings that can shadow module imports and builtins."""
         if scope not in self.scope_bindings:
             bindings: dict[str, set[ast.AST]] = {}
+            comprehension_targets: set[ast.AST] = set()
             for node in statements(scope):
-                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if isinstance(node, ast.comprehension):
+                    comprehension_targets.update(
+                        target for target, _ in assignment_leaves(node.target, None)
+                    )
+                elif (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, (ast.Store, ast.Del))
+                    and node not in comprehension_targets
+                ):
                     bindings.setdefault(node.id, set()).add(node)
                 elif isinstance(node, ast.arg):
                     bindings.setdefault(node.arg, set()).add(node)
@@ -145,6 +167,7 @@ class Member:
     conditional: bool = False
     line: int = 1
     origin: tuple[str, int] | None = None
+    receiver_keyword: str | None = None
 
 
 @dataclass
@@ -216,14 +239,7 @@ class Sources:
                     for alias in node.names
                 }
             elif isinstance(node, ast.ImportFrom):
-                prefix = node.module or ""
-                if node.level:
-                    parts = module.split(".")
-                    if not path.name.startswith("__init__."):
-                        parts.pop()
-                    prefix = ".".join(
-                        parts[: len(parts) - node.level + 1] + ([prefix] if prefix else [])
-                    )
+                prefix = source.import_module(node)
                 if any(alias.name == "*" for alias in node.names):
                     if node not in source.tree.body:
                         source.star_imports.append(UNKNOWN)
@@ -499,10 +515,15 @@ def signature(
 ) -> dict:
     positional = [*node.args.posonlyargs, *node.args.args]
     defaults = [None] * (len(positional) - len(node.args.defaults)) + list(node.args.defaults)
-    has_receiver = binding in {"method", "classmethod", "property-get", "property-set"}
+    consumes_receiver = not keep_receiver and binding in {
+        "method",
+        "classmethod",
+        "property-get",
+        "property-set",
+    }
     parameters = []
     for index, (arg, default) in enumerate(zip(positional, defaults)):
-        if index == 0 and has_receiver and not keep_receiver:
+        if index == 0 and consumes_receiver:
             continue
         kind = "positional-only" if index < len(node.args.posonlyargs) else "positional-or-keyword"
         parameters.append((arg.arg, kind, default_value(default)))
@@ -518,7 +539,7 @@ def signature(
         "generator": any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in statements(node)),
         "parameters": parameters,
     }
-    if has_receiver and not (positional or node.args.vararg):
+    if consumes_receiver and not (positional or node.args.vararg):
         result["missing_receiver"] = True
     return result
 
@@ -622,6 +643,8 @@ def callable_members(
         )
         if repeated:
             member.signature_issue = "Decorator or repeated declaration can change the interface"
+        if binding == "method" and not node.args.posonlyargs and node.args.args:
+            member.receiver_keyword = node.args.args[0].arg
         member.signatures.append(
             signature(node, binding, keep_receiver=keep_receiver and binding == "method")
         )
@@ -691,6 +714,35 @@ def class_shape(
     return copy.deepcopy(shape)
 
 
+def forwards_unchanged_kwargs(
+    caller: ast.FunctionDef | ast.AsyncFunctionDef, call: ast.Call, name: str
+) -> bool:
+    """Allow reads and copies of the caller's keyword mapping before forwarding it."""
+    for statement in caller.body:
+        nodes = list(ast.walk(statement))
+        safe_uses = {
+            node.value
+            for node in nodes
+            if (isinstance(node, ast.keyword) and node.arg is None)
+            or (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load))
+        }
+        safe_uses.update(
+            node.func.value
+            for node in nodes
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"get", "copy", "keys", "items", "values"}
+        )
+        if any(
+            isinstance(node, ast.Name) and node.id == name and node not in safe_uses
+            for node in nodes
+        ):
+            return False
+        if isinstance(statement, ast.Expr) and statement.value is call:
+            return True
+    return False
+
+
 def matches_initializer_call(
     call: ast.Call,
     initializer: Member | None,
@@ -722,6 +774,9 @@ def matches_initializer_call(
         for name, kind, default in signature["parameters"]
     ]
     keywords = {kw.arg: None for kw in call.keywords if kw.arg is not None}
+    receiver = initializer.receiver_keyword
+    if receiver in keywords:
+        return False
     try:
         inspect.Signature(parameters).bind(*([None] * len(call.args)), **keywords)
     except TypeError:
@@ -729,14 +784,15 @@ def matches_initializer_call(
     unpacked = [kw.value for kw in call.keywords if kw.arg is None]
     if not unpacked:
         return True
-    # A direct **kwargs forward cannot supply any of the caller's named parameters.
-    # Verify that it can only add keywords the inherited initializer accepts.
+    # An untouched **kwargs mapping excludes the caller's named parameters.
     named_parameters = {arg.arg for arg in (*caller.args.args, *caller.args.kwonlyargs)}
     explicitly_bound = keywords.keys() | {
         param.name
         for param in parameters[: len(call.args)]
         if param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
     }
+    if receiver is not None:
+        explicitly_bound.add(receiver)
     return (
         len(unpacked) == 1
         and isinstance(unpacked[0], ast.Name)
@@ -745,6 +801,7 @@ def matches_initializer_call(
         and source.bindings(caller).get(unpacked[0].id) == {caller.args.kwarg}
         and explicitly_bound <= named_parameters
         and any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters)
+        and forwards_unchanged_kwargs(caller, call, unpacked[0].id)
     )
 
 
@@ -1619,9 +1676,17 @@ class Analyzer:
         if isinstance(expression, ast.Lambda):
             return
         nodes = list(statements(expression))
-        for node in nodes:
-            if isinstance(node, ast.NamedExpr):
-                self.assignment(node.target, Value(), env)
+        assignments = [node for node in nodes if isinstance(node, ast.NamedExpr)]
+        if assignments:
+            # Track a single alias in an eager expression, where its source value is known.
+            track_alias = len(assignments) == 1 and not any(
+                isinstance(node, (ast.Assert, ast.BoolOp, ast.Call, ast.IfExp, ast.comprehension))
+                or (isinstance(node, ast.Compare) and len(node.comparators) > 1)
+                for node in nodes
+            )
+            for assignment in assignments:
+                value = self.expression(assignment.value, env) if track_alias else Value()
+                self.assignment(assignment.target, value, env)
         for call in nodes:
             if (
                 isinstance(call, ast.Call)
@@ -1717,7 +1782,10 @@ class Analyzer:
                     continue
                 if statement.value is not None:
                     self.effects(statement.value, env)
-                value = self.expression(statement.value, env)
+                value_node = statement.value
+                if isinstance(value_node, ast.NamedExpr):
+                    value_node = value_node.target
+                value = self.expression(value_node, env)
                 targets = (
                     statement.targets if isinstance(statement, ast.Assign) else [statement.target]
                 )
@@ -1825,11 +1893,27 @@ class Analyzer:
 
     def analyze(self) -> list[dict]:
         for node in ast.walk(self.source.tree):
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module == MARKERS
-                and node not in self.source.tree.body
-            ):
+            if isinstance(node, ast.Import):
+                unsupported = any(
+                    alias.name.removeprefix("tests.") == MARKERS
+                    and (alias.name != MARKERS or node not in self.source.tree.body)
+                    for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                module = self.source.import_module(node)
+                prefix = module.removeprefix("tests.")
+                imports_markers = prefix == MARKERS or any(
+                    f"{prefix}.{alias.name}" == MARKERS for alias in node.names
+                )
+                unsupported = imports_markers and (
+                    node.level
+                    or prefix != module
+                    or node not in self.source.tree.body
+                    or any(alias.name == "*" for alias in node.names)
+                )
+            else:
+                continue
+            if unsupported:
                 self.result(
                     "<unresolved>",
                     node.lineno,
@@ -1837,7 +1921,7 @@ class Analyzer:
                     [
                         issue(
                             "unverified-registration",
-                            "Import markers at module scope",
+                            "Use explicit absolute imports for markers at module scope",
                             node.lineno,
                             True,
                         )
@@ -1900,7 +1984,18 @@ def check(
             module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
             results.extend(Analyzer(sources.read(path, module), sources).analyze())
         except (OSError, UnicodeError, SyntaxError, ValueError) as error:
-            failures.append({"path": str(path), "message": str(error)})
+            line = 1
+            message = str(error).replace(f"{root}{os.sep}", "")
+            if isinstance(error, SyntaxError):
+                line = error.lineno or 1
+                message = error.msg
+            failures.append(
+                {
+                    "path": Path(os.path.relpath(path, root)).as_posix(),
+                    "line": line,
+                    "message": message,
+                }
+            )
     for result in results:
         result["path"] = Path(result["path"]).relative_to(root).as_posix()
     counts = {
@@ -1939,10 +2034,6 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--search-path", action="append", type=Path, default=[])
     parser.add_argument("--report", type=Path, default=Path("mock_interface_report.json"))
-    parser.add_argument("--ast-only", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--advisory", action="store_true", help="Report diagnostics without failing the hook"
-    )
     args = parser.parse_args()
     paths = []
     for entry in args.paths or [Path("tests")]:
@@ -1951,8 +2042,7 @@ def main() -> int:
     report = check(args.root, paths, args.search_path)
     check_exit_code = check_status(report)
     report["check_exit_code"] = check_exit_code
-    report["advisory"] = args.advisory
-    report["exit_code"] = 0 if args.advisory else check_exit_code
+    report["exit_code"] = check_exit_code
     print(f"Verification: {report['verification']}")
     args.report.write_text(json.dumps(report, indent=2) + "\n")
     for result in report["results"]:
@@ -1968,9 +2058,7 @@ def main() -> int:
     )
     if not report["registrations"]:
         print("No registered interfaces were verified. Add markers in test code to opt in.")
-    if args.advisory:
-        print(f"Mock interface check exit status: {check_exit_code}; advisory exit status: 0")
-    return report["exit_code"]
+    return check_exit_code
 
 
 if __name__ == "__main__":

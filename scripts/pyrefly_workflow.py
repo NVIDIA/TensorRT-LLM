@@ -184,20 +184,17 @@ def write_test_config(
 
 
 def report_status(report_path: Path) -> int:
-    """Fail strict checks on remaining diagnostics or an unsuccessful tool invocation."""
+    """Determine the strict exit status of the Pyrefly pass."""
     report = json.loads(report_path.read_text())
     if report.get("report_error"):
         return 2
-    mock_status = report.get("mock_interfaces", {}).get("check_exit_code", 0)
-    if mock_status not in (0, 1):
-        return mock_status
     status = report.get("pyrefly_exit_code", 0)
     if status not in (0, 1):
         return status
     result = report.get("result", report)
     if not isinstance(result, dict) or not isinstance(result.get("errors"), list):
         raise ValueError("Pyrefly report must contain an errors array")
-    return int(bool(result["errors"]) or mock_status == 1)
+    return int(bool(result["errors"]))
 
 
 def check_mock_interfaces(report_path: Path, project_root: Path) -> int:
@@ -240,8 +237,10 @@ def check_mock_interfaces(report_path: Path, project_root: Path) -> int:
         errors.append(
             {
                 "path": error["path"],
+                "line": error["line"],
                 "name": "mock-interface/analysis-error",
                 "description": error["message"],
+                "concise_description": error["message"],
                 "severity": "error",
                 "source": "mock-interface",
             }
@@ -258,8 +257,6 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
     except (OSError, json.JSONDecodeError) as error:
         print(f"Could not read Pyrefly report: {error}")
     else:
-        if report.get("report_error"):
-            print(f"Pyrefly report error: {report['report_error']}")
         if mocks := report.get("mock_interfaces"):
             if mocks.get("report_error"):
                 print(f"Mock interface report error: {mocks['report_error']}")
@@ -272,15 +269,25 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
         errors = result.get("errors", []) if isinstance(result, dict) else []
         if not isinstance(errors, list):
             errors = []
-        if not errors:
+        pyrefly_errors = [error for error in errors if error.get("source") != "mock-interface"]
+        mock_errors = [error for error in errors if error.get("source") == "mock-interface"]
+        if report.get("report_error"):
+            print(f"Pyrefly report error: {report['report_error']}")
+        elif report.get("pyrefly_skipped"):
+            print("Pyrefly skipped. No eligible Python files were supplied.")
+        elif not pyrefly_errors:
             print("No Pyrefly diagnostics.")
-        else:
-            if all_diagnostics:
-                print("Pyrefly type check on your changed files. Please fix the type errors below.")
-                print(
-                    "They are only warnings for now, but in the future they may block your commits and PR merges."
-                )
-            for error in errors if all_diagnostics else errors[:8]:
+        elif all_diagnostics:
+            print("Pyrefly type check on your changed files. Please fix the type errors below.")
+            print(
+                "They are only warnings for now, but in the future they may block your commits and PR merges."
+            )
+        shown_count = 0
+        for diagnostics in (pyrefly_errors, mock_errors):
+            shown = diagnostics if all_diagnostics else diagnostics[: 8 - shown_count]
+            if shown and diagnostics is mock_errors:
+                print("Mock interface diagnostics across all registered tests.")
+            for error in shown:
                 path = str(error.get("path", "<unknown>"))
                 line = error.get("line")
                 column = error.get("column")
@@ -298,8 +305,9 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
                 if not all_diagnostics:
                     message = str(message).replace("\n", " ")
                 print(f"{location}: [{kind}] {message}")
-            if not all_diagnostics and len(errors) > 8:
-                print(f"Showing 8 of {len(errors)} diagnostics.")
+            shown_count += len(shown)
+        if shown_count < len(errors):
+            print(f"Showing {shown_count} of {len(errors)} diagnostics.")
     print(f"See full Pyrefly report at: {report_path}")
 
 
@@ -558,7 +566,11 @@ def main() -> int:
     elif args.command == "report-status":
         return report_status(args.report)
     elif args.command == "check-mock-interfaces":
-        return check_mock_interfaces(args.report, args.project_root)
+        try:
+            return check_mock_interfaces(args.report, args.project_root)
+        except Exception as error:
+            print(f"Mock interface check failed: {type(error).__name__}: {error}", file=sys.stderr)
+            return 2
     elif args.command == "clear-exclusions-config":
         clear_path_module_exclusions(args.source, args.destination)
     elif args.command == "write-test-config":
