@@ -15,7 +15,9 @@ from __future__ import annotations
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.ssm.kda_dsa_cache_manager import (
     KimiK3DSAHybridCacheManager,
 )
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DFlashRuntimePolicy, RuntimeHooks
+
+from .ops.ssm.unified_draft_cache import MlaDFlashContextPolicy
 
 #: The engine's admission window (requests at the head of the queue to choose among), at least.
 _ADMISSION_WINDOW = 32
@@ -81,6 +83,10 @@ K31_RUNTIME_HOOKS = RuntimeHooks(
     # KDA recurrent state, MLA latent cache and one DSA indexer K-cache buffer per MLA layer in one
     # KV cache manager V2: a subclass of the hybrid manager the engine resolves for DSA on Kimi linear.
     kv_cache_manager_cls=KimiK3DSAHybridCacheManager,
+    dflash_policy=DFlashRuntimePolicy(
+        uses_paged_context=MlaDFlashContextPolicy(),
+        supports_helix_rejection_sampling=True,
+    ),
     torch_mem_safety_margin=4 << 30,
     kv_balanced_admission_planner=K31CountFirstAdmission(),
 )

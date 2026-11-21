@@ -256,16 +256,21 @@ def _helix_sharded(mapping: Any) -> bool:
     return mapping.has_cp_helix() or mapping.helix_repurposed_cp_size > 1
 
 
-def _drafter_wants_aggregated_unified_draft_cache(draft_model: Any) -> bool:
-    """Whether the drafter keeps its context KV in the unified draft cache
-    in every deployment, aggregated ones included.
+@dataclass(frozen=True)
+class MlaDFlashContextPolicy:
+    """Whether this drafter stores its context in KV pages for a deployment."""
 
-    A drafter opts in with ``unified_draft_cache_when_aggregated = True``.
-    Any other DFlash drafter keeps its private ring unless helix shards
-    its context or it carries it across disaggregated serving
-    (:func:`_carries_dflash_context`).
-    """
-    return getattr(draft_model, "unified_draft_cache_when_aggregated", False) is True
+    when_aggregated: bool = False
+
+    @classmethod
+    def for_drafter(cls, draft_model: Any) -> MlaDFlashContextPolicy:
+        return cls(
+            when_aggregated=getattr(draft_model, "unified_draft_cache_when_aggregated", False)
+            is True
+        )
+
+    def __call__(self, mapping: Any, is_disagg: bool) -> bool:
+        return self.when_aggregated or is_disagg or _helix_sharded(mapping)
 
 
 def _needs_unified_mla_dflash(
@@ -277,11 +282,8 @@ def _needs_unified_mla_dflash(
     disaggregated serving."""
     if not _is_mla_dflash(spec_config, draft_config):
         return False
-    return (
-        _helix_sharded(mapping)
-        or _drafter_wants_aggregated_unified_draft_cache(draft_model)
-        or _carries_dflash_context(spec_config, is_disagg)
-    )
+    uses_pages = MlaDFlashContextPolicy.for_drafter(draft_model)
+    return uses_pages(mapping, is_disagg)
 
 
 def _draft_cache_kwargs(draft: Any, draft_config: Any, spec_config: Any) -> dict:

@@ -8,12 +8,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm._torch.modeling_v2 import NoTarget
 from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5MoeForCausalLM, Qwen3_5MoeVLModel
 from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor import model_loader
 from tensorrt_llm._torch.pyexecutor.model_loader import _reject_unsupported_model_llm_args
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+__extra_import_path__ = ["../modeling_v2/models/kimi_k31"]
 
 pytestmark = pytest.mark.cpu_only
 
@@ -65,3 +68,17 @@ def test_modeling_v2_only_architecture_checks_its_target(monkeypatch, tmp_path, 
         return
     with pytest.raises(ValueError, match=f"{name} is not supported by _ModelingV2Target"):
         model_loader.ModelLoader.load_config_with_defaults(str(tmp_path), args, checkpoint_loader)
+
+
+def test_modeling_v2_only_architecture_reports_route_refusal_in_auto(monkeypatch, tmp_path):
+    from _k31_builders import HfConfigOnly, checkpoint_dir, on_gpu
+
+    on_gpu(monkeypatch, (10, 0))
+    checkpoint = checkpoint_dir(tmp_path)
+    args = TorchLlmArgs(model=checkpoint)
+    with pytest.raises(NoTarget) as refusal:
+        model_loader.ModelLoader.load_config_with_defaults(checkpoint, args, HfConfigOnly())
+    assert str(refusal.value) == (
+        "'KimiK31ForConditionalGeneration' has no built-in fallback, and no modeling_v2 target "
+        "matches this deployment: sm_100 is not validated yet"
+    )

@@ -1925,6 +1925,8 @@ class ModelLoader:
                          modeling_v2_target=modeling_v2_resolve_on_all_ranks(
                              config, self.llm_args))
 
+        self.llm_args._validate_dflash_target(config)
+
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
             # config object it then discards. The MTP heads' structure fields

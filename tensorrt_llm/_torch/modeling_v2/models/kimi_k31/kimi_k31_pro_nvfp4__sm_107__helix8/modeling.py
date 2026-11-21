@@ -34,7 +34,6 @@ from __future__ import annotations
 import copy
 import math
 import weakref
-from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -139,7 +138,7 @@ from ..ops.spec.unified_draft_cache_worker import UnifiedDraftCacheWorkerMixin
 from ..ops.spec.vocab_parallel_argmax import vocab_parallel_argmax
 from ..ops.spec.vocab_parallel_sample import vocab_parallel_sample
 from ..ops.ssm.kda_decode import kda_decode as kda_decode_op
-from ..ops.ssm.rubin_kda_dsa_cache_manager import K31_RUBIN_RUNTIME_HOOKS, bind_kv_cache_args
+from ..ops.ssm.rubin_kda_dsa_cache_manager import bind_kv_cache_args, rubin_runtime_hooks
 from ..ops.ssm.rubin_kda_metadata import RubinKdaMetadata
 from ..ops.ssm.rubin_kda_mtp_verify import rubin_kda_mtp_verify
 from . import weights as _weights
@@ -4285,8 +4284,8 @@ class ModelingV2KimiK31ProNvfp4Sm107Helix8(
     """
 
     # The engine hooks every Kimi K3.1 target declares (``runtime.py``), with the Rubin KDA + DSA
-    # cache manager (``K31_RUBIN_RUNTIME_HOOKS``) and this target's DSA backend.
-    runtime_hooks = replace(K31_RUBIN_RUNTIME_HOOKS, attention_backend_cls=_DSA_BACKEND)
+    # cache manager (``rubin_runtime_hooks``) and this target's DSA backend.
+    runtime_hooks = rubin_runtime_hooks(_DSA_BACKEND, DraftModel)
 
     # The family KDA metadata class the executor builds.
     mamba_metadata_cls = RubinKdaMetadata

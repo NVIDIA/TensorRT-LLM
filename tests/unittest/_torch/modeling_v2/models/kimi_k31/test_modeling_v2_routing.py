@@ -32,8 +32,10 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import (
+    ModelingV2Mode,
     engine_kv_cache_quant_algo,
     modeling_v2_resolve,
+    resolved_mode,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31 import routing
 from tensorrt_llm.llmapi.llm_args import (
@@ -292,7 +294,9 @@ def test_k31_layouts_match(monkeypatch, capability, layout):
     config = _model_config(_k31_config(), **_LAYOUTS[layout])
     expected = _SM103_PERF.get(layout, _TARGET) if capability == (10, 3) else _TARGET
     for mode in ("auto", "require"):
-        assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == expected
+        target = modeling_v2_resolve(config, _llm_args(mode))
+        assert _qualified(target) == expected
+        assert resolved_mode(target) is ModelingV2Mode(mode)
 
 
 # (checkpoint KV-cache algorithm, kv_cache_config.dtype, layout, capability, target): FP8 latents
@@ -553,12 +557,12 @@ _NEAR_MISSES = {
 
 
 @pytest.mark.parametrize("case", list(_NEAR_MISSES.values()), ids=list(_NEAR_MISSES))
-def test_k31_near_misses_do_not_match(monkeypatch, case):
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_k31_near_misses_do_not_match(monkeypatch, case, mode):
     changes, missed = case
     config, args = _deployment(monkeypatch, changes)
-    assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
     with pytest.raises(ValueError) as refusal:
-        modeling_v2_resolve(config, _llm_args("require", **args))
+        modeling_v2_resolve(config, _llm_args(mode, **args))
     for pattern in missed if isinstance(missed, tuple) else (missed,):
         assert re.search(pattern, str(refusal.value)), (pattern, str(refusal.value))
 
@@ -660,26 +664,12 @@ _LOAD_TIME_REFUSALS = {
 
 
 @pytest.mark.parametrize("case", list(_LOAD_TIME_REFUSALS.values()), ids=list(_LOAD_TIME_REFUSALS))
-def test_k31_refuses_what_the_mxfp4_targets_refuse_at_load(monkeypatch, case):
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_k31_refuses_what_the_mxfp4_targets_refuse_at_load(monkeypatch, case, mode):
     changes, missed = case
     config, args = _deployment(monkeypatch, changes)
-    assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
     with pytest.raises(ValueError, match=re.escape(missed)):
-        modeling_v2_resolve(config, _llm_args("require", **args))
-
-
-def test_k31_without_a_fitting_target_is_refused_under_auto():
-    """``auto`` falls back to the built-in implementation when no target fits, and Kimi K3.1 has none: the model build
-    refuses the architecture instead of running Kimi K3's built-in model, which has no DSA indexer."""
-    from tensorrt_llm._errors import UnsupportedError
-    from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
-
-    config = _model_config(_k31_config(), **_TEP8)
-    assert modeling_v2_resolve(config, _llm_args("auto", use_cute_dsl_bf16_gemm=True)) is None
-    assert AutoModelForCausalLM._resolve_class(config) is None
-    refusal = "Unknown architecture for AutoModelForCausalLM: KimiK31ForConditionalGeneration"
-    with pytest.raises(UnsupportedError, match=refusal):
-        AutoModelForCausalLM.from_config(config)
+        modeling_v2_resolve(config, _llm_args(mode, **args))
 
 
 def _mapping(tp, adp=False, moe=None, pp=1, cp=1):
@@ -874,10 +864,10 @@ def _resolves(config, **args) -> str:
 
 
 def _refused(config, named, **args) -> str:
-    """``auto`` falls back (None), ``require`` raises naming ``named``; the reason."""
-    assert modeling_v2_resolve(config, _export_args("auto", **args)) is None
-    with pytest.raises(ValueError, match=re.escape(named)) as refusal:
-        modeling_v2_resolve(config, _export_args("require", **args))
+    """Both modes report the setting that ruled out the deployment."""
+    for mode in ("auto", "require"):
+        with pytest.raises(ValueError, match=re.escape(named)) as refusal:
+            modeling_v2_resolve(config, _export_args(mode, **args))
     return str(refusal.value)
 
 
@@ -943,6 +933,35 @@ def test_every_server_refuses_other_draft_lengths(rubin, monkeypatch, tmp_path, 
     named = f"max_draft_len {draft_len}: a {layout} {role} server runs one of (3, 4, 5, 6, 7)"
     reason = _refused(config, named, backend=backend)
     assert ("KDA verify kernels" in reason and "indexer-logits atom" in reason) == (draft_len > 7)
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "use_cute_dsl_topk",
+        "index_rope_dim",
+        "linear_attn_config",
+        "use_cute_dsl_bf16_gemm",
+        "TRTLLM_LOW_M_GEMM_BACKEND",
+    ],
+)
+def test_specialized_target_validates_projection_and_index_settings(
+    rubin, monkeypatch, tmp_path, setting
+):
+    config, backend = _export_deployment(monkeypatch, tmp_path, "tep8-generation")
+    text = config.pretrained_config.text_config
+    args = {}
+    if setting == "use_cute_dsl_topk":
+        config.sparse_attention_config.use_cute_dsl_topk = True
+    elif setting == "index_rope_dim":
+        text.dsa_config = dict(text.dsa_config, index_rope_dim=32)
+    elif setting == "linear_attn_config":
+        text.linear_attn_config = None
+    elif setting == "TRTLLM_LOW_M_GEMM_BACKEND":
+        monkeypatch.setenv(setting, "cutlass")
+    else:
+        args[setting] = True
+    _refused(config, setting, backend=backend, **args)
 
 
 def test_an_aggregated_server_takes_the_generation_role(rubin, monkeypatch, tmp_path):
@@ -1108,7 +1127,7 @@ _NVFP4_LOAD_TIME_REFUSALS = {
         {},
         {},
         dict(linear_attn_config=None),
-        "the text config has no linear_attn_config kda_layers",
+        "the text config has no linear_attn_config",
     ),
 }
 
@@ -1477,6 +1496,11 @@ def test_the_role_reaches_the_target_through_the_loader(rubin, monkeypatch, tmp_
     The KDA state check, which imports the KDA package (``fla``), is stood in; it gets the config
     the loader returns."""
     model_loader = _model_loader()
+    # The resolved DFlash budget reads device memory on this simulated GPU.
+    monkeypatch.setattr(
+        "torch.cuda.get_device_properties",
+        lambda device: types.SimpleNamespace(total_memory=128 << 30),
+    )
     state_checked = []
     monkeypatch.setattr(
         model_loader,

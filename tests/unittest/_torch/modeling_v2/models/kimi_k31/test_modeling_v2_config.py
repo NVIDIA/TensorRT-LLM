@@ -9,6 +9,7 @@ import importlib
 import json
 import re
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -329,21 +330,105 @@ def test_aggregated_dflash2_needs_the_budget_flag(tmp_path):
     # 2 x 9 slots x 5 layers x (1048576 + 5) x 12 kv heads per rank x 64 x 2 bytes = 135.00 GiB.
     with pytest.raises(ValueError, match=r"need 135\.00 GiB per GPU"):
         _aggregated_dflash2_args(tmp_path, False)._validate_dflash_ctx_budget(
-            memory_budget_bytes=budget
+            memory_budget_bytes=budget, uses_paged_context=False
         )
-    _aggregated_dflash2_args(tmp_path, True)._validate_dflash_ctx_budget(memory_budget_bytes=budget)
+    _aggregated_dflash2_args(tmp_path, True)._validate_dflash_ctx_budget(
+        memory_budget_bytes=budget, uses_paged_context=False
+    )
 
 
-@pytest.mark.parametrize("backend", [None, "NIXL"])
-def test_dflash2_budget_skips_only_with_a_transceiver_backend(tmp_path, backend):
-    """A cache transceiver with a backend keeps the drafter's context in the KV cache manager's pages, so the
-    pooled-buffer check is skipped; a transceiver config without a backend is aggregated and still checked."""
-    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+@pytest.mark.parametrize(
+    "target,backend,cp,manager_v2,shared,paged",
+    [
+        ("default", None, None, True, False, False),
+        ("default", "NIXL", None, True, False, True),
+        ("default", None, "HELIX", True, False, True),
+        ("default", None, "ULYSSES", True, False, False),
+        ("default", "NIXL", None, False, False, False),
+        ("default", "NIXL", None, True, True, False),
+        ("rubin", None, None, True, False, True),
+        ("stock", "NIXL", "HELIX", True, False, False),
+        ("off", "NIXL", "HELIX", True, False, False),
+    ],
+)
+def test_dflash_budget_uses_resolved_target(
+    tmp_path, monkeypatch, target, backend, cp, manager_v2, shared, paged
+):
+    from unittest.mock import Mock
 
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kimi_k31_pro_nvfp4__sm_107__tep8.modeling import (
+        ModelingV2KimiK31ProNvfp4Sm107Tep8,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k31.runtime import K31_RUNTIME_HOOKS
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, CpConfig, TorchLlmArgs
+    from tensorrt_llm.mapping import Mapping
+
+    targets = dict(
+        default=SimpleNamespace(runtime_hooks=K31_RUNTIME_HOOKS),
+        rubin=ModelingV2KimiK31ProNvfp4Sm107Tep8,
+        stock=object,
+        off=None,
+    )
     args = _aggregated_dflash2_args(tmp_path, False, CacheTransceiverConfig(backend=backend))
-    budget = int(84.86 * 1024**3)
-    if backend is None:
-        with pytest.raises(ValueError, match=r"need 135\.00 GiB per GPU"):
-            args._validate_dflash_ctx_budget(memory_budget_bytes=budget)
-    else:
-        args._validate_dflash_ctx_budget(memory_budget_bytes=budget)
+    args.kv_cache_config.use_kv_cache_manager_v2 = manager_v2
+    args.speculative_config._use_shared_kv_cache = shared
+    args.context_parallel_size = 8 if cp else 1
+    args.tensor_parallel_size = 1
+    args.cp_config = CpConfig(cp_type=cp) if cp else None
+    mapping = Mapping(
+        world_size=args.context_parallel_size,
+        cp_size=args.context_parallel_size,
+        cp_config={"cp_type": cp} if cp else None,
+    )
+    budget = Mock()
+    monkeypatch.setattr(TorchLlmArgs, "_validate_dflash_ctx_budget", budget)
+    spec = args.speculative_config
+    config = SimpleNamespace(modeling_v2_target=targets[target], mapping=mapping, spec_config=spec)
+    # The loader can receive its speculative configuration independently of the API args.
+    args.speculative_config = None
+    args._validate_dflash_target(config)
+    budget.assert_called_once_with(uses_paged_context=paged, spec_config=spec)
+
+
+@pytest.mark.parametrize(
+    "family,shared,explicit,tp,attention_dp,supported",
+    [
+        (True, False, True, 1, False, True),
+        (True, True, True, 1, False, False),
+        (False, False, True, 1, False, False),
+        (False, False, False, 1, False, False),
+        (True, False, True, 2, False, False),
+        (True, False, True, 1, True, False),
+    ],
+)
+def test_helix_sampling_requires_target_opt_in(
+    tmp_path, family, shared, explicit, tp, attention_dp, supported
+):
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kimi_k31_pro_nvfp4__sm_107__helix8.modeling import (
+        ModelingV2KimiK31ProNvfp4Sm107Helix8,
+    )
+    from tensorrt_llm.llmapi.llm_args import CpConfig
+
+    args = _aggregated_dflash2_args(tmp_path, True)
+    args.context_parallel_size = 8
+    args.tensor_parallel_size = tp
+    args.enable_attention_dp = attention_dp
+    args.cp_config = CpConfig(cp_type="HELIX")
+    spec = args.speculative_config
+    spec._use_shared_kv_cache = shared
+    spec.use_rejection_sampling = True
+    if not explicit:
+        # Exercise a value inherited from model defaults.
+        spec.model_fields_set.discard("use_rejection_sampling")
+    mapping = SimpleNamespace(has_cp_helix=lambda: True, helix_repurposed_cp_size=1)
+    target = ModelingV2KimiK31ProNvfp4Sm107Helix8 if family else None
+    with (
+        pytest.raises(ValueError, match="context parallelism")
+        if explicit and not supported
+        else nullcontext()
+    ):
+        args._validate_dflash_target(
+            SimpleNamespace(modeling_v2_target=target, mapping=mapping, spec_config=spec)
+        )
+    if supported or not explicit:
+        assert spec.use_rejection_sampling is supported

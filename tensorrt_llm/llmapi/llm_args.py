@@ -102,6 +102,7 @@ if TYPE_CHECKING:
 
     from tensorrt_llm._torch.attention.backends.sparse.qsa import (
         QSASparseMetadataParams, QSASparseParams)
+    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MoEImplRequest
     from tensorrt_llm._torch.virtual_memory import \
         RestoreMode as _VirtualMemoryRestoreMode
@@ -9819,9 +9820,55 @@ class TorchLlmArgs(BaseLlmArgs):
                 return False
         return True
 
-    def _validate_dflash_ctx_budget(self,
-                                    memory_budget_bytes: Optional[int] = None
-                                    ) -> None:
+    def _dflash_helix_sampling_layout(self) -> bool:
+        return (self.context_parallel_size > 1 and self.cp_config is not None
+                and self.cp_config.cp_type == CpType.HELIX
+                and self.tensor_parallel_size == 1
+                and not self.enable_attention_dp)
+
+    def _validate_dflash_target(self, config: "ModelConfig") -> None:
+        """Check sampling and the drafter's context budget after the target is resolved."""
+        spec = config.spec_config
+        if not isinstance(spec, DFlashDecodingConfig):
+            return
+
+        from tensorrt_llm._torch.pyexecutor.runtime_hooks import \
+            runtime_hooks_of
+
+        mla = _is_mla_dflash_drafter(
+            _draft_checkpoint_config(spec.speculative_model))
+        standalone_mla = mla and not spec._use_shared_kv_cache
+        dflash_policy = runtime_hooks_of(
+            config.modeling_v2_target).dflash_policy
+
+        if (self.context_parallel_size > 1 and spec.use_rejection_sampling and
+                not (standalone_mla and self._dflash_helix_sampling_layout()
+                     and dflash_policy.supports_helix_rejection_sampling)):
+            if "use_rejection_sampling" in spec.model_fields_set:
+                raise ValueError(
+                    "use_rejection_sampling=True is not supported for this configuration: "
+                    "context parallelism is active and the target does not support sampled DFlash."
+                )
+            spec.use_rejection_sampling = False
+
+        if mla:
+            from tensorrt_llm._torch.pyexecutor._util import is_disagg_enabled
+
+            uses_pages = dflash_policy.uses_paged_context
+            paged = (standalone_mla
+                     and self.kv_cache_config.use_kv_cache_manager_v2 is True
+                     and uses_pages is not None and uses_pages(
+                         config.mapping,
+                         is_disagg_enabled(self.cache_transceiver_config)))
+            self._validate_dflash_ctx_budget(uses_paged_context=paged,
+                                             spec_config=spec)
+
+    def _validate_dflash_ctx_budget(
+            self,
+            memory_budget_bytes: Optional[int] = None,
+            *,
+            uses_paged_context: Optional[bool] = None,
+            spec_config: Optional[DFlashDecodingConfig] = None) -> None:
         """Fail at config time on DFlash setups that would die late.
 
         Delegates to ``validate_dflash_ctx_buffer_budget``: the token-budget
@@ -9851,7 +9898,7 @@ class TorchLlmArgs(BaseLlmArgs):
             derive_dflash_ctx_memory_budget_bytes,
             estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
 
-        spec_cfg = self.speculative_config
+        spec_cfg = spec_config if spec_config is not None else self.speculative_config
 
         # Token budget: max_batch_size * (1 + max_draft_len) must fit
         # max_num_tokens or the config corrupts memory at engine init. Under
@@ -9882,16 +9929,11 @@ class TorchLlmArgs(BaseLlmArgs):
         draft_config = _draft_checkpoint_config(spec_cfg.speculative_model)
 
         arena_before_pool = self._kv_cache_estimation_runs()
-        is_disagg = (self.cache_transceiver_config is not None
-                     and self.cache_transceiver_config.backend is not None)
-        managed_mla = (_is_mla_dflash_drafter(draft_config) and
-                       self.kv_cache_config.use_kv_cache_manager_v2 is not False
-                       and (is_disagg or self.context_parallel_size > 1))
-        if spec_cfg.skip_ctx_buffer_budget_check or managed_mla:
-            # Opt out of the pooled-context buffer-fit check (the estimate is
-            # conservative; an MLA drafter under a cache transceiver or helix
-            # keeps its context in the KV cache manager's pages, not in pooled
-            # buffers); the token-budget check above still applies.
+        # The target decides where MLA context lives. Until routing, only check
+        # the token budget for an MLA drafter. A pooled target checks both here.
+        if (spec_cfg.skip_ctx_buffer_budget_check or uses_paged_context
+                or (uses_paged_context is None
+                    and _is_mla_dflash_drafter(draft_config))):
             memory_budget_bytes = None
         elif memory_budget_bytes is None:
             kv_fraction = self.kv_cache_config.free_gpu_memory_fraction
@@ -10008,17 +10050,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 # group-synchronized so the LM-head-TP group's collectives stay
                 # uniform -- see SpecMetadata.group_all_greedy_sample). Only
                 # context parallelism remains gated.
-                # The MLA DFlash2 worker uses the flattened Helix TP group
-                # for full-vocabulary candidate selection and verification;
-                # other DFlash drafters keep the context-parallel gate.
-                dflash_helix = (
-                    spec_mode.is_dflash() and self.cp_config is not None
-                    and self.cp_config.cp_type == CpType.HELIX
-                    and self.tensor_parallel_size == 1
-                    and not self.enable_attention_dp and _is_mla_dflash_drafter(
-                        _draft_checkpoint_config(
-                            self.speculative_config.speculative_model)))
-                rs_parallel_active = self.context_parallel_size > 1 and not dflash_helix
+                # For DFlash on Helix, the resolved target decides whether its
+                # worker can sample over the full vocabulary. A hub checkpoint
+                # may still be unresolved here.
+                defer_helix = False
+                if spec_mode.is_dflash() and self._dflash_helix_sampling_layout(
+                ):
+                    draft = _draft_checkpoint_config(
+                        self.speculative_config.speculative_model)
+                    defer_helix = draft is None or _is_mla_dflash_drafter(draft)
+                rs_parallel_active = self.context_parallel_size > 1 and not defer_helix
                 rs_guided_active = self.guided_decoding_backend is not None
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
                                        None) is not None

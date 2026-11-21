@@ -52,9 +52,10 @@ if TYPE_CHECKING:
 
 # architectures[0] -> the ``route`` that decides where it lands, filled by ``@routes``.
 _ROUTES: Dict[str, Callable[..., type]] = {}
+_V2_ONLY_ARCHITECTURES: Set[str] = set()
 
 
-def routes(*architectures: str):
+def routes(*architectures: str, has_builtin: bool = True):
     """Declare that the decorated ``route`` decides where these ``architectures[0]`` values land."""
 
     def register(route):
@@ -63,6 +64,8 @@ def routes(*architectures: str):
                 f"{arch} routed by both {_ROUTES[arch].__module__} and {route.__module__}"
             )
             _ROUTES[arch] = route
+            if not has_builtin:
+                _V2_ONLY_ARCHITECTURES.add(arch)
         return route
 
     return register
@@ -152,9 +155,9 @@ class NoTarget(ValueError):
     the engine arguments set is not the one it is written for.
 
     The message says, in words, which fact ruled the targets out. Under
-    ``auto`` the resolver logs it and falls back to the built-in implementation
-    (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
-    under ``require`` it becomes the error the user sees.
+    ``auto`` a routing refusal falls back to the built-in implementation when the
+    architecture has one. A v2-only architecture reports the refusal to the user.
+    Under ``require`` a refusal is always an error.
     """
 
 
@@ -379,15 +382,13 @@ def _check_eplb_mode(target: type, config: "ModelConfig") -> None:
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
-    Returns the target class, or None for the built-in implementation:
-    when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
-    for the architecture, when that ``route`` raises ``NoTarget``, or when
-    the deployment runs EPLB in a mode the target does not list in
-    ``EPLB_MODES``. In ``require`` every one of those but ``off`` raises
-    ``ValueError`` instead. It also returns None for a
-    ``@disable_v2_by_default`` target when ``modeling_v2`` was left at its
-    default.
-
+    Returns the target class, or None when ``llm_args.modeling_v2`` is ``off``.
+    In ``auto``, a missing route or a route refusal falls back to the built-in
+    implementation. This includes a requested EPLB mode outside the target's
+    ``EPLB_MODES``. For an architecture without a built-in fallback, ``auto``
+    raises ``NoTarget``. In ``require``, these refusals raise ``ValueError``.
+    A ``@disable_v2_by_default`` target also falls back when ``modeling_v2``
+    was left at its default.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -410,6 +411,10 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
+        if arch in _V2_ONLY_ARCHITECTURES:
+            raise NoTarget(
+                f"{arch!r} has no built-in fallback, and no modeling_v2 target matches this deployment: {why}"
+            ) from None
         logger.info(
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )

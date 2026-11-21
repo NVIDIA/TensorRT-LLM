@@ -14,7 +14,7 @@
 # limitations under the License.
 """Kimi KDA hybrid cache manager with a DSA indexer K-cache on its MLA layers (Kimi K3.1 Rubin).
 
-A runtime helper of the family's Rubin targets: their runtime hooks (``K31_RUBIN_RUNTIME_HOOKS``)
+A runtime helper of the family's Rubin targets: their runtime hooks (``rubin_runtime_hooks``)
 declare it in place of the KDA hybrid manager the engine resolves for DSA on a Kimi linear model, and
 the engine builds it with what ``extra_init_kwargs`` returns. A target binds its construction
 arguments (``bind_kv_cache_args``): the GPU pools zeroed at construction and the KV cache, index-K and
@@ -62,6 +62,7 @@ from ..attention.rubin_dsa_cache import (
     get_indexer_k_cache_size_per_token,
 )
 from .kda_cache_manager import K31HybridCacheManager
+from .unified_draft_cache import MlaDFlashContextPolicy
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
@@ -711,8 +712,14 @@ class RubinKdaDsaHybridCacheManager(K31HybridCacheManager):
         super().shutdown()
 
 
-#: The engine hooks of the Rubin targets: every Kimi K3.1 target's (``runtime.py``), with this manager in
-#: place of the KDA hybrid manager the engine resolves for DSA on a Kimi linear model.
-K31_RUBIN_RUNTIME_HOOKS = replace(
-    K31_RUNTIME_HOOKS, kv_cache_manager_cls=RubinKdaDsaHybridCacheManager
-)
+def rubin_runtime_hooks(attention_backend_cls: type, draft_model_cls: type):
+    """Bind the cache and sampling policy to the drafter this target constructs."""
+    return replace(
+        K31_RUNTIME_HOOKS,
+        kv_cache_manager_cls=RubinKdaDsaHybridCacheManager,
+        attention_backend_cls=attention_backend_cls,
+        dflash_policy=replace(
+            K31_RUNTIME_HOOKS.dflash_policy,
+            uses_paged_context=MlaDFlashContextPolicy.for_drafter(draft_model_cls),
+        ),
+    )

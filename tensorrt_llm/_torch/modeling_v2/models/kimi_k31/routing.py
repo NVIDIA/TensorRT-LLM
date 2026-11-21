@@ -809,6 +809,22 @@ def _dsa_mismatch(model_config: ModelConfig, llm_args: TorchLlmArgs, text) -> Op
     return None
 
 
+def _nvfp4_model_mismatch(model_config: ModelConfig, llm_args: TorchLlmArgs, text) -> Optional[str]:
+    """Settings shared by the default and specialized NVFP4 implementations."""
+    if (mismatch := _layer_layout_mismatch(text)) is not None:
+        return mismatch
+    index_rope_dim = text.dsa_config.get("index_rope_dim")
+    if index_rope_dim != 0:
+        return (
+            f"dsa_config index_rope_dim {index_rope_dim!r}: the Kimi K3.1 DSA indexer is "
+            "position-free (index_rope_dim 0)"
+        )
+    sparse = model_config.sparse_attention_config or llm_args.sparse_attention_config
+    if getattr(sparse, "use_cute_dsl_topk", False):
+        return "the Kimi K3.1 DSA indexer runs the GVR / CUDA radix Top-K: no use_cute_dsl_topk"
+    return _bf16_projection_mismatch(llm_args)
+
+
 def _specialized_recipe_mismatch(
     model_config: ModelConfig, llm_args: TorchLlmArgs, text
 ) -> Optional[str]:
@@ -1051,19 +1067,8 @@ def _nvfp4_default_mismatch(
         )
     if (mismatch := modelopt_nvfp4_mismatch(model_config)) is not None:
         return mismatch
-    if (mismatch := _layer_layout_mismatch(text)) is not None:
-        return mismatch
     if (mismatch := _dsa_mismatch(model_config, llm_args, text)) is not None:
         return mismatch
-    index_rope_dim = text.dsa_config.get("index_rope_dim")
-    if index_rope_dim != 0:
-        return (
-            f"dsa_config index_rope_dim {index_rope_dim!r}: the Kimi K3.1 DSA indexer is "
-            "position-free (index_rope_dim 0)"
-        )
-    sparse = model_config.sparse_attention_config or llm_args.sparse_attention_config
-    if getattr(sparse, "use_cute_dsl_topk", False):
-        return "the Kimi K3.1 DSA indexer runs the GVR / CUDA radix Top-K: no use_cute_dsl_topk"
     if (index_k := _indexer_k_dtype(model_config, llm_args)) != "fp8":
         return f"indexer_k_dtype {index_k!r}: {_NOT_VALIDATED_ON_DEFAULT}; {_NVFP4_DEFAULT_RECIPE}"
     state = llm_args.kv_cache_config.mamba_ssm_cache_dtype
@@ -1121,9 +1126,7 @@ def _nvfp4_default_mismatch(
         )
     if (mismatch := _moe_mismatch(text, mapping)) is not None:
         return mismatch
-    if (mismatch := _engine_settings_mismatch(llm_args, _NVFP4_DEFAULT_SERVERS)) is not None:
-        return mismatch
-    return _bf16_projection_mismatch(llm_args)
+    return _engine_settings_mismatch(llm_args, _NVFP4_DEFAULT_SERVERS)
 
 
 def _modelopt_target(
@@ -1142,6 +1145,8 @@ def _modelopt_target(
             "the Kimi K3.1 NVFP4 export runs on sm_103 (GB300, B300) and sm_107 (Rubin), got "
             f"{compute_capability}"
         )
+    if (mismatch := _nvfp4_model_mismatch(model_config, llm_args, text)) is not None:
+        raise NoTarget(mismatch)
     if compute_capability != _RUBIN:
         if (
             mismatch := _nvfp4_default_mismatch(model_config, llm_args, compute_capability, text)
@@ -1160,7 +1165,7 @@ def _modelopt_target(
     return "default"
 
 
-@routes("KimiK31ForConditionalGeneration")
+@routes("KimiK31ForConditionalGeneration", has_builtin=False)
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
