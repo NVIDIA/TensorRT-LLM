@@ -48,7 +48,12 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
-from ..kv_cache_connector import KvCacheConnectorScheduler, RequestData, SchedulerOutput
+from ..kv_cache_connector import (
+    AllocationFence,
+    KvCacheConnectorScheduler,
+    RequestData,
+    SchedulerOutput,
+)
 from .config import MooncakeStoreConnectorConfig
 from .keys import BlockHashChain, ReuseScope
 from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
@@ -394,6 +399,27 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state.async_loaded_upto = load_end
         state.load_blocks = 0
         self._pending_async_loads.append(transfers)
+
+    def dispatch_async_loads(self, fence: AllocationFence) -> None:
+        """Hand the asynchronous loads queued since the last build to this rank's worker now.
+
+        For a request parked when its pages were allocated, before any batch
+        is final: no metadata may be built in an iteration with nothing to
+        run, yet `get_finished` already expects the load to have started.
+        Valid only where this adapter and the worker that owns the pages share
+        the rank (attention DP, or a single rank); under tensor parallelism
+        every rank must load its own shard, which only the metadata reaches.
+        The runtime calls it only there; see
+        `KvCacheConnectorManager.can_dispatch_async_loads`.
+
+        Args:
+            fence: The KV cache manager's allocation fence covering the
+                destination pages.
+        """
+        if not self._pending_async_loads:
+            return
+        queued, self._pending_async_loads = self._pending_async_loads, []
+        self._require_worker().queue_async_loads(queued, fence)
 
     # ---- work lists ----
 

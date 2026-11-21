@@ -1291,6 +1291,73 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             or request_id in self.local_finished_async_requests.loading
         )
 
+    def queries_are_owner_local(self) -> bool:
+        """Whether a scheduler query runs on the request's owner alone, with no broadcast.
+
+        True under attention DP and on a single rank (see `_run_on_leader`).
+        Only then may a query run inside a scheduling pass whose call order
+        differs between ranks.
+        """
+        return bool(self.enable_attention_dp) or mpi_world_size() == 1
+
+    def loads_prefix_async(self) -> Optional[bool]:
+        """Whether the connector scheduler loads served prefixes asynchronously.
+
+        Reads the scheduler's ``loads_async`` property.
+
+        Returns:
+            Its value when the scheduler declares it as a bool, None otherwise
+            or on a rank without a scheduler.
+        """
+        if self.scheduler is None:
+            return None
+        loads_async = getattr(self.scheduler, "loads_async", None)
+        return loads_async if isinstance(loads_async, bool) else None
+
+    def can_dispatch_async_loads(self) -> bool:
+        """Whether `dispatch_async_loads` can start loads outside a batch.
+
+        Needs an owner-local query and a scheduler implementing
+        ``dispatch_async_loads(fence)``.
+        """
+        return (
+            self.queries_are_owner_local()
+            and self.scheduler is not None
+            and callable(getattr(self.scheduler, "dispatch_async_loads", None))
+        )
+
+    def is_loading_async(self, request: LlmRequest) -> bool:
+        """Whether the query committed for ``request`` this iteration started an async load."""
+        return request.request_id in self.new_async_requests.loading
+
+    def dispatch_async_loads(self, fence: AllocationFence) -> bool:
+        """Start the asynchronous loads queued since the last metadata build now.
+
+        For a request parked at admission no batch carries its load to the
+        worker, and no metadata is built at all in an iteration without a batch
+        to run, while `get_finished` already reports the request as loading.
+        The scheduler hands the loads to the worker on this rank directly,
+        which is only valid when that rank owns the pages, hence
+        `can_dispatch_async_loads`. A failure here is logged and not raised, so
+        that a scheduling pass never raises on one attention-DP rank alone; the
+        load is then reported as never started by `get_finished`.
+
+        Args:
+            fence: The KV cache manager's allocation fence, which each load
+                waits on before writing the request's pages.
+
+        Returns:
+            Whether the loads were handed over.
+        """
+        if not self.can_dispatch_async_loads():
+            return False
+        try:
+            self.scheduler.dispatch_async_loads(fence)
+        except RuntimeError as exc:
+            logger.warning(f"KV connector: early asynchronous load dispatch failed: {exc}")
+            return False
+        return True
+
     def has_pending_loads(self) -> bool:
         return bool(
             self._prefix_load_requests

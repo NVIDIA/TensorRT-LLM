@@ -5957,10 +5957,14 @@ class KVCacheManagerV2(BaseResourceManager):
         Setting an active cache's stream makes the new stream wait for the old
         one, so the forward pass stays ordered behind the allocation.
         """
+        self._adopt_allocation_stream_ids(
+            [req.py_request_id for req in scheduled_batch.context_requests]
+        )
+
+    def _adopt_allocation_stream_ids(self, request_ids: Iterable[int]) -> None:
+        """Adopt the side-stream caches of ``request_ids``; see `_adopt_allocation_stream`."""
         adopted = [
-            req.py_request_id
-            for req in scheduled_batch.context_requests
-            if req.py_request_id in self._on_allocation_stream
+            request_id for request_id in request_ids if request_id in self._on_allocation_stream
         ]
         if not adopted:
             return
@@ -5972,6 +5976,79 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache = self.kv_cache_map.get(request_id)
             if kv_cache is not None:
                 kv_cache.cuda_stream = self._stream.cuda_stream
+
+    # ---- KV connector early admission ----
+
+    def early_connector_admission_blockers(self) -> list[str]:
+        """Why an admitted first chunk cannot be parked for its connector load; empty if it can.
+
+        Parking (`park_for_async_connector_load`) runs the connector query
+        inside the scheduling pass. That needs a connector that loads
+        asynchronously and answers on the owner of the request's pages alone
+        (attention DP, or one rank), so the query enters no collective while
+        ranks schedule different requests, and that can start a load outside a
+        batch. It also needs the final-batch query path, since source
+        reservations accept their loads only once the batch is final.
+        """
+        connector = self.kv_connector_manager
+        if connector is None or self.is_draft:
+            return ["no_connector"]
+        blockers = []
+        if connector.capacity_only:
+            blockers.append("capacity_only")
+        if connector.prefix_reservations_enabled:
+            blockers.append("prefix_reservations")
+        # A connector manager without these answers (an older or substitute
+        # implementation) cannot be shown to qualify.
+        loads_async = getattr(connector, "loads_prefix_async", None)
+        if not callable(loads_async) or loads_async() is not True:
+            blockers.append("sync_loads")
+        owner_local = getattr(connector, "queries_are_owner_local", None)
+        if not callable(owner_local) or owner_local() is not True:
+            blockers.append("leader_broadcast_query")
+        can_dispatch = getattr(connector, "can_dispatch_async_loads", None)
+        if not callable(can_dispatch) or can_dispatch() is not True:
+            blockers.append("no_early_dispatch")
+        return blockers
+
+    def park_for_async_connector_load(self, req: LlmRequest) -> bool:
+        """Query the connector for an admitted first chunk now, and park it if it loads async.
+
+        Called by the scheduler right after the chunk's pages are allocated,
+        with the query `_run_kv_connector_hooks` would otherwise run on the
+        final batch. When the connector answers with an asynchronous load, the
+        request keeps its pages (the served prefix included), leaves the
+        context state and stays out of the batch, so it takes no batch slot and
+        no token budget. Its load is started at once and it re-enters
+        scheduling when the load lands, exactly as from the final-batch path.
+        Otherwise it stays in the batch, its allocation already reported.
+
+        Only valid when `early_connector_admission_blockers` is empty.
+
+        Returns:
+            Whether the request was parked.
+        """
+        connector = self.kv_connector_manager
+        if (
+            not req.is_first_context_chunk
+            or req.py_connector_allocation_reported
+            or not self._connector_may_serve(req)
+            or not connector.should_add_sequence(req)
+        ):
+            return False
+        self._apply_connector_matched_prefix(req)
+        req.py_connector_allocation_reported = True
+        by_group = self.get_page_indices_by_layer_group(req)
+        flat = by_group[0] if len(by_group) == 1 else []
+        connector.update_state_after_alloc(req, flat, by_group)
+        if not connector.is_loading_async(req):
+            return False
+        # No batch reports this cache, so take it off the side stream here: the
+        # load's allocation fence then waits for its allocation alone.
+        self._adopt_allocation_stream_ids((req.py_request_id,))
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        connector.dispatch_async_loads(self.wait_allocation_fences)
+        return True
 
     def is_attention_layer(self, layer_idx: int) -> bool:
         """Return whether ``layer_idx`` uses attention KV cache storage."""

@@ -1386,6 +1386,27 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             return
         queued = list(async_loads)
         metadata.async_loads = []
+        # Bound by `handle_metadata` just before this metadata, for the batch
+        # that allocated the destination pages.
+        self.queue_async_loads(queued, self.get_allocation_fence())
+
+    def queue_async_loads(
+        self, queued: List[RequestTransfers], fence: Optional[AllocationFence]
+    ) -> None:
+        """Queue parked requests' loads for the load threads.
+
+        Reached from `bind_connector_meta`, and from the scheduler adapter on
+        this rank when a request parked at admission must start loading before
+        any metadata is built (`MooncakeStoreConnectorScheduler.dispatch_async_loads`).
+
+        Never raises, for the reason `bind_connector_meta` gives.
+
+        Args:
+            queued: The parked requests' transfers.
+            fence: The KV cache manager's allocation fence covering their pages.
+        """
+        if not queued:
+            return
         if not self._async_load:
             self._stash_load_error(
                 RuntimeError(
@@ -1401,9 +1422,6 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
             )
             return
-        # Bound by `handle_metadata` just before this metadata, for the batch
-        # that allocated the destination pages.
-        fence = self.get_allocation_fence()
         for transfers in queued:
             self._start_async_load(transfers, fence)
 

@@ -15,9 +15,11 @@
 
 import enum
 import os
+import time
 from collections import Counter
 from typing import Callable, Optional
 
+from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.llmapi.llm_args import (
     CapacitySchedulerPolicy,
     ContextChunkingPolicy,
@@ -429,6 +431,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Decoder window whose final-window chunks this pass holds (ctx_decoder_batch.py); 0: none.
         self._ctx_decoder_hold_window = 0
         self._ctx_decoder_held = False
+
+        # Early connector admission: a first chunk whose prefix the KV connector
+        # loads asynchronously is parked as soon as its pages are allocated
+        # (KVCacheManagerV2.park_for_async_connector_load) and charged no batch
+        # slot, token budget or prefix contribution, so the pass keeps filling
+        # the step with work that is ready to compute. The parked request keeps
+        # its pages and re-enters when its load lands.
+        # TRTLLM_DISABLE_KV_CONNECTOR_EARLY_ADMISSION=1 turns it off. Whether it
+        # applies is resolved on the first pass with context work (None until
+        # then), once the connector's mode is final; see _resolve_early_admission.
+        self._early_admission: Optional[bool] = None
+        # Parked requests by id, until they leave the loading state.
+        self._early_parked: dict[int, LlmRequest] = {}
+        # Totals: parked, resumed (back in the context state), dropped while
+        # parked (finished or cancelled), budget tokens not charged.
+        self._early_counts = [0, 0, 0, 0]
+        self._early_last_log = time.monotonic()
 
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         """Register the executor's KV-transfer window (DisaggTransferAdmissionController).
@@ -992,6 +1011,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             else frozenset()
         )
 
+        if self._early_parked:
+            self._track_early_parked()
+        early_admission = self._early_admission
+        if early_admission is None and pending_ctx:
+            early_admission = self._resolve_early_admission()
+        num_parked = 0
         if self._ctx_shortest_first and len(pending_ctx) > 1:
             pending_ctx = self._order_ctx_shortest_first(pending_ctx)
         starved_ctx: RequestList = []
@@ -1142,6 +1167,18 @@ class KVCacheV2Scheduler(RequestScheduler):
                         demoted_ids.add(req.py_request_id)
                         ctx_requests.append(req)
                         continue
+                    if (
+                        early_admission
+                        and remote_mode is None
+                        and req.is_first_context_chunk
+                        and self.kv_cache_manager.park_for_async_connector_load(req)
+                    ):
+                        # Pages (and completion headroom) stay held; no slot,
+                        # tokens or prefix contribution is spent, so the scan
+                        # goes on for work ready to compute.
+                        self._on_early_parked(req, tokens)
+                        num_parked += 1
+                        continue
                     has_chunking = has_chunking or chunking_flag
                     scheduled_ctx.append(req)
                     if self._prefix_wait_planner is not None:
@@ -1176,6 +1213,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                             first_chunk_contributors[first_new_block] = req.py_request_id
 
         self._prev_first_chunk_contributors = first_chunk_contributors
+        if early_admission and self._early_counts[0]:
+            self._maybe_log_early_admission()
 
         made_progress = bool(
             scheduled_gen
@@ -1185,6 +1224,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            or num_parked
             # A decoder-batching hold defers a request by one pass on purpose.
             or self._ctx_decoder_held
         )
@@ -1236,6 +1276,75 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
+        )
+
+    # ---- Early admission of asynchronous connector loads ----
+
+    def _resolve_early_admission(self) -> bool:
+        """Decide once whether admitted first chunks may be parked for their connector load.
+
+        The parking pass enters no collective, so attention-DP ranks that park
+        different requests still issue the same per-iteration collectives; the
+        KV cache manager rules out connectors whose query would broadcast.
+        Logs the decision once per rank, with what ruled it out.
+        """
+        blockers = []
+        if os.environ.get("TRTLLM_DISABLE_KV_CONNECTOR_EARLY_ADMISSION", "").strip() == "1":
+            blockers.append("kill_switch")
+        if self.cross_kv_cache_manager is not None:
+            blockers.append("cross_cache")
+        if self.peft_cache_manager is not None:
+            blockers.append("peft")
+        if self.has_cp_helix:
+            blockers.append("helix_cp")
+        manager_blockers = self.kv_cache_manager.early_connector_admission_blockers()
+        if isinstance(manager_blockers, list):
+            blockers.extend(manager_blockers)
+        else:
+            blockers.append("kv_cache_manager")
+        self._early_admission = not blockers
+        # Without a connector (or a manager that cannot answer) there is nothing to report.
+        log = logger.debug if {"no_connector", "kv_cache_manager"} & set(blockers) else logger.info
+        log(
+            f"KV connector early admission: rank={mpi_rank()} enabled={self._early_admission} "
+            f"disabled_by={blockers} (TRTLLM_DISABLE_KV_CONNECTOR_EARLY_ADMISSION=1 disables)"
+        )
+        return self._early_admission
+
+    def _on_early_parked(self, req: LlmRequest, tokens: int) -> None:
+        """Book a request parked at admission; it gives back the snapshot row its chunk took."""
+        if self._inforward_snapshot_rows and req.py_mamba_inforward_snapshot_point is not None:
+            # The parked chunk does not run in this batch, so neither does its snapshot.
+            req.py_mamba_inforward_snapshot_point = None
+            self._inforward_snapshot_rows_left += 1
+        self._early_parked[req.py_request_id] = req
+        self._early_counts[0] += 1
+        self._early_counts[3] += tokens
+
+    def _track_early_parked(self) -> None:
+        """Count parked requests that left the loading state since the last pass."""
+        loading = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value
+        counts = self._early_counts
+        for request_id, req in list(self._early_parked.items()):
+            state = req.state_value
+            if state == loading:
+                continue
+            del self._early_parked[request_id]
+            if state == self._context_init_state_value:
+                counts[1] += 1
+            else:
+                counts[2] += 1
+
+    def _maybe_log_early_admission(self) -> None:
+        now = time.monotonic()
+        if now - self._early_last_log < 60.0:
+            return
+        self._early_last_log = now
+        parked, resumed, dropped, tokens = self._early_counts
+        logger.info(
+            f"KV connector early admission: rank={mpi_rank()} parked={parked} "
+            f"resumed={resumed} dropped={dropped} loading={len(self._early_parked)} "
+            f"tokens_saved={tokens}"
         )
 
     # ---- Long-prefill demotion ----

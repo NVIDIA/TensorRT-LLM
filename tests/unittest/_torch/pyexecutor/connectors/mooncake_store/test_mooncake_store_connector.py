@@ -2389,6 +2389,22 @@ def test_worker_starts_async_loads_from_metadata(store_config, fake_store):
         assert worker.take_failed_async_load_requests() == set()
 
 
+def test_worker_queues_async_loads_handed_over_directly(store_config, fake_store):
+    """The scheduler adapter's early dispatch starts loads behind the fence it passes."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        block_hash = b"\x0b" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        fence = AllocationFence(worker._store)
+        worker.queue_async_loads([RequestTransfers(5, [PageTransfer(block_hash, 0, 3)])], fence)
+        wait_async_idle(worker)
+
+        assert fence.waited_for == [{5}]
+        _saving, finished = worker.get_finished([], [5])
+        assert finished == [5]
+        assert worker.take_failed_async_load_requests() == set()
+
+
 def test_worker_starts_async_loads_from_metadata_under_tensor_parallelism(store_config, fake_store):
     """Every tensor-parallel rank queues its own shard's load from the broadcast metadata.
 
@@ -3089,6 +3105,8 @@ class FakeWorker:
         self.queries = []
         #: What the last `wait_for_save` queued; see `submit_saves`.
         self.submitted = set()
+        #: Every `queue_async_loads` call: the transfers and the fence.
+        self.queued_async = []
 
     def count_prefix_hit(self, block_hashes, record_stats=True):
         self.queries.append(list(block_hashes))
@@ -3097,6 +3115,9 @@ class FakeWorker:
     def take_submitted_saves(self):
         submitted, self.submitted = self.submitted, set()
         return submitted
+
+    def queue_async_loads(self, queued, fence):
+        self.queued_async.append((list(queued), fence))
 
 
 def submit_saves(scheduler, metadata):
@@ -3830,6 +3851,29 @@ def test_scheduler_sends_async_loads_through_metadata(store_config):
     assert metadata
     # Sent once only.
     assert take_async_loads(scheduler) == []
+
+
+def test_scheduler_dispatches_async_loads_to_its_own_worker_once(store_config):
+    """A load dispatched outside a batch goes to this rank's worker and leaves the metadata."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    settle_offer(scheduler, request, 2 * TOKENS_PER_BLOCK, [10, 11, 12, 13, 14])
+
+    def fence(request_ids):
+        return None
+
+    scheduler.dispatch_async_loads(fence)
+
+    ((queued, queued_fence),) = scheduler._worker.queued_async
+    (transfers,) = queued
+    assert transfers.request_id == 1
+    assert [page.page_index for page in transfers.pages] == [10, 11]
+    assert queued_fence is fence
+    # Neither the next metadata nor a second dispatch carries it again.
+    assert take_async_loads(scheduler) == []
+    scheduler.dispatch_async_loads(fence)
+    assert len(scheduler._worker.queued_async) == 1
 
 
 def test_scheduler_repeated_query_replaces_the_answer_and_queues_one_load(store_config):
