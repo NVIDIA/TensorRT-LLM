@@ -165,6 +165,80 @@ def test_materializer_gathers_only_canonical_base_rows():
     assert torch.equal(rows[:, :, 0], host_table[:, copy_idx.long(), 0, :])
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_seqs", [0, 1, 3, 9])
+@pytest.mark.parametrize("with_contexts", [False, True])
+def test_swa_materialization_only_expands_live_rows(monkeypatch, num_seqs, with_contexts):
+    capacity, blocks = 9, 8
+    source = torch.arange(2 * capacity * 2 * blocks, dtype=torch.int32).reshape(
+        2, capacity, 2, blocks
+    )
+    source[:, :, 0, 2:4] = BAD_PAGE_INDEX
+    copy_idx = torch.tensor([8, 2, 6, 2, 0, 7, 1, 5, 3], dtype=torch.int32)
+    pool_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+    scales = torch.tensor([[2, 3], [4, 2]], dtype=torch.int32)
+    offsets = torch.tensor([[0, 1], [2, 0]], dtype=torch.int32)
+    scratch_pages = scales.clone()
+    scratch_begs = torch.ones((2, capacity), dtype=torch.int32)
+    scratch_ends = torch.full((2, capacity), 4, dtype=torch.int32)
+    scratch_slots = torch.arange(2 * capacity * 4, dtype=torch.int32).reshape(2, capacity, 4)
+    scratch_slots += 1000
+    num_contexts = min(2, num_seqs) if with_contexts else 0
+    staging = torch.full((2, capacity, 2, blocks), _UNTOUCHED, dtype=torch.int32)
+    destination = torch.full_like(staging, _UNTOUCHED)
+    manager = SimpleNamespace(
+        _copy_idx_to_device=lambda _: copy_idx,
+        host_kv_cache_block_offsets=source,
+        _device_kv_cache_block_offsets_input=torch.empty_like(source),
+        _copy_scratch_metadata_to_device=lambda *_: (scratch_begs, scratch_ends, scratch_slots),
+        _device_num_contexts=torch.zeros((), dtype=torch.int32),
+        _device_attention_op_pool_ids=pool_ids,
+        _device_attention_op_scales=scales,
+        _device_attention_op_layer_offsets=offsets,
+        _device_attention_op_scratch_pages=scratch_pages,
+        _device_block_positions=torch.arange(blocks, dtype=torch.int32),
+        _device_attention_op_block_offsets_staging=staging,
+        num_attention_op_pools=2,
+    )
+    original_helper = kvcm_v2._copy_swa_block_offsets_with_scratch_compiled
+
+    def checked_helper(source_table, indices, *args):
+        # Source slots are independent of live batch rows: slot 8 must remain addressable at B=1.
+        assert source_table.shape == source.shape
+        assert indices.shape == (num_seqs,)
+        assert args[5].shape == (2, num_seqs)
+        assert args[6].shape == (2, num_seqs)
+        assert args[7].shape == (2, num_seqs, 4)
+        assert args[9].shape == (2, num_seqs, 2, blocks)
+        return original_helper(source_table, indices, *args)
+
+    monkeypatch.setattr(kvcm_v2, "_copy_swa_block_offsets_with_scratch_compiled", checked_helper)
+    with torch.compiler.set_stance("force_eager"):
+        KVCacheManagerV2._copy_batch_block_offsets_per_layer(
+            manager, destination, list(range(num_seqs)), copy_idx[:num_seqs], num_contexts, num_seqs
+        )
+
+    expected = torch.full_like(destination, _UNTOUCHED)
+    for op_pool in range(2):
+        for row in range(num_seqs):
+            for plane in range(2):
+                pool = int(pool_ids[op_pool, plane])
+                scale = int(scales[op_pool, plane])
+                layer_offset = int(offsets[op_pool, plane])
+                for block in range(blocks):
+                    page = int(source[pool, int(copy_idx[row]), 0, block])
+                    value = (
+                        BAD_PAGE_INDEX if page == BAD_PAGE_INDEX else page * scale + layer_offset
+                    )
+                    if page == BAD_PAGE_INDEX and row < num_contexts and 1 <= block < 4:
+                        # One scratch page per logical block in this fixture.
+                        slot = int(scratch_slots[pool, row, block - 1])
+                        value = slot * scale + layer_offset
+                    expected[op_pool, row, plane, block] = value
+    torch.testing.assert_close(destination, expected)
+    assert torch.all(staging[:, num_seqs:] == _UNTOUCHED)
+
+
 @requires_cuda
 def test_index_mapper_snapshot_gather_does_not_mutate_shared_copy_index():
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import IndexMapper
