@@ -35,7 +35,7 @@ TensorRT-LLM has all the essential capabilities to serve as the rollout engine i
 
 In MLPerf Training v6.1, MLCommons added a new benchmark: Qwen3.5-397B, a large-scale LLM post-training workload and the first of its kind in MLPerf Training. Post-training underpins much of the recent progress in agentic AI. In this benchmark, [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B), an MoE model with 17B active parameters per token that combines Gated DeltaNet linear-attention layers with full-attention layers, is trained with Group Relative Policy Optimization (GRPO) to solve software engineering tasks. The score of this benchmark is the time to train to a target accuracy, excluding validation time.
 
-In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of `56` accelerators, **NVIDIA Vera Rubin with NeMo RL and TensorRT-LLM ranks first at `28.466` minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1). On the same Vera Rubin hardware, TensorRT-LLM generated the rollouts for the fastest results: **`24.82` minutes at `64` GPUs**, about `30%` faster than the next-best result with a different rollout engine, and **`10.44` minutes at `1,024` GPUs**, about `5%` faster (Figure 2). See all submission results in the [MLPerf Training v6.1 results](https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&round=v6.1).
+In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of `56` accelerators, **NVIDIA Vera Rubin with NeMo RL and TensorRT-LLM ranks first at `28.466` minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1). On the same Vera Rubin hardware, TensorRT-LLM generated the rollouts for the fastest results: **`24.82` minutes at `64` GPUs** (a [Nebius submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo), also using NeMo RL and TensorRT-LLM), about `30%` faster than the next-best result with a different rollout engine, and **`10.44` minutes at `1,024` GPUs**, about `5%` faster (Figure 2). See all submission results in the [MLPerf Training v6.1 results](https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&round=v6.1).
 
 <div align="center">
 <figure>
@@ -100,7 +100,7 @@ For example, our Megatron trainer consumes `512` trajectories every `108` second
 
 ### Step 2: Plot Curves for Candidate Deployments
 
-Rollout can be laid out in two ways. Aggregated layouts run prefill and decode in the same replicas, using tensor parallelism (TEP). Disaggregated layouts give prefill and decode separate servers, using expert parallelism (DEP). Our `56`- and `64`-GPU recipes are disaggregated, and our `1,024`-GPU recipe is aggregated.
+Rollout can be laid out in two ways. Aggregated layouts run prefill and decode in the same replicas, using tensor-parallel attention with expert parallelism (TEP). Disaggregated layouts give prefill and decode separate servers, using data-parallel attention with expert parallelism (DEP). Our `56`- and `64`-GPU recipes are disaggregated, and our `1,024`-GPU recipe is aggregated.
 
 For each layout, we first plot per-GPU throughput against rollout latency as we vary the number of rollout GPUs: more GPUs make rollouts faster but each GPU less efficient (Figure 5). We then use the latency budget from Step 1 to choose, and the best layout has the highest per-GPU throughput where its curve meets the budget. A loose budget favors disaggregated DEP, which wins when each GPU decodes many requests. A tight budget can only be met by aggregated TEP, which has lower latency but needs many more GPUs.
 
@@ -115,7 +115,7 @@ For each layout, we first plot per-GPU throughput against rollout latency as we 
 
 In a disaggregated layout, as in our `56`- and `64`-GPU recipes, a prefill server must hold the model weights and the KV cache of ongoing sessions, so each turn can reuse its prefix. The smallest server that fits is `4` GPUs, and smaller is better: a request's prefill runs on a single GPU, so a wider server is no faster. On the same `8` GPUs, two `4`-GPU servers cut the context path by `35%` compared with one `8`-GPU server.
 
-Then we balance the prefill servers against the decode server. We keep both below about `70%` busy so requests do not queue, give each extra GPU to whichever side cuts rollout time most, and check the budget from Step 1 again. This gave `2` × DEP4 prefill plus DEP16 decode (`24` rollout GPUs) for the `56`-GPU recipe, and `2` × DEP8 plus DEP16 (`32` rollout GPUs) for the `64`-GPU recipe.
+Then we balance the prefill servers against the decode server. We keep both below `70%` busy so requests do not queue, give each extra GPU to whichever side cuts rollout time most, and check the budget from Step 1 again. This gave `2` × DEP4 prefill plus DEP16 decode (`24` rollout GPUs) for the `56`-GPU recipe, and `2` × DEP8 plus DEP16 (`32` rollout GPUs) for the `64`-GPU recipe.
 
 ## Optimizations
 
@@ -145,7 +145,7 @@ We packed these checks into two synchronizations (Figure 7): the votes and per-G
 
 At large scale, rollout uses aggregated tensor-parallel (TEP) replicas, and each GPU decodes only a few requests, so a step takes just `4` to `5` ms. An aggregated iteration also mixes prefill and decode, and the parts of the model that run between CUDA graphs are eager Python, so host overhead turns directly into wall time.
 
-Two changes helped most. Running the model in piecewise CUDA graphs cut the end-to-end time of a run by about `24%`, and getting the multi-node all-reduce (MNNVL) to work under Ray cut aggregated rollout time by about `11%`.
+Two changes helped most. Running the model in piecewise CUDA graphs cut the end-to-end time of a `64`-GPU aggregated run by about `24%`, and getting the multi-node all-reduce (MNNVL) to work under Ray cut aggregated rollout time by about `11%`.
 
 ### Faster GDN Decode and Prefill (for 1,024 GPUs)
 
@@ -162,11 +162,11 @@ Together, these host-path changes cut the median host time of a mixed iteration 
 
 ### Shard-to-Shard Weight Refit in NeMo RL (for All Scales)
 
-After every training step, the rollout engine loads the new weights and generation pauses while it does. Refit takes only about `2~4%` of a training step, so it matters less than the other optimizations here, but every rollout GPU pays for it on every step. Our first version sent the whole model, about `790` GB, to every rollout GPU, which then quantized all `512` experts. The biggest improvement is an optimization on the NeMo RL side, shard-to-shard refit (`nccl_reshard`): the Megatron trainer sends each routed expert over NCCL straight to the GPU that stores it, so a rollout GPU receives and quantizes only its own experts. Together with whole-stack expert loading in TensorRT-LLM, this cut the refit time by about `88%`, from `20.7` to `2.5` seconds.
+After every training step, the rollout engine loads the new weights and generation pauses while it does. Refit takes only about `2~4%` of a training step, so it matters less than the other optimizations here, but every rollout GPU pays for it on every step. Our first version sent the whole model, about `790` GB, to every rollout GPU, which then quantized all `512` experts. The main change is on the NeMo RL side, shard-to-shard refit (`nccl_reshard`): the Megatron trainer sends each routed expert over NCCL straight to the GPU that stores it, so a rollout GPU receives and quantizes only its own experts. Together with whole-stack expert loading in TensorRT-LLM and a few related tuning changes, this cut the refit time by about `88%`, from about `21` to `2.5` seconds in our small-scale setup.
 
 ## How to Reproduce
 
-The recipes use the [`feat/rl_rc`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/rl_rc) branch of TensorRT-LLM and the [`opt/dev`](https://github.com/NVIDIA-NeMo/RL/tree/opt/dev) branch of NeMo RL. Both are in the process of being merged back into their main branches.
+The recipes use the [`feat/rl_rc`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/rl_rc) branch of TensorRT-LLM and the [`opt/dev`](https://github.com/NVIDIA-NeMo/RL/tree/opt/dev) branch of NeMo RL. Parts of both branches are already in main, and the rest will follow soon.
 
 The configs and instructions for all three Rubin recipes are in our [MLPerf Training v6.1 submission repository](https://github.com/mlcommons/training_results_v6.1/tree/main/NVIDIA/benchmarks/qwen35_397b_grpo/implementations). Each submission directory has a README with the full setup and reproduction instructions:
 
