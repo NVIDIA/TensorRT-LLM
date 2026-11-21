@@ -129,26 +129,70 @@ def test_pool_view_cache_follows_the_owning_manager() -> None:
         manager.get_buffers = lambda layer, attn_type: manager.pool
         return manager
 
+    def covers(view: torch.Tensor, rows: int) -> bool:
+        return tuple(view.shape[1:]) == (1, LATENT) and view.shape[0] >= rows
+
     attn = _Owner()
     fmha = PrimsTSSparseMlaFmha(attn)
     first = make_manager(8)
     view = fmha._pool_view(first, DeepseekV4AttentionType.SWA, 1)
     assert view.data_ptr() == first.swa_pool_ptr
-    assert tuple(view.shape) == (8, 1, LATENT)
+    assert covers(view, 8)
     assert fmha._pool_view(first, DeepseekV4AttentionType.SWA, 1) is view
 
     second = make_manager(16)
     other = fmha._pool_view(second, DeepseekV4AttentionType.SWA, 1)
     assert other is not view
     assert other.data_ptr() == second.swa_pool_ptr
-    assert tuple(other.shape) == (16, 1, LATENT)
+    assert covers(other, 16)
     assert fmha._pool_views_owner() is second
 
     del second
     gc.collect()
     assert fmha._pool_views_owner() is None
     third = make_manager(4)
-    assert tuple(fmha._pool_view(third, DeepseekV4AttentionType.SWA, 1).shape) == (4, 1, LATENT)
+    assert covers(fmha._pool_view(third, DeepseekV4AttentionType.SWA, 1), 4)
+
+
+def test_pool_view_covers_rows_a_rebalance_grows_into() -> None:
+    """A cached pool view keeps covering a pool that KV pool rebalancing grows in place.
+
+    The kernel bounds every read by the view's rows, and the view is cached (and
+    captured by decode CUDA graphs) for the manager's lifetime. A view sized to
+    the buffers at first use would cut off the rows a later in-place grow adds,
+    which silently drops them from attention.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+
+    class _Owner:
+        pass
+
+    storage = torch.empty(64, 1, LATENT, dtype=torch.bfloat16, device="cuda")
+    manager = _Owner()
+    manager.live_rows = 8
+    manager.swa_pool_ptr = storage.data_ptr()
+    manager.compress_pool_ptrs = {4: storage.data_ptr()}
+    manager.pp_layers = [0]
+    manager._compress_ratios = {0: 4}
+    manager.dtype = torch.bfloat16
+    # VMM growth keeps the base address and extends the buffer behind it.
+    manager.get_buffers = lambda layer, attn_type: storage[: manager.live_rows]
+
+    fmha = PrimsTSSparseMlaFmha(_Owner())
+    for attn_type, ratio in (
+        (DeepseekV4AttentionType.SWA, 1),
+        (DeepseekV4AttentionType.COMPRESS, 4),
+    ):
+        manager.live_rows = 8
+        view = fmha._pool_view(manager, attn_type, ratio)
+        rows_at_first_use = view.shape[0]
+        manager.live_rows = 64
+        assert fmha._pool_view(manager, attn_type, ratio) is view
+        assert view.data_ptr() == storage.data_ptr()
+        assert view.shape[0] == rows_at_first_use >= 64
+        assert view.shape[0] <= (1 << 31) - 1
 
 
 def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:

@@ -66,6 +66,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_v
 from tensorrt_llm.logger import logger
 
 from .interface import Fmha
+from .utils import MAX_KV_POOL_INDEX, get_kv_pool_growth_bound_bytes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
@@ -375,7 +376,11 @@ class PrimsTSSparseMlaFmha(Fmha):
         """Return a ``[rows, 1, 512]`` view of a whole pool rooted at its base pointer.
 
         ``sparse_attn_predict`` emits storage rows relative to the pool base, so
-        the view must start there and span every layer sharing the pool.
+        the view must start there and span every layer sharing the pool. The
+        kernel bounds every read by the view's rows, and the view is cached and
+        captured by decode CUDA graphs, while KV pool rebalancing grows pools in
+        place. The view is therefore sized to rows no pool can outgrow, not to
+        the current buffers, which would cut off rows a later grow adds.
         """
         from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
             DeepseekV4AttentionType,
@@ -400,6 +405,9 @@ class PrimsTSSparseMlaFmha(Fmha):
                 if manager._compress_ratios[layer] == compress_ratio
             ]
         total_rows = 0
+        max_offset_rows = 0
+        max_span_rows = 0
+        row_bytes = 0
         for layer in layers:
             buffer = manager.get_buffers(layer, attn_type)
             if buffer.shape[-1] != _LATENT_DIM:
@@ -412,7 +420,14 @@ class PrimsTSSparseMlaFmha(Fmha):
                 raise RuntimeError(
                     f"{attn_type.name} buffer for layer {layer} is not row-aligned to its pool base."
                 )
-            total_rows = max(total_rows, offset // row_bytes + buffer.shape[0] * buffer.shape[1])
+            span_rows = buffer.shape[0] * buffer.shape[1]
+            total_rows = max(total_rows, offset // row_bytes + span_rows)
+            max_offset_rows = max(max_offset_rows, offset // row_bytes)
+            max_span_rows = max(max_span_rows, span_rows)
+        if row_bytes:
+            growth_rows = get_kv_pool_growth_bound_bytes(torch.cuda.current_device()) // row_bytes
+            stable_rows = max_offset_rows + max_span_rows + growth_rows
+            total_rows = min(MAX_KV_POOL_INDEX, max(total_rows, stable_rows))
         view = convert_to_torch_tensor(
             TensorWrapper(base_ptr, manager.dtype, (total_rows, 1, _LATENT_DIM))
         )
