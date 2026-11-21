@@ -5293,19 +5293,19 @@ def test_early_response_suppresses_repeat_and_leaves_terminal_for_normal_pass() 
     batch = types.SimpleNamespace(all_requests=lambda: [request])
 
     executor._emit_first_token_responses(batch)
-    assert len(executor.responses[42]) == 1
-    assert not executor.responses[42][0].result.is_final
+    assert len(executor._response_channel.responses[42]) == 1
+    assert not executor._response_channel.responses[42][0].result.is_final
     executor._handle_responses(emit_first_iter=False)
-    assert len(executor.responses[42]) == 1
+    assert len(executor._response_channel.responses[42]) == 1
     executor._terminate_request.assert_not_called()
 
     request.finish_by_reason(native.FinishReason.CANCELLED)
     executor._emit_first_token_responses(batch)
-    assert len(executor.responses[42]) == 1
+    assert len(executor._response_channel.responses[42]) == 1
     executor._handle_responses(emit_first_iter=False)
-    assert len(executor.responses[42]) == 2
-    assert executor.responses[42][-1].result.is_final
+    assert len(executor._response_channel.responses[42]) == 2
+    assert executor._response_channel.responses[42][-1].result.is_final
     executor._terminate_request.assert_called_once_with(request)
     executor._handle_responses(emit_first_iter=False)
-    assert len(executor.responses[42]) == 2
+    assert len(executor._response_channel.responses[42]) == 2
     assert executor._terminate_request.call_count == 1
