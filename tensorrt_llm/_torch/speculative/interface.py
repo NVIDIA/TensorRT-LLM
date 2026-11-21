@@ -734,6 +734,11 @@ class SpecMetadata:
     # Slot-indexed buffers (draft_probs) must span this full range.
     # 0 falls back to max_num_requests.
     num_seq_slots: int = 0
+    # The engine's generation batch (max_batch_size). Unlike max_num_requests
+    # it is not narrowed on CUDA graph copies, and unlike num_seq_slots it does
+    # not grow with disaggregated attention DP overlap headroom: a step never
+    # carries more requests than this. 0 falls back to max_num_requests.
+    max_generation_batch: int = 0
     # Draft-model vocab size. full_draft_probs is allocated only when it differs
     # from vocab_size; 0 (unknown) or a value equal to vocab_size means shared
     # vocab and skips the buffer.

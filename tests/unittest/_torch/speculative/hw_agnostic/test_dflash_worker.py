@@ -72,7 +72,7 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
     worker = DFlashWorker(config, Mapping())
     draft_model = _FakeDraftModel()
     worker.set_draft_model(draft_model)
-    spec_metadata = SimpleNamespace(max_num_requests=2)
+    spec_metadata = SimpleNamespace(max_num_requests=2, num_seq_slots=2, max_generation_batch=2)
     attn_metadata = SimpleNamespace(max_seq_len=64)
 
     worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
@@ -88,6 +88,24 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
         [3, 4, 5],
         [6, 7, 8],
     ]
+
+
+def test_context_cache_spans_engine_batch_on_graph_bucket(monkeypatch):
+    """The ctx cache is sized by the engine batch: not a narrowed graph bucket,
+    and not a 2x seq-slot pool (worker slots are freed every step)."""
+    worker = _make_worker(monkeypatch)
+    draft_model = _FakeDraftModel()
+    worker.set_draft_model(draft_model)
+    spec_metadata = SimpleNamespace(max_num_requests=1, num_seq_slots=8, max_generation_batch=4)
+    attn_metadata = SimpleNamespace(max_seq_len=64)
+
+    worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
+
+    # Four request slots plus one scratch slot, three pages each.
+    assert worker._dummy_slot == 4
+    assert list(worker._free_slots) == [0, 1, 2, 3]
+    assert worker._ctx_kv_buf.shape == (2, 15, 2, 1, 32, 64)
+    assert worker._ctx_len.shape == (5,)
 
 
 def _make_worker(monkeypatch):
