@@ -118,6 +118,22 @@ def _encode_request_body(request: _SerializableRequest) -> bytes:
 
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
 
+# The 4xx statuses that ask the client to try again later.
+_RETRYABLE_CLIENT_ERROR_STATUSES = frozenset((408, 429))
+
+
+def _is_worker_rejection(error: Exception) -> bool:
+    """Whether a worker rejected the request itself.
+
+    A retry would send the same request to the same worker and be rejected the
+    same way, so the rejection goes to the caller as it is.
+    """
+    return (
+        isinstance(error, aiohttp.ClientResponseError)
+        and 400 <= error.status < 500
+        and error.status not in _RETRYABLE_CLIENT_ERROR_STATUSES
+    )
+
 
 def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
@@ -583,6 +599,7 @@ class OpenAIHttpClient(OpenAIClient):
                             http_response.headers, start_time, destination_time
                         )
                     content_type = http_response.headers.get("Content-Type", "")
+                    media_type = content_type.split(";", 1)[0].strip().lower()
                     if self._request_perf_metrics:
                         role = _metrics_phase(self._role)
                         disagg_params = getattr(request, "disaggregated_params", None)
@@ -605,33 +622,47 @@ class OpenAIHttpClient(OpenAIClient):
                                 role,
                                 response_metrics,
                             )
+                    # The status decides how the caller and the retries below treat
+                    # an error response, whatever its content type, and a body that
+                    # cannot be read only loses the message.
                     if http_response.status >= 400:
-                        if is_stream:
-                            # Preserve no-replay semantics even if reading the
-                            # rejected response's diagnostics fails.
-                            streaming_status_rejected = True
-                            # Error diagnostics must not buffer an unbounded worker response.
-                            error_prefix = bytearray()
-                            while len(error_prefix) < 2048:
-                                chunk = await http_response.content.read(2048 - len(error_prefix))
-                                if not chunk:
-                                    break
-                                error_prefix.extend(chunk)
-                            error_body = error_prefix.decode("utf-8", errors="replace")
-                        else:
-                            error_body = await http_response.text()
+                        read_error = None
+                        try:
+                            if is_stream:
+                                # Preserve no-replay semantics even if reading the
+                                # rejected response's diagnostics fails.
+                                streaming_status_rejected = True
+                                # Error diagnostics must not buffer an unbounded worker response.
+                                error_prefix = bytearray()
+                                while len(error_prefix) < 2048:
+                                    chunk = await http_response.content.read(
+                                        2048 - len(error_prefix)
+                                    )
+                                    if not chunk:
+                                        break
+                                    error_prefix.extend(chunk)
+                                error_body = error_prefix.decode("utf-8", errors="replace")
+                            else:
+                                error_body = await http_response.text(errors="replace")
+                        except (aiohttp.ClientError, OSError) as error:
+                            error_body, read_error = "", error
                         raise aiohttp.ClientResponseError(
                             http_response.request_info,
                             http_response.history,
                             status=http_response.status,
                             message=f"{http_response.reason}: {error_body[:2048]}",
                             headers=http_response.headers,
-                        )
-                    if not is_stream and "text/event-stream" in content_type:
+                        ) from read_error
+                    if not is_stream and media_type == "text/event-stream":
                         raise ValueError(
                             "Received an event-stream although request stream was False"
                         )
                     if is_stream:
+                        if media_type != "text/event-stream":
+                            raise ValueError(
+                                f"Received Content-Type {content_type!r} although request "
+                                "stream was True"
+                            )
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
                         async with aclosing(
@@ -668,7 +699,7 @@ class OpenAIHttpClient(OpenAIClient):
                     url, fallback_url = fallback_url, None
                     affinity_refusals = 1
                     continue
-                if streaming_status_rejected:
+                if streaming_status_rejected or _is_worker_rejection(e):
                     raise
                 # A 4xx from the worker is the request's own fault (malformed
                 # body, context length exceeded, ...) and will fail the same way
@@ -750,10 +781,7 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
         response_clock: Optional[AdjustedSteadyClock] = None,
     ) -> AsyncGenerator[Any, None]:
-        assert request.stream, "Request is not streaming"
-        assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
-            "Response is not streaming"
-        )
+        """Relay a worker's event-stream; the caller has checked its status and content type."""
         try:
             last_token_time = start_time
             chunk_count = 0
