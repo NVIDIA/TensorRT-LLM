@@ -37,6 +37,7 @@ tokens is served: with ``valid_seq_len`` the kernels attend the keys of that pre
 return zeros in the padded rows.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -55,8 +56,19 @@ except (ImportError, OSError) as e:
     deco_attention = None
     _deco_import_error = e
 
-# The token tags of this many recent requests are kept with their basis rows.
+# The token tags of this many recent requests are kept with their basis rows; the rows a CUDA graph
+# was captured with stay for the life of the component state, as the graph reads them on replay.
 _TAGGED_ROWS_KEPT = 4
+
+
+@dataclass(eq=False)
+class _TaggedRows:
+    """The basis rows drawn for one token tags tensor (None: too few valid tokens, the default draw
+    stands in) and whether a CUDA graph was captured with them."""
+
+    tags: torch.Tensor
+    rows: torch.Tensor | None
+    captured: bool
 
 
 class DeCoAttention(AttentionBackend):
@@ -156,20 +168,21 @@ class DeCoAttention(AttentionBackend):
 
         A model's cross-attention layers take this path on every call, inside the compiled
         model, so it logs nothing; ``forward`` warns once when a self-attention call takes it.
-        VANILLA takes no ``valid_seq_len``: the valid prefix of a self-attention call is
-        attended alone, with the prefix of its key padding mask, and the padded rows come back
-        zero, as from the kernels.
+        VANILLA takes no ``valid_seq_len``: the queries of the valid prefix are attended alone
+        and the padded rows come back zero, as from the kernels. A self-attention call also
+        keeps the keys of the prefix only, with the prefix of its key padding mask; the keys of
+        a cross-attention call are not padded.
         """
         valid_seq_len = kwargs.pop("valid_seq_len", None)
-        if valid_seq_len is not None and valid_seq_len < q.shape[1] and q.shape == k.shape:
-            mask = kwargs.get("key_padding_mask")
-            if mask is not None:
-                kwargs = {**kwargs, "key_padding_mask": mask[:, :valid_seq_len]}
+        if valid_seq_len is not None and valid_seq_len < q.shape[1]:
+            if q.shape == k.shape:
+                k, v = k[:, :valid_seq_len], v[:, :valid_seq_len]
+                mask = kwargs.get("key_padding_mask")
+                if mask is not None:
+                    kwargs = {**kwargs, "key_padding_mask": mask[:, :valid_seq_len]}
             out = torch.zeros_like(q)
             if valid_seq_len > 0:
-                out[:, :valid_seq_len] = self._delegate(
-                    q[:, :valid_seq_len], k[:, :valid_seq_len], v[:, :valid_seq_len], **kwargs
-                )
+                out[:, :valid_seq_len] = self._delegate(q[:, :valid_seq_len], k, v, **kwargs)
             return out
         out = self._vanilla.forward(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **kwargs
@@ -206,12 +219,14 @@ class DeCoAttention(AttentionBackend):
     ) -> torch.Tensor | None:
         """The tokens the preparation estimates its basis from: None, its own draw over the
         whole sequence, without token tags; with them, the draw by modality of the kernels'
-        ``sample_rows``, half of it from the text and audio tokens.
+        ``sample_rows``, half of it from the text and audio tokens. Tags with fewer valid tokens
+        than the basis needs give None as well: the default draw then stands in.
 
         The draw by modality reads the token counts back to the host, so it runs once per tags
         tensor and outside CUDA graph capture: every layer and step of a request passes the
         same tensor, and the component state keeps it with its rows, so that no other tensor
-        takes its identity meanwhile.
+        takes its identity meanwhile. The state keeps the last few draws, and every draw a CUDA
+        graph was captured with, which the graph reads on replay.
         """
         if token_tags is None:
             return None
@@ -220,13 +235,25 @@ class DeCoAttention(AttentionBackend):
                 f"DeCo-Attention got {token_tags.numel()} token tags for a sequence of "
                 f"{seq_len} tokens."
             )
-        tagged_rows = self._state.setdefault("deco_tagged_rows", [])
-        for tags, rows in tagged_rows:
-            if tags is token_tags:
-                return rows
+        capturing = torch.cuda.is_current_stream_capturing()
+        tagged_rows: list[_TaggedRows] = self._state.setdefault("deco_tagged_rows", [])
+        for entry in tagged_rows:
+            if entry.tags is token_tags:
+                entry.captured |= capturing
+                return entry.rows
+        if capturing:
+            raise RuntimeError(
+                "DeCo-Attention draws the basis rows of new token tags on the host; run the call "
+                "eagerly once before capturing."
+            )
         rows = deco_attention.sample_rows(seq_len, device, token_tags)
-        tagged_rows.insert(0, (token_tags, rows))
-        del tagged_rows[_TAGGED_ROWS_KEPT:]
+        if rows.numel() < 2 * deco_attention.constants.DEFAULT_RANK:
+            rows = None
+        tagged_rows.insert(0, _TaggedRows(token_tags, rows, captured=False))
+        # Drop the oldest draws past the kept count; a captured draw is never dropped.
+        recent = [entry for entry in tagged_rows if not entry.captured]
+        for entry in recent[_TAGGED_ROWS_KEPT:]:
+            tagged_rows.remove(entry)
         return rows
 
     @torch.compiler.disable

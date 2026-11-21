@@ -486,33 +486,41 @@ def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
     )
 
 
-def _deco_model() -> h3.MiniMaxH3Transformer3DModel:
-    """A one-layer model under a DeCo-Attention recipe; skips on a GPU without its kernels."""
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7), (12, 0)):
+def _deco_attention_config() -> AttentionConfig:
+    """The attention config of a DeCo-Attention recipe; skips on a GPU without its kernels."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
+    try:
+        deco_attention.pv_formats()
+    except NotImplementedError:
         pytest.skip("DeCo-Attention kernels need an SM100, SM103, SM107 or SM120 GPU.")
-    config = _make_model_config(
-        num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
-    )
-    config.attention = AttentionConfig(
+    return AttentionConfig(
         backend="CUTEDSL",
         quant_attention_config=QuantAttentionConfig(
             qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
         ),
     )
+
+
+@requires_cuda
+def test_deco_recipe_serves_the_joint_blocks_and_keeps_the_refiner_unquantized(monkeypatch):
+    """Under a DeCo-Attention recipe the transformer blocks hand the DeCo backend the token tags
+    of the packed sequence and, for trailing padding, the length of its valid prefix instead of
+    a mask; the text-only token refiner runs unquantized on VANILLA, which takes padding as a
+    mask. The padding follows the tags' content, also when one tags buffer is refilled."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention, VanillaAttention
+
+    config = _make_model_config(
+        num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
+    )
+    config.attention = _deco_attention_config()
     config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
     _initialize_weights(model, scale=0.1)
     model.requires_grad_(False)
-    return model
-
-
-@requires_cuda
-def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(monkeypatch):
-    """Under a DeCo-Attention recipe the transformer blocks hand the token tags of the packed
-    sequence to the DeCo backend, and the text-only token refiner runs unquantized on VANILLA."""
-    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention, VanillaAttention
-
-    model = _deco_model()
+    assert model._supports_key_padding_mask
+    assert model.token_refiner._attn_backend == "VANILLA"
+    assert model.token_refiner._supports_key_padding_mask
 
     backends = {
         name: module.attn
@@ -527,7 +535,7 @@ def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(mon
     seen = []
 
     def launch(self, q, k, v, token_tags=None, valid_seq_len=None):
-        seen.append(token_tags)
+        seen.append((token_tags, valid_seq_len))
         return torch.zeros_like(q)
 
     monkeypatch.setattr(DeCoAttention, "_launch", launch)
@@ -535,38 +543,21 @@ def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(mon
     with torch.inference_mode():
         model(**inputs)
     assert len(seen) == len(joint)
-    assert all(tags is not None and torch.equal(tags, inputs["token_tags"]) for tags in seen)
+    assert all(torch.equal(tags, inputs["token_tags"]) and n is None for tags, n in seen)
 
-
-@requires_cuda
-def test_deco_recipe_passes_the_valid_prefix_of_a_padded_sequence(monkeypatch):
-    """Under a DeCo-Attention recipe a packed sequence with trailing padding reaches the DeCo
-    backend with the length of its valid prefix instead of a mask, and interior padding is
-    rejected; the token refiner is built on VANILLA, which takes padding as a mask."""
-    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
-
-    model = _deco_model()
-    assert model._supports_key_padding_mask
-    assert model.token_refiner._attn_backend == "VANILLA"
-    assert model.token_refiner._supports_key_padding_mask
-
-    seen = []
-
-    def launch(self, q, k, v, token_tags=None, valid_seq_len=None):
-        seen.append((token_tags, valid_seq_len))
-        return torch.zeros_like(q)
-
-    monkeypatch.setattr(DeCoAttention, "_launch", launch)
-    inputs = _model_inputs("cuda")
-    inputs["token_tags"] = torch.tensor([1, 0, 2, -1], device="cuda")
+    seen.clear()
+    inputs["token_tags"].copy_(torch.tensor([1, 0, 2, -1], device="cuda"))
     with torch.inference_mode():
         model(**inputs)
-    assert seen and all(valid_seq_len == 3 for _, valid_seq_len in seen)
-    assert all(torch.equal(tags, inputs["token_tags"]) for tags, _ in seen)
+    assert len(seen) == len(joint)
+    assert all(torch.equal(tags, inputs["token_tags"]) and n == 3 for tags, n in seen)
 
-    inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
-    with torch.inference_mode(), pytest.raises(NotImplementedError, match="trailing"):
+    seen.clear()
+    inputs["token_tags"].copy_(torch.tensor([1, 2, -1, -1], device="cuda"))
+    with torch.inference_mode():
         model(**inputs)
+    assert len(seen) == len(joint)
+    assert all(torch.equal(tags, inputs["token_tags"]) and n == 2 for tags, n in seen)
 
 
 @pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])
@@ -1668,15 +1659,19 @@ def test_refiner_rejects_padding_without_mask_support() -> None:
 
 
 @requires_cuda
-@pytest.mark.parametrize("backend", ["FA4", "TRTLLM"])
+@pytest.mark.parametrize("backend", ["FA4", "TRTLLM", "DECO"])
 def test_prefix_backend_rejects_interior_padding(backend: str) -> None:
+    """The backends that take the valid prefix of a padded sequence reject padding between the
+    packed modalities: FA4, TRTLLM and a DeCo-Attention recipe on CUTEDSL."""
     if not _sm_at_least(10):
         pytest.skip("FA4 requires SM100 or newer")
     if backend == "FA4":
         assert FA4_AVAILABLE
     config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
-    config.attention = AttentionConfig(backend=backend)
-    if backend == "TRTLLM":
+    config.attention = (
+        _deco_attention_config() if backend == "DECO" else AttentionConfig(backend=backend)
+    )
+    if backend != "FA4":
         config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
     _initialize_weights(model)
