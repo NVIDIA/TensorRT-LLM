@@ -8809,6 +8809,8 @@ class PyExecutor:
                     raise ValueError(
                         f"Embedding bias index must be in [0, {self._num_embeddings - 1}]"
                     )
+                if not math.isfinite(val):
+                    raise ValueError("Embedding bias values must be finite")
 
     def _validate_encoder_output_len(self, request: LlmRequest) -> None:
         """Reject an encoder input that no iteration can serve.

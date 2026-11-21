@@ -1487,6 +1487,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
             locality_domain_id=self.py_locality_domain_id,
+            _validation_error=self._validation_error,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
