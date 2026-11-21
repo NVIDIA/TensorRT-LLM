@@ -4473,6 +4473,75 @@ class TestGlm47ToolParserFactory:
 
 
 # ============================================================================
+# Shared tool argument schema tests
+# ============================================================================
+
+
+@pytest.mark.parametrize("values,expected_type", [
+    ([None, 1, 2], "integer"),
+    ([None, 1.5, 2.5], "number"),
+    ([1, 1.5], "number"),
+    ([None, 1, 1.5], "number"),
+    ([None, False, True], "boolean"),
+    ([None], "null"),
+    ([None, "1"], "string"),
+    ([1, "1"], "string"),
+    ([True, 1], "string"),
+    ([], "string"),
+])
+def test_enum_schema_infers_non_null_type(values, expected_type):
+    """Null and mixed numeric enum members retain the non-string type."""
+    from tensorrt_llm.serve.tool_parser.utils import infer_type_from_json_schema
+
+    assert infer_type_from_json_schema({"enum": values}) == expected_type
+
+
+@pytest.mark.parametrize("parser_cls,markup", [
+    (MiniMaxM2ToolParser, '<minimax:tool_call><invoke name="f">'
+     '<parameter name="x">{value}</parameter></invoke></minimax:tool_call>'),
+    (PoolsideV1ToolParser,
+     '<tool_call>f<arg_key>x</arg_key><arg_value>{value}</arg_value></tool_call>'
+     ),
+    (Glm4ToolParser,
+     '<tool_call>f\n<arg_key>x</arg_key><arg_value>{value}</arg_value></tool_call>'
+     ),
+])
+@pytest.mark.parametrize("values,raw,expected", [
+    ([None, 1, 2], "1", 1),
+    ([None, 1, 2], "null", None),
+    ([1, 1.5], "1.5", 1.5),
+    ([None, False, True], "false", False),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_non_string_enum_tool_arguments(parser_cls, markup, values, raw,
+                                        expected, streaming):
+    """Enum-declared values reach clients as JSON values, not strings."""
+    tools = [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(name="f",
+                                        parameters={
+                                            "type": "object",
+                                            "properties": {
+                                                "x": {
+                                                    "enum": values
+                                                }
+                                            }
+                                        }))
+    ]
+    parser = parser_cls()
+    text = markup.format(value=raw)
+    if streaming:
+        result = parser.parse_streaming_increment(text, tools)
+        calls = result.calls + parser.finish(tools).calls
+    else:
+        calls = parser.detect_and_parse(text, tools).calls
+    assert [call.name for call in calls if call.name] == ["f"]
+    actual = json.loads("".join(call.parameters for call in calls))["x"]
+    assert type(actual) is type(expected)
+    assert actual == expected
+
+
+# ============================================================================
 # PoolsideV1ToolParser Tests
 # ============================================================================
 
