@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.sparse.offload import (
 from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import merge_sparse_arena_indices
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
+from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -115,6 +116,13 @@ def _request(request_id: int, prompt_len: int) -> LlmRequest:
         sampling_config=SamplingConfig(),
         is_streaming=False,
     )
+
+
+@pytest.fixture(autouse=True)
+def _ample_host_memory(monkeypatch):
+    # The manager rejects a host_history_size above this rank's share of the node's
+    # available memory, which a shared CI node cannot promise.
+    monkeypatch.setattr(rank_striped_read_ahead, "effective_available_host_memory", lambda: 1 << 40)
 
 
 @pytest.fixture
