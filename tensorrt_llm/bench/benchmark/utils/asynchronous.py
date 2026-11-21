@@ -115,7 +115,8 @@ class LlmManager:
                 sampling_params=sampling_params,
                 _postproc_params=post_proc_params,
                 streaming=self.streaming,
-                lora_request=request.lora_request)
+                lora_request=request.lora_request,
+                cache_salt=request.cache_salt)
             if self.streaming:
                 async for stream_output in output:
                     if time_on_first_token is None:
@@ -188,7 +189,8 @@ class LlmManager:
                     input_ids,
                     sampling_params=sampling_params,
                     _postproc_params=post_proc_params,
-                    streaming=False)
+                    streaming=False,
+                    cache_salt=request.cache_salt)
                 response: RequestOutput = await output.aresult()
 
                 if turn_id == 0 and time_on_first_token is None:
