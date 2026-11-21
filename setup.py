@@ -241,11 +241,16 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns configuration/telemetry schemas and the
-    OpenEngine contract. Skip those wheel files so Python-only edits layer over
-    old wheels and tracked bindings from the current checkout remain authoritative.
+    Precompiled wheels own native bits. Source owns configuration/telemetry schemas, the
+    OpenEngine contract and the VisualGen kernel sources that are compiled at run time. Skip
+    those wheel files so Python-only edits layer over old wheels and tracked bindings from the
+    current checkout remain authoritative.
     """
     filename = filename.replace("\\", "/")
+    if filename.startswith(
+            "tensorrt_llm/_torch/visual_gen/models/") and filename.endswith(
+                (".cu", ".cpp")):
+        return True
     if filename.startswith(
         ("tensorrt_llm/schemas/", "tensorrt_llm/usage/schemas/")):
         return filename.endswith(".json")

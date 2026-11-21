@@ -106,10 +106,22 @@ def _reference(qkv, wq, wk, cos, sin, mode, valid_len=None):
     return codes, torch.stack(descales)
 
 
-def _run(qkv, wq, wk, cos, sin, mode, ulysses, valid_len=None):
+def _run(qkv, wq, wk, cos, sin, mode, ulysses, valid_len=None, rope_halves_equal=False):
     static = fq.qk_static_descale(D, qkv.device) if mode == "qkstatic" else None
     outs, descale = fq._qk_norm_rope_fp8_impl(
-        qkv, wq, wk, cos, sin, static, EPS, H, D, 0, valid_len, ulysses
+        qkv,
+        wq,
+        wk,
+        cos,
+        sin,
+        static,
+        EPS,
+        H,
+        D,
+        0,
+        valid_len,
+        ulysses,
+        rope_halves_equal=rope_halves_equal,
     )
     if ulysses > 1:
         # Send buffer [U, S, 3, H / U, D] -> the three plain [1, S, H * D] tensors.
@@ -149,6 +161,36 @@ def test_cast_matches_reference(monkeypatch, rows, mode, kernel, ulysses):
         descale,
         ref_descale,
     )
+
+
+@pytest.mark.parametrize("launch", (None, (8, 2)), ids=("default_launch", "h8w2"))
+@pytest.mark.parametrize("kernel", ("grouped", "grouped_fold"))
+@pytest.mark.parametrize("rows", ROWS)
+def test_equal_rope_halves_option_reads_the_first_half_only(monkeypatch, rows, kernel, launch):
+    """``rope_halves_equal`` takes both halves' angles from the table's first half.
+
+    With a table whose second half differs, the option gives the codes of the table with its
+    first half repeated, and the default gives other codes. Only the grouped cast reads the
+    option, so this runs in the ``qkstatic`` scale mode, where Q and K take a fixed scale and no
+    amax pass reads the table; ``h8w2`` is the launch shape of the static FP8 scenario."""
+    mode = "qkstatic"
+    _pin(monkeypatch, mode, kernel)
+    if launch is not None:
+        monkeypatch.setattr(fq, "_launch_config", lambda: launch)
+    qkv, wq, wk, cos, sin = _inputs(rows, seed=rows)
+    half = cos.shape[-1] // 2
+    assert torch.equal(cos[:, :half], cos[:, half:]) and torch.equal(sin[:, :half], sin[:, half:])
+    other_cos, other_sin = cos.clone(), sin.clone()
+    other_cos[:, half:] = cos[:, :half].roll(1, dims=1)
+    other_sin[:, half:] = sin[:, :half].roll(1, dims=1)
+
+    ref_codes, ref_descale = _reference(qkv, wq, wk, cos, sin, mode)
+    codes, descale = _run(qkv, wq, wk, other_cos, other_sin, mode, 0, rope_halves_equal=True)
+    _assert_codes(codes, ref_codes, f"halves-equal/{mode}/{kernel}")
+    assert torch.equal(descale.view(torch.int32), ref_descale.view(torch.int32))
+    plain, _ = _run(qkv, wq, wk, other_cos, other_sin, mode, 0)
+    assert not torch.equal(plain[0].view(torch.uint8), codes[0].view(torch.uint8))
+    assert not torch.equal(plain[1].view(torch.uint8), codes[1].view(torch.uint8))
 
 
 @pytest.mark.parametrize(

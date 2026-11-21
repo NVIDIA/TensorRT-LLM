@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Natural-N BF16 GEMM + gated residual, with mandatory GEMM BF16 round.
+"""FP8 projection GEMM with a gated residual epilogue, for the two projections back to the hidden width.
 
-Research derivative of the B-reuse gate-up kernel. Natural weight order;
-FP32 accumulation, mandatory BF16 GEMM round, then gated FP32 FMA residual.
-Qualified for the original static-FP8 H3 request at M=37820 on SM107.
+``out = bf16(hidden + gate * bf16(scale_a * scale_w * (activation @ weight.T)))`` in one kernel: FP32
+accumulation, the GEMM result rounded to BF16, then the gated residual as one FP32 FMA rounded to
+BF16. ``gate`` is a column block of the AdaLN modulation table, selected per row by ``indices``;
+``gate_column`` names the block (2 for the attention output, 5 for the MLP down projection).
 """
 
 from typing import Tuple
@@ -23,11 +24,6 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
-
-K_DIM = 5376
-D_HALF = 14336
-N_TOT = 2 * D_HALF
-HALF_TILE_N = 128  # gate (or up) columns per 256-wide MMA N tile
 
 
 @dsl_user_op
@@ -88,8 +84,10 @@ class ProjectionBreuseKernel:
         fallback_cluster_shape_mn=(2, 1),
         mma_tile_k=128,
         tile_n=256,
+        gate_column=2,
     ):
         self.n_dim = n_dim
+        self.gate_column = gate_column
         self.k_dim = k_dim
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.TWO
@@ -732,7 +730,9 @@ class ProjectionBreuseKernel:
                         gGate = cute.local_tile(aux_mod[(selected, None)], (n_val,), (None,))
                         cute.copy(load_x, xRow[(None, out_col // n_val + sub)], rX)
                         cute.copy(
-                            load_mod, gGate[(None, (5 * self.n_dim + out_col) // n_val + sub)], rG
+                            load_mod,
+                            gGate[(None, (self.gate_column * self.n_dim + out_col) // n_val + sub)],
+                            rG,
                         )
                         for i in cutlass.range_constexpr(n_val // 2):
                             g0 = cutlass.Float32(rG[2 * i])
@@ -769,7 +769,7 @@ class ProjectionBreuseKernel:
 # ----------------------------------------------------------------------------------------------
 # Host side
 # ----------------------------------------------------------------------------------------------
-_CFG = dict(
+CONFIG = dict(
     tile_n=256,
     cluster_shape_mn=(4, 1),
     num_ab_stage=4,
@@ -777,34 +777,42 @@ _CFG = dict(
     fallback_cluster_shape_mn=(2, 1),
     mma_tile_k=128,
 )
+ATTENTION_OUTPUT_GATE, DOWN_GATE = 2, 5
+_DTYPES = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+    torch.int32: cutlass.Int32,
+    torch.int64: cutlass.Int64,
+}
 _compiled = {}
 
 
-def _get_compiled(device_index, n, k, mod, idx):
-    tile_n = _CFG.get("tile_n", 256)
-    assert n % tile_n == 0 and k % 128 == 0
-    key = (
-        device_index,
-        n,
-        k,
-        str(mod.dtype),
-        tuple(mod.shape),
-        str(idx.dtype),
-        repr(sorted(_CFG.items())),
+def block_shared_memory_bytes(device_index):
+    """Shared memory one block of this device may opt in to, 0 when the driver does not report it."""
+    status, capacity = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute(150), cuda.CUdevice(device_index)
     )
+    return int(capacity) if int(status) == 0 else 0
+
+
+def compile_kernel(device_index, n, k, gate_column, modulation_dtype, index_dtype):
+    """The compiled kernel for one projection shape; row counts are symbolic, so one build serves
+    every sequence length and every number of modulation rows."""
+    key = (device_index, n, k, gate_column, modulation_dtype, index_dtype)
     if key not in _compiled:
-        config = dict(_CFG)
-        cn = config["cluster_shape_mn"][1]
-        assert (n // tile_n) % cn == 0 and ((n // tile_n) // cn) % config["swizzle_size"] == 0
-        status, capacity = cuda.cuDeviceGetAttribute(
-            cuda.CUdevice_attribute(150), cuda.CUdevice(device_index)
-        )
-        assert (
-            int(status) == 0
-            and int(capacity)
-            >= (256 + tile_n // 2) * config["mma_tile_k"] * config["num_ab_stage"] + 4096
-        )
-        kern = ProjectionBreuseKernel(n, k, **config)
+        tile_n = CONFIG["tile_n"]
+        cn = CONFIG["cluster_shape_mn"][1]
+        tiles = n // tile_n
+        if n % tile_n or k % 128 or tiles % cn or (tiles // cn) % CONFIG["swizzle_size"]:
+            raise ValueError(f"the FP8 projection kernel does not tile a [{n}, {k}] weight")
+        capacity = block_shared_memory_bytes(device_index)
+        needed = (256 + tile_n // 2) * CONFIG["mma_tile_k"] * CONFIG["num_ab_stage"] + 4096
+        if capacity < needed:
+            raise RuntimeError(
+                f"the FP8 projection kernel needs {needed} bytes of shared memory per block, "
+                f"the device offers {capacity}"
+            )
+        kern = ProjectionBreuseKernel(n, k, gate_column=gate_column, **CONFIG)
         m_sym = cute.sym_int32()
         act = make_fake_compact_tensor(
             cutlass.Float8E4M3FN, (m_sym, k), stride_order=(1, 0), assumed_align=256
@@ -817,19 +825,16 @@ def _get_compiled(device_index, n, k, mod, idx):
             cutlass.BFloat16, (m_sym, n), stride_order=(1, 0), assumed_align=256
         )
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        dtype_map = {
-            torch.bfloat16: cutlass.BFloat16,
-            torch.float32: cutlass.Float32,
-            torch.int32: cutlass.Int32,
-            torch.int64: cutlass.Int64,
-        }
         x = make_fake_compact_tensor(
             cutlass.BFloat16, (m_sym, n), stride_order=(1, 0), assumed_align=256
         )
         gates = make_fake_compact_tensor(
-            dtype_map[mod.dtype], tuple(mod.shape), stride_order=(1, 0), assumed_align=32
+            _DTYPES[modulation_dtype],
+            (cute.sym_int32(), 6 * n),
+            stride_order=(1, 0),
+            assumed_align=32,
         )
-        indices = make_fake_compact_tensor(dtype_map[idx.dtype], (m_sym,), assumed_align=16)
+        indices = make_fake_compact_tensor(_DTYPES[index_dtype], (m_sym,), assumed_align=16)
         _compiled[key] = cute.compile(
             kern,
             act,
@@ -844,15 +849,39 @@ def _get_compiled(device_index, n, k, mod, idx):
     return _compiled[key]
 
 
-def run(a, w, sa, sw, x, mod, idx):
+def supports(a, w, x, mod, idx, gate_column):
+    """Whether a kernel compiled by ``compile_kernel`` serves these tensors as they are.
+
+    Nothing is compiled here: a shape, gate or dtype without a compiled kernel, or a tensor
+    outside the kernel's layout and alignment contract, takes the caller's unfused path."""
+    if not (a.is_cuda and a.ndim == w.ndim == mod.ndim == 2 and idx.ndim == 1):
+        return False
+    m, n = a.shape[0], w.shape[0]
+    key = (a.device.index, n, a.shape[1], gate_column, mod.dtype, idx.dtype)
+    return (
+        key in _compiled
+        and m > 0
+        and a.shape[1] == w.shape[1]
+        and a.dtype == w.dtype == torch.float8_e4m3fn
+        and x.dtype == torch.bfloat16
+        and x.numel() == m * n
+        and mod.shape[1] == 6 * n
+        and idx.numel() == m
+        and all(t.device == a.device for t in (w, x, mod, idx))
+        and all(t.is_contiguous() for t in (a, w, x, mod, idx))
+        and all(t.data_ptr() % 256 == 0 for t in (a, w, x))
+        and mod.data_ptr() % 32 == 0
+        and mod.stride(0) * mod.element_size() % 32 == 0
+        and idx.data_ptr() % 16 == 0
+    )
+
+
+def run(a, w, sa, sw, x, mod, idx, gate_column):
+    """``bf16(x + gate * bf16(sa * sw * a @ w.T))`` as a new ``[M, N]`` BF16 tensor."""
     m, k = a.shape
     n = w.shape[0]
-    assert a.is_contiguous() and w.is_contiguous()
-    assert a.dtype == w.dtype == torch.float8_e4m3fn
     out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
-    assert mod.shape[1] == 6 * n and x.numel() == m * n and idx.numel() == m
-    assert mod.data_ptr() % 32 == 0 and (mod.stride(0) * mod.element_size()) % 32 == 0
-    _get_compiled(a.device.index, n, k, mod, idx)(
+    _compiled[(a.device.index, n, k, gate_column, mod.dtype, idx.dtype)](
         a, w, sa.reshape(1), sw.reshape(1), (x.view(m, n), mod, idx), out
     )
     return out

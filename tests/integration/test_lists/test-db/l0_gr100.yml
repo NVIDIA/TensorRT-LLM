@@ -91,3 +91,5 @@ l0_gr100:
   - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_nvfp4__sm_107__u1_u4/kernels
   - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_nvfp4__sm_107__u1_u4/test_minimax_h3_scenario_consumers.py
   - unittest/_torch/visual_gen/test_minimax_h3_mixed_precision.py
+  - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_fp8__sm_107__u1/test_fp8_kernels.py
+  - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_fp8__sm_107__u1/test_fp8_conversions.py

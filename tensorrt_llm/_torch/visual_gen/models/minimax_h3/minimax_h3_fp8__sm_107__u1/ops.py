@@ -4,14 +4,14 @@
 
 import torch
 
-from .kernels import attention_output, down_residual, gate_up_swiglu
+from tensorrt_llm.logger import logger
+
+from .kernels import gate_up_swiglu, projection_residual
 from .kernels.adaln import launch as adaln_launch
 from .kernels.conversion import BLOCKS, THREADS, modules_for_device
 
-FULL_SEQUENCE_LENGTHS = (37776, 37820, 38169)
 
-
-@torch.library.custom_op("h3_fp8::qkv_gemm", mutates_args=())
+@torch.library.custom_op("h3_fp8::qkv_gemm", mutates_args=(), device_types="cuda")
 def qkv_gemm(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -36,39 +36,21 @@ def _qkv_gemm_fake(activation, weight, input_scale, weight_scale):
     )
 
 
-def supports_projection(
-    activation: torch.Tensor,
-    weight: torch.Tensor,
-    hidden: torch.Tensor,
-    modulation: torch.Tensor,
-    indices: torch.Tensor,
-    in_features: int,
-) -> bool:
-    """Keep the full-sequence kernel's dtype, shape and alignment contract."""
-    rows = activation.shape[0]
-    return (
-        rows in FULL_SEQUENCE_LENGTHS
-        and activation.shape == (rows, in_features)
-        and weight.shape == (5376, in_features)
-        and activation.dtype == weight.dtype == torch.float8_e4m3fn
-        and hidden.dtype == torch.bfloat16
-        and hidden.numel() == rows * 5376
-        and activation.is_contiguous()
-        and weight.is_contiguous()
-        and hidden.is_contiguous()
-        and modulation.ndim == 2
-        and modulation.shape[1] == 6 * 5376
-        and modulation.dtype in (torch.bfloat16, torch.float32)
-        and modulation.is_contiguous()
-        and modulation.data_ptr() % 32 == 0
-        and modulation.stride(0) * modulation.element_size() % 32 == 0
-        and indices.numel() == rows
-        and indices.is_contiguous()
-        and indices.dtype in (torch.int32, torch.int64)
-    )
+_UNFUSED_REPORTED: set[str] = set()
 
 
-def _scaled_mm(
+def _report_unfused(projection: str) -> None:
+    """Warn the first time a projection runs unfused: correct, but slower on every later call too."""
+    if projection not in _UNFUSED_REPORTED:
+        _UNFUSED_REPORTED.add(projection)
+        logger.warning(
+            f"MiniMax-H3 static FP8: the {projection} projection received tensors outside the "
+            "fused kernel's contract (dtypes, layout or 256-byte alignment) and runs on the "
+            "unfused cuBLAS path; reported once"
+        )
+
+
+def _cublas_scaled_mm(
     activation: torch.Tensor,
     weight: torch.Tensor,
     input_scale: torch.Tensor,
@@ -84,7 +66,7 @@ def _scaled_mm(
     )
 
 
-@torch.library.custom_op("h3_fp8::gate_up_swiglu", mutates_args=())
+@torch.library.custom_op("h3_fp8::gate_up_swiglu", mutates_args=(), device_types="cuda")
 def gate_up(
     activation: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -113,7 +95,7 @@ def _gate_up_fake(activation, packed_weight, input_scale, weight_scale, output_s
     )
 
 
-@torch.library.custom_op("h3_fp8::down_gated_residual", mutates_args=())
+@torch.library.custom_op("h3_fp8::down_gated_residual", mutates_args=(), device_types="cuda")
 def down(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -123,20 +105,29 @@ def down(
     modulation: torch.Tensor,
     indices: torch.Tensor,
 ) -> torch.Tensor:
-    if supports_projection(activation, weight, hidden, modulation, indices, 14336):
-        return down_residual.run(
-            activation, weight, input_scale, weight_scale, hidden, modulation, indices
+    if projection_residual.supports(
+        activation, weight, hidden, modulation, indices, projection_residual.DOWN_GATE
+    ):
+        return projection_residual.run(
+            activation,
+            weight,
+            input_scale,
+            weight_scale,
+            hidden,
+            modulation,
+            indices,
+            projection_residual.DOWN_GATE,
         ).reshape_as(hidden)
-    projected = _scaled_mm(activation, weight, input_scale, weight_scale).reshape_as(hidden)
-    return _gated_residual(hidden, projected, modulation, indices)
+    _report_unfused("Down")
+    projected = _cublas_scaled_mm(activation, weight, input_scale, weight_scale).reshape_as(hidden)
+    return _gated_residual(hidden, projected, modulation, indices, projection_residual.DOWN_GATE)
 
 
-def _residual_expression(hidden, projected, modulation, indices):
+def _gated_residual(hidden, projected, modulation, indices, gate_column):
+    """The kernel's residual for tensors outside its layout contract: FP32, then one BF16 round."""
     width = hidden.shape[-1]
-    return hidden + modulation[:, 5 * width : 6 * width].index_select(0, indices) * projected
-
-
-_gated_residual = torch.compile(_residual_expression, fullgraph=True, dynamic=False)
+    gate = modulation[:, gate_column * width : (gate_column + 1) * width].index_select(0, indices)
+    return torch.addcmul(hidden.float(), gate.float(), projected.float()).to(hidden.dtype)
 
 
 @down.register_fake
@@ -144,7 +135,7 @@ def _down_fake(activation, weight, input_scale, weight_scale, hidden, modulation
     return torch.empty_like(hidden)
 
 
-@torch.library.custom_op("h3_fp8::norm", mutates_args=())
+@torch.library.custom_op("h3_fp8::norm", mutates_args=(), device_types="cuda")
 def norm(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -163,7 +154,7 @@ def _norm_fake(hidden, weight, modulation, indices, reciprocal_scale, eps):
     return torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
 
 
-@torch.library.custom_op("h3_fp8::attention_projection", mutates_args=())
+@torch.library.custom_op("h3_fp8::attention_projection", mutates_args=(), device_types="cuda")
 def attention_projection(
     raw: torch.Tensor,
     weight: torch.Tensor,
@@ -181,11 +172,11 @@ def attention_projection(
         raise ValueError("Expected matching attention [*,7168] and hidden [*,5376] rows")
     quant, _ = modules_for_device(raw.device.index)
     if (
-        raw.is_cuda
+        quant is not None
+        and raw.is_cuda
         and raw.dtype == torch.bfloat16
         and raw.is_contiguous()
         and raw.data_ptr() % 16 == 0
-        and raw.numel() // 7168 in FULL_SEQUENCE_LENGTHS
     ):
         activation = quant.quantize_config(
             raw, input_scale, quant_factor, 0, quant.pdl, BLOCKS, THREADS
@@ -193,15 +184,25 @@ def attention_projection(
     else:
         activation = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(raw, input_scale)[0]
     activation = activation.reshape(-1, 7168)
-    if supports_projection(activation, weight, hidden, modulation, indices, 7168):
-        residual = attention_output.run(
-            activation, weight, input_scale, weight_scale, hidden, modulation, indices
+    if projection_residual.supports(
+        activation, weight, hidden, modulation, indices, projection_residual.ATTENTION_OUTPUT_GATE
+    ):
+        residual = projection_residual.run(
+            activation,
+            weight,
+            input_scale,
+            weight_scale,
+            hidden,
+            modulation,
+            indices,
+            projection_residual.ATTENTION_OUTPUT_GATE,
         ).reshape_as(hidden)
         codes = adaln_launch(
             residual, None, norm_weight, modulation, indices, reciprocal_scale, eps, 0, 4, 3
         )[1]
         return residual, codes
-    projected = _scaled_mm(activation, weight, input_scale, weight_scale).reshape_as(hidden)
+    _report_unfused("attention output")
+    projected = _cublas_scaled_mm(activation, weight, input_scale, weight_scale).reshape_as(hidden)
     return adaln_launch(
         hidden, projected, norm_weight, modulation, indices, reciprocal_scale, eps, 2, 4, 3
     )
@@ -224,13 +225,13 @@ def _attention_projection_fake(
     return torch.empty_like(hidden), torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
 
 
-@torch.library.custom_op("h3_fp8::shared_output_cast", mutates_args=())
+@torch.library.custom_op("h3_fp8::shared_output_cast", mutates_args=(), device_types="cuda")
 def output_cast(hidden: torch.Tensor) -> torch.Tensor:
     _, cast = modules_for_device(hidden.device.index)
     eligible = (
-        hidden.dtype == torch.bfloat16
+        cast is not None
+        and hidden.dtype == torch.bfloat16
         and hidden.is_contiguous()
-        and tuple(hidden.shape) in tuple((1, n, 5376) for n in FULL_SEQUENCE_LENGTHS)
         and hidden.data_ptr() % 16 == 0
     )
     return cast.cast(hidden, 1, BLOCKS, THREADS) if eligible else hidden.float()

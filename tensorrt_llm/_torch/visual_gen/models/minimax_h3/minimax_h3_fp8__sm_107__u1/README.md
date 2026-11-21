@@ -4,14 +4,17 @@
 # MiniMax-H3 static FP8 on Rubin
 
 This scenario implements the uniform static ModelOpt FP8 DiT on one SM107 GPU
-with 212 SMs. It keeps BF16 residuals and the original FP32 media heads, uses
-trtllm-gen FP16-softmax Attention with `skip_corr_threshold=0`, and reuses the
+with 212 SMs. It keeps BF16 residuals and the original FP32 media heads, and
+runs FP8 Q/K/V through the trtllm-gen attention kernel with FP16 softmax
+(`skip_corr_threshold=0`). The `CUDNN` backend with `qk_dtype=v_dtype="fp8"` in
+the example below is how the FP8 attention recipe is requested; the scenario
+then selects that kernel for it. It reuses the
 existing H3 scenario's FP8 Video VAE, component graphs and preloop scheduling.
 The Video VAE is prepared from the model's native decoder; it does not need a
 separate FP8 Video VAE checkpoint.
 
 Start the Python process with `NVIDIA_TF32_OVERRIDE=0` and select the existing
-H3 scenario resolver. Other TF32 settings are outside this scenario's qualification:
+H3 scenario resolver:
 
 ```python
 from tensorrt_llm import VisualGen, VisualGenArgs
@@ -33,70 +36,91 @@ generator = VisualGen(model=args.model, args=args)
 ```
 
 `visual_gen_scenario="off"` keeps the family implementation. `"auto"` selects
-this scenario only when its hardware, checkpoint and execution requirements
-match. No new public argument or separate benchmark command is introduced.
+this scenario when its hardware, checkpoint and execution requirements match and
+otherwise keeps the family implementation; `"require"` raises with the reason.
+No new public argument or separate benchmark command is introduced.
 
 ## Scope
 
 - All 200 main DiT Linears must be static per-tensor FP8 with the original H3
-  shapes. BF16 or mixed checkpoints, including EarlyTop8, are not admitted.
-- The fused block serves batch one and packed lengths 37776, 37820 or 38169,
-  including the fixed 1344×768×124 Waiter/Cycling workloads. Other packed lengths
-  use the existing family AdaLN and FFN math, complete scenario Attention with
-  its output projection, and stock FP8QDQ QKV GEMM. They do not enter the
-  scenario's dedicated GEMM kernels. Batch, hidden width and dtype requirements
-  remain enforced.
-- The default loader warmup uses the prompt `"warmup"`, producing packed length
-  37712 at 1344×768×124. It takes this fallback; normal requests at the listed
-  lengths select the fused kernels independently. Skipping loader warmup is not
-  required. The fallback and fused requests require separate GPU qualification.
-- Ulysses, TP and parallel VAE are one. GB300 and four-GPU inference keep their
-  separately qualified family routes.
+  shapes. BF16 or mixed checkpoints are not admitted.
+- Batch one, any packed sequence length. The fused kernels take the row count at
+  run time, so one build of each serves every request shape. The blocks raise on
+  another batch size or layout rather than falling back.
+- Ulysses, TP and parallel VAE are one. Other GPUs and multi-GPU inference keep
+  the family routes.
 - Compile is on; whole-model CUDA Graphs, LoRA, CPU weight offload and diffusion
-  caches are off. Weights and calibration scales remain immutable after loading.
-- `NVIDIA_TF32_OVERRIDE=0` is required, including during model loading and warmup.
-- Component-local text-encoder/decoder graphs are inherited from the existing
-  scenario. The conditioning-keyed DiT cache is outside those graph captures.
-- CuTe DSL, CUDA 13.4 tooling and the SM107 runtime are required. Exact conversion
-  kernels are compiled and qualified before pipeline compilation and warmup.
-  Python assertions must be enabled; conversion preparation rejects `python -O`.
-- Initialization uses the model/scales CUDA device for allocations and launches.
-  Execution on a nonzero CUDA device still needs independent GPU qualification.
+  caches are off. Weights and calibration scales are immutable after loading.
+- `NVIDIA_TF32_OVERRIDE=0` is required from process start; the route declines
+  otherwise.
+- The scenario shares attention and decoder settings with the H3 NVFP4 scenario,
+  which are fixed per process. A process that already selected other values for
+  them cannot load this scenario; the route declines with that reason.
+
+## Requirements
+
+CuTe DSL and the SM107 runtime are required. The CUDA toolchain is optional:
+
+| Tool | Used for | Without it |
+|---|---|---|
+| `nvcc`, `ninja` | build the scalar quantize and output-cast kernels at load | the installed operators run |
+| `cuobjdump` | check the instructions of the built kernels | the installed operators run |
+
+The built kernels and the installed operators produce the same bytes, so the
+toolchain changes speed, not output. `transformer.fp8_kernel_qualification`
+reports which one is active and why, and the loader logs a warning when the
+built kernels are not used (shown with `TLLM_LOG_LEVEL=warning`). `python -O`
+also uses the installed operators, as does a failed build or a failed inspection
+of the built binaries. A built kernel whose output differs from the installed
+operators fails the load.
+
+Model loading compiles the CuTe DSL kernels (GateUp and the two projections)
+and prepares packed GateUp weights and reciprocal scales before `torch.compile`
+wraps the blocks; the Triton kernels compile during the loader's warmup request.
+The denoise loop compiles no projection kernel: an input outside the compiled
+kernel's dtypes, layout or 256-byte alignment takes the unfused cuBLAS path
+(whose Triton AdaLN variant compiles on first use; the blocks' own tensors
+never take it). The first such call of each projection logs a warning, since
+the slower path then serves every later call as well.
+The packed GateUp weights replace the checkpoint layout in place, so the
+model's `state_dict()` no longer holds that weight in checkpoint order.
 
 ## Implementation
 
 `modeling.py` owns the FP8 attention, block and Transformer subclasses;
-`conditioning.py` owns each pipeline's exact timestep-keyed AdaLN tables.
-`ops.py` defines the compiler boundaries. `kernels/` contains AdaLN→FP8,
-GateUp+SwiGLU→FP8, Down+gated residual, attention-output+gated residual,
-QK/RoPE load reuse, static quantization and the shared final BF16→FP32 cast.
-No shared Linear, GatedMLP or NVFP4 model class is patched globally.
+`conditioning.py` owns each pipeline's timestep-keyed AdaLN tables. `ops.py`
+defines the compiler boundaries. `kernels/` contains:
 
-The FP8 attention passes its RoPE cast explicitly to the shared QK orchestration;
-the NVFP4 scenario's default cast and behavior are unchanged. Model loading
-prepares packed GateUp weights, reciprocals and conversion factors before
-`torch.compile` wraps the blocks.
+| File | Kernel |
+|---|---|
+| `adaln.py` | AdaLN to FP8, and gated residual + AdaLN to FP8 |
+| `gate_up_swiglu.py` | GateUp GEMM + SwiGLU to FP8 |
+| `projection_residual.py` | FP8 GEMM + gated residual, for the attention output and Down projections |
+| `conversion.py`, `pdl.py`, `*.cu`, `*.cpp` | optional scalar FP8 quantize and the shared BF16 to FP32 output cast, with their load-time checks |
 
-The conditioning cache can retain approximately 1.2 GiB for 64 distinct
-two-timestep keys. Reclaiming these allocations across sleep/wake is unverified
-and remains follow-up work; this scenario does not clear a cache concurrently
-with inference.
+Q/K normalization, RoPE and FP8 quantization reuse the H3 NVFP4 scenario's
+`fused_fp8_qk` kernel with `rope_halves_equal=True`. No shared Linear, GatedMLP
+or NVFP4 model class is patched.
 
-## Validation and attribution
+The conditioning cache keeps the AdaLN tables of the 64 most recently used
+timestep keys (about 1.2 GiB at two timesteps per key) and evicts the least
+recently used key beyond that.
 
-This native scenario integration requires its own GPU functional, LPIPS and
-performance qualification. Historical measurements of the separately frozen
-implementation do not qualify a changed integration. See the linked complete
-reports for exact configurations, video comparisons, accepted/rejected changes
-and the current validation status:
+Where the normalized hidden state is NaN (a NaN anywhere in a row, or an Inf
+element), the fused AdaLN kernel writes a saturated FP8 code; the unfused
+quantize emits the FP8 NaN code. Finite values are unaffected.
 
-- [English report](https://sc.talos.nvidia.com/view/home/scratch.taianz_inf/workspace/notes/rubin/runs/20261110-h3-static-fp8/report-en.html)
-- [中文报告](https://sc.talos.nvidia.com/view/home/scratch.taianz_inf/workspace/notes/rubin/runs/20261110-h3-static-fp8/report.html)
+## Validation
 
-Kanghwan supplied the H3/scenario foundation, QK/RoPE work, Attention backend
-choices and component/preloop work. Pamela's discussion and Chenghao's register
-epilogue examples informed GEMM fusion; Yiheng's discussion informed conditioning
-precomputation. Kernel Factory supplied scheduling ideas used by the GateUp
-kernel. The FP8 adaptations and retained fusion implementation are included here;
-search campaigns, rejected variants and experimental measurement harnesses are
-maintained with the local report evidence.
+`tests/unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_fp8__sm_107__u1/`:
+
+| Test | Needs | Checks |
+|---|---|---|
+| `test_fp8_contracts.py` | CPU | routing, admission, op wiring, load order, cache eviction |
+| `test_fp8_kernels.py` | SM107 GPU with 212 SMs | each fused op against the unfused operators at six sequence lengths, the unfused path for inputs outside the kernel contract, non-finite rows |
+| `test_fp8_conversions.py` | the same GPU, CUDA toolchain | built conversions byte-identical to the installed operators, directly and through the ops |
+| `test_fp8_pipeline.py` | the same GPU, `MiniMax-H3-FP8` checkpoint, `NVIDIA_TF32_OVERRIDE=0` | 8-step end-to-end generation; not in a CI list |
+
+The `rope_halves_equal` option is tested with the NVFP4 scenario's kernel tests
+(`test_h3_scenario_fused_fp8_qk.py`); the family table's equal halves, which it
+relies on, are pinned by a CPU test in `test_minimax_h3_attention_precision.py`.

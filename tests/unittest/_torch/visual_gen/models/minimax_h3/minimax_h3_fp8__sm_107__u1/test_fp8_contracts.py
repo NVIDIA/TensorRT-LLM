@@ -13,6 +13,7 @@ import subprocess
 import sys
 import unittest
 import weakref
+from collections import OrderedDict
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -304,6 +305,49 @@ class RoutingContracts(unittest.TestCase):
             self.assertIs(namespace["route_fp8_sm_107_u1"](_config()), expected)
         self.assertEqual(calls, ["selected"])
 
+    def test_unavailable_selection_declines_and_auto_keeps_family(self):
+        namespace = _routing_namespace()
+        module = "_h3_fp8_cpu_contracts.minimax_h3_fp8__sm_107__u1"
+        config = ModuleType(module + ".config")
+
+        def unavailable():
+            raise RuntimeError("this process already runs the scenario with other settings")
+
+        config.select = unavailable
+        with patch.dict(sys.modules, {module + ".config": config}):
+            with self.assertRaisesRegex(namespace["NoScenario"], "other settings"):
+                namespace["route_fp8_sm_107_u1"](_config())
+            cfg = _config()
+            cfg.extra_attrs["visual_gen_scenario"] = "auto"
+            family = object()
+            self.assertIs(namespace["resolve_scenario"](family, cfg), family)
+
+    def test_missing_build_tools_are_named(self):
+        for home, present, missing in (
+            ("/cuda", {"ninja", "cuobjdump", "/cuda/bin/nvcc"}, []),
+            (None, {"ninja", "cuobjdump"}, ["nvcc"]),
+            ("/cuda", {"ninja", "/cuda/bin/nvcc"}, ["cuobjdump"]),
+            ("/cuda", {"cuobjdump"}, ["nvcc", "ninja"]),
+        ):
+            namespace = _source_definitions(
+                FP8 / "config.py",
+                {"missing_build_tools"},
+                {
+                    "os": SimpleNamespace(
+                        path=SimpleNamespace(
+                            isfile=lambda path, present=present: path in present,
+                            join=os.path.join,
+                        )
+                    ),
+                    "shutil": SimpleNamespace(
+                        which=lambda tool, present=present: tool if tool in present else None
+                    ),
+                    "CUDA_HOME": home,
+                },
+            )
+            with self.subTest(home=home, present=sorted(present)):
+                self.assertEqual(namespace["missing_build_tools"](), missing)
+
     def test_uniform_non_main_exclusions_still_select_fp8(self):
         cfg = _config()
         cfg.model_configs["transformer"].quant_config.exclude_modules = _uniform_ignore_patterns()
@@ -572,54 +616,56 @@ class ForwardContract(unittest.TestCase):
             sources, {"sharedCast.cpp", "sharedCast.cu", "staticQuant.cpp", "staticQuant.cu"}
         )
 
-    def test_shared_head_input_is_the_only_forward_change(self):
-        tree = ast.parse((MODEL / "transformer_minimax_h3.py").read_text())
+    def test_heads_share_one_cast_through_the_family_hook(self):
+        casts = []
+        namespace = {"torch": SimpleNamespace(Tensor=object)}
+        namespace["ops"] = SimpleNamespace(
+            output_cast=lambda hidden: casts.append(hidden) or ("fp32", hidden)
+        )
+        tree = ast.parse((FP8 / "modeling.py").read_text())
         cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Fp8Transformer"
+        )
+        hook = next(
+            n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_head_inputs"
+        )
+        self.assertFalse(
+            any(isinstance(n, ast.FunctionDef) and n.name == "forward" for n in cls.body)
+        )
+        _exec_function(hook, namespace)
+        video, audio = namespace["_head_inputs"](None, "hidden")
+        self.assertIs(video, audio)
+        self.assertEqual(casts, ["hidden"])
+        # the family forward takes both head inputs from the hook this scenario overrides
+        family = ast.parse((MODEL / "transformer_minimax_h3.py").read_text())
+        model = next(
             n
-            for n in tree.body
+            for n in family.body
             if isinstance(n, ast.ClassDef) and n.name == "MiniMaxH3Transformer3DModel"
         )
-        native = copy.deepcopy(
-            next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+        forward = next(
+            n for n in model.body if isinstance(n, ast.FunctionDef) and n.name == "forward"
         )
-        native.body.pop(0)
-        clone = next(
+        calls = [
             n
-            for n in ast.parse((FP8 / "transformer_forward.py").read_text()).body
-            if isinstance(n, ast.FunctionDef)
-        )
-        clone.name, clone.decorator_list = native.name, copy.deepcopy(native.decorator_list)
-        shared = [
-            n
-            for n in clone.body
-            if isinstance(n, ast.Assign)
-            and any(
-                isinstance(t, ast.Name) and t.id == "shared_projection_input" for t in n.targets
-            )
+            for n in ast.walk(forward)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "_head_inputs"
         ]
-        self.assertEqual(len(shared), 1)
-        clone.body.remove(shared[0])
-        consumers = []
-        for node in ast.walk(clone):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self"
-                and node.func.attr in ("proj_out", "audio_proj_out")
-            ):
-                self.assertEqual(len(node.args), 1)
-                self.assertIsInstance(node.args[0], ast.Name)
-                self.assertEqual(node.args[0].id, "shared_projection_input")
-                node.args[0] = ast.parse(
-                    f"self._projection_input(self.{node.func.attr}, packed_hidden_states)",
-                    mode="eval",
-                ).body
-                consumers.append(node.func.attr)
-        self.assertEqual(sorted(consumers), ["audio_proj_out", "proj_out"])
-        self.assertEqual(
-            ast.dump(clone, include_attributes=False), ast.dump(native, include_attributes=False)
-        )
+        self.assertEqual(len(calls), 1)
+
+
+def _exec_function(node, namespace):
+    node.returns = None
+    for arg in node.args.args:
+        arg.annotation = None
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "<source>", "exec"
+        ),
+        namespace,
+    )
 
 
 class _LayoutTensor:
@@ -673,18 +719,9 @@ class _LayoutTensor:
     __mul__ = __add__
 
 
-def _length_fallback_namespace():
+def _fused_dispatch_namespace():
     """Execute actual scenario and family methods; replace only CUDA/linear math."""
     calls = []
-    tree = ast.parse((FP8 / "ops.py").read_text())
-    lengths = ast.literal_eval(
-        next(
-            n.value
-            for n in tree.body
-            if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "FULL_SEQUENCE_LENGTHS" for t in n.targets)
-        )
-    )
 
     def mark(name, result):
         def call(*args, **kwargs):
@@ -699,16 +736,12 @@ def _length_fallback_namespace():
 
     def dedicated(name, result):
         def call(first, *args):
-            rows = first.numel() // first.shape[-1]
-            if rows not in lengths:
-                raise AssertionError(f"Unqualified rows reached {name}: {rows}")
             calls.append(name)
             return result(first, *args)
 
         return call
 
     ops = SimpleNamespace(
-        FULL_SEQUENCE_LENGTHS=lengths,
         qkv_gemm=dedicated("qkv_gemm", lambda a, w, *s: _LayoutTensor((a.shape[0], w.shape[0]))),
         norm=dedicated("norm", lambda h, *a: _LayoutTensor(h.shape, "FP8")),
         attention_projection=dedicated(
@@ -803,7 +836,7 @@ def _length_fallback_namespace():
     return namespace, calls
 
 
-class LengthFallbackContracts(unittest.TestCase):
+class FusedDispatchContracts(unittest.TestCase):
     def _block(self, namespace, calls):
         tensor = _LayoutTensor
 
@@ -849,12 +882,10 @@ class LengthFallbackContracts(unittest.TestCase):
         block.adaln_proj = SimpleNamespace(table=lambda temb: tensor((3, 6 * 5376)))
         block._fp8_qkv_reciprocal = block._fp8_gate_up_reciprocal = tensor((1,), "FP32")
         block._fp8_output_quant_factor = tensor((1,), "FP32")
-        block._fp8_packed_gate_up = tensor((28672, 5376), "FP8")
         return block
 
     def _run_block(self, shape, dtype="BF16"):
-        namespace, calls = _length_fallback_namespace()
-        self.assertEqual(namespace["ops"].FULL_SEQUENCE_LENGTHS, (37776, 37820, 38169))
+        namespace, calls = _fused_dispatch_namespace()
         block = self._block(namespace, calls)
         rows = shape[-2]
         output = block._forward_fused_adaln(
@@ -868,26 +899,8 @@ class LengthFallbackContracts(unittest.TestCase):
         )
         return output, calls
 
-    def test_loader_warmup_and_other_unknown_lengths_use_complete_family_math(self):
-        for rows in (37712, 38170):
-            with self.subTest(rows=rows):
-                output, calls = self._run_block((1, rows, 5376))
-                self.assertEqual(output.shape, (1, rows, 5376))
-                self.assertEqual(
-                    calls,
-                    [
-                        "family_norm",
-                        "family_quantize",
-                        "family_qkv",
-                        "family_qk_norm",
-                        "out_projection",
-                        "family_gate_res_norm",
-                        "family_ffn",
-                    ],
-                )
-
-    def test_qualified_request_keeps_dedicated_fusions_and_raw_attention_output(self):
-        for rows in (37776, 37820, 38169):
+    def test_every_packed_length_takes_the_fused_kernels(self):
+        for rows in (1, 37712, 37776, 37820, 38169, 38170, 104000):
             with self.subTest(rows=rows):
                 output, calls = self._run_block((1, rows, 5376))
                 self.assertEqual(output.shape, (1, rows, 5376))
@@ -904,7 +917,7 @@ class LengthFallbackContracts(unittest.TestCase):
             ((1, 37712, 5376), "FP16"),
         ]:
             with self.subTest(shape=shape, dtype=dtype):
-                with self.assertRaisesRegex(ValueError, "qualified BF16"):
+                with self.assertRaisesRegex(ValueError, r"BF16 \[1,S,5376\]"):
                     self._run_block(shape, dtype)
 
 
@@ -921,6 +934,7 @@ class LifecycleContracts(unittest.TestCase):
                                 empty=lambda shape, *, device, dtype: _LayoutTensor(shape, dtype)
                             ),
                             "types": SimpleNamespace(MethodType=MethodType),
+                            "OrderedDict": OrderedDict,
                             "_IDENTIFIERS": itertools.count(),
                             "_OWNERS": weakref.WeakValueDictionary(),
                         },
@@ -1072,18 +1086,133 @@ class LifecycleContracts(unittest.TestCase):
                     FP8 / "kernels/conversion.py",
                     {"prepare"},
                     {
-                        "torch": SimpleNamespace(cuda=SimpleNamespace(device=device_context)),
-                        "_prepare": lambda scales, cache: inner(cache),
+                        "torch": SimpleNamespace(
+                            cuda=SimpleNamespace(device=device_context),
+                            reciprocal=lambda scales: "reciprocal",
+                        ),
+                        "subprocess": subprocess,
+                        "missing_build_tools": lambda: [],
+                        "logger": SimpleNamespace(warning=state["calls"].append),
+                        "_MODULES": {},
+                        "_build": lambda cache: ("quant", "cast", "resources"),
+                        "_prepare": lambda scales, cache, *built: inner(cache),
                     },
                 )
                 scales = SimpleNamespace(device=target)
                 if failure:
+                    # a built kernel that fails its comparison with the installed operators is an error
                     with self.assertRaisesRegex(RuntimeError, "inner context"):
                         namespace["prepare"](scales, Path("cache"))
+                    self.assertEqual(namespace["_MODULES"], {})
+                    self.assertEqual(state["calls"], [Path("cache")])
                 else:
                     self.assertEqual(namespace["prepare"](scales, Path("cache")), "result")
+                    self.assertEqual(state["calls"], [Path("cache")])
                 self.assertEqual(state["current"], 0)
-                self.assertEqual(state["calls"], [Path("cache")])
+
+    def test_initialize_compiles_before_packing_and_packs_once(self):
+        tree = ast.parse((FP8 / "modeling.py").read_text())
+        cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Fp8Transformer"
+        )
+        function = next(
+            n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_initialize_fp8"
+        )
+
+        def calls(node, name):
+            return [
+                n
+                for n in ast.walk(node)
+                if isinstance(n, ast.Call)
+                and (getattr(n.func, "attr", None) or getattr(n.func, "id", None)) == name
+            ]
+
+        packs = calls(function, "pack_weight")
+        self.assertEqual(len(packs), 1)
+        # every step that builds a kernel is a statement that ends before the packing loop starts
+        loop = next(n for n in function.body if isinstance(n, ast.For) and calls(n, "pack_weight"))
+        for name in ("prepare", "_get_compiled", "compile_kernel"):
+            built = calls(function, name)
+            self.assertTrue(built, name)
+            self.assertTrue(all(call.end_lineno < loop.lineno for call in built), name)
+        # the packing is the body of "if not isinstance(gate_up.quant_method, PackedGateUpMethod)"
+        guard = next(
+            n
+            for n in ast.walk(loop)
+            if isinstance(n, ast.If) and any(call is packs[0] for call in calls(n, "pack_weight"))
+        )
+        self.assertEqual(
+            ast.unparse(guard.test),
+            "not isinstance(gate_up.quant_method, PackedGateUpMethod)",
+        )
+        self.assertFalse(guard.orelse)
+        self.assertIn("gate_up.quant_method = PackedGateUpMethod()", ast.unparse(guard))
+
+    def test_failed_build_or_inspection_keeps_installed_operators(self):
+        for error in (
+            OSError("read-only cache"),
+            RuntimeError("nvcc: unknown -arch"),
+            AssertionError("no LDG.128 in SASS"),
+            subprocess.TimeoutExpired("cuobjdump", 90),
+        ):
+            with self.subTest(error=type(error).__name__):
+                warnings = []
+
+                def failing_build(cache, error=error):
+                    raise error
+
+                @contextmanager
+                def device_context(device):
+                    yield
+
+                namespace = _source_definitions(
+                    FP8 / "kernels/conversion.py",
+                    {"prepare"},
+                    {
+                        "torch": SimpleNamespace(
+                            cuda=SimpleNamespace(device=device_context),
+                            reciprocal=lambda scales: "reciprocal",
+                        ),
+                        "subprocess": subprocess,
+                        "missing_build_tools": lambda: [],
+                        "logger": SimpleNamespace(warning=warnings.append),
+                        "_MODULES": {},
+                        "_build": failing_build,
+                        "_prepare": lambda *args: self.fail("ran kernels that were not built"),
+                    },
+                )
+                scales = SimpleNamespace(device=SimpleNamespace(type="cuda", index=1))
+                result = namespace["prepare"](scales, Path("cache"))
+                self.assertEqual(result[:3], (None, None, "reciprocal"))
+                self.assertFalse(result[3]["unary_qualified"])
+                self.assertIn("the build or its inspection failed", result[3]["reason"])
+                self.assertIn(type(error).__name__, result[3]["reason"])
+                self.assertEqual(namespace["_MODULES"], {1: (None, None)})
+                self.assertEqual(len(warnings), 1)
+
+    def test_missing_build_tools_keep_installed_operators_without_building(self):
+        warnings = []
+        namespace = _source_definitions(
+            FP8 / "kernels/conversion.py",
+            {"prepare"},
+            {
+                "torch": SimpleNamespace(reciprocal=lambda scales: "reciprocal"),
+                "missing_build_tools": lambda: ["ninja", "cuobjdump"],
+                "logger": SimpleNamespace(warning=warnings.append),
+                "_MODULES": {},
+                "_build": lambda cache: self.fail("built without the tools"),
+                "_prepare": lambda *args: self.fail("built without the tools"),
+            },
+        )
+        scales = SimpleNamespace(device=SimpleNamespace(type="cuda", index=1))
+        result = namespace["prepare"](scales, Path("cache"))
+        self.assertEqual(result[:3], (None, None, "reciprocal"))
+        self.assertEqual(
+            result[3], {"unary_qualified": False, "reason": "not found: ninja, cuobjdump"}
+        )
+        self.assertEqual(namespace["_MODULES"], {1: (None, None)})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("not found: ninja, cuobjdump", warnings[0])
 
     def test_prepare_queries_scales_device_before_numerical_work(self):
         target, queries = object(), []
@@ -1111,7 +1240,7 @@ class LifecycleContracts(unittest.TestCase):
             },
         )
         with self.assertRaises(StopProbe):
-            namespace["_prepare"](SimpleNamespace(device=target), Path("cache"))
+            namespace["_prepare"](SimpleNamespace(device=target), Path("cache"), None, None, {})
         self.assertEqual(queries, [("properties", target), ("capability", target)])
 
     def test_route_device_queries_use_same_current_device(self):
@@ -1137,7 +1266,7 @@ class LifecycleContracts(unittest.TestCase):
         self.assertEqual(namespace["_device_multiprocessors"](), 212)
         self.assertEqual(queries, [1])
 
-    def test_optimized_python_rejects_prepare_before_any_cuda_or_inner_call(self):
+    def test_optimized_python_keeps_installed_operators_without_any_cuda_or_inner_call(self):
         path = FP8 / "kernels/conversion.py"
         tree = ast.parse(path.read_text())
         wrapper = next(
@@ -1147,24 +1276,37 @@ class LifecycleContracts(unittest.TestCase):
         probe = (
             source
             + """
+import subprocess
 from types import SimpleNamespace
 def forbidden(*args, **kwargs):
-    raise AssertionError("CUDA or qualification body was reached")
-torch = SimpleNamespace(cuda=SimpleNamespace(device=forbidden))
-_prepare = forbidden
-try:
-    prepare(SimpleNamespace(device="cuda:1"), None)
-except RuntimeError as error:
-    if "requires Python assertions" not in str(error):
-        raise
-else:
-    raise RuntimeError("-O did not fail closed")
-print("rejected-before-CUDA")
+    raise SystemExit("CUDA, the tool lookup or the qualification body was reached")
+torch = SimpleNamespace(cuda=SimpleNamespace(device=forbidden), reciprocal=lambda scales: "reciprocal")
+missing_build_tools = _prepare = forbidden
+logger = SimpleNamespace(warning=lambda message: None)
+_MODULES = {}
+quant, cast, factors, proof = prepare(SimpleNamespace(device=SimpleNamespace(index=1)), None)
+assert_ok = quant is None and cast is None and factors == "reciprocal" and _MODULES == {1: (None, None)}
+print("installed-operators" if assert_ok and "-O" in proof["reason"] else "unexpected")
 """
         )
         result = subprocess.run([sys.executable, "-O", "-c", probe], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "rejected-before-CUDA")
+        self.assertEqual(result.stdout.strip(), "installed-operators")
+
+    def test_conditioning_cache_evicts_the_least_recently_used_key(self):
+        namespace = _source_definitions(
+            FP8 / "conditioning.py", {"ConditioningCache"}, {"OrderedDict": OrderedDict}
+        )
+        cache = namespace["ConditioningCache"].__new__(namespace["ConditioningCache"])
+        cache.max_keys, cache.keys, cache.cache, cache.evictions = 2, OrderedDict(), {}, 0
+        for key in ("a", "b"):
+            cache.remember(key)
+            cache.cache[(0, key, "shape")] = cache.cache[(1, key, "shape")] = key
+        cache.remember("a")  # "b" is now the least recently used
+        cache.remember("c")
+        self.assertEqual(list(cache.keys), ["a", "c"])
+        self.assertEqual(sorted(cache.cache), [(0, "a", "shape"), (1, "a", "shape")])
+        self.assertEqual(cache.evictions, 1)
 
 
 if __name__ == "__main__":

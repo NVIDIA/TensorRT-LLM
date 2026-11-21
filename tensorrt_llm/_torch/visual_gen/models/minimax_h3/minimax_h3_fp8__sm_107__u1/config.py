@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixed backend and component settings of the single-GPU static-FP8 scenario."""
 
+import os
+import shutil
+
+from torch.utils.cpp_extension import CUDA_HOME
+
 from ..minimax_h3_nvfp4__sm_107__u1_u4 import config as shared_config
 
 PRESET = {
@@ -26,6 +31,17 @@ PRESET = {
 }
 
 
+def missing_build_tools() -> list[str]:
+    """The tools the optional conversion kernels are built and checked with that this process lacks."""
+    missing = [tool for tool in ("ninja", "cuobjdump") if shutil.which(tool) is None]
+    if CUDA_HOME is None or not os.path.isfile(os.path.join(CUDA_HOME, "bin", "nvcc")):
+        missing.insert(0, "nvcc")
+    return missing
+
+
 def select() -> None:
-    """Fix shared attention/decoder settings before their modules are imported."""
+    """Fix shared attention/decoder settings before their modules are imported.
+
+    Raises RuntimeError when the shared settings are already selected with other values.
+    """
     shared_config.apply(PRESET)
