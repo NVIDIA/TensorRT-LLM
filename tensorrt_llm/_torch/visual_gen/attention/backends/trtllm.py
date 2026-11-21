@@ -417,8 +417,13 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
         self.quant_attention_config = quant_attention_config
         # The tile-mean VC-Attention recipe keeps its value grouping between denoising
-        # steps in a preprocessor owned by this layer.
+        # steps in preprocessors owned by this layer. Calls the CUDA graph runner drives
+        # (probe, warmup, capture) use _vc_preprocessor, which keeps every captured shape's
+        # grouping, as the captured graphs read those buffers by address. Calls without a
+        # published phase (graphs off, a block call warmup did not capture, a FLUX.2 edit)
+        # use _vc_eager_preprocessor, which keeps the current K/V shape's grouping only.
         self._vc_preprocessor: Optional["VCAttentionPreprocessor"] = None
+        self._vc_eager_preprocessor: Optional["VCAttentionPreprocessor"] = None
         # The K/V shape the eager preprocessor currently holds a grouping for.
         self._vc_shape: Optional[tuple[int, int, int]] = None
         if quant_attention_config is not None and quant_attention_config.vc_attention:
@@ -436,6 +441,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 )
 
                 self._vc_preprocessor = VCAttentionPreprocessor()
+                self._vc_eager_preprocessor = VCAttentionPreprocessor()
         elif (
             quant_attention_config is not None
             and quant_attention_config.q_block_size == 0
@@ -499,11 +505,14 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         metadata state, so the V-Smooth window is a fraction of the schedule's
         steps on any scheduler. Under the CUDA graph runner the host resolved
         phase names the preprocessor path. Capture must not record the step.
+        Runner-driven calls and eager calls keep their groupings in separate
+        preprocessors.
         """
         del timestep
         quant_cfg = self.quant_attention_config
         denoise_step = mode = None
-        if self._vc_preprocessor is not None:
+        preprocessor = self._vc_preprocessor
+        if preprocessor is not None:
             phase = resolved_extra_key("vc_smooth_phase")
             if phase is not None:
                 mode = VC_PHASE_MODES[phase]
@@ -515,24 +524,24 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                     mode = "keep"
             else:
                 denoise_step = self.metadata._metadata_state.get("denoise_step")
-                # Eager runs keep the grouping of the current K/V shape only. Under
-                # the CUDA graph runner every captured shape keeps its grouping, as
-                # the captured graphs read those buffers by address.
+                # Eager runs keep the grouping of the current K/V shape only, apart from
+                # the runner's groupings, which captured graphs read by address.
                 shape = (batch_size, kv_seq_len, self.num_kv_heads)
                 if self._vc_shape is not None and shape != self._vc_shape:
                     from ....attention.backends.prims_ts.vc_attention.quantization import (
                         VCAttentionPreprocessor,
                     )
 
-                    self._vc_preprocessor = VCAttentionPreprocessor()
+                    self._vc_eager_preprocessor = VCAttentionPreprocessor()
                 self._vc_shape = shape
+                preprocessor = self._vc_eager_preprocessor
         return prepare_vc_operands(
             q.view(batch_size, seq_len, self.num_heads, self.head_dim),
             k.view(batch_size, kv_seq_len, self.num_kv_heads, self.head_dim),
             v.view(batch_size, kv_seq_len, self.num_kv_heads, self.head_dim),
             qk_fp8=quant_cfg.qk_dtype == "fp8",
             repair_budget=quant_cfg.vc_repair_budget,
-            preprocessor=self._vc_preprocessor,
+            preprocessor=preprocessor,
             denoise_step=denoise_step,
             grouped_tokens=grouped_tokens,
             mode=mode,

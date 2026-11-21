@@ -194,7 +194,7 @@ def test_graph_keys():
     """Model graph keys select graphs and reach the block during capture; so do block args.
 
     Once capture stops (after warmup), a new key runs eagerly, adds no graph and is logged
-    once per block; the block still sees the call's model graph keys, as in a replay.
+    once per block; it runs as with graphs off, without the call's model graph keys.
     """
     torch.manual_seed(0)
     model = _TwoBlockModel(timestep_key=True, block_cls=_PhaseBlock).cuda().eval()
@@ -209,8 +209,7 @@ def test_graph_keys():
     longer = dict(
         call, hidden_states=torch.randn(2, 32, _DIM, device="cuda"), image_rotary_emb=rope
     )
-    with resolved_extra_keys_scope({"late_phase": True}):
-        expected_longer = model(**longer)
+    expected_longer = model(**longer)
     runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
 
     for timestep, expected in ((900, early), (100, late), (800, early), (50, late)):

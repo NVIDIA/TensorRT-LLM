@@ -604,10 +604,9 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
                             + ".",
                             key=("block CUDA graph not captured", key),
                         )
-                    # Publish the call's graph keys as a replay would, so state a block keeps
-                    # for captured graphs (VC-Attention's per-shape grouping) stays in use.
-                    with resolved_extra_keys_scope(self._last_resolved_extra_keys):
-                        return fn(*args, **kwargs)
+                    # Run as with graphs off: no graph keys are published, so VC-Attention
+                    # keeps this shape's grouping apart from the ones captured graphs read.
+                    return fn(*args, **kwargs)
 
                 def call_with_tensors(*graph_tensors: torch.Tensor) -> Any:
                     rebuilt = list(leaves)
