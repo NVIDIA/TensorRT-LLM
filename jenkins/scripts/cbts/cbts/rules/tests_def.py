@@ -753,6 +753,9 @@ class TestsDefRule(Rule):
                     else []
                 )
                 whole_file = anchors == [yaml_path]
+                if git_path == "tests/unittest/_torch/distributed/test_nccl_profiler.py":
+                    # The contract launches this file in a subprocess with both native build modes.
+                    anchors.append("test_unittests.py::test_nccl_profiler_build_contract")
                 # Package-file anchors keep directory scopes at their own level.
                 group_anchors = [
                     path if path.endswith(".py") else f"{path}/__init__.py"
