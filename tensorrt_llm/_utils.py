@@ -31,7 +31,8 @@ from contextlib import contextmanager
 from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import (Any, Callable, Dict, List, Optional, Sequence, TypeVar,
+                    Union, overload)
 
 import numpy as np
 import nvtx
@@ -1338,6 +1339,51 @@ def confidential_compute_enabled() -> bool:
     """Return whether confidential compute restrictions are enabled."""
     cc_enabled, _ = get_cc_and_nvle_status()
     return cc_enabled
+
+
+_ENV_FLAG_TRUE_VALUES = ("1", "true", "yes", "on")
+_ENV_FLAG_FALSE_VALUES = ("0", "false", "no", "off")
+
+
+@overload
+def get_env_flag(name: str, default: bool) -> bool:
+    ...
+
+
+@overload
+def get_env_flag(name: str, default: None = None) -> Optional[bool]:
+    ...
+
+
+def get_env_flag(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    """Read an on/off switch from the environment.
+
+    The value is compared case-insensitively, with surrounding whitespace
+    ignored.
+
+    Args:
+        name: name of the environment variable.
+        default: value returned when the variable is unset or blank.
+
+    Returns:
+        True for ``1``/``true``/``yes``/``on``, False for
+        ``0``/``false``/``no``/``off``, and ``default`` when the variable is
+        unset or blank.
+
+    Raises:
+        ValueError: the variable holds any other value.
+    """
+    raw = os.environ.get(name, "")
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in _ENV_FLAG_TRUE_VALUES:
+        return True
+    if value in _ENV_FLAG_FALSE_VALUES:
+        return False
+    raise ValueError(f"{name}={raw!r} is not one of "
+                     f"{'/'.join(_ENV_FLAG_TRUE_VALUES)} or "
+                     f"{'/'.join(_ENV_FLAG_FALSE_VALUES)}")
 
 
 @lru_cache(maxsize=None)
