@@ -157,6 +157,11 @@ def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
             "区域",
             {"nested": {"values": [None, True, 1.5, ("x", -2)]}},
         ),
+        (
+            r'TRTLLM1:6:区域{"control":"\u0000\u0001\r","ids":[-7,0,9223372036854775807]}',
+            "区域",
+            {"control": "\x00\x01\r", "ids": [-7, 0, 9223372036854775807]},
+        ),
     ],
 )
 def test_decoder_handles_native_and_unicode_golden_payloads(
