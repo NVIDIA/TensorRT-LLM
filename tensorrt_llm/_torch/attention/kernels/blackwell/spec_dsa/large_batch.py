@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """specDSA large-batch kernels (CuTe DSL, SM100): the persistent indexer kernel (one CTA per SM: FP8 logits,
-sampled-threshold top-512, mapping to compressed-KV rows, ready queue) and the attention kernel launched behind it with
-programmatic dependent launch.
+in-stream top-512 with a learned floor, mapping to compressed-KV rows, ready queue) and the attention kernel launched
+behind it with programmatic dependent launch.
 
 The kernels are specialized for the ``DS_V4_FLASH`` spec of ``config.py``: their structural constants are defined from
 it and the kernel classes reject a config with another ``kernel_key``.

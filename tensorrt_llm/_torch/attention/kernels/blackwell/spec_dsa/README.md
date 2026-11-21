@@ -4,9 +4,13 @@
 # specDSA (speculative DSA)
 
 Fused decode kernels for the DeepSeek sparse attention (DSA) of a decode step on Blackwell: the indexer logits, the
-exact top-K selection, the loads of the selected KV rows and the dense attention over them. The top-K threshold is
-guessed from sampled logits as in the GVR V2 top-K and checked by a count certificate; a row where the guess does not
-hold takes an exact fallback, so the selection stays exact. "spec" here is that guess, not speculative decoding (MTP).
+exact top-K selection, the loads of the selected KV rows and the dense attention over them. The selection is exact. The
+megakernel (few rows) guesses the top-K threshold from a sample of the row's own logits, with the rung formulas of the
+sampling ladder of the GVR V2 top-K (a copy in this package, nothing is imported), and checks the guess with a count
+certificate; a row where the guess does not hold takes an exact fallback. The large-batch kernels (many rows) take no
+sample: each CTA keeps the candidates of its row segment above a floor that it raises from the candidates it has
+admitted so far, and selects the exact top-K from the ones kept. "spec" here is this speculation on the selection
+threshold, not speculative decoding (MTP).
 
 The kernels of this package are specialized for the specs of one model, DS-V4-Flash with an FP8 or an MXFP4 indexer K
 cache. `config.py` defines what a spec is and which specs have kernels; the rest of this file says where the parts that
@@ -54,7 +58,7 @@ top-2048, no compression; V4-Pro: top-1024, 4x compression); they have no spec y
 | --- | --- | --- |
 | Numbers | top-K, compression ratio, heads, head dim, page sizes, window, longest row | `SpecDsaConfig` fields; the kernels define their structural constants from the spec and reject another `kernel_key` |
 | Indexer K cache | fp8 or fp4 | `index_k_dtype`; a logits front end per dtype in the megakernel's stream CTAs and in the indexer kernel (fp4: block-scaled MXF4 MMA, the scale factors go to tensor memory with UTCCP; `run` takes the query scales as `q_scale`) |
-| Selection | K sets the candidate buffers, the certificate bounds and the ladder of the threshold guess | the selection primitives (`*_lib.py`); tuning that depends on K lives with them |
+| Selection | K sets the candidate buffers, the certificate bounds and the ladder of the megakernel's threshold guess | the selection primitives (`*_lib.py`); tuning that depends on K lives with them |
 | KV format and dense attention | MLA latent KV (V3.2), E4M3 rows with a footer scale, window and sink (V4), the CSA2 cache (V4.1) | `kv_format`; one attention module per format (today `megakernel_attention.py` and the attention part of `large_batch.py`) |
 | Schedule | teams, ring depth, batch-size ranges per implementation | the knob tables of the host modules, keyed by `kernel_key`; `megakernel_max_batch` and `large_batch` of the spec |
 

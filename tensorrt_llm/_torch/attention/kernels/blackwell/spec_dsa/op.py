@@ -16,9 +16,11 @@
 
 One decode step of a CSA layer: FP8 paged-MQA indexer logits over the compressed indexer K cache, exact top-K
 selection, mapping of the selected positions to compressed-KV rows, and the sparse MLA attention over those rows, the
-sliding window and the attention sink. One call replaces the four kernels of the unfused chain. The top-K threshold is
-guessed from sampled logits as in the GVR V2 top-K and checked by a count certificate (the selection stays exact: a row
-where the guess does not hold takes an exact fallback).
+sliding window and the attention sink. One call replaces the four kernels of the unfused chain. The megakernel guesses
+the top-K threshold from a sample of the row's own logits (the sampling ladder of the GVR V2 top-K) and checks it with a
+count certificate; a row where the guess does not hold takes an exact fallback. The large-batch kernels take no sample:
+they learn a floor from the candidates already admitted in the row and select the exact top-K from the ones kept. The
+selection is exact in both.
 
 The kernels are specialized for a ``SpecDsaConfig`` (``config.py``). The default and, today, only spec is
 ``DS_V4_FLASH`` (top-512 over a 64 x 128 FP8 indexer, 64 attention heads over 512-byte E4M3 KV rows, a 128-row window).

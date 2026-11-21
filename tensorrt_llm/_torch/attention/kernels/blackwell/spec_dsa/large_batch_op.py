@@ -15,8 +15,9 @@
 """specDSA large-batch kernels, host side: DeepSeek-V4-Flash decode for many rows on B200 (SM100, 148 SMs).
 
 Two launches per call, back to back on the current stream. The first streams each row's FP8 indexer K cache once,
-computes the indexer logits and selects the exact top-512 compressed positions (sampled threshold with a count
-certificate and exact fallbacks), maps them to compressed-KV rows and publishes finished rows to a ready queue. The
+computes the indexer logits and selects the exact top-512 compressed positions in the stream (a floor learned from the
+candidates already admitted in the row segment, the exact top-512 of the ones kept, exact fallbacks when too many are
+kept), maps them to compressed-KV rows and publishes finished rows to a ready queue. The
 second, started with programmatic dependent launch, runs the sparse MLA attention over the selected rows plus the
 128-row sliding window and the attention sink, claiming rows from the queue as they complete.
 
