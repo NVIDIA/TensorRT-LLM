@@ -1630,6 +1630,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     self.conversation_manager.save_drop_plan(request, kv_cache)
                 kv_cache.enable_swa_scratch_reuse = False
 
+    @property
+    @override
+    def chunks_at_snapshot_points(self) -> bool:
+        """With block reuse, a recurrent state is saved only where a chunk ends."""
+        return self.enable_block_reuse and not self.is_draft and any(self._mamba_layer_mask)
+
     @override
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)

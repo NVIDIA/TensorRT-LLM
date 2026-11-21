@@ -18,7 +18,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.py_executor_creator import _branch_snapshot_ctx_chunk_config
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import _snapshot_ctx_chunk_config
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -27,8 +28,17 @@ FCFS = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
 FORCE = ContextChunkingPolicy.FORCE_CHUNK
 
 
-RECORDS = Mock(spec=KVCacheManagerV2, records_branch_snapshots=True)
-NO_RECORDS = Mock(spec=KVCacheManagerV2, records_branch_snapshots=False)
+RECORDS = Mock(
+    spec=KVCacheManagerV2, records_branch_snapshots=True, chunks_at_snapshot_points=False
+)
+NO_RECORDS = Mock(
+    spec=KVCacheManagerV2, records_branch_snapshots=False, chunks_at_snapshot_points=False
+)
+# A recurrent-state manager under block reuse, also one a model declares for a configuration
+# `is_hybrid_linear` does not recognize.
+RECURRENT = Mock(
+    spec=KVCacheManagerV2, records_branch_snapshots=False, chunks_at_snapshot_points=True
+)
 
 
 @pytest.mark.parametrize(
@@ -44,12 +54,15 @@ NO_RECORDS = Mock(spec=KVCacheManagerV2, records_branch_snapshots=False)
         (NO_RECORDS, None, None),
         (Mock(records_branch_snapshots=True), (FCFS, 256), (FCFS, 256)),
         (None, None, None),
+        # Recurrent-state snapshots need forced boundaries as well.
+        (RECURRENT, (FCFS, 256), (FORCE, 256)),
+        (RECURRENT, None, (FORCE, 32)),
     ],
 )
-def test_branch_snapshot_ctx_chunk_config(
+def test_snapshot_ctx_chunk_config(
     manager: object, ctx_chunk_config: tuple | None, expected: tuple | None
 ) -> None:
-    assert _branch_snapshot_ctx_chunk_config(ctx_chunk_config, manager, 32) == expected
+    assert _snapshot_ctx_chunk_config(ctx_chunk_config, manager, 32) == expected
 
 
 @pytest.mark.parametrize(
@@ -64,11 +77,45 @@ def test_branch_snapshot_ctx_chunk_config(
         ((FORCE, 32), FORCE, False),
     ],
 )
-def test_branch_snapshot_ctx_chunk_config_reports_overrides(
+@pytest.mark.parametrize(
+    ("manager", "reason"),
+    [(RECORDS, "enable_branch_snapshot"), (RECURRENT, "block reuse of recurrent state")],
+    ids=["branch_points", "recurrent_state"],
+)
+def test_snapshot_ctx_chunk_config_reports_overrides(
     ctx_chunk_config: tuple | None,
     configured_policy: ContextChunkingPolicy | None,
     warned: bool,
+    manager: object,
+    reason: str,
 ) -> None:
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger") as logger:
-        _branch_snapshot_ctx_chunk_config(ctx_chunk_config, RECORDS, 32, configured_policy)
+        _snapshot_ctx_chunk_config(ctx_chunk_config, manager, 32, configured_policy)
     assert logger.warning_once.called == warned
+    if warned:
+        assert reason in logger.warning_once.call_args.args[0]
+
+
+def test_only_attention_layers_need_no_chunking_at_snapshot_points() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    assert not manager.chunks_at_snapshot_points
+
+
+@pytest.mark.parametrize(
+    ("enable_block_reuse", "is_draft", "mamba_layer_mask", "expected"),
+    [
+        (True, False, [True, False], True),
+        (False, False, [True, False], False),
+        # A draft pool's recurrent layers belong to its target.
+        (True, True, [True, False], False),
+        (True, False, [False, False], False),
+    ],
+)
+def test_a_hybrid_manager_chunks_at_snapshot_points_under_block_reuse(
+    enable_block_reuse: bool, is_draft: bool, mamba_layer_mask: list, expected: bool
+) -> None:
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.enable_block_reuse = enable_block_reuse
+    manager.is_draft = is_draft
+    manager._mamba_layer_mask = mamba_layer_mask
+    assert manager.chunks_at_snapshot_points == expected
