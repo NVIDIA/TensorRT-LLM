@@ -634,6 +634,17 @@ _NVFP4_GEMM_TUNING_OP = "trtllm::nvfp4_gemm::gemm"
 
 
 @contextlib.contextmanager
+def _fixed_nvfp4_gemm_backends() -> Iterator[None]:
+    """Pin NVFP4 GEMMs built in this thread to ``_FIXED_NVFP4_GEMM_BACKENDS``."""
+    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
+
+    extra_attrs = dict(get_model_extra_attrs() or {})
+    extra_attrs["nvfp4_gemm_allowed_backends"] = list(_FIXED_NVFP4_GEMM_BACKENDS)
+    with model_extra_attrs(extra_attrs):
+        yield
+
+
+@contextlib.contextmanager
 def _fixed_nvfp4_quantization_backend(features):
     """Pin NVFP4 golden runs to deterministic TRT-LLM and CUTLASS paths.
 
@@ -648,14 +659,11 @@ def _fixed_nvfp4_quantization_backend(features):
         return
 
     from tensorrt_llm._torch.custom_ops import torch_custom_ops
-    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
     previous_flashinfer_available = torch_custom_ops.IS_FLASHINFER_AVAILABLE
-    extra_attrs = dict(get_model_extra_attrs() or {})
-    extra_attrs["nvfp4_gemm_allowed_backends"] = list(_FIXED_NVFP4_GEMM_BACKENDS)
     try:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = False
-        with model_extra_attrs(extra_attrs):
+        with _fixed_nvfp4_gemm_backends():
             yield
     finally:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = previous_flashinfer_available
@@ -667,7 +675,9 @@ def _run_diffusion_worker_with_fixed_nvfp4_gemm(**worker_kwargs: Any) -> None:
     ``_fixed_nvfp4_quantization_backend`` sets a thread-local in the calling process, so it
     cannot reach a worker that VisualGen spawns. Patch ``executor.run_diffusion_worker`` with
     this function while constructing ``VisualGen``: each spawned worker then builds its
-    pipeline, and every NVFP4 ``Linear`` in it, under the GEMM pin.
+    pipeline, and every NVFP4 ``Linear`` in it, under the GEMM pin. Unlike that helper, it
+    leaves the FP4 activation quantizer autotuned: its TRT-LLM and FlashInfer tactics are
+    bit-identical (``test_fp4_quantize_flashinfer.py``), so only the GEMM backend needs the pin.
 
     Args:
         **worker_kwargs: Keyword arguments for ``executor.run_diffusion_worker``.
@@ -675,7 +685,6 @@ def _run_diffusion_worker_with_fixed_nvfp4_gemm(**worker_kwargs: Any) -> None:
     Raises:
         RuntimeError: If called in the process that patched ``executor.run_diffusion_worker``.
     """
-    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
     from tensorrt_llm._torch.visual_gen import executor
 
     run_worker = executor.run_diffusion_worker
@@ -683,9 +692,7 @@ def _run_diffusion_worker_with_fixed_nvfp4_gemm(**worker_kwargs: Any) -> None:
         raise RuntimeError(
             "The NVFP4 GEMM pin only works as the target of a spawned VisualGen worker."
         )
-    extra_attrs = dict(get_model_extra_attrs() or {})
-    extra_attrs["nvfp4_gemm_allowed_backends"] = list(_FIXED_NVFP4_GEMM_BACKENDS)
-    with model_extra_attrs(extra_attrs):
+    with _fixed_nvfp4_gemm_backends():
         run_worker(**worker_kwargs)
 
 
