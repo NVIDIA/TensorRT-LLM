@@ -39,6 +39,21 @@ async def _iter_sse_data(response_content):
             yield payload
 
 
+def _sse_error_message(data: dict) -> Optional[str]:
+    """Return the message of an SSE error event, or None for any other event.
+
+    A server that fails after it has sent HTTP 200 cannot change the status
+    code, so OpenAI-compatible servers end the stream with an
+    ``{"error": {"message": ...}}`` event instead.
+    """
+    error = data.get("error")
+    if not error:
+        return None
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return str(error)
+
+
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -213,6 +228,9 @@ async def async_request_openai_completions(
                     first_chunk_received = False
                     async for chunk in _iter_sse_data(response.content):
                         data = json.loads(chunk)
+                        if error := _sse_error_message(data):
+                            output.error = error
+                            break
 
                         # NOTE: Some completion API might have a last
                         # usage summary response without a token so we
@@ -243,7 +261,9 @@ async def async_request_openai_completions(
                         elif usage := data.get("usage"):
                             output.output_tokens = usage.get(
                                 "completion_tokens")
-                    if first_chunk_received:
+                    if output.error:
+                        output.success = False
+                    elif first_chunk_received:
                         output.success = True
                     else:
                         output.success = False
@@ -352,6 +372,10 @@ async def async_request_openai_chat_completions(
                     async for chunk in _iter_sse_data(response.content):
                         timestamp = time.perf_counter()
                         data = json.loads(chunk)
+                        if error := _sse_error_message(data):
+                            output.success = False
+                            output.error = error
+                            break
 
                         if choices := data.get("choices"):
                             content = choices[0]["delta"].get("content")
