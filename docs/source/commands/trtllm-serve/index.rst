@@ -9,3 +9,4 @@ trtllm-serve
    render-endpoints
    performance-metrics-collection
    run-benchmark-with-trtllm-serve
+   audio-transcriptions
