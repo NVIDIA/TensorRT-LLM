@@ -498,11 +498,22 @@ def test_describe_lists_first_differences_and_avoids_failure_markers():
 # Chunk checksums: where two tensors' bytes differ
 # --------------------------------------------------------------------------- #
 
+_MASK64 = (1 << 64) - 1
+
+
+def _reference_weight(offset: int) -> int:
+    """The documented checksum weight of a byte offset, in Python integers."""
+    state = ((offset + 1) * 0x9E3779B97F4A7C15) & _MASK64
+    state = ((state ^ (state >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    state = ((state ^ (state >> 27)) * 0x94D049BB133111EB) & _MASK64
+    state ^= state >> 31
+    return (state >> 33) | 1
+
 
 def _reference_chunk_checksums(tensor: torch.Tensor, chunk_bytes: int) -> tuple[str, ...]:
     """The documented checksum formula, evaluated in plain Python."""
     raw = canonical_tensor_bytes(tensor).tolist()
-    weights = weight_manifest_mod._checksum_weights(chunk_bytes).tolist()
+    weights = [_reference_weight(offset) for offset in range(min(chunk_bytes, len(raw)))]
     return tuple(
         f"{sum(byte * weights[offset] for offset, byte in enumerate(raw[start : start + chunk_bytes])):016x}"
         for start in range(0, len(raw), chunk_bytes)
@@ -526,8 +537,26 @@ class _KiBWeightModule(nn.Module):
         self.register_buffer("scale", torch.tensor([0.5], dtype=torch.float32))
 
 
+def _byte_of(tensor: torch.Tensor, byte_index: int) -> int:
+    return int(tensor.detach().reshape(-1).view(torch.uint8)[byte_index])
+
+
 @pytest.mark.cpu_only
-def test_chunk_checksums_follow_the_documented_formula():
+def test_checksum_weights_follow_the_documented_formula() -> None:
+    weights = weight_manifest_mod._checksum_weights(1 << 20)
+
+    assert weights.dtype == torch.int64 and weights.numel() == 1 << 20
+    assert int(weights.min()) >= 1 and int(weights.max()) < 1 << 31
+    for offset in (0, 1, 2, 3, 12345, (1 << 20) - 1):
+        assert int(weights[offset]) == _reference_weight(offset)
+    # Pinned, so a change to the formula cannot go unnoticed.
+    assert weight_manifest_mod.chunk_checksums(torch.arange(4, dtype=torch.uint8), 4) == (
+        "00000001b2d2414e",
+    )
+
+
+@pytest.mark.cpu_only
+def test_chunk_checksums_follow_the_documented_formula() -> None:
     # Non-contiguous: the checksums cover the logical bytes, like the digest.
     tensor = torch.arange(1000, dtype=torch.int16).reshape(10, 100)[:, ::2]
     checksums = weight_manifest_mod.chunk_checksums(tensor, 256)
@@ -539,13 +568,13 @@ def test_chunk_checksums_follow_the_documented_formula():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("chunk_bytes", [0, (1 << 24) + 1])
-def test_chunk_checksums_reject_chunk_sizes_without_exact_sums(chunk_bytes: int):
+def test_chunk_checksums_reject_chunk_sizes_without_exact_sums(chunk_bytes: int) -> None:
     with pytest.raises(ValueError, match="chunk_bytes"):
         weight_manifest_mod.chunk_checksums(torch.ones(4), chunk_bytes)
 
 
 @pytest.mark.cpu_only
-def test_chunk_checksums_tell_apart_buffers_with_equal_position_weighted_sums():
+def test_chunk_checksums_tell_apart_buffers_with_equal_position_weighted_sums() -> None:
     # Weighting bytes by position alone would give both buffers 2 * 1 + 0 * 2 == 0 * 1 + 1 * 2.
     first = _UInt8BufferModule([2, 0])
     second = _UInt8BufferModule([0, 1])
@@ -559,50 +588,67 @@ def test_chunk_checksums_tell_apart_buffers_with_equal_position_weighted_sums():
 
 
 @pytest.mark.cpu_only
-def test_manifest_records_chunk_checksums_and_round_trips_them(tmp_path: Path):
+def test_manifest_records_chunk_checksums_device_and_scheme() -> None:
     manifest = build_weight_manifest(_KiBWeightModule(), chunk_bytes=1024)
     entries = manifest.entries_by_fqn()
 
     assert entries["weight"].chunk_bytes == 1024
     assert len(entries["weight"].chunk_checksums) == 4
     assert len(entries["scale"].chunk_checksums) == 1
+    assert {entry.chunk_device for entry in manifest.entries} == {"cpu"}
+    assert manifest.context["chunk_checksum_scheme"] == weight_manifest_mod.CHUNK_CHECKSUM_SCHEME
     assert manifest.manifest_format_version == WEIGHT_MANIFEST_FORMAT_VERSION
-
-    path = tmp_path / manifest_file_name("final", "baseline", 0)
-    write_weight_manifest(manifest, path)
-    assert load_weight_manifest(path).entries == manifest.entries
 
 
 @pytest.mark.cpu_only
-def test_describe_locates_a_flipped_byte_to_its_chunk():
+def test_describe_names_a_single_changed_byte_and_its_delta() -> None:
     module = _KiBWeightModule()
     before = build_weight_manifest(module, chunk_bytes=1024)
-    _flip_bit(module.weight, byte_index=2048 + 5, bit=3)
+    original = _byte_of(module.weight, 2053)
+    _flip_bit(module.weight, byte_index=2053, bit=3)
     after = build_weight_manifest(module, chunk_bytes=1024)
 
     report = compare_weight_manifests(before, after).describe("baseline", "donor")
 
-    assert "1 of 4 1 KiB chunks differ (bytes 2048-3072)" in report
+    delta = (original ^ 8) - original
+    assert (
+        f"1 of 4 1 KiB chunks differ (bytes 2048-3072); byte 2053 changed by {delta:+d}" in report
+    )
     lowered = report.lower()
     assert not any(marker in lowered for marker in _FAILURE_MARKERS)
 
 
 @pytest.mark.cpu_only
-def test_describe_merges_adjacent_chunks_and_ends_at_the_tensor_size():
+def test_describe_merges_adjacent_chunks_and_ends_at_the_tensor_size() -> None:
     # 1000 float32 elements: 4000 bytes, so the last 1 KiB chunk holds 928 bytes.
     module = _KiBWeightModule(numel=1000)
     before = build_weight_manifest(module, chunk_bytes=1024)
-    for byte_index in (100, 2100, 3990):
+    for byte_index in (100, 2100, 2101, 3990):
         _flip_bit(module.weight, byte_index=byte_index, bit=0)
     after = build_weight_manifest(module, chunk_bytes=1024)
 
     report = compare_weight_manifests(before, after).describe("baseline", "donor")
 
     assert "3 of 4 1 KiB chunks differ (bytes 0-1024, bytes 2048-4000)" in report
+    assert "byte 100 changed by" in report and "byte 3990 changed by" in report
+    assert "more than one byte changed in bytes 2048-3072" in report
 
 
 @pytest.mark.cpu_only
-def test_describe_says_when_the_device_bytes_most_likely_match():
+def test_describe_leaves_size_differences_to_the_metadata_report() -> None:
+    # Zero bytes add nothing to a checksum, so the padded buffer keeps the same chunk checksums.
+    expected = build_weight_manifest(_UInt8BufferModule([1, 2, 3, 4]), chunk_bytes=8)
+    actual = build_weight_manifest(_UInt8BufferModule([1, 2, 3, 4, 0]), chunk_bytes=8)
+
+    report = compare_weight_manifests(expected, actual).describe("baseline", "donor")
+
+    assert "data nbytes: expected=4 actual=5" in report
+    digest_line = next(line for line in report.splitlines() if line.startswith("  data torch."))
+    assert "chunk" not in digest_line
+
+
+@pytest.mark.cpu_only
+def test_describe_cannot_locate_differences_that_every_cpu_chunk_agrees_on() -> None:
     expected = build_weight_manifest(_KiBWeightModule(), chunk_bytes=1024)
     weight = dataclasses.replace(expected.entries_by_fqn()["weight"], sha256="0" * 64)
     actual = dataclasses.replace(
@@ -612,14 +658,43 @@ def test_describe_says_when_the_device_bytes_most_likely_match():
 
     report = compare_weight_manifests(expected, actual).describe("baseline", "donor")
 
-    assert (
-        "every device chunk checksum agrees, so the device bytes most likely match "
-        "and the hashed host copies differ"
-    ) in report
+    assert "every chunk checksum agrees, so the checksums cannot locate the difference" in report
 
 
 @pytest.mark.cpu_only
-def test_version_1_manifests_still_load_but_never_compare(tmp_path: Path):
+def test_describe_skips_chunk_notes_when_the_checksum_schemes_differ() -> None:
+    module = _KiBWeightModule()
+    expected = build_weight_manifest(module, chunk_bytes=1024)
+    _flip_bit(module.weight, byte_index=10, bit=0)
+    actual = build_weight_manifest(module, chunk_bytes=1024)
+    actual = dataclasses.replace(
+        actual, context={**actual.context, "chunk_checksum_scheme": "an-older-scheme"}
+    )
+
+    report = compare_weight_manifests(expected, actual).describe("baseline", "donor")
+
+    assert "chunk checksums do not compare" in report
+    assert "chunks differ" not in report
+
+
+@pytest.mark.cpu_only
+def test_building_fails_when_a_tensor_changes_while_it_is_hashed(monkeypatch) -> None:
+    original = weight_manifest_mod.canonical_tensor_bytes
+
+    def hash_then_write(tensor: torch.Tensor) -> torch.Tensor:
+        raw = original(tensor)
+        if raw.numel() > 100:
+            tensor.detach().reshape(-1).view(torch.uint8)[100] ^= 1
+        return raw
+
+    monkeypatch.setattr(weight_manifest_mod, "canonical_tensor_bytes", hash_then_write)
+
+    with pytest.raises(RuntimeError, match="bytes of weight changed while its entry was built"):
+        build_weight_manifest(_KiBWeightModule(), chunk_bytes=1024)
+
+
+@pytest.mark.cpu_only
+def test_version_1_manifests_still_load_and_compare_with_version_2(tmp_path: Path) -> None:
     current = build_weight_manifest(_TwoTensorModule())
     entries = [
         {key: value for key, value in entry.to_dict().items() if not key.startswith("chunk_")}
@@ -640,21 +715,51 @@ def test_version_1_manifests_still_load_but_never_compare(tmp_path: Path):
 
     assert legacy.manifest_format_version == 1
     assert [entry.chunk_checksums for entry in legacy.entries] == [(), ()]
-    with pytest.raises(ValueError, match="format versions"):
-        compare_weight_manifests(legacy, current)
+    assert compare_weight_manifests(legacy, current).is_empty
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_chunk_checksums_are_equal_on_cuda_and_on_cpu():
+def test_chunk_checksums_are_equal_on_cuda_and_on_cpu() -> None:
     generator = torch.Generator().manual_seed(0)
-    # 41,500 bytes: two full reductions of 16 chunks, one of 8, and a tail.
+    # 41,500 bytes with 1 KiB chunks: several full chunks and a tail.
     tensor = torch.randint(0, 256, (41_500,), dtype=torch.uint8, generator=generator)
     expected = _reference_chunk_checksums(tensor, 1024)
 
     assert weight_manifest_mod.chunk_checksums(tensor, 1024) == expected
     assert weight_manifest_mod.chunk_checksums(tensor.cuda(), 1024) == expected
     module = _KiBWeightModule().cuda()
-    assert build_weight_manifest(module).entries == build_weight_manifest(module.cpu()).entries
+    cuda_entries = build_weight_manifest(module).entries
+    module.cpu()
+    cpu_entries = build_weight_manifest(module).entries
+    assert {entry.chunk_device for entry in cuda_entries} == {"cuda"}
+    assert [dataclasses.replace(entry, chunk_device="") for entry in cuda_entries] == [
+        dataclasses.replace(entry, chunk_device="") for entry in cpu_entries
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_describe_blames_the_hashed_host_copy_when_every_cuda_chunk_agrees(monkeypatch) -> None:
+    module = _KiBWeightModule().cuda()
+    expected = build_weight_manifest(module, chunk_bytes=1024)
+    original = weight_manifest_mod.canonical_tensor_bytes
+
+    def corrupted_host_copy(tensor: torch.Tensor) -> torch.Tensor:
+        raw = original(tensor)
+        if raw.numel() > 100:
+            raw = raw.clone()
+            raw[100] ^= 1
+        return raw
+
+    monkeypatch.setattr(weight_manifest_mod, "canonical_tensor_bytes", corrupted_host_copy)
+    actual = build_weight_manifest(module, chunk_bytes=1024)
+
+    report = compare_weight_manifests(expected, actual).describe("baseline", "donor")
+
+    assert compare_weight_manifests(expected, actual).digest_diffs == ("weight",)
+    assert (
+        "every device chunk checksum agrees, so the device bytes most likely match "
+        "and the hashed host copies differ"
+    ) in report
 
 
 # --------------------------------------------------------------------------- #

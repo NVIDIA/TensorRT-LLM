@@ -35,6 +35,7 @@ image-probe row alike.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -251,32 +252,121 @@ def test_mx_role_manifests_still_reject_a_preloaded_donor(tmp_path: Path) -> Non
         assert_weight_manifests(_case(), manifests, roles=MX_ROLES)
 
 
-def test_final_tier_failure_names_the_role_that_disagrees(tmp_path: Path) -> None:
-    _write_mx_manifests(tmp_path)
-    baseline = _TwoTensorModule()
+class _ExtraBufferModule(_TwoTensorModule):
+    """`_TwoTensorModule` with one more buffer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("extra", torch.ones(2))
+
+
+def _changed(name: str, delta: float = 1.0) -> nn.Module:
+    """A `_TwoTensorModule` whose first element of `name` is raised by `delta`."""
+    module = _TwoTensorModule()
     with torch.no_grad():
-        baseline.weight[1, 2] += 1
-    context = {
-        "family": "final",
-        "role": "baseline",
-        "rank": 0,
-        "checkpoint_format": "HF",
-        "world_size": 1,
+        getattr(module, name).view(-1)[0] += delta
+    return module
+
+
+def _write_role_manifests(manifest_dir: Path, final_modules: dict[str, nn.Module]) -> None:
+    """Write a TP=1 run whose roles' final manifests come from `final_modules`.
+
+    Roles not in `final_modules` use `_TwoTensorModule`, and both transfer
+    manifests do, so the transfer tier passes and the final tier decides.
+    """
+    _write_mx_manifests(manifest_dir)
+    contexts = {
+        "baseline": {"checkpoint_format": "HF", "weights_preloaded": False},
+        "donor": {"checkpoint_format": "MX", "weights_preloaded": False},
+        "receiver": {"checkpoint_format": "MX", "weights_preloaded": True},
     }
-    write_weight_manifest(
-        build_weight_manifest(baseline, context=context),
-        tmp_path / manifest_file_name("final", "baseline", 0),
-    )
+    for role, extra in contexts.items():
+        path = manifest_dir / manifest_file_name("final", role, 0)
+        path.unlink(missing_ok=True)
+        context = {"family": "final", "role": role, "rank": 0, "world_size": 1, **extra}
+        write_weight_manifest(
+            build_weight_manifest(final_modules.get(role, _TwoTensorModule()), context=context),
+            path,
+        )
+
+
+_PARAM_CAVEAT = (
+    " (receiver parameters are the donor's transferred bytes, so a bad donor load reads the same)"
+)
+
+
+@pytest.mark.parametrize(
+    ("final_modules", "expected_note"),
+    [
+        (
+            {"baseline": _changed("weight")},
+            "  weight: baseline differs from donor and receiver" + _PARAM_CAVEAT,
+        ),
+        ({"baseline": _changed("scale")}, "  scale: baseline differs from donor and receiver"),
+        ({"donor": _changed("scale")}, "  scale: donor differs from baseline and receiver"),
+        ({"receiver": _changed("scale")}, "  scale: receiver differs from baseline and donor"),
+        (
+            {"baseline": _changed("weight", 1.0), "donor": _changed("weight", 2.0)},
+            "  weight: no two roles agree",
+        ),
+        (
+            {"baseline": _ExtraBufferModule()},
+            "  extra: baseline differs from donor and receiver",
+        ),
+    ],
+    ids=[
+        "baseline-param",
+        "baseline-buffer",
+        "donor",
+        "receiver",
+        "no-two-agree",
+        "missing-tensor",
+    ],
+)
+def test_final_tier_failure_names_the_role_that_disagrees(
+    tmp_path: Path, final_modules: dict[str, nn.Module], expected_note: str
+) -> None:
+    _write_role_manifests(tmp_path, final_modules)
     manifests = collect_weight_manifests(tmp_path, _case())
 
     with pytest.raises(pytest.fail.Exception) as failure:
         assert_weight_manifests(_case(), manifests)
 
     message = str(failure.value)
-    assert "Weight manifests differ: baseline@final rank0 vs donor@final rank0" in message
-    assert "1 of 1 1 MiB chunks differ (bytes 0-32)" in message
-    summary = message.split("roles that disagree with the others on rank 0:\n")[1]
-    assert summary == "  weight: baseline differs from donor and receiver"
+    reports, note = message.split("\n roles that disagree with the others on rank 0:\n")
+    assert note == expected_note
+    # Every differing pair is reported, not only the first one.
+    differing_pairs = {
+        line.split(": ", 1)[1]
+        for line in reports.splitlines()
+        if line.startswith("Weight manifests differ: ")
+    }
+    assert len(differing_pairs) == (3 if "no two roles agree" in expected_note else 2)
+
+
+def test_final_tier_failure_locates_a_changed_parameter_byte(tmp_path: Path) -> None:
+    baseline = _TwoTensorModule()
+    with torch.no_grad():
+        # Element 6 is 7.0 (0x40E00000) in the baseline and 6.0 (0x40C00000) elsewhere:
+        # its byte 2, byte 26 of the tensor, reads 0xE0 against 0xC0.
+        baseline.weight[1, 2] = 7.0
+    _write_role_manifests(tmp_path, {"baseline": baseline})
+    manifests = collect_weight_manifests(tmp_path, _case())
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        assert_weight_manifests(_case(), manifests)
+
+    assert "1 of 1 1 MiB chunks differ (bytes 0-32); byte 26 changed by -32" in str(failure.value)
+
+
+def test_exempt_tensors_neither_fail_the_final_tier_nor_appear_in_the_note(
+    tmp_path: Path,
+) -> None:
+    _write_role_manifests(tmp_path, {"baseline": _changed("weight")})
+    manifests = collect_weight_manifests(tmp_path, _case())
+    case = dataclasses.replace(_case(), final_manifest_exempt_patterns=("weight",))
+
+    assert_weight_manifests(case, manifests)
 
 
 def test_manifest_roles_must_include_both_mx_roles(tmp_path: Path) -> None:
