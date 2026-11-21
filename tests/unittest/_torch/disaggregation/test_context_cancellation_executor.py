@@ -614,7 +614,7 @@ def test_draining_control_waits_for_retained_transfer(
     executor.control_action_done = Mock()
     executor.hang_detector = SimpleNamespace(pause=nullcontext)
     executor.dwdp_manager = None
-    executor._retire_inflight_batch_for_control = Mock()
+    executor.retire_inflight_batch = Mock()
     executor._pop_sleep_wakeup_abort = Mock(return_value=None)
     synchronize = Mock()
     monkeypatch.setattr("torch.cuda.synchronize", synchronize)
@@ -640,7 +640,7 @@ def test_draining_control_waits_for_retained_transfer(
     assert not executor.control_requests
     executor.control_request_barrier.set.assert_called_once()
     executor.control_action_done.wait.assert_called_once()
-    executor._retire_inflight_batch_for_control.assert_called_once()
+    executor.retire_inflight_batch.assert_called_once()
     synchronize.assert_called_once()
 
 
@@ -739,7 +739,7 @@ def test_control_drain_delivers_accumulated_and_live_aborts_on_every_rank(
     for engine in engines:
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
-        engine._retire_inflight_batch_for_control = Mock()
+        engine.retire_inflight_batch = Mock()
         engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     # Exercise the group control gate with asymmetric local readiness. This is
@@ -784,7 +784,7 @@ def test_adp_drain_delivers_parking_abort_to_the_owning_rank(
         engine.control_requests = [RequestQueueItem(CONTROL_REQUEST_ID, control_id="drain")]
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
-        engine._retire_inflight_batch_for_control = Mock()
+        engine.retire_inflight_batch = Mock()
         engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     monkeypatch.setattr("torch.cuda.synchronize", Mock())

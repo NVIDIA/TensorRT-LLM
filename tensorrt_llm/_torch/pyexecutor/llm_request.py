@@ -15,6 +15,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
@@ -241,6 +242,27 @@ class LogitsStorage:
         except IndexError:
             return None
 
+    @property
+    def num_appends(self) -> int:
+        """Return the number of logits appends stored."""
+        if self.use_chunked_generation_logits:
+            # Each fragment is one append, and a transfer moves its fragments to the next rows.
+            return self._current_position + len(self._device_fragments)
+        return len(self._logits_indices)
+
+    def truncate(self, num_appends: int) -> None:
+        """Drop the logits of every append after the first ``num_appends``."""
+        if not self.use_chunked_generation_logits:
+            del self._logits_indices[num_appends:]
+        elif num_appends >= self._current_position:
+            del self._device_fragments[num_appends - self._current_position:]
+        else:
+            self._device_fragments.clear()
+            self._current_position = num_appends
+            self._logits_indices = [(begin, min(end, num_appends))
+                                    for begin, end in self._logits_indices
+                                    if begin < num_appends]
+
     def _add_fragment(self, logits: torch.Tensor):
         """Add a logits fragment to device storage"""
         self._device_fragments.append(logits.clone())
@@ -328,6 +350,12 @@ class LogProbStorage:
         self.append(log_probs, cum_log_probs)
 
 
+def _output_counts(
+        outputs: Optional[Dict[str, List[torch.Tensor]]]) -> Dict[str, int]:
+    """Return the number of stored tensors of each additional output."""
+    return {name: len(tensors) for name, tensors in (outputs or {}).items()}
+
+
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
 
@@ -357,6 +385,21 @@ class PyResult:
                                                            default_factory=list)
         encoder_output: torch.Tensor | None = None
 
+    @dataclass(frozen=True)
+    class OutputsMark:
+        """Where the stored outputs of a request end before a step.
+
+        A step that a rank failure discards has already stored its logits, its
+        additional outputs and, for a context chunk, its prompt rows.
+        ``rewind_outputs`` drops them, so the recomputed step stores them once.
+        """
+        context_rows_end: int
+        context_logits_appends: int
+        prompt_logprob_appends: int
+        generation_logits_appends: int
+        additional_context_output_appends: Dict[str, int]
+        additional_generation_output_appends: Dict[str, int]
+
     def __init__(self,
                  *,
                  prompt_len: int,
@@ -382,6 +425,10 @@ class PyResult:
         # rows); the worker builds the user-facing values from them.
         self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
         self.context_prompt_last_logprobs: torch.Tensor | None = None
+        # One past the last prompt position whose context row is stored. Only
+        # the rank that calls store_context_logits reads it, so PyResult.Diff
+        # does not sync it to other ranks.
+        self.context_rows_end = 0
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
             use_device_memory=use_device_memory,
@@ -518,6 +565,38 @@ class PyResult:
         """
         self.context_prompt_last_logprobs = logprobs
         self.diff.prompt_last_logprobs = logprobs
+
+    def mark_outputs(self) -> OutputsMark:
+        """Record where the stored outputs end."""
+        return PyResult.OutputsMark(
+            context_rows_end=self.context_rows_end,
+            context_logits_appends=self._context_logits.num_appends
+            if self._context_logits is not None else 0,
+            prompt_logprob_appends=len(self.context_prompt_logprob_rows or ()),
+            generation_logits_appends=self._generation_logits.num_appends
+            if self._generation_logits is not None else 0,
+            additional_context_output_appends=_output_counts(
+                self._additional_context_outputs),
+            additional_generation_output_appends=_output_counts(
+                self._additional_generation_outputs))
+
+    def rewind_outputs(self, mark: OutputsMark) -> None:
+        """Drop the outputs stored after ``mark``, for a step that is discarded."""
+        if self._generation_logits is not None:
+            self._generation_logits.truncate(mark.generation_logits_appends)
+        for name, appends in mark.additional_context_output_appends.items():
+            del self._additional_context_outputs[name][appends:]
+        for name, appends in mark.additional_generation_output_appends.items():
+            del self._additional_generation_outputs[name][appends:]
+        if mark.context_rows_end >= self.context_rows_end:
+            return
+        self.context_rows_end = mark.context_rows_end
+        if self._context_logits is not None:
+            self._context_logits.truncate(mark.context_logits_appends)
+        if self.context_prompt_logprob_rows is not None:
+            del self.context_prompt_logprob_rows[mark.prompt_logprob_appends:]
+        # It is stored with the rows of the last context chunk, all of them past the mark.
+        self.context_prompt_last_logprobs = None
 
     def append_context_logits(self,
                               context_logits: torch.Tensor,
@@ -790,7 +869,7 @@ class LlmResult:
 @dataclass
 class LlmResponse:
     request_id: int
-    error_msg: Optional[str] = None
+    error_msg: Optional[Union[str, RequestError]] = None
     result: Optional[LlmResult] = None
     client_id: Optional[int] = None
 
@@ -929,6 +1008,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # PyExecutor._handle_responses and LlmResult.spec_dec_totals.
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
+        # Set with the first cached_tokens of the request's first prefill;
+        # see reported_cached_tokens.
+        self._reported_cached_tokens: Optional[int] = None
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
@@ -1099,6 +1181,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if not self._cached_tokens_set:
             self._cached_tokens = value
             self._cached_tokens_set = True
+            if self._reported_cached_tokens is None:
+                self._reported_cached_tokens = value
+
+    @property
+    def reported_cached_tokens(self) -> int:
+        """Prompt tokens the request's first prefill found in the KV cache.
+
+        Reported as usage cached_tokens. Unlike cached_tokens, it is kept
+        across a recompute, whose prefill reuses blocks this request computed
+        itself.
+        """
+        return self._reported_cached_tokens or 0
 
     def _initialize_execution_state(self,
                                     *,
@@ -1292,7 +1386,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         )
         if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
             llm_result.remote_tail_start = self.py_csa2_remote_tail_start
-        llm_result.cached_tokens = self.cached_tokens
+        llm_result.cached_tokens = self.reported_cached_tokens
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,

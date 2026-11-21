@@ -598,6 +598,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 top_k,
                 slot_count_per_rank,
                 aux_stream=aux_stream)
+            if not per_layer_dynamic_eplb:
+                self.expert_size_per_partition = self.layer_load_balancer.total_slot_count_per_rank
 
             self.repeat_count = self.layer_load_balancer.get_repeat_count()
 
@@ -619,6 +621,10 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     range(self.num_experts))
                 self.initial_global_assignments = loaded_initial_global_assignments
 
+            if not per_layer_dynamic_eplb:
+                self.initial_global_assignments = self.layer_load_balancer.with_spare_slots(
+                    self.initial_global_assignments)
+                self.num_slots = len(self.initial_global_assignments)
             self.layer_load_balancer.set_initial_weight_assignments(
                 self.initial_global_assignments)
 
@@ -649,10 +655,13 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             # mode. The layer manager separately owns compute slots M.
             self.slot_start = self.ep_rank * self.expert_size_per_partition
             self.slot_end = self.slot_start + self.expert_size_per_partition
+            # The weight loaders fill every local slot but the spare slots.
+            loaded_slot_count = self.expert_size_per_partition
+            if not per_layer_dynamic_eplb:
+                loaded_slot_count = self.layer_load_balancer.active_slot_count_per_rank
             self.initial_local_expert_ids = self.initial_global_assignments[
-                self.slot_start:self.slot_end]
-            assert len(
-                self.initial_local_expert_ids) == self.expert_size_per_partition
+                self.slot_start:self.slot_start + loaded_slot_count]
+            assert len(self.initial_local_expert_ids) == loaded_slot_count
         else:
             # No EPLB: each rank gets a ceil/floor slice of num_experts.
             # Only backends that have validated their dispatch/combine paths

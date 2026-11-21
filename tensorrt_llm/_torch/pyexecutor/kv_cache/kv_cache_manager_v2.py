@@ -17,6 +17,7 @@ import math
 import os
 import sys
 from collections import OrderedDict, defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from functools import cached_property
@@ -26,6 +27,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Literal,
     NamedTuple,
@@ -43,6 +45,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
@@ -801,6 +804,11 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
     most-constrained rank set the value for everyone, mirroring the device
     quota sync. A single-rank job needs no collective and is returned as-is.
 
+    A replacement rank takes the original ranks' quota. Its own quota is a share
+    of the host memory left after the ranks beside it, replacements included,
+    pinned theirs, so only its share of the node's memory and its RLIMIT_MEMLOCK
+    bound it.
+
     Args:
         host_quota: This rank's locally-computed host tier quota in bytes.
         mapping: Parallelism mapping; ``world_size`` selects whether a
@@ -810,8 +818,36 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
         The globally-agreed host tier quota in bytes (the fleet ``MIN``).
     """
     if mapping.world_size > 1:
-        host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+        with Distributed.rank_varying("host cache tier quota"):
+            host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+        record = Distributed.startup_record
+        if record is not None and record.replaying:
+            _check_replacement_host_tier(host_quota, mapping)
     return host_quota
+
+
+def _check_replacement_host_tier(host_quota: int, mapping: Mapping) -> None:
+    """Check that a replacement rank can pin the original ranks' host tier quota.
+
+    The node's available memory is shared with the replacements starting beside
+    it, so the quota must fit this rank's share of it.
+
+    Raises:
+        ReplacementCannotStart: The quota exceeds this rank's RLIMIT_MEMLOCK.
+        RuntimeError: The quota exceeds this rank's share of available host memory.
+    """
+    limits = get_host_memory_limits(mapping)
+    if host_quota > limits.memlock_limit:
+        raise ReplacementCannotStart(
+            f"The original ranks' host cache tier quota of {host_quota} bytes exceeds the "
+            f"RLIMIT_MEMLOCK of {int(limits.memlock_limit)} bytes of this replacement rank"
+        )
+    if host_quota > limits.rank_share:
+        raise RuntimeError(
+            f"The original ranks' host cache tier quota of {host_quota} bytes exceeds this "
+            f"replacement rank's {int(limits.rank_share)}-byte share of available host memory "
+            f"({limits.local_ranks} starting rank(s) on its node)"
+        )
 
 
 class _KVCacheManagerInitStatus(IntEnum):
@@ -2307,6 +2343,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # draft's one-token backoff costs it a whole interval. Takes effect only
     # with TLLM_DRAFT_REUSE_SKIP_BACKOFF=1; see _skips_draft_reuse_backoff.
     _drop_advisory_draft_lookahead = False
+    # Commit ends that update_context_resources records instead of committing; set only inside
+    # deferred_context_commits.
+    _deferred_commit_ends: Optional[Dict[int, int]] = None
     # A subclass whose pools are not all addressed at `tokens_per_block` token
     # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
     #
@@ -3059,6 +3098,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 # against a bogus inflation (nvbugs/6418103).
                 synced_quota = self._gpu_quota_for_max_tokens(max_tokens, max_util_for_resume)
                 quota = min(quota, synced_quota)
+            # Warmup shapes follow the KV cache capacity, so a replacement rank keeps its
+            # predecessor's quota.
+            quota = Distributed.agree_rank_capacity(
+                "kv_cache_device_quota", mapping.rank, quota, lambda: dist.allgather(quota)
+            )
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
@@ -8846,6 +8890,30 @@ class KVCacheManagerV2(BaseResourceManager):
             if any(pool.storage_medium != CacheTier.GPU_MEM for pool in pool_group.pools)
         ]
 
+    @property
+    def gpu_quota(self) -> int:
+        """Return the device bytes of the GPU KV cache pool."""
+        return self.impl.get_quota(GPU_LEVEL)
+
+    def resize_gpu_quota(self, quota: int) -> int:
+        """Resize the GPU KV cache pool to ``quota`` bytes, rounded down to its allocation unit.
+
+        Every KV cache must be suspended, the CUDA graph padding dummies included, and no queued
+        work may use the pool.
+
+        Returns:
+            The quota the pool took.
+
+        Raises:
+            OutOfPagesError: The pages in use do not fit in ``quota`` bytes.
+            RuntimeError: A KV cache is not suspended.
+        """
+        unit = _gpu_alloc_granularity(self.impl.init_config.cache_tiers[GPU_LEVEL].quota)
+        quota = max(0, quota) // unit * unit
+        if quota != self.gpu_quota and not self.impl.resize(GPU_LEVEL, quota):
+            raise OutOfPagesError(f"The GPU KV cache pool cannot be resized to {quota} bytes")
+        return self.gpu_quota
+
     def flush_iteration_events(self):
         event_manager = self.event_manager
         if event_manager is not None:
@@ -9220,6 +9288,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def try_commit_blocks(self, request: LlmRequest) -> None:
+        self._try_commit_blocks(request, request.context_current_position)
+
+    def _try_commit_blocks(self, request: LlmRequest, commit_end: int) -> None:
+        """Commit the request's context KV for reuse up to the context position ``commit_end``."""
         should_block_reuse = (
             self.enable_block_reuse
             and self._can_publish_block_reuse
@@ -9232,7 +9304,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return
 
-        commit_end = request.context_current_position
         if commit_end > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 self._reuse_token_source(request),
@@ -9243,8 +9314,9 @@ class KVCacheManagerV2(BaseResourceManager):
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
+        context_end = request.context_current_position + request.context_remaining_length
         keep_committing = self._can_commit_generation_blocks(request)
-        if request.context_remaining_length == 0 and not keep_committing:
+        if commit_end == context_end and not keep_committing:
             kv_cache.stop_committing()
 
     def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
@@ -10365,7 +10437,11 @@ class KVCacheManagerV2(BaseResourceManager):
         would under-estimate available KV cache for sliding-window attention
         layer. In non-overlap scheduler, you should call it together with
         update_resources().
+
+        Inside :meth:`deferred_context_commits`, each request's commit end is
+        recorded for :meth:`commit_context_blocks` instead of committed here.
         """
+        commit_ends = self._deferred_commit_ends
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
@@ -10401,14 +10477,41 @@ class KVCacheManagerV2(BaseResourceManager):
             if should_resize:
                 self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:
-                self.try_commit_blocks(req)
+                if commit_ends is None:
+                    self.try_commit_blocks(req)
+                else:
+                    commit_ends[req.py_request_id] = req.context_current_position
             if req.context_remaining_length == 0:
-                if self.conversation_manager is not None:
+                if self.conversation_manager is not None and commit_ends is None:
                     self.conversation_manager.save_drop_plan(req, kv_cache)
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
                 kv_cache.enable_swa_scratch_reuse = False
+
+    @contextmanager
+    def deferred_context_commits(self) -> Iterator[Dict[int, int]]:
+        """Defer the reuse commits of :meth:`update_context_resources` in this scope.
+
+        Yields:
+            The commit end of each request by request id, for :meth:`commit_context_blocks`.
+        """
+        self._deferred_commit_ends = commit_ends = {}
+        try:
+            yield commit_ends
+        finally:
+            self._deferred_commit_ends = None
+
+    def commit_context_blocks(
+        self, scheduled_batch: ScheduledRequests, commit_ends: Dict[int, int]
+    ) -> None:
+        """Commit for reuse the context chunks of an accepted step up to ``commit_ends``."""
+        for req in scheduled_batch.context_requests:
+            kv_cache = self.kv_cache_map.get(req.py_request_id)
+            if req.py_request_id in commit_ends and kv_cache is not None and kv_cache.is_active:
+                self._try_commit_blocks(req, commit_ends[req.py_request_id])
+                if self.conversation_manager is not None and req.context_remaining_length == 0:
+                    self.conversation_manager.save_drop_plan(req, kv_cache)
 
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
         """Advance a context cache's history marker, or raise."""

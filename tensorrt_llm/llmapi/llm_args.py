@@ -52,6 +52,7 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
+from .._wide_ep_fault_tolerance import check_llm_args
 
 # yapf: disable
 # isort: off
@@ -7306,6 +7307,42 @@ def _validate_dense_dwdp_launch(args: 'TorchLlmArgs') -> None:
             reject(f"{name}=1", f"{name}={size}")
 
 
+def _validate_wide_ep_fault_tolerance_launch(args: 'TorchLlmArgs') -> None:
+    """The launch rules of Wide-EP fault tolerance (its validator's first part).
+
+    Every MoE layer must run the NVLink one-sided all-to-all of the built-in
+    model, the only MoE communication that can leave out a failed rank. A MoE
+    layer gets it only under attention DP over more than one rank, without MoE
+    TP and with expert parallelism over more than one rank. What these
+    arguments leave open (a MoE parallel split left unset, which a model may
+    resolve itself, and the MoE backend) is checked when the model loads.
+    """
+    unmet = []
+    if not args.enable_attention_dp:
+        unmet.append("attention DP (enable_attention_dp=True)")
+    if args.tensor_parallel_size == 1:
+        unmet.append("more than one attention DP rank (tensor_parallel_size "
+                     "above 1, not 1)")
+    moe_tp_size = args.moe_tensor_parallel_size
+    if moe_tp_size is not None and moe_tp_size > 1:
+        unmet.append(
+            f"no MoE TP (moe_tensor_parallel_size=1, not {moe_tp_size})")
+    if args.moe_expert_parallel_size == 1:
+        unmet.append("expert parallelism over more than one rank "
+                     "(moe_expert_parallel_size above 1, not 1)")
+    if args.dwdp_config is not None and args.dwdp_config.enable_experts:
+        unmet.append("no expert DWDP (dwdp_config.enable_experts=False), "
+                     "which runs the MoE layers without expert parallelism")
+    if args.modeling_v2 == "require":
+        unmet.append("the built-in model (modeling_v2='auto' or 'off', not "
+                     "'require'), because no modeling_v2 target runs its MoE "
+                     "layers with fault tolerance")
+    if unmet:
+        raise ValueError("Wide-EP fault tolerance requires " +
+                         "; ".join(unmet) + "; change the configuration or "
+                         "set enable_wide_ep_fault_tolerance=False")
+
+
 class BaseLlmArgs(StrictBaseModel):
     """Base class for the LLM arguments. It contains all the common arguments."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
@@ -8727,6 +8764,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    enable_wide_ep_fault_tolerance: bool = Field(
+        default=False,
+        description=
+        "Keep a wide expert-parallel deployment serving at reduced capacity "
+        "when one of its ranks fails, until a replacement rejoins. "
+        "Requires attention DP over more than one rank, no MoE TP, the "
+        "built-in MoE layers, EPLB and KV cache manager V2; unsupported "
+        "configurations are rejected at startup with the reason. Turns off "
+        "the sentinel transport and the two-rank pull combine of the NVLink "
+        "one-sided all-to-all.",
+        status="prototype")
+
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
         default=None,
         description="The request reordering policy to use.",
@@ -9892,6 +9941,27 @@ class TorchLlmArgs(BaseLlmArgs):
         self.moe_config.load_balancer = _resolve_load_balancer_config(
             self.moe_config.load_balancer)
         self.moe_config.resolve_load_balancer_compatibility()
+        return self
+
+    # Runs after validate_load_balancer, so a load balancer given as a YAML path
+    # is loaded by then.
+    @model_validator(mode="after")
+    def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
+        """Refuse a fault-tolerant launch that these arguments rule out.
+
+        ``_validate_wide_ep_fault_tolerance_launch`` checks the parallel layout
+        and model of the MoE all-to-all, ``check_llm_args`` the features that
+        failover supports. ``modeling_v2='auto'`` falls back to the built-in
+        model, because no modeling_v2 target supports fault tolerance yet.
+        """
+        if self.enable_wide_ep_fault_tolerance:
+            _validate_wide_ep_fault_tolerance_launch(self)
+            check_llm_args(self)
+            if self.modeling_v2 == "auto":
+                logger.warning(
+                    "modeling_v2: no target supports Wide-EP fault tolerance; "
+                    "using the built-in implementation")
+                self.modeling_v2 = "off"
         return self
 
     @model_validator(mode="after")

@@ -1335,6 +1335,10 @@ class TestWarmupCleanup(unittest.TestCase):
         @contextlib.contextmanager
         def trtllm_autotune(**kwargs: object) -> Iterator[None]:
             self.assertIsNone(kwargs["cache_path"])
+            # Without fault tolerance, priming keeps to the JIT runners and
+            # the pass reports no startup progress.
+            self.assertFalse(kwargs["prime_all_runners"])
+            self.assertIsNone(kwargs["report_progress"])
             calls.append("trtllm_autotune_enter")
             yield
             calls.append("trtllm_autotune_exit")
@@ -1783,6 +1787,8 @@ def test_general_warmup_oom_restores_guided_batch_queue(callback_pending: bool) 
             py_guided_decoding_params=object() if guided else None,
             py_seq_slot=0,
             py_batch_idx=None,
+            prompt_len=1,
+            orig_prompt_len=1,
             is_context_init_state=True,
             is_last_context_chunk=True,
             is_generation_in_progress_state=False,

@@ -221,6 +221,9 @@ class BaseWorker(GenerationExecutor):
         # Model construction may update the maximum sequence length.
         if self.engine.max_seq_len is not None:
             self.max_seq_len = self.engine.max_seq_len
+        if self.engine.rank_failure_recovery is not None:
+            self.engine.rank_failure_recovery.set_outstanding_requests(
+                self.outstanding_requests)
 
         self._lora_manager: Optional[LoraManager] = None
 
@@ -346,6 +349,19 @@ class BaseWorker(GenerationExecutor):
                 )
                 return
             self.engine.cancel_request(request_id)
+
+    def outstanding_requests(self) -> Dict[int, int]:
+        """Map request id to client id for every request without a final response.
+
+        A request has a result until its final response. The submit may store
+        the request id after that response, so the result decides.
+        """
+        return {
+            request_id: client_id
+            for client_id, request_id in dict(
+                self._client_id_to_request_id).items()
+            if client_id in self._results
+        }
 
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()

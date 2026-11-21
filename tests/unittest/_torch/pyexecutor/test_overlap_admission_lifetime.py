@@ -55,6 +55,7 @@ def _admission_executor(
         canceled_req_ids=[],
         request_broadcaster=SimpleNamespace(deliver_prompts=lambda requests: None),
         track_unique_tokens=False,
+        rank_failure_recovery=None,
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
     )
@@ -65,6 +66,7 @@ def _admission_executor(
         "_get_request_admission_capacity",
         "_pop_from_waiting_queue",
         "_cancel_queued_context_requests",
+        "_has_pending_context_retirement",
     ):
         setattr(executor, name, MethodType(getattr(PyExecutor, name), executor))
     return executor
@@ -78,7 +80,9 @@ def _fetch_all_ranks(
     # Produce peer payloads through the real router before simulating transport.
     payloads = []
     for executor, active in zip(executors, residents, strict=True):
-        executor.dist.tp_allgather_int64 = lambda payload: np.asarray([payload], dtype=np.int64)
+        executor.dist.tp_allgather_int64 = lambda payload, active_only: np.asarray(
+            [payload], dtype=np.int64
+        )
         state = executor.adp_router.gather_all_rank_states(active)[0]
         payloads.append(state.serialize())
 
@@ -86,7 +90,7 @@ def _fetch_all_ranks(
     for rank, (executor, queue, active) in enumerate(
         zip(executors, queues, residents, strict=True)
     ):
-        executor.dist.tp_allgather_int64 = lambda payload, rank=rank: np.asarray(
+        executor.dist.tp_allgather_int64 = lambda payload, active_only, rank=rank: np.asarray(
             [
                 payload if peer == rank else peer_payload
                 for peer, peer_payload in enumerate(payloads)

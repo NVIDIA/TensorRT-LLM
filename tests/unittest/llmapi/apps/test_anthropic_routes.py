@@ -506,14 +506,21 @@ def _streaming_chat_server(monkeypatch, generation):
     return server
 
 
-async def _chat_stream(monkeypatch, generation):
-    """The body of a streamed /v1/chat/completions response, and the server."""
+async def _chat_stream(monkeypatch, generation, route="openai_chat"):
+    """The body of a streamed /v1/chat/completions response from ``route``, and the server."""
     server = _streaming_chat_server(monkeypatch, generation)
+    if route == "chat_harmony":
+        server.harmony_adapter = SimpleNamespace(get_stop_tokens=lambda: [0])
+        monkeypatch.setattr(
+            openai_server_module,
+            "tokenize_harmony_chat_request",
+            lambda request, harmony_adapter: [1, 2, 3],
+        )
     request = ChatCompletionRequest(
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True
     )
     raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
-    response = await server.openai_chat(request, raw_request)
+    response = await getattr(server, route)(request, raw_request)
     assert isinstance(response, StreamingResponse), response.body
     return response.body_iterator, server
 
@@ -613,20 +620,46 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
     server_logger.error.assert_not_called()
 
 
-def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
-    """A failure of the generation itself is still logged and raised."""
+@pytest.mark.parametrize("route", ["openai_chat", "chat_harmony"])
+def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, server_logger, route):
+    """A failed generation is logged, and the stream ends with an error event and [DONE].
+
+    A completion stream ends the same way, because HTTP 200 was already sent.
+    """
 
     async def run():
         generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
-        stream, _ = await _chat_stream(monkeypatch, generation)
-        with pytest.raises(RuntimeError, match="engine failed"):
-            async for _ in stream:
-                pass
+        stream, server = await _chat_stream(monkeypatch, generation, route)
+        return [frame async for frame in stream], server
 
-    asyncio.run(run())
+    frames, server = asyncio.run(run())
 
+    assert frames[0] == "data: one\n\n"
+    # OpenAI clients raise on an event whose data carries an "error" object.
+    error = json.loads(frames[1][len("data: ") :])["error"]
+    assert (error["message"], error["type"]) == ("engine failed", "server_error")
+    assert frames[2:] == ["data: [DONE]\n\n"]
+    server._extract_metrics.assert_not_awaited()
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
+
+
+def test_chat_stream_failure_after_done_adds_no_error_event(monkeypatch, server_logger):
+    """A failure while recording the metrics after [DONE] sends no error event after it."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]])
+        stream, server = await _chat_stream(monkeypatch, generation)
+        server._extract_metrics.side_effect = RuntimeError("metrics failed")
+        frames = []
+        with pytest.raises(RuntimeError, match="metrics failed"):
+            async for frame in stream:
+                frames.append(frame)
+        return frames
+
+    frames = asyncio.run(run())
+
+    assert frames == ["data: one\n\n", "data: [DONE]\n\n"]
 
 
 @pytest.fixture

@@ -319,6 +319,7 @@ def test_fill_gate_wiring():
         _executor_loop_cleanup = pe.PyExecutor._executor_loop_cleanup
         _executor_events = None
         _flush_staged_responses = pe.PyExecutor._flush_staged_responses
+        rank_failure_recovery = None
 
         def __init__(self, keepalive):
             self.events = []

@@ -1360,12 +1360,14 @@ class DecoderWarmup:
         # cache already holds every tactic this pass would tune. The token
         # shape comes from this rank's free KV capacity, so the whole forward
         # group must agree before any rank skips the collective-bearing pass.
-        skip_completed_warmup = self._agreement.agree_flag(
+        completed_warmup = (
             self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens
             and not enable_flashinfer_mxfp8_autotuner
             and not enable_native_mxfp8_autotuner
         )
-        if skip_completed_warmup:
+        with Distributed.rank_varying("autotuner warmup skip vote"):
+            skip_completed_warmup = self._agreement.agree_flag(completed_warmup)
+        if skip_completed_warmup and completed_warmup:
             logger.info(
                 "Skipping duplicate autotuner warmup for already completed "
                 f"num_tokens={curr_max_num_tokens}"
@@ -1375,8 +1377,11 @@ class DecoderWarmup:
             clear_memory_buffers()
             torch.cuda.empty_cache()
             return
+        # A replacement rank replays its predecessor's vote, so the group can skip
+        # a pass this process never ran. It then runs the pass alone.
+        tune_alone = skip_completed_warmup
 
-        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
+        AutoTuner.get().setup_distributed_state(self.mapping, None if tune_alone else self.dist)
         logger.info(
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
@@ -1397,6 +1402,7 @@ class DecoderWarmup:
                     warmup_configs.append((max_gen_batch_tokens, num_gen_requests))
                 else:
                     warmup_configs.append((tokens_per_gen_request, 1))
+        agreement = WarmupAgreement(None, self.mapping) if tune_alone else self._agreement
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
@@ -1409,7 +1415,7 @@ class DecoderWarmup:
                     with self._dummy_requests.release_batch_context(
                         warmup_request, resource_manager
                     ) as batch:
-                        if not self._agreement.should_run_warmup_batch(
+                        if not agreement.should_run_warmup_batch(
                             batch,
                             num_tokens,
                             f"autotuner, num_tokens={num_tokens}, "
@@ -1449,17 +1455,30 @@ class DecoderWarmup:
             return ran_forward
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        # A replacement rank launches every cached tactic before it serves.
+        startup_record = Distributed.startup_record
+        replacement = startup_record is not None and startup_record.replacement
+        if tune_alone:
+            Distributed.pause_startup_record()
         ran_native_forward = run_autotuner_pass(
-            autotune(cache_path=cache_path), synchronize_trtllm_cache=True
+            autotune(
+                cache_path=cache_path,
+                prime_all_runners=replacement,
+                report_progress=startup_record.report_progress if replacement else None,
+            ),
+            synchronize_trtllm_cache=True,
         )
+        if tune_alone:
+            Distributed.resume_startup_record()
+            AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         ran_flashinfer_forward = False
         if enable_flashinfer_mxfp8_autotuner:
             ran_flashinfer_forward = run_autotuner_pass(
                 flashinfer_mxfp8_autotune(), synchronize_trtllm_cache=False
             )
         # The model's declared hooks (the all-off default when it declares none): the warmup passes also run on
-        # engines built without the runner's constructor.
-        if runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks:
+        # engines built without the runner's constructor. A replacement's pass ran alone, with no peer to merge with.
+        if runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks and not tune_alone:
             # Rank-local profiling noise must not leave tensor-parallel peers
             # serving different tactics for one shape: keep the fastest everywhere.
             # Collective; before the native MXFP8 cache below registers the tactics.

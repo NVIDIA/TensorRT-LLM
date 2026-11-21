@@ -1393,16 +1393,25 @@ class ModelLoader:
         original_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
 
+        if self.llm_args.enable_wide_ep_fault_tolerance:
+            from .rank_failure_model_load import (check_supported,
+                                                  create_moe_load_balancer)
+            check_supported(self.llm_args, self.mapping)
+        else:
+            create_moe_load_balancer = maybe_create_moe_load_balancer
         # build the model; MoE layers register with the active load balancer
         # while they are built, so only construction needs its block
-        with maybe_create_moe_load_balancer(config,
-                                            self.mapping) as moe_load_balancer:
+        with create_moe_load_balancer(config,
+                                      self.mapping) as moe_load_balancer:
             # Some constructors adjust the config they are built from, so the
             # model's config gets its own name.
             model, model_config, is_meta_init = memory_init.create_model_with_meta_tensors(
                 config)
 
         validate_lm_head_output_dtype(model, self.llm_args.lm_head_output_dtype)
+        if self.llm_args.enable_wide_ep_fault_tolerance:
+            from .rank_failure_model_load import prepare_model
+            prepare_model(model)
 
         # raise error when the built model cannot load the checkpoint as is
         _check_post_init_model_compat(model, load_format, checkpoint_loader)
@@ -1738,6 +1747,8 @@ class ModelLoader:
                 checkpoint_loader),
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
+            enable_wide_ep_fault_tolerance=self.llm_args.
+            enable_wide_ep_fault_tolerance,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
             use_cute_dsl_blockscaling_mm=self.llm_args.
