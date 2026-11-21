@@ -256,8 +256,8 @@ def test_superseded_install_gives_same_results(monkeypatch):
     assert results[1] == results[0]
 
 
-def test_interrupt_without_handler_reruns_round(monkeypatch):
-    """Check that a rank stops and runs the round again when ``on_interrupt`` is unset."""
+def test_stop_before_round_without_install_runs_it(monkeypatch):
+    """Check that a rank that stops before a round and installs nothing runs the round once."""
     exchanges = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
     stops = [True]
     exchanges[0].set_interrupt_handler(lambda: bool(stops) and stops.pop())
@@ -269,6 +269,31 @@ def test_interrupt_without_handler_reruns_round(monkeypatch):
     assert results[0] == [b"r0", b"r1"]
     assert results[1] == results[0]
     assert exchanges[0].stopped_epoch == 1
+
+
+@pytest.mark.timeout(60)
+def test_stop_in_wait_without_install_keeps_round(monkeypatch):
+    """Check that a rank that stops while it waits and installs nothing keeps its sent round.
+
+    Rank 0 stops once while it waits for rank 1, which starts its rounds only after that stop.
+    """
+    exchanges = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
+    stops = [True]
+    exchanges[0].set_interrupt_handler(
+        lambda: bool(exchanges[0].waiting_for & 0b10) and bool(stops) and stops.pop()
+    )
+
+    def two_rounds(exchange):
+        if exchange.rank == 1:
+            deadline_s = time.monotonic() + JOIN_TIMEOUT_S
+            while stops and time.monotonic() < deadline_s:
+                time.sleep(1e-4)
+        return exchange.exchange(b"a%d" % exchange.rank), exchange.exchange(b"b%d" % exchange.rank)
+
+    results = _run_ranks(exchanges, [two_rounds, two_rounds])
+    assert not stops
+    assert results[0] == ([b"a0", b"a1"], [b"b0", b"b1"])
+    assert results[1] == results[0]
 
 
 @pytest.mark.timeout(60)

@@ -139,6 +139,8 @@ class HostExchange:
         self._finished_round: Optional[np.ndarray] = None
         # The epoch to continue from once the round takes _finished_round.
         self._epoch_after_round: Optional[int] = None
+        # The installs so far. A wait runs its round again only after an install.
+        self._installs = 0
         # Cached _ranks_of results, keyed by mask.
         self._ranks_by_mask: dict[int, tuple[np.ndarray, list[int]]] = {}
 
@@ -163,7 +165,8 @@ class HostExchange:
         a wait, after each ``wake()``. When it holds, the exchange sets ``stopped_epoch`` to the
         current or next round's epoch and calls ``on_interrupt``, which runs the change and calls
         ``install()``. The exchange then takes the round that ``install()`` completed from the
-        peers' rows, or runs the round again.
+        peers' rows, or runs the round again. If no ``install()`` ran, a wait goes on waiting for
+        the round it already sent.
         """
         self._interrupted = interrupted
         self._on_interrupt = on_interrupt
@@ -211,6 +214,7 @@ class HostExchange:
         if completed is not None:
             self._finished_round = completed
         self.admit(active_mask, epoch)
+        self._installs += 1
         if self._finished_round is not None:
             # Take the completed round at its own epoch, then continue from the installed epoch.
             self._epoch_after_round, self._epoch = self._epoch, round_epoch
@@ -405,10 +409,12 @@ class HostExchange:
         in_active, in_readers = self._ranks_of(active)[0], self._ranks_of(readers)[0]
         while (rows := self.group.wait(self._epoch, in_active, in_readers, idle)) is None:
             if self._interrupted():
+                installs = self._installs
                 self._stop(self._epoch)
                 if self._finished_round is not None:
                     return self._take_finished_round(active, readers)
-                return None
+                if self._installs != installs:
+                    return None
         return rows
 
 
