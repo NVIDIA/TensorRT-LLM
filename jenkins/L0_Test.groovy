@@ -244,6 +244,7 @@ SLURM_MEMORY_LIMIT = "12Gi"
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
+// Whole-core budget shared by pod CPU limits and CPU-only pytest thread limits.
 TESTER_CPU_ONLY_CORES = "2"
 TESTER_CPU_ONLY_MEMORY = "12Gi"
 
@@ -2094,6 +2095,10 @@ def getPytestBaseCommandLine(
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
+    if (stageName.startsWith("CPU-")) {
+        extraInternalEnv += " OMP_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+        extraInternalEnv += " MKL_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+    }
     // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
