@@ -33,7 +33,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal.runtime import wait_for_slots
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
@@ -230,7 +230,13 @@ class MnnvlHostExchangeGroup:
                 "fabric handles, because fault tolerance remaps MNNVL memory and exchanges host "
                 "values through fabric handles; the fabric handles also need IMEX running and an "
                 "IMEX channel in the container, which this check does not test",
-            )
+            ),
+            (
+                get_sm_version() == 100,
+                "an SM 100 GPU (Blackwell B200/GB200), because the host exchange relies on the "
+                "copy engines writing each aligned 8-byte packet in one transaction, which a tear "
+                "test confirmed on GB200 only",
+            ),
         ]
 
     @classmethod

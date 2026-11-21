@@ -734,6 +734,7 @@ def test_node_ranks_follow_gpus_per_node(rank, local):
         ("cp", "context_parallel_size=1"),
         ("mnnvl", "multi-node NVLink (MNNVL) domain"),
         ("fabric", "an aarch64 host (such as a GB200 node), on which MNNVL memory is shared"),
+        ("sm", "an SM 100 GPU (Blackwell B200/GB200), because the host exchange relies on the"),
         ("mpi", "the MPI orchestrator (TLLM_DISABLE_MPI unset)"),
     ],
 )
@@ -747,6 +748,9 @@ def test_requirements_name_what_is_missing(monkeypatch, lacks, requirement):
         mnnvl_host_exchange.HostExchangeMnnvlMemory,
         "uses_fabric_handles",
         classmethod(lambda cls, dev_id: lacks != "fabric"),
+    )
+    monkeypatch.setattr(
+        mnnvl_host_exchange, "get_sm_version", lambda: 103 if lacks == "sm" else 100
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     mapping = SimpleNamespace(
