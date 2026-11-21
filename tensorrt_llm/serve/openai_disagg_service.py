@@ -66,7 +66,12 @@ from tensorrt_llm.serve.responses_utils import (
     responses_done_generator,
     stream_error_event,
 )
-from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
+from tensorrt_llm.serve.router import (
+    CoordinatorDelegatingRouter,
+    KvCacheAwareRouter,
+    Router,
+    ServerPreparationPending,
+)
 
 # Finish reasons for which a GEN handoff is still pending; any other reason means
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
@@ -413,8 +418,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
-        if not await self.is_ready():
-            raise RuntimeError("Cluster is not ready")
+        await self._require_ready()
         if not isinstance(request.prompt, str):
             # Reject empty prompt lists explicitly so the router does not
             # index prompt[0] on an empty list.
@@ -435,8 +439,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def openai_chat_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
-        if not await self.is_ready():
-            raise RuntimeError("Cluster is not ready")
+        await self._require_ready()
         return await self._send_disagg_request(request, hooks)
 
     async def _next_ctx_server(self) -> str:
@@ -475,8 +478,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def openai_responses(
         self, request: ResponsesRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
-        if not await self.is_ready():
-            raise RuntimeError("Cluster is not ready")
+        await self._require_ready()
 
         # Stored responses are per worker and unreachable through this proxy.
         if request.previous_response_id is not None:
@@ -565,6 +567,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                     hooks.on_ctx_dispatch(request)
                 ctx_req = self._get_ctx_request(request, disagg_request_id)
                 # ctx generator is empty
+                if cancellation is not None and not self._ctx_router.has_prepared_server:
+                    raise ServerPreparationPending("No admitted CTX worker is available")
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
@@ -827,6 +831,12 @@ class OpenAIDisaggregatedService(OpenAIService):
             request.ignore_eos = True
             return True
         return False
+
+    async def _require_ready(self) -> None:
+        if not await self.is_ready():
+            if self.context_cancellation_enabled and not self._ctx_router.has_prepared_server:
+                raise ServerPreparationPending("No admitted CTX worker is available")
+            raise RuntimeError("Cluster is not ready")
 
     async def is_ready(self) -> bool:
         # Per-request readiness gate for the /v1/ handlers (the server's /health

@@ -207,6 +207,10 @@ The sender and receiver retain resources until access is proven safe. An unresol
 
 For the protected native context-first HTTP path, configure the same `internal_request_auth_key` on the coordinator, serving frontends, and CTX workers, and keep their UTC clocks synchronized. Before it accepts a CTX endpoint, each signing process sends an authenticated, read-only probe; this does not reserve a request ID, allocate KV, or dispatch GEN. Each actual reservation is still authenticated and checked against the worker's clock. A frontend signs an expiry 60 seconds ahead; when the worker receives it, that expiry must be in the future and no more than 120 seconds away. This UTC window protects **admission**; it is not the transfer timeout or the physical-quiescence grace period. A cancellation receipt means admission was closed or cancellation was queued, not that the worker has already released KV.
 
+If the coordinator loses access to the worker registry, its protected CTX router stops placing new requests. It resumes placement only after it can read the registry and verify a worker again. Fleet frontends that use local round-robin routing can still select a cached CTX address until their next coordinator refresh; revocation is not instantaneous across the fleet. The receiving worker still checks each reservation. Requests already accepted keep their original owners for cancellation and retirement.
+
+Configure the final worker URL when sending internally signed HTTP requests. The frontend does not follow redirects for these requests, including signed GEN handoffs when lifecycle enforcement is off. An unexpected redirect returns `502` to the client. Unsigned worker requests retain their existing redirect behavior.
+
 #### Basic serving example
 
 The following example illustrates general serving setup, not the ownership-enabled profile above. You could launch two context servers and one generation server as follows:

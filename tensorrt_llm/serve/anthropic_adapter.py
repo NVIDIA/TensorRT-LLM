@@ -31,6 +31,7 @@ import json
 import re
 import traceback
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
@@ -1175,7 +1176,10 @@ STREAM_PING_INTERVAL_S = 10.0
 
 
 async def _with_ticks(
-    source: AsyncIterator[Any], timeout: Callable[[], Optional[float]]
+    source: AsyncIterator[Any],
+    timeout: Callable[[], Optional[float]],
+    *,
+    shield_reader_close: bool = False,
 ) -> AsyncIterator[Any]:
     """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
 
@@ -1229,13 +1233,18 @@ async def _with_ticks(
     finally:
         consumer_stopped = True
         reader.cancel()
-        # Return only once the reader has stopped and closed the source.
-        with anyio.CancelScope(shield=True):
+        # A protected CTX reader owns the cancellation receipt; its caller
+        # must not repeatedly interrupt it while waiting for shutdown.
+        with anyio.CancelScope(shield=True) if shield_reader_close else nullcontext():
             await asyncio.gather(reader, return_exceptions=True)
 
 
 async def reframe_openai_stream(
-    openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: Optional[int] = None
+    openai_sse: AsyncIterator[Union[str, bytes]],
+    model: str,
+    request_id: Optional[int] = None,
+    *,
+    shield_reader_close: bool = False,
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames.
 
@@ -1262,7 +1271,9 @@ async def reframe_openai_stream(
 
     # The ticks wrap the upstream's payloads, not the lines split from them:
     # one hand-off between the reading task and this one per payload.
-    lines = _iter_openai_sse_lines(_with_ticks(openai_sse, until_ping))
+    lines = _iter_openai_sse_lines(
+        _with_ticks(openai_sse, until_ping, shield_reader_close=shield_reader_close)
+    )
     try:
         async for line in lines:
             if line is None:

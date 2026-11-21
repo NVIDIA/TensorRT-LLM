@@ -20,6 +20,7 @@ from starlette.types import Message
 from test_common.serve.app_factory import AggConfig, ServeTestEnv
 
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+from tensorrt_llm.executor.context_cancellation import ContextReservationCapacityError
 from tensorrt_llm.executor.rpc import RPCError, RPCTimeout
 from tensorrt_llm.llmapi.disagg_utils import CtxGenServerConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.serve.anthropic_adapter import _with_ticks
@@ -50,7 +51,7 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.output_length_predictor import OutputLengthPriority
 from tensorrt_llm.serve.responses_utils import ClosingStreamingResponse
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import Router, ServerPreparationPending
 
 pytestmark = pytest.mark.cpu_only
 
@@ -114,6 +115,7 @@ def _service(
     service = OpenAIDisaggregatedService(config, coordinator, Mock())
     service._check_conditional_disagg = AsyncMock(return_value=(None, True))
     service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.has_prepared_server = True
     service._ctx_router.get_next_server.return_value = ("ctx:8000", {})
     service._gen_router.get_next_server.return_value = ("gen:8001", {})
     service._ctx_client = SimpleNamespace(
@@ -123,6 +125,56 @@ def _service(
     )
     service._gen_client = SimpleNamespace(send_request=AsyncMock(return_value=_response("stop")))
     return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method", ["openai_completion", "openai_chat_completion", "openai_responses"]
+)
+@pytest.mark.parametrize(
+    "protected,ctx_servers,status", [(True, [], 503), (True, ["ctx:8000"], 500), (False, [], 500)]
+)
+async def test_unready_cluster_distinguishes_missing_protected_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    protected: bool,
+    ctx_servers: list[str],
+    status: int,
+) -> None:
+    service = _service(monkeypatch, enabled=protected)
+    service._coordinator.is_ready = AsyncMock(return_value=False)
+    service._ctx_router.has_prepared_server = bool(ctx_servers)
+    with pytest.raises(RuntimeError) as failure:
+        await getattr(service, method)(Mock())
+    with pytest.raises(HTTPException) as response:
+        OpenAIDisaggServer._handle_exception(
+            SimpleNamespace(_perf_metrics_collector=Mock()), failure.value
+        )
+    assert response.value.status_code == status
+    service._ctx_client.reserve_context_cancellation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ctx_pool_withdrawn_after_readiness_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(monkeypatch)
+    service._coordinator.is_ready = AsyncMock(return_value=True)
+
+    async def withdraw(*args: object) -> tuple[None, bool]:
+        service._ctx_router.has_prepared_server = False
+        return None, True
+
+    service._check_conditional_disagg.side_effect = withdraw
+    with pytest.raises(ServerPreparationPending) as failure:
+        await service.openai_completion(CompletionRequest(model="model", prompt="hello"))
+    with pytest.raises(HTTPException) as response:
+        OpenAIDisaggServer._handle_exception(
+            SimpleNamespace(_perf_metrics_collector=Mock()), failure.value
+        )
+    assert response.value.status_code == 503
+    service._ctx_client.reserve_context_cancellation.assert_not_awaited()
+    service._gen_client.send_request.assert_not_awaited()
 
 
 def test_cancellation_auth_is_required_and_bound_to_action_and_identity() -> None:
@@ -696,7 +748,7 @@ async def test_anthropic_cancelled_consumer_joins_reader_once(monkeypatch) -> No
             await cancellation.cancel()
 
     async def consumer() -> None:
-        stream = _with_ticks(source(), lambda: None)
+        stream = _with_ticks(source(), lambda: None, shield_reader_close=True)
         assert await stream.__anext__() == "partial"
         with anyio.CancelScope() as scope:
             scope.cancel()
@@ -714,6 +766,42 @@ async def test_anthropic_cancelled_consumer_joins_reader_once(monkeypatch) -> No
         await asyncio.wait_for(consumer_task, 2)
     assert cancellation._token is None
     client.cancel_context_cancellation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_legacy_anthropic_reader_close_remains_cancellable() -> None:
+    """A slow legacy source cannot hold its consumer after cancellation."""
+    closing, release, interrupted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    scope_ready = asyncio.get_running_loop().create_future()
+
+    async def source() -> AsyncGenerator[str, None]:
+        try:
+            yield "partial"
+            await asyncio.Future()
+        finally:
+            closing.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                interrupted.set()
+                raise
+
+    async def consume() -> None:
+        stream = _with_ticks(source(), lambda: None)
+        assert await stream.__anext__() == "partial"
+        with anyio.CancelScope() as scope:
+            scope_ready.set_result(scope)
+            await stream.aclose()
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(closing.wait(), 2)
+        (await scope_ready).cancel()
+        await asyncio.wait_for(asyncio.shield(consumer), 2)
+        assert interrupted.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(consumer, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -819,6 +907,22 @@ async def test_control_rpc_error_is_unavailable_not_a_cancel_receipt(
     with pytest.raises(HTTPException) as failure:
         await method(request, _raw_request(headers))
     assert failure.value.status_code == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_rpc", [False, True], ids=["direct", "rpc"])
+async def test_reservation_capacity_is_temporary(
+    via_rpc: bool, context_worker: OpenAIServer
+) -> None:
+    error = ContextReservationCapacityError("Context cancellation reservations are full")
+    reserve = Mock(side_effect=RPCError("worker rejection", cause=error) if via_rpc else error)
+    context_worker.generator._executor.reserve_context_cancellation = reserve
+    request = ContextCancellationReservationRequest(**context_cancellation_reservation_payload(42))
+    headers = build_context_cancellation_headers("secret", "reserve", request.model_dump())
+    with pytest.raises(HTTPException) as failure:
+        await context_worker.reserve_context_cancellation(request, _raw_request(headers))
+    assert failure.value.status_code == 503
+    reserve.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -974,19 +1078,24 @@ async def test_cancel_callers_wait_for_shared_receipt(cancel_scope: bool) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["reserve", "cancel", "submit"])
+@pytest.mark.parametrize("action", ["reserve", "cancel", "submit", "signed_legacy_gen"])
 @pytest.mark.parametrize("status", [301, 307, 308])
 async def test_signed_context_posts_reject_redirect_without_replay(
     monkeypatch: pytest.MonkeyPatch, action: str, status: int
 ) -> None:
-    """Signed control and submission bodies never follow worker redirects."""
-    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    """A redirect cannot forward a signed control, CTX submission, or legacy GEN handoff."""
+    legacy_gen = action == "signed_legacy_gen"
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "0" if legacy_gen else "1")
+    if legacy_gen:
+        monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", "0")
     monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", Mock())
     received = []
 
     async def redirect(request: web.Request) -> web.Response:
         """Record every request, including any wrongly followed redirect."""
         received.append(request.path)
+        if legacy_gen:
+            assert request.headers.get("x-trtllm-disagg-auth")
         return web.Response(status=status, headers={"Location": "/unexpected-target"})
 
     app = web.Application()
@@ -994,7 +1103,7 @@ async def test_signed_context_posts_reject_redirect_without_replay(
     async with TestServer(app) as http, aiohttp.ClientSession() as session:
         client = OpenAIHttpClient(
             AsyncMock(spec=Router),
-            ServerRole.CONTEXT,
+            ServerRole.GENERATION if legacy_gen else ServerRole.CONTEXT,
             session=session,
             internal_disagg_auth_key="secret",
         )
@@ -1004,6 +1113,17 @@ async def test_signed_context_posts_reject_redirect_without_replay(
                 await client.reserve_context_cancellation(server, 42)
             elif action == "cancel":
                 await client.cancel_context_cancellation(server, "opaque")
+            elif legacy_gen:
+                request = CompletionRequest(
+                    model="model",
+                    prompt=[1, 2],
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="generation_only",
+                        disagg_request_id=42,
+                        ctx_info_endpoint="ctx:8000",
+                    ),
+                )
+                await client.send_request(request, server=server, req_id=42)
             else:
                 request = CompletionRequest(
                     model="model",

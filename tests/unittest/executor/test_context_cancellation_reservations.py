@@ -10,7 +10,10 @@ from unittest.mock import DEFAULT, Mock
 import pytest
 
 from tensorrt_llm.executor import context_cancellation
-from tensorrt_llm.executor.context_cancellation import ContextCancellationReservations
+from tensorrt_llm.executor.context_cancellation import (
+    ContextCancellationReservations,
+    ContextReservationCapacityError,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -221,7 +224,7 @@ def test_full_reservations_reject_new_work_without_evicting_live_tokens(
     monkeypatch.setattr(context_cancellation.time, "monotonic", lambda: now[0])
     owner = ContextCancellationReservations()
     tokens = [_reserve(owner, request_id) for request_id in range(1, 1025)]
-    with pytest.raises(RuntimeError, match="reservations are full"):
+    with pytest.raises(ContextReservationCapacityError, match="reservations are full"):
         _reserve(owner, 1025)
     assert owner.cancel(tokens[0], Mock()) == "not_submitted"
     _reserve(owner, 1025)
@@ -488,7 +491,7 @@ def test_replay_ledger_capacity_is_separate_and_expiry_does_not_reopen_old_nonce
     second = owner.reserve(18, "b" * 32, 1_030_000)
     owner.cancel(second, Mock())
     assert not owner._pending and len(owner._authorizations) == 2
-    with pytest.raises(RuntimeError, match="replay accounting is full"):
+    with pytest.raises(ContextReservationCapacityError, match="replay accounting is full"):
         owner.reserve(19, "c" * 32, 1_060_000)
 
     # The first record reaches its monotonic retention deadline first, even

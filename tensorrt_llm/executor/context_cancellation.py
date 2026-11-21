@@ -57,6 +57,10 @@ class _AcceptedAuthorization(NamedTuple):
     retain_until: float
 
 
+class ContextReservationCapacityError(RuntimeError):
+    """The worker cannot retain another pending reservation or replay record."""
+
+
 class ContextCancellationReservations:
     """Serialize one-shot context admission against cancellation on rank zero."""
 
@@ -88,7 +92,7 @@ class ContextCancellationReservations:
 
         Raises:
             ValueError: The request identity is invalid.
-            RuntimeError: Pending admission or replay-accounting capacity is full.
+            ContextReservationCapacityError: Pending admission or replay accounting is full.
         """
         # The executor treats zero as an unset pairing ID and assigns a local ID.
         if type(request_id) is not int or not 0 < request_id < 2**64:
@@ -138,11 +142,13 @@ class ContextCancellationReservations:
             if authorization_expires_at_ms <= self._pruned_authorization_expiry_ms:
                 raise ValueError("Context reservation authorization is outside its validity window")
             if len(self._pending) + len(self._preparing) >= _PENDING_RESERVATION_LIMIT:
-                raise RuntimeError("Context cancellation reservations are full")
+                raise ContextReservationCapacityError("Context cancellation reservations are full")
             # Keep replay storage bounded independently of the 1,024 pending
             # slots. Never evict a live nonce to admit more work: reject overload.
             if len(self._authorizations) >= _AUTHORIZATION_REPLAY_LIMIT:
-                raise RuntimeError("Context reservation replay accounting is full")
+                raise ContextReservationCapacityError(
+                    "Context reservation replay accounting is full"
+                )
             # This bounds only the time to submit. It is not a transfer or
             # quiescence deadline and never revokes cancellation after admission.
             deadline = now + _RESERVATION_LIFETIME_SECONDS

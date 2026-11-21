@@ -45,6 +45,8 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.executor.context_cancellation import \
+    ContextReservationCapacityError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
@@ -1190,7 +1192,12 @@ class OpenAIServer(_VideoRoutesMixin):
             token = await asyncio.to_thread(reserve, request.disagg_request_id,
                                             request.authorization_id,
                                             request.authorization_expires_at_ms)
+        except ContextReservationCapacityError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except RPCError as error:
+            if isinstance(error.cause, ContextReservationCapacityError):
+                raise HTTPException(status_code=503,
+                                    detail=str(error.cause)) from error
             if isinstance(error.cause, (ValueError, RuntimeError)):
                 raise HTTPException(status_code=409,
                                     detail=str(error.cause)) from error

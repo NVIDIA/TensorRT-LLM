@@ -718,10 +718,12 @@ class OpenAIDisaggServer:
         disagg_request_id = getattr(raw_request.state, "disagg_request_id",
                                     None)
         if isinstance(openai_response, StreamingResponse):
+            protected = isinstance(openai_response, ClosingStreamingResponse)
             adapted = reframe_openai_stream(openai_response.body_iterator,
                                            model=request.model,
-                                           request_id=disagg_request_id)
-            if isinstance(openai_response, ClosingStreamingResponse):
+                                           request_id=disagg_request_id,
+                                           shield_reader_close=protected)
+            if protected:
                 adapted = self._close_adapted_context_stream(
                     openai_response.body_iterator, adapted)
                 await adapted.__anext__()

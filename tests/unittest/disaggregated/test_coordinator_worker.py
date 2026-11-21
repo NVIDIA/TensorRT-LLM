@@ -37,6 +37,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import chain, repeat
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -64,6 +65,10 @@ from tensorrt_llm.serve.cluster_storage import (
     WatchEventType,
 )
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+from tensorrt_llm.serve.disagg_auth import (
+    build_context_cancellation_headers,
+    validate_context_probe,
+)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.disagg_coordinator import (
     COORDINATOR_RESERVATION_TIMEOUT_ENV,
@@ -72,6 +77,7 @@ from tensorrt_llm.serve.disagg_coordinator import (
     coordinator_reservation_timeout,
 )
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -1243,37 +1249,55 @@ async def test_protected_start_retries_transport_then_accepts_capable_context(
     await owner.stop()
 
 
+def _context_probe_server(responses: list[tuple[int, object]], key: str) -> TestServer:
+    """Serve the specified metadata responses to authenticated HTTP probes."""
+
+    async def server_info(request: web.Request) -> web.Response:
+        challenge = validate_context_probe(key, request.headers)
+        status, body = responses.pop(0)
+        headers = (
+            build_context_cancellation_headers(
+                key,
+                "probe-result",
+                {
+                    "challenge": challenge,
+                    "supported": body.get("supports_logical_context_cancellation"),
+                },
+            )
+            if status == 200 and isinstance(body, dict)
+            else None
+        )
+        return web.json_response(body, status=status, headers=headers)
+
+    app = web.Application()
+    app.router.add_get("/server_info", server_info)
+    return TestServer(app)
+
+
 @pytest.mark.asyncio
 async def test_protected_start_retries_non_success_server_info_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A transient HTTP response is not a definitive capability rejection."""
-    config = _context_cancellation_config(monkeypatch, ctx_urls=["ctx:8000"])
-    owner = DisaggCoordinatorService(
-        config, Mock(), health_check_interval_secs=0, server_start_timeout_secs=1
-    )
-    unavailable = Mock()
-    unavailable.raise_for_status.side_effect = aiohttp.ClientResponseError(
-        Mock(real_url="http://ctx:8000/server_info"), (), status=503
-    )
-    unavailable.json = AsyncMock(return_value={"error": "starting"})
-    ready = Mock()
-    ready.json = AsyncMock(return_value={"supports_logical_context_cancellation": True})
-    responses = []
-    for response in (unavailable, ready):
-        manager = AsyncMock()
-        manager.__aenter__.return_value = response
-        responses.append(manager)
-    owner.ctx_router._session = Mock(get=Mock(side_effect=responses), close=AsyncMock())
-    owner.gen_router._fetch_server_info = AsyncMock(return_value={})
-    owner._wait_for_all_servers_ready = AsyncMock()
-    try:
-        await owner.start()
-        assert owner.ctx_router._session.get.call_count == 2
-        unavailable.json.assert_not_awaited()
-        assert owner.ctx_router.prepared_servers == {"ctx:8000"}
-    finally:
-        await owner.stop()
+    responses: list[tuple[int, object]] = [
+        (503, {"error": "starting"}),
+        (200, {"supports_logical_context_cancellation": True}),
+    ]
+    async with _context_probe_server(responses, "secret") as ctx:
+        address = f"{ctx.host}:{ctx.port}"
+        config = _context_cancellation_config(monkeypatch, ctx_urls=[address])
+        owner = DisaggCoordinatorService(
+            config, Mock(), health_check_interval_secs=0, server_start_timeout_secs=5
+        )
+        owner.gen_router._fetch_server_info = AsyncMock(return_value={})
+        owner._wait_for_all_servers_ready = AsyncMock()
+        try:
+            await owner.start()
+            assert not responses
+            assert owner.ctx_router.prepared_servers == {address}
+        finally:
+            await owner.ctx_router.close()
+            await owner.stop()
 
 
 @pytest.mark.asyncio
@@ -1333,29 +1357,145 @@ async def test_protected_metadata_can_recover_after_empty_discovery() -> None:
 
 
 @pytest.mark.asyncio
+async def test_protected_monitor_revalidates_after_registry_outage() -> None:
+    """Revoking placement during an outage must not lose the prior request's finish."""
+    server = "ctx:8000"
+    record = {"url": server, "server_role": "context"}
+    registry = Mock()
+    registry.keys.return_value = ["trtllm/v1"]
+    registry.get.return_value = record
+    router = LoadBalancingRouter(
+        ServerRole.CONTEXT, metadata_server=registry, require_context_cancellation=True
+    )
+    router.check_servers_health = AsyncMock(return_value=[server])
+    verified = {"supports_logical_context_cancellation": True}
+    router._fetch_server_info = AsyncMock(return_value=verified)
+    reprobe, release = asyncio.Event(), asyncio.Event()
+
+    async def verify_again(*args: object) -> dict[str, bool]:
+        reprobe.set()
+        await release.wait()
+        return verified
+
+    async def wait_for_readmission() -> None:
+        while not router.has_prepared_server:
+            await asyncio.sleep(0.01)
+
+    try:
+        await router.refresh_protected_context_servers()
+        old_grant = router.context_admissions()[server]
+        await router.get_next_server_by_key({}, req_id=41)
+        owner = router._server_state[server]
+        assert owner._num_active_requests == 1
+        router._fetch_server_info.side_effect = verify_again
+        # Even an unchanged registration must obtain a fresh grant after an outage.
+        registry.keys.side_effect = chain(
+            [ConnectionError("registry unavailable")], repeat(["trtllm/v1"])
+        )
+        await router.start_server_monitoring(poll_interval=0.01)
+        await asyncio.wait_for(reprobe.wait(), 5)
+        assert not router.has_prepared_server and not router.context_admissions()
+        with pytest.raises(ValueError, match="No .*servers available"):
+            await router.get_next_server_by_key({}, req_id=42)
+        await router.finish_request_by_id(41, success=False)
+        assert owner._num_active_requests == 0
+        release.set()
+        await asyncio.wait_for(wait_for_readmission(), 5)
+        assert router.server_registration_id(server) == "trtllm/v1"
+        assert router.context_admissions()[server] != old_grant
+        assert (await router.get_next_server_by_key({}, req_id=42))[0] == server
+        await router.finish_request_by_id(42)
+    finally:
+        release.set()
+        await router.stop_server_monitoring()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "role,protected",
+    [(ServerRole.CONTEXT, True), (ServerRole.CONTEXT, False), (ServerRole.GENERATION, False)],
+)
+async def test_unhealthy_worker_registry_delete_error(role: ServerRole, protected: bool) -> None:
+    registry = Mock()
+    registry.remove.side_effect = OSError("registry unavailable")
+    router = RoundRobinRouter(
+        role, metadata_server=registry, require_context_cancellation=protected
+    )
+    router._check_server_health = AsyncMock(return_value=False)
+    try:
+        if protected:
+            assert await router.check_servers_health({"trtllm/old": "old"}) == []
+        else:
+            with pytest.raises(OSError, match="registry unavailable"):
+                await router.check_servers_health({"trtllm/old": "old"})
+        registry.remove.assert_called_once_with("trtllm/old")
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_protected_probe_io_failure_isolates_the_worker() -> None:
+    metadata = {"trtllm/good": {"url": "good", "server_role": "context"}}
+    failing = True
+
+    async def prepare(server: str) -> None:
+        if server == "joining" and failing:
+            raise OSError("worker unavailable")
+
+    router = RoundRobinRouter(
+        ServerRole.CONTEXT,
+        metadata_server=metadata,
+        require_context_cancellation=True,
+        server_preparation_func=prepare,
+    )
+    router._check_server_health = AsyncMock(return_value=True)
+    router._fetch_server_info = AsyncMock(
+        return_value={"supports_logical_context_cancellation": True}
+    )
+    try:
+        await router.refresh_protected_context_servers()
+        grant = router.context_admissions()["good"]
+        metadata["trtllm/joining"] = {"url": "joining", "server_role": "context"}
+        await router.refresh_protected_context_servers()
+        assert router.context_admissions() == {"good": grant}
+        failing = False
+        await router.refresh_protected_context_servers()
+        assert router.prepared_servers == {"good", "joining"}
+        assert router.context_admissions()["good"] == grant
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("malformed", [[], None], ids=["array", "null"])
 async def test_protected_metadata_skips_malformed_server_info(malformed: object) -> None:
     """A bad response excludes only its worker; a later valid probe can admit it."""
-    servers = ["ctx-a:8000", "ctx-b:8000"]
-    metadata = {f"trtllm/{server}": {"url": server, "server_role": "context"} for server in servers}
-    router = RoundRobinRouter(
-        ServerRole.CONTEXT, metadata_server=metadata, require_context_cancellation=True
-    )
-    router.check_servers_health = AsyncMock(return_value=servers)
-    valid = {"supports_logical_context_cancellation": True}
-    json_response = AsyncMock(side_effect=[malformed, valid, valid])
-    manager = AsyncMock()
-    manager.__aenter__.return_value = Mock(json=json_response)
-    router._session = Mock(get=Mock(return_value=manager), close=AsyncMock())
-    try:
-        await router.refresh_protected_context_servers()
-        assert router.prepared_servers == {servers[1]}
-        assert router.servers == [servers[1]]
-        await router.refresh_protected_context_servers()
-        assert router.prepared_servers == set(servers)
-        assert set(router.servers) == set(servers)
-    finally:
-        await router.close()
+    valid: tuple[int, object] = (200, {"supports_logical_context_cancellation": True})
+    recovering = [(200, malformed), valid]
+    healthy = [valid]
+    async with (
+        _context_probe_server(recovering, "secret") as a,
+        _context_probe_server(healthy, "secret") as b,
+    ):
+        servers = [f"{ctx.host}:{ctx.port}" for ctx in (a, b)]
+        metadata = {f"trtllm/{s}": {"url": s, "server_role": "context"} for s in servers}
+        router = RoundRobinRouter(
+            ServerRole.CONTEXT,
+            metadata_server=metadata,
+            require_context_cancellation=True,
+            context_auth_key="secret",
+        )
+        router.check_servers_health = AsyncMock(return_value=servers)
+        try:
+            await router.refresh_protected_context_servers()
+            assert router.prepared_servers == {servers[1]}
+            assert router.servers == [servers[1]]
+            await router.refresh_protected_context_servers()
+            assert router.prepared_servers == set(servers)
+            assert set(router.servers) == set(servers)
+            assert not recovering and not healthy
+        finally:
+            await router.close()
 
 
 @pytest.mark.asyncio
@@ -1935,6 +2075,50 @@ async def test_fleet_matching_cancellation_mode_prepares_before_ready(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True], ids=["removed", "same-url"])
+async def test_protected_round_robin_revokes_before_waiting_for_worker(
+    monkeypatch: pytest.MonkeyPatch, replacement: bool
+) -> None:
+    client = CoordinatorClient("http://coordinator", _context_cancellation_config(monkeypatch))
+    router = client.ctx_router
+    verified = {"supports_logical_context_cancellation": True}
+    router._fetch_server_info = AsyncMock(return_value=verified)
+    old = "departed:8000"
+    keep = "healthy:8000"
+    new = old if replacement else "joining:8000"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def snapshot(grants: dict[str, str]) -> dict:
+        return {
+            "server_lists": {"context": list(grants), "generation": []},
+            "context_admissions": grants,
+        }
+
+    async def pending(*args: object) -> dict:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("worker not ready")
+
+    await client._sync_router_server_lists(snapshot({old: "v1", keep: "healthy"}))
+    router._fetch_server_info.side_effect = pending
+    refresh = asyncio.create_task(
+        client._sync_router_server_lists(snapshot({keep: "healthy", new: "v2"}))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert router.servers == [keep]
+        assert router.server_registration_id(keep) == "healthy"
+        release.set()
+        with pytest.raises(ServerPreparationPending, match="Failed to prepare"):
+            await refresh
+        assert router.servers == [keep]
+    finally:
+        release.set()
+        await asyncio.gather(refresh, return_exceptions=True)
+        await client.stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("same_url", [False, True], ids=["new-address", "replacement"])
 async def test_delegated_select_rejects_unverified_grant(
     monkeypatch: pytest.MonkeyPatch, same_url: bool
@@ -2002,9 +2186,57 @@ async def test_delegated_select_rejects_unverified_grant(
                 not owner._reservation_tasks
                 and router._server_state[selected]._num_active_requests == 0
             )
+            # This frontend still has a grant; only the coordinator sees the empty pool.
+            await router.remove_server(selected)
+            with pytest.raises(ServerPreparationPending) as paused:
+                await edge.get_next_server(request, req_id=43)
+            with pytest.raises(HTTPException) as unavailable:
+                OpenAIDisaggServer._handle_exception(
+                    SimpleNamespace(_perf_metrics_collector=Mock()), paused.value
+                )
+            assert unavailable.value.status_code == 503
+            assert not owner._reservation_tasks
         finally:
             await frontend.stop()
             await owner.stop()
+
+
+@pytest.mark.asyncio
+async def test_replaced_delegated_ctx_url_is_not_a_prepared_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _context_cancellation_config(monkeypatch, router="load_balancing")
+    client = CoordinatorClient("http://coordinator", config)
+    edge = client.ctx_router
+    server = "ctx:8000"
+    info = {
+        "is_ready": True,
+        "context_cancellation_enabled": True,
+        "server_lists": {"context": [server], "generation": []},
+        "context_admissions": {server: "old"},
+    }
+    edge._local._fetch_server_info = AsyncMock(
+        return_value={"supports_logical_context_cancellation": True}
+    )
+    try:
+        await client._apply_cluster_info(info)
+        assert edge.has_prepared_server
+        info["context_admissions"] = {server: "replacement"}
+        client.cluster_info = AsyncMock(return_value=info)
+        edge._local._fetch_server_info.side_effect = RuntimeError("probe temporarily unavailable")
+        with pytest.raises(ServerPreparationPending):
+            await client._apply_cluster_info(info)
+        assert edge.servers == [server] and not edge.has_prepared_server
+        service = OpenAIDisaggregatedService(config, client, Mock())
+        with pytest.raises(ServerPreparationPending) as failure:
+            await service.openai_completion(CompletionRequest(model="m", prompt="one"))
+        with pytest.raises(HTTPException) as response:
+            OpenAIDisaggServer._handle_exception(
+                SimpleNamespace(_perf_metrics_collector=Mock()), failure.value
+            )
+        assert response.value.status_code == 503
+    finally:
+        await client.stop()
 
 
 @pytest.mark.asyncio
@@ -2073,6 +2305,46 @@ async def test_rejecting_old_conversation_preserves_replacement_load() -> None:
         await router.finish_request_by_id(42, True)
         assert router._server_content_load == {server: 0}
         assert not router._coord_pending
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace", [False, True], ids=["removed", "replaced"])
+async def test_standalone_conversation_finish_after_removal(replace: bool) -> None:
+    router = ConversationRouter(
+        ServerRole.CONTEXT, require_context_cancellation=True, new_conversation_min_match_blocks=0
+    )
+    router._fetch_server_info = AsyncMock(
+        return_value={"supports_logical_context_cancellation": True}
+    )
+    server = "ctx:8000"
+
+    def request_with_weight(weight: int) -> CompletionRequest:
+        return CompletionRequest(
+            model="m",
+            prompt="x" * (weight * router.CHAR_PER_TOKEN),
+            conversation_params=ConversationParams(conversation_id="session"),
+        )
+
+    old, new = request_with_weight(10), request_with_weight(4)
+    try:
+        assert await router.add_server(server, registration_id="old")
+        await router.get_next_server(old)
+        assert router._server_content_load == {server: 10}
+        if replace:
+            assert await router.add_server(server, registration_id="new")
+            await router.get_next_server(new)
+        else:
+            await router.remove_server(server)
+        expected = {server: 4} if replace else {}
+        assert router._server_content_load == expected
+        await router.finish_request(old, success=False)
+        assert router._server_content_load == expected
+        if replace:
+            await router.finish_request(new)
+            assert router._server_content_load == {server: 0}
+        assert not router._req_content_entry
     finally:
         await router.close()
 

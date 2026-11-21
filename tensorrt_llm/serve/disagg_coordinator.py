@@ -363,6 +363,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
             if previous is not None:
                 previous.expiry.cancel()
                 await router.finish_request_by_id(req_id, False)
+            if (
+                reservation_key[0] == "context"
+                and self._context_cancellation_enabled
+                and not router.has_prepared_server
+            ):
+                raise ServerPreparationPending("No admitted CTX worker is available")
             server, info, request_id = await router.get_next_server_by_key(
                 routing_key, req_id=req_id, exclude_server=exclude_server
             )
@@ -1225,6 +1231,13 @@ class CoordinatorClient(DisaggCoordinator):
                 continue
             desired = set(servers)
             if admissions is not None:
+                # A protected frontend must stop using superseded grants as soon
+                # as it sees the snapshot, even if another worker is slow to prove.
+                for server in list(router.servers):
+                    if server not in desired or (
+                        router.server_registration_id(server) != admissions[server]
+                    ):
+                        await router.remove_server(server)
                 for server in desired:
                     if (
                         server in router.servers

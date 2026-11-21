@@ -22,12 +22,14 @@ from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
+import grpc
 import msgpack
 from blake3 import blake3
 
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.cluster_storage import etcd3
 from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.disagg_auth import (CONTEXT_PROBE_HEADER,
                                             build_context_probe_headers,
@@ -59,6 +61,7 @@ COORDINATOR_FINISH_WORKERS = 16
 COORDINATOR_FINISH_QUEUE_SIZE = 4096
 COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
 _MAX_METADATA_HEALTH_PROBES = 16
+_REGISTRY_IO_ERRORS = (OSError, grpc.RpcError, etcd3.Etcd3Exception)
 # Coalesce completed capability probes without waiting for a cold peer.
 _METADATA_ADMISSION_BATCH_WINDOW_S = 0.05
 # Backoff cap of a pooled /finish, which is retried until delivered (see _finish_async).
@@ -817,7 +820,12 @@ class Router(ABC):
         while True:
             try:
                 if self._require_context_cancellation:
-                    await self.refresh_protected_context_servers()
+                    try:
+                        await self.refresh_protected_context_servers()
+                    except ServerPreparationPending as error:
+                        logger.warning(
+                            f"CTX placement paused until registry recovery: {error}"
+                        )
                     await asyncio.sleep(poll_interval)
                     continue
                 # Get servers from metadata
@@ -882,7 +890,7 @@ class Router(ABC):
         Raises:
             RuntimeError: A worker is incompatible during strict startup validation.
         """
-        server_key_map = await self.fetch_live_servers(matching_role_only=True)
+        server_key_map = await self._read_context_registrations()
         keys_by_server = self._group_registration_keys(server_key_map)
         for server in list(self._servers):
             if (server not in keys_by_server
@@ -894,7 +902,7 @@ class Router(ABC):
                                                        remove_dead=not startup)
         # Recheck the whole fleet once after health I/O.
         current = self._group_registration_keys(
-            await self.fetch_live_servers(matching_role_only=True))
+            await self._read_context_registrations())
         healthy = set(live_servers)
         for server in list(self._servers):
             if (server not in healthy or server not in current
@@ -909,6 +917,23 @@ class Router(ABC):
         }
         await self._admit_metadata_servers(candidates, startup=startup)
 
+    async def _read_context_registrations(self) -> dict[str, str]:
+        """An unreadable registry invalidates all grants, unlike a failed worker probe."""
+        try:
+            return await self.fetch_live_servers(matching_role_only=True)
+        except _REGISTRY_IO_ERRORS as error:
+            # Revoke placement grants together; request records retain their
+            # original owners for finish and worker-side cancellation.
+            async with self._lock:
+                old_servers, self._servers = self._servers, []
+                self._on_servers_updated(old_servers, self._servers)
+                self._server_info.clear()
+                self._prepared_ready_servers.clear()
+                self._server_registration_ids.clear()
+                self._metadata_registration_keys.clear()
+            raise ServerPreparationPending(
+                "Cannot verify CTX registrations") from error
+
     async def _admit_metadata_servers(self, candidates: dict[str,
                                                              frozenset[str]], *,
                                       startup: bool) -> None:
@@ -921,7 +946,7 @@ class Router(ABC):
                     return await self._probe_server_info(server)
             except ContextCancellationCapabilityError:
                 raise
-            except RuntimeError as error:
+            except (RuntimeError, OSError) as error:
                 logger.warning(f"Error preparing server {server}: {error}")
                 return None
 
@@ -939,7 +964,7 @@ class Router(ABC):
                         pending, timeout=_METADATA_ADMISSION_BATCH_WINDOW_S)
                     done.update(more)
                 current = self._group_registration_keys(
-                    await self.fetch_live_servers(matching_role_only=True))
+                    await self._read_context_registrations())
                 for server, keys in list(
                         self._metadata_registration_keys.items()):
                     if keys != current.get(server):
@@ -1127,7 +1152,10 @@ class Router(ABC):
             except Exception as e:
                 logger.error(
                     f"Error removing dead server from metadata service: {e}")
-                raise
+                # Protected placement still requires a fresh authoritative read.
+                if not (self._require_context_cancellation
+                        and isinstance(e, _REGISTRY_IO_ERRORS)):
+                    raise
 
         return live_servers
 
@@ -2292,11 +2320,10 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             s: 0
             for s in (servers or [])
         }
-        # id(request) -> (server, weight, monotonic_timestamp)
-        self._req_content_entry: dict[int, tuple[str, int, float]] = {}
-        # Coordinator-delegated path only: disagg req_id -> server, between
-        # select and finish (id(request) can't cross the HTTP hop).
-        self._coord_pending: dict = {}
+        # Load charges retain the server incarnation that received the work.
+        self._req_content_entry: dict[int, tuple[str, int, ServerState]] = {}
+        # The disagg req_id replaces id(request) across the coordinator HTTP hop.
+        self._coord_pending: dict[int, tuple[str, int, ServerState]] = {}
 
     # ── content-based load tracking ──
 
@@ -2320,14 +2347,15 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._server_content_load[server] = (
             self._server_content_load.get(server, 0) + weight)
         self._req_content_entry[id(request)] = (server, weight,
-                                                time.monotonic())
+                                                self._server_state[server])
 
-    def _remove_content_load(self, server: str, request: OpenAIRequest):
-        entry = self._req_content_entry.pop(id(request), None)
-        if entry is not None:
-            _, weight, _ = entry
+    def _remove_content_load(self, server: str, weight: int,
+                             owner: ServerState):
+        if (server in self._server_content_load
+                and (not self._require_context_cancellation
+                     or self._server_state.get(server) is owner)):
             self._server_content_load[server] = max(
-                self._server_content_load.get(server, 0) - weight, 0)
+                0, self._server_content_load[server] - weight)
 
     def _get_content_load(self, server: str) -> int:
         return self._server_content_load.get(server, 0)
@@ -2812,7 +2840,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         del session, req_id
         async with self._lock:
             server = await self._unregister_request(request)
-            self._remove_content_load(server, request)
+            entry = self._req_content_entry.pop(id(request), None)
+            if entry is not None:
+                self._remove_content_load(*entry)
             self._finish_conversation_tokens(id(request), success)
             loads = {s: self._get_content_load(s) for s in self._servers}
             logger.debug(f"ConversationRouter: FINISH server={server}, "
@@ -2914,14 +2944,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         async with self._lock:
             self._finish_conversation_tokens(("req_id", req_id), success)
             pending = self._coord_pending.pop(req_id, None)
-            if pending is None:
-                return
-            server, load, owner = pending
-            if (server in self._server_content_load
-                    and (not self._require_context_cancellation
-                         or self._server_state.get(server) is owner)):
-                self._server_content_load[server] = max(
-                    0, self._server_content_load[server] - load)
+            if pending is not None:
+                self._remove_content_load(*pending)
 
 
 class _CoordinatorFinishError(RuntimeError):
@@ -3000,6 +3024,14 @@ class CoordinatorDelegatingRouter(Router):
         # servers / prepare_servers / num_prepared_servers / start_server_monitoring
         # / routing_key / ... all delegate to the local router.
         return getattr(self._local, name)
+
+    @property
+    def has_prepared_server(self) -> bool:
+        if self._role == "context" and self._local._require_context_cancellation:
+            # A superseded URL can remain in the mirror while its new grant is probed.
+            return not self._local._server_registration_ids.keys().isdisjoint(
+                self._local.servers)
+        return self._local.has_prepared_server
 
     @property
     def session(self) -> aiohttp.ClientSession:
