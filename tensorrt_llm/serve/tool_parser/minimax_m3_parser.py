@@ -55,8 +55,11 @@ def _coerce_value(value_str: str, param_type: Optional[str]) -> Any:
         return value_str
 
     try:
-        return json.loads(value_str)
-    except (json.JSONDecodeError, ValueError):
+        parsed = json.loads(value_str)
+        # The value is sent inside the arguments object, one level deeper.
+        json.dumps([parsed])
+        return parsed
+    except (json.JSONDecodeError, ValueError, RecursionError):
         pass
 
     if param_type in ("number", "integer"):
