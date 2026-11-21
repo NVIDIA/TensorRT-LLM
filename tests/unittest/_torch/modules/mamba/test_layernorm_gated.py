@@ -313,13 +313,14 @@ class TestRMSNormBasic:
         self, gate_activation: str, with_fp8: bool
     ) -> None:
         """From _MULTIROW_GROUPS_MIN_ROWS rows a program runs _MULTIROW_GROUPS
-        tiles; every output bit must equal the one-tile-per-program launch,
+        4-row tiles; every output bit must equal the one-tile-per-program launch,
         including a partial last group."""
         from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
 
         device = "cuda"
         dtype = torch.bfloat16
-        heads, N = 24, 128
+        heads, N = 24, 256
+        assert layernorm_gated._multirow_rows(N, dtype.itemsize) == layernorm_gated._MULTIROW_ROWS
         rows_per_program = layernorm_gated._MULTIROW_ROWS * layernorm_gated._MULTIROW_GROUPS
         num_tokens = (
             triton.cdiv(layernorm_gated._MULTIROW_GROUPS_MIN_ROWS, heads * rows_per_program)
@@ -366,6 +367,134 @@ class TestRMSNormBasic:
         )
 
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    @pytest.mark.parametrize(
+        "N,dtype,expected_rows",
+        [
+            (128, torch.bfloat16, 8),
+            (128, torch.float16, 8),
+            (64, torch.bfloat16, 16),
+            (256, torch.bfloat16, 4),
+            (128, torch.float32, 4),
+            (64, torch.float32, 8),
+        ],
+    )
+    def test_multirow_rows_per_tile(self, N: int, dtype: torch.dtype, expected_rows: int) -> None:
+        """Tiles are tall enough for whole 16-byte loads of x and z, and at least 4 rows."""
+        assert layernorm_gated._multirow_rows(N, dtype.itemsize) == expected_rows
+
+    @pytest.mark.parametrize(
+        "N,dtype",
+        [
+            (64, torch.bfloat16),
+            (128, torch.bfloat16),
+            (128, torch.float16),
+            (128, torch.float32),
+            (256, torch.bfloat16),
+        ],
+    )
+    def test_row_output_does_not_depend_on_launch_size(self, N: int, dtype: torch.dtype) -> None:
+        """A row gets the same output bits launched alone or with enough other rows
+        to pass the grouping threshold, on both entry points."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        heads = 16
+        num_tokens = layernorm_gated._MULTIROW_GROUPS_MIN_ROWS // heads + 5
+        torch.manual_seed(7)
+        x = torch.randn(num_tokens * heads, N, device=device, dtype=dtype)
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+        wide = torch.randn(num_tokens, heads * N + 64, device=device, dtype=dtype)
+        z = wide[:, 64:].view(num_tokens, heads, N)
+
+        large = rms_norm_gated_token_major(x, z, weight, 1e-6)
+        for tokens in (1, 3):
+            small = rms_norm_gated_token_major(x[: tokens * heads], z[:tokens], weight, 1e-6)
+            assert torch.equal(small, large[: tokens * heads])
+        z_rows = z.reshape(-1, N)
+        dense, _, _ = layernorm_gated._layer_norm_fwd(
+            x, weight, None, 1e-6, z=z_rows.contiguous(), is_rms_norm=True
+        )
+        assert torch.equal(dense, large)
+        expected = reference_rmsnorm_gated(x.float(), weight.float(), z_rows.float(), eps=1e-6)
+        tol = 1e-5 if dtype == torch.float32 else 1e-2
+        torch.testing.assert_close(large, expected.to(dtype), rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("N,heads,num_tokens", [(64, 3, 5), (128, 3, 3)])
+    def test_token_major_partial_tile_matches_reference(
+        self, N: int, heads: int, num_tokens: int
+    ) -> None:
+        """A token-major launch whose row count is not a multiple of the tile height
+        computes every row, reading z through its token stride."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        num_rows = num_tokens * heads
+        assert num_rows % layernorm_gated._multirow_rows(N, dtype.itemsize) != 0
+        torch.manual_seed(11)
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+        wide = torch.randn(num_tokens, heads * N + 64, device=device, dtype=dtype)
+        z = wide[:, 64:].view(num_tokens, heads, N)
+
+        actual = rms_norm_gated_token_major(x, z, weight, 1e-6)
+        expected = reference_rmsnorm_gated(
+            x.float(), weight.float(), z.reshape(-1, N).float(), eps=1e-6
+        )
+        torch.testing.assert_close(actual, expected.to(dtype), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("num_tokens", [256, 257])
+    @pytest.mark.parametrize("N", [64, 128, 256])
+    def test_strided_rows_match_contiguous(self, N: int, num_tokens: int) -> None:
+        """x and output rows with padded strides, with and without a partial last tile,
+        give the contiguous launch's bits on both entry points and leave the padding
+        untouched."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        heads, pad = 3, 32
+        num_rows = num_tokens * heads
+        tile = layernorm_gated._multirow_rows(N, dtype.itemsize)
+        torch.manual_seed(13)
+        x = torch.randn(num_rows, N + pad, device=device, dtype=dtype)[:, pad:]
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+        wide = torch.randn(num_tokens, heads * N + pad, device=device, dtype=dtype)
+        z = wide[:, pad:].view(num_tokens, heads, N)
+        z_rows = z.reshape(-1, N)
+        expected, _, _ = layernorm_gated._layer_norm_fwd(
+            x.contiguous(), weight, None, 1e-6, z=z_rows, is_rms_norm=True
+        )
+
+        guarded = torch.full((num_rows + tile, N + pad), 7.0, device=device, dtype=dtype)
+        layernorm_gated._layer_norm_fwd(
+            x, weight, None, 1e-6, z=z_rows, out=guarded[:num_rows, :N], is_rms_norm=True
+        )
+        assert torch.equal(guarded[:num_rows, :N], expected)
+        guarded[:num_rows, :N] = 7.0
+        assert torch.all(guarded == 7.0)
+        assert torch.equal(rms_norm_gated_token_major(x, z, weight, 1e-6), expected)
+
+    @pytest.mark.parametrize("N,extra_rows", [(128, 3), (128, 4), (64, 8)])
+    def test_dense_launch_writes_no_row_past_the_end(self, N: int, extra_rows: int) -> None:
+        """Row counts that are not a multiple of the tile height must not write past the output."""
+        device = "cuda"
+        dtype = torch.bfloat16
+        tile = layernorm_gated._multirow_rows(N, dtype.itemsize)
+        num_rows = 1024 * tile + extra_rows
+        torch.manual_seed(5)
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        z = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+        guarded = torch.full((num_rows + tile, N), 7.0, device=device, dtype=dtype)
+
+        layernorm_gated._layer_norm_fwd(
+            x, weight, None, 1e-6, z=z, out=guarded[:num_rows], is_rms_norm=True
+        )
+        assert torch.all(guarded[num_rows:] == 7.0)
+        expected = reference_rmsnorm_gated(x.float(), weight.float(), z.float(), eps=1e-6)
+        torch.testing.assert_close(guarded[:num_rows], expected.to(dtype), rtol=1e-2, atol=1e-2)
 
 
 @skip_no_cuda
