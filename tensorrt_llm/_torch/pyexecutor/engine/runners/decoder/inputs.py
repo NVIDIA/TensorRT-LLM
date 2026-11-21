@@ -2962,11 +2962,10 @@ class DecoderInputPreparer:
                     and breakable_runner.has_graph(virtual_num_tokens)
                 )
             # Bucket selection is collective; combine eligibility and capture
-            # availability in one vote before keeping any padding.
+            # availability in one vote of the active ranks before keeping any padding.
             if self._config.enable_attention_dp:
-                graph_available = bool(
-                    self.dist.tp_allgather_int64([int(graph_available)])[:, 0].all()
-                )
+                votes = self.dist.tp_allgather_int64([int(graph_available)], active_only=True)
+                graph_available = bool(votes[:, 0].all())
             if not graph_available:
                 set_per_request_prefill_cuda_graph_flag(False)
                 attn_metadata.padded_num_tokens = None

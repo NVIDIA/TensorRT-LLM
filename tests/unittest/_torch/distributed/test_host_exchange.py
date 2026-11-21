@@ -270,8 +270,8 @@ def test_superseded_install_gives_same_results(monkeypatch):
     assert results[1] == results[0]
 
 
-def test_interrupt_without_handler_reruns_round(monkeypatch):
-    """Check that a rank stops and runs the round again when ``on_interrupt`` is unset."""
+def test_stop_before_round_without_install_runs_it(monkeypatch):
+    """Check that a rank that stops before a round and installs nothing runs the round once."""
     exchanges = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
     stops = [True]
     exchanges[0].set_interrupt_handler(lambda: bool(stops) and stops.pop())
@@ -283,6 +283,31 @@ def test_interrupt_without_handler_reruns_round(monkeypatch):
     assert results[0] == [b"r0", b"r1"]
     assert results[1] == results[0]
     assert exchanges[0].stopped_epoch == 1
+
+
+@pytest.mark.timeout(60)
+def test_stop_in_wait_without_install_keeps_round(monkeypatch):
+    """Check that a rank that stops while it waits and installs nothing keeps its sent round.
+
+    Rank 0 stops once while it waits for rank 1, which starts its rounds only after that stop.
+    """
+    exchanges = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
+    stops = [True]
+    exchanges[0].set_interrupt_handler(
+        lambda: bool(exchanges[0].waiting_for & 0b10) and bool(stops) and stops.pop()
+    )
+
+    def two_rounds(exchange):
+        if exchange.rank == 1:
+            deadline_s = time.monotonic() + JOIN_TIMEOUT_S
+            while stops and time.monotonic() < deadline_s:
+                time.sleep(1e-4)
+        return exchange.exchange(b"a%d" % exchange.rank), exchange.exchange(b"b%d" % exchange.rank)
+
+    results = _run_ranks(exchanges, [two_rounds, two_rounds])
+    assert not stops
+    assert results[0] == ([b"a0", b"a1"], [b"b0", b"b1"])
+    assert results[1] == results[0]
 
 
 @pytest.mark.timeout(60)
@@ -497,6 +522,36 @@ def test_lagging_rank_takes_completed_round():
     assert exchange.epoch == 3
 
 
+@pytest.mark.timeout(60)
+def test_completed_round_counts_header_of_missing_payload(monkeypatch):
+    """Check that a rank runs as many rounds as its peers after completing a round from their rows.
+
+    In a gather to rank 0, rank 2's payload takes two rounds. Rank 2 failed after its header
+    reached rank 1 but before its payload reached rank 0. Rank 1 finished round 1 from the
+    headers and stopped in round 2, so rank 0 must run round 2 as well.
+    """
+    exchange = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)[0]
+    group, rows = exchange.group, exchange.group.rows
+
+    def write(row, epoch, sender, packets):
+        slot = row * rows.stride + (epoch & 1) * group._slot_set_bytes + sender * group._slot_bytes
+        rows._memory[slot : slot + packets.nbytes] = packets.view(np.uint8)
+
+    write(0, 1, 1, _slot(1, b"p1"))
+    write(1, 1, 2, _slot(1, b"", length=2 * _SLOT_BYTES)[:1])
+
+    def change():
+        exchange.set_interrupt_handler(lambda: False)
+        exchange.install(None, 0b011, 3)
+        # Rank 1's slot of round 2, which carries no payload, sent over the new rows.
+        write(0, 3, 1, _slot(3, b""))
+
+    exchange.set_interrupt_handler(lambda: bool(exchange.waiting_for & 0b100), change)
+    results = _run_ranks([exchange], [lambda e: e.exchange(b"x0", recipients=(0,))])
+    assert results[0] == [b"x0", b"p1", None]
+    assert exchange.epoch == 3
+
+
 def test_retried_install_keeps_completed_round(monkeypatch):
     """Check that a retried install takes the round that a failed install completed.
 
@@ -568,6 +623,66 @@ def test_long_payloads_reach_only_recipients(monkeypatch, seed):
         assert not rows[others, :, r, header_poll:].any()
 
 
+class _ZeroBytes:
+    """``size`` zero bytes, made only for the slices taken."""
+
+    def __init__(self, size):
+        self._size = size
+
+    def __len__(self):
+        return self._size
+
+    def __getitem__(self, part):
+        return bytes(len(range(*part.indices(self._size))))
+
+
+def test_payload_longer_than_header_length(monkeypatch):
+    """Check that a payload of 4 GiB or more sends its rounds, whose headers hold 32 bits.
+
+    The test stops the exchange at its third round, so the payload's bytes are never made.
+    """
+    exchange = _host_exchange_group(monkeypatch, 1, _SLOT_BYTES)[0]
+    start_round, lengths = exchange.group.start_round, []
+
+    def start_three_rounds(epoch, words, length, recipients):
+        start_round(epoch, words, length, recipients)
+        lengths.append(length)
+        if len(lengths) == 3:
+            raise _Replaced
+
+    exchange.group.start_round = start_three_rounds
+    with pytest.raises(_Replaced):
+        exchange.exchange(_ZeroBytes(1 << 32))
+    assert lengths == [0xFFFFFFFF, (1 << 32) - _SLOT_BYTES, (1 << 32) - 2 * _SLOT_BYTES]
+
+
+@pytest.mark.timeout(60)
+def test_header_with_more_than_a_slot_left_runs_another_round(monkeypatch):
+    """Check that a rank runs another round while a peer's header says more than a slot is left.
+
+    Rank 1 sends three slots with its headers capped at two slots, as a payload of 4 GiB or more
+    caps them at 32 bits, so its first header says less than it has left.
+    """
+    exchange = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)[0]
+    group, rows = exchange.group, exchange.group.rows
+    start_round = group.start_round
+    payload = b"a" * _SLOT_BYTES + b"b" * _SLOT_BYTES + b"c" * _SLOT_BYTES
+    headers = iter([2 * _SLOT_BYTES, 2 * _SLOT_BYTES, _SLOT_BYTES])
+
+    def start_with_rank_1(epoch, words, length, recipients):
+        start_round(epoch, words, length, recipients)
+        # Rank 1's slot of this round, written into rank 0's row.
+        start = (epoch - 1) * _SLOT_BYTES
+        packets = _slot(epoch, payload[start : start + _SLOT_BYTES], length=next(headers))
+        slot = (epoch & 1) * group._slot_set_bytes + group._slot_bytes
+        rows._memory[slot : slot + packets.nbytes] = packets.view(np.uint8)
+
+    group.start_round = start_with_rank_1
+    results = _run_ranks([exchange], [lambda e: e.exchange(b"x0")])
+    assert results[0] == [b"x0", payload]
+    assert exchange.epoch == 3
+
+
 def _row_chunk_by_slicing(rows, size, k):
     """Return round ``k`` of ``size``-byte rows by slicing the packets' lower halves in numpy."""
     words = rows.shape[1] - 1
@@ -588,8 +703,8 @@ def test_unpack_payloads_into_matches_slicing():
         size = int(rng.integers(1, 12 * words))
         k = int(rng.integers(-(-size // (4 * words))))
         ranks = sorted(rng.choice(nranks, rng.integers(1, nranks + 1), replace=False).tolist())
-        # Round 0 carries the whole row size in the header, later rounds their chunk size.
-        length = size if k == 0 else min(4 * words, size - 4 * words * k)
+        # Each round's header carries the bytes left from that round on.
+        length = size - 4 * words * k
         lengths = np.full(nranks, length, dtype=np.uint32)
         out = np.zeros((nranks, size), dtype=np.uint8)
         host_exchange.unpack_payloads_into(rows, lengths, ranks, out, 4 * words * k)
@@ -633,6 +748,7 @@ def test_node_ranks_follow_gpus_per_node(rank, local):
         ("cp", "context_parallel_size=1"),
         ("mnnvl", "multi-node NVLink (MNNVL) domain"),
         ("fabric", "an aarch64 host (such as a GB200 node), on which MNNVL memory is shared"),
+        ("sm", "an SM 100 GPU (Blackwell B200/GB200), because the host exchange relies on the"),
         ("mpi", "the MPI orchestrator (TLLM_DISABLE_MPI unset)"),
     ],
 )
@@ -646,6 +762,9 @@ def test_requirements_name_what_is_missing(monkeypatch, lacks, requirement):
         mnnvl_host_exchange.HostExchangeMnnvlMemory,
         "uses_fabric_handles",
         classmethod(lambda cls, dev_id: lacks != "fabric"),
+    )
+    monkeypatch.setattr(
+        mnnvl_host_exchange, "get_sm_version", lambda: 103 if lacks == "sm" else 100
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     mapping = SimpleNamespace(
