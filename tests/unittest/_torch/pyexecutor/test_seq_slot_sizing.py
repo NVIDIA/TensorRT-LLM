@@ -825,6 +825,34 @@ def test_sampler_args_require_the_resolved_pool():
     assert "max_batch_size" not in params
 
 
+@pytest.mark.parametrize("pp_size, share_beam_state", [(1, False), (2, True)])
+def test_instantiate_sampler_shares_beam_state_for_pp(pp_size: int, share_beam_state: bool) -> None:
+    engine = SimpleNamespace(
+        max_seq_len=16,
+        spec_config=None,
+        model=SimpleNamespace(model_config=SimpleNamespace(is_generation=True)),
+    )
+    llm_args = SimpleNamespace(
+        sampler_force_async_worker=False,
+        disable_overlap_scheduler=False,
+        enable_speculative_beam_history_d2h=False,
+    )
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    with patch.object(util_module.TorchSampler, "__init__", return_value=None) as initialize:
+        util_module.instantiate_sampler(
+            engine,
+            llm_args,
+            mapping,
+            max_batch_size=1,
+            max_beam_width=2,
+            mm_encoder_only=False,
+            speculative_config=None,
+            max_num_sequences=pp_size,
+        )
+    sampler_args = initialize.call_args.args[0]
+    assert sampler_args.share_beam_search_state is share_beam_state
+
+
 @pytest.mark.parametrize("slot_factor", [1, 2])
 def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
     max_batch_size = 8
@@ -837,6 +865,7 @@ def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
         enable_async_worker=False,
         enable_speculative_beam_history_d2h=False,
         max_num_sequences=max_num_sequences,
+        share_beam_search_state=False,
     )
     assert args.max_num_sequences == max_num_sequences
 
