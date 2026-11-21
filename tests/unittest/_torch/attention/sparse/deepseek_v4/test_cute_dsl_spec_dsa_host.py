@@ -471,7 +471,7 @@ def test_fp8_knob_tables_are_the_pr_head_tables():
 
 
 def test_large_batch_knob_tables():
-    """FP8: the one knob set, no variants, no tail knobs. FP4: its knobs, a variant from 60 rows, exit_early."""
+    """FP8: one knob set, no variants, no tail knobs. FP4: its knobs, the variants (60 / 192 / 768 rows), exit_early."""
     assert op._KNOBS[FLASH.kernel_key] == op._KERNEL_CONFIG
     assert FLASH.kernel_key not in op._VARIANTS and FLASH.kernel_key not in op._TAIL_KNOBS
     assert FLASH.kernel_key not in op._SEG_UNITS
@@ -480,7 +480,20 @@ def test_large_batch_knob_tables():
     assert all(fp4[k] for k in ("fast_verdict", "sel_fast", "cmp_fast", "sel_hand2"))
     # the knobs the FP8 set does not have are exactly the FP4 additions
     added = {k for k in fp4 if k not in op._KERNEL_CONFIG}
-    assert added == {"merge1", "fast_verdict", "sel_fast", "cmp_fast", "sel_hand2"}
+    assert added == {
+        "merge1",
+        "fast_verdict",
+        "sel_fast",
+        "cmp_fast",
+        "sel_hand2",
+        "lim_loop",
+        "lim_loop2",
+        "nolock",
+        "floor_mask",
+    }
+    # the loop-control knobs, the UMMA lockstep and the floor interval are off in the base table (the shipped
+    # behaviour below the first variant) and on only in the variants
+    assert not any(fp4[k] for k in ("lim_loop", "lim_loop2", "nolock")) and fp4["floor_mask"] == 6
     variants = op._VARIANTS[FLASH_FP4.kernel_key]
     firsts = [first for first, _ in variants]
     assert firsts == sorted(set(firsts)) and firsts[0] > FLASH_FP4.megakernel_max_batch
@@ -491,6 +504,47 @@ def test_large_batch_knob_tables():
             "a variant that changes nothing is a second compile for nothing"
         )
     assert op._TAIL_KNOBS[FLASH_FP4.kernel_key] == {"exit_early": True}
+
+
+def _three_term_loop(start, num_kv, q_is_end, end_kv_idx):
+    """The tile indices of a segment under the shipped loop condition (a do-while that steps by two)."""
+    out, kv = [], start
+    while True:
+        out.append(kv)
+        kv += 2
+        if not ((kv < num_kv) and (not q_is_end or kv != end_kv_idx)):
+            return out
+
+
+def _limit_loop(start, num_kv, q_is_end, end_kv_idx):
+    """The same segment under ``lim_loop`` / ``lim_loop2``: one compare against ``_kv_limit`` computed at the start."""
+    lim = (num_kv + 1) & -2
+    if q_is_end:
+        lim = end_kv_idx
+    lim = max(lim, start + 2)
+    out, kv = [], start
+    while True:
+        out.append(kv)
+        kv += 2
+        if not kv < lim:
+            return out
+
+
+def test_kv_limit_loop_matches_the_three_term_condition():
+    """kv_idx is even and steps by two, so ``kv_idx < kv_lim`` visits exactly the tiles of the three-term condition."""
+    rng = np.random.default_rng(1234)
+    for _ in range(20000):
+        num_kv = int(rng.integers(1, 2049))
+        q_is_end = bool(rng.integers(0, 2))
+        start = 2 * int(rng.integers(0, (num_kv + 1) // 2 + 1)) if num_kv > 1 else 0
+        start = min(start, num_kv - 1 if num_kv % 2 else num_kv - 2) if num_kv > 1 else 0
+        if q_is_end:
+            end_kv_idx = 2 * int(rng.integers(start // 2 + 1, (num_kv + 1) // 2 + 1))
+        else:
+            end_kv_idx = 0
+        assert _three_term_loop(start, num_kv, q_is_end, end_kv_idx) == _limit_loop(
+            start, num_kv, q_is_end, end_kv_idx
+        ), (start, num_kv, q_is_end, end_kv_idx)
 
 
 def test_large_batch_kernel_objects_build():

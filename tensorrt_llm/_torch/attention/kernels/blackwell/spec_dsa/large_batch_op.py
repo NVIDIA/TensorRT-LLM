@@ -115,7 +115,11 @@ _KERNEL_CONFIG = dict(
 # trig0: the first compaction of a segment waits for 1536 candidates; sel_fast / cmp_fast: the exact selection of the
 # finalization and the in-stream compaction issue the independent work of an iteration together; sel_hand2: the selector
 # warps finalize the last segment of a CTA into their own result list instead of waiting for the row warps to finish the
-# earlier segment (the wait made the call 5 - 12 us slower at 40 - 92 rows).
+# earlier segment (the wait made the call 5 - 12 us slower at 40 - 92 rows). lim_loop / lim_loop2: the tile loops of the
+# math warps / of the K-loading and UMMA warps end on one compare with a limit computed once per segment instead of
+# the three-term condition; nolock: the two UMMA warps meet at the named barrier at a row change only, not after every
+# tile; floor_mask: a math warp re-reads its candidate floor when (tile & floor_mask) == 0. All four are off here (the
+# base table is the behaviour below the first variant) and on in the variants.
 _KNOBS = {
     DS_V4_FLASH.kernel_key: _KERNEL_CONFIG,
     DS_V4_FLASH_FP4.kernel_key: dict(
@@ -127,6 +131,10 @@ _KNOBS = {
         sel_fast=True,
         cmp_fast=True,
         sel_hand2=True,
+        lim_loop=False,
+        lim_loop2=False,
+        nolock=False,
+        floor_mask=6,
     ),
 }
 
@@ -135,9 +143,31 @@ _KNOBS = {
 # selector warps poll the candidate rings every sel_idle_ns: from 60 rows on the polls compete with the TMA / MMA
 # barriers of the SM and with the power budget (a 1.5 us sleep is 1 - 2 % faster at 100 - 150 rows and 4 - 7 % from 192
 # rows on), and six K stages (12 tiles in flight instead of 16) share the HBM more evenly between the SMs (the slowest
-# SMs set the end of the call). Below that the longer sleep delays the drain at the end of a piece.
+# SMs set the end of the call). Below that the longer sleep delays the drain at the end of a piece. At 512 rows and
+# more the SM clock sits at about 1.4 GHz (power cap) and the stream is bound by the ~290 SM cycles a math warp spends
+# per 128-position tile (hand-offs, the 64-head epilogue, floor read, compare, loop control), more than the HBM time of
+# a tile (184 ns): the loop-control, lockstep and floor-read knobs take instructions off that chain (from 60 rows, a
+# 16 times rarer floor read from 192 rows), and from 768 rows the selector warps sleep 3 us between polls and the K
+# stages are eight again (in the nsys protocol six stages are better at 384 - 767 rows, eight at 768 and more).
 _VARIANTS = {
-    DS_V4_FLASH_FP4.kernel_key: ((60, dict(sel_idle_ns=1536, kv_stages=6)),),
+    DS_V4_FLASH_FP4.kernel_key: (
+        (60, dict(sel_idle_ns=1536, kv_stages=6, lim_loop=True, lim_loop2=True, nolock=True)),
+        (
+            192,
+            dict(
+                sel_idle_ns=1536,
+                kv_stages=6,
+                lim_loop=True,
+                lim_loop2=True,
+                nolock=True,
+                floor_mask=30,
+            ),
+        ),
+        (
+            768,
+            dict(sel_idle_ns=3072, lim_loop=True, lim_loop2=True, nolock=True, floor_mask=30),
+        ),
+    ),
 }
 
 # Knobs of the attention kernel per spec (kernel_key); no entry = the shipped kernel. exit_early: the "last CTA to leave

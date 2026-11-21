@@ -32,11 +32,12 @@ from . import test_cute_dsl_spec_dsa_large_batch as H
 
 pytestmark = H.pytestmark
 idx = H.idx
-# The batch sizes at which the FP4 spec switches: its megakernel's last size, and the first size that runs the second
-# compile of the large-batch indexer kernel (``large_batch_op._VARIANTS``).
+# The batch sizes at which the FP4 spec switches: its megakernel's last size, and the first size of every further
+# compile of the large-batch indexer kernel (``large_batch_op._VARIANTS``) with the size before it.
 FP4_LAST = H.SPEC_FP4.megakernel_max_batch
-FP4_VARIANT = min((first for first, _ in _lbo._VARIANTS.get(H.SPEC_FP4.kernel_key, ())), default=64)
-SWITCHES = {FP4_LAST, FP4_LAST + 1, FP4_VARIANT - 1, FP4_VARIANT}
+FP4_VARIANTS = [first for first, _ in _lbo._VARIANTS.get(H.SPEC_FP4.kernel_key, ())] or [64]
+FP4_VARIANT = min(FP4_VARIANTS)
+SWITCHES = {FP4_LAST, FP4_LAST + 1} | {b for first in FP4_VARIANTS for b in (first - 1, first)}
 
 
 def _op():

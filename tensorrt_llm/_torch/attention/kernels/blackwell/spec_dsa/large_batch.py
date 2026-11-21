@@ -2644,6 +2644,10 @@ class IndexerKernel:
         row_regs: int = 96,
         trig: int = TRIG,
         stamps: bool = False,
+        floor_mask: int = 6,
+        nolock: bool = False,
+        lim_loop2: bool = False,
+        lim_loop: bool = False,
         num_w_in_reg: int = 64,
         attn: bool = False,
         dbg_dup: bool = False,
@@ -2744,6 +2748,11 @@ class IndexerKernel:
             raise ValueError("trig must be in (512, MAIN_CAP - 512]")
         self.trig = trig
         self.stamps = bool(stamps)
+        self.floor_mask = int(floor_mask)
+        self.nolock = bool(nolock)
+        self.lim_loop2 = bool(lim_loop2)
+        # lim_loop: the math warps' tile loop ends on kv_idx < kv_lim (limit computed once per segment)
+        self.lim_loop = bool(lim_loop)
         if num_heads != 64 or num_w_in_reg != num_heads:
             raise ValueError("split epilogue requires 64 heads and all head weights in registers")
         self.num_w_in_reg = num_w_in_reg
@@ -2906,6 +2915,17 @@ class IndexerKernel:
                 if rot_on == Int32(0):
                     ok = Int32(1)
         return (pq, ok)
+
+    @cute.jit
+    def _kv_limit(self, kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx):
+        # the loop bound of a segment (see _seg_s): the row length rounded up to an even tile, or the end tile of the
+        # CTA in its last row, at least one pair beyond the first tile
+        b2 = num_kv + Int32(1) & Int32(-2)
+        if q_idx == end_q_idx:
+            b2 = end_kv_idx
+        if b2 < kv_idx + Int32(2):
+            b2 = kv_idx + Int32(2)
+        return b2
 
     @cute.jit
     def _seg_s(self, kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx):
@@ -3951,6 +3971,8 @@ class IndexerKernel:
                 q_idx = next_q_idx
                 kv_idx = next_kv_idx
                 num_kv = next_num_kv
+                if cutlass.const_expr(self.lim_loop2):
+                    kv_lim = self._kv_limit(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
                 if q_idx != q_idx_old:
                     if cutlass.const_expr(self.desc):
                         seg_s = self._seg_s(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
@@ -4026,7 +4048,10 @@ class IndexerKernel:
                         )
                     kv_prod_state_0.advance()
                     kv_idx = kv_idx + NUM_MATH_WG
-                    kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
+                    if cutlass.const_expr(self.lim_loop2):
+                        kv_go = kv_idx < kv_lim
+                    else:
+                        kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
                 next_q_idx, next_kv_idx, next_num_kv, phase, has_work = self._walk_next(
                     q_idx,
                     kv_idx,
@@ -4062,6 +4087,8 @@ class IndexerKernel:
                 q_idx = next_q_idx
                 kv_idx = next_kv_idx
                 num_kv = next_num_kv
+                if cutlass.const_expr(self.lim_loop2):
+                    kv_lim = self._kv_limit(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
                 if q_idx != q_idx_old:
                     if cutlass.const_expr(self.desc):
                         seg_s = self._seg_s(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
@@ -4110,7 +4137,10 @@ class IndexerKernel:
                         )
                     kv_prod_state_1.advance()
                     kv_idx = kv_idx + NUM_MATH_WG
-                    kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
+                    if cutlass.const_expr(self.lim_loop2):
+                        kv_go = kv_idx < kv_lim
+                    else:
+                        kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
                 next_q_idx, next_kv_idx, next_num_kv, phase, has_work = self._walk_next(
                     q_idx,
                     kv_idx,
@@ -4154,6 +4184,8 @@ class IndexerKernel:
                     q_idx = next_q_idx
                     kv_idx = next_kv_idx
                     num_kv = next_num_kv
+                    if cutlass.const_expr(self.lim_loop2):
+                        kv_lim = self._kv_limit(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
                     if q_idx != q_idx_old:
                         if q_idx_old < batch_size:
                             if cutlass.const_expr(self.fp4):
@@ -4251,10 +4283,15 @@ class IndexerKernel:
                         kv_cons_state_umma_0.advance()
                         umma_pipeline_0.producer_commit(umma_prod_state_0)
                         umma_prod_state_0.advance()
-                        if cutlass.const_expr(self.fp4):
+                        if cutlass.const_expr(self.fp4 and not self.nolock):
                             sfb_sync_barrier.arrive_and_wait()
                         kv_idx = kv_idx + NUM_MATH_WG
-                        kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
+                        if cutlass.const_expr(self.lim_loop2):
+                            kv_go = kv_idx < kv_lim
+                        else:
+                            kv_go = (kv_idx < num_kv) & (
+                                (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                            )
                     next_q_idx, next_kv_idx, next_num_kv, phase, has_work = self._walk_next(
                         q_idx,
                         kv_idx,
@@ -4301,6 +4338,8 @@ class IndexerKernel:
                     q_idx = next_q_idx
                     kv_idx = next_kv_idx
                     num_kv = next_num_kv
+                    if cutlass.const_expr(self.lim_loop2):
+                        kv_lim = self._kv_limit(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
                     if q_idx != q_idx_old:
                         if q_idx_old < batch_size:
                             if cutlass.const_expr(self.fp4):
@@ -4370,10 +4409,15 @@ class IndexerKernel:
                         kv_cons_state_umma_1.advance()
                         umma_pipeline_1.producer_commit(umma_prod_state_1)
                         umma_prod_state_1.advance()
-                        if cutlass.const_expr(self.fp4):
+                        if cutlass.const_expr(self.fp4 and not self.nolock):
                             sfb_sync_barrier.arrive_and_wait()
                         kv_idx = kv_idx + NUM_MATH_WG
-                        kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
+                        if cutlass.const_expr(self.lim_loop2):
+                            kv_go = kv_idx < kv_lim
+                        else:
+                            kv_go = (kv_idx < num_kv) & (
+                                (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                            )
                     next_q_idx, next_kv_idx, next_num_kv, phase, has_work = self._walk_next(
                         q_idx,
                         kv_idx,
@@ -4452,6 +4496,8 @@ class IndexerKernel:
                     num_kv = next_num_kv
                     if cutlass.const_expr(self.desc):
                         seg_s = self._seg_s(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
+                    if cutlass.const_expr(self.lim_loop):
+                        kv_lim = self._kv_limit(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
                     if q_idx != q_idx_old:
                         if q_idx_old < batch_size:
                             if cutlass.const_expr(self.pfence):
@@ -4529,7 +4575,7 @@ class IndexerKernel:
                             mLogits_flat[out_row_off + kv_pos] = val
                         if cutlass.const_expr(self.admit):
                             # Stale same-segment floors remain conservative.
-                            if (kv_idx & Int32(6)) == Int32(0):
+                            if (kv_idx & Int32(self.floor_mask)) == Int32(0):
                                 T = _floor_of(tw_ptr, seg_ord, m_lane)
                             hit = (kv_pos < ctx_q) & (val >= T)
                             ent = L.pack_entry(L.u32_of_f32(val), kv_pos)
@@ -4557,7 +4603,12 @@ class IndexerKernel:
                                             mStamps[bidz * 256 + 162 + tslot] = cutlass.Int64(
                                                 cute.arch.globaltimer()
                                             )
-                        kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
+                        if cutlass.const_expr(self.lim_loop):
+                            kv_go = kv_idx < kv_lim
+                        else:
+                            kv_go = (kv_idx < num_kv) & (
+                                (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                            )
                     if cutlass.const_expr(self.admit):
                         if cutlass.const_expr(self.skew_ns > 0):
                             L.skew_sleep(
@@ -4603,6 +4654,8 @@ class IndexerKernel:
                     num_kv = next_num_kv
                     if cutlass.const_expr(self.desc):
                         seg_s = self._seg_s(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
+                    if cutlass.const_expr(self.lim_loop):
+                        kv_lim = self._kv_limit(kv_idx, num_kv, q_idx, end_q_idx, end_kv_idx)
                     if q_idx != q_idx_old:
                         if q_idx_old < batch_size:
                             if cutlass.const_expr(self.pfence):
@@ -4681,7 +4734,7 @@ class IndexerKernel:
                             mLogits_flat[out_row_off + kv_pos] = val
                         if cutlass.const_expr(self.admit):
                             # Stale same-segment floors remain conservative.
-                            if (kv_idx & Int32(6)) == Int32(0):
+                            if (kv_idx & Int32(self.floor_mask)) == Int32(0):
                                 T = _floor_of(tw_ptr, seg_ord, m_lane)
                             hit = (kv_pos < ctx_q) & (val >= T)
                             ent = L.pack_entry(L.u32_of_f32(val), kv_pos)
@@ -4709,7 +4762,12 @@ class IndexerKernel:
                                             mStamps[bidz * 256 + 162 + tslot] = cutlass.Int64(
                                                 cute.arch.globaltimer()
                                             )
-                        kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
+                        if cutlass.const_expr(self.lim_loop):
+                            kv_go = kv_idx < kv_lim
+                        else:
+                            kv_go = (kv_idx < num_kv) & (
+                                (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                            )
                     if cutlass.const_expr(self.admit):
                         if cutlass.const_expr(self.skew_ns > 0):
                             L.skew_sleep(
