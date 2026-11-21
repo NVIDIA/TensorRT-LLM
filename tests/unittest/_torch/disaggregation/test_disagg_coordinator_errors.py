@@ -402,7 +402,11 @@ def _executor_with_real_error_path(monkeypatch) -> tuple:
     executor.force_terminate_ctx_for_partial_reuse = False
     transceiver = FakeKvCacheTransceiver()
     executor.kv_cache_transceiver = transceiver
-    kv_cache_manager = Mock(spec=["store_blocks_for_reuse", "unpin_blocks_by_id"])
+    kv_cache_manager = Mock(
+        spec=["store_blocks_for_reuse", "unpin_blocks_by_id", "is_preemption_pending"]
+    )
+    kv_cache_manager.is_preemption_pending.return_value = False
+    executor.kv_cache_manager = kv_cache_manager
     transfers = AsyncTransferManager(
         SimpleNamespace(resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
     )

@@ -1004,6 +1004,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 encoder_input_tokens, "tolist") else list(encoder_input_tokens))
             self.encoder_tokens = encoder_tokens
         self.py_return_encoder_output = return_encoder_output
+        self.py_request_terminated = False
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
@@ -1208,6 +1209,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                     seq_slot: Optional[int],
                                     orig_prompt_len: int,
                                     clear_draft_tokens: bool = False) -> None:
+        self.py_request_resources_released = False
+        self.py_request_pp_termination_agreed = False
         self.py_prompt_len = self.prompt_len
         self.py_orig_prompt_len = orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens

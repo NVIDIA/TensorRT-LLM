@@ -97,6 +97,7 @@ def _make_v2_kv_cache_manager() -> Mock:
     manager = Mock()
     manager.enable_block_reuse = True
     manager.disk_prefetch_num_reqs = 0
+    manager.is_preemption_pending.return_value = False
     return manager
 
 
@@ -814,6 +815,8 @@ class MockPadDummyExecutor:
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
     _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
+    _is_request_schedulable = PyExecutor._is_request_schedulable
+    _is_preemption_pending = PyExecutor._is_preemption_pending
     _get_non_overlap_adp_forward_intent = PyExecutor._get_non_overlap_adp_forward_intent
     _has_adp_dummy_kv_capacity = PyExecutor._has_adp_dummy_kv_capacity
     _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg
