@@ -1507,9 +1507,11 @@ def test_startup_metrics_by_server_info(
     assert first == {
         "disaggregated_params": {},
         "startup_metrics": {},
+        "supports_logical_context_cancellation": False,
     }
     expected_success = {
         "disaggregated_params": {},
+        "supports_logical_context_cancellation": False,
         "startup_metrics": {
             "model_loader": {
                 "total_model_loading_seconds": 1.5,

@@ -2773,6 +2773,36 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_context_transfer_cancel(client_id)
 
+    def supports_logical_context_cancellation(
+            self, request: Optional[LlmRequest] = None) -> bool:
+        """Expose the executor's qualified independent CTX retirement capability.
+
+        Args:
+            request: Exact request to check, or None for the runtime capability.
+
+        Returns:
+            Whether the transfer coordinator owns cancellation independently of
+            response completion. Connector-backed requests remain unsupported.
+        """
+        return (self.kv_connector_manager is None
+                and self.disagg.supports_logical_context_cancellation(request)
+                is True)
+
+    def cancel_context_request(self, token: str) -> None:
+        """Queue intent for a worker-authenticated context request instance.
+
+        Successful enqueue is neither cancellation handling nor a
+        physical-retirement receipt.
+
+        Args:
+            token: Single-use identity validated by the admission owner.
+
+        Raises:
+            RuntimeError: The cancellation queue closed before enqueue.
+        """
+        if not self.executor_request_queue.enqueue_context_token_cancel(token):
+            raise RuntimeError("Context cancellation queue is closed")
+
     def _start_mpi_progress_thread(self) -> None:
         """Start a native thread that keeps this rank's MPI sends moving.
 
@@ -9268,12 +9298,15 @@ class PyExecutor:
             req.parent_request_id if req.is_child else req.py_request_id
             for req in itertools.chain(self.active_requests, retained))
         client_ids = {req.py_client_id for req in retained}
+        tokens = set(self._context_cancellation_targets(waiting_queue))
         if self.enable_attention_dp:
             # Every bridge rank enters this fixed drain-fetch slot, including
             # empty ranks. Rank zero need not own the request being cancelled.
-            participants = self.dist.tp_allgather((request_ids, client_ids))
-            request_ids = set().union(*(ids for ids, _ in participants))
-            client_ids = set().union(*(ids for _, ids in participants))
+            participants = self.dist.tp_allgather(
+                (request_ids, client_ids, tokens))
+            request_ids = set().union(*(ids for ids, _, _ in participants))
+            client_ids = set().union(*(ids for _, ids, _ in participants))
+            tokens = set().union(*(ids for _, _, ids in participants))
         if self.dist.rank != 0:
             return []
         self.request_accumulated.extend(
@@ -9282,9 +9315,12 @@ class PyExecutor:
         cancellations = []
         deferred = []
         for item in self.request_accumulated:
-            matches_existing = (item.id in request_ids
-                                if item.cancel_context_client_id is None else
-                                item.cancel_context_client_id in client_ids)
+            if item.cancel_context_token is not None:
+                matches_existing = item.cancel_context_token in tokens
+            elif item.cancel_context_client_id is not None:
+                matches_existing = item.cancel_context_client_id in client_ids
+            else:
+                matches_existing = item.id in request_ids
             if item.is_canceled_request and matches_existing:
                 cancellations.append(item)
             else:
@@ -10340,7 +10376,10 @@ class PyExecutor:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
-                if req_item.cancel_context_client_id is None:
+                if req_item.cancel_context_token is not None:
+                    self._resolve_context_token_cancellation(
+                        req_item.cancel_context_token, accepted_new_requests)
+                elif req_item.cancel_context_client_id is None:
                     self.canceled_req_ids.append(req_item.id)
                 else:
                     # Never reinterpret a client ID as an executor ID. A late
@@ -10378,6 +10417,58 @@ class PyExecutor:
             self.kv_connector_manager.finish_prefix_loads(
                 finished_prefix_load_ids)
         return accepted_new_requests
+
+    def _resolve_context_token_cancellation(
+            self, token: str,
+            accepted_new_requests: list[RequestQueueItem]) -> None:
+        """Resolve exact-instance intent without retaining a second ID registry.
+
+        The admission owner serializes request enqueue before token cancellation.
+        Unmatched intent therefore names work that cannot arrive later. Control
+        handling keeps a future submit and its cancellation on the same side.
+
+        Args:
+            token: Worker-authenticated request identity, not a pairing ID.
+            accepted_new_requests: Normal entries preceding the cancellation in
+                this envelope, before any pending control barrier.
+        """
+        self.canceled_req_ids.extend(
+            sorted(
+                self._context_cancellation_targets(self.waiting_queue,
+                                                   accepted_new_requests).get(
+                                                       token, ())))
+
+    def _context_cancellation_targets(
+        self,
+        waiting_queue: WaitingQueue,
+        accepted_new_requests: Iterable[RequestQueueItem] = ()
+    ) -> dict[str, set[int]]:
+        """Map context tokens to existing work on this side of a control barrier.
+
+        Args:
+            waiting_queue: Previously fetched but unscheduled requests.
+            accepted_new_requests: Requests preceding cancellation in the current envelope.
+
+        Returns:
+            Executor identities keyed by the exact context cancellation token.
+        """
+        targets: dict[str, set[int]] = {}
+        for item in itertools.chain(waiting_queue, accepted_new_requests):
+            token = item.context_cancellation_token
+            if (token is not None and item.request is not None
+                    and item.request.request_type
+                    == RequestType.REQUEST_TYPE_CONTEXT_ONLY):
+                targets.setdefault(token, set()).add(item.id)
+        transfers = self.async_transfer_manager.requests_in_transfer().values()
+        for req in itertools.chain(self.active_requests, transfers):
+            token = getattr(req.py_disaggregated_params,
+                            "context_cancellation_token", None)
+            if token is not None and self.supports_logical_context_cancellation(
+                    req):
+                targets.setdefault(token,
+                                   set()).add(req.parent_request_id if req.
+                                              is_child else req.py_request_id)
+        return targets
 
     def _update_new_active_requests_queue_latency(
             self, new_requests: List[RequestQueueItem]):

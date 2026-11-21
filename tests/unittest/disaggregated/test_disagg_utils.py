@@ -417,6 +417,49 @@ def test_get_global_disagg_request_id(multithread):
     assert all(id >= MIN_GLOBAL_ID and id < ((1 << 63) - 1) for id in all_ids)
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_global_disagg_ids_do_not_repeat_when_millisecond_counter_wraps(
+        monkeypatch: pytest.MonkeyPatch, concurrent: bool) -> None:
+    """Cross two counter windows while every clock observation returns the same millisecond."""
+    from tensorrt_llm.llmapi import disagg_utils
+
+    monkeypatch.setattr(disagg_utils.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(disagg_utils, "_global_disagg_request_id_counter", 0)
+    monkeypatch.setattr(disagg_utils, "_global_disagg_request_id_timestamp_ms",
+                        -1)
+    count = 2 * (1 << disagg_utils.DISAGG_COUNTER_BITS) + 1
+
+    def allocate(_: int) -> int:
+        """Use the same real node/process namespace from every caller."""
+        return get_global_disagg_request_id(1, 2)
+
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            identities = list(pool.map(allocate, range(count)))
+    else:
+        identities = [allocate(index) for index in range(count)]
+    assert len(identities) == count
+    assert len(set(identities)) == count
+    assert all(MIN_GLOBAL_ID <= value < (1 << 63) - 1 for value in identities)
+    # Logical time can lead the physical clock after a burst. A subsequent
+    # observation must not reuse the ID of work that is still active/retained.
+    monkeypatch.setattr(disagg_utils.time, "monotonic", lambda: 100.001)
+    assert allocate(count) not in identities
+
+
+def test_global_disagg_id_space_exhaustion_does_not_wrap(
+    monkeypatch: pytest.MonkeyPatch, ) -> None:
+    """Reject exhaustion instead of reusing an identity still held by old work."""
+    from tensorrt_llm.llmapi import disagg_utils
+
+    monkeypatch.setattr(disagg_utils.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(disagg_utils, "_global_disagg_request_id_counter", 0)
+    monkeypatch.setattr(disagg_utils, "_global_disagg_request_id_timestamp_ms",
+                        (1 << disagg_utils.DISAGG_TIMESTAMP_BITS) - 1)
+    with pytest.raises(RuntimeError, match="identity space is exhausted"):
+        get_global_disagg_request_id(0, 0)
+
+
 def test_get_global_disagg_request_id_range_validation():
     # node_id: 8 bits [0,256); process_id: 6 bits [0,64).
     with pytest.raises(ValueError):
