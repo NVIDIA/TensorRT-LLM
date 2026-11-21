@@ -55,6 +55,8 @@ l0_a10:
   - unittest/_torch/models/checkpoints
   - unittest/_torch/models/test_qwen3_next_moe_quant.py
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py
+  # Triton GDN prefill (the default on SM80/86/89) against an fp64 reference.
+  - unittest/_torch/modules/mamba/test_fla_triton_reference.py
   - unittest/_torch/weight_sharing
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cuda_architecture_check.py
