@@ -42,6 +42,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._profiler import warn_unsupported_moe_routing
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention.attention import Attention
@@ -748,6 +749,13 @@ class Step3p7MoE(nn.Module):
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ) -> None:
+        """Construct the router, expert path, and optional TP output reduction.
+
+        Args:
+            model_config: Model, quantization, and parallelism settings.
+            layer_idx: Decoder or MTP layer index used for expert ownership.
+            aux_stream_dict: Auxiliary CUDA streams passed to the MoE backend.
+        """
         super().__init__()
         text_config = _get_text_config(model_config)
         self.layer_idx = layer_idx
@@ -787,6 +795,8 @@ class Step3p7MoE(nn.Module):
         # Routed-expert LoRA must execute in the fused backend. Otherwise the
         # selected Python path owns expert execution and its dequantized weights.
         self._use_python_experts = self._use_python_clamp and not self._moe_lora_enabled
+        if self._use_python_experts:
+            warn_unsupported_moe_routing("Step3p7 Python clamp path")
 
         # An MTP layer nests its decoder block under ``mtp_block``.
         block = "mtp_block." if layer_idx >= int(text_config.num_hidden_layers) else ""
