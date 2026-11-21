@@ -34,7 +34,7 @@ if ${have_headers} || ${have_library}; then
 fi
 
 . /etc/os-release
-# Match GDRCopy in the NGC PyTorch 26.09 base images.
+# Match GDRCopy in the NGC PyTorch base images.
 GDRCOPY_VERSION=2.5.1
 ARCH=$(uname -m)
 # TODO: Add an internal CI mirror after verifying the pinned 2.5.1 DEB/RPM packages.
