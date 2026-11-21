@@ -28,7 +28,7 @@ from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
 from .backends.interface import AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
-from .backends.utils import create_attention
+from .backends.utils import create_attention, is_quant_excluded
 
 
 class QKVMode(str, Enum):
@@ -157,6 +157,10 @@ class Attention(nn.Module):
         self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.module_name = self._qualified_module_name(config.component_name, module_name)
+        recipe = config.attention.quant_attention_config
+        self._quantization_excluded = recipe is not None and is_quant_excluded(
+            recipe, self.module_name
+        )
         self.eps = eps
 
         self.q_dim = self.num_attention_heads * self.head_dim
@@ -285,6 +289,7 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
+            module_name=self.module_name,
             sparse_params=sparse_params,
         )
 

@@ -332,3 +332,110 @@ class TestFlux2AttentionBackend(unittest.TestCase):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_flux_fixed_attention_qkv_quantization(quantized: bool) -> None:
+    """Flux QKV preparation uses BF16 when attention quantization is ignored."""
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+
+    attention = FluxJointAttention.__new__(FluxJointAttention)
+    torch.nn.Module.__init__(attention)
+    attention.requires_static_e4m3_attention = quantized
+    attention._static_e4m3_attention_scales_loaded = True
+    attention.added_kv_proj_dim = None
+    attention.pre_only = True
+    attention.fuse_qk_norm_rope = True
+    attention.num_attention_heads = attention.num_key_value_heads = 1
+    attention.head_dim = attention.local_q_dim = attention.local_kv_dim = 128
+    attention.eps = 1e-6
+    attention.interleave = True
+    attention.norm_q = attention.norm_k = SimpleNamespace(weight=torch.ones(128))
+    attention.qkv_proj = torch.nn.Linear(128, 384, bias=False, dtype=torch.bfloat16)
+    for name in ("q", "k", "v"):
+        setattr(attention, f"_static_{name}_dequant_scale", torch.ones(()))
+    x = torch.randn(1, 4, 128, dtype=torch.bfloat16)
+    rotary = (torch.ones(1, 4, 1, 128), torch.zeros(1, 4, 1, 128))
+    fp8_qkv = tuple(torch.ones(4, 128).to(torch.float8_e4m3fn) for _ in range(3))
+    calls = []
+
+    def attend(q, k, v, **kwargs):
+        calls.append((q.dtype, kwargs))
+        return q.to(torch.bfloat16)
+
+    with (
+        patch.object(attention, "apply_packed_qk_norm_rope") as bf16,
+        patch.object(attention, "_attn_impl", side_effect=attend),
+        patch("torch.ops.trtllm.fused_dit_qk_norm_rope_quant_fp8", return_value=fp8_qkv) as fp8,
+    ):
+        attention(x, image_rotary_emb=rotary)
+    assert fp8.call_count == int(quantized) and bf16.call_count == int(not quantized)
+    assert [dtype for dtype, _ in calls] == [torch.float8_e4m3fn if quantized else torch.bfloat16]
+    assert ["static_q_scale" in kwargs for _, kwargs in calls] == [quantized]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("variant", ["flux1", "flux2"])
+def test_flux_attention_ignore_matches_real_module_path(
+    variant: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import patch
+
+    from test_common.visual_gen_quantization import ToyAttentionBackend
+
+    from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import FluxTransformer2DModel
+    from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import Flux2Transformer2DModel
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "0")
+    for component, target, tp_size in (
+        (None, "single_transformer_blocks.0.attn", 1),
+        ("transformer", "transformer.single_transformer_blocks.1.attn", 2),
+        ("transformer", "transformer_blocks.0.attn", 1),
+    ):
+        config = DiffusionModelConfig(
+            component_name=component,
+            mapping=Mapping(world_size=tp_size, rank=0, tp_size=tp_size),
+            pretrained_config=SimpleNamespace(
+                num_layers=1,
+                num_single_layers=2,
+                num_attention_heads=2,
+                attention_head_dim=128,
+                joint_attention_dim=128,
+                pooled_projection_dim=128,
+                timestep_guidance_channels=32,
+                in_channels=128,
+                axes_dims_rope=[32, 32, 32, 32] if variant == "flux2" else [16, 56, 56],
+            ),
+            attention=AttentionConfig(
+                backend="CUTEDSL",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="nvfp4", v_dtype="fp8", ignore=[target]
+                ),
+            ),
+        )
+        with (
+            torch.device("meta"),
+            patch(
+                "tensorrt_llm._torch.visual_gen.attention.backends.utils.get_visual_gen_attention_backend",
+                return_value=ToyAttentionBackend,
+            ),
+        ):
+            model_type = Flux2Transformer2DModel if variant == "flux2" else FluxTransformer2DModel
+            model = model_type(config)
+        found = []
+        for name, module in model.named_modules():
+            if name.endswith(".attn"):
+                prefix = f"{component}." if component else ""
+                assert module.module_name == prefix + name
+                assert module._quantization_excluded == (target in (name, prefix + name))
+                global_index = int(name.split(".")[1])
+                if name.startswith("single_transformer_blocks."):
+                    global_index += len(model.transformer_blocks)
+                assert module.layer_idx == global_index
+                assert module.tp_size == tp_size
+                found.append(name)
+        assert target.removeprefix("transformer.") in found

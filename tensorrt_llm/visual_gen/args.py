@@ -48,6 +48,29 @@ CacheBackendName = Literal["teacache", "cache_dit", "seacache"]
 # =============================================================================
 
 
+DenoiseStep = Annotated[int, Field(ge=0, strict=True)]
+
+
+class LinearQuantConfig(QuantConfig):
+    """Linear quantization configuration with per-step quantization exclusions."""
+
+    ignore_steps: List[DenoiseStep] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Denoising step numbers at which Linear layers run without quantization; "
+            "0 is the first step. Requires a BF16/FP16 checkpoint and load-time weight "
+            "quantization. Cannot be combined with layer exclusions."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_step_quant_algo(self) -> "LinearQuantConfig":
+        if self.ignore_steps and self.quant_algo is None:
+            raise ValueError("ignore_steps requires an explicit quant_algo")
+        return self
+
+
 class QuantAttentionConfig(StrictBaseModel):
     """Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).
 
@@ -130,6 +153,25 @@ class QuantAttentionConfig(StrictBaseModel):
             "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
             "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
             "fastest setting measured at unchanged quality. vc_attention only."
+        ),
+    )
+    ignore: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Attention module paths excluded from attention quantization at every step. "
+            "Uses the same glob and re: patterns as Linear exclude_modules; paths may be "
+            "relative to a transformer or qualified by its component name. Cannot be combined "
+            "with nonempty Linear or attention ignore_steps lists."
+        ),
+    )
+    ignore_steps: List[DenoiseStep] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Denoising step numbers at which attention runs without quantization, using the "
+            "selected backend's BF16/FP16 path; 0 is the first step. Linear and attention "
+            "can specify different steps. Cannot be combined with layer exclusions."
         ),
     )
 
@@ -961,7 +1003,7 @@ class VisualGenArgs(StrictBaseModel):
         description="HuggingFace Hub revision (branch, tag, or commit SHA) to download.",
     )
 
-    quant_config: Union[QuantConfig, Dict[str, Any]] = Field(
+    quant_config: Union[LinearQuantConfig, QuantConfig, Dict[str, Any]] = Field(
         default_factory=QuantConfig,
         status="prototype",
         description=(
@@ -1030,6 +1072,45 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
+    @field_validator("quant_config", mode="before")
+    @classmethod
+    def _validate_quant_ignore_steps(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "ignore_steps" in value:
+            LinearQuantConfig(
+                quant_algo=value.get("quant_algo"), ignore_steps=value["ignore_steps"]
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_quant_ignore_combinations(self) -> "VisualGenArgs":
+        linear_quant_ignore_steps = (
+            self.quant_config.get("ignore_steps", [])
+            if isinstance(self.quant_config, dict)
+            else getattr(self.quant_config, "ignore_steps", [])
+        )
+        recipe = self.attention_config.quant_attention_config
+        attention_quant_ignore_steps = recipe.ignore_steps if recipe is not None else []
+        linear_ignore = (
+            self.quant_config.get("ignore") or self.quant_config.get("exclude_modules")
+            if isinstance(self.quant_config, dict)
+            else getattr(self.quant_config, "exclude_modules", None)
+        )
+        attention_ignore = recipe.ignore if recipe is not None else []
+        if (linear_ignore or attention_ignore) and (
+            linear_quant_ignore_steps or attention_quant_ignore_steps
+        ):
+            raise ValueError(
+                "ignore and ignore_steps are mutually exclusive across Linear and attention "
+                "quantization; choose either layer or step quantization exclusions."
+            )
+        if (
+            linear_quant_ignore_steps or attention_quant_ignore_steps
+        ) and self.cache_config is not None:
+            raise ValueError("ignore_steps cannot be combined with diffusion step caching")
+        if linear_quant_ignore_steps and self.runtime_lora_config is not None:
+            raise ValueError("Linear ignore_steps cannot be combined with runtime LoRA fusion")
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _normalize_quant_config(cls, data: Any) -> Any:
@@ -1094,6 +1175,7 @@ class VisualGenArgs(StrictBaseModel):
 
 
 __all__ = [
+    "LinearQuantConfig",
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",

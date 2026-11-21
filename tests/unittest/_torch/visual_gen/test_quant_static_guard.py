@@ -9,13 +9,17 @@ checkpoint through a static recipe silently corrupts the weights (scales stay
 at their default or uninitialized values), so the loader must raise instead.
 """
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod, W4A16NVFP4LinearMethod
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.visual_gen.args import LinearQuantConfig
 
 # Pure-CPU test (stub Linear, no device): runs in the CPU lane (l0_cpu.yml),
 # which selects with `-m cpu_only`; GPU stages deselect it via `not cpu_only`.
@@ -27,17 +31,22 @@ class _StubLinear:
 
     quant_config = None
 
-    def __init__(self):
+    def __init__(self, quant_algo=None, force_dynamic_quantization=False):
         self.loaded = None
+        self.quant_method = NVFP4LinearMethod() if quant_algo == QuantAlgo.NVFP4 else None
+        self.force_dynamic_quantization = force_dynamic_quantization
 
     def load_weights(self, weight_dicts):
         self.loaded = weight_dicts
 
 
-def _make_loader(quant_algo, dynamic_weight_quant=False, exclude_modules=None):
+def _make_loader(
+    quant_algo, dynamic_weight_quant=False, exclude_modules=None, force_dynamic_quantization=False
+):
     model_config = DiffusionModelConfig(
         quant_config=QuantConfig(quant_algo=quant_algo, exclude_modules=exclude_modules),
         dynamic_weight_quant=dynamic_weight_quant,
+        force_dynamic_quantization=force_dynamic_quantization,
     )
     return DynamicLinearWeightLoader(model_config)
 
@@ -85,11 +94,12 @@ class TestStaticQuantGuard:
 
     def test_static_nvfp4_checkpoint_with_scales_loads(self):
         loader = _make_loader(QuantAlgo.NVFP4)
-        module = _StubLinear()
+        module = _StubLinear(QuantAlgo.NVFP4)
         weight_dict = {
             "weight": torch.zeros(8, 8, dtype=torch.uint8),
             "weight_scale": torch.zeros(8, 1, dtype=torch.float8_e4m3fn),
             "weight_scale_2": torch.ones(1, dtype=torch.float32),
+            "input_scale": torch.ones(1, dtype=torch.float32),
         }
         loader.load_linear_weights(module, "blocks.0.attn1.to_q", [weight_dict])
         assert module.loaded == [weight_dict]
@@ -144,3 +154,185 @@ class TestStaticQuantGuard:
         # The guard is a no-op for dynamic recipes; quantization happens later
         # in _maybe_dynamic_quantize (GPU path, not exercised here).
         loader._check_static_quant_scales(_bf16_weights(), QuantAlgo.FP8, "blocks.0.attn1.to_q")
+
+
+class TestDynamicQuantGuard:
+    @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.uint8])
+    def test_unsupported_algorithm_raises_before_retaining_or_loading_weights(
+        self, weight_dtype: torch.dtype
+    ) -> None:
+        loader = DynamicLinearWeightLoader(
+            DiffusionModelConfig(
+                quant_config=LinearQuantConfig(quant_algo=QuantAlgo.W4A16_AWQ, ignore_steps=[0]),
+                dynamic_weight_quant=True,
+            )
+        )
+        module = _StubLinear()
+        with patch.object(
+            loader, "_maybe_dynamic_quantize", wraps=loader._maybe_dynamic_quantize
+        ) as quantize:
+            with pytest.raises(
+                ValueError,
+                match="pre-quantized checkpoint"
+                if weight_dtype == torch.uint8
+                else "no load-time quantizer",
+            ):
+                loader.load_linear_weights(
+                    module,
+                    "blocks.0.attn1.to_q",
+                    [{"weight": torch.zeros(8, 16, dtype=weight_dtype)}],
+                )
+        quantize.assert_not_called()
+        assert module.loaded is None
+
+    @pytest.mark.parametrize(
+        ("ignore_steps", "weight_dtype"),
+        [(None, torch.bfloat16), ([], torch.bfloat16), ([], torch.uint8)],
+        ids=["not-configured", "empty", "prequantized"],
+    )
+    def test_without_step_exclusions_preserves_existing_loading(
+        self, ignore_steps: list[int] | None, weight_dtype: torch.dtype
+    ) -> None:
+        quant_algo = QuantAlgo.W4A16_AWQ
+        quant_config = (
+            QuantConfig(quant_algo=quant_algo)
+            if ignore_steps is None
+            else LinearQuantConfig(quant_algo=quant_algo, ignore_steps=ignore_steps)
+        )
+        loader = DynamicLinearWeightLoader(
+            DiffusionModelConfig(quant_config=quant_config, dynamic_weight_quant=True)
+        )
+        module = _StubLinear()
+        weights = {"weight": torch.zeros(8, 16, dtype=weight_dtype)}
+        with patch.object(
+            loader, "_maybe_dynamic_quantize", wraps=loader._maybe_dynamic_quantize
+        ) as quantize:
+            loader.load_linear_weights(module, "blocks.0.attn1.to_q", [weights])
+        assert quantize.call_count == 1
+        assert module.loaded == [weights]
+
+
+class TestStaticNVFP4ActivationScale:
+    @pytest.fixture
+    def quantizer(self, monkeypatch):
+        monkeypatch.setattr(torch.Tensor, "cuda", lambda value: value)
+        quantizer = Mock(
+            return_value=(
+                torch.zeros(8, 8, dtype=torch.uint8),
+                torch.ones(8, 1, dtype=torch.float8_e4m3fn),
+                torch.ones(1),
+            )
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.visual_gen.quantization.loader.quantize_nvfp4", quantizer
+        )
+        return quantizer
+
+    @pytest.mark.parametrize(
+        "dynamic_weight_quant,input_scale",
+        [
+            (False, None),
+            (True, None),
+            (True, torch.tensor(0.0)),
+            (True, torch.tensor(-1.0)),
+            (True, torch.tensor(float("nan"))),
+            (True, torch.tensor(float("inf"))),
+            (True, torch.empty(0)),
+            (True, torch.ones(2)),
+        ],
+        ids=[
+            "prequantized-missing",
+            "bf16-missing",
+            "zero",
+            "negative",
+            "nan",
+            "inf",
+            "empty",
+            "non-scalar",
+        ],
+    )
+    def test_missing_or_invalid_scale_raises_before_quantization(
+        self, dynamic_weight_quant, input_scale, quantizer
+    ):
+        loader = _make_loader(QuantAlgo.NVFP4, dynamic_weight_quant=dynamic_weight_quant)
+        module = _StubLinear(QuantAlgo.NVFP4)
+        weight_dict = (
+            _bf16_weights()
+            if dynamic_weight_quant
+            else {
+                "weight": torch.zeros(8, 8, dtype=torch.uint8),
+                "weight_scale": torch.ones(8, 1, dtype=torch.float8_e4m3fn),
+                "weight_scale_2": torch.ones(1),
+            }
+        )
+        if input_scale is not None:
+            weight_dict["input_scale"] = input_scale
+        with pytest.raises(ValueError, match="blocks.0.attn1.to_q.*calibrated 'input_scale'"):
+            loader.load_linear_weights(module, "blocks.0.attn1.to_q", [weight_dict])
+        quantizer.assert_not_called()
+        assert module.loaded is None
+        assert not module.force_dynamic_quantization
+
+    def test_load_time_quantization_preserves_calibrated_scale(self, quantizer):
+        loader = _make_loader(QuantAlgo.NVFP4, dynamic_weight_quant=True)
+        module = _StubLinear(QuantAlgo.NVFP4)
+        input_scale = torch.tensor([0.125])
+        loader.load_linear_weights(
+            module, "blocks.0.attn1.to_q", [{**_bf16_weights(), "input_scale": input_scale}]
+        )
+        quantizer.assert_called_once()
+        assert module.loaded[0]["input_scale"] is input_scale
+        assert not module.force_dynamic_quantization
+        assert not loader.model_config.force_dynamic_quantization
+
+    def test_step_exclusions_still_require_calibrated_scale(self, quantizer):
+        loader = DynamicLinearWeightLoader(
+            DiffusionModelConfig(
+                quant_config=LinearQuantConfig(quant_algo=QuantAlgo.NVFP4, ignore_steps=[0]),
+                dynamic_weight_quant=True,
+                force_dynamic_quantization=False,
+            )
+        )
+        module = _StubLinear(QuantAlgo.NVFP4)
+        with pytest.raises(ValueError, match="calibrated 'input_scale'"):
+            loader.load_linear_weights(module, "blocks.0.attn1.to_q", [_bf16_weights()])
+        quantizer.assert_not_called()
+        assert module.loaded is None
+        assert not module.force_dynamic_quantization
+
+    def test_fused_weights_require_scale_for_every_entry(self, quantizer):
+        loader = _make_loader(QuantAlgo.NVFP4, dynamic_weight_quant=True)
+        module = _StubLinear(QuantAlgo.NVFP4)
+        weight_dicts = [
+            {**_bf16_weights(), "input_scale": torch.ones(1)},
+            _bf16_weights(),
+            {**_bf16_weights(), "input_scale": torch.ones(1)},
+        ]
+        with pytest.raises(ValueError, match="blocks.0.attn1.qkv_proj.*calibrated 'input_scale'"):
+            loader.load_linear_weights(module, "blocks.0.attn1.qkv_proj", weight_dicts)
+        quantizer.assert_not_called()
+        assert module.loaded is None
+
+    @pytest.mark.parametrize("activation_mode", ["dynamic", "weight_only"])
+    def test_uncalibrated_dynamic_or_weight_only_path_loads(self, activation_mode, quantizer):
+        dynamic = activation_mode == "dynamic"
+        loader = _make_loader(
+            QuantAlgo.NVFP4, dynamic_weight_quant=True, force_dynamic_quantization=dynamic
+        )
+        module = _StubLinear(QuantAlgo.NVFP4, force_dynamic_quantization=dynamic)
+        if activation_mode == "weight_only":
+            module.quant_method = W4A16NVFP4LinearMethod()
+        loader.load_linear_weights(module, "blocks.0.attn1.to_q", [_bf16_weights()])
+        quantizer.assert_called_once()
+        assert "input_scale" not in module.loaded[0]
+        assert module.force_dynamic_quantization == dynamic
+
+    def test_excluded_nvfp4_layer_needs_no_activation_scale(self, quantizer):
+        loader = _make_loader(
+            QuantAlgo.NVFP4, dynamic_weight_quant=True, exclude_modules=["proj_out"]
+        )
+        module = _StubLinear()
+        weight_dict = _bf16_weights()
+        loader.load_linear_weights(module, "proj_out", [weight_dict])
+        quantizer.assert_not_called()
+        assert module.loaded == [weight_dict]

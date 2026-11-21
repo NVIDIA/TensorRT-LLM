@@ -37,6 +37,7 @@ from tensorrt_llm.visual_gen.args import (
     CompilationConfig,
     CpuOffloadConfig,
     CudaGraphConfig,
+    LinearQuantConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
     SeaCacheConfig,
@@ -315,7 +316,20 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         if isinstance(user_quant, dict) and user_quant.get("quant_algo") is not None:
             return cls.load_diffusion_quant_config(user_quant)
         if isinstance(user_quant, QuantConfig) and user_quant.quant_algo is not None:
-            return user_quant, None, False, False
+            ignore_steps = (
+                user_quant.ignore_steps if isinstance(user_quant, LinearQuantConfig) else []
+            )
+            # Keep the validated typed fields and resolve loading modes through the shared parser.
+            _, layer_quant_config, dynamic_weights, dynamic_activations = (
+                cls.load_diffusion_quant_config(
+                    {
+                        "quant_algo": user_quant.quant_algo,
+                        "dynamic": bool(ignore_steps),
+                        "ignore_steps": ignore_steps,
+                    }
+                )
+            )
+            return user_quant, layer_quant_config, dynamic_weights, dynamic_activations
         if isinstance(checkpoint_quant, dict):
             return cls.load_diffusion_quant_config(checkpoint_quant)
         return QuantConfig(), None, False, False
@@ -335,7 +349,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         """
         quant_algo_str = quant_config_dict.get("quant_algo")
         quant_algo = None
-        if quant_algo_str:
+        if isinstance(quant_algo_str, QuantAlgo):
+            quant_algo = quant_algo_str
+        elif quant_algo_str:
             algo_map = {
                 "FP8": QuantAlgo.FP8,
                 "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
@@ -387,11 +403,18 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 dynamic_activation_quant = True
 
-        quant_config = QuantConfig(
+        quant_config = LinearQuantConfig(
             quant_algo=quant_algo,
             group_size=group_size,
             exclude_modules=quant_config_dict.get("ignore"),
+            ignore_steps=quant_config_dict.get("ignore_steps", []),
         )
+
+        if quant_config.ignore_steps and not dynamic_weight_quant:
+            raise ValueError(
+                "quant_config.ignore_steps requires a quant_algo and dynamic weight "
+                "quantization from a BF16/FP16 checkpoint (dynamic: true)."
+            )
 
         # TODO: Per-layer config (None for now - future: parse mixed precision settings)
         layer_quant_config = None
@@ -823,9 +846,13 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
             FP8RowwiseLinearMethod.use_tunable_quantize = True
 
+        recipe = attention_cfg.quant_attention_config
+        needs_quant_ignore_state = any(
+            getattr(quant[0], "ignore_steps", []) for quant in transformer_quant_configs.values()
+        ) or (recipe is not None and bool(recipe.ignore_steps))
         attention_metadata_state = (
             create_attention_metadata_state()
-            if attention_cfg.backend in ("TRTLLM", "FLASHINFER")
+            if attention_cfg.backend in ("TRTLLM", "FLASHINFER") or needs_quant_ignore_state
             else None
         )
 

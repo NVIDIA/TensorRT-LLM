@@ -223,10 +223,42 @@ class DynamicLinearWeightLoader:
             "quant_config."
         )
 
+    def _check_static_nvfp4_input_scale(
+        self,
+        module: Linear,
+        weight_dict: Dict[str, torch.Tensor],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
+    ) -> None:
+        """Require calibration data when NVFP4 activations use a static scale."""
+        if (
+            quant_algo != QuantAlgo.NVFP4
+            or not getattr(
+                getattr(module, "quant_method", None), "quantizes_nvfp4_activations", False
+            )
+            or module.force_dynamic_quantization
+        ):
+            return
+
+        input_scale = weight_dict.get("input_scale")
+        if (
+            input_scale is None
+            or input_scale.numel() != 1
+            or not torch.isfinite(input_scale).all()
+            or not (input_scale > 0).all()
+        ):
+            raise ValueError(
+                f"Static NVFP4 activation quantization for module '{name}' requires a calibrated "
+                "'input_scale' tensor containing one finite, positive value in every checkpoint "
+                "weight entry. Load-time weight quantization does not calibrate activations. "
+                "Provide the calibrated scale or explicitly set "
+                "quant_config.config_groups.<group>.input_activations.dynamic: true."
+            )
+
     def _should_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
     ) -> bool:
-        """Decide if weight should be dynamically quantized at load time."""
+        """Decide whether a checkpoint weight needs load-time quantization."""
         if not self.dynamic_weight_quant or quant_algo is None:
             return False
 
@@ -256,6 +288,29 @@ class DynamicLinearWeightLoader:
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
 
         return False
+
+    def _validate_linear_step_ignore_weight_loading(
+        self, weight_dict: Dict[str, torch.Tensor], quant_algo: QuantAlgo, name: str
+    ) -> None:
+        """Validate source weights and load-time quantization support for Linear step ignore."""
+        weight = weight_dict.get("weight")
+        if (
+            not self.dynamic_weight_quant
+            or weight is None
+            or weight.dtype not in _HIGH_PRECISION_DTYPES
+        ):
+            raise ValueError(
+                f"quant_config.ignore_steps requires original BF16/FP16 weights and "
+                f"load-time weight quantization (dynamic: true) for module '{name}'; "
+                "a pre-quantized checkpoint cannot restore the original BF16 precision."
+            )
+        if not self._should_dynamic_quantize(weight_dict, quant_algo, name):
+            raise ValueError(
+                "`ignore_steps` requires load-time weight quantization (`dynamic: true`). "
+                f"Load-time weight quantization ({quant_algo.name}) is not supported for "
+                f"module '{name}'. The checkpoint provides a {weight.dtype} weight, "
+                "but the VisualGen loader has no load-time quantizer for this algorithm."
+            )
 
     def _maybe_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
@@ -360,6 +415,11 @@ class DynamicLinearWeightLoader:
         self, module: Linear, name: str, weight_dicts: List[Dict[str, torch.Tensor]]
     ) -> None:
         """Load weights into Linear module with optional quantization."""
+        from .transformer_quant_dispatcher import current_weight_reuse
+
+        reuse = current_weight_reuse(self.model_config.component_name)
+        if reuse is not None and id(module) in reuse.reused_modules:
+            return
         module_quant_config = getattr(module, "quant_config", None)
         if module_quant_config is not None:
             quant_algo = module_quant_config.quant_algo
@@ -370,6 +430,14 @@ class DynamicLinearWeightLoader:
         # that do not carry the expected scale tensors.
         for weight_dict in weight_dicts:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
+            self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
+
+        if quant_algo is not None and (
+            (reuse is not None and reuse.require_dynamic_weights)
+            or getattr(self.quant_config, "ignore_steps", [])
+        ):
+            for weight_dict in weight_dicts:
+                self._validate_linear_step_ignore_weight_loading(weight_dict, quant_algo, name)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER

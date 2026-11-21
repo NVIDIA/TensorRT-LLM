@@ -107,7 +107,9 @@ class FluxJointAttention(Attention):
         )
 
         self.requires_static_e4m3_attention = bool(
-            requests_static_e4m3_attention and self.attn_backend == "CUTEDSL"
+            requests_static_e4m3_attention
+            and self.attn_backend == "CUTEDSL"
+            and not self._quantization_excluded
         )
         self.register_buffer(
             "_static_q_dequant_scale", torch.empty((), dtype=torch.float32), persistent=False
