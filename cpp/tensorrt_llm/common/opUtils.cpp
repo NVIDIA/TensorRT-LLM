@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
@@ -29,7 +30,9 @@
 #include <cuda_fp8.h>
 
 #include <functional>
+#include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -163,8 +166,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         ++groupRank;
     }
     TLLM_CHECK(static_cast<size_t>(groupRank) < group.size());
+    auto nativeMemory = std::make_shared<tensorrt_llm::common::NativeMemoryRecord>();
     std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
-        [](ncclComm_t* comm)
+        [nativeMemory](ncclComm_t* comm)
         {
             if (!comm)
             {
@@ -201,7 +205,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 
             // STEP 2: Always free the pointer memory (regardless of whether *comm was valid)
             delete comm;
+            tensorrt_llm::common::recordNativeRelease(*nativeMemory);
         });
+    auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.graphUsageMode = 1;
@@ -209,6 +215,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #else
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+    // With NCCL_RUNTIME_CONNECT=0 (set above) NCCL allocates its connection buffers here and reports no size.
+    *nativeMemory = tensorrt_llm::common::recordNativeAllocationMeasured(
+        tensorrt_llm::common::nativeMemoryLabels::kNcclCommunicators, freeBefore);
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     if (common::nccl_util::isNcclWindowSupported())
     {

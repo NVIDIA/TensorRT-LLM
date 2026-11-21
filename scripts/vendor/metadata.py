@@ -71,7 +71,7 @@ def _pr_reference(
     )
 
 
-def parse(body: str, vendor_name: str, upstream_repo: str) -> dict:
+def parse(body: str, vendor_name: str, upstream_repo: str, *, lock: str = promote._LOCK) -> dict:
     """Read exactly one marked block and validate the selected vendor's inputs."""
     if len(body) > 65536:
         raise Diagnostic(
@@ -208,7 +208,7 @@ def parse(body: str, vendor_name: str, upstream_repo: str) -> dict:
             "Invalid vendor keys under `vendors`: "
             + ", ".join(field(name) for name in invalid_names)
             + ".",
-            "Use the exact vendor names from `3rdparty/vendor_sources.lock.yaml` as "
+            f"Use the exact vendor names from `{lock}` as "
             "string keys under `vendors` in the PR description.",
         )
     entry = entries[vendor_name]
@@ -460,6 +460,7 @@ def match(
     include: tuple[str, ...] = ("**/*",),
     upstream_repo: str | None = None,
     vendor_name: str = "VENDOR_NAME",
+    lock: str = promote._LOCK,
 ) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Match a linear source range against fetched immutable upstream PR snapshots.
 
@@ -471,7 +472,7 @@ def match(
     if not commits:
         raise Diagnostic(
             "Source update has no new commits to attribute.",
-            "Check the source SHA in `3rdparty/vendor_sources.lock.yaml`. Pin the intended "
+            f"Check the source SHA in `{lock}`. Pin the intended "
             "new source commit, or remove the unnecessary source update from this PR.",
         )
     source_parents = {}
@@ -673,7 +674,7 @@ def resolve(
     cache: Path,
 ) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Fetch only Git data into a private bare cache and resolve declared PRs."""
-    promote._check_selection(previous, reviewed)
+    promote._check_selection(previous, reviewed, lock=gh.lock)
     cache.mkdir(parents=True, exist_ok=True)
     if not (cache / "HEAD").exists():
         promote._git(cache, "init", "--bare", "--quiet")
@@ -701,7 +702,7 @@ def resolve(
         f"and rebase the temporary source branch {field(reviewed.branch)} onto its latest "
         f"tip without merge commits, not just the consumer lock's pin `{previous.commit}`. "
         "Then use `scripts/vendor/manage.py` to update "
-        "`3rdparty/vendor_sources.lock.yaml` and the vendored snapshot to the rebased SHA, "
+        f"`{gh.lock}` and the vendored snapshot to the rebased SHA, "
         "and push the source branch and consumer PR. Editing metadata alone will not fix this."
     )
     if not common:
@@ -757,4 +758,5 @@ def resolve(
         include=reviewed.include,
         upstream_repo=gh.upstream_repo,
         vendor_name=gh.vendor_name,
+        lock=gh.lock,
     )
