@@ -136,6 +136,9 @@ l0_cpu:
   - unittest/_torch/sampler/test_stop_criteria.py
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
+  - unittest/_torch/executor/test_profile_window_filenames.py
+  - unittest/_torch/executor/test_workflow_profiler.py
+  - unittest/test_profiler.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
