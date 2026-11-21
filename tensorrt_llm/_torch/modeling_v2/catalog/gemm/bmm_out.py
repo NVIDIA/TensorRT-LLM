@@ -21,10 +21,14 @@ class BmmOut(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # deepseek-r1's MLA is the only caller, and it uses the op twice per layer
+    # deepseek-r1's MLA is the only caller. Decode uses the op twice per layer
     # in opposite orientations: absorbing the nope half of q into the latent
     # space on the way in, and projecting the latent attention output back out
-    # to v. Batch is the head count (128, replicated under attention DP).
+    # to v. Context uses it to expand the latent KV per head: `a` is the latent
+    # broadcast over heads (batch stride 0), `b` a transposed view of the
+    # weight, and `out` a strided view into the buffer the FMHA reads -- the
+    # nope half of K, or the v half of a packed [k_nope | v] row. Batch is the
+    # head count (128, replicated under attention DP).
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode, q_nope -> latent: [H, 1, nope] @ [H, nope, kv_lora]",
@@ -37,6 +41,34 @@ class BmmOut(OpWrapper):
         Cell(
             why="prefill token count, the same absorbing orientation",
             spec=dict(batch=128, m=2048, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
+        ),
+        Cell(
+            why="context K expansion: broadcast latent @ k_b^T into the nope half of K",
+            spec=dict(
+                batch=128,
+                m=4096,
+                k=512,
+                n=128,
+                dtype=torch.bfloat16,
+                transposed_out=True,
+                broadcast_a=True,
+                transposed_b=True,
+                out_row=(128 * 192, 192, 0),
+            ),
+        ),
+        Cell(
+            why="context V expansion: broadcast latent @ v_b into the v half of [k_nope | v]",
+            spec=dict(
+                batch=128,
+                m=4096,
+                k=512,
+                n=128,
+                dtype=torch.bfloat16,
+                transposed_out=True,
+                broadcast_a=True,
+                transposed_b=True,
+                out_row=(128 * 256, 128, 128 * 128),
+            ),
         ),
         Cell(
             why="contiguous out, to separate the op's own correctness from the "

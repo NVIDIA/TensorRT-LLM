@@ -134,6 +134,25 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
 
 _KV_RESIDUAL_DIM = 0
 
+
+def _context_kv(
+    latent: torch.Tensor, k_b: torch.Tensor, v_b_t: torch.Tensor, k: torch.Tensor
+) -> torch.Tensor:
+    """Expand the context rows' compressed KV `latent` [tkv, kv_lora] per head straight into
+    where the context FMHA reads it: k_nope into the nope half of `k` [tkv, H, nope + rope],
+    and v into the v half of a [tkv, H * (nope + v_dim)] buffer, whose row stride the FMHA
+    hard-codes as the packed [k_nope | v] width. Returns the v view. `k_b` [H, nope, kv_lora]
+    and `v_b_t` [H, kv_lora, v_dim] are the per-head halves of `kv_b`."""
+    tkv, heads, nope = latent.shape[0], k_b.shape[0], k_b.shape[1]
+    v_dim = v_b_t.shape[2]
+    a = latent.unsqueeze(0).expand(heads, tkv, latent.shape[1])
+    bmm_out(a=a, b=torch.transpose(k_b, 1, 2), out=torch.transpose(k[..., :nope], 0, 1))
+    kv = latent.new_empty([tkv, heads * (nope + v_dim)])
+    v = kv[:, heads * nope :]
+    bmm_out(a=a, b=v_b_t, out=torch.transpose(v.unflatten(-1, (heads, v_dim)), 0, 1))
+    return v
+
+
 # Both kv scale tensors stay None: None is read as a scale of exactly 1.0, which is what this
 # checkpoint's k_scale/v_scale hold and the only value the context flavors are correct at.
 # The MLA path reads the rope table and nothing else — rope_scale_type, rope_scale, the two
@@ -417,6 +436,13 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
+    def _ctx_reads_cache(self, md) -> bool:
+        """Whether this step's context rows attend over KV already in the paged cache, the
+        cached-context flavor: KV reuse or chunked prefill is on and some context request
+        starts past position 0. Otherwise the fresh flavor, which reads no KV back and
+        ropes K inside the attention call. A host-side integer, decided per step."""
+        return self._cached_ctx and md.num_ctx_cached_tokens > 0
+
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
         """Which target runs this step.
 
@@ -512,7 +538,7 @@ class _LayerWeights(NamedTuple):
     """One layer's weights at this rank's share, as the views the ops read.
 
     GEMM operands are `.t()` views; `k_b` / `v_b_t` are the two halves of this rank's
-    `kv_b` in the shapes the absorbed-q and expand BMMs take; `norm_next` is the *next*
+    `kv_b` in the shapes the absorbed-q, expand and context KV-expansion BMMs take; `norm_next` is the *next*
     layer's input norm (the final norm on the last layer). The MoE fields are None on the
     dense layers.
     """
@@ -522,7 +548,6 @@ class _LayerWeights(NamedTuple):
     qb: torch.Tensor
     kva: torch.Tensor
     kv_norm: torch.Tensor
-    kvb: torch.Tensor
     k_b: torch.Tensor
     v_b_t: torch.Tensor
     o: torch.Tensor
@@ -603,7 +628,6 @@ def _layer_views(core: DeepseekV3DefaultModelingV2) -> list[_LayerWeights]:
                 qb=w[f"l{i}_qb"].t(),
                 kva=w[f"l{i}_kva"].t(),
                 kv_norm=w[f"l{i}_kv_norm"],
-                kvb=kvb.t(),
                 k_b=kvb[:hn].reshape(d.heads, d.nope, d.kv_lora),
                 v_b_t=torch.transpose(kvb[hn:].reshape(d.heads, d.v_dim, d.kv_lora), 1, 2),
                 o=w[f"l{i}_o"].t(),
@@ -705,7 +729,6 @@ class _MtpWeights(NamedTuple):
     qb: torch.Tensor
     kva: torch.Tensor
     kv_norm: torch.Tensor
-    kvb: torch.Tensor
     k_b: torch.Tensor
     v_b_t: torch.Tensor
     o: torch.Tensor
@@ -737,7 +760,6 @@ def _mtp_views(core: DeepseekV3DefaultModelingV2) -> _MtpWeights:
         qb=w[f"l{j}_qb"].t(),
         kva=w[f"l{j}_kva"].t(),
         kv_norm=w[f"l{j}_kv_norm"],
-        kvb=kvb.t(),
         k_b=kvb[:hn].reshape(d.heads, d.nope, d.kv_lora),
         v_b_t=torch.transpose(kvb[hn:].reshape(d.heads, d.v_dim, d.kv_lora), 1, 2),
         o=w[f"l{j}_o"].t(),
@@ -949,7 +971,7 @@ class PrefillTarget:
         gen_p = gen // gen_seqs if gen_seqs else 1
         ctx_kv_tokens = int(md.host_total_kv_lens[0])
         pad_rows = core._dp_pad_rows(md, num_tokens)
-        cached_ctx = core._cached_ctx
+        cached_ctx = core._ctx_reads_cache(md)
 
         attn_out = torch.empty([num_tokens, heads * v_dim], dtype=dt, device=dev)
         attn_ctx, attn_gen = torch.split(attn_out, [tc, gen], 0)
@@ -960,7 +982,7 @@ class PrefillTarget:
         # the cached-ctx flavor; the fresh flavor never reads it.
         tkv = ctx_kv_tokens
         k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
-        k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
+        k_pe_dst = k[..., nope:]
         fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
         fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
         fq_nope_t = torch.transpose(fq_nope, 0, 1)
@@ -1033,11 +1055,7 @@ class PrefillTarget:
                 ckv_full, _ = torch.split(ckv, [tc, gen], 0)
                 k_pe_full = None
                 latent_arg = latent_ctx
-            # The context FMHA hard-codes V's row stride as the full packed [k_nope | v]
-            # width and reads the column block, so V must stay this split view.
-            kv = cublas_mm(ckv_full, L.kvb)
-            k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
-            k_nope_dst.copy_(torch.reshape(k_nope, [tkv, heads, nope]))
+            v_view = _context_kv(ckv_full, L.k_b, L.v_b_t, k)
             if k_pe_full is not None:
                 k_pe_dst.copy_(
                     torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
@@ -1241,7 +1259,7 @@ class PrefillTarget:
         q_ctx, q_gen = torch.split(q, [tc, gen], 0)
         latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
-        if core._cached_ctx:
+        if core._ctx_reads_cache(md):
             # The ctx_* metadata fields exist only in this flavor.
             q_ctx = mla_rope_append_paged_kv_assign_q(
                 q=q_ctx,
@@ -1290,15 +1308,10 @@ class PrefillTarget:
             k_pe_full = None
             latent_arg = latent_ctx
         tkv = ctx_kv_tokens
-        # The context FMHA hard-codes V's row stride as the full packed [k_nope | v]
-        # width and reads the column block, so V must stay this split view.
-        kv = cublas_mm(ckv_full, M.kvb)
-        k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
         k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
-        k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
-        k_nope_dst.copy_(torch.reshape(k_nope, [tkv, heads, nope]))
+        v_view = _context_kv(ckv_full, M.k_b, M.v_b_t, k)
         if k_pe_full is not None:
-            k_pe_dst.copy_(
+            k[..., nope:].copy_(
                 torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
             )
         attn_ctx = thop_attention(
