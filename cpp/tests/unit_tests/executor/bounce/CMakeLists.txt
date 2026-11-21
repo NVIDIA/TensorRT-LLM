@@ -127,45 +127,37 @@ endif()
 
 # ---- Real-NIXL tests (need NIXL_ROOT). The bounce DATA PLANE is always real
 # NIXL — there is no loopback fake — so every test that drives the reactor
-# (transport, failure-path, e2e) lives here, sharing one source set + the
+# (transport, failure-path, e2e) lives here, using the production components and
 # bounceTestNixlNode.h helpers. ----
 if(NIXL_ROOT)
   # The reactor tests also need zmq for the control plane (cppzmq is fetched
-  # when NIXL is on); all of them share this source set + include/link sets.
-  # Same gate as the zmq-only tier above.
+  # when NIXL is on); all of them share these include/link dependencies. Same
+  # gate as the zmq-only tier above.
   if(BOUNCE_CPPZMQ_AVAILABLE)
-    set(BOUNCE_REACTOR_SRCS ${BOUNCE_DIR}/BounceTransport.cpp)
-    set(BOUNCE_TSAN_SRCS
-        ${BOUNCE_DIR}/BounceTransport.cpp
-        ${BOUNCE_DIR}/BounceTransferPlan.cpp
-        ${BOUNCE_DIR}/BuddyAllocator.cpp
-        ${BOUNCE_DIR}/CreditScheduler.cpp
-        ${BOUNCE_DIR}/BounceMessage.cpp
-        ${BOUNCE_DIR}/BounceArena.cpp
-        ${BOUNCE_DIR}/ExecPool.cpp
-        ${BOUNCE_DIR}/GatherScatterKernel.cu
-        ${BOUNCE_DIR}/ZmqControlChannel.cpp)
     set(BOUNCE_TEST_INCS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
     set(BOUNCE_TEST_LIBS tensorrt_llm_nixl_wrapper NIXL::nixl
                          ${NIXL_BUILD_LIBRARY} PkgConfig::TLLM_BOUNCE_ZMQ)
 
-    # One reactor test target: the bounce sources compiled in, plus the shared
-    # include/link sets.
+    # Reactor tests use the production component or its instrumented variant.
     function(add_bounce_reactor_test name src)
       cmake_parse_arguments(ARG "INSTRUMENTED" "" "" ${ARGN})
-      add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS
-                     "unit;full-stack;gpu")
       if(ARG_INSTRUMENTED)
-        target_sources(${name} PRIVATE ${BOUNCE_TSAN_SRCS})
+        set(reactor tllm::executor_bounce_reactor_tsan)
       else()
-        target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
-        target_link_libraries(
-          ${name}
-          PRIVATE tllm::executor_bounce_core tllm::executor_bounce_cuda
-                  tllm::executor_bounce_arena tllm::executor_bounce_control)
+        set(reactor tllm::executor_bounce_reactor)
       endif()
+      add_tllm_gtest(
+        ${name}
+        OWNER
+        executor
+        SOURCES
+        ${src}
+        LINK_LIBRARIES
+        ${reactor}
+        ${BOUNCE_TEST_LIBS}
+        LABELS
+        "unit;executor;bounce;integration;gpu")
       target_include_directories(${name} PRIVATE ${BOUNCE_TEST_INCS})
-      target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
     endfunction()
 
     # End-to-end transport over real RDMA (gather -> RDMA write -> scatter +
@@ -177,20 +169,49 @@ if(NIXL_ROOT)
                             bounceTransportFailureTest.cpp)
 
     # Optional ThreadSanitizer variant of the reactor concurrency test. The
-    # bounce sources + the test are instrumented; the shared libtensorrt_llm
-    # (linked for the logger) and CUDA runtime are left uninstrumented (TSan
-    # partial-instrumentation mode). Enable with -DBOUNCE_TSAN=ON and run with a
-    # suppressions file that ignores CUDA/driver/libtllm frames.
+    # bounce component and test are instrumented; the production NIXL wrapper,
+    # common helpers, and CUDA runtime are left uninstrumented. Enable with
+    # -DBOUNCE_TSAN=ON and use suppressions for CUDA/driver/runtime frames.
     option(BOUNCE_TSAN
            "Build a ThreadSanitizer variant of the bounce reactor test" OFF)
     if(BOUNCE_TSAN)
+      add_library(
+        tllm_executor_bounce_reactor_tsan STATIC EXCLUDE_FROM_ALL
+        ${BOUNCE_DIR}/BounceTransport.cpp
+        ${BOUNCE_DIR}/BounceTransferPlan.cpp
+        ${BOUNCE_DIR}/BuddyAllocator.cpp
+        ${BOUNCE_DIR}/CreditScheduler.cpp
+        ${BOUNCE_DIR}/BounceMessage.cpp
+        ${BOUNCE_DIR}/BounceArena.cpp
+        ${BOUNCE_DIR}/ExecPool.cpp
+        ${BOUNCE_DIR}/GatherScatterKernel.cu
+        ${BOUNCE_DIR}/ZmqControlChannel.cpp)
+      add_library(tllm::executor_bounce_reactor_tsan ALIAS
+                  tllm_executor_bounce_reactor_tsan)
+      target_link_libraries(
+        tllm_executor_bounce_reactor_tsan
+        PUBLIC tllm::common_cuda tllm::executor_transfer_agent NIXL::nixl
+               PkgConfig::TLLM_BOUNCE_ZMQ Threads::Threads
+        PRIVATE tllm::kv_cache_legacy)
+      target_include_directories(tllm_executor_bounce_reactor_tsan SYSTEM
+                                 PUBLIC ${BOUNCE_TEST_INCS})
+      target_compile_features(tllm_executor_bounce_reactor_tsan
+                              PUBLIC cxx_std_20)
+      target_compile_options(
+        tllm_executor_bounce_reactor_tsan
+        PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-error -fsanitize=thread -g>
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fsanitize=thread>)
+      target_link_options(tllm_executor_bounce_reactor_tsan INTERFACE
+                          -fsanitize=thread)
+      set_target_properties(
+        tllm_executor_bounce_reactor_tsan
+        PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+                   CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
       add_bounce_reactor_test(bounceTransportTsanTest
                               bounceTransportFailureTest.cpp INSTRUMENTED)
-      target_compile_options(
-        bounceTransportTsanTest
-        PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=thread -g>
-                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fsanitize=thread>)
-      target_link_options(bounceTransportTsanTest PRIVATE -fsanitize=thread)
+      target_compile_options(bounceTransportTsanTest PRIVATE -fsanitize=thread
+                                                             -g)
     endif()
 
     # Production-path e2e: bounce engaged via
@@ -198,11 +219,21 @@ if(NIXL_ROOT)
     # wrapper; this test only uses the public agent API (the zmq include is
     # needed only because the shared bounceTestNixlNode.h helpers pull in
     # ZmqControlChannel.h at compile time).
-    add_tllm_gtest(bounceAgentE2ETest SOURCES bounceAgentE2ETest.cpp FULL_STACK
-                   LABELS "unit;full-stack;gpu")
+    add_tllm_gtest(
+      bounceAgentE2ETest
+      OWNER
+      executor
+      SOURCES
+      bounceAgentE2ETest.cpp
+      LINK_LIBRARIES
+      tllm::executor_transfer_agent
+      tllm::common_cuda
+      tensorrt_llm_nixl_wrapper
+      NIXL::nixl
+      ${NIXL_BUILD_LIBRARY}
+      Threads::Threads
+      LABELS
+      "unit;executor;bounce;integration;gpu")
     target_include_directories(bounceAgentE2ETest PRIVATE ${BOUNCE_TEST_INCS})
-    target_link_libraries(
-      bounceAgentE2ETest PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl
-                                 ${NIXL_BUILD_LIBRARY})
   endif()
 endif()

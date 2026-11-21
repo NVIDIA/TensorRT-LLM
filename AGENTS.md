@@ -242,10 +242,6 @@ C++ integration fixtures build the collected tests with incremental native targe
 `cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
 legacy and full-stack executables. OWNER aggregates are component subsets and
 are not interchangeable with these directory targets.
-The Linux Release source-build fixture reuses the installed CI library for the
-RNN formatter test. CI source and wheel use the same commit and image per
-architecture. Link/load errors fail the tests. Direct CMake builds use source
-libraries unless explicitly configured otherwise.
 `CONFIG_LINUX_X86_64_VANILLA` also builds `google-tests`
 and publishes the `cpp_test_bundle` CMake component as a separate
 `cpp-tests-<main-tar-name>` artifact. The main package does not include the test
