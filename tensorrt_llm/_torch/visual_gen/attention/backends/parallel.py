@@ -323,9 +323,10 @@ def _compiled_attention_with_replicated_kv_fake(
 
 def post_permute_5d_to_4d(out_5d, P):
     """5D [P, B, Sp, H/P, D] → 4D [B, P*Sp, H/P, D] (block-by-rank gather).
-    .contiguous() copies slot data out (layout-normalize for SDPA, decoupling
-    from IPC slot lifetime). Inductor fuses permute+contig with downstream
-    SDPA input prep."""
+    For contiguous inputs this is a view when B == 1: the permute only moves a
+    size-one dimension. Otherwise the contiguous call copies the permuted data.
+    Inductor can fuse layout normalization with downstream SDPA input prep.
+    """
     _P, Bt, Spt, HpP, Dt = out_5d.shape
     return out_5d.permute(1, 0, 2, 3, 4).contiguous().view(Bt, _P * Spt, HpP, Dt)
 
@@ -819,13 +820,20 @@ class UlyssesAttention(AttentionBackend):
                 process_group=self.process_group,
             )
 
-        # Fast path: one fused kernel replaces the eager post-A2A chain
-        # (6 ops for HND target: permute+reshape+contig + transpose+contig
-        # per Q/K/V; 3 ops for NHD target). bf16-only because the kernel is
-        # only instantiated for __nv_bfloat16.
+        # BF16 receives use the fused kernel except batch-one NHD for an opted-in
+        # backend, which reads receive-slot views.
+        # The kernel is only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        use_fused_post_unscatter = self.world_size > 1 and q_5d.dtype == torch.bfloat16
+        # Receive-slot views follow the cross-rank lifetime rule in _output_a2a.
+        post_unscatter_is_view = (
+            not is_hnd
+            and B_q == 1
+            and getattr(self.inner_backend, "accepts_unowned_inputs", False) is True
+        )
+        use_fused_post_unscatter = (
+            self.world_size > 1 and q_5d.dtype == torch.bfloat16 and not post_unscatter_is_view
+        )
         if use_fused_post_unscatter:
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
@@ -866,7 +874,13 @@ class UlyssesAttention(AttentionBackend):
         batch_size: int,
         seq_len_full: int,
     ) -> torch.Tensor:
-        """Reverse all-to-all: [B, S, H/P, D] → [B, S/P, H, D]"""
+        """Reverse all-to-all: [B, S, H/P, D] → [B, S/P, H, D].
+
+        For async receive views, every rank must finish its backend reads before
+        entering this same-group collective. Keep the collective and its wait
+        ahead of the next _issue_async in eager and compiled execution, ordering
+        peers' next writes after these reads.
+        """
         inner_layout = self.inner_backend.preferred_layout
 
         if inner_layout == AttentionTensorLayout.HND:

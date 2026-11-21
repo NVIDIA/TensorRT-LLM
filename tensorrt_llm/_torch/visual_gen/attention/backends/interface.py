@@ -20,7 +20,7 @@ Defines shared types, enums, and the abstract base class for attention backends.
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 
@@ -84,6 +84,21 @@ class AttentionBackend(ABC):
     via ``**kwargs``.
     """
 
+    accepts_unowned_inputs: ClassVar[bool] = False
+    """Whether async Ulysses may pass its receive-slot views to this backend.
+
+    This controls ``UlyssesAttention.forward_async`` only, not ownership of
+    inputs from other attention paths. An opt-in must cover every configuration
+    and subclass that inherits it. Do not retain these inputs or call
+    ``record_stream`` on them or their views, directly or through helpers.
+    Join all side-stream reads back to the caller's stream before returning.
+
+    An opt-in requires native ``cudaMallocAsync`` and side-stream verification,
+    passing ``test_batch_one_receive_view_lifetime`` in eager and CUDA graph
+    modes, and unequal-Q/KV Q-first and hardware ordering-negative-control
+    coverage. The lifetime test alone does not establish allocator compatibility.
+    """
+
     def __call__(self, *args, **kwargs) -> torch.Tensor:
         return self.forward(*args, **kwargs)
 
@@ -96,6 +111,8 @@ class AttentionBackend(ABC):
         **kwargs,
     ) -> torch.Tensor:
         """Attention over ``q``, ``k``, ``v`` in the backend's ``preferred_layout``.
+
+        Async-Ulysses receive-slot usage is governed by ``accepts_unowned_inputs``.
 
         Keyword contract shared by every backend (unknown keywords are ignored):
 
