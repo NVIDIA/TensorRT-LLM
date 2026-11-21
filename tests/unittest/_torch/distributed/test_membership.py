@@ -21,6 +21,7 @@ import contextlib
 import logging
 import os
 import random
+import resource
 import select
 import signal
 import socket
@@ -1641,21 +1642,41 @@ def test_late_wakeup_keeps_live_authority(monkeypatch):
         liveness, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + skipped_s[0])
     )
     calls = []
+    readable = liveness._readable
 
-    def select_with_late_wakeup(watched, *rest):
+    def readable_with_late_wakeup(watched, timeout_s):
         calls.append(watched)
         if len(calls) > 1:
-            return select.select(watched, *rest)
+            return readable(watched, timeout_s)
         # The authority's line has arrived, but the thread wakes only after the silence timeout.
-        select.select(watched[:1], [], [])
+        readable(watched[:1], None)
         skipped_s[0] += 2 * silence_s
-        return [], [], []
+        return []
 
-    monkeypatch.setattr(liveness, "select", SimpleNamespace(select=select_with_late_wakeup))
+    monkeypatch.setattr(liveness, "_readable", readable_with_late_wakeup)
     errors = []
     with _scripted_client(errors, resend_s=0.1):
         _until(lambda: errors or len(calls) > 2)
         assert not errors
+
+
+def test_client_serves_descriptors_above_select_limit():
+    """Keep a client whose liveness socket and wake pipe are numbered above select's limit."""
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 2048:
+        pytest.skip("the open-file limit is below 2048")
+    placeholders = []
+    try:
+        while not placeholders or placeholders[-1] < 1024:
+            placeholders.append(os.open(os.devnull, os.O_RDONLY))
+        errors = []
+        with _scripted_client(errors, resend_s=0.1) as client:
+            assert client._sock.fileno() > 1024
+            time.sleep(1.0)
+            assert not errors
+            assert client._thread.is_alive()
+    finally:
+        for fd in placeholders:
+            os.close(fd)
 
 
 def test_callback_error_logged_with_traceback(monkeypatch):
