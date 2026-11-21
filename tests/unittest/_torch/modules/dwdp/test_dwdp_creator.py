@@ -196,7 +196,7 @@ def _create(
     Args:
         mode: ``"expert"`` (expert DWDP alone), ``"attached"`` (dense DWDP attached to it) or
             ``"standalone"`` (dense DWDP alone).
-        kv_cache: ``"estimated"``, ``"not_estimated"`` or ``"none"`` (a model without one).
+        kv_cache: ``"estimated"`` or ``"not_estimated"``.
         real_dense_manager: Standalone, the creator builds a real ``DenseDwdpManager``, whose
             setup only logs; the model engine logs the SM reserve it is built with.
         copy_mode: Standalone, ``dwdp_config.copy_mode``.
@@ -265,7 +265,6 @@ def _create(
         engine = _DummyModelEngine(
             attn_runtime_features=attn_runtime_features, kv_cache_quant_algo=QuantAlgo.NO_QUANT
         )
-        engine.model.model_config.is_generation = kv_cache != "none"
         return engine
 
     dense_mode = {"attached": DenseMode.ATTACHED, "standalone": DenseMode.STANDALONE}.get(mode)
@@ -278,7 +277,7 @@ def _create(
         create_py_executor_instance=create_py_executor_instance,
         create_py_executor_resources=create_py_executor_resources,
         ModelEngine=model_engine,
-        _load_config_and_create_checkpoint_loader=lambda llm_args, _dir: (llm_args, None),
+        _load_config_and_create_checkpoint_loader=lambda llm_args, _dir: (llm_args, None, True),
         _get_mapping=lambda _: Mapping(),
         dwdp_global_rank=lambda: 0,
         get_calibrator=_DummyCalibrator,
@@ -320,7 +319,7 @@ def _create(
     return log, manager
 
 
-@pytest.mark.parametrize("kv_cache", ["estimated", "not_estimated", "none"])
+@pytest.mark.parametrize("kv_cache", ["estimated", "not_estimated"])
 @pytest.mark.parametrize("mode", ["expert", "attached", "standalone"])
 def test_only_the_serving_phase_gets_the_manager(
     monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str
@@ -348,7 +347,6 @@ def test_only_the_serving_phase_gets_the_manager(
             "rebind",
         ],
         "not_estimated": ["setup", final_kv_cache],
-        "none": ["setup"],
     }[kv_cache]
     if kv_cache != "estimated":
         expected.append(("executor", *given))
@@ -372,7 +370,7 @@ def test_expert_dwdp_accepts_a_tactic_naming_an_implementation_with_dwdp(
     monkeypatch: pytest.MonkeyPatch, tactic: str
 ) -> None:
     """A tactic leaves moe_config.backend at AUTO, so the tactic is what the launch checks."""
-    log, _ = _create(monkeypatch, "expert", "none", moe_backend="AUTO", moe_tactic=tactic)
+    log, _ = _create(monkeypatch, "expert", "not_estimated", moe_backend="AUTO", moe_tactic=tactic)
 
     assert "setup" in log
 

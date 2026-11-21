@@ -738,7 +738,8 @@ def test_attention_mla_flashinfer(scenario: Scenario,
 
 @pytest.mark.parametrize("v2_kv_cache", [True, False],
                          ids=["v2_kv_cache", "v1_kv_cache"])
-def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
+def test_attention_mla_cute_dsl_autotune(
+        v2_kv_cache: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     """Cover the CuTe DSL MLA decode AutoTuner path.
 
     The plain test_attention_mla runs with the autotuner off, so the op
@@ -765,9 +766,7 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVMlaDecodeBlackwellRunner
 
-    # fp8 KV with (num_heads=128, seq_len_q=1) is admitted by the CuTe DSL
-    # perf gate from batch_size >= 64, so a 64-request decode batch routes
-    # the generation phase through cute_dsl_mla in the default lib order.
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "cute_dsl_mla,fallback")
     scenario = Scenario(kv_cache_dtype=torch.float8_e4m3fn,
                         num_layers=1,
                         kv_cache_tokens_per_block=tokens_per_block)
@@ -1481,6 +1480,12 @@ class _Prefixes:
         # The hooks also read `enable_flash_mla` and `mixed_precision_staging`.
         self.enable_flash_mla = False
         self.mixed_precision_staging = None
+        # _invalidate_mla_scheduler_buffers consults these before recomputing
+        # the per-locality-domain splits; False short-circuits that branch.
+        self.locality_domain_enabled = False
+        self.locality_domain_cute_dsl_mla_split_plans = None
+        self.kv_cache_manager = None
+        self.request_ids = None
         self._invalidate_mla_scheduler_buffers()
 
     def rebuild(self):

@@ -692,7 +692,8 @@ class HelixAllToAllNative:
 
     Exchanges data along the cp_size dimension:
     - partial_o: [..., cp_size, kv_lora_rank] half-precision
-    - softmax_stats: [..., cp_size, 2] float32
+    - softmax_stats: [..., cp_size, stats_width] float32, containing max/sum
+      pairs or compact base-2 LSE (one float per head)
     """
 
     # Global cache: mapping -> instance
@@ -744,16 +745,19 @@ class HelixAllToAllNative:
     def alltoall_native(self,
                         partial_o: torch.Tensor,
                         softmax_stats: torch.Tensor,
-                        zero_kv_mask: Optional[torch.Tensor] = None):
+                        zero_kv_mask: Optional[torch.Tensor] = None,
+                        is_lse: bool = False):
         """
         Perform all-to-all data exchange.
 
         Args:
             partial_o: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
-            softmax_stats: Tensor with shape [..., cp_size, 2], dtype float32.
+            softmax_stats: Tensor with shape [..., cp_size, stats_width], dtype float32.
             zero_kv_mask: Optional bool mask over the entry dimension, True
                 where this rank owns no KV. The sender rewrites those rows to a
                 no-op contribution, so the caller must not sanitize them itself.
+            is_lse: Whether softmax_stats contains compact base-2 LSE, rather
+                than max/sum pairs. Must agree on every rank.
 
         Returns:
             Tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs.
@@ -765,6 +769,7 @@ class HelixAllToAllNative:
             self.mapping.cp_rank,
             self.mapping.cp_size,
             zero_kv_mask,
+            is_lse,
         )
 
         return partial_o_out, softmax_stats_out

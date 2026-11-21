@@ -6,25 +6,35 @@
 # invoke the kernel hardware rather than the Python dispatch logic.
 
 import dataclasses
+import functools
+import gc
 import sys
+import threading
 import time
-from unittest.mock import MagicMock
+import weakref
+from typing import Any, Callable
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 import tensorrt_llm._torch.modules.low_m_gemm as _mod
 from tensorrt_llm._torch.autotuner import AutoTuner, TunableRunner, autotune
+from tensorrt_llm._torch.modules.linear import flashinfer_mxfp8_decode_graph_capture
 from tensorrt_llm._torch.modules.low_m_gemm import (
     _BACKEND_ENV,
     LOW_M_GEMM_OPT_IN_ATTR,
     LowMGemmDispatcher,
     _parse_enabled,
+    bf16_lowm_linear,
+    fp8_grouped_lowm,
     lowm_fp8_supported,
+    lowm_tiles,
+    mxfp8_lowm_index_query,
     mxfp8_lowm_linear,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
 
 # ---------------------------------------------------------------------------
 # Skip helpers — apply to tests that need hardware, not to mocked unit tests.
@@ -607,6 +617,484 @@ def test_fp8_lowm_rms_norm_matches_norm_then_gemm(m):
     torch.testing.assert_close(actual, ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
     separate = mxfp8_lowm_linear((normalized * gamma.float()).to(torch.bfloat16), w, s).float()
     torch.testing.assert_close(actual, separate, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
+    # Output RoPE rotates each pair with the row scale on both partners.
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    rope = (positions, torch.randn(64, 2, 32, device="cuda", generator=g), 128)
+    roped = mxfp8_lowm_linear(x, w, s, rms_norm=(gamma, eps), rope=rope).float()
+    separate = mxfp8_lowm_linear(
+        (normalized * gamma.float()).to(torch.bfloat16), w, s, rope=rope
+    ).float()
+    torch.testing.assert_close(roped, separate, rtol=1e-2, atol=1e-2 * separate.abs().max().item())
+
+
+@_skip_no_lowm_fp8
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [1, 5, 8])
+def test_fp8_lowm_bf16_dequant_and_swap_ab_bitwise(m, monkeypatch):
+    """The BF16 weight conversion and, at <= 8 rows, two tiles per CTA with swapped MMA operands give
+    the plain kernel's bits (MXFP8 with and without the RMS norm, and the grouped FP8 GEMM)."""
+    g = torch.Generator(device="cuda").manual_seed(m)
+
+    def run(options, fn):
+        monkeypatch.setattr(_mod, "lowm_mma_options", lambda: options)
+        return fn()
+
+    def bits(y):
+        return y.view(torch.int16)
+
+    plain, dequant, both = (False, False), (True, False), (True, True)
+    n, k, edge = 4096, 1280, 64
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(110, 125, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    # The first output columns take the NaN codes and full-range scale bytes; the rest stay finite.
+    w.view(torch.uint8)[: edge // 2, ::97] = 0x7F
+    w.view(torch.uint8)[: edge // 4, 1::97] = 0xFF
+    s[edge // 2 : edge] = torch.randint(
+        0, 256, (edge // 2, k // 32), device="cuda", dtype=torch.uint8, generator=g
+    )
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    gamma = (torch.rand(k, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    tiles = 2 if m <= 8 else 1
+    for norm in (None, (gamma, 1e-6)):
+        ref = run(plain, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm))
+        assert torch.isfinite(ref[:, edge:]).all()
+        assert torch.equal(
+            bits(run(dequant, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm))), bits(ref)
+        )
+        swapped = run(both, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm, n_tiles=tiles))
+        assert torch.equal(bits(swapped), bits(ref))
+    # Split outputs whose boundary falls inside a CTA's two tiles.
+    split = run(both, lambda: torch.cat(mxfp8_lowm_linear(x, w, s, split_n=1032, n_tiles=tiles), 1))
+    assert torch.equal(bits(split), bits(run(plain, lambda: mxfp8_lowm_linear(x, w, s))))
+
+    groups, rank, head_dim, heads = 2, 1024, 512, 8
+    depth = heads * head_dim
+    wa = (torch.randn(groups * rank, depth, device="cuda", generator=g) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    sa = torch.exp2(
+        torch.randint(-12, -4, (groups * rank // 128, depth // 128), device="cuda", generator=g)
+    ).float()
+    sa[0, :4] = torch.tensor([0.3, 1.0 + 2**-9, 3e-3, 2.0**-130], device="cuda")
+    xa = torch.randn(m, groups * depth, device="cuda", generator=g).to(torch.bfloat16)
+    positions = torch.randint(0, 4096, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(4096, 2, 32, device="cuda", generator=g)
+    rope = (positions, cos_sin, head_dim)
+    ref = run(plain, lambda: fp8_grouped_lowm(xa, wa, sa, rank, inverse_rope=rope))
+    swapped = run(
+        both, lambda: fp8_grouped_lowm(xa, wa, sa, rank, inverse_rope=rope, n_tiles=tiles)
+    )
+    assert torch.equal(bits(swapped), bits(ref))
+
+
+@_skip_no_lowm_fp8
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [1, 12])
+def test_fp8_lowm_index_query_matches_packed_rope_projection(m):
+    """The packed index queries are ``pack_index_queries_split`` of the RoPE'd projection, bit for
+    bit, with zero, tiny, huge, NaN and infinite rows."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        pack_index_queries_split,
+    )
+
+    n, k = 4096, 1280
+    g = torch.Generator(device="cuda").manual_seed(m)
+    w, s = torch.ops.trtllm.mxfp8_quantize(
+        (torch.randn(n, k, device="cuda", generator=g) * 0.05).to(torch.bfloat16), True
+    )
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    for row, scale in zip(range(1, m), (0.0, 1e-30, 1e30, float("nan"), float("inf"))):
+        x[row] *= scale
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(64, 2, 32, device="cuda", generator=g)
+    query = mxfp8_lowm_linear(x, w, s, rope=(positions, cos_sin, 128), scale_swizzled=True)
+    expected = pack_index_queries_split(query.view(m, n // 128, 128))
+    for got, want in zip(mxfp8_lowm_index_query(x, w, s, positions, cos_sin), expected):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_blackwell_datacenter(),
+    reason="the shared expert stores the SwiGLU on SM100/SM103",
+)
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [6])
+def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
+    """The full-TP shared-expert piece's gate_up GEMM stores the clamped SwiGLU: the bits of the
+    GEMM, the separate SwiGLU launch and the down GEMM, eagerly and in graph replays."""
+    from tensorrt_llm._torch.models.modeling_deepseekv4 import full_tp_shared_expert_forward
+    from tensorrt_llm._torch.modules import swiglu as swiglu_module
+
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    limit, k, inter = 10.0, 5120, 320
+    g = torch.Generator(device="cuda").manual_seed(m * 1000 + inter)
+
+    def weight(n, kk):
+        w = (torch.randn(n, kk, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+        s = torch.randint(115, 128, (n, kk // 32), device="cuda", dtype=torch.uint8, generator=g)
+        return w, s
+
+    (w13, s13), (w2, s2) = weight(2 * inter, k), weight(k, inter)
+    x = torch.empty(m, k, device="cuda", dtype=torch.bfloat16)
+
+    def new_input(scale):
+        x.copy_(torch.randn(m, k, device="cuda", generator=g) * scale)
+        x[0] *= 16  # past the clamp limit
+
+    def separate():
+        gate_up = mxfp8_lowm_linear(x, w13, s13)
+        return mxfp8_lowm_linear(swiglu_module.swiglu(gate_up, swiglu_limit=limit), w2, s2)
+
+    def no_swiglu(*args, **kwargs):
+        raise AssertionError("the shared expert launched the separate SwiGLU")
+
+    def folded():
+        with monkeypatch.context() as patch:
+            patch.setattr(swiglu_module, "swiglu", no_swiglu)
+            return full_tp_shared_expert_forward(x, (w13, s13, w2, s2), limit)
+
+    new_input(2)
+    assert torch.equal(folded(), separate())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = folded()
+    for scale in (1, 4, 8):
+        new_input(scale)
+        graph.replay()
+        assert torch.equal(out, separate())
+
+
+def _lowm_call(variant: str, m: int) -> Callable[[], Any]:
+    """A small-M MMA GEMM call of ``variant`` on ``m`` rows, as a no-argument function. Calls
+    with ``lowm_tiles`` tiles swap their MMA operands at <= 8 rows where the GPU does."""
+    g = torch.Generator(device="cuda").manual_seed(m)
+    n, k = 512, 1024
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(115, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(64, 2, 32, device="cuda", generator=g)
+    if variant == "rope":
+        return lambda: mxfp8_lowm_linear(x, w, s, rope=(positions, cos_sin, 128))
+    if variant == "rms_norm":
+        gamma = (torch.rand(k, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+        return lambda: mxfp8_lowm_linear(x, w, s, rms_norm=(gamma, 1e-6), n_tiles=lowm_tiles(n, m))
+    if variant == "split_n":
+        return lambda: mxfp8_lowm_linear(x, w, s, split_n=128, n_tiles=lowm_tiles(n, m))
+    if variant == "swiglu_out":
+        return lambda: mxfp8_lowm_linear(x, w, s, swiglu_out_limit=10.0)
+    if variant == "index_query":
+        ws, ss = torch.ops.trtllm.mxfp8_quantize(
+            (torch.randn(n, k, device="cuda", generator=g) * 0.05).to(torch.bfloat16), True
+        )
+        return lambda: mxfp8_lowm_index_query(x, ws, ss, positions, cos_sin)
+    if variant == "grouped_inverse_rope":
+        groups = 2
+        xg = torch.randn(m, groups * k, device="cuda", generator=g).to(torch.bfloat16)
+        block = torch.exp2(torch.randint(-3, 3, (n // 128, k // 128), device="cuda", generator=g))
+        tiles = lowm_tiles(n, m, n // groups)
+        return lambda: fp8_grouped_lowm(
+            xg, w, block.float(), n // groups, (positions, cos_sin, 128), n_tiles=tiles
+        )
+    wb = torch.randn(n, k, device="cuda", generator=g).to(torch.bfloat16)
+    return lambda: bf16_lowm_linear(x, wb)
+
+
+@_skip_no_lowm_fp8
+@pytest.mark.parametrize("m", [3, 5, 13, 17, 40, 50])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "rope",
+        "rms_norm",
+        "split_n",
+        "swiglu_out",
+        "index_query",
+        "grouped_inverse_rope",
+        "bf16",
+    ],
+)
+def test_eager_rows_run_the_row_bucket_kernel_bitwise(
+    variant: str, m: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eager call runs the kernel of its row bucket on rows padded with an earlier call's, and a
+    CUDA graph captured after it runs that kernel without compiling; a decode-graph call runs the
+    kernel of its exact rows, which later eager calls reuse. The real rows of all four results carry
+    the same bits."""
+    kernel_rows = []
+    mma_kernel = _mod._mma_kernel
+    compiled_mma = _mod._compiled_mma
+
+    def record(m: int, *args: Any, **kwargs: Any) -> tuple[Any, int]:
+        fn, rows = mma_kernel(m, *args, **kwargs)
+        kernel_rows.append(rows)
+        return fn, rows
+
+    monkeypatch.setattr(_mod, "_MMA_SIGNATURES", {})
+    monkeypatch.setattr(_mod, "_MMA_BUILT", set())
+    monkeypatch.setattr(_mod, "_MMA_ROUTES", {})
+    bucket = {3: 3, 5: 5, 13: 16, 17: 32, 40: 48, 50: 64}[m]
+    if bucket > m:
+        # Leaves other rows in the staging rows this call pads with.
+        _lowm_call(variant, bucket - 1)()
+    monkeypatch.setattr(_mod, "_mma_kernel", record)
+    call = _lowm_call(variant, m)
+    eager = call()
+    misses = compiled_mma.cache_info().misses
+    # A padded call under capture keeps its buffer to the capture, out of the staging cache.
+    monkeypatch.setattr(_mod, "_A_STAGING", threading.local())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    assert compiled_mma.cache_info().misses == misses
+    assert not _mod._staging_buffers()
+    graph.replay()
+    torch.cuda.synchronize()
+    with flashinfer_mxfp8_decode_graph_capture():
+        exact = call()
+    reused = call()
+    assert kernel_rows == [bucket, bucket, m, m]
+    results = [r if isinstance(r, tuple) else (r,) for r in (eager, captured, exact, reused)]
+    if variant == "split_n":
+        assert [t.shape for t in results[0]] == [(m, 128), (m, 384)]
+    if variant == "index_query":
+        data, scales = results[0]
+        assert data.shape == (m, 4, 64) and data.dtype == torch.int8
+        assert scales.shape == (m, 4, 4) and scales.dtype == torch.uint8
+    assert len({len(r) for r in results}) == 1
+    for outputs in zip(*results):
+        for t in outputs:
+            assert t.shape == outputs[0].shape and t.shape[0] == m and t.is_contiguous()
+            assert torch.equal(t.view(torch.uint8), outputs[0].view(torch.uint8))
+    assert len(_mod._MMA_SIGNATURES) == 1
+
+
+@_skip_no_lowm_fp8
+def test_prewarm_compiles_every_row_bucket_of_eager_calls_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prewarm compiles the eleven buckets an eager call did not reach and none of a GEMM that
+    only a decode graph ran. Afterwards no eager row count compiles, and eager calls of the decode
+    graph's row count run its exact kernel."""
+    compiled_mma = functools.lru_cache(maxsize=None)(_mod._compiled_mma.__wrapped__)
+    monkeypatch.setattr(_mod, "_compiled_mma", compiled_mma)
+    monkeypatch.setattr(_mod, "_MMA_SIGNATURES", {})
+    monkeypatch.setattr(_mod, "_MMA_BUILT", set())
+    monkeypatch.setattr(_mod, "_MMA_ROUTES", {})
+
+    def rows(m: int) -> torch.Tensor:
+        return torch.zeros(m, 512, device="cuda", dtype=torch.bfloat16)
+
+    eager_w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    graph_w = torch.randn(72, 512, device="cuda").to(torch.bfloat16)
+    bf16_lowm_linear(rows(3), eager_w)
+    with flashinfer_mxfp8_decode_graph_capture():
+        bf16_lowm_linear(rows(3), graph_w)
+    assert compiled_mma.cache_info().misses == 2
+    assert _mod.prewarm_mma_row_buckets() == (11, 1)
+    assert compiled_mma.cache_info().misses == 13
+    for m in range(1, 65):
+        bf16_lowm_linear(rows(m), eager_w)
+    bf16_lowm_linear(rows(3), graph_w)
+    assert compiled_mma.cache_info().misses == 13
+    bf16_lowm_linear(rows(13), graph_w)
+    assert compiled_mma.cache_info().misses == 14
+
+
+@_skip_no_lowm_fp8
+def test_prewarm_stops_at_the_bucket_that_holds_the_most_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a row bound, the prewarm compiles the buckets up to the first one that holds it."""
+    compiled_mma = functools.lru_cache(maxsize=None)(_mod._compiled_mma.__wrapped__)
+    monkeypatch.setattr(_mod, "_compiled_mma", compiled_mma)
+    for name, fresh in (("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set()), ("_MMA_ROUTES", {})):
+        monkeypatch.setattr(_mod, name, fresh)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    bf16_lowm_linear(torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16), w)
+    assert _mod.prewarm_mma_row_buckets(8) == (7, 1)
+    assert _mod.prewarm_mma_row_buckets(20) == (2, 1)
+    assert _mod.prewarm_mma_row_buckets() == (2, 1)
+    assert compiled_mma.cache_info().misses == 12
+
+
+@_skip_no_lowm_fp8
+def test_a_bucket_route_yields_to_an_exact_kernel_built_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An eager call that compiles its bucket's kernel while another thread builds the exact one
+    leaves later eager calls of its row count on the exact kernel."""
+    for name, fresh in (("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set()), ("_MMA_ROUTES", {})):
+        monkeypatch.setattr(_mod, name, fresh)
+    compiled_mma = _mod._compiled_mma
+    compiling_bucket, exact_built = threading.Event(), threading.Event()
+
+    def bucket_after_exact(rows: int, *args: Any, **kwargs: Any) -> Any:
+        if rows == 16:
+            compiling_bucket.set()
+            assert exact_built.wait(timeout=60)
+        return compiled_mma(rows, *args, **kwargs)
+
+    monkeypatch.setattr(_mod, "_compiled_mma", bucket_after_exact)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    x = torch.randn(13, 512, device="cuda").to(torch.bfloat16)
+    eager = threading.Thread(target=bf16_lowm_linear, args=(x, w))
+    eager.start()
+    try:
+        assert compiling_bucket.wait(timeout=60)
+        with flashinfer_mxfp8_decode_graph_capture():
+            bf16_lowm_linear(x, w)
+    finally:
+        exact_built.set()
+        eager.join(timeout=60)
+    routes = [r for (m, _, graph), (_, r) in _mod._MMA_ROUTES.items() if m == 13 and not graph]
+    assert routes == [13]
+
+
+@_skip_no_lowm_fp8
+def test_padded_calls_run_in_and_out_of_inference_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A padded call's staging buffer is a normal tensor: calls in and out of inference mode both
+    write it, and both match the exact-row kernel."""
+    for name, fresh in (
+        ("_A_STAGING", threading.local()),
+        ("_MMA_SIGNATURES", {}),
+        ("_MMA_BUILT", set()),
+    ):
+        monkeypatch.setattr(_mod, name, fresh)
+    monkeypatch.setattr(_mod, "_MMA_ROUTES", {})
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    x = torch.randn(13, 512, device="cuda").to(torch.bfloat16)
+    with torch.inference_mode():
+        inside = bf16_lowm_linear(x, w)
+    outside = bf16_lowm_linear(x, w)
+    with flashinfer_mxfp8_decode_graph_capture():
+        exact = bf16_lowm_linear(x, w)
+    assert torch.equal(inside, exact) and torch.equal(outside, exact)
+
+
+@_skip_no_lowm_fp8
+def test_padded_calls_keep_the_staging_buffer_out_of_autograd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A padded call copies its rows detached: the staging buffer it reuses never joins the autograd
+    graph of an input that requires gradients."""
+    for name, fresh in (
+        ("_A_STAGING", threading.local()),
+        ("_MMA_SIGNATURES", {}),
+        ("_MMA_BUILT", set()),
+        ("_MMA_ROUTES", {}),
+    ):
+        monkeypatch.setattr(_mod, name, fresh)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    with torch.enable_grad():
+        for _ in range(2):
+            x = torch.randn(13, 512, device="cuda").to(torch.bfloat16).requires_grad_()
+            bf16_lowm_linear(x, w)
+    (buf,) = _mod._staging_buffers().values()
+    assert not buf.requires_grad and buf.grad_fn is None
+
+
+@_skip_no_lowm_fp8
+def test_padded_calls_of_two_threads_on_one_stream_keep_their_own_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each host thread pads into its own staging buffer: a padded call that another thread submits
+    to the same stream between this call's copy and its launch cannot overwrite this launch's rows."""
+    for name, fresh in (
+        ("_A_STAGING", threading.local()),
+        ("_MMA_SIGNATURES", {}),
+        ("_MMA_BUILT", set()),
+        ("_MMA_ROUTES", {}),
+    ):
+        monkeypatch.setattr(_mod, name, fresh)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    x = {name: torch.randn(13, 512, device="cuda").to(torch.bfloat16) for name in "AB"}
+    expected = {name: bf16_lowm_linear(x[name], w) for name in "AB"}
+    mma_kernel = _mod._mma_kernel
+    copied, submitted = threading.Event(), threading.Event()
+
+    def launch_after_the_other_submits(m: int, *args: Any, **kwargs: Any) -> tuple[Any, int]:
+        fn, rows = mma_kernel(m, *args, **kwargs)
+        if threading.current_thread().name != "A":
+            return fn, rows
+
+        def launch(*launch_args: Any, **launch_kwargs: Any) -> Any:
+            copied.set()
+            assert submitted.wait(timeout=60)
+            return fn(*launch_args, **launch_kwargs)
+
+        return launch, rows
+
+    monkeypatch.setattr(_mod, "_mma_kernel", launch_after_the_other_submits)
+    out = {}
+    a = threading.Thread(target=lambda: out.update(A=bf16_lowm_linear(x["A"], w)), name="A")
+    a.start()
+    try:
+        assert copied.wait(timeout=60)
+        out["B"] = bf16_lowm_linear(x["B"], w)
+    finally:
+        submitted.set()
+        a.join(timeout=60)
+    torch.cuda.synchronize()
+    assert torch.equal(out["A"], expected["A"]) and torch.equal(out["B"], expected["B"])
+
+
+@_skip_no_lowm_fp8
+def test_prewarm_keeps_going_past_a_failed_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bucket that fails to compile is reported and left to its first call; the other buckets of
+    its GEMM and the other GEMMs still compile."""
+    compiled_mma = _mod._compiled_mma
+
+    def flaky(rows: int, *args: Any, **kwargs: Any) -> Any:
+        if rows == 16 and args[0] == 64:
+            raise RuntimeError("no compiler")
+        return compiled_mma(rows, *args, **kwargs)
+
+    monkeypatch.setattr(_mod, "_compiled_mma", flaky)
+    for name, fresh in (("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set()), ("_MMA_ROUTES", {})):
+        monkeypatch.setattr(_mod, name, fresh)
+    x = torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16)
+    for n in (64, 72):
+        bf16_lowm_linear(x, torch.randn(n, 512, device="cuda").to(torch.bfloat16))
+    with patch.object(_mod.logger, "warning") as warning:
+        assert _mod.prewarm_mma_row_buckets() == (2 * 11 - 1, 2)
+    warning.assert_called_once()
+    for signature in _mod._MMA_SIGNATURES:
+        for rows in _mod._MMA_ROW_BUCKETS:
+            failed = rows == 16 and signature[0][0] == 64
+            assert ((rows, signature) in _mod._MMA_BUILT) is not failed
+
+
+@_skip_no_lowm_fp8
+def test_cute_views_are_reused_per_tensor_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A base tensor's CuTe view is exported once per host thread and reused by that thread; another
+    thread, new storage, a view, or a dead tensor does not reuse it. A thread's cache goes with the
+    thread while the tensor lives on."""
+    monkeypatch.setattr(_mod, "_CUTE_VIEWS", threading.local())
+    t = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
+    first = _mod._cute_view(t)
+    assert _mod._cute_view(t) is first
+    other = []
+
+    def use_in_worker(u: torch.Tensor) -> None:
+        other.extend((_mod._cute_view(u), _mod._cute_view(u), weakref.ref(_mod._views())))
+
+    worker = threading.Thread(target=use_in_worker, args=(t,))
+    worker.start()
+    worker.join()
+    assert other[0] is other[1] and other[0] is not first
+    worker_cache = other[2]
+    other.clear()
+    gc.collect()
+    assert worker_cache() is None
+    t.data = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
+    assert _mod._cute_view(t) is not first
+    assert _mod._cute_view(t[:4]) is not _mod._cute_view(t[:4])
+    key = id(t)
+    del t
+    gc.collect()
+    assert key not in _mod._views()
 
 
 # ---------------------------------------------------------------------------

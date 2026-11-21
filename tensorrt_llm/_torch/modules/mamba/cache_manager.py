@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -23,18 +24,22 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaLayerCache,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
+    _is_disagg_context_server,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
-    ReplayLayout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+
+from .replay_metadata import ReplayMamba2Metadata
+from .replay_region import REPLAY_STATE_REGION, Mamba2ReplayRegion, ReplayLayout
 
 MIN_REPLAY_HISTORY_SIZE = 16
 # Per-layer replay history roles, in ReplayHistory attribute order.
@@ -491,17 +496,18 @@ class ReplayHistory:
                 rank_offset=self._seed_rank_offset,
             )
 
-    def update(self, batch: MambaAcceptanceBatch) -> None:
+    def update(self, batch: MambaAcceptanceBatch, replay_slots: torch.Tensor | None = None) -> None:
+        """Advance the bookkeeping of ``replay_slots`` and promote the accepted conv windows.
+
+        ``replay_slots`` are the generation rows' replay slots; ``None`` means
+        their destination state slots.
+        """
         metadata = self.get_replay_metadata()
         if metadata is None:
             raise RuntimeError("Mamba2 replay buffers are not bound")
         _advance_replay_state(
             metadata,
-            (
-                batch.destination_state_indices
-                if batch.replay_indices is None
-                else batch.replay_indices
-            ),
+            batch.destination_state_indices if replay_slots is None else replay_slots,
             batch.num_accepted_tokens,
             batch.is_dummy_request,
         )
@@ -589,14 +595,24 @@ def select_mamba2_state(
 
 
 class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
-    """Nemotron/Mamba2 geometry, replay selection and seed ownership."""
+    """Nemotron/Mamba2 geometry, replay selection and seed ownership.
+
+    The replay history lives in a region of its own, declared and indexed by
+    ``Mamba2ReplayRegion``.
+    """
 
     _speculative_state: Mamba2State | ReplayHistory
+    mamba_metadata_cls = ReplayMamba2Metadata
+    _replay_region: Mamba2ReplayRegion | None = None
+    _context_only = False
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
+        # A disaggregated context server never decodes and keeps no replay history.
+        self._context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
+        self._replay_region = None
         kwargs.setdefault("conv_state_layout", "x_b_c")
         super().__init__(*args, **kwargs)
 
@@ -627,11 +643,136 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
             state.validate(self._state_layout)
         return state
 
+    @override
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        providers = super()._region_providers()
+        if (
+            not isinstance(self._speculative_state, ReplayHistory)
+            or self._context_only
+            or not self.mamba_pp_layers
+        ):
+            return providers
+        self._replay_region = Mamba2ReplayRegion(
+            self._speculative_state,
+            self._state_layout,
+            self.layer_offsets,
+            self._index_mapper_capacity,
+            self.kv_cache_config.max_util_for_resume,
+        )
+        return (*providers, self._replay_region)
+
+    @override
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """The generation worker starts the replay history afresh."""
+        roles = super().get_disagg_ignored_roles()
+        if self._replay_region is not None:
+            roles |= self._replay_region.roles
+        return roles
+
+    @override
+    def _setup_model_state(self) -> None:
+        region = self._replay_region
+        if region is not None:
+            region.bind(
+                self._get_state_buffer,
+                self.layer_offsets,
+                self.get_region_group_ids(REPLAY_STATE_REGION),
+                self._host_state_indices.shape[0],
+                self.cuda_state_indices.device,
+            )
+        super()._setup_model_state()
+
+    @property
+    def replay_layer_group_id(self) -> int | None:
+        """Layer group of the replay history's own slots; None without replay."""
+        region = self._replay_region
+        return region.group_id if region is not None else None
+
+    @property
+    def cuda_replay_state_indices(self) -> torch.Tensor:
+        region = self._replay_region
+        return (
+            region.cuda_indices(self.cuda_state_indices)
+            if region is not None
+            else self.cuda_state_indices
+        )
+
+    def get_replay_state_indices(
+        self, request_ids: list[int] | None = None
+    ) -> torch.Tensor | list[int]:
+        """Replay slots like get_state_indices(), without touching the dummy mask."""
+        if request_ids is None:
+            return self.cuda_replay_state_indices
+        region = self._replay_region
+        if region is None or region.group_id is None:
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
+        return region.request_indices(request_ids)
+
+    @override
+    def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
+        super()._setup_state_indices(requests, num_contexts)
+        if self._replay_region is not None and self.local_num_mamba_layers:
+            self._replay_region.prepare(
+                requests,
+                self.kv_cache_map,
+                self.cuda_state_indices,
+                self._host_state_indices,
+                num_contexts,
+                self._skips_steady_state_index_upload,
+            )
+
+    @override
+    def _reset_context_mamba_slots(self, num_contexts: int) -> None:
+        if self._replay_region is None:
+            super()._reset_context_mamba_slots(num_contexts)
+        else:
+            self._replay_region.reset_context(
+                num_contexts, self.cuda_state_indices, self._host_state_indices
+            )
+
+    @override
+    def _update_model_state(self, batch: MambaAcceptanceBatch) -> None:
+        if self._replay_region is None:
+            super()._update_model_state(batch)
+        else:
+            self._replay_region.update(batch, self.cuda_state_indices)
+
+    @override
+    def free_resources(self, request, pin_on_release: bool = False) -> None:
+        if self._replay_region is not None:
+            self._replay_region.release(request.py_request_id)
+        super().free_resources(request, pin_on_release)
+
+    @override
+    def shutdown(self) -> None:
+        if self._replay_region is not None:
+            self._replay_region.shutdown()
+        super().shutdown()
+
     @classmethod
     @override
-    def _estimate_private_replay_bytes_per_slot(
-        cls, model_config, mapping: Mapping, **kwargs
+    def _estimate_fixed_region_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config,
+        **kwargs,
     ) -> int:
+        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+            return 0
+        return Mamba2ReplayRegion.estimate_fixed_bytes(
+            cls._estimate_replay_bytes_per_slot(model_config, mapping, **kwargs),
+            mapping,
+            max_batch_size,
+            kv_cache_config.max_util_for_resume,
+            **kwargs,
+        )
+
+    @classmethod
+    def _estimate_replay_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        """Bytes of one replay slot across the local Mamba2 layers; 0 without replay."""
         spec_config = kwargs.get("spec_config")
         if spec_config is None:
             return 0

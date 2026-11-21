@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,15 +22,15 @@
 #include <cuda_fp8.h>
 #include <cutlass/array.h>
 #include <cutlass/half.h>
+#include <type_traits>
 
 namespace
 {
 
-template <typename T>
+template <typename T, int HeadSize>
 struct MergeSoftmaxTraits
 {
-    static constexpr int kQKNopeSize = 128;
-    static constexpr int kHeadSize = kQKNopeSize;
+    static constexpr int kHeadSize = HeadSize;
 
     static constexpr int kBytesPerElem = sizeof(T);
     static constexpr int kBytesPerLoad = 16;
@@ -38,6 +38,8 @@ struct MergeSoftmaxTraits
     static_assert((kHeadSize * kBytesPerElem) % kBytesPerLoad == 0,
         "kHeadSize * kBytesPerElem must be multiple of kBytesPerLoad (16Bytes)");
     static constexpr int kVecPerHead = (kHeadSize * kBytesPerElem) / kBytesPerLoad;
+    // All readers of aliased softmax stats must stay in the same warp as their writer.
+    static_assert(kVecPerHead <= 32, "In-place softmax stats require at most one warp per head");
     static constexpr int kTokenPerBlock
         = std::is_same_v<T, float> ? 4 : 8; // for each block, we fetch 8 token for fp16, 4 tokens for fp32.
     static constexpr int kNumThreads = kVecPerHead * kTokenPerBlock;
@@ -136,14 +138,40 @@ inline __device__ void dequantCopy(
     }
 }
 
-// merged_attn [q_total_len, H=128, D=128] (T)
-// merged_softmax_sum [q_total_len, H, 2] (float, max/sum)
-template <typename T>
-__global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softmax_stats, T const* pre_attn,
-    float2 const* pre_softmax_stats, T const* curr_attn, float2 const* curr_softmax_stats, int64_t const* cu_q_seq_len,
+// Normalizers are compact base-2 LSE or natural-log anchor/sum pairs.
+template <bool IsLse>
+__device__ __forceinline__ float2 loadMergeNormalizer(float const* stats, int index)
+{
+    if constexpr (IsLse)
+    {
+        float const lse = stats[index];
+        return make_float2(lse, lse == -INFINITY ? 0.F : 1.F);
+    }
+    else
+    {
+        return reinterpret_cast<float2 const*>(stats)[index];
+    }
+}
+
+template <bool IsLse>
+__device__ __forceinline__ void storeMergeNormalizer(float* stats, int index, float2 value)
+{
+    if constexpr (IsLse)
+    {
+        stats[index] = value.y > 0.F ? value.x + log2f(value.y) : -INFINITY;
+    }
+    else
+    {
+        reinterpret_cast<float2*>(stats)[index] = value;
+    }
+}
+
+template <typename T, int HeadSize, bool IsLse>
+__global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
+    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int64_t const* cu_q_seq_len,
     int64_t const* merge_op, int const num_heads, int const head_size)
 {
-    using KT = MergeSoftmaxTraits<T>;
+    using KT = MergeSoftmaxTraits<T, HeadSize>;
     int const batch_idx = static_cast<int>(blockIdx.y);
     int const head_idx = static_cast<int>(blockIdx.z);
 
@@ -168,8 +196,8 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
     {
         // load softmax stat
         int const global_softmax_stats_offset = (global_q_offset + local_token_idx) * num_heads + head_idx;
-        float2 curr_stats = curr_softmax_stats[global_softmax_stats_offset];
-        float2 pre_stats = pre_softmax_stats[global_softmax_stats_offset];
+        float2 curr_stats = loadMergeNormalizer<IsLse>(curr_softmax_stats, global_softmax_stats_offset);
+        float2 pre_stats = loadMergeNormalizer<IsLse>(pre_softmax_stats, global_softmax_stats_offset);
 
         // load attn
         typename KT::VecReader pre_attn_reader{};
@@ -187,11 +215,21 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
         // only copy curr attn and curr softmax sum
         if (merge_op_val == 2)
         {
+            if constexpr (IsLse)
+            {
+                if (curr_stats.y == 0.F)
+                {
+                    for (int i = 0; i < KT::kElemPerThread; ++i)
+                    {
+                        curr_attn_reader.data[i] = static_cast<T>(0.F);
+                    }
+                }
+            }
             *reinterpret_cast<decltype(merged_attn_reader.reader)*>(merged_attn + global_attn_offset + head_dim_idx)
                 = curr_attn_reader.reader;
             if (head_dim_idx == 0)
             {
-                merged_softmax_stats[global_softmax_stats_offset] = curr_stats;
+                storeMergeNormalizer<IsLse>(merged_softmax_stats, global_softmax_stats_offset, curr_stats);
             }
         }
         else
@@ -199,15 +237,39 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
             // merge attn and softmax stats
             float2 merged_stats;
             merged_stats.x = fmaxf(pre_stats.x, curr_stats.x);
-            float pre_shift = std::exp(pre_stats.x - merged_stats.x);
-            float curr_shift = std::exp(curr_stats.x - merged_stats.x);
+            float pre_shift;
+            float curr_shift;
+            if constexpr (IsLse)
+            {
+                pre_shift = pre_stats.y > 0.F ? exp2f(pre_stats.x - merged_stats.x) : 0.F;
+                curr_shift = curr_stats.y > 0.F ? exp2f(curr_stats.x - merged_stats.x) : 0.F;
+            }
+            else
+            {
+                pre_shift = std::exp(pre_stats.x - merged_stats.x);
+                curr_shift = std::exp(curr_stats.x - merged_stats.x);
+            }
             merged_stats.y = (pre_stats.y * pre_shift + curr_stats.y * curr_shift);
             for (int i = 0; i < KT::kElemPerThread; ++i)
             {
-                merged_attn_reader.data[i]
-                    = (static_cast<float>(pre_attn_reader.data[i]) * pre_stats.y * pre_shift
-                          + static_cast<float>(curr_attn_reader.data[i]) * curr_stats.y * curr_shift)
-                    / merged_stats.y;
+                if constexpr (IsLse)
+                {
+                    float const previous = pre_stats.y > 0.F
+                        ? static_cast<float>(pre_attn_reader.data[i]) * pre_stats.y * pre_shift
+                        : 0.F;
+                    float const current = curr_stats.y > 0.F
+                        ? static_cast<float>(curr_attn_reader.data[i]) * curr_stats.y * curr_shift
+                        : 0.F;
+                    merged_attn_reader.data[i]
+                        = static_cast<T>(merged_stats.y > 0.F ? (previous + current) / merged_stats.y : 0.F);
+                }
+                else
+                {
+                    merged_attn_reader.data[i]
+                        = (static_cast<float>(pre_attn_reader.data[i]) * pre_stats.y * pre_shift
+                              + static_cast<float>(curr_attn_reader.data[i]) * curr_stats.y * curr_shift)
+                        / merged_stats.y;
+                }
             }
             // write merged attn back to global memory
             *reinterpret_cast<decltype(merged_attn_reader.reader)*>(merged_attn + global_attn_offset + head_dim_idx)
@@ -215,9 +277,40 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
             // write merged softmax stats back to global memory
             if (head_dim_idx == 0)
             {
-                merged_softmax_stats[global_softmax_stats_offset] = merged_stats;
+                storeMergeNormalizer<IsLse>(merged_softmax_stats, global_softmax_stats_offset, merged_stats);
             }
         }
+    }
+}
+
+template <typename T, int HeadSize, bool IsLse>
+void launchMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
+    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
+    int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, cudaStream_t stream)
+{
+    using KT = MergeSoftmaxTraits<T, HeadSize>;
+    dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_q_seq_len, KT::kTokenPerBlock)), batch_size, num_heads);
+    dim3 block(KT::kNumThreads);
+
+    mergeAttnWithSoftmaxKernel<T, HeadSize, IsLse><<<grid, block, 0, stream>>>(merged_attn, merged_softmax_stats,
+        pre_attn, pre_softmax_stats, curr_attn, curr_softmax_stats, cu_q_seq_len, merge_op, num_heads, HeadSize);
+}
+
+template <typename T, int HeadSize>
+void dispatchMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
+    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
+    int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, cudaStream_t stream,
+    bool isLse)
+{
+    if (isLse)
+    {
+        launchMergeAttnWithSoftmax<T, HeadSize, true>(merged_attn, merged_softmax_stats, pre_attn, pre_softmax_stats,
+            curr_attn, curr_softmax_stats, batch_size, cu_q_seq_len, max_q_seq_len, merge_op, num_heads, stream);
+    }
+    else
+    {
+        launchMergeAttnWithSoftmax<T, HeadSize, false>(merged_attn, merged_softmax_stats, pre_attn, pre_softmax_stats,
+            curr_attn, curr_softmax_stats, batch_size, cu_q_seq_len, max_q_seq_len, merge_op, num_heads, stream);
     }
 }
 
@@ -296,7 +389,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// merged_attn [q_total_len, H=128, D=128] (T)
+// merged_attn [q_total_len, num_heads, head_size] (T)
 // merged_softmax_sum [q_total_len, H, 2] (float), the first part is the max value for each
 // row of P = QK^T, the second part is the softmax sum
 // if merge_op[b] == 0, we just skip this batch, if merge_op[b] == 1, we merge the pre-attn and curr-attn, if
@@ -306,17 +399,25 @@ template <typename T>
 void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
     float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
     int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size,
-    cudaStream_t stream)
+    cudaStream_t stream, bool isLse)
 {
-    using KT = MergeSoftmaxTraits<T>;
-    TLLM_CHECK_WITH_INFO(head_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
-
-    dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_q_seq_len, KT::kTokenPerBlock)), batch_size, num_heads);
-    dim3 block(KT::kNumThreads);
-
-    mergeAttnWithSoftmaxKernel<T><<<grid, block, 0, stream>>>(merged_attn,
-        reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2 const*>(pre_softmax_stats),
-        curr_attn, reinterpret_cast<float2 const*>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, head_size);
+    constexpr int kHeadSize128 = 128;
+    constexpr int kHeadSize256 = 256;
+    if (head_size == kHeadSize128)
+    {
+        dispatchMergeAttnWithSoftmax<T, kHeadSize128>(merged_attn, merged_softmax_stats, pre_attn, pre_softmax_stats,
+            curr_attn, curr_softmax_stats, batch_size, cu_q_seq_len, max_q_seq_len, merge_op, num_heads, stream, isLse);
+    }
+    else if constexpr (!std::is_same_v<T, float>)
+    {
+        TLLM_CHECK_WITH_INFO(head_size == kHeadSize256, "head dim should be 128 or 256 for FP16/BF16");
+        dispatchMergeAttnWithSoftmax<T, kHeadSize256>(merged_attn, merged_softmax_stats, pre_attn, pre_softmax_stats,
+            curr_attn, curr_softmax_stats, batch_size, cu_q_seq_len, max_q_seq_len, merge_op, num_heads, stream, isLse);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "head dim should be equal to 128 for FP32");
+    }
 }
 
 // load single chunk kv from kv_cache for each request
@@ -339,7 +440,7 @@ void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray c
     template void invokeMergeAttnWithSoftmax<T>(T * merged_attn, float* merged_softmax_stats, T const* pre_attn,       \
         float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,     \
         int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads,                  \
-        int const head_size, cudaStream_t stream);                                                                     \
+        int const head_size, cudaStream_t stream, bool isLse);                                                         \
     template void invokeMLALoadChunkedKV<T, T>(T * output_kv_ptr, T * output_k_pe_ptr, KVBlockArray const& kv_cache,   \
         int const num_contexts, int64_t const* cu_ctx_chunked_len, int64_t const* chunked_ld_global_offset,            \
         int lora_size, int rope_size, int max_seq_len, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);     \

@@ -22,6 +22,7 @@ import click
 
 from tensorrt_llm.logger import logger
 
+from .config import load_generator_config
 from .config import load_prompt_records as _load_prompt_records
 from .evaluators import build_image_evaluator as _build_image_evaluator
 from .generators import build_visual_generator as _build_visual_generator
@@ -182,12 +183,16 @@ class ImageGenerationEval:
             )
         generator_config = visual_gen_args or root_visual_gen_args
 
+        generator_options = load_generator_config(
+            generator_config,
+            explicit_cli_telemetry=root_config.get("explicit_cli_telemetry", False),
+        )
         prompt_ids, prompt_texts = _load_prompt_records(prompts, num_samples)
         output_path = Path(output_dir)
         generator = None
         evaluator_runtime = None
         try:
-            generator, generation_params = _build_visual_generator(model, generator_config)
+            generator, generation_params = _build_visual_generator(model, generator_options)
             evaluator_runtime = _build_image_evaluator(evaluator, evaluator_options)
             pipeline = ImageGenerationEvaluationPipeline(generator, evaluator_runtime)
             response = pipeline.run(

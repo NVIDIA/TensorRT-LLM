@@ -2005,6 +2005,26 @@ def hidden_extra_attrs(extra_attrs: Dict, keys: Tuple[str,
         extra_attrs.update(saved)
 
 
+def _key_exchange_max_rows(model_config: ModelConfig) -> int:
+    """Rows the TP key exchange of a one-model speculative worker is sized for.
+
+    The exchange takes the target rows (at most ``tokens_per_gen_step`` per
+    request: one per context request, the verified window per generation
+    request, PARD's 2K) and the draft rows (one per request and draft step, K
+    per request for a block drafter); a launch with more rows takes the NCCL
+    path of the same decision. Bounded by ``max_num_tokens``; without a known
+    batch bound (only Eagle and MTP configs carry ``_max_batch_size``), sized
+    by ``max_num_tokens``.
+    """
+    spec_config = model_config.spec_config
+    max_rows = model_config.max_num_tokens
+    max_batch_size = getattr(spec_config, "_max_batch_size", None)
+    if max_batch_size:
+        max_rows = min(max_rows,
+                       max_batch_size * spec_config.tokens_per_gen_step)
+    return max_rows
+
+
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
@@ -2078,7 +2098,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 from ..distributed import ll_exchange
                 key_exchange = ll_exchange.create_tp_key_exchange(
                     model_config.mapping,
-                    model_config.max_num_tokens,
+                    _key_exchange_max_rows(model_config),
                     fast_gumbel=self.spec_decode_fast_gumbel,
                     argmax_row_split=self.spec_decode_argmax_row_split)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
@@ -2199,6 +2219,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 key_exchange=key_exchange,
                 spec_decode_fast_paths=self.spec_decode_fast_paths)
             if self.spec_worker is not None:
+                self._enable_vocab_parallel_argmax(model_config, key_exchange)
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
                 # draft_model.model.d2t on every forward.
@@ -2207,6 +2228,31 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
+    def _enable_vocab_parallel_argmax(self, model_config: ModelConfig,
+                                      key_exchange) -> None:
+        """Let the spec worker take its greedy target and draft tokens from
+        vocabulary-sharded logits (cross-rank argmax, no logits all-gather)
+        where the worker and the LM head allow it, unless
+        ``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0``.
+
+        Collective over the TP group: the decision depends only on the
+        configuration, which every rank shares, and the key exchange is
+        built by every rank in step."""
+        from ..speculative.vocab_parallel import (is_vocab_sharded_lm_head,
+                                                  vocab_parallel_argmax_enabled)
+        mapping = model_config.mapping
+        if not (vocab_parallel_argmax_enabled()
+                and self.spec_worker.verifies_on_target_shard
+                and not mapping.has_pp() and mapping.cp_size == 1
+                and is_vocab_sharded_lm_head(self.lm_head)):
+            return
+        if key_exchange is None:
+            from ..distributed import ll_exchange
+            key_exchange = ll_exchange.create_tp_key_exchange(
+                mapping, _key_exchange_max_rows(model_config))
+        self.spec_worker.enable_vocab_parallel_argmax(self.lm_head,
+                                                      key_exchange)
+
     def setup_aliases(self) -> None:
         if (self.draft_model is not None
                 and getattr(self.draft_model, "shares_target_kv_cache", False)):
@@ -2214,6 +2260,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
+        if self.spec_worker is not None:
+            # Fused BF16 LM head + argmax + key exchange for greedy draft
+            # steps, from the current draft LM head weights.
+            self.spec_worker.build_fused_draft_head(self.draft_model)
         spec_config = self.spec_config
         if (self.spec_worker is not None and spec_config is not None
                 and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
@@ -2244,7 +2294,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata: SpecMetadata) -> Tuple[torch.Tensor, bool]:
         """The target logits the worker verifies, and whether they are this rank's vocabulary
         columns, which the worker samples without the head's gather."""
-        rows = hidden_states[spec_metadata.gather_ids]
+        gather_ids = spec_metadata.gather_ids
+        if (spec_metadata.skip_verify_row_gather
+                and attn_metadata.num_contexts == 0
+                and gather_ids.shape[0] == hidden_states.shape[0]):
+            # A generation-only step gathers every row in order.
+            rows = hidden_states
+        else:
+            rows = hidden_states[gather_ids]
         worker = self.spec_worker
         vocab_sharded = worker.takes_vocab_sharded_target_logits(
             attn_metadata, spec_metadata)

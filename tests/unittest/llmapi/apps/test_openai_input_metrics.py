@@ -148,7 +148,9 @@ async def test_total_includes_inline_preprocessing_but_not_generation(
         prompt_token_ids=[7, 8],
         aresult=AsyncMock(side_effect=complete),
         disaggregated_params=SimpleNamespace(
-            multimodal_embedding_handles=[{"tensor_size": [4, 8]}]
+            multimodal_embedding_handles=[{"tensor_size": [4, 8]}],
+            mrope_position_ids_handle=None,
+            mrope_position_deltas_handle=None,
         ),
     )
 

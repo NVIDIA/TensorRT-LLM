@@ -13,21 +13,19 @@
 # limitations under the License.
 """Sampler orchestration: the entry points the executor drives each step.
 
-Holds the :class:`Sampler` ABC and its ``SampleState`` types, the trivial
-early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
-:class:`EarlyStopWithMMResult` for the multimodal-encoder-only engine), and
-:class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
-sampling logic of its own beyond batching and orchestration: each feature
-(beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-seeds) lives in its own module and is held here as a handler, driven through
-``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
+Holds the :class:`Sampler` ABC and its ``SampleState`` types, and
+:class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no sampling logic of its own beyond
+batching and orchestration: each feature (beam search, penalties, token bans,
+top-p decay, finish reasons, log-probs, seeds) lives in its own module and is
+held here as a handler, driven through ``setup_sampler_step`` /
+``sample_async`` / ``update_requests``.
 """
 
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 
 import torch
 
@@ -36,7 +34,6 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
-from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.logger import logger
 
 from ...utils import torch_multi_arange
@@ -288,10 +285,6 @@ class Sampler(ABC, Generic[GenericSampleState]):
             return req.py_beam_width
         return 0
 
-    @abstractmethod
-    def is_generation_model(self) -> bool:
-        raise NotImplementedError
-
     def validate_request(self, request: LlmRequest) -> None:
         """Validate that the request can be processed by the sampler.
 
@@ -307,228 +300,6 @@ class Sampler(ABC, Generic[GenericSampleState]):
         Raises:
             Appropriate exception if request is not supported by sampler.
         """
-
-
-def _validate_single_forward_request(request: LlmRequest, max_num_tokens: Optional[int]) -> None:
-    """Reject a prompt that does not fit the one forward a non-generation request runs in."""
-    if max_num_tokens is not None and request.prompt_len > max_num_tokens:
-        raise ValueError(
-            context_length_exceeded_message(
-                max_context_length=max_num_tokens, num_prompt_tokens=request.prompt_len
-            )
-        )
-
-
-class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensors]]):
-    """
-    Use for skipping decoding step for non generation model,
-    such as encoder-only model (e.g., BERT) or reward models that only need context phase.
-
-    Args:
-        max_num_tokens: The engine's token budget. A request runs whole in one
-            forward, so a prompt longer than this is rejected; None skips the check.
-    """
-
-    SampleState: TypeAlias = SampleState[SampleStateTensors, SampleStateTensors]
-
-    def __init__(self, max_num_tokens: Optional[int] = None) -> None:
-        self.max_num_tokens = max_num_tokens
-
-    @override
-    def validate_request(self, request: LlmRequest) -> None:
-        _validate_single_forward_request(request, self.max_num_tokens)
-
-    @override
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, Any],
-        num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> SampleState:
-        host = SampleStateTensors(new_tokens=torch.empty(0))
-        assert not scheduled_requests.generation_requests
-        return self.SampleState(requests=scheduled_requests.context_requests, host=host)
-
-    @override
-    def update_requests(
-        self,
-        state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        assert isinstance(state, SampleState)
-        requests = state.requests
-        for idx, request in enumerate(requests):
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            # NOTE: This is a hack: set finish reason manually and set the beam 0
-            request.set_finished_reason(FinishReason.LENGTH, 0)
-
-    @override
-    def is_generation_model(self) -> bool:
-        return False
-
-
-@dataclass(kw_only=True)
-class MultimodalResult:
-    mm_embeddings: List[torch.Tensor]
-    # needed to torch.split the mm_embeddings into item-wise chunks
-    mm_embedding_lengths: List[List[int]]
-    # needed when requests mix text-only and multimodal ones
-    mm_embedding_request_indices: List[int]
-    # number of context requests in the batch
-    num_context_requests: int
-    # Can be used to include e.g. `mrope_position_ids`, etc.
-    extra_data: Optional[Dict[str, Any]] = None
-
-    def __post_init__(self) -> None:
-        num_embeddings = len(self.mm_embeddings)
-        metadata = (self.extra_data or {}).get("mm_embedding_metadata")
-        if metadata is not None and len(metadata) != num_embeddings:
-            raise ValueError("mm_embedding_metadata batch size does not match mm_embeddings")
-        num_lengths = len(self.mm_embedding_lengths)
-        if num_lengths != num_embeddings:
-            raise ValueError(
-                "mm_embedding_lengths batch size does not match mm_embeddings: "
-                f"{num_lengths} != {num_embeddings}"
-            )
-        num_request_indices = len(self.mm_embedding_request_indices)
-        if num_request_indices != num_embeddings:
-            raise ValueError(
-                "mm_embedding_request_indices batch size does not match "
-                f"mm_embeddings: {num_request_indices} != {num_embeddings}"
-            )
-        for result_index, (mm_embedding, mm_embedding_lengths) in enumerate(
-            zip(self.mm_embeddings, self.mm_embedding_lengths, strict=True)
-        ):
-            actual_rows = len(mm_embedding)
-            expected_rows = sum(mm_embedding_lengths)
-            if actual_rows != expected_rows:
-                raise ValueError(
-                    f"mm_embedding shape mismatch for result {result_index}: "
-                    f"{actual_rows} != {expected_rows}"
-                )
-        for request_index in self.mm_embedding_request_indices:
-            if request_index < 0 or request_index >= self.num_context_requests:
-                raise ValueError(
-                    "mm_embedding_request_indices contains an invalid request "
-                    f"index: {request_index} not in [0, {self.num_context_requests})"
-                )
-
-    @classmethod
-    def from_model_outputs(
-        cls, model_outputs: Dict[str, Any], num_context_requests: int
-    ) -> "MultimodalResult":
-        result_keys = {
-            "mm_embeddings",
-            "mm_embedding_lengths",
-            "mm_embedding_request_indices",
-        }
-        return cls(
-            mm_embeddings=model_outputs["mm_embeddings"],
-            mm_embedding_lengths=model_outputs["mm_embedding_lengths"],
-            mm_embedding_request_indices=model_outputs["mm_embedding_request_indices"],
-            num_context_requests=num_context_requests,
-            extra_data={
-                key: value for key, value in model_outputs.items() if key not in result_keys
-            },
-        )
-
-
-@dataclass(kw_only=True)
-class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors]):
-    data: MultimodalResult
-
-
-class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
-    """
-    Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
-
-    Args:
-        return_mm_results: Whether to attach the multimodal outputs to the
-            requests' results. Disable it on ranks whose responses never reach
-            the frontend: the results are exported as CUDA IPC handles, and
-            PyTorch keeps an exported allocation alive until a consumer opens
-            and releases its handle.
-        max_num_tokens: The engine's token budget. A request runs whole in one
-            forward, so a prompt longer than this is rejected; None skips the check.
-    """
-
-    SampleState: TypeAlias = SampleStateWithMMResult
-
-    def __init__(
-        self, return_mm_results: bool = True, max_num_tokens: Optional[int] = None
-    ) -> None:
-        self.return_mm_results = return_mm_results
-        self.max_num_tokens = max_num_tokens
-
-    @override
-    def validate_request(self, request: LlmRequest) -> None:
-        _validate_single_forward_request(request, self.max_num_tokens)
-
-    @override
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, Any],
-        num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> SampleState:
-        # from model_outputs to MultimodalResult
-        assert not scheduled_requests.generation_requests
-        data = MultimodalResult.from_model_outputs(
-            model_outputs, scheduled_requests.num_context_requests
-        )
-        return self.SampleState(requests=scheduled_requests.context_requests, data=data)
-
-    @override
-    def update_requests(
-        self,
-        state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        # resource_manager will not be used in this function, just for interface consistency.
-        assert isinstance(state, SampleState)
-        requests = state.requests
-        mm_embeddings = state.data.mm_embeddings
-        extra_data = state.data.extra_data or {}
-        mrope_position_ids = extra_data.get("mrope_position_ids", None)
-        mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
-        for request in requests:
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            # NOTE: This is a hack: set finish reason manually and set the beam 0
-            request.set_finished_reason(FinishReason.LENGTH, 0)
-
-        if not self.return_mm_results:
-            return
-
-        request_indices = state.data.mm_embedding_request_indices
-        for result_index, (request_index, mm_embedding) in enumerate(
-            zip(request_indices, mm_embeddings, strict=True)
-        ):
-            request = requests[request_index]
-            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
-
-            embedding_metadata = extra_data.get("mm_embedding_metadata")
-            if embedding_metadata is None:
-                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
-            else:
-                request.py_result.append_mm_embeddings(
-                    mm_embedding, mm_embedding_lengths, embedding_metadata[result_index]
-                )
-
-            # Store mrope data if available
-            if mrope_position_ids is not None and mrope_position_deltas is not None:
-                mrope_index = (
-                    request_index if len(mrope_position_ids) == len(requests) else result_index
-                )
-                request.py_result.set_mrope_position(
-                    mrope_position_ids[mrope_index],
-                    mrope_position_deltas[mrope_index],
-                )
-
-    @override
-    def is_generation_model(self) -> bool:
-        return False
 
 
 @dataclass(kw_only=True)
@@ -603,10 +374,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         to give logits post-processors each beam's real hypothesis.
         """
         return self._beam_search.start_beam_histories(requests)
-
-    @override
-    def is_generation_model(self) -> bool:
-        return True
 
     @dataclass(kw_only=True)
     @dataclass(kw_only=True)
@@ -2832,6 +2599,32 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return_log_probs = self._log_probs._return_log_probs(sampling_requests)
         if return_log_probs:
             self._log_probs._prepare_log_probs(sampling_requests)
+        # Raw logprobs come from the model's logits, but the embedding bias,
+        # penalties and token bans below rewrite logits_cuda in place. Keep a
+        # copy of the rows of the requests that ask for raw logprobs and use one
+        # of them, and put those rows back before the logprobs are read.
+        # Multi-beam requests are skipped, as in the raw-logit extraction of
+        # _sample_batched_by_strategy: their logprobs come from the beam history.
+        raw_rows_index_cuda: Optional[torch.Tensor] = None
+        raw_rows_cuda: Optional[torch.Tensor] = None
+        if return_log_probs:
+            raw_rows = [
+                row
+                for request, offset, num_tokens in zip(
+                    sampling_requests,
+                    sampling_requests_metadata.req_offsets.tolist(),
+                    sampling_requests_metadata.req_num_generated_tokens.tolist(),
+                )
+                if self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)]
+                and not (self._use_beam_search and request.py_beam_width != 1)
+                and self._request_rewrites_logits(request)
+                for row in range(offset, offset + num_tokens)
+            ]
+            if raw_rows:
+                raw_rows_index_cuda = torch.tensor(
+                    raw_rows, dtype=torch.int64, pin_memory=prefer_pinned()
+                ).to(logits_cuda.device, non_blocking=True)
+                raw_rows_cuda = logits_cuda.index_select(0, raw_rows_index_cuda)
 
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
@@ -2983,6 +2776,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         if return_log_probs:
+            if raw_rows_cuda is not None:
+                logits_cuda.index_copy_(0, raw_rows_index_cuda, raw_rows_cuda)
             self._log_probs._process_logprobs(
                 batched_sampling_result,
                 logits_cuda=logits_cuda,

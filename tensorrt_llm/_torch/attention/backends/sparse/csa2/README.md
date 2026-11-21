@@ -181,9 +181,13 @@ over the paged logits. Candidate consumers score only their published candidate
 blocks with DeepGEMM sparse MQA logits: straight from the index pages for decode
 with the exact radix TopK, which selects over the kernel's BF16 logits as they
 are, and over each context request's gathered prefix for prefill; they require
-SM100 and 32 index heads of 128D rows (see the hardware note above). Reuse layers
-consume logical selections from their index source and resolve current physical
-pages without recomputing indexer logits.
+SM100 and 32 index heads of 128D rows (see the hardware note above). Decode
+batches of more than 64 rows on SM100/SM103 select the same positions by ranking
+groups of 8 columns first
+(`kernels/blackwell/paged_mqa_logits/sparse_logits_topk_dsl.py`): every
+selected logit lies in the top_k groups with the best smallest key, so only their
+8 * top_k logits are ranked. Reuse layers consume logical selections from their
+index source and resolve current physical pages without recomputing indexer logits.
 
 CuTe DSL kernels in `kernel.py` handle the decode selection glue: one derives
 the native block table, visibility and page validity of an owner from its
@@ -195,6 +199,15 @@ expanded to ascending positions and DeepGEMM sparse block ids). The TopK module
 sits between the mask and the finalize launch, so exact, self-sampling and
 temporal GVR TopK all select over the same masked scores; a temporal prior that
 lands on a masked column is dropped before the GVR kernel seeds its threshold.
+
+On SM100/SM103, split-row decode batches without temporal GVR hints skip that
+chain from more than 64 rows on the candidate source (of 8-position candidate
+blocks) and from 256 rows on other Full layers: one `block_select.py` launch
+selects from the scorer's maxima of every 32 visible positions and, on the
+candidate source, also publishes the candidates. It ranks 32-position blocks,
+then 8-position blocks, then positions, ties lowest index first at every level,
+so it selects the masked TopK's positions up to the choice among exact ties at
+the k-th logit (and the publication's blocks up to ties at the k-th block).
 
 TopK is exact by default: eligible prefill of at least 8192 score columns uses
 the single-pass self-sampling engine, narrower prefill and decode the radix

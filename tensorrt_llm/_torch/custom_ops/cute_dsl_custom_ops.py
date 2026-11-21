@@ -12410,14 +12410,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      accept_cap=8192,
                      num_next_n_atoms=1,
                      atom=None,
-                     row_heads=0):
+                     row_heads=0,
+                     emit_block_max=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
                    emit_cand_bucketed, accept_cap, num_next_n_atoms, atom,
-                   row_heads)
+                   row_heads, emit_block_max)
             if key in cls.kernel_cache:
                 return
 
@@ -12574,6 +12575,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         stride_order=(1, 0),
                         assumed_align=4)
 
+            block_max32_fake = None
+            row_visible_fake = None
+            if emit_block_max:
+                block_max32_fake = cute.runtime.make_fake_tensor(
+                    cutlass.Float32, (cute.sym_int(), cute.sym_int()),
+                    stride=(cute.sym_int64(), 1))
+                row_visible_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), ), stride_order=(0, ))
+
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -12599,6 +12609,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 emit_cand_bucketed=emit_cand_bucketed,
                 accept_cap=accept_cap,
                 row_heads=row_heads,
+                emit_block_max=emit_block_max,
             )
 
             compiled = cute.compile(
@@ -12625,6 +12636,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_ctl=cand_ctl_fake,
                 cand_idx_t=cand_idx_fake,
                 cand_cur=cand_cur_fake,
+                block_max32=block_max32_fake,
+                row_visible=row_visible_fake,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
@@ -12663,6 +12676,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_next_n_atoms: int = 1,
             atom: Optional[int] = None,
             row_heads: int = 0,
+            block_max32_out: Optional[torch.Tensor] = None,
+            row_visible: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -12712,7 +12727,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         or emit_cand or emit_cand_bucketed):
                     raise ValueError(
                         "Split query rows need FP32, one epilogue sub-tile, "
-                        "one atom and no emission")
+                        "one atom and no GVR emission")
             split_rows = H // row_heads if row_heads else 1
             # num_next_n_atoms / atom: in-kernel split, as in the FP8 runner.
             atom = validate_atom_split(next_n, H, num_next_n_atoms, atom,
@@ -12910,13 +12925,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_idx_out = None
                 cand_cur_out = None
 
+            # Maxima of every 32 visible logits of a row, for the CSA2 block selection.
+            emit_block_max = block_max32_out is not None
+            assert (row_visible is not None) == emit_block_max, (
+                "block maxima and the rows' visible lengths go together")
+            if emit_block_max:
+                rows = B * next_n * split_rows
+                columns = aligned_max_ctx // 32
+                block_max_ok = (not emit_block_meta
+                                and block_max32_out.dtype == torch.float32
+                                and block_max32_out.stride(1) == 1
+                                and block_max32_out.shape[0] == rows
+                                and block_max32_out.shape[1] >= columns
+                                and row_visible.dtype == torch.int32
+                                and row_visible.is_contiguous()
+                                and row_visible.numel() == rows)
+                assert block_max_ok, (
+                    "block maxima need an fp32 [rows, >= aligned ctx / 32] output "
+                    "and int32 [rows] visible lengths")
+
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
                    remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
                    emit_seed_counts, seed_packed, emit_cand, cand_cap,
                    emit_cand_bucketed, accept_cap, num_next_n_atoms, atom,
-                   row_heads)
+                   row_heads, emit_block_max)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -12939,7 +12973,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     accept_cap=accept_cap,
                     num_next_n_atoms=num_next_n_atoms,
                     atom=atom,
-                    row_heads=row_heads)
+                    row_heads=row_heads,
+                    emit_block_max=emit_block_max)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -12948,11 +12983,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          context_lens, schedule_meta, num_phys_blocks, B,
                          block_max_out, hit_stats_out, hit_bitmap, seed_thr,
                          seed_counts_out, cand_out, cand_ctl_out, cand_idx_out,
-                         cand_cur_out)
+                         cand_cur_out, None, None)
                 return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                      context_lens, schedule_meta, num_phys_blocks, exp_B, None,
-                     None, None, None, None, None, None, None, None)
+                     None, None, None, None, None, None, None, None,
+                     block_max32_out, row_visible)
             return logits
 
     # NOTE: the optional emission tensors ARE written by the kernel but must
@@ -12983,6 +13019,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_next_n_atoms: int = 1,
         atom: Optional[int] = None,
         row_heads: int = 0,
+        block_max32_out: Optional[torch.Tensor] = None,
+        row_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -13034,7 +13072,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_cur_out=cand_cur_out,
             num_next_n_atoms=num_next_n_atoms,
             atom=atom,
-            row_heads=row_heads)
+            row_heads=row_heads,
+            block_max32_out=block_max32_out,
+            row_visible=row_visible)
         # with emission on the runner returns a tuple; the op returns
         # logits only (emission buffers are caller-owned)
         return ret[0] if isinstance(ret, tuple) else ret
@@ -13063,6 +13103,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_next_n_atoms: int = 1,
         atom: Optional[int] = None,
         row_heads: int = 0,
+        block_max32_out: Optional[torch.Tensor] = None,
+        row_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
@@ -15999,6 +16041,63 @@ if IS_CUTLASS_DSL_AVAILABLE:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
             return mat_a.new_empty(shape, dtype=torch.bfloat16)
+
+        # Prefill-sized MXFP8 GEMMs take one SM107 tile instead of autotuning the full tactic space per shape.
+        _MXFP8_PREFILL_TILE_SM107 = ((512, 256, 128), (256, 256, 64), (4, 2))
+
+        def _mxfp8_prefill_tactic_sm107(
+            runner: CuteDSLMXFP8RubinLinear,
+            inputs: list[torch.Tensor],
+        ) -> Optional[tuple]:
+            """Validate just the fixed prefill tile, including M-dependent cluster feasibility."""
+            if (get_sm_version() != 107 or inputs[0].ndim != 2
+                    or inputs[1].ndim != 2):
+                return None
+            m, k = inputs[0].shape
+            n = inputs[1].shape[0]
+            if (k % runner.k_alignment != 0
+                    or False not in _get_cute_dsl_swap_ab_candidates(
+                        m, n % 8 == 0)
+                    or "static" not in _dense_gemm_scheduler_modes(
+                        runner.scheduler_mode_candidates)):
+                return None
+            tiler, instruction, cluster = _MXFP8_PREFILL_TILE_SM107
+            if not runner.kernel_class.can_implement(
+                (m, n, k, 1),
+                    runner.a_dtype,
+                    runner.b_dtype,
+                    runner.sf_dtype,
+                    cutlass.BFloat16,
+                    "k",
+                    "k",
+                    "n",
+                    runner.sf_vec_size,
+                    tiler,
+                    instruction,
+                    cluster,
+                    1,
+            ):
+                return None
+            return ("base", tiler, instruction, cluster, False, True, "static",
+                    "m", 1)
+
+        def cute_dsl_mxfp8_prefill_gemm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> Optional[torch.Tensor]:
+            """BF16 ``input @ weight.T`` of MXFP8 operands with R128c4 UE8M0 scales on the SM107 GEMM's
+            prefill tile, or None when that tile does not fit the shape."""
+            runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16)
+            inputs = [
+                input, weight,
+                input_scale.view(torch.uint8),
+                weight_scale.view(torch.uint8), alpha
+            ]
+            tactic = _mxfp8_prefill_tactic_sm107(runner, inputs)
+            return runner(inputs, tactic=tactic) if tactic else None
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",

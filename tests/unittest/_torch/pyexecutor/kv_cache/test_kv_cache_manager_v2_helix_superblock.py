@@ -240,6 +240,9 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         # No lender attached, so a resize has no one to tell.
         _sharing=None,
     )
+    mgr._generation_history_length = lambda request: (
+        KVCacheManagerV2._generation_history_length(mgr, request)
+    )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)
     assert resizes == [(100, None)]
@@ -403,9 +406,48 @@ def test_host_tier_allowed_under_agg_helix(host_cache_size: Optional[int]) -> No
     assert manager.has_cache_tier_below_gpu
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates real KV cache pools")
+def test_helix_dummy_min_tokens_applies_to_generation_only() -> None:
+    """Warmup splits a full max_num_tokens context batch as [n - 1, 1]. Under
+    helix only generation dummies are raised to 2 tokens, so a context batch
+    keeps its total and stays within max_num_tokens."""
+    from unittest.mock import Mock, patch
+
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    distributed = Mock()
+    distributed.allreduce.side_effect = lambda value, op: value
+    distributed.local_world_size = 1
+    mapping = Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    with patch.object(Distributed, "get", return_value=distributed):
+        manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=512, enable_block_reuse=False),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=3,
+            mapping=mapping,
+            is_disagg=False,
+        )
+    ctx = manager.add_dummy_requests([0, 1], token_nums=[63, 1])
+    gen = manager.add_dummy_requests([2], token_nums=[1], is_gen=True)
+    try:
+        assert [req.get_num_tokens(0) for req in ctx] == [63, 1]
+        assert gen[0].get_num_tokens(0) == 2
+    finally:
+        for req in ctx + gen:
+            manager.free_resources(req)
+        manager.shutdown()
+
+
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
-    """Helix disables estimation; with a V2 manager it must also promote
-    _skip_est so build_managers() calls configure_kv_cache_capacity().
+    """Disaggregated helix disables estimation; with a V2 manager it must also
+    promote _skip_est so build_managers() calls configure_kv_cache_capacity().
     Other CP types must NOT be promoted: configure_kv_cache_capacity has no
     sizing path for them."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
@@ -414,6 +456,8 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     def creator(is_v2, cp_type=CpType.HELIX):
         return SimpleNamespace(
             _skip_est=False,
+            _is_disagg=True,
+            _is_agg_helix=False,
             _mapping=SimpleNamespace(cp_config={"cp_type": cp_type}),
             _is_kv_cache_manager_v2=is_v2,
             _model_engine=SimpleNamespace(
@@ -442,6 +486,7 @@ def _failing_gen_scheduler(
     sched = SimpleNamespace(
         has_cp_helix=True,
         enable_recompute_pause=enable_recompute_pause,
+        _single_beam=False,
         kv_cache_manager=SimpleNamespace(
             try_allocate_generation=lambda req: False,
             is_request_active=lambda request_id: True,
