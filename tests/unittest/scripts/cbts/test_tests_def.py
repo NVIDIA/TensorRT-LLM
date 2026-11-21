@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Stage, YAMLIndex, parse_stages_from_groovy
+from cbts.blocks import Stage, YAMLIndex, parse_stages_from_groovy, write_filtered_test_db
 from cbts.rules._helpers import strip_noop_diff_lines
 from cbts.rules.base import PRInputs, RuleResult
 from cbts.rules.tests_def import (
@@ -1275,3 +1275,44 @@ def test_modeling_v2_association_paths_and_ci_registration(
     guard = "unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_test_helpers.py"
     assert (repo / "tests" / guard).is_file()
     assert _is_whole_tree_test(guard)
+
+
+@pytest.mark.parametrize(
+    ("changed_file", "profiling_expected"),
+    [
+        ("tests/unittest/_torch/distributed/test_nccl_profiler.py", True),
+        ("tests/unittest/scripts/cbts/test_blocks.py", False),
+    ],
+)
+def test_nccl_profiler_changes_keep_build_contract_wrappers(
+    tmp_path: Path, changed_file: str, profiling_expected: bool
+) -> None:
+    repo = Path(__file__).resolve().parents[4]
+    test_db = repo / "tests/integration/test_lists/test-db"
+    rule = CbtsTestsDefRule(
+        YAMLIndex.load(test_db),
+        parse_stages_from_groovy(repo / "jenkins/L0_Test.groovy"),
+        repo,
+    )
+    result = rule.apply(PRInputs(changed_files=[changed_file], diffs={}))
+    assert result is not None
+    assert result.scope == "testdefonly"
+    assert "CPU-Generic-x86-1" in result.affected_stages
+    assert ("DGX_H100-2_GPUs-PyTorch-Profiling-1" in result.affected_stages) is profiling_expected
+
+    output = tmp_path / "test-db"
+    write_filtered_test_db(test_db, output, result.block_filters)
+    profiling_yaml = output / "l0_nccl_profiler.yml"
+    if profiling_expected:
+        import yaml
+
+        assert yaml.safe_load(profiling_yaml.read_text())["l0_nccl_profiler"][0]["tests"] == [
+            "test_unittests.py::test_nccl_profiler_build_contract[on]"
+        ]
+        blocks = yaml.safe_load((output / "l0_dgx_h100.yml").read_text())["l0_dgx_h100"]
+        assert any(
+            "test_unittests.py::test_nccl_profiler_build_contract[off]" in block["tests"]
+            for block in blocks
+        )
+    else:
+        assert not profiling_yaml.exists()

@@ -34,11 +34,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
+from profiler_test_utils import select_regions
 
+from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    EncoderCUDAGraphRunner,
+    EncoderCUDAGraphRunnerConfig,
+    KeyType,
+)
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
@@ -302,35 +309,84 @@ class TestCaptureReplayStaticTensors:
 
         assert static_buf[:batch_size].tolist() == [dummy_seq_slot] * batch_size
 
-    def test_replay_output_reflects_latest_inputs(self):
-        """Replaying twice with different inputs must produce outputs that
-        reflect each call's own inputs. A dropped copy_ makes them identical.
-        """
-        batch_size = 1
-        runner = create_mock_cuda_graph_runner(batch_size, use_mrope=False)
-        key = KeyType(batch_size=batch_size, draft_len=0)
-        num_tokens = runner._get_num_tokens_for_key(key)
-        attn_metadata = object()
+    @pytest.mark.skipif(
+        not profiler.custom_region_enabled("workflow"),
+        reason="workflow decorators must be selected before importing their owners",
+    )
+    @pytest.mark.parametrize("kind", ["decoder", "encoder"])
+    def test_replay_output_reflects_latest_inputs(
+        self, monkeypatch: pytest.MonkeyPatch, kind: str
+    ) -> None:
+        """Workflow scopes must preserve real capture and changed-input replay."""
+        select_regions(monkeypatch, "workflow")
+        if kind == "decoder":
+            runner = create_mock_cuda_graph_runner(batch_size=1, use_mrope=False)
+            key = KeyType(batch_size=1, draft_len=0)
+            attn_metadata = object()
+        else:
+            runner = EncoderCUDAGraphRunner(
+                EncoderCUDAGraphRunnerConfig(
+                    use_cuda_graph=True,
+                    cuda_graph_padding_enabled=False,
+                    cuda_graph_batch_sizes=[1],
+                    cuda_graph_num_tokens=[1],
+                    cuda_graph_seq_lens=[1],
+                    max_cuda_graph_batch_size=1,
+                    max_cuda_graph_num_tokens=1,
+                    max_num_tokens=1,
+                    max_seq_len=1,
+                    feature_shape=(1,),
+                    feature_dtype=torch.float32,
+                    fixed_seq_len=1,
+                )
+            )
+            key = (1, 1, 1)
+            attn_metadata = SimpleNamespace(
+                _seq_lens=torch.ones(1, dtype=torch.int32),
+                _seq_lens_cuda=torch.ones(1, device="cuda", dtype=torch.int32),
+            )
 
-        def forward_fn(inputs):
-            return inputs["input_ids"].clone() + inputs["position_ids"][...,].clone()
+        def make_inputs(value: int) -> dict:
+            if kind == "decoder":
+                return self._make_inputs(attn_metadata, 1, 1, value=value)
+            return {
+                "attn_metadata": attn_metadata,
+                "input_features": [torch.full((1, 1), value, dtype=torch.float32)],
+            }
 
-        runner.capture(
-            key, forward_fn, self._make_inputs(attn_metadata, num_tokens, batch_size, value=5)
-        )
+        def model_call(
+            *, input_ids: torch.Tensor, position_ids: torch.Tensor, attn_metadata: object
+        ) -> torch.Tensor:
+            return input_ids.clone() + position_ids.clone()
 
-        # run 1
-        runner.replay(key, self._make_inputs(attn_metadata, num_tokens, batch_size, value=1))
+        decoder = DecoderRunner.__new__(DecoderRunner)
+        decoder._model_caller = model_call
+        decoder._eager_workspace_reclaimer = None
+        decoder._moe_workspace_reclaimer = None
 
-        # run 2 with new inputs
-        logits_cuda_graph = runner.replay(
-            key, self._make_inputs(attn_metadata, num_tokens, batch_size, value=2)
-        )
+        def forward_fn(inputs: dict) -> torch.Tensor:
+            if kind == "decoder":
+                return DecoderRunner._model_forward(decoder, is_dummy=True, **inputs)
+            return inputs["input_features"] * 2
 
-        # run 2 eagerly
-        logits_eager = forward_fn(self._make_inputs(attn_metadata, num_tokens, batch_size, value=2))
-
-        torch.testing.assert_close(logits_cuda_graph, logits_eager)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as trace:
+            runner.capture(key, forward_fn, make_inputs(5))
+            for value, expected in ((1, 2), (2, 4)):
+                output = runner.replay(key, make_inputs(value))
+                torch.testing.assert_close(
+                    output, torch.full((1, 1), expected, device="cuda", dtype=output.dtype)
+                )
+        names = [
+            event.name
+            for event in trace.events()
+            if event.device_type == torch.autograd.DeviceType.CPU
+        ]
+        assert names.count("trtllm::cuda_graph_capture") == 1
+        assert names.count("trtllm::cuda_graph_replay") == 2
+        if kind == "decoder":
+            assert names.count("trtllm::model_forward") == runner.WARMUP_STEPS + 1
 
 
 class TestEngineBuffersAsStaticInputs:

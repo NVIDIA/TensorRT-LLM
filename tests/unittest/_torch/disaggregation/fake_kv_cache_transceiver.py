@@ -107,6 +107,9 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
 
     # -- KvCacheTransceiver contract -----------------------------------------
 
+    def status_request_id(self, req: LlmRequest) -> int:
+        return req.py_request_id
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return self._consumes_transfer_buffer
