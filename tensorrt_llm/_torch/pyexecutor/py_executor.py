@@ -773,6 +773,7 @@ class PyExecutor:
     # Set on a rank that reports completions while requests its first-token
     # check finished, which run no batch, wait for an iteration-stats record.
     _has_close_outs_pending_iter_stats = False
+    _fleet_has_live_requests = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -1264,7 +1265,8 @@ class PyExecutor:
             initial_sample = self._kv_load_tracker.sample(
                 self._kv_cache_capacity, force=True)
             if self.enable_attention_dp:
-                rank_loads = self.dist.tp_allgather(initial_sample)
+                with Distributed.rank_varying("KV cache load sample"):
+                    rank_loads = self.dist.tp_allgather(initial_sample)
                 if self.dist.rank == 0 and all(rank_loads):
                     self._kv_load_tracker.snapshot = aggregate_load(rank_loads)
             elif initial_sample:
@@ -1327,6 +1329,11 @@ class PyExecutor:
         self._remote_tail_phase = RemoteTailPhase.NONE
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # Whether any attention-DP rank held a request to step, received one or
+        # awaited a context retirement at the last routing allgather. An idle
+        # rank keeps stepping while it is set, so every rank leaves the
+        # executor loop on the same iteration.
+        self._fleet_has_live_requests = False
         # Buffer for responses staged by rank-divergent paths (disagg transfer
         # completion, ADP error handling). With ADP, _enqueue_responses does a
         # tp_gather collective; the owning DP rank has a response but the other
@@ -2463,11 +2470,16 @@ class PyExecutor:
                 f"for rank {self.global_rank}")
             return
 
-        # Sync all ranks
-        self.dist.barrier()
-        # Immediately take the local steady clock timestamp
-        local_timestamp = get_steady_clock_now_in_seconds()
-        all_rank_timestamps = self.dist.allgather(local_timestamp)
+        def gather_timestamps() -> List[float]:
+            # Sync all ranks
+            self.dist.barrier()
+            # Immediately take the local steady clock timestamp
+            return self.dist.allgather(get_steady_clock_now_in_seconds())
+
+        # A replacement rank takes the offset of the rank it replaces.
+        all_rank_timestamps = Distributed.agree_per_process(
+            "steady_clock_timestamps", gather_timestamps)
+        local_timestamp = all_rank_timestamps[self.global_rank]
         if self.global_rank == 0:
             logger.info(
                 f"global_steady_clock_offset at each rank: {[local_timestamp - ts for ts in all_rank_timestamps]}"
@@ -3191,6 +3203,7 @@ class PyExecutor:
     @property
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
+            not self._fleet_has_live_requests and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
             not self.disagg.has_retiring_gen_receives and \
             not self._has_pending_context_retirement()
@@ -6389,7 +6402,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 if self.enable_attention_dp:
                     # Owner-local completions cannot enter a response gather.
                     self._pending_transfer_responses.append(
@@ -6778,11 +6791,13 @@ class PyExecutor:
                 len(self.request_accumulated) +
                 self.executor_request_queue.get_request_queue_size())
         extra_ints = [n_error_ids, n_blocked_ids, has_kv_timeout]
+        context_retirement = self._has_pending_context_retirement()
         rank_states, vectors = self.adp_router.gather_all_rank_states_with_extras(
             self.active_requests,
             extra_ints,
             iter_stats_payload=iter_stats_payload,
-            num_pending_new_requests=num_pending_new_requests)
+            num_pending_new_requests=num_pending_new_requests,
+            has_pending_context_retirement=context_retirement)
         any_error = any(vector[0] > 0 for vector in vectors)
         any_timeout = any(vector[2] > 0 for vector in vectors)
 
@@ -7517,7 +7532,8 @@ class PyExecutor:
                 # the KV-transfer deadline is wall-clock, so they could cross it
                 # in different iterations. All ranks reach this point in every
                 # iteration while the control request is pending.
-                drained = all(self.dist.tp_allgather(int(drained)))
+                drained = all(
+                    self.dist.tp_allgather(int(drained), active_only=True))
             if not drained:
                 return
         self._control_drain_transfer_deadline = None
@@ -9012,7 +9028,8 @@ class PyExecutor:
         if self.enable_attention_dp:
             # Every bridge rank enters this fixed drain-fetch slot, including
             # empty ranks. Rank zero need not own the request being cancelled.
-            participants = self.dist.tp_allgather((request_ids, client_ids))
+            participants = self.dist.tp_allgather((request_ids, client_ids),
+                                                  active_only=True)
             request_ids = set().union(*(ids for ids, _ in participants))
             client_ids = set().union(*(ids for _, ids in participants))
         if self.dist.rank != 0:
@@ -9195,10 +9212,13 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
-    def _get_request_admission_capacity(self) -> int:
+    def _get_request_admission_capacity(
+            self, all_rank_states: Optional[List[RankState]] = None) -> int:
         """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
-            return self.dist.tp_size * self.max_num_active_requests
+            num_ranks = (self.dist.tp_size
+                         if all_rank_states is None else len(all_rank_states))
+            return num_ranks * self.max_num_active_requests
         return self.max_num_active_requests
 
     def _configure_benchmark_req_queues_size(self) -> None:
@@ -9320,7 +9340,8 @@ class PyExecutor:
         Returns the requests and, with attention DP, the ranks the router
         planned for them (request id -> rank; empty when none are planned).
         """
-        admission_capacity = self._get_request_admission_capacity()
+        admission_capacity = self._get_request_admission_capacity(
+            all_rank_states)
 
         max_new_requests = admission_capacity - total_num_active_requests
 
@@ -9446,6 +9467,7 @@ class PyExecutor:
                         self.executor_request_queue.get_request_queue_size())
                 remote_tail_adp = getattr(self, "_enable_remote_tail_adp",
                                           False)
+                context_retirement = self._has_pending_context_retirement()
                 context_ids, generation_ids = (
                     self._snapshot_remote_tail_phase_work(active_requests)
                     if remote_tail_adp else (frozenset(), frozenset()))
@@ -9469,7 +9491,8 @@ class PyExecutor:
                     if remote_tail_adp else None,
                     num_pending_new_requests=num_pending_new_requests,
                     include_kv_cache_load=self._kv_load_tracker.enabled,
-                    iter_stats_enabled=self.enable_iter_perf_stats)
+                    iter_stats_enabled=self.enable_iter_perf_stats,
+                    has_pending_context_retirement=context_retirement)
                 if remote_tail_adp:
                     self._select_remote_tail_phase(all_rank_states, context_ids,
                                                    generation_ids)
@@ -9567,6 +9590,17 @@ class PyExecutor:
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs
             ]
+            # Fleet-wide snapshot for should_stop_processing. A rank-local
+            # decision would let an idle rank stop while a peer still runs
+            # collectives. A request still sending KV needs no step, but a
+            # rank whose context request awaits the retirement of its send
+            # keeps stepping until the send retires, so its peers step too.
+            num_requests_to_step = total_num_live_requests - sum(
+                s.num_in_transfer_requests for s in all_rank_states)
+            self._fleet_has_live_requests = (
+                num_requests_to_step > 0 or len(all_new_flat) > 0
+                or any(s.has_pending_context_retirement
+                       for s in all_rank_states))
             if not self._enable_non_overlap_adp_forward_intent:
                 self._update_adp_dummy_role(all_new_flat)
 
@@ -9804,10 +9838,13 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather_int64([
-            num_scheduled_context_requests, num_scheduled_generation_requests,
-            num_scheduled_tokens, num_real_generation_requests
-        ]).tolist()
+        responses_list = self.dist.tp_allgather_int64(
+            [
+                num_scheduled_context_requests,
+                num_scheduled_generation_requests, num_scheduled_tokens,
+                num_real_generation_requests
+            ],
+            active_only=True).tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]
@@ -12585,7 +12622,7 @@ class PyExecutor:
                 self._start_connector_async_save(request)
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -12667,7 +12704,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13030,7 +13067,7 @@ class PyExecutor:
             response = request.create_response()
             if response is None:
                 continue
-            response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens = request.reported_cached_tokens
             response.result.ctx_computed_tokens = getattr(
                 request, 'py_ctx_computed_tokens', 0)
             response.result.ctx_first_begin = getattr(request,
@@ -13077,7 +13114,7 @@ class PyExecutor:
                 [request], gpu_times_cache=gpu_times_cache)
         response = request.create_response()
         if response:
-            response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens = request.reported_cached_tokens
             response.result.ctx_computed_tokens = getattr(
                 request, 'py_ctx_computed_tokens', 0)
             response.result.ctx_first_begin = getattr(request,

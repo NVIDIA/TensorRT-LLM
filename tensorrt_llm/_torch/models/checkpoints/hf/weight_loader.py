@@ -32,6 +32,7 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._errors import ModelLoadError
+from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
@@ -1152,10 +1153,14 @@ class HfWeightLoader(BaseWeightLoader):
         weights = {}
         pbar = tqdm.tqdm(total=len(weight_files), desc=description)
 
+        def add_file_weights(file_weights: dict[str, Any]) -> None:
+            weights.update(file_weights)
+            Distributed.report_startup_progress()
+
         # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
         # specifically the comma right after the w is important to make it a tuple.
         run_concurrently(load_func, [(w, ) for w in weight_files],
-                         reduce_func=weights.update,
+                         reduce_func=add_file_weights,
                          pbar=pbar)
 
         return ConsumableWeightsDict(weights)
@@ -1312,6 +1317,7 @@ class HfWeightLoader(BaseWeightLoader):
             logger.info(
                 f"Prefetch progress: {current_size / (1024**3):.2f}GB / "
                 f"{total_size / (1024**3):.2f}GB (this rank's share).")
+            Distributed.report_startup_progress()
 
         max_workers = min(multiprocessing.cpu_count() * 2, 16,
                           len(local_file_names))

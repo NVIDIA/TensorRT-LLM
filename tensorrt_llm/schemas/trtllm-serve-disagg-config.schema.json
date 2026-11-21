@@ -2756,6 +2756,13 @@
           "title": "Enable Tokenization Cache",
           "type": "boolean"
         },
+        "enable_wide_ep_fault_tolerance": {
+          "default": false,
+          "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires attention DP over more than one rank, no MoE TP and the built-in MoE layers. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all. Does not yet recover from a failed rank.",
+          "status": "prototype",
+          "title": "Enable Wide Ep Fault Tolerance",
+          "type": "boolean"
+        },
         "encode_only": {
           "default": false,
           "description": "Set to True to use the batch-forward encode() path, which runs a single forward pass and returns the model output directly, bypassing the scheduler and autoregressive loop. Works for encoder-only models (BERT, RoBERTa, reward models) and decoder models used in single-prefill mode (e.g., extracting embeddings). When False (default), uses the standard generate() path.",
@@ -11128,6 +11135,13 @@
       "description": "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
       "status": "prototype",
       "title": "Enable Tokenization Cache",
+      "type": "boolean"
+    },
+    "enable_wide_ep_fault_tolerance": {
+      "default": false,
+      "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires attention DP over more than one rank, no MoE TP and the built-in MoE layers. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all. Does not yet recover from a failed rank.",
+      "status": "prototype",
+      "title": "Enable Wide Ep Fault Tolerance",
       "type": "boolean"
     },
     "encode_only": {

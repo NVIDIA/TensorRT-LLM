@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <gtest/gtest.h>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <thread>
 #include <vector>
@@ -583,6 +585,60 @@ TEST_P(MoeLoadBalanceRouteKernelTest, TestInvalidExpertIds)
     {
         EXPECT_EQ(mHostTokenRoutedRankIds[i], param.epSize * param.slotCountPerRank)
             << "Invalid expert ID not routed to invalid rank at index " << i;
+    }
+}
+
+TEST_P(MoeLoadBalanceRouteKernelTest, TestSingleReplicaPerExpertWithSpareSlots)
+{
+    auto param = GetParam();
+    int const slotCount = param.epSize * param.slotCountPerRank;
+
+    // Each expert has one replica in a random slot. The other slots are spare and hold no expert. The start offsets
+    // point one expert further, which only the kernels for several replicas read, so the result shows which kernel ran.
+    std::vector<int> slots(slotCount);
+    std::iota(slots.begin(), slots.end(), 0);
+    std::shuffle(slots.begin(), slots.end(), mRng);
+    std::fill(mHostGlobalSlotIdsInfo.begin(), mHostGlobalSlotIdsInfo.end(), slotCount);
+    for (int expertId = 0; expertId < param.expertCount; ++expertId)
+    {
+        mHostExpertReplicaCount[expertId] = 1;
+        mHostExpertReplicaStartOffset[expertId] = (expertId + 1) % param.expertCount;
+        mHostGlobalSlotIdsInfo[expertId] = slots[expertId];
+    }
+    ASSERT_EQ(cudaMemcpy(mPlacementInfo.expertReplicaCount, mHostExpertReplicaCount.data(),
+                  param.expertCount * sizeof(int), cudaMemcpyHostToDevice),
+        cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(mPlacementInfo.expertReplicaStartOffset, mHostExpertReplicaStartOffset.data(),
+                  param.expertCount * sizeof(int), cudaMemcpyHostToDevice),
+        cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(mPlacementInfo.globalSlotIds, mHostGlobalSlotIdsInfo.data(), slotCount * sizeof(int),
+                  cudaMemcpyHostToDevice),
+        cudaSuccess);
+
+    // Every seventh token selects an invalid expert.
+    std::uniform_int_distribution<int> dist(0, param.expertCount - 1);
+    for (int i = 0; i < mTotalTokens; ++i)
+    {
+        mHostTokenSelectedExperts[i] = i % 7 == 0 ? -1 : dist(mRng);
+    }
+    ASSERT_EQ(cudaMemcpy(mDeviceTokenSelectedExperts, mHostTokenSelectedExperts.data(), mTotalTokens * sizeof(int),
+                  cudaMemcpyHostToDevice),
+        cudaSuccess);
+
+    moeComputeRouteDevice(mMetaInfo, mPlacementInfo, mDeviceTokenSelectedExperts, mDeviceTokenRoutedRankIds,
+        param.maxTokenCountPerRank, false, mStream, /*singleReplicaPerExpert=*/true);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpy(mHostTokenRoutedRankIds.data(), mDeviceTokenRoutedRankIds, mTotalTokens * sizeof(int),
+                  cudaMemcpyDeviceToHost),
+        cudaSuccess);
+
+    for (int i = 0; i < mTotalTokens; ++i)
+    {
+        int const expertId = mHostTokenSelectedExperts[i];
+        int const expectedSlotId = expertId < 0 ? slotCount : mHostGlobalSlotIdsInfo[expertId];
+        EXPECT_EQ(mHostTokenRoutedRankIds[i], expectedSlotId)
+            << "Token " << i << " routed to wrong slot. Expert ID: " << expertId;
     }
 }
 

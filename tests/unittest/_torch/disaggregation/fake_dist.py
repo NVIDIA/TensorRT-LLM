@@ -130,13 +130,13 @@ class FakeDistRank:
         self.tp_rank = rank % group.tp_size
         self.calls: List[Tuple[str, Any]] = []
 
-    def tp_allgather(self, obj, *, small_payload: bool = False) -> list:
+    def tp_allgather(self, obj, *, small_payload: bool = False, active_only: bool = False) -> list:
         return self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather", obj)
 
     def tp_cp_allgather(self, obj, *, small_payload: bool = False) -> list:
         return self._gather(self._group._tp_cp, "tp_cp_allgather", obj)
 
-    def tp_allgather_int64(self, values) -> np.ndarray:
+    def tp_allgather_int64(self, values, *, active_only: bool = False) -> np.ndarray:
         gathered = self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather_int64", values)
         rows = [np.asarray(row, dtype=np.int64).reshape(-1) for row in gathered]
         if len({row.size for row in rows}) > 1:

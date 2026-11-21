@@ -39,6 +39,7 @@ def test_wheel_contains_serving_schemas(tmp_path: Path, missing_schema: bool) ->
         "tensorrt_llm/llmapi/trtllm-llmapi-launch",
         "tensorrt_llm/llmapi/_llmapi_process_guard.py",
         "tensorrt_llm/llmapi/_llmapi_mpi_stop.py",
+        "tensorrt_llm/llmapi/_llmapi_node_supervisor.py",
         "tensorrt_llm/serve/render/trtllm-render",
     ]
     files += [path.name for path in _REPO_ROOT.glob("requirements*.txt")]
@@ -91,6 +92,7 @@ def test_wheel_contains_serving_schemas(tmp_path: Path, missing_schema: bool) ->
             "trtllm-llmapi-launch",
             "_llmapi_process_guard.py",
             "_llmapi_mpi_stop.py",
+            "_llmapi_node_supervisor.py",
         } <= scripts
         names = {
             name

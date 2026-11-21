@@ -59,7 +59,6 @@ SEVERE_ERROR_PATTERNS: list[str] = [
     "nccl operation timed out",
     "alltoall timeout",
     "all-to-all timeout",
-    "alltoall watchdog",
     "completion_flags timeout",
     "deep_ep buffer barrier hang",
     "deepep buffer barrier hang",

@@ -41,7 +41,7 @@ class _LockstepDist:
         dist = self
 
         class _Proxy:
-            def tp_allgather_int64(self, values):
+            def tp_allgather_int64(self, values, active_only=False):
                 vec = list(values)
                 with dist.lock:
                     dist.calls[rank].append(vec)
@@ -281,7 +281,7 @@ class _ObjectPathDist(Distributed):
     def cp_broadcast(self, obj, root=0, **kwargs):
         return obj
 
-    def tp_allgather(self, obj, *, small_payload=False):
+    def tp_allgather(self, obj, *, small_payload=False, active_only=False):
         return [list(p) for p in self.peers]
 
     def cp_allgather(self, obj, *, small_payload=False):

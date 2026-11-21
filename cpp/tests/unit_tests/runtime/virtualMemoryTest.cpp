@@ -195,6 +195,35 @@ TEST_F(VirtualMemoryTest, TestBasic)
     }
 }
 
+// Test UnicastConfigurator unmaps the range when granting access fails, so the range can be mapped again
+TEST_F(VirtualMemoryTest, TestUnicastAccessFailureUnmaps)
+{
+    CUdeviceptr address{};
+    std::size_t constexpr size = 256 * 1024 * 1024;
+    TLLM_CU_CHECK(cuMemAddressReserve(&address, size, 0, {}, 0));
+
+    bool constexpr countInMemoryCounters = false;
+    LocalCreator<countInMemoryCounters> creator(
+        CUmemAllocationProp{
+            CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE, CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
+        size);
+    CUmemGenericAllocationHandle handle = creator.create();
+
+    // An access descriptor for a device that does not exist fails after the range is mapped.
+    UnicastConfigurator failing(address, size,
+        CUmemAccessDesc{
+            CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {tc::getDeviceCount()}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE});
+    EXPECT_THROW(failing.setup(handle), tc::TllmException);
+
+    UnicastConfigurator configurator(address, size,
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE});
+    EXPECT_NO_THROW(configurator.setup(handle)) << "the failed setup left the range mapped";
+    configurator.teardown(handle, false);
+
+    creator.release(handle, false);
+    TLLM_CU_CHECK(cuMemAddressFree(address, size));
+}
+
 // Test BackedConfigurator refills memory correctly for both CPU and PINNED memory types
 class VirtualMemoryOffloadConfigurator : public VirtualMemoryTest, public ::testing::WithParamInterface<MemoryType>
 {
