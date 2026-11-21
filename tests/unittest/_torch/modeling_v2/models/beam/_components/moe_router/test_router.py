@@ -49,18 +49,12 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
-try:
-    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
-except ModuleNotFoundError as exc:
-    if exc.name != "tensorrt_llm._torch.models.modeling_beam":
-        raise
-    builtin_beam = None  # The standard-serving implementation is a separate PR.
 __extra_import_path__ = [".", "../..", "../../../.."]
 
 import _beam_component_support as support  # noqa: E402
+import _beam_reference as reference_beam
 import _router_cases as cases  # noqa: E402
 from _beam_component_support import tensor_sha256  # noqa: E402
-from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402
 
 from _components.moe_router.router import NORM_EPS, BeamMoeRouterBf16Sm103Tp1  # noqa: E501
@@ -220,22 +214,19 @@ def recording_op_calls():
 
 @contextlib.contextmanager
 def builtin_router_forbidden():
-    """The built-in Beam router must not compute any part of this component's routing."""
-    if builtin_beam is None:
-        yield
-        return
-    saved = {name: getattr(builtin_beam.BeamRouter, name) for name in ("forward", "route")}
+    """The reference Beam router must not compute any part of this component's routing."""
+    saved = {name: getattr(reference_beam.BeamRouter, name) for name in ("forward", "route")}
 
     def refuse(*args, **kwargs):
-        raise AssertionError("the built-in BeamRouter was called")
+        raise AssertionError("the reference BeamRouter was called")
 
     for name in saved:
-        setattr(builtin_beam.BeamRouter, name, refuse)
+        setattr(reference_beam.BeamRouter, name, refuse)
     try:
         yield
     finally:
         for name, fn in saved.items():
-            setattr(builtin_beam.BeamRouter, name, fn)
+            setattr(reference_beam.BeamRouter, name, fn)
 
 
 def loaded_router(weight: torch.Tensor, bias: torch.Tensor) -> BeamMoeRouterBf16Sm103Tp1:
@@ -258,10 +249,9 @@ def routed(router: BeamMoeRouterBf16Sm103Tp1, hidden: torch.Tensor) -> tuple:
 
 
 def reference_route(router: BeamMoeRouterBf16Sm103Tp1, hidden: torch.Tensor) -> dict:
-    with true_fp32_matmul():
-        return beam_grouped_topk_router.reference(
-            hidden, router.weight, router.e_score_correction_bias, **OP_KWARGS
-        )
+    return beam_grouped_topk_router.reference(
+        hidden, router.weight, router.e_score_correction_bias, **OP_KWARGS
+    )
 
 
 def check_output_contract(weights, ids, hidden) -> list:
