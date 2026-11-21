@@ -1826,11 +1826,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
 
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
-        .def(nb::init<int, int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
-            nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none())
+        .def(nb::init<int, int, int, std::optional<int>, bool>(), nb::arg("num_selected_blocks"),
+            nb::arg("max_cached_units"), nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none(),
+            nb::arg("include_partial_units") = false)
         .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
         .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens)
+        .def_rw("include_partial_units", &kv::SparseCacheConfig::includePartialUnits)
         .def_prop_ro(
             "max_unit_ordinal", [](kv::SparseCacheConfig const&) { return kv::SparseCacheConfig::kMaxUnitOrdinal; },
             "Largest zero-based unit ordinal supported by the sparse probe index.")
@@ -1841,16 +1843,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>, int>(),
             nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
             nb::arg("is_sparse") = false, nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1,
-            nb::arg("reuse_policy") = std::nullopt)
+            nb::arg("reuse_policy") = std::nullopt, nb::arg("sparse_write_back_granularity") = 0)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup)
         .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks)
+        .def_rw("sparse_write_back_granularity", &kv::BufferConfig::sparseWriteBackGranularity)
         .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
@@ -3261,9 +3264,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
             "Give each request's in-flight unit a cell, and report where to write it.\n\n"
-            "The unit between the two watermarks is the one the model is about to produce. It has no "
-            "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
-            "it -- so nothing is fetched: the call assigns a cell and leaves its bytes to the model.\n\n"
+            "The unit between the watermarks is the one the model is about to produce. With "
+            "include_partial_units, a newly reserved cell restores its host prefix before exposing "
+            "the write index; resident cells remain intact. Otherwise only a cell is reserved.\n\n"
             "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
             "which the indexer produces from the previous layer; a write needs only the watermarks, so "
             "it can run first, which is the order the model requires.\n\n"

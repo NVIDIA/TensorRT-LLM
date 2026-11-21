@@ -455,7 +455,52 @@ caches with an FP8 indexer. The MiniMax-M3.1-Flash targets of the Modeling V2
 `minimax_m3` family also accept a standalone DSpark drafter; see the
 deployment guide.
 
-The sparse path has no dense fallback and does not support KV-cache reuse.
+On a disaggregated generation worker, `enable_kv_cache_offload: true` keeps
+sparse main K/V history and its NVFP4 block scales in host memory. Decode
+fetches the union of the blocks selected by the local KV heads into a bounded
+GPU cache; each head still attends to its original selection. Dense attention
+layers and index keys remain resident. The growing 128-token block is restored
+before appending a token and written back after the step, including when a
+transferred prompt ends inside a block.
+
+```yaml
+kv_cache_config:
+  dtype: nvfp4  # fp8 is also supported
+  tokens_per_block: 128
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  block_reuse_config:
+    policy: per_request
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  enable_kv_cache_offload: true
+  kv_cache_offload_config:
+    gpu_cache_factor: 2.0
+```
+
+Enable offload only on the generation worker and use matching KV precision
+on the context worker. Offload requires single-token, single-beam generation,
+pipeline parallel size 1, and no speculative decoding. `gpu_cache_factor`
+multiplies the maximum union size (`sparse_topk_blocks` times local KV heads),
+with one additional block reserved for writing. `host_history_size` optionally
+bounds the host history budget in bytes; when unset, sizing follows the shared
+sparse offload memory planner. CUDA graphs reuse the same arena and page-table
+allocations across batch changes.
+
+KV cache manager V2 supports reuse of received prompt blocks on MSA generation
+workers, including with offload enabled. Repeated prompts reuse sparse K/V and
+NVFP4 scales from host pages together with the resident dense K/V and index
+keys. The KV transfer skips reused full blocks and transfers the remaining
+suffix, including any partial block. Offloaded generation history is not
+published to the reuse tree. `block_reuse_config.policy: per_request` applies
+the same limit to resident generation when comparing the two modes. This
+configuration keeps `enable_block_reuse: false` on the context worker.
+`FORCE_DETERMINISTIC=1` disables block reuse; leave it unset or set it to `0`
+when enabling reuse.
+
+The sparse path has no dense fallback.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree
 configurations are unsupported. NVFP4 KV with piecewise CUDA graphs is not
 qualified by the existing FP8-KV PCG tests. See the

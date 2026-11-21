@@ -594,17 +594,29 @@ def _register_fake():
 
     @torch.library.register_fake(
         "trtllm::minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert")
-    def _(packed: torch.Tensor, kv_cache: torch.Tensor,
-          index_k_cache: torch.Tensor, out_cache_loc: torch.Tensor,
-          num_heads_q: int, num_heads_kv: int, num_heads_index: int,
-          head_dim: int, rotary_dim: int, eps: float, q_weight: torch.Tensor,
-          k_weight: torch.Tensor, index_q_weight: torch.Tensor,
-          index_k_weight: torch.Tensor, rotary_cos_sin: torch.Tensor,
-          position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _(
+        packed: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_heads_q: int,
+        num_heads_kv: int,
+        num_heads_index: int,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        index_q_weight: torch.Tensor,
+        index_k_weight: torch.Tensor,
+        rotary_cos_sin: torch.Tensor,
+        position_ids: torch.Tensor,
+        index_out_cache_loc: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Infer main and index query shapes without mutating either cache."""
         del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
         del eps, q_weight, k_weight, index_q_weight, index_k_weight
-        del rotary_cos_sin, position_ids
+        del rotary_cos_sin, position_ids, index_out_cache_loc
         num_tokens = packed.shape[0]
         return (packed.new_empty((num_tokens, num_heads_q, head_dim),
                                  dtype=torch.float8_e4m3fn),

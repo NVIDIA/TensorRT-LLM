@@ -98,6 +98,8 @@ struct SparseCacheShape
     //! Sub-slots one page divides into. One when the life cycle has no fetch path, so the
     //! page and the unit coincide.
     int unitsPerPage = 1;
+    //! Whether a partially written unit is resident and written back each step.
+    bool includePartialUnits = false;
     //! Sparse buffers this life cycle has.
     int buffers = 0;
     //! Units a step selects per buffer.
@@ -467,6 +469,11 @@ public:
     [[nodiscard]] int sparseCacheUnitsPerPage(LifeCycleId lifeCycle) const noexcept
     {
         return _sparseCacheShape(lifeCycle).unitsPerPage;
+    }
+
+    [[nodiscard]] bool sparseCacheIncludesPartialUnits(LifeCycleId lifeCycle) const noexcept
+    {
+        return _sparseCacheShape(lifeCycle).includePartialUnits;
     }
 
     //! Sparse buffers this life cycle has, one per (layer, role). Cells and cold-page

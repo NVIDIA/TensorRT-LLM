@@ -1092,13 +1092,20 @@ def minimax_m3_attn_custom_op_inplace(
             attn_metadata,
         )
         if horizontal is None:
-            raise RuntimeError(
-                "MiniMax-M3 fused horizontal producer is required inside the "
-                f"piecewise attention boundary for layer {layer_idx}, but its "
-                "runtime geometry or cache layout was unsupported."
+            main_size = attn_layer.q_size + 2 * attn_layer.kv_size
+            packed_qkv, packed_idx_qk = packed_qkv_index[:num_tokens].split(
+                [main_size, attn_layer.index_q_size + attn_layer.index_k_size], dim=-1
             )
-        q, idx_q = horizontal
-        k = v = idx_k = None
+            q, k, v, idx_q, idx_k = attn_layer._sparse_projection_norm_rope(
+                position_ids[..., :num_tokens] if position_ids is not None else None,
+                None,
+                attn_metadata,
+                packed_qkv,
+                packed_idx_qk,
+            )
+        else:
+            q, idx_q = horizontal
+            k = v = idx_k = None
     if q is None:
         raise RuntimeError(f"MiniMax-M3 attention layer {layer_idx} received no query tensor.")
     # The live token count is a host value, so the compiled graph above must
@@ -1576,6 +1583,7 @@ class MiniMaxM3Attention(Attention):
         caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
         Q, index-Q, and index-K remain FP8.
         """
+        offload_state = getattr(attn_metadata, "sparse_offload_state", None)
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
@@ -1583,6 +1591,7 @@ class MiniMaxM3Attention(Attention):
             or self.attn.indexer_kv_dtype != "fp8"
             or packed.dtype != torch.bfloat16
             or position_ids is None
+            or (offload_state is not None and self.main_kv_is_nvfp4)
         ):
             return None
         kv_cache_manager = attn_metadata.kv_cache_manager
@@ -1601,7 +1610,14 @@ class MiniMaxM3Attention(Attention):
             buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
         if out_cache_loc is None:
             return None
-        plan = self._fused_producer_plan(buffers, index_k_cache, scale_buffers, out_cache_loc)
+        offload = (
+            offload_state is not None
+            and kv_cache_manager is not None
+            and kv_cache_manager.offloads_layer(self.layer_idx)
+        )
+        plan = self._fused_producer_plan(
+            buffers, index_k_cache, scale_buffers, out_cache_loc, offload=offload
+        )
         if plan is None:
             return None
         num_tokens = int(packed.shape[0])
@@ -1609,6 +1625,14 @@ class MiniMaxM3Attention(Attention):
             return None
         kv_quant_scale, static_args = plan
         positions = position_ids.reshape(-1).contiguous().to(torch.int32)
+        index_out_cache_loc = None
+        if offload:
+            from ..attention.backends.sparse.minimax_m3.kernels.offload import prepare_write_slots
+
+            index_out_cache_loc = out_cache_loc[:num_tokens]
+            kv_cache_manager.prepare_sparse_write_indices(offload_state, self.layer_idx)
+            prepare_write_slots(offload_state, self.layer_idx, attn_metadata.msa_sparse_write_slots)
+            out_cache_loc = attn_metadata.msa_sparse_write_slots
         if scale_buffers is not None:
             q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
                 packed.contiguous(),
@@ -1628,6 +1652,7 @@ class MiniMaxM3Attention(Attention):
                 out_cache_loc[:num_tokens],
                 *static_args,
                 positions,
+                index_out_cache_loc=index_out_cache_loc,
             )
         return q.flatten(1), index_q.flatten(1)
 
@@ -1637,6 +1662,8 @@ class MiniMaxM3Attention(Attention):
         index_k_cache: torch.Tensor,
         scale_buffers: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor,
+        *,
+        offload: bool = False,
     ) -> Optional[Tuple[Optional[torch.Tensor], tuple]]:
         """Resolve the horizontal producer's per-layer-invariant inputs once.
 
@@ -1645,9 +1672,9 @@ class MiniMaxM3Attention(Attention):
         weights and epsilons) is fixed for a given set of cache views and
         parameters, so the checks run once per distinct set and the resolved
         arguments are reused. The key is the address and layout (shape, strides,
-        dtype, device) of every tensor involved plus the norm epsilons: a
-        reloaded parameter or a new cache manager starts a fresh entry, even
-        when it reuses freed memory.
+        dtype, device) of every tensor involved plus the norm epsilons and
+        whether the main cache is an offload arena: a reloaded parameter or a
+        new cache manager starts a fresh entry, even when it reuses freed memory.
         The plan holds the kernel's static arguments only; the cache views
         themselves are passed per call. Returns ``None`` when the fused producer
         does not apply.
@@ -1664,6 +1691,7 @@ class MiniMaxM3Attention(Attention):
             getattr(self.qkv_proj, "inv_kv_scales", None) if scale_buffers is not None else None
         )
         key = (
+            offload,
             _tensor_view_key(buffers),
             _tensor_view_key(index_k_cache),
             _tensor_view_key(scale_buffers),
@@ -1683,7 +1711,13 @@ class MiniMaxM3Attention(Attention):
         if len(cache) >= _MAX_FUSED_PRODUCER_PLANS:
             cache.clear()
         plan = self._resolve_fused_producer_plan(
-            buffers, index_k_cache, scale_buffers, out_cache_loc, rotary_cos_sin, kv_quant_scale
+            buffers,
+            index_k_cache,
+            scale_buffers,
+            out_cache_loc,
+            rotary_cos_sin,
+            kv_quant_scale,
+            offload=offload,
         )
         cache[key] = plan
         return plan
@@ -1696,6 +1730,8 @@ class MiniMaxM3Attention(Attention):
         out_cache_loc: torch.Tensor,
         rotary_cos_sin: Optional[torch.Tensor],
         kv_quant_scale: Optional[torch.Tensor],
+        *,
+        offload: bool = False,
     ) -> Optional[Tuple[Optional[torch.Tensor], tuple]]:
         """Validate the producer's static inputs; see :meth:`_fused_producer_plan`."""
         rope = self.pos_embd_params.rope if self.pos_embd_params is not None else None
@@ -1754,7 +1790,14 @@ class MiniMaxM3Attention(Attention):
                 and buffers.stride(3) == 128
                 and buffers.stride(2) == 128 * 128
                 and buffers.stride(1) >= self.num_key_value_heads * buffers.stride(2)
-                and buffers.stride(0) >= 2 * buffers.stride(1)
+                and (
+                    buffers.stride(0) >= 2 * buffers.stride(1)
+                    or (
+                        offload
+                        and buffers.stride(0) == self.num_key_value_heads * buffers.stride(2)
+                        and buffers.stride(1) % buffers.stride(0) == 0
+                    )
+                )
                 and buffers.stride(0) % 4 == 0
                 and buffers.stride(1) % 4 == 0
             )
@@ -1770,7 +1813,7 @@ class MiniMaxM3Attention(Attention):
             and index_k_cache.stride(0) % 4 == 0
             and index_k_cache.stride(1) % 4 == 0
             and buffers is not None
-            and index_k_cache.shape[0] == buffers.shape[0]
+            and (offload or index_k_cache.shape[0] == buffers.shape[0])
         )
         supported_rope_cache = (
             rotary_cos_sin.is_cuda
@@ -2257,127 +2300,16 @@ class MiniMaxM3Attention(Attention):
         self.attn.forward(q, None, None, attn_metadata, forward_args=forward_args)
         return output
 
-    def _sparse_forward(
+    def _sparse_projection_norm_rope(
         self,
-        position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
-        all_reduce_params: Optional[AllReduceParams] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Run a MiniMax-M3 sparse attention forward end-to-end.
+        packed_qkv: Optional[torch.Tensor] = None,
+        packed_idx_qk: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Normalize the main and index projections without requiring resident main KV."""
 
-        Steps:
-          1. Project ``hidden_states`` to Q/K/V (fused ``qkv_proj``)
-             plus index Q (per-head) and index K (single replicated).
-          2-3. Apply per-head Gemma RMSNorm and partial RoPE to the main and
-             index branches, each fused into one kernel by
-             :meth:`_fused_qk_norm_rope` when it applies. The index branch
-             passes num_heads_v=0 because it carries no value heads.
-          4. Pull paged main K/V cache (reshaped to flat-slot view) and
-             paged side index-K cache from the
-             :class:`MiniMaxM3KVCacheManagerV2`.
-          5. Build a :class:`MiniMaxM3TritonSparseAttentionMetadata` from the
-             standard :class:`AttentionMetadata` (using ``request_ids``
-             + ``seq_lens`` + ``num_cached_tokens_per_seq``).
-          6. Write the new token's K/V/idx_K to the slots named by the
-             per-token ``out_cache_loc`` derived from
-             ``req_to_token``.
-          7. Dispatch to :meth:`MiniMaxM3SparseRuntimeBackend.forward`
-             which runs the sparse path end-to-end.
-          8. Apply ``o_proj`` and return.
-
-        Production callers (the LLM API path) drive
-        :meth:`MiniMaxM3AttentionMetadata.prepare` outside any
-        CUDA-graph capture window; that method attaches a pre-built
-        :class:`MiniMaxM3TritonSparseAttentionMetadata` and an
-        ``out_cache_loc`` tensor as ``attn_metadata.minimax_m3``. Test
-        callers attach the same dict manually.  This forward path
-        always reads the pre-built attachment and never builds metadata
-        itself — both would trigger
-        ``cudaErrorStreamCaptureUnsupported`` for the
-        ``cuda_graph=True`` hard path because the build does
-        CPU->GPU copies.
-        """
-        if attn_metadata is None:
-            raise RuntimeError(
-                f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
-                "attn_metadata; received None."
-            )
-
-        # The opt-in projection emits [Q|K|V|index-Q|index-K] with one GEMM.
-        # Its horizontal producer writes both paged caches directly and returns
-        # only compact Q/index-Q. Unsupported compile/geometry/layout cases
-        # split the packed output and retain the existing producer paths.
-        packed_qkv = None
-        packed_idx_qk = None
-        if self.enable_fused_qkv_index_projection:
-            if (
-                self.register_to_config
-                and is_torch_compiling()
-                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-                and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
-                and self.attn.indexer_kv_dtype == "fp8"
-            ):
-                # Metadata stages these zero-copy views before compilation;
-                # tracing the cache manager's native pointer access is unsafe.
-                kv_cache, index_k_cache, kv_scale_cache = attn_metadata.msa_layer_cache_tensors[
-                    self.layer_idx
-                ]
-                q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
-                    hidden_states,
-                    position_ids,
-                    kv_cache,
-                    index_k_cache,
-                    kv_scale_cache,
-                    attn_metadata.msa_out_cache_loc,
-                    self.layer_idx_str,
-                )
-                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
-                return self.o_proj(o, all_reduce_params=all_reduce_params)
-            if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
-                # Keep the projection in the captured segment while hiding
-                # its shape-specializing MXFP8 internals behind a symbolic
-                # fake implementation. Cache insertion and MSA remain in the
-                # existing eager attention boundary below.
-                packed = torch.ops.trtllm.minimax_m3_qkv_index_proj(
-                    hidden_states, position_ids, self.layer_idx_str
-                )
-                num_tokens = (
-                    position_ids.shape[-1] if position_ids is not None else hidden_states.shape[0]
-                )
-                output = packed.new_empty(
-                    (num_tokens, self.num_heads * self.head_dim),
-                    dtype=self.attn_activation_dtype,
-                )
-                maybe_bcg_minimax_m3_attn_custom_op_inplace(
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    packed,
-                    position_ids,
-                    self.layer_idx_str,
-                    output,
-                )
-                return self.o_proj(output, all_reduce_params=all_reduce_params)
-            packed = self.qkv_proj(hidden_states)
-            horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
-                packed, position_ids, attn_metadata
-            )
-            if horizontal is not None:
-                q, idx_q = horizontal
-                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
-                return self.o_proj(o, all_reduce_params=all_reduce_params)
-            main_size = self.q_size + 2 * self.kv_size
-            packed_qkv, packed_idx_qk = packed.split(
-                [main_size, self.index_q_size + self.index_k_size], dim=-1
-            )
-
-        # Project, norm, and apply RoPE for the compatibility/fallback main and
-        # index branches. Both read only hidden_states and write disjoint
-        # outputs, so they overlap on the aux stream and join before attention.
         def _main_norm_rope():
             qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(hidden_states)
             fused_qkv = self._fused_qk_norm_rope(
@@ -2455,6 +2387,131 @@ class MiniMaxM3Attention(Attention):
             self.ln_events[1],
             self.aux_stream,
             disable_on_compile=True,
+        )
+
+        return q, k, v, idx_q, idx_k
+
+    def _sparse_forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run a MiniMax-M3 sparse attention forward end-to-end.
+
+        Steps:
+          1. Project ``hidden_states`` to Q/K/V (fused ``qkv_proj``)
+             plus index Q (per-head) and index K (single replicated).
+          2-3. Apply per-head Gemma RMSNorm and partial RoPE to the main and
+             index branches, each fused into one kernel by
+             :meth:`_fused_qk_norm_rope` when it applies. The index branch
+             passes num_heads_v=0 because it carries no value heads.
+          4. Pull paged main K/V cache (reshaped to flat-slot view) and
+             paged side index-K cache from the
+             :class:`MiniMaxM3KVCacheManagerV2`.
+          5. Build a :class:`MiniMaxM3TritonSparseAttentionMetadata` from the
+             standard :class:`AttentionMetadata` (using ``request_ids``
+             + ``seq_lens`` + ``num_cached_tokens_per_seq``).
+          6. Write the new token's K/V/idx_K to the slots named by the
+             per-token ``out_cache_loc`` derived from
+             ``req_to_token``.
+          7. Dispatch to :meth:`MiniMaxM3SparseRuntimeBackend.forward`
+             which runs the sparse path end-to-end.
+          8. Apply ``o_proj`` and return.
+
+        Production callers (the LLM API path) drive
+        :meth:`MiniMaxM3AttentionMetadata.prepare` outside any
+        CUDA-graph capture window; that method attaches a pre-built
+        :class:`MiniMaxM3TritonSparseAttentionMetadata` and an
+        ``out_cache_loc`` tensor as ``attn_metadata.minimax_m3``. Test
+        callers attach the same dict manually.  This forward path
+        always reads the pre-built attachment and never builds metadata
+        itself — both would trigger
+        ``cudaErrorStreamCaptureUnsupported`` for the
+        ``cuda_graph=True`` hard path because the build does
+        CPU->GPU copies.
+        """
+        if attn_metadata is None:
+            raise RuntimeError(
+                f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
+                "attn_metadata; received None."
+            )
+
+        # The opt-in projection emits [Q|K|V|index-Q|index-K] with one GEMM.
+        # Its horizontal producer writes both paged caches directly and returns
+        # only compact Q/index-Q. Unsupported compile/geometry/layout cases
+        # split the packed output and retain the existing producer paths.
+        packed_qkv = None
+        packed_idx_qk = None
+        if self.enable_fused_qkv_index_projection:
+            if (
+                self.register_to_config
+                and is_torch_compiling()
+                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+                and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
+                and self.attn.indexer_kv_dtype == "fp8"
+                and attn_metadata.sparse_offload_state is None
+            ):
+                # Metadata stages these zero-copy views before compilation;
+                # tracing the cache manager's native pointer access is unsafe.
+                kv_cache, index_k_cache, kv_scale_cache = attn_metadata.msa_layer_cache_tensors[
+                    self.layer_idx
+                ]
+                q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+                    hidden_states,
+                    position_ids,
+                    kv_cache,
+                    index_k_cache,
+                    kv_scale_cache,
+                    attn_metadata.msa_out_cache_loc,
+                    self.layer_idx_str,
+                )
+                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
+                return self.o_proj(o, all_reduce_params=all_reduce_params)
+            if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
+                # Keep the projection in the captured segment while hiding
+                # its shape-specializing MXFP8 internals behind a symbolic
+                # fake implementation. Cache insertion and MSA remain in the
+                # existing eager attention boundary below.
+                packed = torch.ops.trtllm.minimax_m3_qkv_index_proj(
+                    hidden_states, position_ids, self.layer_idx_str
+                )
+                num_tokens = (
+                    position_ids.shape[-1] if position_ids is not None else hidden_states.shape[0]
+                )
+                output = packed.new_empty(
+                    (num_tokens, self.num_heads * self.head_dim),
+                    dtype=self.attn_activation_dtype,
+                )
+                maybe_bcg_minimax_m3_attn_custom_op_inplace(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    packed,
+                    position_ids,
+                    self.layer_idx_str,
+                    output,
+                )
+                return self.o_proj(output, all_reduce_params=all_reduce_params)
+            packed = self.qkv_proj(hidden_states)
+            horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed, position_ids, attn_metadata
+            )
+            if horizontal is not None:
+                q, idx_q = horizontal
+                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
+                return self.o_proj(o, all_reduce_params=all_reduce_params)
+            main_size = self.q_size + 2 * self.kv_size
+            packed_qkv, packed_idx_qk = packed.split(
+                [main_size, self.index_q_size + self.index_k_size], dim=-1
+            )
+
+        q, k, v, idx_q, idx_k = self._sparse_projection_norm_rope(
+            position_ids, hidden_states, attn_metadata, packed_qkv, packed_idx_qk
         )
 
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)

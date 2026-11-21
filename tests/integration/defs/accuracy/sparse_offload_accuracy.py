@@ -38,7 +38,7 @@ LONGBENCH_CASES = {
 
 
 def assert_token_parity(reference: dict, candidate: dict, *, label: str) -> None:
-    """Reject empty, truncated, reordered, or unequal paired completions."""
+    """Compare paired completions independently of benchmark answer scoring."""
     assert reference["id"] == candidate["id"], f"{label}: sample IDs differ"
     assert reference["prompt_sha256"] == candidate["prompt_sha256"], (
         f"{label}: tokenized prompts differ"
@@ -57,8 +57,101 @@ def assert_token_parity(reference: dict, candidate: dict, *, label: str) -> None
     assert reference["finish_reason"] == candidate["finish_reason"], (
         f"{label}: finish reasons differ"
     )
-    assert reference["answer"] == candidate["answer"], f"{label}: extracted answers differ"
-    assert reference["correct"] == candidate["correct"], f"{label}: answer correctness differs"
+
+
+def make_boundary_prompts(
+    prompts: list[list[int]], *, cache_tokens: int, tokens_per_block: int
+) -> list[tuple[str, list[int]]]:
+    """Build token-prefix continuations around cache-block boundaries.
+
+    These continuations test KV layout and decoding, without assigning benchmark
+    answers to incomplete documents. Every history exceeds the GPU cache capacity.
+    """
+    boundaries = (cache_tokens + 2 * tokens_per_block, 8192, 16384)
+    lengths = [boundary + offset for boundary in boundaries for offset in (-1, 0, 1)]
+    assert all(boundary % tokens_per_block == 0 for boundary in boundaries)
+    assert min(lengths) // tokens_per_block > cache_tokens // tokens_per_block
+    assert prompts and max(map(len, prompts)) >= max(lengths), (
+        f"Boundary coverage requires a source prompt of at least {max(lengths)} tokens"
+    )
+    cases = []
+    for index, length in enumerate(lengths):
+        sources = [prompt for prompt in prompts if len(prompt) >= length]
+        cases.append((f"boundary-{length}", sources[index % len(sources)][:length]))
+    return cases
+
+
+class DecodeBatchGate:
+    """Start a test wave with all histories ready, then permit normal retirement."""
+
+    def __init__(self) -> None:
+        self._wave: int | None = None
+        self._opened = False
+        self._waiting_since: float | None = None
+
+    def select(
+        self,
+        *,
+        wave: int,
+        expected_lengths: list[int],
+        request_lengths: list[int],
+        decoding_iters: list[int],
+    ) -> list[int]:
+        """Return ready request positions in the wave's declared order."""
+        if wave != self._wave:
+            self._wave = wave
+            self._opened = False
+            self._waiting_since = None
+        assert len(request_lengths) == len(decoding_iters)
+        if len(expected_lengths) < 2 or not request_lengths:
+            return list(range(len(request_lengths)))
+        assert len(request_lengths) <= len(expected_lengths), "Unexpected requests in parity wave"
+        assert all(length in expected_lengths for length in request_lengths), (
+            f"Unexpected prompt lengths: {request_lengths}; expected {expected_lengths}"
+        )
+        if not self._opened:
+            assert all(iteration <= 1 for iteration in decoding_iters), (
+                "Parity batch started decoding before all histories were ready"
+            )
+            if len(request_lengths) < len(expected_lengths):
+                now = time.monotonic()
+                if self._waiting_since is None:
+                    self._waiting_since = now
+                assert now - self._waiting_since < 30, "Timed out waiting for the parity batch"
+                return []
+            assert sorted(request_lengths) == sorted(expected_lengths)
+            self._opened = True
+        return sorted(
+            range(len(request_lengths)), key=lambda i: expected_lengths.index(request_lengths[i])
+        )
+
+
+def assert_concurrent_decode(
+    stats: list[dict],
+    *,
+    min_batched_steps: int,
+    require_retirement: bool = False,
+    expected_initial_batch_size: int | None = None,
+) -> list[int]:
+    """Require sustained overlap and, optionally, decode after a request retires."""
+    active_counts = [
+        stat.get("inflightBatchingStats", {}).get("numGenRequests", 0) for stat in stats
+    ]
+    batched = [i for i, count in enumerate(active_counts) if count > 1]
+    assert len(batched) >= min_batched_steps, f"Only {len(batched)} batched decode iterations"
+    if require_retirement:
+        assert 1 in active_counts[batched[-1] + 1 :], (
+            "Mixed-length wave did not decode after one request retired"
+        )
+    trace = [count for count in active_counts if count > 0]
+    if expected_initial_batch_size is not None:
+        assert trace[0] == expected_initial_batch_size, (
+            "Parity wave started with an incomplete batch"
+        )
+    print(
+        f"Concurrent decode evidence: {len(batched)} batched steps, retirement={require_retirement}"
+    )
+    return trace
 
 
 def assert_host_fetches(

@@ -55,6 +55,8 @@ struct SparseWorkList
     int32_t* slot = nullptr;
     //! [numLists] entries written so far. Zeroed before the producer runs; the consumer
     //! bounds its loop by it, which is why the count never crosses to the host.
+    //! Null for a single fixed list of `capacity` entries: each producer overwrites its
+    //! row's entry, using kNoSparseSlot when no partial-prefix restore is required.
     int32_t* total = nullptr;
 
     //! Entries one list holds, and the distance between consecutive lists. Zero for a single
@@ -67,9 +69,8 @@ struct SparseWorkList
 //! Fetch statistics, as the device counter and as its host copy.
 //!
 //! The two figures the resolve produces, not the two a reader wants: `hits()` is their
-//! difference and is never stored. `misses` is the row's claimed run in the compacted miss
-//! list -- the selected units that were not resident and so had to be copied from their
-//! host pages.
+//! difference and is never stored. `misses` counts selected units that were not resident
+//! and had to be copied from host. Partial-prefix restores are excluded from both figures.
 //!
 //! `unsigned long long` rather than `uint64_t` because the device side accumulates with
 //! `atomicAdd`, which has no overload for `unsigned long` on LP64.
@@ -133,13 +134,16 @@ struct SparseResolveArgs
     //! value rather than one baked in at capture.
     //!
     //! Ordinals below historyUnits are selectable history. Ordinals in
-    //! [historyUnits, capacityUnits) are in flight: the entry holds the only copy of their
-    //! data, so it is pinned against eviction and there is nothing to fetch for it. See
+    //! [historyUnits, capacityUnits) are in flight and pinned against eviction. With
+    //! includePartialUnits, a newly reserved cell restores the host prefix of the
+    //! partially filled history unit before the model appends data. See
     //! "Unflushed entries carry no state" in SPARSE_ATTENTION_DESIGN.md.
     int32_t const* historyTokens;
     int32_t const* capacityTokens;
     //! tokens_per_block / unitsPerPage, a per-layer-group constant.
     int32_t unitTokens;
+    //! Round capacity up to a unit, restoring a partial history prefix on a miss.
+    bool includePartialUnits = false;
 
     //! [numRows][selectionWidth] entry index per selection, kNoSparseSlot where padded or
     //! where the row holds no reservation. One list serves every buffer of the layer.
@@ -157,8 +161,9 @@ struct SparseResolveArgs
     //! since a call resolves one selection; every buffer of every layer naming that
     //! selection copies from it, each into its own mirror of the entry.
     //!
-    //! An in-flight unit that misses is allocated an entry but never appears here: its host
-    //! page is not written until the watermark passes it, so there is nothing to fetch.
+    //! With includePartialUnits, a missing in-flight unit with a nonempty host prefix
+    //! also appears here. Write preparation uses a separate fixed list indexed by row;
+    //! a selection resolve uses the compacted list.
     SparseWorkList work;
     //! [numRows] entries this row contributed. The copy does not read it -- it walks the
     //! compacted list -- but it is what makes a row's hit rate observable.
@@ -178,8 +183,8 @@ struct SparseResolveArgs
     //! Cumulative fetch statistics, which every row adds its own share of. Null skips it.
     //!
     //! Counted in the resolve because only the resolve can count either half: a padded
-    //! selection entry is negative and an in-flight unit is not a fetch, neither of which
-    //! the host can see. Both halves come from one pass, so they agree on what they count.
+    //! selection entry is negative and an in-flight unit is not a selected-history lookup,
+    //! neither of which the host can see. Both halves come from one pass, so they agree on what they count.
     //!
     //! A row adds its own contribution rather than anything reading a total afterwards. The
     //! step's counters are cleared once per publish, not per fetch, so a reader downstream
@@ -224,7 +229,7 @@ enum class SparseCopyDirection : uint8_t
 //! Sizes rather than addresses, so the width is a property of the layout and can live in a
 //! descriptor built once. The two base pointers are checked against it on the host, where a
 //! misaligned pool is a configuration error worth naming rather than a case to handle.
-enum class SparseCopyWidth : int32_t
+enum class SparseCopyWidth : uint8_t
 {
     kByte = 0,
     kWord = 1,
@@ -294,6 +299,9 @@ struct alignas(16) SparseCopyDesc
     SelectionUnitLayout layout;
 
     SparseCopyWidth width;
+    //! Zero retains whole-unit write-back; otherwise each chunk contains contiguous
+    //! groups of this many tokens. Preserves the descriptor's 64-byte footprint.
+    uint16_t writeBackGranularity = 0;
 };
 
 static_assert(sizeof(SparseCopyDesc) == 64, "A copy descriptor is meant to be four vector loads");
@@ -345,6 +353,12 @@ struct SparseUnitCopyArgs
     //! is fixed before anyone knows how many units a step will miss. The device-side total
     //! is what the loop actually follows.
     int32_t gridCtas;
+
+    //! Optional [numRows] token bounds for partial-unit write-back. Descriptors opt
+    //! into copying this range, rounded out to their contiguous token groups.
+    int32_t const* fromTokens = nullptr;
+    int32_t const* toTokens = nullptr;
+    int32_t unitTokens = 1;
 };
 
 //! Widest vector a pool's layout admits, from its sizes alone. A layout admitting none

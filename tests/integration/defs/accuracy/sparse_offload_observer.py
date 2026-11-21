@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Test-only native-cache observer, installed in serving and MPI worker interpreters.
+"""Test-only native-cache observer and deterministic decode admission.
 
 The lazy import hook leaves library files untouched. It wraps the real fetch and
 release methods, reading counters only at request boundaries; it never changes
 indices, KV data, cache capacity, or the return values of either operation.
+An optional scheduling gate starts concurrent parity waves with every history
+ready and fixes their decode order, leaving transfers and retirement intact.
 """
 
 from __future__ import annotations
@@ -28,8 +30,47 @@ if TYPE_CHECKING:
         SparseOffloadCacheMixin,
         SparseOffloadState,
     )
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 _MODULE = "tensorrt_llm._torch.attention.backends.sparse.offload"
+_EXECUTOR_MODULE = "tensorrt_llm._torch.pyexecutor.py_executor"
+
+
+def _observe_scheduler(module: ModuleType) -> None:
+    control_file = os.environ.get("TLLM_TEST_SPARSE_BATCH_CONTROL")
+    if control_file is None:
+        return
+    from sparse_offload_accuracy import DecodeBatchGate
+
+    control_path = Path(control_file)
+    schedule = module.PyExecutor._schedule
+    gates = {}
+
+    @functools.wraps(schedule)
+    def scheduled_wave(self: PyExecutor) -> tuple:
+        result = schedule(self)
+        batch = result[0]
+        control = json.loads(control_path.read_text())
+        if self not in gates:
+            gates[self] = DecodeBatchGate()
+        requests = batch.generation_requests
+        selected = gates[self].select(
+            wave=control["wave"],
+            expected_lengths=control["prompt_lengths"],
+            request_lengths=[request.py_orig_prompt_len for request in requests],
+            decoding_iters=[request.py_decoding_iter for request in requests],
+        )
+        selected_indices = set(selected)
+        held = type(batch)()
+        held.generation_requests = [
+            request for index, request in enumerate(requests) if index not in selected_indices
+        ]
+        if held.generation_requests:
+            self._revert_unexecuted_alloc(held)
+        batch.generation_requests = [requests[index] for index in selected]
+        return result
+
+    module.PyExecutor._schedule = scheduled_wave
 
 
 def _observe(module: ModuleType) -> None:
@@ -113,7 +154,10 @@ class _ObserverLoader(importlib.abc.Loader):
 
     def exec_module(self, module: ModuleType) -> None:
         self._loader.exec_module(module)
-        _observe(module)
+        if module.__name__ == _EXECUTOR_MODULE:
+            _observe_scheduler(module)
+        else:
+            _observe(module)
 
 
 class _ObserverFinder(importlib.abc.MetaPathFinder):
@@ -123,7 +167,7 @@ class _ObserverFinder(importlib.abc.MetaPathFinder):
         path: Sequence[str] | None,
         target: ModuleType | None = None,
     ) -> importlib.machinery.ModuleSpec | None:
-        if fullname != _MODULE:
+        if fullname not in (_MODULE, _EXECUTOR_MODULE):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
         assert spec is not None and spec.loader is not None, "Sparse offload module not found"
@@ -133,5 +177,7 @@ class _ObserverFinder(importlib.abc.MetaPathFinder):
 
 def install() -> None:
     """Observe the real library when imported, without initializing MPI or CUDA early."""
-    assert _MODULE not in sys.modules, "Observer must be installed before the sparse backend"
+    assert all(name not in sys.modules for name in (_MODULE, _EXECUTOR_MODULE)), (
+        "Observer must be installed before the sparse backend and executor"
+    )
     sys.meta_path.insert(0, _ObserverFinder())

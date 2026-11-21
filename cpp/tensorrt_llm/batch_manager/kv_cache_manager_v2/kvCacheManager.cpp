@@ -257,12 +257,13 @@ void KvCacheManager::_computeSparseCacheShape()
         if (shape.layers > 0)
         {
             TLLM_CHECK_WITH_INFO(shape.maxUnits == cache.maxCachedUnits && shape.selection == cache.numSelectedBlocks
-                    && shape.unitsPerPage == unitsPerPage,
+                    && shape.unitsPerPage == unitsPerPage && shape.includePartialUnits == cache.includePartialUnits,
                 "Layers sharing a life cycle must declare the same sparse_cache; they share one arena");
         }
         shape.maxUnits = cache.maxCachedUnits;
         shape.selection = cache.numSelectedBlocks;
         shape.unitsPerPage = unitsPerPage;
+        shape.includePartialUnits = cache.includePartialUnits;
 
         bool layerCounted = false;
         for (auto const& buf : attn->buffers)

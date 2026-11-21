@@ -1716,6 +1716,10 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             }
             int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lc);
             crosses = std::min(newHist, mCapacity) / unitTokens > mHistoryLength / unitTokens;
+            if (mManager->sparseCacheIncludesPartialUnits(lc))
+            {
+                crosses = std::min(newHist, mCapacity) > mHistoryLength;
+            }
         }
         if (crosses)
         {

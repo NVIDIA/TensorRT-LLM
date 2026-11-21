@@ -24,6 +24,7 @@ from ..offload import (
     SparseOffloadState,
     allocate_sparse_offload_state,
     get_sparse_offload_metadata_layers,
+    validate_sparse_offload_batch,
 )
 from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
@@ -474,15 +475,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         An offloading worker only decodes, one query token per request.
         """
         self.sparse_offload_state.prepared = False
-        if self.num_contexts:
-            raise NotImplementedError(
-                "Sparse KV cache offload runs decode batches only; context requests reach "
-                "an offloading worker through disaggregated KV transfer"
-            )
-        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
-            raise ValueError("Sparse offload batch validation requires host sequence lengths")
-        if not torch.equal(self.seq_lens, self.seq_lens_kv) or not torch.all(self.seq_lens == 1):
-            raise NotImplementedError("Sparse offload decode requires one query per request")
+        validate_sparse_offload_batch(self.num_contexts, self.seq_lens, self.seq_lens_kv)
 
     def _has_mixed_precision_staging(self) -> bool:
         # No staging: attention reads the gather's FP8 scratch.
