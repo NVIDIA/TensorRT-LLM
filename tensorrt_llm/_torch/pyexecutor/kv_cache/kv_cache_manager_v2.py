@@ -158,6 +158,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .page_table import ByHead, PageTableSpec, Replicated, explicit_layer_specs, kv_dtype_name
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
     HostHistoryReservations,
@@ -389,6 +390,12 @@ class Role:
     MLA_V_PACKED = DataRole("mla_v_packed")
     MLA_HP_TAIL = DataRole("mla_hp_tail")
     ALL = DataRole("all")
+
+
+# The roles the base manager splits by KV head (page_table_spec).
+_HEAD_SPLIT_ROLES = frozenset(
+    str(role) for role in (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
+)
 
 
 class BlockReusePolicy(StrEnum):
@@ -5828,6 +5835,23 @@ class KVCacheManagerV2(BaseResourceManager):
             own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
         return [high[layer_id] if layer_id in high else 2 * own[layer_id] for layer_id in layer_ids]
 
+    def _mixed_precision_model_layer_ids(self, layer_group_id: int) -> List[int]:
+        """Return the model layer of each layer of a layer group under mixed-precision KV, in the
+        order of ``_mixed_precision_global_layer_ids``; a high layer belongs to its layer's."""
+        high = {
+            int(high_layer): int(self.pp_layers[local])
+            for local, high_layer in self.mixed_precision_high_layers.items()
+        }
+        virtual = getattr(self, "_layer_attn_to_layer_id", None)
+        if virtual:
+            own = {}
+            for (model_layer, _), layer_id in virtual.items():
+                own.setdefault(int(layer_id), int(model_layer))
+        else:
+            own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
+        layer_ids = self._layer_ids_by_group[layer_group_id]
+        return [high[layer_id] if layer_id in high else own[layer_id] for layer_id in layer_ids]
+
     def _get_mixed_precision_buffers(
         self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
     ) -> torch.Tensor:
@@ -5954,6 +5978,52 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    def page_table_spec(self) -> PageTableSpec:
+        """What this manager says of its pages that its runtime config and storage do not: how
+        each role's bytes spread over ranks, which roles never move, are derived or are rebuilt
+        per request, how its layers are named and how its KV data is quantized.
+
+        The base manager lays out the roles it registers itself: K/V and their block scales
+        split by KV head, head-major (HND), as the TRTLLM attention kernels write them, a K-only
+        (MLA) cache holding one latent head, which every tensor rank holds whole; and index-K,
+        which every tensor rank projects alike. A K-only cache given layers of K and V of their
+        own (``layer_specs``), as a drafter's beside an MLA target's latent, splits each layer by
+        its own KV heads instead, the latent one head (``page_table._kv_heads``). A manager
+        registering other roles or laying these out otherwise returns its own, usually this one
+        with some fields replaced (``dataclasses.replace``); a role that moves and that its spec
+        does not lay out makes ``get_page_table`` fail rather than guess. Under mixed-precision
+        KV it names the layers (``_mixed_precision_layer_ids``)."""
+        latent = self.kv_factor == 1 and all(
+            int(layer.kv_factor) == 1 for layer in explicit_layer_specs(self).values()
+        )
+        head_split = ByHead(total=1) if latent else ByHead()
+        return PageTableSpec(
+            role_layouts={
+                **{role: head_split for role in _HEAD_SPLIT_ROLES},
+                Role.INDEX_KEY: Replicated(),
+            },
+            layer_ids=self._mixed_precision_layer_ids(),
+            quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
+        )
+
+    def _mixed_precision_layer_ids(self) -> Optional[Dict[int, Tuple[int, int]]]:
+        """Internal layer id -> (global layer id, model layer) under mixed-precision KV, as
+        ``_mixed_precision_global_layer_ids`` and ``_mixed_precision_model_layer_ids`` name each
+        layer group's layers: model layer ``L``'s high layer ``2 * L + 1`` and every other layer
+        twice the id it has without, alike on every pipeline stage, whether it holds high layers
+        or not; None without mixed-precision KV."""
+        if getattr(self, "mixed_precision_low_dtype", None) is None:
+            return None
+        layer_ids: Dict[int, Tuple[int, int]] = {}
+        for layer_group_id, layers in enumerate(self._layer_ids_by_group):
+            names = zip(
+                self._mixed_precision_global_layer_ids(layer_group_id),
+                self._mixed_precision_model_layer_ids(layer_group_id),
+            )
+            for layer, (global_layer, model_layer) in zip(layers, names):
+                layer_ids[int(layer)] = (int(global_layer), int(model_layer))
+        return layer_ids
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.
