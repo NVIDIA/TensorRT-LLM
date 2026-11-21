@@ -38,6 +38,7 @@ def _context_request() -> SimpleNamespace:
     """Build the request fields consumed by native context send retirement."""
     request = _request()
     request.is_context_only_request = True
+    request.is_generation_only_request = False
     request.is_child = False
     request.py_kv_send_session_retired = False
     request.py_kv_transfer_timed_out = False
@@ -54,6 +55,7 @@ def _harness(
 ) -> SimpleNamespace:
     """Run real coordinator/transfer-manager/reaper code with controlled engine effects."""
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._context_first_ownership = True
     transceiver._pending_rank_info_admissions = None
     transceiver._send_sessions = {} if session is None else {401: session}

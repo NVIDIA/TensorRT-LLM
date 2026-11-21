@@ -80,6 +80,7 @@ def test_transceiver_drain_refusal_preserves_sessions_and_registration(
         close=Mock(return_value=True),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._send_sessions = {}
     transceiver._send_reqs = {}
     transceiver._recv_sessions = {1: session}

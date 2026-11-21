@@ -56,6 +56,7 @@ class _Group:
 
 def _make_transceiver(rank: int, group: _Group, *, probe: bool) -> KvCacheTransceiverV2:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._dist = _GroupDist(rank, group)
     transceiver._mapping = SimpleNamespace(
         enable_attention_dp=False, world_size=group.size, pp_size=1
