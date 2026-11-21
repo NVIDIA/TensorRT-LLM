@@ -515,6 +515,19 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  # No dedicated LTX-2.5 dependency-install job is configured. The text-encoder
+  # tests skip unless Transformers matches requirements.ltx2_5.txt (5.14.1).
+  - unittest/_torch/visual_gen/test_ltx2_5_conditioning.py
+  - unittest/_torch/visual_gen/test_ltx2_5_bwe.py
+  - unittest/_torch/visual_gen/test_ltx2_5_registry.py
+  - unittest/_torch/visual_gen/test_ltx2_5_transformer.py
+  - unittest/_torch/visual_gen/test_ltx2_5_validation.py
+  - unittest/_torch/visual_gen/test_ltx2_5_orchestration.py
+  - unittest/_torch/visual_gen/test_ltx2_5_text_encoder.py
+  - unittest/_torch/visual_gen/test_ltx2_5_metrics.py
+  - unittest/_torch/visual_gen/test_ltx2_5_fp8.py
+  - unittest/_torch/visual_gen/test_ltx2_5_nvfp4.py
+  - unittest/_torch/visual_gen/test_ltx2_5_fp8_attention.py
   - unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
@@ -701,6 +714,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cuda-graph]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16]
+  - examples/visual_gen/test_ltx2_5.py
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[fp8]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16]

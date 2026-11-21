@@ -299,6 +299,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
+| `Lightricks/LTX-2.5` | IC-LoRA Video-to-Video (with Audio), `LTX25ICLoraPipeline` |
 | `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
 | `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
@@ -322,9 +323,16 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
 | **LTX-2.3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No |
+| **LTX-2.5** | No | No | No | No | No | No | No | No | Not validated | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
 | **FastH3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+
+LTX-2.5 supports single-GPU IC-LoRA video-to-video generation with audio. See the
+[LTX-2.5 notes](./visual-generation.md#ltx-25-notes) for precision configurations,
+workflow requirements and validation scope. FP8_BLOCK_SCALES and NVFP4 are marked
+No because their quantized outputs have not met the reported quality thresholds;
+the available experimental configurations are not quality-qualified support.

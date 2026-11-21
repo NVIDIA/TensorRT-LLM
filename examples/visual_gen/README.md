@@ -1,4 +1,11 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Visual Generation Examples
+
+LTX-2.5 BF16 IC-LoRA V2V uses [the standalone example](models/ltx2_5.py) and
+[single-GPU config](configs/ltx2_5-iclora-bf16-1gpu.yaml).
+See [model-specific setup and validation](models/README.ltx2_5.md) for its split checkpoints and Gemma4 environment.
 
 See [the VisualGen doc](https://nvidia.github.io/TensorRT-LLM/models/visual-generation.html)
 for feature details.
