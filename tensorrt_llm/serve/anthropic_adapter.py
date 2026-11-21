@@ -34,6 +34,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
+import anyio
 from fastapi.responses import JSONResponse
 
 from tensorrt_llm.logger import logger
@@ -1229,7 +1230,8 @@ async def _with_ticks(
         consumer_stopped = True
         reader.cancel()
         # Return only once the reader has stopped and closed the source.
-        await asyncio.gather(reader, return_exceptions=True)
+        with anyio.CancelScope(shield=True):
+            await asyncio.gather(reader, return_exceptions=True)
 
 
 async def reframe_openai_stream(

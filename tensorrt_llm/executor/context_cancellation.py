@@ -28,6 +28,8 @@ import re
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from threading import Lock
 from typing import Callable, Literal, NamedTuple
 
@@ -39,6 +41,11 @@ _RESERVATION_LIFETIME_SECONDS = 60.0
 _AUTHORIZATION_REPLAY_LIMIT = 65_536
 _AUTHORIZATION_RETENTION_SECONDS = 120.0
 _AUTHORIZATION_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+
+def context_authorization_time_valid(expires_at_ms: int, now_ms: int) -> bool:
+    """Whether the signed UTC expiry is inside the worker's admission window."""
+    return now_ms < expires_at_ms <= now_ms + _MAX_AUTHORIZATION_HORIZON_MS
 
 
 class _AcceptedAuthorization(NamedTuple):
@@ -58,6 +65,9 @@ class ContextCancellationReservations:
         self._key = secrets.token_bytes(32)
         self._lock = Lock()
         self._pending: OrderedDict[str, float] = OrderedDict()
+        # A claimed token cannot be delivered again, but is still cancellable
+        # until the request has been prepared and actually enqueued.
+        self._preparing: set[str] = set()
         # All HTTP lanes share this worker-owned ledger. Consumed authorizations
         # do not occupy pending admission, but remain recognizable after UTC changes.
         self._authorizations: OrderedDict[str, _AcceptedAuthorization] = OrderedDict()
@@ -92,7 +102,7 @@ class ContextCancellationReservations:
         with self._lock:
             now = time.monotonic()
             now_ms = time.time_ns() // 1_000_000
-            if not now_ms < authorization_expires_at_ms <= now_ms + _MAX_AUTHORIZATION_HORIZON_MS:
+            if not context_authorization_time_valid(authorization_expires_at_ms, now_ms):
                 raise ValueError("Context reservation authorization is outside its validity window")
             # UTC corrections cannot shorten nonce retention. Once a record is
             # removed, its signed expiry stays at or below a fixed rejection floor.
@@ -127,7 +137,7 @@ class ContextCancellationReservations:
             # advancing UTC catches this fixed floor without a moving offset.
             if authorization_expires_at_ms <= self._pruned_authorization_expiry_ms:
                 raise ValueError("Context reservation authorization is outside its validity window")
-            if len(self._pending) >= _PENDING_RESERVATION_LIMIT:
+            if len(self._pending) + len(self._preparing) >= _PENDING_RESERVATION_LIMIT:
                 raise RuntimeError("Context cancellation reservations are full")
             # Keep replay storage bounded independently of the 1,024 pending
             # slots. Never evict a live nonce to admit more work: reject overload.
@@ -168,16 +178,16 @@ class ContextCancellationReservations:
             raise ValueError("Invalid context cancellation token")
         return json.loads(payload)[0]
 
-    def submit(self, token: str, request_id: int, enqueue: Callable[[], int]) -> int:
-        """Consume admission and enqueue before a concurrent cancel can proceed.
+    @contextmanager
+    def admission(self, token: str, request_id: int) -> Iterator[AbstractContextManager[None]]:
+        """Claim admission for unlocked preparation, then guard the actual queue insertion.
 
         Args:
             token: Unconsumed reservation token.
             request_id: Pairing identity of the submitted context request.
-            enqueue: The existing worker-to-executor admission operation.
 
-        Returns:
-            The executor request identity returned by admission.
+        Yields:
+            A guard to enter only around insertion of the fully prepared request.
 
         Raises:
             ValueError: Admission expired, was cancelled/consumed, or mismatches.
@@ -188,9 +198,22 @@ class ContextCancellationReservations:
             deadline = self._pending.pop(token, None)
             if deadline is None or deadline <= time.monotonic():
                 raise ValueError("Context cancellation admission is closed")
-            # Consume even if enqueue raises: a partial/failed admission must
-            # never be retried with this token. Cancellation remains routable.
-            return enqueue()
+            self._preparing.add(token)
+        try:
+            yield self._enqueue_guard(token)
+        finally:
+            # Even interrupted preparation consumes admission and frees its slot.
+            with self._lock:
+                self._preparing.discard(token)
+
+    @contextmanager
+    def _enqueue_guard(self, token: str) -> Iterator[None]:
+        """Serialize the final queue insert with cancellation of a claimed token."""
+        with self._lock:
+            if token not in self._preparing:
+                raise ValueError("Context cancellation admission is closed")
+            self._preparing.remove(token)
+            yield
 
     def cancel(self, token: str, enqueue: Callable[[str], None]) -> CancellationReceipt:
         """Close unused admission or queue cancellation of the exact instance.
@@ -200,7 +223,7 @@ class ContextCancellationReservations:
             enqueue: Enqueues token cancellation on the existing executor queue.
 
         Returns:
-            ``not_submitted`` only when admission was closed before consumption;
+            ``not_submitted`` only when admission was closed before enqueue;
             otherwise ``queued``, not worker handling or resource retirement.
 
         Raises:
@@ -209,6 +232,9 @@ class ContextCancellationReservations:
         with self._lock:
             self._request_id(token)
             if self._pending.pop(token, None) is not None:
+                return "not_submitted"
+            if token in self._preparing:
+                self._preparing.remove(token)
                 return "not_submitted"
             enqueue(token)
             return "queued"

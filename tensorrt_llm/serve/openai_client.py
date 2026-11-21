@@ -676,7 +676,8 @@ class OpenAIHttpClient(OpenAIClient):
             headers = dict(MSGPACK_HEADERS)
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
-            headers.update(self._get_request_headers(request))
+            internal_headers = self._get_request_headers(request)
+            headers.update(internal_headers)
             response_started = False
             terminal_status_rejected = False
             try:
@@ -686,7 +687,7 @@ class OpenAIHttpClient(OpenAIClient):
                     url,
                     data=body,
                     headers=headers,
-                    allow_redirects=False,
+                    allow_redirects=not internal_headers,
                 ) as http_response:
                     response_started = True
                     response_clock = AdjustedSteadyClock()

@@ -15,12 +15,16 @@
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 import warnings
 from typing import Any, Mapping, Optional
 
-from tensorrt_llm.executor.context_cancellation import CONTEXT_RESERVATION_AUTH_LIFETIME_MS
+from tensorrt_llm.executor.context_cancellation import (
+    CONTEXT_RESERVATION_AUTH_LIFETIME_MS,
+    context_authorization_time_valid,
+)
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.conversation_id import (
     SUBAGENT_AFFINITY_HEADER,
@@ -32,6 +36,8 @@ from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
 CONTEXT_CANCELLATION_AUTH_HEADER = "x-trtllm-context-cancellation-auth"
+CONTEXT_PROBE_HEADER = "x-trtllm-context-cancellation-challenge"
+_CONTEXT_PROBE_PATTERN = re.compile(r"[0-9a-f]{32}:([0-9]{1,16})")
 SUBAGENT_AFFINITY_AUTH_HEADER = "x-trtllm-subagent-affinity-auth"
 _SIGNATURE_PREFIX = "sha256="
 _INTERNAL_DISAGG_AUTH_FIELDS = ("encoded_opaque_state", "ctx_info_endpoint")
@@ -157,6 +163,28 @@ def context_cancellation_reservation_payload(request_id: int) -> dict[str, str |
         "authorization_expires_at_ms": time.time_ns() // 1_000_000
         + CONTEXT_RESERVATION_AUTH_LIFETIME_MS,
     }
+
+
+def build_context_probe_headers(key: str | None) -> dict[str, str]:
+    """Sign a fresh, short-lived challenge for a read-only CTX capability probe."""
+    expiry = time.time_ns() // 1_000_000 + CONTEXT_RESERVATION_AUTH_LIFETIME_MS
+    challenge = f"{secrets.token_hex(16)}:{expiry}"
+    return {
+        CONTEXT_PROBE_HEADER: challenge,
+        **build_context_cancellation_headers(key, "probe", {"challenge": challenge}),
+    }
+
+
+def validate_context_probe(key: str | None, headers: Mapping[str, str]) -> str:
+    """Accept only authenticated challenges in the same clock window as a reservation."""
+    challenge = headers.get(CONTEXT_PROBE_HEADER, "")
+    match = _CONTEXT_PROBE_PATTERN.fullmatch(challenge)
+    if match is None:
+        raise ValueError("Invalid context cancellation challenge")
+    validate_context_cancellation_auth(key, "probe", {"challenge": challenge}, headers)
+    if not context_authorization_time_valid(int(match[1]), time.time_ns() // 1_000_000):
+        raise ValueError("Context cancellation challenge is outside its validity window")
+    return challenge
 
 
 def validate_context_cancellation_auth(

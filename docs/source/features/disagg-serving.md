@@ -205,6 +205,8 @@ The same flag can select the existing no-retry FP4 MLA generation-first bridge w
 
 The sender and receiver retain resources until access is proven safe. An unresolved failure, cancellation or timeout starts the existing non-resettable quiescence grace (also `kv_transfer_timeout_ms`); expiry retains those resources and fail-stops the executor, potentially the entire shared MPI launcher job. This does not provide automatic replacement or generalized in-flight cancellation delivery.
 
+For the protected native context-first HTTP path, configure the same `internal_request_auth_key` on the coordinator, serving frontends, and CTX workers, and keep their UTC clocks synchronized. Before it accepts a CTX endpoint, each signing process sends an authenticated, read-only probe; this does not reserve a request ID, allocate KV, or dispatch GEN. Each actual reservation is still authenticated and checked against the worker's clock. A frontend signs an expiry 60 seconds ahead; when the worker receives it, that expiry must be in the future and no more than 120 seconds away. This UTC window protects **admission**; it is not the transfer timeout or the physical-quiescence grace period. A cancellation receipt means admission was closed or cancellation was queued, not that the worker has already released KV.
+
 #### Basic serving example
 
 The following example illustrates general serving setup, not the ownership-enabled profile above. You could launch two context servers and one generation server as follows:

@@ -75,6 +75,7 @@ from tensorrt_llm.serve.output_length_predictor import (
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
     ROUTING_CONTENT_REQUIRED,
+    ContextCancellationCapabilityError,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
     Router,
@@ -243,6 +244,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             server_preparation_func,
             disagg_node_id=config.node_id,
             require_context_cancellation=self._context_cancellation_enabled,
+            context_auth_key=config.internal_request_auth_key,
         )
         # The coordinator owns the disagg cluster storage (auto-scaling backend):
         # it drives the DisaggClusterManager below and, when the storage is an
@@ -570,9 +572,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
         try:
             await asyncio.wait_for(prepare(), timeout=self._server_start_timeout_secs)
         except asyncio.TimeoutError as error:
+            pending = self._ctx_router.unverified_context_servers
             raise RuntimeError(
                 "Timed out verifying logical context cancellation for CTX servers: "
-                f"{sorted(set(self._ctx_router.servers) - self._ctx_router.prepared_servers)}"
+                f"{sorted(pending) if pending else 'no CTX registration admitted'}"
             ) from error
 
     async def start(self) -> None:
@@ -643,6 +646,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
             await self._gen_router.stop_server_monitoring()
 
     async def is_ready(self) -> bool:
+        if self._context_cancellation_enabled and not self._ctx_router.has_prepared_server:
+            return False
         if self._disagg_cluster_manager:
             return await self._disagg_cluster_manager.is_ready_with_router(
                 self._ctx_router.num_prepared_servers,
@@ -659,6 +664,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 "generation": list(self._gen_router.servers),
             },
         }
+        if self._context_cancellation_enabled:
+            info["context_admissions"] = self._ctx_router.context_admissions()
         routing_key_configs = {}
         for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
             if isinstance(router, KvCacheAwareRouter):
@@ -667,8 +674,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     routing_key_configs[role] = config
         if routing_key_configs:
             info["routing_key_configs"] = routing_key_configs
-        # Frontends never fetch /server_info, so they cannot check that a worker renders like
-        # their own router; they use the fingerprints this coordinator already fetched.
+        # Delegated placement uses the coordinator's rendering fingerprints.
         info["render_fingerprints"] = {
             role: {
                 server: fingerprint_summary(server_info.get("render_fingerprint"))
@@ -686,15 +692,27 @@ class DisaggCoordinatorService(DisaggCoordinator):
         gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
 
         async def check_servers_ready():
-            elapsed_time = 0
             interval = self._health_check_interval_secs
-            while elapsed_time < self._server_start_timeout_secs:
-                if gen_only:
-                    unready_ctx_servers = []
-                else:
-                    _, unready_ctx_servers = await self._ctx_client.check_ready()
+            while True:
+                # A removal or same-address replacement publishes a new list.
+                # Its health cannot be inferred from a previous incarnation.
+                ctx_snapshot = self._ctx_router.servers
+                try:
+                    if gen_only:
+                        unready_ctx_servers = []
+                    else:
+                        _, unready_ctx_servers = await self._ctx_client.check_ready()
+                except ServerPreparationPending as error:
+                    logger.info(f"Waiting for context server preparation: {error}")
+                    await asyncio.sleep(interval)
+                    continue
                 _, unready_gen_servers = await self._gen_client.check_ready()
-                if len(unready_ctx_servers) == 0 and len(unready_gen_servers) == 0:
+                ctx_current = not self._context_cancellation_enabled or (
+                    bool(ctx_snapshot)
+                    and ctx_snapshot is self._ctx_router.servers
+                    and set(ctx_snapshot) <= self._ctx_router.prepared_servers
+                )
+                if ctx_current and not unready_ctx_servers and not unready_gen_servers:
                     logger.info(
                         "All servers are ready"
                         if not gen_only
@@ -702,11 +720,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     )
                     return
                 logger.info(
-                    f"Waiting for servers, context: {unready_ctx_servers}, "
+                    f"Waiting for servers, context: {unready_ctx_servers}, current: {ctx_current}, "
                     f"generation: {unready_gen_servers}"
                 )
                 await asyncio.sleep(interval)
-                elapsed_time += interval
 
         try:
             await asyncio.wait_for(check_servers_ready(), timeout=self._server_start_timeout_secs)
@@ -738,6 +755,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
             return await self._ctx_router.add_server(
                 address, registration_id=registration, raise_on_capability_error=True
             )
+        except ServerPreparationPending:
+            return False
         except RuntimeError as error:
             # Preparation rejects an incompatible registration before publication.
             # The watch stream must still process other workers in this batch.
@@ -938,6 +957,7 @@ class CoordinatorClient(DisaggCoordinator):
             create_metadata_server(metadata_config),
             disagg_node_id=config.node_id,
             require_context_cancellation=self._context_cancellation_enabled,
+            context_auth_key=config.internal_request_auth_key,
         )
         self._ctx_router = self._maybe_delegate(ctx_router, "context")
         self._gen_router = self._maybe_delegate(gen_router, "generation")
@@ -971,7 +991,13 @@ class CoordinatorClient(DisaggCoordinator):
         # Fail fast: probe /cluster_info with bounded retry so a delegating server
         # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
-        await self._apply_cluster_info(info)
+        try:
+            await self._apply_cluster_info(info)
+        except ServerPreparationPending:
+            # A reachable coordinator can precede its CTX backends. Keep this
+            # frontend unready; the shared refresh retries a transient probe.
+            if not self._context_cancellation_enabled:
+                raise
         self._sync_task = asyncio.create_task(
             self._sync_coordinator_state(self._state_sync_interval_s)
         )
@@ -1138,6 +1164,22 @@ class CoordinatorClient(DisaggCoordinator):
 
     async def _sync_router_server_lists(self, info: Dict[str, Any]) -> None:
         server_lists = info.get("server_lists")
+        context_admissions = None
+        if self._context_cancellation_enabled:
+            context_admissions = info.get("context_admissions")
+            if not isinstance(context_admissions, dict) or not isinstance(server_lists, dict):
+                raise ContextCancellationCapabilityError(
+                    "Protected coordinator did not publish CTX admissions"
+                )
+            desired_ctx = set(server_lists.get("context", []))
+            if (
+                set(context_admissions) != desired_ctx
+                or not all(
+                    isinstance(value, str) and value for value in context_admissions.values()
+                )
+                or (info.get("is_ready") and not desired_ctx)
+            ):
+                raise ServerPreparationPending("Waiting for the coordinator's admitted CTX pool")
         if server_lists is None:
             return
         router_servers = (
@@ -1145,10 +1187,25 @@ class CoordinatorClient(DisaggCoordinator):
             (self._gen_router, server_lists.get("generation", [])),
         )
         for router, servers in router_servers:
+            admissions = context_admissions if router is self._ctx_router else None
             if isinstance(router, CoordinatorDelegatingRouter):
-                await router.sync_servers(servers)
+                if admissions is None:
+                    await router.sync_servers(servers)
+                else:
+                    await router.sync_servers(servers, context_admissions=admissions)
                 continue
             desired = set(servers)
+            if admissions is not None:
+                for server in desired:
+                    if (
+                        server in router.servers
+                        and router.server_registration_id(server) == admissions[server]
+                    ):
+                        continue
+                    if not await router.add_server(
+                        server, registration_id=admissions[server], raise_on_capability_error=True
+                    ):
+                        raise ServerPreparationPending(f"Failed to prepare {server}")
             for server in desired - set(router.servers):
                 if not await router.add_server(server):
                     raise RuntimeError(

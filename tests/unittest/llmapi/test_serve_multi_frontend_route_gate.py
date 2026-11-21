@@ -40,7 +40,7 @@ PER_FRONTEND_SAFE = {
     ("GET", "/health_generate"): "a real request through the shared executor",
     ("GET", "/version"): "constant",
     ("GET", "/v1/models"): "constant",
-    ("GET", "/server_info"): "static configuration",
+    ("GET", "/server_info"): "worker metadata and a read-only CTX capability probe",
     ("POST", "/v1/completions"): "request path",
     ("POST", "/v1/chat/completions"): "request path",
     ("POST", "/v1/messages"): "request path",

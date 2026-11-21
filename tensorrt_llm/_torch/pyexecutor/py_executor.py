@@ -634,6 +634,20 @@ def _request_flag(request, name: str) -> bool:
     return bool(value)
 
 
+def _index_queued_context_request(targets: dict[str, set[int]],
+                                  item: RequestQueueItem) -> None:
+    """Add a queued CTX request to the token lookup for this queue pass.
+
+    Args:
+        targets: Executor IDs keyed by context cancellation token.
+        item: A previously queued or newly accepted request.
+    """
+    token = item.context_cancellation_token
+    if (token is not None and item.request is not None and
+            item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY):
+        targets.setdefault(token, set()).add(item.id)
+
+
 def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
     """Whether a single-rank attention-DP group can skip ADP dummy padding.
 
@@ -10377,6 +10391,7 @@ class PyExecutor:
         """Handle special signals."""
         accepted_new_requests = []
         finished_prefix_load_ids = []
+        context_targets: dict[str, set[int]] | None = None
         for idx, req_item in enumerate(new_requests):
             if req_item.is_prefix_load_completion_request:
                 finished_prefix_load_ids.extend(
@@ -10385,9 +10400,14 @@ class PyExecutor:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
-                if req_item.cancel_context_token is not None:
-                    self._resolve_context_token_cancellation(
-                        req_item.cancel_context_token, accepted_new_requests)
+                token = req_item.cancel_context_token
+                if token is not None:
+                    if context_targets is None:
+                        context_targets = self._context_cancellation_targets(
+                            itertools.chain(self.waiting_queue,
+                                            accepted_new_requests))
+                    self.canceled_req_ids.extend(
+                        sorted(context_targets.get(token, ())))
                 elif req_item.cancel_context_client_id is None:
                     self.canceled_req_ids.append(req_item.id)
                 else:
@@ -10420,6 +10440,9 @@ class PyExecutor:
                 self._benchmark_stage_vote_pending = True
             else:
                 accepted_new_requests.append(req_item)
+                if context_targets is not None:
+                    # Later submissions only become visible to later cancels.
+                    _index_queued_context_request(context_targets, req_item)
 
         if finished_prefix_load_ids:
             self._defer_connector_load_cancellations()
@@ -10427,47 +10450,20 @@ class PyExecutor:
                 finished_prefix_load_ids)
         return accepted_new_requests
 
-    def _resolve_context_token_cancellation(
-            self, token: str,
-            accepted_new_requests: list[RequestQueueItem]) -> None:
-        """Resolve exact-instance intent without retaining a second ID registry.
-
-        The admission owner serializes request enqueue before token cancellation.
-        Unmatched intent therefore names work that cannot arrive later. Control
-        handling keeps a future submit and its cancellation on the same side.
-
-        Args:
-            token: Worker-authenticated request identity, not a pairing ID.
-            accepted_new_requests: Normal entries preceding the cancellation in
-                this envelope, before any pending control barrier.
-        """
-        self.canceled_req_ids.extend(
-            sorted(
-                self._context_cancellation_targets(self.waiting_queue,
-                                                   accepted_new_requests).get(
-                                                       token, ())))
-
     def _context_cancellation_targets(
-        self,
-        waiting_queue: WaitingQueue,
-        accepted_new_requests: Iterable[RequestQueueItem] = ()
-    ) -> dict[str, set[int]]:
+            self,
+            queued_requests: Iterable[RequestQueueItem]) -> dict[str, set[int]]:
         """Map context tokens to existing work on this side of a control barrier.
 
         Args:
-            waiting_queue: Previously fetched but unscheduled requests.
-            accepted_new_requests: Requests preceding cancellation in the current envelope.
+            queued_requests: Unscheduled requests already visible to cancellation.
 
         Returns:
             Executor identities keyed by the exact context cancellation token.
         """
         targets: dict[str, set[int]] = {}
-        for item in itertools.chain(waiting_queue, accepted_new_requests):
-            token = item.context_cancellation_token
-            if (token is not None and item.request is not None
-                    and item.request.request_type
-                    == RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                targets.setdefault(token, set()).add(item.id)
+        for item in queued_requests:
+            _index_queued_context_request(targets, item)
         transfers = self.async_transfer_manager.requests_in_transfer().values()
         for req in itertools.chain(self.active_requests, transfers):
             token = getattr(req.py_disaggregated_params,

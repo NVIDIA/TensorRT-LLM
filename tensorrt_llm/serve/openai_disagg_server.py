@@ -127,6 +127,13 @@ class _ClientDisconnected(Exception):
     """The client closed its connection before the response started."""
 
 
+async def _wait_for_disconnect(request: Request, stopping: asyncio.Event) -> None:
+    """Wait on the parsed request's ASGI channel until disconnect or listener handoff."""
+    while not stopping.is_set():
+        if (await request.receive())["type"] == "http.disconnect":
+            return
+
+
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
                  collect_perf_metrics: bool):
@@ -474,16 +481,9 @@ class OpenAIDisaggServer:
             _ClientDisconnected: The client disconnected during the prelude.
             asyncio.CancelledError: The caller cancelled the handler.
         """
-        stop_watching = False
-
-        async def watch_disconnect() -> None:
-            while not stop_watching:
-                if await raw_req.is_disconnected() or stop_watching:
-                    return
-                await asyncio.sleep(0.1)
-
+        stopping = asyncio.Event()
         work = asyncio.create_task(entry_point(req, hooks))
-        disconnected = asyncio.create_task(watch_disconnect())
+        disconnected = asyncio.create_task(_wait_for_disconnect(raw_req, stopping))
         returned = False
         try:
             await asyncio.wait((work, disconnected), return_when=asyncio.FIRST_COMPLETED)
@@ -494,8 +494,7 @@ class OpenAIDisaggServer:
             returned = True
             return result
         finally:
-            # Request.is_disconnected() can consume task cancellation in its cancel scope.
-            stop_watching = True
+            stopping.set()
             disconnected.cancel()
             if not returned:
                 work.cancel()
@@ -610,21 +609,16 @@ class OpenAIDisaggServer:
             _ClientDisconnected: The client left before the first chunk;
                 `stream` is closed.
         """
-        async def wait_for_disconnect() -> None:
-            while True:
-                message = await raw_request.receive()
-                if message["type"] == "http.disconnect":
-                    return
-
+        stopping = asyncio.Event()
         first_chunk_task = asyncio.ensure_future(anext(stream))
-        disconnect_task = asyncio.create_task(wait_for_disconnect())
-        listener_stopping = False
+        disconnect_task = asyncio.create_task(_wait_for_disconnect(raw_request, stopping))
         handed_off = False
 
         async def close_unhanded_stream() -> None:
             if not first_chunk_task.done():
                 first_chunk_task.cancel()
-            if not listener_stopping and not disconnect_task.done():
+            if not stopping.is_set() and not disconnect_task.done():
+                stopping.set()
                 disconnect_task.cancel()
             # A generator cannot be closed while its first anext is running.
             await asyncio.gather(first_chunk_task, disconnect_task, return_exceptions=True)
@@ -642,7 +636,7 @@ class OpenAIDisaggServer:
             except StopAsyncIteration:
                 return stream
 
-            listener_stopping = True
+            stopping.set()
             disconnect_task.cancel()
             stopped = asyncio.gather(disconnect_task, return_exceptions=True)
             if protected:
@@ -814,6 +808,8 @@ class OpenAIDisaggServer:
         elif isinstance(exception, aiohttp.ClientResponseError):
             self._perf_metrics_collector.http_exceptions.inc()
             status = exception.status or 502
+            if 300 <= status < 400:
+                raise HTTPException(status_code=502, detail="Unexpected worker redirect") from exception
             logger.error(
                 f"Upstream HTTP error {status} {exception.message}: ",
                 traceback.format_exc())

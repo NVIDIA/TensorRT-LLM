@@ -21,6 +21,7 @@ import time
 import traceback
 import uuid
 import weakref
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
@@ -470,9 +471,13 @@ class BaseWorker(GenerationExecutor):
                     self._lora_adapter_identities.setdefault(
                         adapter_id, identity)
 
-    def _enqueue_request(self,
-                         request: GenerationRequest,
-                         result_wait_queue=None) -> int:
+    def _enqueue_request(
+            self,
+            request: GenerationRequest,
+            result_wait_queue=None,
+            *,
+            enqueue_guard: Optional[AbstractContextManager[None]] = None
+    ) -> int:
         assert request.id is not None
         if request.prompt_adapter_request is not None:
             raise RequestError(
@@ -681,13 +686,11 @@ class BaseWorker(GenerationExecutor):
                     prompt_trimmed_prefix=trimmed_prefix,
                 ),
             )
-
-            if result_wait_queue is not None:
-                req_id = self.engine.enqueue_request(
-                    executor_request, result_wait_queue=result_wait_queue)
-            else:
-                req_id = self.engine.enqueue_request(executor_request)
-            return req_id
+            with enqueue_guard if enqueue_guard is not None else nullcontext():
+                if result_wait_queue is not None:
+                    return self.engine.enqueue_request(
+                        executor_request, result_wait_queue=result_wait_queue)
+                return self.engine.enqueue_request(executor_request)
         except Exception as e:
             raise RequestError(str(e)) from e
 
@@ -733,9 +736,10 @@ class BaseWorker(GenerationExecutor):
                         raise ValueError(
                             "Cancellation tokens require context-first CTX requests"
                         )
-                    request_id = self._context_cancellation_reservations.submit(
-                        token, params.disagg_request_id,
-                        lambda: self._enqueue_request(request))
+                    with self._context_cancellation_reservations.admission(
+                            token, params.disagg_request_id) as enqueue_guard:
+                        request_id = self._enqueue_request(
+                            request, enqueue_guard=enqueue_guard)
                 except ValueError as error:
                     # Admission rejection is request-local, not worker death.
                     raise RequestError(str(error)) from error

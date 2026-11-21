@@ -118,6 +118,7 @@ class _SseErrorObserver:
     """Observe worker error events without changing the forwarded SSE bytes."""
 
     _EVENT_END = re.compile(rb"\r?\n\r?\n")
+    _RESPONSE_TERMINALS = (b"response.completed", b"response.incomplete", b"response.failed")
 
     def __init__(self, *, responses_api: bool = False) -> None:
         """Retain only the incomplete event between network chunks."""
@@ -150,6 +151,13 @@ class _SseErrorObserver:
             if data == b"[DONE]" and not self._responses_api:
                 self.completed = True
                 continue
+            # Most events are ordinary deltas. Escaped JSON keys or values
+            # still need decoding, even if the marker is not present verbatim.
+            if b"\\" not in data and b'"error"' not in data:
+                if not self._responses_api or not any(
+                    tag in data for tag in self._RESPONSE_TERMINALS
+                ):
+                    continue
             try:
                 payload = json.loads(data)
             except ValueError:
@@ -287,19 +295,22 @@ class _ContextCancellation:
         if self._delivery is None:
             self._delivery = asyncio.create_task(self._deliver_cancellation())
         settled = asyncio.gather(self._delivery, return_exceptions=True)
+        interrupted = False
         with anyio.CancelScope(shield=True):
             while not settled.done():
                 try:
                     await asyncio.shield(settled)
                 except asyncio.CancelledError:
                     # Direct Task.cancel() must not cancel shared delivery.
-                    pass
+                    interrupted = True
         error = settled.result()[0]
         if isinstance(error, BaseException):
             logger.warning(
                 f"Context cancellation delivery is unconfirmed ({type(error).__name__}); "
                 "the transfer timeout and physical-quiescence grace/fail-close policy remain active"
             )
+        if interrupted:
+            raise asyncio.CancelledError
 
     async def stream(
         self,
@@ -315,7 +326,6 @@ class _ContextCancellation:
         Yields:
             An initial private sentinel, then unchanged response frames.
         """
-        success = False
         observer = _SseErrorObserver(responses_api=responses_api)
         failed = False
         try:
@@ -331,9 +341,8 @@ class _ContextCancellation:
                     async for chunk in guarded:
                         failed = observer.feed(chunk) or failed
                         yield chunk
-            success = not failed and observer.completed
         finally:
-            if not success:
+            if failed or not observer.completed:
                 await self.cancel()
 
 
@@ -713,8 +722,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
         if ctx_response:
-            request.disaggregated_params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params
-            request.disaggregated_params.context_cancellation_token = None
+            params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params.model_copy()
+            # The token belongs to CTX. GEN must not receive even a null token:
+            # older workers reject unknown fields, and the client sends fields set by CTX.
+            params.context_cancellation_token = None
+            params.model_fields_set.discard("context_cancellation_token")
+            request.disaggregated_params = params
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.ctx_usage = _ctx_usage_info(ctx_response)

@@ -9,7 +9,7 @@ transceiver acceptance and transport, not physical GPU/NIXL retirement.
 
 import datetime
 import pickle
-from unittest.mock import call
+from unittest.mock import call, patch
 
 import pytest
 
@@ -156,6 +156,38 @@ def test_token_abort_preserves_retained_owner_and_earlier_result(retained_only: 
     if retained_only:
         assert request.state == previous_state
         engine._enqueue_responses.assert_not_called()
+
+
+def test_batched_token_cancellations_scan_existing_work_once_in_queue_order() -> None:
+    """A burst sees only preceding submits, without rescanning existing work per token."""
+    engine = _executor()
+    queue = engine.executor_request_queue
+    transfers = engine.async_transfer_manager
+    active = _active_request(101)
+    active.py_disaggregated_params.context_cancellation_token = "active"
+    engine.active_requests.append(active)
+    transfers.start_transfer(active)
+
+    with patch.object(
+        transfers, "requests_in_transfer", wraps=transfers.requests_in_transfer
+    ) as scan:
+        waiting_id = queue.enqueue_request(_raw_with_token("waiting"))
+        items = queue.get_from_request_queue(datetime.timedelta(0), wait_for_batch=False)
+        engine.waiting_queue.add_requests(engine._handle_special_queue_items(items))
+        scan.assert_not_called()
+
+        engine.cancel_context_request("later")
+        later_id = queue.enqueue_request(_raw_with_token("later"))
+        engine.cancel_context_request("active")
+        engine.cancel_context_request("active")
+        engine.cancel_context_request("later")
+        engine.cancel_context_request("waiting")
+        items = queue.get_from_request_queue(datetime.timedelta(0), wait_for_batch=False)
+        accepted = engine._handle_special_queue_items(items)
+
+        assert [item.id for item in accepted] == [later_id]
+        assert engine.canceled_req_ids == [101, 101, later_id, waiting_id]
+        scan.assert_called_once_with()
 
 
 def test_token_cancel_drain_preserves_future_submit_and_cancel_order() -> None:

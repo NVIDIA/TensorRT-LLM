@@ -53,6 +53,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     ServerRole,
 )
 from tensorrt_llm.serve import disagg_coordinator as coordinator_module
+from tensorrt_llm.serve import router as router_module
 from tensorrt_llm.serve.cluster_storage import (
     StorageItem,
     WatchEvent,
@@ -81,6 +82,7 @@ from tensorrt_llm.serve.router import (
     KvCacheAwareRouter,
     LoadBalancingRouter,
     RoundRobinRouter,
+    ServerPreparationPending,
 )
 from tensorrt_llm.serve.router_utils import BlockHashMixin as SharedBlockHashMixin
 
@@ -1869,7 +1871,12 @@ async def test_fleet_cancellation_mode_mismatch_precedes_routing_sync(
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize(
     "router,capable",
-    [("round_robin", True), ("round_robin", False), ("load_balancing", True)],
+    [
+        ("round_robin", True),
+        ("round_robin", False),
+        ("load_balancing", True),
+        ("load_balancing", False),
+    ],
 )
 async def test_fleet_matching_cancellation_mode_prepares_before_ready(
     monkeypatch: pytest.MonkeyPatch, enabled: bool, router: str, capable: bool
@@ -1877,25 +1884,37 @@ async def test_fleet_matching_cancellation_mode_prepares_before_ready(
     """Matching fleet policy permits only a fully applied coordinator snapshot."""
     config = _context_cancellation_config(monkeypatch, enabled=enabled, router=router)
     client = CoordinatorClient("http://coordinator", config)
-    client.ctx_router._fetch_server_info = AsyncMock(
+    local = getattr(client.ctx_router, "_local", client.ctx_router)
+    local._fetch_server_info = AsyncMock(
         return_value={"supports_logical_context_cancellation": True} if capable else {}
     )
     info = {"is_ready": True, "server_lists": {"context": ["ctx:8000"], "generation": []}}
     # Missing metadata remains compatible only for a disabled frontend.
     if enabled:
         info["context_cancellation_enabled"] = True
+        info["context_admissions"] = {"ctx:8000": "first"}
     try:
         if enabled and not capable:
-            with pytest.raises(RuntimeError, match="Failed to prepare ctx:8000"):
+            with pytest.raises(RuntimeError, match="does not advertise supported"):
                 await client._apply_cluster_info(info)
             assert not client._is_ready
             assert not client.ctx_router.servers
             assert not client.ctx_router.prepared_servers
-            client.ctx_router._fetch_server_info.assert_awaited_once()
+            local._fetch_server_info.assert_awaited_once()
         else:
             await client._apply_cluster_info(info)
             assert client._is_ready
             assert client.ctx_router.servers == ["ctx:8000"]
+            if enabled:
+                await client._apply_cluster_info(info)
+                local._fetch_server_info.assert_awaited_once()
+                info["context_admissions"]["ctx:8000"] = "replacement"
+                await client._apply_cluster_info(info)
+                assert local._fetch_server_info.await_count == 2
+                del info["context_admissions"]
+                with pytest.raises(RuntimeError, match="did not publish CTX admissions"):
+                    await client._apply_cluster_info(info)
+                assert not client._is_ready
     finally:
         await client.stop()
 
@@ -1921,13 +1940,26 @@ def test_coordinator_enforces_existing_context_cancellation_prerequisites(
 
 
 @pytest.mark.asyncio
-async def test_protected_transport_startup_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A missing server-info endpoint cannot leave startup waiting indefinitely."""
-    config = _context_cancellation_config(monkeypatch, ctx_urls=["ctx:8000"])
+@pytest.mark.parametrize("discovered", [False, True], ids=["static", "metadata"])
+async def test_protected_transport_startup_wait_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, discovered: bool
+) -> None:
+    """Name unadmitted addresses even if the deadline interrupts the first health probe."""
+    config = _context_cancellation_config(monkeypatch, ctx_urls=[] if discovered else ["ctx:8000"])
     owner = DisaggCoordinatorService(
         config, Mock(), health_check_interval_secs=1, server_start_timeout_secs=0.01
     )
     owner.ctx_router._fetch_server_info = AsyncMock(side_effect=RuntimeError("not ready"))
+    if discovered:
+        entries = {"trtllm/ctx": {"url": "ctx:8000", "server_role": "context"}}
+        owner._metadata_server = owner.ctx_router._metadata_server = entries
+        owner._metadata_config = SimpleNamespace(refresh_interval=1)
+
+        async def pending(_url: str) -> bool:
+            await asyncio.Event().wait()
+            return False
+
+        owner.ctx_router._check_server_health = AsyncMock(side_effect=pending)
     try:
         with pytest.raises(RuntimeError, match="Timed out.*CTX servers.*ctx:8000"):
             await asyncio.wait_for(owner.start(), timeout=2)
@@ -2029,6 +2061,180 @@ async def test_protected_start_keeps_unready_metadata_until_health_recovers(
     finally:
         owner._metadata_server = None
         await owner.stop()
+
+
+@pytest.mark.asyncio
+async def test_protected_metadata_admission_rechecks_probed_registration() -> None:
+    """A record retired during /server_info cannot authorize its replacement."""
+    metadata = {"trtllm/v1": {"url": "ctx", "server_role": "context"}}
+    router = RoundRobinRouter(
+        ServerRole.CONTEXT, metadata_server=metadata, require_context_cancellation=True
+    )
+    router._check_server_health = AsyncMock(return_value=True)
+
+    async def info(_server: str, _timeout: float) -> dict:
+        metadata["trtllm/v2"] = metadata.pop("trtllm/v1")
+        return {"supports_logical_context_cancellation": True}
+
+    router._fetch_server_info = AsyncMock(side_effect=info)
+    try:
+        await router.refresh_protected_context_servers(startup=True)
+        assert not router.servers and not router.prepared_servers
+        router._fetch_server_info = AsyncMock(return_value={})
+        with pytest.raises(RuntimeError, match="does not advertise"):
+            await router.refresh_protected_context_servers(startup=True)
+        assert not router.servers and not router.prepared_servers
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace", [False, True], ids=["removed", "replaced"])
+async def test_protected_preparation_discards_retired_worker_reply(replace: bool) -> None:
+    """An old /server_info response must not republish readiness or replace current metadata."""
+    router = RoundRobinRouter(ServerRole.CONTEXT, ["ctx"], require_context_cancellation=True)
+    started, resume = asyncio.Event(), asyncio.Event()
+
+    async def info(_server: str, _timeout: float) -> dict:
+        if not started.is_set():
+            started.set()
+            await resume.wait()
+            return {"supports_logical_context_cancellation": True, "version": "retired"}
+        return {"supports_logical_context_cancellation": True, "version": "replacement"}
+
+    router._fetch_server_info = AsyncMock(side_effect=info)
+    old = asyncio.create_task(router.prepare_servers(["ctx"]))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await router.remove_server("ctx")
+        if replace:
+            assert await router.add_server("ctx", registration_id="v2")
+        resume.set()
+        await asyncio.wait_for(old, timeout=1)
+        assert router.prepared_servers == ({"ctx"} if replace else set())
+        assert [entry["version"] for entry in router.server_infos().values()] == (
+            ["replacement"] if replace else []
+        )
+    finally:
+        resume.set()
+        await asyncio.gather(old, return_exceptions=True)
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during", ["context", "generation"])
+async def test_protected_readiness_rechecks_current_registration(
+    monkeypatch: pytest.MonkeyPatch, during: str
+) -> None:
+    """An obsolete health result, empty router, or pending probe cannot complete startup."""
+    owner = DisaggCoordinatorService(
+        _context_cancellation_config(monkeypatch), Mock(), health_check_interval_secs=0
+    )
+    router = owner.ctx_router
+    server = "ctx:8000"
+    router._fetch_server_info = AsyncMock(
+        return_value={"supports_logical_context_cancellation": True}
+    )
+    await router.add_server(server, registration_id="v1")
+    seen: list[str | None] = []
+
+    async def check_context() -> tuple[list[str], list[str]]:
+        targets = list(router.servers)
+        seen.append(router.server_registration_id(server))
+        if len(seen) == 1 and during == "context":
+            await router.remove_server(server)
+        if seen[-1] == "v2" and seen.count("v2") == 1:
+            raise ServerPreparationPending("capability temporarily unavailable")
+        # OpenAIHttpClient.check_ready prepares the addresses its health check returned.
+        await router.prepare_servers(targets)
+        return targets, []
+
+    async def check_generation() -> tuple[list[str], list[str]]:
+        if len(seen) == 1 and during == "generation":
+            await router.add_server(server, registration_id="v2")
+        if seen[-1] is None:
+            assert not await owner.is_ready()
+            await router.add_server(server, registration_id="v2")
+        return ["gen:8001"], []
+
+    owner._ctx_client = Mock(check_ready=check_context, shutdown=AsyncMock())
+    owner._gen_client = Mock(check_ready=check_generation, shutdown=AsyncMock())
+    try:
+        await asyncio.wait_for(owner._wait_for_all_servers_ready(), timeout=1)
+        assert seen == (["v1", None, "v2", "v2"] if during == "context" else ["v1", "v2", "v2"])
+        assert await owner.is_ready()
+        assert router.prepared_servers == {server}
+        assert router._fetch_server_info.await_count == 2
+    finally:
+        await owner.stop()
+
+
+@pytest.mark.asyncio
+async def test_protected_metadata_probes_only_distinct_unambiguous_context_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound startup concurrency; neither duplicate ordering nor other roles reset admission."""
+    # Three eligible addresses must take two waves at this limit.
+    monkeypatch.setattr(router_module, "_MAX_METADATA_HEALTH_PROBES", 2)
+    entries = {
+        f"trtllm/{key}": {"url": url, "server_role": role}
+        for key, url, role in (
+            ("a1", "a", "context"),
+            ("a2", "a", "context"),
+            ("b", "b", "context"),
+            ("c", "c", "context"),
+            ("g", "gen", "generation"),
+            ("x1", "conflict", "context"),
+            ("x2", "conflict", "generation"),
+        )
+    }
+    router = LoadBalancingRouter(
+        ServerRole.CONTEXT, metadata_server=entries, require_context_cancellation=True
+    )
+    wave, release = asyncio.Event(), asyncio.Event()
+    active = 0
+    observed: list[str] = []
+
+    async def health(url: str) -> bool:
+        nonlocal active
+        active += 1
+        try:
+            observed.append(url)
+            assert active <= 2
+            if active == 2:
+                wave.set()
+            await release.wait()
+            return True
+        finally:
+            active -= 1
+
+    router._check_server_health = AsyncMock(side_effect=health)
+    router._fetch_server_info = AsyncMock(
+        return_value={"supports_logical_context_cancellation": True}
+    )
+    refresh = asyncio.create_task(router.refresh_protected_context_servers(startup=True))
+    try:
+        await asyncio.wait_for(wave.wait(), timeout=1)
+        release.set()
+        await asyncio.wait_for(refresh, timeout=1)
+        assert sorted(observed) == ["a", "b", "c"]
+        assert router.prepared_servers == {"a", "b", "c"}
+        state = router._server_state["a"]
+        entries["trtllm/a1"] = entries.pop("trtllm/a1")
+        await router.refresh_protected_context_servers(startup=True)
+        assert router._server_state["a"] is state
+        assert router._fetch_server_info.await_count == 3
+
+        entries["trtllm/a3"] = dict(entries["trtllm/a1"])
+        router._fetch_server_info.return_value = {}
+        await router.refresh_protected_context_servers()
+        assert router.prepared_servers == {"b", "c"}
+        assert router._fetch_server_info.await_count == 4
+    finally:
+        release.set()
+        refresh.cancel()
+        await asyncio.gather(refresh, return_exceptions=True)
+        await router.close()
 
 
 @pytest.mark.asyncio

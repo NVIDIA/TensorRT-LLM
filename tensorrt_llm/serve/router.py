@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import secrets
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -28,6 +29,9 @@ from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.conversation_id import get_request_routing_id
+from tensorrt_llm.serve.disagg_auth import (CONTEXT_PROBE_HEADER,
+                                            build_context_probe_headers,
+                                            validate_context_cancellation_auth)
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ResponsesRequest)
@@ -54,6 +58,7 @@ COORDINATOR_FINISH_TIMEOUT_S = 5.0
 COORDINATOR_FINISH_WORKERS = 16
 COORDINATOR_FINISH_QUEUE_SIZE = 4096
 COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
+_MAX_METADATA_HEALTH_PROBES = 16
 # Backoff cap of a pooled /finish, which is retried until delivered (see _finish_async).
 COORDINATOR_POOLED_FINISH_MAX_RETRY_DELAY_S = 5.0
 # A fleet worker's bound on a pooled generation /select, which waits for a free seat.
@@ -375,6 +380,19 @@ class ServerPreparationPending(RuntimeError):
     """Required worker metadata is not yet available for preparation."""
 
 
+def _check_context_capability(server: str, info: dict) -> None:
+    """Distinguish a currently unavailable capability RPC from a completed rejection."""
+    field = "supports_logical_context_cancellation"
+    if field in info and info[field] is None:
+        raise ServerPreparationPending(
+            f"CTX server {server} cancellation capability is temporarily unavailable"
+        )
+    if info.get(field) is not True:
+        raise ContextCancellationCapabilityError(
+            f"CTX server {server} does not advertise supported logical context cancellation"
+        )
+
+
 class Router(ABC):
 
     # True for a router whose placement may wait for capacity (a generation seat). The coordinator
@@ -391,6 +409,7 @@ class Router(ABC):
             server_preparation_func: Optional[Callable[[str],
                                                        Awaitable[None]]] = None,
             require_context_cancellation: bool = False,
+            context_auth_key: Optional[str] = None,
             **kwargs):
         self._servers = servers or []
         self._metadata_server = metadata_server
@@ -403,7 +422,10 @@ class Router(ABC):
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
         self._require_context_cancellation = require_context_cancellation
+        self._context_auth_key = context_auth_key if require_context_cancellation else None
         self._server_registration_ids: dict[str, str] = {}
+        self._metadata_registration_keys: dict[str, frozenset[str]] = {}
+        self._discovered_context_servers: set[str] = set()
 
     async def close(self):
         """Close the shared HTTP session."""
@@ -437,8 +459,18 @@ class Router(ABC):
         return len(self._prepared_ready_servers)
 
     @property
+    def has_prepared_server(self) -> bool:
+        return not self._prepared_ready_servers.isdisjoint(self._servers)
+
+    @property
     def prepared_servers(self) -> set[str]:
         return set(self._prepared_ready_servers)
+
+    @property
+    def unverified_context_servers(self) -> set[str]:
+        """Discovered or configured CTX addresses still awaiting admission."""
+        return (self._discovered_context_servers
+                | set(self._servers)) - self._prepared_ready_servers
 
     @property
     def server_role(self) -> ServerRole:
@@ -459,6 +491,14 @@ class Router(ABC):
         """The ``/server_info`` of every prepared server, by server."""
         return self._server_info
 
+    def context_admissions(self) -> dict[str, str]:
+        """Identify each currently admitted CTX incarnation without sharing its proof."""
+        return {
+            server: self._server_info[server]["_ctx_admission"]
+            for server in self._servers
+            if server in self._prepared_ready_servers
+        }
+
     @staticmethod
     def _ensure_url(server: str) -> str:
         return server if server.startswith("http") else f"http://{server}"
@@ -466,13 +506,47 @@ class Router(ABC):
     async def _fetch_server_info(self, server: str, timeout: float) -> dict:
         try:
             url = self._ensure_url(server)
-            async with self.session.get(f"{url}/server_info",
-                                        timeout=timeout) as response:
+            headers = None
+            if self._require_context_cancellation:
+                if not self._context_auth_key:
+                    raise ContextCancellationCapabilityError(
+                        "Missing CTX probe authentication key")
+                headers = build_context_probe_headers(self._context_auth_key)
+                request = self.session.get(f"{url}/server_info",
+                                           headers=headers,
+                                           timeout=timeout,
+                                           allow_redirects=False)
+            else:
+                request = self.session.get(f"{url}/server_info",
+                                           timeout=timeout)
+            async with request as response:
+                if headers is not None and (300 <= response.status < 400
+                                            or response.status
+                                            in (400, 401, 403, 404, 405, 409)):
+                    raise ContextCancellationCapabilityError(
+                        f"CTX server {server} rejected the cancellation challenge (HTTP {response.status})"
+                    )
                 response.raise_for_status()
                 info = await response.json()
                 if not isinstance(info, dict):
                     raise ValueError("/server_info must return a JSON object")
+                if headers is not None:
+                    try:
+                        validate_context_cancellation_auth(
+                            self._context_auth_key, "probe-result", {
+                                "challenge":
+                                headers[CONTEXT_PROBE_HEADER],
+                                "supported":
+                                info.get(
+                                    "supports_logical_context_cancellation")
+                            }, response.headers)
+                    except ValueError as error:
+                        raise ContextCancellationCapabilityError(
+                            f"CTX server {server} did not authenticate the cancellation challenge"
+                        ) from error
                 return info
+        except ContextCancellationCapabilityError:
+            raise
         except Exception as e:
             logger.warning(
                 f"Error fetching server info for server {server}: {e}")
@@ -482,24 +556,22 @@ class Router(ABC):
     async def _prepare_server(self, server: str):
         if server in self._prepared_ready_servers:
             return
+        membership = (self._servers if self._require_context_cancellation
+                      and server in self._servers else None)
         try:
             if self._server_preparation_func:
                 await self._server_preparation_func(server)
             server_info = await self._fetch_server_info(
                 server, self._health_check_timeout)
-            if (self._require_context_cancellation
-                    and "supports_logical_context_cancellation" in server_info
-                    and server_info["supports_logical_context_cancellation"]
-                    is None):
-                raise ServerPreparationPending(
-                    f"CTX server {server} cancellation capability is temporarily unavailable"
-                )
-            if (self._require_context_cancellation
-                    and server_info.get("supports_logical_context_cancellation")
-                    is not True):
-                raise ContextCancellationCapabilityError(
-                    f"CTX server {server} does not advertise supported logical context cancellation"
-                )
+            if membership is not None and membership is not self._servers:
+                # A health check may have started preparation for a retired
+                # address. Its result cannot update a new incarnation.
+                return
+            if self._require_context_cancellation:
+                _check_context_capability(server, server_info)
+                server_info = {
+                    **server_info, "_ctx_admission": secrets.token_hex(16)
+                }
             self._server_info[server] = server_info
             logger.info(
                 f"server is ready with info: {self._server_info[server]}")
@@ -517,7 +589,8 @@ class Router(ABC):
                 continue
             await self._prepare_server(server)
         if self._require_context_cancellation:
-            unprepared = set(targets) - self._prepared_ready_servers
+            unprepared = set(targets).intersection(
+                self._servers) - self._prepared_ready_servers
             if unprepared:
                 raise ServerPreparationPending(
                     f"CTX servers lack verified logical context cancellation: {sorted(unprepared)}"
@@ -529,11 +602,14 @@ class Router(ABC):
     def _unstage_server(self, server: str) -> None:
         pass
 
-    async def add_server(self,
-                         server: str,
-                         *,
-                         registration_id: Optional[str] = None,
-                         raise_on_capability_error: bool = False) -> bool:
+    async def add_server(
+        self,
+        server: str,
+        *,
+        registration_id: Optional[str] = None,
+        raise_on_capability_error: bool = False,
+        metadata_keys: frozenset[str] = frozenset()
+    ) -> bool:
         """Validate a worker before making it available for placement.
 
         Args:
@@ -541,6 +617,7 @@ class Router(ABC):
             registration_id: Observed process registration, if available.
             raise_on_capability_error: Distinguish permanent rejection from
                 transient preparation failure for an admission retry owner.
+            metadata_keys: Observed registrations that must still match at publication.
 
         Returns:
             Whether the worker is admitted. A rejected replacement stays unroutable.
@@ -570,6 +647,12 @@ class Router(ABC):
                     f"Server {server} was not added because preparation failed")
                 return False
             async with self._lock:
+                if metadata_keys and not self._metadata_keys_match(
+                        server, metadata_keys):
+                    self._prepared_ready_servers.discard(server)
+                    self._server_info.pop(server, None)
+                    self._unstage_server(server)
+                    return False
                 if server not in self._servers:
                     old_servers = self._servers.copy()
                     self._servers = [*old_servers, server]
@@ -607,6 +690,7 @@ class Router(ABC):
         self._prepared_ready_servers.discard(server)
         self._server_info.pop(server, None)
         self._server_registration_ids.pop(server, None)
+        self._metadata_registration_keys.pop(server, None)
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
 
@@ -761,26 +845,52 @@ class Router(ABC):
         Raises:
             RuntimeError: A worker is incompatible during strict startup validation.
         """
-        server_key_map = await self.fetch_live_servers()
+        server_key_map = await self.fetch_live_servers(matching_role_only=True)
+        keys_by_server: dict[str, set[str]] = {}
+        for key, server in server_key_map.items():
+            keys_by_server.setdefault(server, set()).add(key)
+        for server in list(self._servers):
+            if (server not in keys_by_server
+                    or self._metadata_registration_keys.get(server)
+                    != keys_by_server[server]):
+                # Revoke obsolete admissions before awaiting health on any peer.
+                await self.remove_server(server)
         live_servers = await self.check_servers_health(server_key_map,
                                                        remove_dead=not startup)
-        servers = (self._filter_servers_by_role(live_servers, server_key_map)
-                   if live_servers else [])
-        registrations = {url: key for key, url in server_key_map.items()}
-        for server in list(self._servers):
-            if server not in servers:
-                await self.remove_server(server)
-        for server in servers:
+        for server in set(self._servers).difference(live_servers):
+            await self.remove_server(server)
+        for server in live_servers:
+            keys = frozenset(keys_by_server[server])
+            if not self._metadata_keys_match(server, keys):
+                if server in self._servers:
+                    await self.remove_server(server)
+                continue
+            if self._metadata_registration_keys.get(server) == keys:
+                continue
             try:
-                await self.add_server(server,
-                                      registration_id=registrations.get(server),
-                                      raise_on_capability_error=startup)
+                # Duplicate records identify the endpoint, not which process
+                # answered. Revalidate on key-set changes, never on key order.
+                if await self.add_server(server,
+                                         registration_id=next(iter(keys))
+                                         if len(keys) == 1 else None,
+                                         raise_on_capability_error=startup,
+                                         metadata_keys=keys):
+                    self._metadata_registration_keys[server] = keys
             except RuntimeError as error:
-                if startup:
+                if startup and self._metadata_keys_match(server, keys):
                     raise
                 logger.warning(
                     f"CTX server {server} remains excluded after preparation: {error}"
                 )
+
+    def _metadata_keys_match(self, server: str, keys: frozenset[str]) -> bool:
+        """Recheck observed keys after awaited probes, before using their results."""
+        for key in keys:
+            record = self._metadata_server.get(key)
+            if (not isinstance(record, dict) or record.get("url") != server or
+                    not self._is_matching_role(self._get_server_type(record))):
+                return False
+        return True
 
     def _filter_servers_by_role(self, servers, server_key_map):
         """Filter servers by role (context or generation)"""
@@ -811,13 +921,17 @@ class Router(ABC):
         return (self._server_role == ServerRole.CONTEXT and server_type == 'context') or \
             (self._server_role == ServerRole.GENERATION and server_type == 'generation')
 
-    async def fetch_live_servers(self) -> Dict[str, str]:
-        """Fetch all servers from metadata service and return {key: url} mapping"""
+    async def fetch_live_servers(self,
+                                 *,
+                                 matching_role_only: bool = False
+                                 ) -> Dict[str, str]:
+        """Return registration keys and URLs, excluding ambiguous roles when filtering."""
         if self._metadata_server is None:
             raise RuntimeError("Metadata server is not initialized")
 
         # If metadata server is available, ignore static server list entirely
         server_key_map = {}
+        other_roles = set()
         try:
             # Get all keys from the metadata server
             all_keys = self._metadata_server.keys()
@@ -829,7 +943,25 @@ class Router(ABC):
                     server_metadata = self._metadata_server.get(key)
                     if server_metadata and isinstance(
                             server_metadata, dict) and 'url' in server_metadata:
-                        server_key_map[key] = server_metadata['url']
+                        url = server_metadata['url']
+                        if matching_role_only and not self._is_matching_role(
+                                self._get_server_type(server_metadata)):
+                            other_roles.add(url)
+                        else:
+                            server_key_map[key] = url
+
+            if matching_role_only:
+                self._discovered_context_servers = set(server_key_map.values())
+                conflicts = self._discovered_context_servers & other_roles
+                if conflicts:
+                    logger.warning(
+                        f"Excluding conflicting CTX registrations: {sorted(conflicts)}"
+                    )
+                    server_key_map = {
+                        key: url
+                        for key, url in server_key_map.items()
+                        if url not in conflicts
+                    }
 
             if server_key_map:
                 logger.debug(
@@ -858,33 +990,38 @@ class Router(ABC):
         Returns:
             Addresses that passed a health probe.
         """
-        live_servers = []
-        dead_servers = []
 
-        # Check health of each server
-        for key, server_url in server_key_map.items():
+        async def probe(server_url: str) -> bool:
             try:
-                is_healthy = await self._check_server_health(server_url)
-
-                # If first attempt failed, try again before declaring server dead
-                if not is_healthy:
-                    # Second attempt - will print errors if it fails
-                    is_healthy = await self._check_server_health(server_url)
-
-                if not is_healthy:
-                    # Only now add to dead servers
-                    dead_servers.append((key, server_url))
-                else:
-                    live_servers.append(server_url)
+                return (await self._check_server_health(server_url)
+                        or await self._check_server_health(server_url))
             except Exception as e:
                 logger.error(
-                    f"Error checking health for server {server_url} (key: {key}): {e}"
-                )
-                dead_servers.append((key, server_url))
+                    f"Error checking health for server {server_url}: {e}")
+                return False
+
+        urls = list(server_key_map.values())
+        if self._require_context_cancellation:
+            urls = list(dict.fromkeys(urls))
+            limit = asyncio.Semaphore(_MAX_METADATA_HEALTH_PROBES)
+
+            async def bounded_probe(url: str) -> bool:
+                async with limit:
+                    return await probe(url)
+
+            healthy = await asyncio.gather(*(bounded_probe(url)
+                                             for url in urls))
+            by_url = dict(zip(urls, healthy))
+            record_health = [by_url[url] for url in server_key_map.values()]
+        else:
+            healthy = [await probe(url) for url in urls]
+            record_health = healthy
+        live_servers = [url for url, ok in zip(urls, healthy) if ok]
 
         # Remove dead servers from etcd
-        for key, dead_server in dead_servers:
-            if not remove_dead:
+        for (key, dead_server), ok in zip(server_key_map.items(),
+                                          record_health):
+            if ok or not remove_dead:
                 continue
             try:
                 logger.info(
@@ -2778,10 +2915,6 @@ class CoordinatorDelegatingRouter(Router):
     def _on_servers_updated(self, old_servers, new_servers):
         pass
 
-    async def sync_servers(self, servers: list[str]) -> None:
-        """Mirror the coordinator server list without preparing worker state."""
-        await self._local.mirror_servers(servers)
-
     async def mirror_servers(self, servers: List[str]) -> None:
         """Mirror ``servers`` onto the wrapped local router.
 
@@ -2791,6 +2924,29 @@ class CoordinatorDelegatingRouter(Router):
         ``__getattr__`` but its assignments would create attributes on the
         wrapper, silently splitting the state. Delegate explicitly instead.
         """
+        await self._local.mirror_servers(servers)
+
+    async def sync_servers(
+            self,
+            servers: list[str],
+            *,
+            context_admissions: Optional[dict[str, str]] = None) -> None:
+        """Mirror placement state; verify protected CTX with the frontend's own key and clock."""
+        if context_admissions is not None:
+            for server in servers:
+                if self._local.server_registration_id(
+                        server) == context_admissions[server]:
+                    continue
+                try:
+                    info = await self._local._fetch_server_info(
+                        server, self._request_timeout_s)
+                except ContextCancellationCapabilityError:
+                    raise
+                except RuntimeError as error:
+                    raise ServerPreparationPending(
+                        f"CTX probe unavailable for {server}") from error
+                _check_context_capability(server, info)
+            self._local._server_registration_ids = dict(context_admissions)
         await self._local.mirror_servers(servers)
 
     def set_unpredicted_priority(self, priority: float) -> None:
@@ -3107,6 +3263,7 @@ def create_router(
     server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
     disagg_node_id: int = 0,
     require_context_cancellation: bool = False,
+    context_auth_key: Optional[str] = None,
 ) -> Router:
     """Factory function to create different types of router instances.
 
@@ -3143,6 +3300,7 @@ def create_router(
         router_class = PooledLoadBalancingRouter
     extra_args["disagg_node_id"] = disagg_node_id
     extra_args["require_context_cancellation"] = require_context_cancellation
+    extra_args["context_auth_key"] = context_auth_key
 
     return router_class(router_config.server_role if router_config else None,
                         servers,
@@ -3162,6 +3320,7 @@ def build_disagg_routers(
     server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
     disagg_node_id: int = 0,
     require_context_cancellation: bool = False,
+    context_auth_key: Optional[str] = None,
 ) -> tuple[Router, Router]:
     """Build the ctx and gen routers for one disagg process.
 
@@ -3179,7 +3338,8 @@ def build_disagg_routers(
         metadata_server,
         server_preparation_func,
         disagg_node_id,
-        require_context_cancellation=require_context_cancellation)
+        require_context_cancellation=require_context_cancellation,
+        context_auth_key=context_auth_key)
     gen_router = create_router(gen_router_config, gen_servers,
                                metadata_server_cfg, metadata_server,
                                server_preparation_func, disagg_node_id)

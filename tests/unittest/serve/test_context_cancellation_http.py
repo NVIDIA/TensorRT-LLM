@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock
 import aiohttp
 import anyio
 import httpx
+import msgspec
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -21,6 +22,7 @@ from test_common.serve.app_factory import AggConfig, ServeTestEnv
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.executor.rpc import RPCError, RPCTimeout
 from tensorrt_llm.llmapi.disagg_utils import CtxGenServerConfig, DisaggServerConfig, ServerRole
+from tensorrt_llm.serve.anthropic_adapter import _with_ticks
 from tensorrt_llm.serve.disagg_auth import (
     CONTEXT_CANCELLATION_AUTH_HEADER,
     build_context_cancellation_headers,
@@ -29,7 +31,7 @@ from tensorrt_llm.serve.disagg_auth import (
     validate_context_cancellation_auth,
 )
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
-from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+from tensorrt_llm.serve.openai_client import OpenAIHttpClient, _encode_request_body
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer, _ClientDisconnected
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService,
@@ -60,7 +62,9 @@ def context_worker(serve_env: ServeTestEnv) -> OpenAIServer:
         AggConfig(role=ServerRole.CONTEXT, env=(("TRTLLM_DISAGG_NO_RETRY", "1"),))
     )
     worker._internal_disagg_auth_key = "secret"
-    worker.generator.args.cache_transceiver_config = {"backend": "DEFAULT"}
+    worker.generator.args.cache_transceiver_config = SimpleNamespace(
+        backend="DEFAULT", kv_transfer_timeout_ms=None
+    )
     return worker
 
 
@@ -384,15 +388,18 @@ async def test_tracked_context_stream_closes_source_and_preserves_learning(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "enabled, echoed", [(False, "absent"), (False, None), (True, "worker-token")]
+)
 async def test_healthy_handoff_and_legacy_do_not_cancel(
     monkeypatch: pytest.MonkeyPatch,
     enabled: bool,
+    echoed: str | None,
 ) -> None:
     service = _service(monkeypatch, enabled=enabled)
-    if enabled:
-        params = service._ctx_client.send_request.return_value.choices[0].disaggregated_params
-        params.context_cancellation_token = "worker-token"
+    params = service._ctx_client.send_request.return_value.choices[0].disaggregated_params
+    if echoed != "absent":
+        params.context_cancellation_token = echoed
     result = await service._send_disagg_request_ctx_first(
         CompletionRequest(model="model", prompt="hello")
     )
@@ -409,7 +416,14 @@ async def test_healthy_handoff_and_legacy_do_not_cancel(
             ctx_send.kwargs["server"], ctx_params.disagg_request_id
         )
     gen_request = service._gen_client.send_request.call_args.args[0]
-    assert gen_request.disaggregated_params.context_cancellation_token is None
+    wire = msgspec.msgpack.decode(_encode_request_body(gen_request))["disaggregated_params"]
+    assert wire["request_type"] == "generation_only"
+    assert wire["disagg_request_id"] == 42
+    assert "context_cancellation_token" not in wire
+    assert params.request_type == "context_only"
+    assert ("context_cancellation_token" in params.model_fields_set) == (echoed != "absent")
+    if echoed != "absent":
+        assert params.context_cancellation_token == echoed
 
 
 @pytest.mark.asyncio
@@ -424,7 +438,8 @@ async def test_prelude_disconnect_cancels_service_while_ctx_is_inflight(
         await asyncio.Future()
 
     async def receive() -> Message:
-        return {"type": "http.disconnect"} if disconnected.is_set() else {"type": "http.request"}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
 
     service._ctx_client.send_request.side_effect = context
     raw = Request({"type": "http", "headers": []}, receive)
@@ -450,18 +465,17 @@ async def test_prelude_stops_watcher_when_disconnect_probe_consumes_cancellation
     outcome: str,
 ) -> None:
     """A probe's cancellation scope cannot keep response cleanup waiting for disconnect."""
-    probing, consumed, disconnect = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    probing, consumed = asyncio.Event(), asyncio.Event()
     release_probe = asyncio.Event()
 
-    async def is_disconnected() -> bool:
-        if probing.is_set():
-            return disconnect.is_set()
+    async def receive() -> Message:
+        assert not probing.is_set(), "A stopped listener must not read another ASGI event"
         probing.set()
         try:
             await release_probe.wait()
         except asyncio.CancelledError:
             consumed.set()
-        return False
+        return {"type": "http.request"}
 
     response = _response()
 
@@ -478,7 +492,7 @@ async def test_prelude_stops_watcher_when_disconnect_probe_consumes_cancellation
             entry,
             CompletionRequest(model="model", prompt="hello"),
             None,
-            SimpleNamespace(is_disconnected=is_disconnected),
+            Request({"type": "http"}, receive),
         )
     )
     try:
@@ -499,7 +513,6 @@ async def test_prelude_stops_watcher_when_disconnect_probe_consumes_cancellation
     finally:
         # Release the probe even if the bounded completion assertion fails.
         release_probe.set()
-        disconnect.set()
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
 
 
@@ -551,10 +564,12 @@ async def test_prelude_cancelled_scope_waits_for_cleanup_without_spinning(
         finally:
             await cancellation.cancel()
 
-    async def is_disconnected() -> bool:
+    async def receive() -> Message:
         """The stream variant races disconnect with its completed prelude."""
         await ready.wait()
-        return unconsumed_stream
+        if not unconsumed_stream:
+            await asyncio.Future()
+        return {"type": "http.disconnect"}
 
     async def run() -> None:
         """Mirror the request's ASGI cancellation scope."""
@@ -565,7 +580,7 @@ async def test_prelude_cancelled_scope_waits_for_cleanup_without_spinning(
                     entry,
                     CompletionRequest(model="model", prompt="hello"),
                     None,
-                    SimpleNamespace(is_disconnected=is_disconnected),
+                    Request({"type": "http"}, receive),
                 )
 
     task = asyncio.create_task(run())
@@ -600,6 +615,8 @@ async def test_prelude_cancelled_scope_waits_for_cleanup_without_spinning(
             True,
         ),
         (True, b'event: response.failed\ndata: {"type":"response.failed"}\n\n', True),
+        (True, b'data: {"type":"response.complete\\u0064"}\r\n\r\n', False),
+        (False, b'data: {"\\u0065rror":{}}\n\ndata: [DONE]\n\n', True),
     ],
     ids=[
         "done",
@@ -609,6 +626,8 @@ async def test_prelude_cancelled_scope_waits_for_cleanup_without_spinning(
         "responses_incomplete",
         "responses_eof",
         "responses_error",
+        "escaped_terminal",
+        "escaped_error_before_done",
     ],
 )
 async def test_stream_completion_requires_a_terminal_event(
@@ -632,6 +651,72 @@ async def test_stream_completion_requires_a_terminal_event(
 
 
 @pytest.mark.asyncio
+async def test_immediate_close_after_terminal_does_not_cancel_context() -> None:
+    client = SimpleNamespace(cancel_context_cancellation=AsyncMock())
+    cancellation = _ContextCancellation(client)
+    cancellation._server, cancellation._token = "ctx:8000", "opaque"
+
+    async def source() -> AsyncGenerator[bytes, None]:
+        yield b"data: [DONE]\n\n"
+        pytest.fail("Closing a consumed handoff must not require another read")
+
+    stream = cancellation.stream(source(), False)
+    assert await stream.__anext__() is None
+    assert await stream.__anext__() == b"data: [DONE]\n\n"
+    await stream.aclose()
+    client.cancel_context_cancellation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_cancelled_consumer_joins_reader_once(monkeypatch) -> None:
+    delivering, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+    original = asyncio.shield
+
+    def counted(awaitable):
+        nonlocal calls
+        calls += 1
+        assert calls < 20, "reader cleanup is repeatedly interrupted"
+        return original(awaitable)
+
+    async def deliver(*args) -> str:
+        delivering.set()
+        await release.wait()
+        return "queued"
+
+    client = SimpleNamespace(cancel_context_cancellation=AsyncMock(side_effect=deliver))
+    cancellation = _ContextCancellation(client)
+    cancellation._server, cancellation._token = "ctx:8000", "opaque"
+
+    async def source() -> AsyncGenerator[str, None]:
+        try:
+            yield "partial"
+            await asyncio.Future()
+        finally:
+            await cancellation.cancel()
+
+    async def consumer() -> None:
+        stream = _with_ticks(source(), lambda: None)
+        assert await stream.__anext__() == "partial"
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
+
+    monkeypatch.setattr(asyncio, "shield", counted)
+    consumer_task = asyncio.create_task(consumer())
+    try:
+        await asyncio.wait_for(delivering.wait(), 2)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not consumer_task.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(consumer_task, 2)
+    assert cancellation._token is None
+    client.cancel_context_cancellation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_disconnect_winning_completed_prelude_closes_unconsumed_stream() -> None:
     client = SimpleNamespace(cancel_context_cancellation=AsyncMock(return_value="queued"))
     cancellation = _ContextCancellation(client)
@@ -646,7 +731,7 @@ async def test_disconnect_winning_completed_prelude_closes_unconsumed_stream() -
         await stream.__anext__()
         return stream
 
-    raw = SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
+    raw = Request({"type": "http"}, AsyncMock(return_value={"type": "http.disconnect"}))
     with pytest.raises(_ClientDisconnected):
         await OpenAIDisaggServer._await_context_request(
             entry, CompletionRequest(model="model", prompt="hello"), None, raw
@@ -889,14 +974,13 @@ async def test_cancel_callers_wait_for_shared_receipt(cancel_scope: bool) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["reserve", "cancel", "submit", "retry_enabled_submit"])
+@pytest.mark.parametrize("action", ["reserve", "cancel", "submit"])
 @pytest.mark.parametrize("status", [301, 307, 308])
 async def test_signed_context_posts_reject_redirect_without_replay(
     monkeypatch: pytest.MonkeyPatch, action: str, status: int
 ) -> None:
     """Signed control and submission bodies never follow worker redirects."""
-    retry_enabled = action == "retry_enabled_submit"
-    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "0" if retry_enabled else "1")
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
     monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", Mock())
     received = []
 
@@ -928,13 +1012,44 @@ async def test_signed_context_posts_reject_redirect_without_replay(
                         request_type="context_only",
                         disagg_request_id=42,
                         schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
-                        context_cancellation_token=None if retry_enabled else "opaque",
+                        context_cancellation_token="opaque",
                     ),
                 )
                 await client.send_request(request, server=server, req_id=42)
         assert failure.value.status == status
     assert len(received) == 1
     assert received[0] != "/unexpected-target"
+    frontend = SimpleNamespace(_perf_metrics_collector=Mock())
+    with pytest.raises(HTTPException) as client_error:
+        OpenAIDisaggServer._handle_exception(frontend, failure.value)
+    assert client_error.value.status_code == 502
+    assert not client_error.value.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [307, 308])
+async def test_unsigned_legacy_submit_follows_worker_redirect(monkeypatch, status):
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "0")
+    monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", Mock())
+    bodies = []
+
+    async def handler(request: web.Request) -> web.Response:
+        bodies.append(await request.read())
+        if request.path == "/target":
+            return web.json_response(_response().model_dump(mode="json"))
+        return web.Response(status=status, headers={"Location": "/target"})
+
+    app = web.Application()
+    app.router.add_post("/{path:.*}", handler)
+    async with TestServer(app) as http, aiohttp.ClientSession() as session:
+        client = OpenAIHttpClient(AsyncMock(spec=Router), ServerRole.CONTEXT, session=session)
+        result = await client.send_request(
+            CompletionRequest(model="model", prompt=[1, 2]),
+            server=str(http.make_url("/")),
+            req_id=42,
+        )
+    assert result.choices[0].finish_reason == "length"
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
 
 
 @pytest.mark.asyncio
@@ -1236,11 +1351,12 @@ async def test_server_info_reports_actual_context_cancellation_capability(
     context_worker: OpenAIServer, supported: object
 ) -> None:
     """Server metadata reports the live executor query, not an environment guess."""
-    context_worker.generator.args.cache_transceiver_config = None
     context_worker.generator._disaggregated_params = {}
     context_worker.generator._startup_metrics = {}
     context_worker.generator._executor.get_kv_cache_capacity = Mock(return_value={})
     capability = Mock(return_value=supported)
+    context_worker.generator._executor.reserve_context_cancellation = Mock()
+    context_worker.generator._executor.cancel_context_cancellation = Mock()
     context_worker.generator._executor.supports_logical_context_cancellation = capability
     content = json.loads((await context_worker.get_server_info()).body)
     assert content["supports_logical_context_cancellation"] is (supported is True)
@@ -1252,7 +1368,6 @@ async def test_server_info_reports_legacy_executor_without_capability(
     context_worker: OpenAIServer,
 ) -> None:
     """Missing executor support remains an explicit false capability."""
-    context_worker.generator.args.cache_transceiver_config = None
     context_worker.generator._disaggregated_params = {}
     context_worker.generator._startup_metrics = {}
     context_worker.generator._executor.get_kv_cache_capacity = Mock(return_value={})
@@ -1268,11 +1383,12 @@ async def test_server_info_survives_capability_rpc_timeout_and_recovers(
     """Protected startup retries the real handler's unavailable probe, not a false capability."""
     monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", "1")
     monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
-    context_worker.generator.args.cache_transceiver_config = None
     context_worker.generator._disaggregated_params = {}
     context_worker.generator._startup_metrics = {}
     context_worker.generator._executor.get_kv_cache_capacity = Mock(return_value={})
     capability = Mock(side_effect=[RPCTimeout("unavailable"), True])
+    context_worker.generator._executor.reserve_context_cancellation = Mock()
+    context_worker.generator._executor.cancel_context_cancellation = Mock()
     context_worker.generator._executor.supports_logical_context_cancellation = capability
     config = DisaggServerConfig(
         server_configs=[CtxGenServerConfig(type="ctx", hostname="ctx", port=8000)],
@@ -1440,7 +1556,7 @@ async def test_prelude_cancellation_during_successful_stream_watcher_join() -> N
         streams.append(stream)
         return stream
 
-    async def is_disconnected() -> bool:
+    async def receive() -> Message:
         """Hold watcher teardown after the response has become ready."""
         watching.set()
         try:
@@ -1448,14 +1564,14 @@ async def test_prelude_cancellation_during_successful_stream_watcher_join() -> N
         finally:
             joining.set()
             await release.wait()
-        return False
+        return {"type": "http.request"}
 
     task = asyncio.create_task(
         OpenAIDisaggServer._await_context_request(
             entry,
             CompletionRequest(model="model", prompt="hello"),
             None,
-            SimpleNamespace(is_disconnected=is_disconnected),
+            Request({"type": "http"}, receive),
         )
     )
     try:
