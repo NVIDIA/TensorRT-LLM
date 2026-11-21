@@ -6,6 +6,9 @@
 import fcntl
 import hashlib
 import json
+import math
+import os
+import re
 import threading
 import time
 import uuid
@@ -19,6 +22,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.shared_tensor.shared_tensor import str_to_torch_dtype
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.logger import logger
@@ -117,8 +121,9 @@ def _config_digest(llm: Any) -> str:
 
 
 BACKEND = "trtllm-shared-safetensors-v1"
-_MAX_TENSOR_BYTES = 64 * 1024 * 1024
-_MAX_CACHE_BYTES = 256 * 1024 * 1024
+_MAX_TENSOR_BYTES = 1024 * 1024 * 1024
+_MAX_CACHE_BYTES = 4 * 1024 * 1024 * 1024
+_CACHE_FILE = re.compile(r"(?:[0-9a-f]{32}\.(?:safetensors|tmp)|[0-9a-f]{32}-[0-9a-f]{32}\.tmp)\Z")
 _MAX_METADATA_BYTES = 64 * 1024
 _TTL_SECONDS = 300
 _EXPORT_LOCK = threading.Lock()
@@ -141,10 +146,48 @@ def _release(handles: list[dict]) -> bool:
     return succeeded
 
 
-def take_encoder_exports(params: Any) -> tuple[list[dict], list[dict | None]]:
+def _encoder_byte_limits(
+    max_tensor_bytes: int | None, max_cache_bytes: int | None
+) -> tuple[int, int]:
+    values = []
+    for value, name, default in (
+        (max_tensor_bytes, "TRTLLM_ENCODER_MAX_TENSOR_BYTES", _MAX_TENSOR_BYTES),
+        (max_cache_bytes, "TRTLLM_ENCODER_MAX_CACHE_BYTES", _MAX_CACHE_BYTES),
+    ):
+        if value is None:
+            raw = os.getenv(name)
+            try:
+                value = int(raw) if raw is not None else default
+            except ValueError as error:
+                raise ValueError(f"{name} must be a positive integer") from error
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        values.append(value)
+    if values[0] > values[1]:
+        raise ValueError("encoder tensor limit must not exceed the cache limit")
+    return values[0], values[1]
+
+
+def take_encoder_exports(
+    params: Any, *, max_tensor_bytes: int | None = None
+) -> tuple[list[dict], list[dict | None]]:
     with _EXPORT_LOCK:
         embeddings = params.multimodal_embedding_handles or []
         mrope = [params.mrope_position_ids_handle, params.mrope_position_deltas_handle]
+        if max_tensor_bytes is not None:
+            total = 0
+            for handle in [*embeddings, *(h for h in mrope if h is not None)]:
+                shape = handle.get("tensor_size")
+                if not isinstance(shape, (list, tuple)) or any(
+                    type(n) is not int or n <= 0 for n in shape
+                ):
+                    raise ValueError("invalid native encoder tensor shape")
+                total += (
+                    math.prod(shape)
+                    * str_to_torch_dtype(handle.get("dtype", handle.get("storage_dtype"))).itemsize
+                )
+                if total > max_tensor_bytes:
+                    raise EncoderCapacityError("encoder output exceeds the tensor limit")
         params.multimodal_embedding_handles = None
         params.mrope_position_ids_handle = params.mrope_position_deltas_handle = None
     return embeddings, mrope
@@ -267,10 +310,34 @@ def _capture_encoder_decode_state(llm: Any, inputs: Any, mrope: dict) -> None:
 
 
 class EncoderCache:
+    """Shared-file outputs isolated beneath a private parent directory.
+
+    Native byte budgets default to 1 GiB per output and 4 GiB retained. Override
+    through max_tensor_bytes/max_cache_bytes or TRTLLM_ENCODER_MAX_TENSOR_BYTES
+    and TRTLLM_ENCODER_MAX_CACHE_BYTES on each producer and consumer.
+    """
+
     backend = BACKEND
 
-    def __init__(self, directory: str) -> None:
-        self.root = Path(directory).resolve()
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        max_tensor_bytes: int | None = None,
+        max_cache_bytes: int | None = None,
+    ) -> None:
+        self._max_tensor_bytes, self._max_cache_bytes = _encoder_byte_limits(
+            max_tensor_bytes, max_cache_bytes
+        )
+        if not directory or not os.fspath(directory).strip():
+            raise ValueError("encoder cache directory must be nonempty")
+        parent = Path(directory).resolve()
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if parent.stat().st_mode & 0o022:
+            raise ValueError("encoder cache directory must not be group- or world-writable")
+        self.root = parent / ".trtllm-encoder-cache-v1"
+        if self.root.is_symlink():
+            raise ValueError("encoder cache directory must not be a symlink")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.root.stat().st_mode & 0o022:
             raise ValueError("encoder cache directory must not be group- or world-writable")
@@ -291,7 +358,7 @@ class EncoderCache:
     def _collect(self) -> int:
         used = 0
         for path in self.root.iterdir():
-            if path.suffix not in (".safetensors", ".tmp"):
+            if not _CACHE_FILE.fullmatch(path.name) or path.is_symlink():
                 continue
             try:
                 stat = path.stat()
@@ -307,7 +374,7 @@ class EncoderCache:
         params = result.disaggregated_params
         if params is None or not params.multimodal_embedding_handles:
             raise RuntimeError("encoder did not return native embedding handles")
-        embeddings, mrope = take_encoder_exports(params)
+        embeddings, mrope = take_encoder_exports(params, max_tensor_bytes=self._max_tensor_bytes)
         if not embeddings:
             raise RuntimeError("encoder exports were already reclaimed")
         pending = [*embeddings, *(handle for handle in mrope if handle is not None)]
@@ -327,7 +394,7 @@ class EncoderCache:
                 tensor = SharedTensorContainer.from_dict(handle).get_local_view()
                 pending.pop(0)
                 total += tensor.numel() * tensor.element_size()
-                if total > _MAX_TENSOR_BYTES:
+                if total > self._max_tensor_bytes:
                     raise ValueError("encoder output exceeds the shared-cache tensor limit")
                 tensors[name] = tensor.detach().cpu().contiguous().clone()
         finally:
@@ -354,9 +421,9 @@ class EncoderCache:
                 used = self._collect()
                 save_file(tensors, str(temporary), metadata={"handoff": metadata})
                 size = temporary.stat().st_size
-                if size > _MAX_TENSOR_BYTES + _MAX_METADATA_BYTES:
+                if size > self._max_tensor_bytes + _MAX_METADATA_BYTES:
                     raise ValueError("serialized encoder output exceeds the size limit")
-                if used + size > _MAX_CACHE_BYTES:
+                if used + size > self._max_cache_bytes:
                     raise EncoderCapacityError("encoder shared cache is full")
                 temporary.replace(path)
         finally:
@@ -429,7 +496,7 @@ class EncoderCache:
                 self._collect()
                 if not path.is_file() or path.is_symlink():
                     raise ValueError("encoder handoff expired or was already consumed")
-                if path.stat().st_size > _MAX_TENSOR_BYTES + _MAX_METADATA_BYTES:
+                if path.stat().st_size > self._max_tensor_bytes + _MAX_METADATA_BYTES:
                     raise ValueError("encoder handoff exceeds the size limit")
                 with safe_open(str(path), framework="pt", device="cpu") as stored:
                     encoded_metadata = (stored.metadata() or {}).get("handoff")

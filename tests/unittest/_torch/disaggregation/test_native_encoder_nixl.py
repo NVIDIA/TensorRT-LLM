@@ -296,16 +296,25 @@ def test_receive_registration_failure_does_not_disable_unrelated_handoffs(
 
     with monkeypatch.context() as patch:
         patch.setattr(FakeAgent, operation, fail_receive)
-        with pytest.raises(RuntimeError, match="state uncertain"):
-            _receive(consumer, reference)
+        attempts = transport._MAX_RECEIVE_SLOTS + 1 if operation == "register_memory" else 1
+        for _ in range(attempts):
+            with pytest.raises(RuntimeError, match="state uncertain"):
+                _receive(consumer, reference)
     pinned = _receiver(consumer)
     size = consumer._used
-    assert size > 0 and pinned.registrations and not pinned.stopped
-    assert not consumer.failed and consumer._receive_slots == 1
+    if operation == "register_memory":
+        assert size == 0 and pinned.stopped and not pinned.registrations
+        assert consumer._receive_slots == 0
+    else:
+        assert size > 0 and pinned.registrations and not pinned.stopped
+        assert consumer._receive_slots == 1
+    assert not consumer.failed
     fresh = producer.publish(native_result()[0], request(), llm)
     actual = _receive(consumer, fresh)
     assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
-    assert consumer._used == size and consumer._receive_slots == 1
+    assert consumer._used == size and consumer._receive_slots == int(
+        operation == "deregister_memory"
+    )
 
 
 def test_bad_destination_size_does_not_consume_export(pair):
@@ -571,7 +580,7 @@ def test_receive_quota_is_reserved_before_allocation_and_returned_on_failure(pai
     llm, _ = model()
     reference = producer.publish(native_result()[0], request(), llm)
     size = producer._used
-    monkeypatch.setattr(transport, "_MAX_CACHE_BYTES", size)
+    monkeypatch.setattr(consumer, "_max_cache_bytes", size)
     original = torch.empty
     checked = []
 
@@ -665,7 +674,7 @@ def test_producer_quota_is_reserved_before_cloning_concurrent_exports(pair, monk
     llm, _ = model()
     outputs = [native_result(), native_result()]
     size = sum(tensor.numel() * tensor.element_size() for tensor in outputs[0][1])
-    monkeypatch.setattr(transport, "_MAX_CACHE_BYTES", size)
+    monkeypatch.setattr(producer, "_max_cache_bytes", size)
     entered, release = threading.Event(), threading.Event()
     original = torch.Tensor.clone
     clones = []
@@ -812,7 +821,7 @@ def test_quarantined_receives_remain_charged_and_bound_future_allocations(pair, 
     used, agents = consumer._used, len(consumer.test_agents)
     fresh = producer.publish(native_result()[0], request(), llm)
     if limit == "bytes":
-        monkeypatch.setattr(transport, "_MAX_CACHE_BYTES", used * 2 - 1)
+        monkeypatch.setattr(consumer, "_max_cache_bytes", used * 2 - 1)
         message = "cache is full"
     else:
         monkeypatch.setattr(transport, "_MAX_RECEIVE_SLOTS", 1)
@@ -834,7 +843,7 @@ def test_exhausted_quarantine_budget_marks_cache_unhealthy_without_freeing_buffe
     reference = producer.publish(native_result()[0], request(), llm)
     size = producer._used
     if limit == "bytes":
-        monkeypatch.setattr(transport, "_MAX_CACHE_BYTES", size)
+        monkeypatch.setattr(consumer, "_max_cache_bytes", size)
     else:
         monkeypatch.setattr(transport, "_MAX_RECEIVE_SLOTS", 1)
 
