@@ -4,24 +4,28 @@
 
 Covers the pieces that are checkable without a GPU or an engine: the token
 accounting formula, the placeholder expansion, the tower's shape/dtype
-contract, the checkpoint-name mirror, and -- when a checkpoint and golden
-files are provided via environment variables -- numeric parity of the tower
-against reference-produced embeddings.
+contract, the checkpoint-name mirror, and numeric parity of the tower
+against reference-produced embeddings, which needs the checkpoint and the
+golden files.
 
 The module under test is loaded by file path so the tests run with any plain
 Python that has torch + numpy, without importing (or building) tensorrt_llm.
 
-Environment for the golden test:
-    MUSESPARK_CKPT_DIR      HF checkpoint dir (model.safetensors.index.json +
+Data for the golden tests, under LLM_MODELS_ROOT (environment variables override):
+    Muse-Spark-Open-816B-A42B-NVFP4 (MUSESPARK_CKPT_DIR)
+                            HF checkpoint dir (model.safetensors.index.json +
                             shards) to pull the 72 audio tensors from.
-    MUSESPARK_AUDIO_GOLDENS Directory containing speech_<k>.pt golden files,
-                            each a torch.save dict with keys `wav_24k`
-                            (float32 [N]), `n_tokens` (int), `embeddings`
-                            (bfloat16 [n_tokens, 8192]).
-Both unset -> the golden test skips cleanly.
+    Muse-Spark-Open-test-data/audio-goldens (MUSESPARK_AUDIO_GOLDENS)
+                            Directory containing the speech_<k>.pt and
+                            tone_<k>.pt golden files, each a torch.save dict
+                            with keys `wav_24k` (float32 [N]), `n_tokens` (int)
+                            and `embeddings` (float32 [n_tokens, 8192]),
+                            written by the generate_audio_goldens.py next to
+                            them.
+Either one absent -> the golden tests fail, naming the missing path.
 """
 
-import glob
+import copy
 import importlib.util
 import json
 import math
@@ -31,6 +35,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 pytestmark = pytest.mark.cpu_only
 
@@ -321,37 +326,48 @@ def test_tower_causality():
 
 
 # ---------------------------------------------------------------------------
-# (d) golden parity against the reference implementations
+# (d) golden parity against the reference implementation
 # ---------------------------------------------------------------------------
-# Tolerance: on the environment the goldens were produced in (CPU, torch 2.12,
-# any thread count) this port is BITWISE-identical to all six golden files, so
-# the tolerance is pure headroom for other environments: a GPU run or a
-# different torch build changes GEMM tiling and fused-RMSNorm rounding by ~1
-# BF16 ulp per op. Rows come out of an RMSNorm, so entries are O(1); one BF16
-# ulp at |x|=1 is 2^-8 = 3.9e-3, and the tower stacks 13 norms + 13 linears +
-# 8 depthwise convs, each re-rounding to BF16. atol=rtol=1e-2 (~2.5 ulps at
-# unit scale) covers that while still failing hard on a real defect: the one
-# porting bug this test caught (a dropped `.contiguous()` changing a
-# reduction's accumulation order) moved the output by 2.2e-1.
-GOLDEN_ATOL = 1e-2
-GOLDEN_RTOL = 1e-2
+# The goldens hold the float32 output of transformers' `MuseSparkAudioModel`
+# with the checkpoint's BF16 weights, and the comparison runs this tower in
+# float32 too. Two correct implementations then agree to about 1e-5 (8.4e-6 at
+# most on the six goldens), so atol=rtol=1e-3 leaves wide headroom for other
+# CPUs and torch builds while a real defect, which moves the output by far
+# more, still fails.
+#
+# The BF16 path only gets a loose bound, on one 12-token golden, because some
+# CPUs run BF16 far slower than float32. The tower's 13 norms, 13 linears and
+# 8 depthwise convs each re-round to BF16, and a one-ulp difference early on
+# grows to as much as 1.5 at the output, so two correct BF16 implementations
+# differ by that much. Each lands 0.8-12 % from the float32 result in relative
+# L2 on the six goldens, this tower and the reference alike, so the bound only
+# rejects a broken BF16 path.
+GOLDEN_ATOL = 1e-3
+GOLDEN_RTOL = 1e-3
+GOLDEN_BF16_MAX_REL_L2 = 0.25
 
-_CKPT_DIR = os.environ.get("MUSESPARK_CKPT_DIR", "")
-_GOLDENS_DIR = os.environ.get("MUSESPARK_AUDIO_GOLDENS", "")
+
+#: The golden files, as generate_audio_goldens.py writes them.
+GOLDEN_NAMES = ("speech_0", "speech_1", "speech_2", "tone_0", "tone_1", "tone_2")
+BF16_GOLDEN = "tone_0"
 _AUDIO_CKPT_PREFIX = "modalities.soft_audio_perception.interaction_encoder."
 
 
-def _golden_files():
-    if not _GOLDENS_DIR:
-        return []
-    return sorted(
-        glob.glob(os.path.join(_GOLDENS_DIR, "speech_*.pt"))
-        + glob.glob(os.path.join(_GOLDENS_DIR, "tone_*.pt"))
+def _checkpoint_dir() -> str:
+    return os.environ.get("MUSESPARK_CKPT_DIR") or get_checkpoint("Muse-Spark-Open-816B-A42B-NVFP4")
+
+
+def _goldens_dir() -> str:
+    return os.environ.get("MUSESPARK_AUDIO_GOLDENS") or get_checkpoint(
+        os.path.join("Muse-Spark-Open-test-data", "audio-goldens")
     )
 
 
 def _load_real_tower():
     """Build the tower and load the 72 audio tensors from the checkpoint shards.
+
+    The tower is built on the meta device and materialized empty: every
+    parameter comes from the checkpoint, so random initialization is skipped.
 
     Works on either checkpoint layout. The source export names the tower
     `modalities.soft_audio_perception.interaction_encoder.*`; the open (HF
@@ -369,7 +385,8 @@ def _load_real_tower():
         open_format_to_source_key,
     )
 
-    index_path = os.path.join(_CKPT_DIR, "model.safetensors.index.json")
+    checkpoint = _checkpoint_dir()
+    index_path = os.path.join(checkpoint, "model.safetensors.index.json")
     with open(index_path) as f:
         weight_map = json.load(f)["weight_map"]
     # key in the file -> key in source spelling (identity on a source checkpoint)
@@ -383,14 +400,17 @@ def _load_real_tower():
     }
     assert len(audio_keys) == 72, f"expected 72 audio tensors, found {len(audio_keys)}"
 
-    tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
+    with torch.device("meta"):
+        tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
+    tower = tower.to_empty(device="cpu")
+    assert not list(tower.buffers())
     state = dict(tower.named_parameters())
     by_shard = {}
     for key, shard in audio_keys.items():
         by_shard.setdefault(shard, []).append(key)
     loaded = 0
     for shard, keys in by_shard.items():
-        with safe_open(os.path.join(_CKPT_DIR, shard), framework="pt", device="cpu") as f:
+        with safe_open(os.path.join(checkpoint, shard), framework="pt", device="cpu") as f:
             for key in keys:
                 tensor = f.get_tensor(key)
                 assert tensor.dtype == torch.bfloat16, f"{key} is {tensor.dtype}, not BF16"
@@ -399,45 +419,63 @@ def _load_real_tower():
                 with torch.no_grad():
                     param.copy_(tensor)
                 loaded += 1
-    assert loaded == 72
+    assert loaded == len(state) == 72
     return tower
 
 
-@pytest.mark.parametrize("golden_path", _golden_files() or [pytest.param(None, id="no-goldens")])
-def test_golden_embeddings_parity(golden_path):
-    if golden_path is None:
-        pytest.skip("MUSESPARK_AUDIO_GOLDENS unset or empty: no golden files to compare")
-    if not _CKPT_DIR:
-        pytest.skip("MUSESPARK_CKPT_DIR unset: no real weights to load")
+@pytest.fixture(scope="module")
+def real_towers():
+    """The tower with the checkpoint's weights in BF16, and a float32 copy."""
+    tower = _load_real_tower()
+    return tower, copy.deepcopy(tower).float()
 
-    golden = torch.load(golden_path, map_location="cpu", weights_only=True)
+
+def _golden(name):
+    golden = torch.load(
+        os.path.join(_goldens_dir(), f"{name}.pt"), map_location="cpu", weights_only=True
+    )
     wav = golden["wav_24k"].to(torch.float32)
     n_tokens = int(golden["n_tokens"])
     expected = golden["embeddings"]
-
     # The golden's own accounting must match the formula.
     assert n_tokens == math.ceil(wav.numel() / SAMPLES_PER_TOKEN)
     assert expected.shape == (n_tokens, HIDDEN_SIZE)
+    assert expected.dtype == torch.float32
+    return wav, expected
 
-    tower = _load_real_tower()
-    # The goldens are minted under torch.set_num_threads(1). At the container
-    # default (144 threads here) CPU reductions split differently and the tower
-    # lands 0.0156-0.0469 away -- above the tolerance below, from thread count
-    # alone. Pin it for the comparison and restore it, so one test cannot
-    # reconfigure the rest of the session.
+
+def _encode(tower, wav):
+    # One thread, as the goldens were generated, so reruns repeat exactly. The
+    # setting is restored, so one test cannot reconfigure the rest of the session.
     threads_before = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
         with torch.no_grad():
-            (got,) = tower([wav])
+            (out,) = tower([wav])
     finally:
         torch.set_num_threads(threads_before)
+    return out
 
+
+@pytest.mark.parametrize("name", GOLDEN_NAMES)
+def test_golden_embeddings_parity(name, real_towers):
+    wav, expected = _golden(name)
+    got = _encode(real_towers[1], wav)
+    assert got.shape == expected.shape
+    assert got.dtype == torch.float32
+    max_abs = (got - expected).abs().max().item()
+    assert torch.allclose(got, expected, atol=GOLDEN_ATOL, rtol=GOLDEN_RTOL), (
+        f"{name}: float32 max abs diff {max_abs:.4e} exceeds atol={GOLDEN_ATOL}/rtol={GOLDEN_RTOL}"
+    )
+
+
+def test_golden_bf16_output_stays_close(real_towers):
+    wav, expected = _golden(BF16_GOLDEN)
+    got = _encode(real_towers[0], wav)
     assert got.shape == expected.shape
     assert got.dtype == torch.bfloat16
-    got32, exp32 = got.float(), expected.float()
-    max_abs = (got32 - exp32).abs().max().item()
-    assert torch.allclose(got32, exp32, atol=GOLDEN_ATOL, rtol=GOLDEN_RTOL), (
-        f"{os.path.basename(golden_path)}: max abs diff {max_abs:.4e} exceeds "
-        f"atol={GOLDEN_ATOL}/rtol={GOLDEN_RTOL}"
+    rel_l2 = ((got.float() - expected).norm() / expected.norm()).item()
+    assert rel_l2 <= GOLDEN_BF16_MAX_REL_L2, (
+        f"{BF16_GOLDEN}: the BF16 output is {rel_l2:.3f} from the float32 golden in relative L2, "
+        f"above {GOLDEN_BF16_MAX_REL_L2}"
     )
