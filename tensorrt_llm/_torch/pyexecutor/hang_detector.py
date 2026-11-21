@@ -431,8 +431,9 @@ class HangDetector:
     - Detection never stops while active: not after firing, and not if
       ``on_detected`` raises an ``Exception``. ``on_detected`` is not
       idempotent, so a single lapse invokes it once.
-    - ``checkpoint()`` is one clock read and one float store, and does no
-      cross-thread work. The executor loop calls it three times per iteration.
+    - ``checkpoint()`` is one clock read and one float store, plus one store to
+      the pause word once one is shared, and does no cross-thread work. The
+      executor loop calls it three times per iteration.
     """
 
     def __init__(
@@ -452,8 +453,11 @@ class HangDetector:
         self.active = False
         self._detected = False
         self._status_providers: list[Callable[[], str]] = []
+        self._pause_word: Optional[memoryview] = None
+        self._pid = 0
         # Monotonic stamp the watcher compares against; ``inf`` means disarmed.
-        # A plain float store is the entire cost of ``checkpoint()``.
+        # A plain float store is the entire cost of ``checkpoint()`` without a
+        # pause word.
         self._deadline = math.inf
 
     def start(self):
@@ -490,6 +494,16 @@ class HangDetector:
         """Register a nonblocking callable that returns status to dump on hang detection."""
         with self.lock:
             self._status_providers.append(provider)
+
+    def share_pause_word(self, word: memoryview) -> None:
+        """Keep ``word[0]`` at this process's PID while detection is disarmed, and 0 while armed.
+
+        The disarming and arming calls write it themselves, so another process that reads the
+        word, such as a node supervisor, sees the pause also while the paused call holds the GIL.
+        """
+        self._pid = os.getpid()
+        self._pause_word = word
+        word[0] = self._pid if self.paused() else 0
 
     async def _watch(self) -> None:
         """Sleep until the deadline lapses, report, and keep watching.
@@ -580,10 +594,14 @@ class HangDetector:
         """Reset hang detection timer."""
         if self.active:
             self._deadline = time.monotonic() + self.timeout
+            if self._pause_word is not None:
+                self._pause_word[0] = 0
 
     def disarm(self) -> None:
         """Disarm hang detection until the next checkpoint."""
         self._deadline = math.inf
+        if self._pause_word is not None:
+            self._pause_word[0] = self._pid
 
     def cancel_task(self) -> None:
         """Compatibility alias for :meth:`disarm`.
@@ -603,6 +621,10 @@ class HangDetector:
             yield
         finally:
             self.checkpoint()
+
+    def paused(self) -> bool:
+        """Return whether detection is disarmed."""
+        return self._deadline == math.inf
 
     def stop(self):
         """Stop hang detection."""

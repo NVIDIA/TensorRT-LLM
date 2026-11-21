@@ -75,7 +75,7 @@ def _request(request_id: int = 1) -> SimpleNamespace:
         is_dummy_request=False,
         is_finished=False,
         py_decoding_iter=0,
-        cached_tokens=32,
+        reported_cached_tokens=32,
         create_response=Mock(return_value=response),
     )
 
@@ -349,7 +349,9 @@ def test_control_drain_waits_for_detached_connector_load() -> None:
 def test_control_drain_waits_for_peer_ranks_under_attention_dp() -> None:
     executor = _executor()
     executor.enable_attention_dp = True
-    executor.dist = SimpleNamespace(rank=0, world_size=2, tp_allgather=lambda drained: [drained, 0])
+    executor.dist = SimpleNamespace(
+        rank=0, world_size=2, tp_allgather=lambda drained, active_only: [drained, 0]
+    )
     executor.waiting_queue = []
     pending = SimpleNamespace(control_requires_drain=True)
     executor.control_requests = [pending]

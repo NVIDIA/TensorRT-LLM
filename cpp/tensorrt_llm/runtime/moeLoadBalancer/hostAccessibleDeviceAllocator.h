@@ -87,6 +87,26 @@ public:
      */
     void memcpyToDevice(void* dst, void const* src, size_t size);
 
+    /**
+     * @brief Copy from the host to host accessible device memory at a device address, across allocations if needed.
+     */
+    void memcpyToDeviceAddress(void* devDst, void const* src, size_t size);
+
+    /**
+     * @brief Return whether host accessible device memory is device memory that GDRCopy maps for the host.
+     */
+    bool usesGdrCopy() const;
+
+    /**
+     * @brief Pin and map GPU-page aligned device memory of one allocation for the host with GDRCopy.
+     */
+    void mapDeviceMemory(void* devPtr, size_t size);
+
+    /**
+     * @brief Unmap and unpin device memory that mapDeviceMemory mapped, logging errors.
+     */
+    void unmapDeviceMemory(void* devPtr) noexcept;
+
 private:
     struct AllocationInfo
     {

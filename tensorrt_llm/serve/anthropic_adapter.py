@@ -36,6 +36,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 from fastapi.responses import JSONResponse
 
+from tensorrt_llm.executor.rank_failure_requests import RANK_FAILURE_CODE
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicContentBlockDeltaEvent,
@@ -95,6 +96,18 @@ def anthropic_error_response(
 ) -> JSONResponse:
     envelope = AnthropicErrorResponse(error=AnthropicError(type=error_type, message=message))
     return JSONResponse(content=envelope.model_dump(exclude_none=True), status_code=status_code)
+
+
+def anthropic_error_type(
+    status_code: int, code: Optional[Union[int, str]] = None
+) -> AnthropicErrorType:
+    """Return the Anthropic error type of an OpenAI error response's HTTP status and ``code``.
+
+    A rank failure is an overloaded_error, the type of a temporary failure that a retry can pass.
+    """
+    if code == RANK_FAILURE_CODE:
+        return "overloaded_error"
+    return "invalid_request_error" if 400 <= status_code < 500 else "api_error"
 
 
 # ---------------------------------------------------------------------------
@@ -1103,12 +1116,12 @@ class AnthropicStreamReframer:
         frames.append(anthropic_sse(AnthropicMessageStopEvent()))
         return frames
 
-    def error(self, message: str) -> List[str]:
+    def error(self, message: str, error_type: AnthropicErrorType = "api_error") -> List[str]:
         """Close any open block, then surface an error event."""
         frames = self._close_block()
         frames.append(
             anthropic_sse(
-                AnthropicErrorEvent(error=AnthropicError(type="api_error", message=message))
+                AnthropicErrorEvent(error=AnthropicError(type=error_type, message=message))
             )
         )
         return frames
@@ -1247,8 +1260,8 @@ async def reframe_openai_stream(
     """
     reframer = AnthropicStreamReframer(model=model, request_id=request_id)
     done = False
-    # The frames that close the message, held from [DONE] until the upstream
-    # has been read to its end.
+    # The frames that end the message (finish at [DONE], an error frame at an
+    # upstream error event), held until the upstream has been read to its end.
     closing_frames: List[str] = []
     loop = asyncio.get_running_loop()
     last_event = loop.time()
@@ -1286,8 +1299,27 @@ async def reframe_openai_stream(
                 done = True
                 continue
             try:
-                chunk = ChatCompletionStreamResponse(**json.loads(data))
-            except (json.JSONDecodeError, ValueError) as e:
+                payload = json.loads(data)
+            except json.JSONDecodeError as e:
+                raise AnthropicResponseError("Malformed upstream stream chunk") from e
+            if isinstance(payload, dict) and "error" in payload:
+                # The upstream request failed after the stream started. The Anthropic message ends
+                # with an error frame once the rest of the upstream is read. Only a rank failure,
+                # whose message carries no internal detail and says that a retry can succeed,
+                # passes its message on. Other errors are only logged.
+                error = payload["error"]
+                logger.error(f"Chat stream behind /v1/messages ended with an error: {error}")
+                rank_failure = isinstance(error, dict) and error.get("code") == RANK_FAILURE_CODE
+                closing_frames = (
+                    reframer.error(error["message"], "overloaded_error")
+                    if rank_failure
+                    else reframer.error("Internal server error")
+                )
+                done = True
+                continue
+            try:
+                chunk = ChatCompletionStreamResponse(**payload)
+            except ValueError as e:  # pydantic's ValidationError is a ValueError.
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
@@ -1314,8 +1346,8 @@ async def reframe_openai_stream(
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")
         if done:
-            # The response was complete at [DONE], so a failure while reading
-            # the rest of the upstream is logged and the message still closes.
+            # The message's ending is already known, so a failure while reading
+            # the rest of the upstream is only logged.
             for frame in closing_frames:
                 yield frame
             return

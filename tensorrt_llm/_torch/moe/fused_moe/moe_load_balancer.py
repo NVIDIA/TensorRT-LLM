@@ -7,7 +7,8 @@ import threading
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
+                    Tuple)
 
 import numpy as np
 import torch
@@ -61,6 +62,10 @@ class HostMoeTensorSharer:
     A class representing a host tensor sharer.
     """
 
+    # Bytes before the expert weights in each shared memory segment, where a
+    # subclass may keep a header.
+    data_offset = 0
+
     def __init__(self, layer_id: int, expert_count: int,
                  shared_mpi_comm: MPI.Comm):
         """
@@ -77,9 +82,7 @@ class HostMoeTensorSharer:
         self.local_rank = self.shared_mpi_comm.Get_rank()
         self.local_size = self.shared_mpi_comm.Get_size()
 
-        self.expert_start = self.local_rank * self.expert_count // self.local_size
-        self.expert_end = (self.local_rank +
-                           1) * self.expert_count // self.local_size
+        self.keep_experts(range(self.expert_count))
 
         self.name_info = {}  # key is weight name, value is (dtype, shape)
         self.host_weights = {}
@@ -91,6 +94,28 @@ class HostMoeTensorSharer:
         self.names = []
 
         self.loaded_shared_weights = []
+
+    def keep_experts(self, expert_ids: Iterable[int]) -> None:
+        """
+        Keep the host weights of only ``expert_ids``, split over the ranks of the node.
+
+        Args:
+            expert_ids: The experts whose host weights the node keeps
+        """
+        self.expert_ids = sorted(expert_ids)
+        self.own_expert_ids = self.rank_expert_ids(self.local_rank)
+
+    def rank_expert_ids(self, local_rank: int) -> list[int]:
+        """
+        Get the experts whose host weights a local rank loads and shares.
+
+        Args:
+            local_rank: The rank in the node
+        """
+        count = len(self.expert_ids)
+        return self.expert_ids[local_rank * count //
+                               self.local_size:(local_rank + 1) * count //
+                               self.local_size]
 
     def set_shared_memory_base_name(self, shared_memory_base_name):
         """
@@ -134,7 +159,7 @@ class HostMoeTensorSharer:
         assert len(tensor_shape
                    ) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert 0 <= expert_id < self.expert_count
-        assert expert_id < self.expert_start or expert_id >= self.expert_end
+        assert expert_id not in self.own_expert_ids
         if name not in self.name_info:
             self.name_info[name] = (dtype, tensor_shape)
         else:
@@ -158,7 +183,7 @@ class HostMoeTensorSharer:
             t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert t.is_contiguous() == True, "t.is_contiguous() must be True"
         assert (expert_id, name) not in self.shared_tensors.keys()
-        assert self.expert_start <= expert_id < self.expert_end
+        assert expert_id in self.own_expert_ids
         self.shared_tensors[(expert_id, name)] = t
         dtype = t.dtype
         tensor_shape = t.shape
@@ -182,27 +207,13 @@ class HostMoeTensorSharer:
         """
         self.loaded_shared_weights.extend(raw_weight_tensors)
 
-    def finalize_layer_weights(self):
-        self.names = list(sorted(self.name_info.keys()))
-        assert len(
-            self.shared_tensors.keys()) == (self.expert_end -
-                                            self.expert_start) * len(self.names)
-
-        total_size = 0
-        for name in self.names:
-            dtype, shape = self.name_info[name]
-            for expert_id in range(self.expert_start, self.expert_end):
-                t = self.shared_tensors[(expert_id, name)]
-                assert dtype == t.dtype and shape == t.shape
-                data_size = t.numel() * t.element_size()
-                aligned_size = self.align_size(data_size)
-                total_size += aligned_size
-
+    def _create_own_shm(self, size: int) -> shared_memory.SharedMemory:
+        """Create this rank's shared memory, replacing one an earlier process left."""
         shm_name = self.get_shared_memory_name()
         try:
             shm = shared_memory.SharedMemory(name=shm_name,
                                              create=True,
-                                             size=total_size)
+                                             size=size)
         except FileExistsError:
             tensorrt_llm.logger.warning(
                 f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
@@ -212,12 +223,34 @@ class HostMoeTensorSharer:
             existing_shm.unlink()
             shm = shared_memory.SharedMemory(name=shm_name,
                                              create=True,
-                                             size=total_size)
+                                             size=size)
+        return shm
+
+    def _open_peer_shm(self, rank: int) -> shared_memory.SharedMemory:
+        return shared_memory.SharedMemory(
+            name=self.get_shared_memory_name(rank))
+
+    def finalize_layer_weights(self):
+        self.names = list(sorted(self.name_info.keys()))
+        assert len(self.shared_tensors.keys()) == len(
+            self.own_expert_ids) * len(self.names)
+
+        total_size = self.data_offset
+        for name in self.names:
+            dtype, shape = self.name_info[name]
+            for expert_id in self.own_expert_ids:
+                t = self.shared_tensors[(expert_id, name)]
+                assert dtype == t.dtype and shape == t.shape
+                data_size = t.numel() * t.element_size()
+                aligned_size = self.align_size(data_size)
+                total_size += aligned_size
+
+        shm = self._create_own_shm(total_size)
         self.own_shm = shm
 
-        offset = 0
+        offset = self.data_offset
         for name in self.names:
-            for expert_id in range(self.expert_start, self.expert_end):
+            for expert_id in self.own_expert_ids:
                 t = self.shared_tensors[(expert_id, name)].contiguous().cpu()
                 data_size = t.numel() * t.element_size()
                 aligned_size = self.align_size(data_size)
@@ -252,36 +285,34 @@ class HostMoeTensorSharer:
             if rank == self.local_rank:
                 continue
 
-            shm_name = self.get_shared_memory_name(rank)
-            shm = shared_memory.SharedMemory(name=shm_name)
+            shm = self._open_peer_shm(rank)
             self.imported_shms.append(shm)
-
-            rank_expert_start = rank * self.expert_count // self.local_size
-            rank_expert_end = (rank + 1) * self.expert_count // self.local_size
-
-            offset = 0
-            for name in self.names:
-                dtype, shape = self.name_info[name]
-                elt_count = int(np.prod(shape))
-                data_size = torch.tensor([],
-                                         dtype=dtype).element_size() * elt_count
-                aligned_size = self.align_size(data_size)
-                for expert_id in range(rank_expert_start, rank_expert_end):
-                    t = torch.frombuffer(shm.buf,
-                                         dtype=dtype,
-                                         offset=offset,
-                                         count=elt_count).view(shape)
-                    key = (expert_id, name)
-                    assert key not in self.host_weights.keys(
-                    ), f"key={key} already exists"
-                    self.host_weights[key] = t
-                    offset += aligned_size
+            self._import_host_weights(shm, rank)
 
         if add_host_weight_fn is not None:
             for key, t in self.host_weights.items():
                 add_host_weight_fn(key[0], key[1], t)
 
         self.host_weights.clear()
+
+    def _import_host_weights(self, shm: shared_memory.SharedMemory, rank: int):
+        """Add the host weights that local ``rank`` wrote to ``shm``."""
+        offset = self.data_offset
+        for name in self.names:
+            dtype, shape = self.name_info[name]
+            elt_count = int(np.prod(shape))
+            data_size = torch.tensor([], dtype=dtype).element_size() * elt_count
+            aligned_size = self.align_size(data_size)
+            for expert_id in self.rank_expert_ids(rank):
+                t = torch.frombuffer(shm.buf,
+                                     dtype=dtype,
+                                     offset=offset,
+                                     count=elt_count).view(shape)
+                key = (expert_id, name)
+                assert key not in self.host_weights.keys(
+                ), f"key={key} already exists"
+                self.host_weights[key] = t
+                offset += aligned_size
 
     def pre_shutdown_cleanup(self):
         """
@@ -322,7 +353,11 @@ class SingleLayerMoeLoadBalancer:
             expert_count: int,
             updates_enabled: bool = True,
             repeated_count=1,
-            aux_stream: Optional[torch.cuda.Stream] = None):
+            aux_stream: Optional[torch.cuda.Stream] = None,
+            *,
+            total_slot_count_per_rank: Optional[int] = None,
+            spare_slot_count: int = 0,
+            host_tensor_sharer_cls=HostMoeTensorSharer):
         """
         Initialize a SingleLayerMoeLoadBalancer instance.
 
@@ -332,6 +367,12 @@ class SingleLayerMoeLoadBalancer:
             expert_count: total number of experts
             updates_enabled: whether to enable weight updates
             repeated_count: the repeated count of current layer, used when forward is repeated more than once like MTP.
+            total_slot_count_per_rank: the number of slots per rank, including
+                the spare slots. Required with spare slots.
+            spare_slot_count: the number of unbacked spare slots per rank for
+                Wide-EP fault tolerance.
+            host_tensor_sharer_cls: the class that shares the host weights of
+                the experts between the ranks of a node.
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
@@ -339,21 +380,17 @@ class SingleLayerMoeLoadBalancer:
         self.expert_count = expert_count
         self.updates_enabled = updates_enabled
         self.repeated_count = repeated_count
+        self.total_slot_count_per_rank = total_slot_count_per_rank
+        self.spare_slot_count = spare_slot_count
+        self.unbacked_slot_tensors: dict[str, torch.Tensor] = {}
+        self.slot_tensors: dict[str, torch.Tensor] = {}
+        self.initial_placement: Optional[np.ndarray] = None
         layer_id = self.single_layer_load_balancer_impl.get_layer_id()
-        self.host_tensor_sharer = HostMoeTensorSharer(
+        self.host_tensor_sharer = host_tensor_sharer_cls(
             layer_id, expert_count,
-            shared_mpi_comm) if self.updates_enabled else None
+            shared_mpi_comm) if self.need_load_shared_weights() else None
         self.register_weight_fns = []
         self.to_migrate_weight_fns = []
-
-        shared_rank = shared_mpi_comm.Get_rank()
-        shared_size = shared_mpi_comm.Get_size()
-
-        load_expert_start = shared_rank * self.expert_count // shared_size
-        load_expert_end = min(
-            (shared_rank + 1) * self.expert_count // shared_size,
-            self.expert_count)
-        self.load_expert_ids = list(range(load_expert_start, load_expert_end))
 
         if self.updates_enabled:
             self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
@@ -390,12 +427,25 @@ class SingleLayerMoeLoadBalancer:
     def get_old_rank_expert_ids(self):
         return self.single_layer_load_balancer_impl.get_old_rank_expert_ids()
 
+    def get_unusable_local_slots(self) -> list[int]:
+        return self.single_layer_load_balancer_impl.get_unusable_local_slots()
+
     def get_load_expert_ids(self):
-        assert self.updates_enabled, "should not call get_load_expert_ids when using statistic routing"
-        return self.load_expert_ids
+        assert self.need_load_shared_weights(
+        ), "should not call get_load_expert_ids when using statistic routing"
+        return self.host_tensor_sharer.own_expert_ids
 
     def get_repeat_count(self):
         return self.repeated_count
+
+    @property
+    def active_slot_count_per_rank(self) -> int:
+        return self.total_slot_count_per_rank - self.spare_slot_count
+
+    @property
+    def spare_slots(self) -> range:
+        return range(self.active_slot_count_per_rank,
+                     self.total_slot_count_per_rank)
 
     def is_static_routing(self):
         return not self.updates_enabled
@@ -404,7 +454,7 @@ class SingleLayerMoeLoadBalancer:
         return self.updates_enabled
 
     def need_load_shared_weights(self):
-        return self.is_dynamic_routing()
+        return self.is_dynamic_routing() or self.spare_slot_count > 0
 
     def set_shared_memory_base_name(self, shared_memory_base_name):
         """
@@ -413,7 +463,7 @@ class SingleLayerMoeLoadBalancer:
         Args:
             shared_memory_base_name: The base name for the shared memory
         """
-        if self.updates_enabled:
+        if self.need_load_shared_weights():
             self.host_tensor_sharer.set_shared_memory_base_name(
                 shared_memory_base_name)
 
@@ -475,14 +525,26 @@ class SingleLayerMoeLoadBalancer:
         host_weight = _tensor_to_weight(t)
         self._add_host_weight(expert_id, name, host_weight)
 
+    def with_spare_slots(self, eplb_assignments: list[int]) -> list[int]:
+        """Return ``eplb_assignments`` with each rank's spare slots appended empty."""
+        if not self.spare_slot_count:
+            return eplb_assignments
+        per_rank = np.asarray(eplb_assignments).reshape(
+            -1, self.active_slot_count_per_rank)
+        spares = np.full((per_rank.shape[0], self.spare_slot_count), -1)
+        return np.concatenate([per_rank, spares], axis=1).ravel().tolist()
+
     def set_initial_weight_assignments(self,
                                        initial_weight_assignments: List[int]):
         """
         Set the initial weight assignments for the layer.
 
         Args:
-            initial_weight_assignments: A list of initial weight assignments
+            initial_weight_assignments: The expert of every slot, -1 for the spare slots.
         """
+        if self.spare_slot_count:
+            self.initial_placement = np.array(initial_weight_assignments,
+                                              dtype=np.int32)
         self.single_layer_load_balancer_impl.set_initial_weight_assignments(
             initial_weight_assignments)
 
@@ -514,6 +576,15 @@ class SingleLayerMoeLoadBalancer:
             fn(*args, **kwargs)
 
         self.to_migrate_weight_fns = []
+        without_host_weights = [
+            name for name in sorted(self.unbacked_slot_tensors)
+            if name not in self.host_tensor_sharer.name_info
+        ]
+        if without_host_weights:
+            raise RuntimeError(
+                f"Weights {without_host_weights} of MoE layer "
+                f"{self.get_layer_idx()} have spare slots without device "
+                "memory but no host weights to restore an expert from")
 
         for fn, args, kwargs in self.register_weight_fns:
             fn(*args, **kwargs)
@@ -525,9 +596,10 @@ class SingleLayerMoeLoadBalancer:
         Finalize the model after all layers have been added.
         This must be called before starting any iterations.
         """
-        if self.updates_enabled:
+        if self.need_load_shared_weights():
             self.host_tensor_sharer.finalize_host_tensor_sharing(
-                self._add_host_weight_from_tensor)
+                self._add_host_weight_from_tensor if self.
+                updates_enabled else None)
 
     def start_wait_gpu_stage(self):
         """
@@ -588,6 +660,15 @@ class SingleLayerMoeLoadBalancer:
         if self.updates_enabled:
             if do_multi_stream():
                 self.event_dict[EventType.MoeBalancer].wait()
+
+    def abandon_forward(self):
+        """
+        Reset the stage bookkeeping of a forward that did not complete, so
+        that the next forward starts afresh.
+        """
+        for name in self.func_called_count:
+            self.func_called_count[name] = 0
+        self.statistic_flag_tensor = None
 
     def update_local_statistic(self, local_raw_expert_ids: torch.Tensor,
                                is_first_stage: bool, is_last_stage: bool):
@@ -764,14 +845,14 @@ class SingleLayerMoeLoadBalancer:
 
         Call after the C++ shutdown and before the barrier.
         """
-        if self.updates_enabled:
+        if self.need_load_shared_weights():
             self.host_tensor_sharer.pre_shutdown_cleanup()
 
     def py_post_shutdown_cleanup(self):
         """
          Clean up the resources after C++ shutdown and barrier
          """
-        if self.updates_enabled:
+        if self.need_load_shared_weights():
             self.host_tensor_sharer.post_shutdown_cleanup()
 
 
@@ -797,6 +878,11 @@ class BaseMoeLoadBalancer(ABC):
 
     def is_dynamic_routing(self) -> bool:
         return not self.is_static_routing()
+
+    @property
+    def adds_spare_slots(self) -> bool:
+        """Whether ``add_layer`` gives the layers unbacked spare slots (Wide-EP fault tolerance)."""
+        return False
 
     @abstractmethod
     def set_repeated_for_next_layer(self, repeated_count: int) -> None:
@@ -891,6 +977,11 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
     This class can be used as a context manager to manage the lifecycle of a MoeLoadBalancer.
     """
 
+    host_tensor_sharer_cls: Callable[...,
+                                     HostMoeTensorSharer] = HostMoeTensorSharer
+    # Whether the C++ load balancer can restore the placement after a rank failure.
+    fault_tolerance = False
+
     def __init__(
             self,
             ep_rank: int,
@@ -918,8 +1009,11 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.layer_updates_per_iter = layer_updates_per_iter
-        self.load_balancer_impl = _tbr.MoeLoadBalancer(ep_rank, ep_size,
-                                                       layer_updates_per_iter)
+        self.load_balancer_impl = _tbr.MoeLoadBalancer(
+            ep_rank,
+            ep_size,
+            layer_updates_per_iter,
+            fault_tolerance=self.fault_tolerance)
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         self.shared_memory_base_name = shared_memory_base_name or os.getenv(
@@ -983,14 +1077,16 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         Args:
             expert_count: The number of experts in the layer
             top_k: The number of experts each token selects
-            slot_count_per_rank: The number of slots per rank
+            slot_count_per_rank: The number of EPLB slots per rank, excluding spare slots.
             aux_stream: The auxiliary stream for overlapping
 
         Returns:
             A SingleLayerMoeLoadBalancer instance for the new layer
         """
+        spare_slot_count = self._spare_slot_count(expert_count,
+                                                  slot_count_per_rank)
         single_layer_load_balancer_impl = self.load_balancer_impl.add_layer(
-            expert_count, top_k, slot_count_per_rank)
+            expert_count, top_k, slot_count_per_rank + spare_slot_count)
         updates_enabled = not self.is_static_routing()
         repeat_count = 1
         if self.next_layer_repeated_count is not None:
@@ -1002,11 +1098,22 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             expert_count,
             updates_enabled=updates_enabled,
             repeated_count=repeat_count,
-            aux_stream=aux_stream)
+            aux_stream=aux_stream,
+            total_slot_count_per_rank=slot_count_per_rank + spare_slot_count,
+            spare_slot_count=spare_slot_count,
+            host_tensor_sharer_cls=self.host_tensor_sharer_cls)
         single_layer_load_balancer.set_shared_memory_base_name(
             self.shared_memory_base_name)
         self.single_layer_load_balancers.append(single_layer_load_balancer)
         return single_layer_load_balancer
+
+    def _spare_slot_count(self, expert_count: int,
+                          slot_count_per_rank: int) -> int:
+        """Return the number of spare slots per rank to add to a layer.
+
+        A fault-tolerant load balancer overrides this. This one adds none.
+        """
+        return 0
 
     def register_weight_slots_after_to_cuda(self):
         """
@@ -1134,7 +1241,9 @@ moe_model_arch_list = [
 
 
 def maybe_create_moe_load_balancer(
-    model_config, mapping: Optional[Mapping]
+    model_config,
+    mapping: Optional[Mapping],
+    load_balancer_cls: Callable[..., MoeLoadBalancer] = MoeLoadBalancer
 ) -> AbstractContextManager[BaseMoeLoadBalancer | None]:
     ep_rank = model_config.mapping.moe_ep_rank
     ep_size = model_config.mapping.moe_ep_size
@@ -1203,7 +1312,7 @@ def maybe_create_moe_load_balancer(
 
             warmup_placement = _create_warmup_placement(model_config, ep_rank,
                                                         ep_size)
-            moe_load_balancer = MoeLoadBalancer(
+            moe_load_balancer = load_balancer_cls(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
                 layer_updates_per_iter=config.layer_updates_per_iter,

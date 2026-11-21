@@ -42,6 +42,7 @@ from .._errors import ConfigInputError
 from .._startup_errors import (classify_startup_error, log_startup_error,
                                mark_llm_initialized)
 from .._utils import nvtx_range_debug
+from .._wide_ep_fault_tolerance import check_node_supervisor_launch
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -449,6 +450,16 @@ class BaseLLM:
                                      **kwargs)
             self.args._enable_routing_load = enable_routing_load
             self.args._openengine_discovery = openengine_discovery
+            check_node_supervisor_launch(
+                self.args.enable_wide_ep_fault_tolerance)
+            self._fault_tolerance_env: Optional[Dict[str, str]] = None
+            self._rendezvous_socket: Optional[socket.socket] = None
+            if self.args.enable_wide_ep_fault_tolerance:
+                from .._torch.distributed.membership import startup
+
+                # The socket reserves the rendezvous port while this LLM runs.
+                self._fault_tolerance_env, self._rendezvous_socket = (
+                    startup.ensure_rendezvous(self.args.orchestrator_type))
 
             self._capture_usage_startup(llm_args=self.args)
 
@@ -511,8 +522,13 @@ class BaseLLM:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
                     logger_debug("LLM create MpiPoolSession\n", "yellow")
-                    self.mpi_session = MpiPoolSession(
-                        n_workers=self.args.parallel_config.world_size)
+                    session_cls = MpiPoolSession
+                    if self.args.enable_wide_ep_fault_tolerance:
+                        from ._node_supervised_mpi_session import \
+                            NodeSupervisedMpiPoolSession as session_cls
+                    self.mpi_session = session_cls(
+                        n_workers=self.args.parallel_config.world_size,
+                        env_overrides=self._fault_tolerance_env)
                 else:
                     logger_debug("LLM create MpiCommSession\n", "yellow")
                     self.mpi_session = create_mpi_comm_session(
@@ -1683,6 +1699,15 @@ class BaseLLM:
                     f"max_num_tokens ({max_num_tokens})")
         self._check_one_model_speculative_sampling(sampling_params)
 
+        if self.args.enable_wide_ep_fault_tolerance and (
+                sampling_params.use_beam_search or sampling_params.n > 1
+                or sampling_params.best_of > 1):
+            raise RequestError(
+                "Wide-EP fault tolerance (enable_wide_ep_fault_tolerance) does "
+                "not support requests with n > 1, best_of > 1 or beam search "
+                "yet, since after a rank failure it continues only "
+                "single-sequence requests")
+
         if sampling_params.return_routed_experts and not (
                 self.args.backend == "pytorch"
                 and getattr(self.args, "enable_return_routed_experts", False)):
@@ -1816,7 +1841,7 @@ class BaseLLM:
             self._record_usage_shutdown()
 
     def _shutdown_resources(self) -> None:
-        """Release executors and any LLM-owned MPI session."""
+        """Release executors, any LLM-owned MPI session and the rendezvous port."""
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
@@ -1830,6 +1855,10 @@ class BaseLLM:
                 and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
+
+        if getattr(self, "_rendezvous_socket", None) is not None:
+            self._rendezvous_socket.close()
+            self._rendezvous_socket = None
 
     def _record_usage_shutdown(self) -> None:
         """Update the process counter at most once for this LLM object."""

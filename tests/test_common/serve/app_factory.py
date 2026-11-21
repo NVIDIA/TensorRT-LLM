@@ -110,6 +110,9 @@ class AggConfig:
     # Attached frontend of a multi-frontend server: registers the launcher
     # forwarding routes ahead of the local handlers, which they shadow.
     multi_frontend_attached: bool = False
+    # enable_wide_ep_fault_tolerance, with the ranks' rendezvous store on a
+    # closed loopback port: the status reads fail without blocking construction.
+    fault_tolerance: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,6 +210,7 @@ class ServeTestEnv:
             encode_only=config.role in (ServerRole.EMBEDDING, ServerRole.RERANK),
             reasoning_parser=config.reasoning_parser,
             num_postprocess_workers=config.num_postprocess_workers,
+            enable_wide_ep_fault_tolerance=config.fault_tolerance,
         )
         executor = FakeExecutor(resource_governor_queue=object() if config.governor_queue else None)
         if config.role is ServerRole.VISUAL_GEN:
@@ -223,6 +227,14 @@ class ServeTestEnv:
             generator = FakeAsyncLLM(args=args, executor=executor)
         else:
             generator = FakeLLM(args=args, executor=executor)
+        if config.fault_tolerance:
+            from tensorrt_llm._torch.distributed.membership import RENDEZVOUS_ENV, SHARED_SECRET_ENV
+
+            # The LLM keeps the rendezvous address and shared secret of the ranks it starts.
+            generator._fault_tolerance_env = {
+                RENDEZVOUS_ENV: "127.0.0.1:9",
+                SHARED_SECRET_ENV: "ab" * 32,
+            }
 
         multi_frontend_serving = None
         if config.multi_frontend_attached:
@@ -299,6 +311,8 @@ class ServeTestEnv:
         self._entered_clients.clear()
         self._plain_clients.clear()
         for server in self._servers:
+            if server.fault_tolerance_health is not None:
+                server.fault_tolerance_health.close()
             for pool_name in (
                 "_input_proc_executor",
                 "_media_load_executor",

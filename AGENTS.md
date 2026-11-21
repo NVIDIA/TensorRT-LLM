@@ -120,6 +120,7 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
+| `tensorrt_llm/_torch/distributed/membership/FAULT_TOLERANCE_DEVELOPER_GUIDE.md` | Wide-EP fault tolerance: membership protocol, node supervisor, rejoin, startup record and replay, backend contract — **read before modifying fault-tolerance code or a shared path it runs (`Distributed`, the attention-DP vote, `NVLinkOneSided`, EPLB)** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns

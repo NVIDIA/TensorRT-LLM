@@ -173,6 +173,40 @@ class JitGemmRunner(GemmRunner):
         return super().forward(inputs, tactic=tactic, **kwargs)
 
 
+def test_report_progress_per_tactic(monkeypatch) -> None:
+    """Report progress once per (runner, tactic) profiled and once per cached tactic primed."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    w = torch.randn(64, 128)
+    x = torch.randn(3, 64)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        DynamicTensorSpec(input_idx=0,
+                          dim_idx=0,
+                          gen_tuning_buckets=(3, 4, 5),
+                          map_to_tuning_buckets=lambda value: value), ))
+    op = "test_report_progress"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner._primed_cached_tactics.clear()
+    num_profiles = len(tuner._optimization_profiles(tuning_config, [x, w]))
+    steps = []
+    with autotune(report_progress=lambda: steps.append(op)):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    winners = {
+        value[1]
+        for value in tuner.profiling_cache.get_specific_custom_op(op).values()
+    }
+    # Each profile profiles the three tactics of GemmRunner.
+    assert len(steps) >= 3 * num_profiles
+
+    # A cache hit profiles nothing and primes each cached winner again.
+    steps.clear()
+    tuner._primed_cached_tactics.clear()
+    with autotune(report_progress=lambda: steps.append(op)):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    assert len(steps) == len(winners)
+    assert tuner.report_progress is None
+
+
 @pytest.mark.parametrize("strategy", [
     DistributedTuningStrategy.PARALLEL,
     DistributedTuningStrategy.MERGE,
@@ -238,6 +272,53 @@ def test_prime_cached_tactics_on_cache_hit(monkeypatch, strategy) -> None:
         with autotune(cache_path=cache_path):
             tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
         assert JitGemmRunner.calls == []
+
+
+class CountingGemmRunner(GemmRunner):
+    """GemmRunner without a JIT kernel cache, like the C++ runners."""
+    calls: list[int] = []
+
+    def forward(self,
+                /,
+                inputs: list[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        type(self).calls.append(tactic)
+        return super().forward(inputs, tactic=tactic, **kwargs)
+
+
+@pytest.mark.parametrize("prime_all_runners", [False, True])
+def test_prime_all_runners_on_cache_hit(monkeypatch, prime_all_runners) -> None:
+    """Prime the cached winners of a runner without a JIT kernel cache only on request."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    w = torch.randn(64, 128)
+    x = torch.randn(3, 64)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        DynamicTensorSpec(input_idx=0,
+                          dim_idx=0,
+                          gen_tuning_buckets=(3, 4, 5),
+                          map_to_tuning_buckets=lambda value: value), ))
+    op = "test_prime_all_runners"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        tuner.choose_one(op, [CountingGemmRunner()], tuning_config, [x, w])
+    winners = {
+        value[1]
+        for value in tuner.profiling_cache.get_specific_custom_op(op).values()
+    }
+    assert winners
+
+    # Simulate a fresh process that holds the tactics but launched none of them.
+    tuner._primed_cached_tactics.clear()
+    CountingGemmRunner.calls.clear()
+    for _ in range(2):
+        with autotune(prime_all_runners=prime_all_runners):
+            tuner.choose_one(op, [CountingGemmRunner()], tuning_config, [x, w])
+    expected = sorted(winners) if prime_all_runners else []
+    assert sorted(CountingGemmRunner.calls) == expected
+    assert not tuner.prime_all_runners
 
 
 def test_prime_cached_tactics_after_parallel_cache_merge(monkeypatch) -> None:

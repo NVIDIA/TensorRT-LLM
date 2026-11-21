@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for ExecutorRequestQueue class.
 
 This module tests the ExecutorRequestQueue class functionality including:
@@ -11,7 +25,8 @@ import datetime
 import queue
 import threading
 import time
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 
@@ -388,3 +403,54 @@ def test_queue_size_methods(executor_queue):
     # Add some data and test
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
     assert executor_queue.get_request_queue_size() == 1
+
+
+def test_wake_returns_a_waiting_fetch(executor_queue):
+    """Test that wake ends a waiting fetch without a request."""
+    fetched = []
+    waiter = threading.Thread(target=lambda: fetched.append(
+        executor_queue.get_from_request_queue(datetime.timedelta(seconds=30))),
+                              daemon=True)
+    waiter.start()
+    executor_queue.wake()
+    waiter.join(timeout=5)  # Well before the fetch's own 30 s timeout.
+    assert not waiter.is_alive(), "wake did not end the fetch"
+    assert fetched == [[]]
+
+
+def test_wakes_coalesce_until_fetched(executor_queue):
+    """Test that repeated wakes queue one item until a fetch consumes it."""
+    executor_queue.wake()
+    executor_queue.wake()
+    assert executor_queue.get_request_queue_size() == 1
+    assert executor_queue.get_from_request_queue(None) == []
+    executor_queue.wake()
+    assert executor_queue.get_request_queue_size() == 1
+
+
+def test_fetch_without_wake_reads_no_ids(executor_queue):
+    """Test that a fetch looks for a wake item only while a wake is pending."""
+    item = Mock()
+    id_reads = PropertyMock(return_value=1)
+    type(item).id = id_reads
+    executor_queue.request_queue.put(item)
+    assert executor_queue.get_from_request_queue(None) == [item]
+    id_reads.assert_not_called()
+
+
+def test_queued_request_ids_skip_wake(executor_queue):
+    """Test that a pending wake is not reported as a queued request."""
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+    executor_queue.wake()
+    assert executor_queue.queued_request_ids() == {1}
+
+
+def test_request_stats_skip_wake(executor_queue):
+    """Test that the request stats do not list a pending wake as queued."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+    executor_queue.wake()
+    executor = SimpleNamespace(executor_request_queue=executor_queue)
+    stats = PyExecutor._populate_req_stats(executor, [], [], None)
+    assert [stat.id for stat in stats] == [1]

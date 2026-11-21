@@ -59,6 +59,8 @@ from tensorrt_llm._utils import \
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
+from tensorrt_llm.executor.rank_failure_requests import (RANK_FAILURE_CODE,
+                                                         RankFailureError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.chat_template_guard import \
     unreferenced_chat_template_kwargs
@@ -3407,6 +3409,8 @@ def _sse_delimiter_and_markers(sample: Any) -> Tuple[Any, tuple]:
 
 def classify_stream_termination(exc: Exception) -> str:
     """Attribute a stream-ending exception to a cause."""
+    if isinstance(exc, RankFailureError):
+        return RANK_FAILURE_CODE
     if isinstance(exc, (RequestError, EngineDeadError)):
         return STREAM_TERMINATION_ENGINE_ERROR
     # By module, to keep the HTTP client library out of this layer.
@@ -3418,10 +3422,11 @@ def classify_stream_termination(exc: Exception) -> str:
 def describe_stream_termination(exc: Exception, cause: str) -> str:
     """The client-facing detail of a stream-ending exception.
 
-    Only engine errors carry their message; transport and internal errors can
-    name internal hosts.
+    Only engine errors and rank failures carry their message; transport and
+    internal errors can name internal hosts.
     """
-    if cause == STREAM_TERMINATION_ENGINE_ERROR and str(exc):
+    if cause in (STREAM_TERMINATION_ENGINE_ERROR,
+                 RANK_FAILURE_CODE) and str(exc):
         return f"{type(exc).__name__}: {exc}"
     return type(exc).__name__
 
