@@ -35,3 +35,6 @@ properties:
   routed_experts:
     annotation: Optional[torch.Tensor]
     default: inspect._empty
+  postprocess_result:
+    annotation: Any
+    default: inspect._empty

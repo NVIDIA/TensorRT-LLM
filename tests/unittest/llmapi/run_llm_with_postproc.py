@@ -56,7 +56,7 @@ def main(model_dir: str, tp_size: int, n: int, best_of: Optional[int],
                                                _postproc_params=postproc_params,
                                                streaming=True):
             print(output)
-            outputs.append(output.outputs[0]._postprocess_result)
+            outputs.append(output.outputs[0].postprocess_result)
 
     asyncio.run(generate_async())
 
