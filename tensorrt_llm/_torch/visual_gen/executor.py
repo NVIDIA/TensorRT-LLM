@@ -711,10 +711,19 @@ class DiffusionExecutor:
                 and self.pipeline._warmed_up_shapes
                 and cache_key not in self.pipeline._warmed_up_shapes
             ):
+                if self.pipeline._uses_blockwise_cuda_graphs():
+                    # Block graphs are captured only during warmup.
+                    slower = (
+                        "It runs without CUDA graphs, and its first request is also slower "
+                        "due to torch.compile recompilation."
+                    )
+                else:
+                    slower = (
+                        "First request with this shape will be slower due to "
+                        "torch.compile recompilation or CUDA graph capture."
+                    )
                 logger.warning(
-                    f"Requested shape {cache_key} was not warmed up. "
-                    f"First request with this shape will be slower due to "
-                    f"torch.compile recompilation or CUDA graph capture. "
+                    f"Requested shape {cache_key} was not warmed up. {slower} "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
             output = self.pipeline.run_inference(req)

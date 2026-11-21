@@ -4,7 +4,7 @@
 """FLUX.1 Pipeline implementation following WAN pattern."""
 
 import time
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -54,6 +54,11 @@ class FluxPipeline(BasePipeline):
 
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
+
+    # Text is padded to max_sequence_length, so a request uses the block graphs of the warmup
+    # run with its size, batch size and text length. Warmup runs one image with 512 text
+    # tokens; other batch sizes and text lengths run their blocks without graphs.
+    supports_blockwise_cuda_graphs = True
 
     @property
     def supports_dynamic_batching(self) -> bool:
@@ -136,8 +141,23 @@ class FluxPipeline(BasePipeline):
     def default_warmup_num_frames(self):
         return [1]
 
-    def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
+    def warmup_cache_key(
+        self, height: int, width: int, batch_size: int = 1, max_sequence_length: int = 512, **kwargs
+    ) -> tuple:
+        # Block graph keys include every block input shape; the defaults are _run_warmup's.
+        if self._uses_blockwise_cuda_graphs():
+            return (height, width, batch_size, max_sequence_length)
         return (height, width)
+
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        if not self._uses_blockwise_cuda_graphs():
+            return super().request_warmup_cache_key(req)
+        return self.warmup_cache_key(
+            req.params.height,
+            req.params.width,
+            batch_size=len(req.prompt) * req.params.num_images_per_prompt,
+            max_sequence_length=req.params.max_sequence_length,
+        )
 
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""

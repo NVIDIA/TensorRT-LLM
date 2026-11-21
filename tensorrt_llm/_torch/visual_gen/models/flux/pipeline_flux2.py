@@ -116,6 +116,10 @@ class Flux2Pipeline(BasePipeline):
 
     supports_image_edit = True
     derive_output_size_from_reference = True
+    # Text is padded to max_sequence_length, so a request uses the block graphs of the warmup
+    # run with its size, batch size and text length. Warmup runs one image with 512 text
+    # tokens and no reference image; other requests run their blocks without graphs.
+    supports_blockwise_cuda_graphs = True
 
     @property
     def supports_dynamic_batching(self) -> bool:
@@ -212,11 +216,24 @@ class Flux2Pipeline(BasePipeline):
     def default_warmup_num_frames(self):
         return [1]
 
-    def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
+    def warmup_cache_key(
+        self, height: int, width: int, batch_size: int = 1, max_sequence_length: int = 512, **kwargs
+    ) -> tuple:
+        # Block graph keys include every block input shape; the defaults are _run_warmup's.
+        if self._uses_blockwise_cuda_graphs():
+            return (height, width, batch_size, max_sequence_length)
         return (height, width)
 
     def request_warmup_cache_key(self, req: Any) -> tuple:
-        cache_key = super().request_warmup_cache_key(req)
+        if self._uses_blockwise_cuda_graphs():
+            cache_key = self.warmup_cache_key(
+                req.params.height,
+                req.params.width,
+                batch_size=len(req.prompt) * req.params.num_images_per_prompt,
+                max_sequence_length=req.params.max_sequence_length,
+            )
+        else:
+            cache_key = super().request_warmup_cache_key(req)
         condition_images = req.prepared_inputs.get("condition_images")
         if condition_images is None:
             return cache_key
