@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1561,8 +1561,9 @@ def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
             fake_scale(compile_spec.scale_types[0]),
             fake_scale(compile_spec.scale_types[1]),
             stream_fake,
-            output_quant_args=output_quant_args,
-            max_q_len=cutlass.Int32(0),
+            output_quant_args,
+            cutlass.Int32(0),
+            cutlass.Int32(0),
             options=_COMPILE_OPTIONS,
         )
 
@@ -1770,6 +1771,7 @@ def _launch_mla_decode(
     compiled: Callable[..., object],
     lse: Optional[torch.Tensor] = None,
     max_q_len: int,
+    cp_rank: int = 0,
     tensor_views: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""

@@ -1146,6 +1146,56 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size: int, tp_size: 
         assert events == [] and not owner.dist.mock_calls
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cp_size,gather,attention_dp,spec_mode,max_rows",
+    [
+        (1, "tp_allgather", False, None, 8),
+        (2, "tp_cp_allgather", True, None, 16),
+        (1, "tp_allgather", False, "DSPARK", None),
+        (1, "tp_allgather", False, "NGRAM", 8),
+        (1, "tp_allgather", False, "USER_PROVIDED", None),
+    ],
+)
+@pytest.mark.parametrize("fails", [False, True])
+def test_lowm_row_bucket_prewarm_always_meets_its_peers(
+    cp_size: int,
+    gather: str,
+    attention_dp: bool,
+    spec_mode: str | None,
+    max_rows: int | None,
+    fails: bool,
+) -> None:
+    """Without speculation, or with NGram's prefix-lookup drafts, a rank prewarms the buckets up to
+    a step's most rows (its tokens, gathered over the TP group under attention DP). With any other
+    drafter, a user-provided one included, every bucket, since it can run more rows than its target
+    verifies. The rank meets its TP (TP x CP) peers whether its prewarm compiled nothing or failed;
+    a failure is a warning, since it only defers the compiles to their first calls."""
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+    spec_config = (
+        None
+        if spec_mode is None
+        else SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode[spec_mode])
+    )
+    owner = SimpleNamespace(
+        _config=SimpleNamespace(
+            max_num_tokens=8, spec_config=spec_config, is_spec_decode=spec_config is not None
+        ),
+        mapping=SimpleNamespace(cp_size=cp_size, tp_size=2, enable_attention_dp=attention_dp),
+        dist=Mock(),
+    )
+    prewarm = Mock(side_effect=RuntimeError("no compiler")) if fails else Mock(return_value=(0, 0))
+    with (
+        patch("tensorrt_llm._torch.modules.low_m_gemm.prewarm_mma_row_buckets", prewarm),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+    ):
+        DecoderWarmup._prewarm_lowm_mma_row_buckets(owner)
+    prewarm.assert_called_once_with(max_rows)
+    getattr(owner.dist, gather).assert_called_once_with(1)
+    assert warning.call_count == int(fails)
+
+
 class TestWarmupCleanup(unittest.TestCase):
     def test_lowm_row_bucket_prewarm_runs_between_the_autotuner_and_capture(self) -> None:
         """The low-M MMA row-bucket prewarm runs exactly once, after the eager warmup forwards (the
