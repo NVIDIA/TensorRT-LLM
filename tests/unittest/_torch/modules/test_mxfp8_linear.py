@@ -522,7 +522,9 @@ def _mxfp8_profiling_cache(entries):
     as tuning ``MXFP8GemmRunner`` alone under the current code keys them."""
     cache = AutoTunerProfilingCache.__new__(AutoTunerProfilingCache)  # No device query.
     fingerprint = _candidates_fingerprint((MXFP8GemmRunner,))
-    cache.cache = {(*key, fingerprint): value for key, value in entries.items()}
+    # No fingerprint element under TLLM_AUTOTUNER_CACHE_KEY=none.
+    suffix = () if fingerprint is None else (fingerprint,)
+    cache.cache = {(*key, *suffix): value for key, value in entries.items()}
     return cache
 
 

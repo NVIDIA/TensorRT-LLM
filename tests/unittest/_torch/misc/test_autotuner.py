@@ -1945,7 +1945,7 @@ def test_tactic_space_key_extends_the_cache_key():
     default = _tactic_space_cache_key(cache, _TacticSpaceRunner())
     assert default == ("test_tactic_space", "_TacticSpaceRunner", "()",
                        ((16, 64), ),
-                       autotuner._code_fingerprint(_TacticSpaceRunner))
+                       autotuner._runner_fingerprint(_TacticSpaceRunner))
     guided = _tactic_space_cache_key(cache, _TacticSpaceRunner(
         ("nvmmh", "x", 3)))
     assert guided == default + (("nvmmh", "x", 3), )
@@ -1975,6 +1975,8 @@ def fp_modules(tmp_path, monkeypatch):
 
     monkeypatch.setattr(autotuner, "_tracked",
                         lambda module: module.startswith("fp_"))
+    # These tests exercise the code walk (TLLM_AUTOTUNER_CACHE_KEY=code).
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "code")
     # Rewritten sources must never run from a stale .pyc (one written within
     # the same second for a source of the same size).
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
@@ -2706,6 +2708,98 @@ def test_code_fingerprint_follows_captured_implementations(fp_modules):
     fp_modules.edit("fp_runners", "return [0, 1]", "return [0, 1, 2]")
     assert _changed(cached, fp_modules.fingerprints(narrow,
                                                     wide)) == [False, True]
+
+
+def test_candidates_fingerprint_follows_the_build(fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Winner(Base):
+            pass
+
+
+        class Loser(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return 0
+        """)
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "build")
+    build = {"id": "a"}
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: build["id"])
+
+    def fingerprints():
+        autotuner._candidates_fingerprint.cache_clear()
+        return [
+            autotuner._candidates_fingerprint(classes)
+            for classes in ((runners.Winner, ), (runners.Loser, ),
+                            (runners.Winner, runners.Loser))
+        ]
+
+    before = fingerprints()
+    assert len(set(before)) == 3
+    # The same on every process of an installation, whatever the code does.
+    fp_modules.edit("fp_runners", "return 0", "return 42")
+    assert fingerprints() == before
+    # A rebuild re-keys every runner.
+    build["id"] = "b"
+    assert _changed(before, fingerprints()) == [True, True, True]
+
+
+def test_candidates_fingerprint_covers_the_losers_tactic_spaces(fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Spaced(Base):
+            def __init__(self, space=None):
+                self.space = space
+
+            def unique_id(self):
+                return ()
+
+            def tactic_space_key(self):
+                return self.space
+
+
+        class Winner(Base):
+            pass
+        """)
+    winner = runners.Winner()
+    classes = (runners.Winner, runners.Spaced)
+    set_fingerprint = autotuner._candidates_fingerprint(classes)
+
+    def key(loser):
+        spaces = autotuner._tactic_spaces([winner, loser])
+        return autotuner._key_fingerprint(runners.Winner, set_fingerprint,
+                                          spaces)
+
+    # A loser that widens its tactic space re-opens the comparison.
+    assert key(runners.Spaced(("limited", ))) != key(runners.Spaced(("all", )))
+    assert key(runners.Spaced()) == autotuner._key_fingerprint(
+        runners.Winner, set_fingerprint)
+
+
+def test_code_fingerprint_of_a_factory_runner_that_names_itself(fp_modules):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def factory():
+            class Runner(Base):
+                tactics = [0]
+
+                def get_valid_tactics(self, inputs, profile, **kwargs):
+                    return Runner.tactics
+
+            return Runner
+        """)
+    fp_modules.fingerprints()
+    first, second = runners.factory(), runners.factory()
+    assert autotuner._code_fingerprint(first) == autotuner._code_fingerprint(
+        second)
 
 
 def test_candidates_fingerprint_keys_same_named_runners_apart(fp_modules):

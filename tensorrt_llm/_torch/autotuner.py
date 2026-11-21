@@ -378,14 +378,19 @@ _EPOCH_NS = time.time_ns()
 # Entries under it serve this process only: save_cache leaves them out, and
 # no cache file holds an entry this process could hit with it.
 _EDITED_PREFIX = "edited-"
-# TLLM_AUTOTUNER_CACHE_KEY: "code" keys cache entries by the code fingerprint
-# of their candidate runners; "none" leaves it out, as before fingerprints.
-_CACHE_KEY_MODES = ("code", "none")
-_CACHE_KEY_MODE = os.environ.get("TLLM_AUTOTUNER_CACHE_KEY", "code").lower()
+# TLLM_AUTOTUNER_CACHE_KEY: what a cache key's fingerprint covers.
+# "build" (default): the TensorRT-LLM build and installed kernel packages, the
+# same on every rank of an installation. "code": also the Python code each
+# runner reaches (_code_fingerprint), best effort. "none": no fingerprint, the
+# key as before fingerprints.
+_CACHE_KEY_MODES = ("build", "code", "none")
+_CACHE_KEY_MODE = os.environ.get("TLLM_AUTOTUNER_CACHE_KEY", "build").lower()
 if _CACHE_KEY_MODE not in _CACHE_KEY_MODES:
     logger.warning(f"[Autotuner] TLLM_AUTOTUNER_CACHE_KEY={_CACHE_KEY_MODE!r} "
-                   f"is not one of {_CACHE_KEY_MODES}; using 'code'.")
-    _CACHE_KEY_MODE = "code"
+                   f"is not one of {_CACHE_KEY_MODES}; using 'build'.")
+    _CACHE_KEY_MODE = "build"
+# Packages whose kernels runners launch; their versions are part of a build.
+_KERNEL_PACKAGES = ("cuda", "cutlass", "deep_gemm", "flashinfer", "triton")
 
 
 class _SourceIndex(NamedTuple):
@@ -1374,6 +1379,9 @@ _FINGERPRINTS: Dict[Tuple, str] = {}
 _CANDIDATE_FINGERPRINTS: Dict[Tuple, str] = {}
 _LOCAL_CLASS_IDENTITIES: "weakref.WeakKeyDictionary[type, Tuple]" = (
     weakref.WeakKeyDictionary())
+_CLASS_IDENTITIES_IN_PROGRESS: "weakref.WeakSet[type]" = weakref.WeakSet()
+# (module, qualname) -> a runner class's fingerprint under "build".
+_BUILD_RUNNER_FINGERPRINTS: Dict[Tuple[str, str], str] = {}
 
 
 def _class_name(cls: type) -> Tuple[str, str]:
@@ -1391,6 +1399,21 @@ def _class_identity(cls: type) -> Tuple:
     if "<locals>" not in cls.__qualname__:
         return _class_name(cls)
     identity = _LOCAL_CLASS_IDENTITIES.get(cls)
+    if identity is None and cls in _CLASS_IDENTITIES_IN_PROGRESS:
+        # A method that names its own class (`Runner.tactics`) captures it.
+        return _class_name(cls)
+    if identity is None:
+        _CLASS_IDENTITIES_IN_PROGRESS.add(cls)
+        try:
+            identity = _local_class_identity(cls)
+        finally:
+            _CLASS_IDENTITIES_IN_PROGRESS.discard(cls)
+    return identity
+
+
+def _local_class_identity(cls: type) -> Tuple:
+    """_class_identity of a class a function builds, computed once."""
+    identity = _LOCAL_CLASS_IDENTITIES.get(cls)
     if identity is None:
         members = []
         for key, value in sorted(vars(cls).items()):
@@ -1403,9 +1426,9 @@ def _class_identity(cls: type) -> Tuple:
                 if inspect.isclass(value):
                     members.append((key, _class_identity(value)))
                 elif callable(value):
-                    identity = _function_identity(value)
-                    if identity[0] is not None:
-                        members.append((key, identity))
+                    member = _function_identity(value)
+                    if member[0] is not None:
+                        members.append((key, member))
         identity = _LOCAL_CLASS_IDENTITIES[cls] = (*_class_name(cls),
                                                    tuple(
                                                        map(
@@ -1426,7 +1449,10 @@ def _coarse_fingerprint(runner_cls: type) -> str:
 
 
 def _code_fingerprint(runner_cls: type) -> str:
-    """A digest of the code a runner's tactics depend on, in its cache keys.
+    """A digest of the code a runner's tactics depend on, in its cache keys
+    under TLLM_AUTOTUNER_CACHE_KEY=code. It is best effort: what Python code
+    reaches only at run time (a callable a runner instance holds, getattr) is
+    not followed.
 
     It starts from the runner and its TunableRunner bases and follows, one
     definition at a time, what they reach by name in tensorrt_llm code
@@ -1477,18 +1503,49 @@ def _code_fingerprint(runner_cls: type) -> str:
     return fingerprint
 
 
+@lru_cache(maxsize=None)
+def _build_fingerprint() -> str:
+    """A digest of the TensorRT-LLM build: its version, its native libraries'
+    build IDs, and the installed versions of torch and the kernel packages.
+    It is the same on every rank of an installation, and changes with a
+    rebuild (even under the same version string) or a package upgrade."""
+    parts = [
+        f"tensorrt_llm=={tensorrt_llm.__version__}",
+        f"torch=={torch.__version__}",
+        _native_build_id(),
+        *map(_package_versions, _KERNEL_PACKAGES),
+    ]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
+def _runner_fingerprint(runner_cls: type) -> str:
+    """A runner class's own fingerprint: under TLLM_AUTOTUNER_CACHE_KEY=code
+    its code fingerprint; else the build fingerprint and its module and
+    qualified name."""
+    if _CACHE_KEY_MODE == "code":
+        return _code_fingerprint(runner_cls)
+    name = _class_name(runner_cls)
+    fingerprint = _BUILD_RUNNER_FINGERPRINTS.get(name)
+    if fingerprint is None:
+        fingerprint = _BUILD_RUNNER_FINGERPRINTS[name] = hashlib.sha256(
+            "\0".join((_build_fingerprint(), *name)).encode()).hexdigest()[:16]
+    return fingerprint
+
+
 def _candidates_fingerprint(runner_classes) -> Optional[str]:
-    """The code fingerprint in the key of an entry tuned among the runners of
+    """The fingerprint in the key of an entry tuned among the runners of
     `runner_classes`: the runner's own when it was the only candidate, else a
     digest over every candidate's, so that a change to a runner that lost
     also re-opens the comparison. None when TLLM_AUTOTUNER_CACHE_KEY=none
     leaves fingerprints out of keys."""
     if _CACHE_KEY_MODE == "none":
         return None
-    identities = tuple(dict.fromkeys(map(_class_identity, runner_classes)))
+    class_key = _class_identity if _CACHE_KEY_MODE == "code" else _class_name
+    identities = (_CACHE_KEY_MODE,
+                  *dict.fromkeys(map(class_key, runner_classes)))
     fingerprint = _CANDIDATE_FINGERPRINTS.get(identities)
     if fingerprint is None:
-        fingerprints = sorted({_code_fingerprint(k) for k in runner_classes})
+        fingerprints = sorted({_runner_fingerprint(k) for k in runner_classes})
         fingerprint = fingerprints[0]
         if len(fingerprints) > 1:
             edited = any(f.startswith(_EDITED_PREFIX) for f in fingerprints)
@@ -1498,17 +1555,38 @@ def _candidates_fingerprint(runner_classes) -> Optional[str]:
     return fingerprint
 
 
-def _key_fingerprint(runner_cls: type, set_fingerprint: Optional[str]):
+def _tactic_spaces(candidates) -> str:
+    """For several candidates of which any has a tactic space key, a digest
+    of every candidate's; else ''. A runner that lost and then widens its
+    tactic space re-opens the comparison."""
+    if len(candidates) < 2:
+        return ""
+    spaces = [r.tactic_space_key() for r in candidates]
+    if all(space is None for space in spaces):
+        return ""
+    text = repr(
+        sorted((_class_name(type(r)), repr(space))
+               for r, space in zip(candidates, spaces)))
+    return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+def _key_fingerprint(runner_cls: type,
+                     set_fingerprint: Optional[str],
+                     tactic_spaces: str = "") -> Optional[str]:
     """The fingerprint in the key of `runner_cls`'s entry, tuned among runners
     whose set has `set_fingerprint`: that alone for a runner tuned alone,
-    else the set's and the runner's own. Two candidates of one set can share
-    a class name and unique_id (classes one factory builds); their own
-    fingerprints keep their entries, and so their tactics, apart."""
+    else the set's, the runner's own and the candidates' tactic spaces
+    (_tactic_spaces). Two candidates of one set can share a class name and
+    unique_id; their own fingerprints keep their entries apart where they
+    differ (always under "code"; under "build", when the module or qualified
+    name does)."""
     if set_fingerprint is None:
         return None
-    own = _code_fingerprint(runner_cls)
-    return set_fingerprint if own == set_fingerprint else (
-        f"{set_fingerprint}/{own}")
+    own = _runner_fingerprint(runner_cls)
+    if own == set_fingerprint:
+        return own
+    return f"{set_fingerprint}/{own}" + (f"/{tactic_spaces}"
+                                         if tactic_spaces else "")
 
 
 def _edited_key(key: Tuple) -> bool:
@@ -1518,8 +1596,10 @@ def _edited_key(key: Tuple) -> bool:
 
 
 def _clear_fingerprints() -> None:
+    _build_fingerprint.cache_clear()
     _FINGERPRINTS.clear()
     _CANDIDATE_FINGERPRINTS.clear()
+    _BUILD_RUNNER_FINGERPRINTS.clear()
 
 
 # What lru_cache offered, for tests that model a new process.
@@ -1837,11 +1917,13 @@ class AutoTunerProfilingCache:
         found = None
         set_fingerprint = _candidates_fingerprint(
             tuple(type(r) for r in runners))
+        tactic_spaces = _tactic_spaces(runners)
         for idx, r in enumerate(runners):
             if (cache_key := self._cache_key(
                     custom_op, r, input_shapes, tuning_config,
                     apply_map_to_tuning_buckets,
-                    _key_fingerprint(type(r), set_fingerprint))) in self.cache:
+                    _key_fingerprint(type(r), set_fingerprint,
+                                     tactic_spaces))) in self.cache:
                 # Return the current index in runners list, not the cached runner_id
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
                 if not parallel:
@@ -1864,15 +1946,18 @@ class AutoTunerProfilingCache:
     ) -> Tuple:
         """The key of `runner`'s entry for `input_shapes`:
         `(custom_op, runner class name, unique_id, shape profile,
-        code fingerprint[, tactic space key])`. `candidates` are the runners
-        it was tuned among (only `runner` when omitted); the fingerprint covers
-        their code and `runner`'s own (_key_fingerprint), and is left out
-        under TLLM_AUTOTUNER_CACHE_KEY=none."""
+        fingerprint[, tactic space key])`. `candidates` are the runners it was
+        tuned among (only `runner` when omitted); the fingerprint covers them
+        and `runner` (_key_fingerprint) under TLLM_AUTOTUNER_CACHE_KEY's mode,
+        and is left out under "none"."""
+        candidates = candidates or [runner]
         set_fingerprint = _candidates_fingerprint(
-            tuple(type(r) for r in candidates or (runner, )))
-        return self._cache_key(custom_op, runner, input_shapes, tuning_config,
-                               apply_map_to_tuning_buckets,
-                               _key_fingerprint(type(runner), set_fingerprint))
+            tuple(type(r) for r in candidates))
+        return self._cache_key(
+            custom_op, runner, input_shapes, tuning_config,
+            apply_map_to_tuning_buckets,
+            _key_fingerprint(type(runner), set_fingerprint,
+                             _tactic_spaces(candidates)))
 
     def _cache_key(self, custom_op: str, runner: TunableRunner,
                    input_shapes: Tuple[torch.Size], tuning_config: TuningConfig,
