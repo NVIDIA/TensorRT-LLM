@@ -207,7 +207,8 @@ class LmEvalWrapper(TemplateLM):
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
                  partial_scores_every: Optional[int] = None,
-                 partial_scoring_task_dict: Optional[dict] = None):
+                 partial_scoring_task_dict: Optional[dict] = None,
+                 apply_chat_template: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
@@ -227,6 +228,12 @@ class LmEvalWrapper(TemplateLM):
         # signal for long evals. See _RunningScoreTracker.
         self.partial_scores_every = partial_scores_every
         self.partial_scoring_task_dict = partial_scoring_task_dict
+        # With apply_chat_template, lm-eval renders every prompt through
+        # apply_chat_template(). The chat template already writes the special
+        # tokens the model expects (such as BOS), so the rendered text is
+        # tokenized without adding them again, as trtllm-serve does for chat
+        # requests.
+        self.add_special_tokens = not apply_chat_template
         # Env-gated cap on concurrently in-flight requests (0/unset = no cap,
         # submit everything up front). See generate_until for the tradeoff.
         env_window = os.environ.get(MAX_IN_FLIGHT_ENV_VAR)
@@ -323,6 +330,8 @@ class LmEvalWrapper(TemplateLM):
                     if current is not None and current > value:
                         continue
                 setattr(sampling_params, trtllm_key, value)
+        if not self.add_special_tokens:
+            sampling_params.add_special_tokens = False
         if self.spec_stats:
             # The AR line in _log_spec_stats reads per-request
             # request_perf_metrics.speculative_decoding, which is only
@@ -1034,6 +1043,8 @@ class LmEvalEvaluator(Evaluator):
             lm_kwargs["post_process_fn"] = self.post_process_fn
             lm_kwargs[
                 "preserve_caller_max_tokens"] = self.preserve_caller_max_tokens
+        else:
+            lm_kwargs["apply_chat_template"] = self.apply_chat_template
 
         results = lm_eval.evaluate(
             lm=lm_cls(llm, **lm_kwargs),
@@ -1917,12 +1928,15 @@ class LongBenchV1(LmEvalEvaluator):
         import lm_eval
 
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
+        lm_kwargs: Dict[str, Any] = dict(
+            sampling_params=sampling_params,
+            streaming=streaming,
+            chat_template_kwargs=self.chat_template_kwargs,
+            output_dir=self.output_dir)
+        if not self.MULTIMODAL:
+            lm_kwargs["apply_chat_template"] = self.apply_chat_template
         results = lm_eval.evaluate(
-            lm=lm_cls(llm,
-                      sampling_params=sampling_params,
-                      streaming=streaming,
-                      chat_template_kwargs=self.chat_template_kwargs,
-                      output_dir=self.output_dir),
+            lm=lm_cls(llm, **lm_kwargs),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
