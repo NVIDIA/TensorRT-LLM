@@ -506,6 +506,78 @@ def test_expiry_reports_expired_not_canceled():
     assert batch.request_counts.canceled == 0, "expiry must not be reported as cancellation"
 
 
+def test_late_runner_result_does_not_change_an_expired_batch():
+    async def scenario():
+        started = asyncio.Event()
+
+        async def finish_as_cancelled(_request):
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                return "succeeded", {"type": "message"}
+
+        store = AnthropicBatchStore(runner=finish_as_cancelled, concurrency=1)
+        batch = store.create([_item("late"), _item("queued")])
+        await asyncio.wait_for(started.wait(), timeout=1)
+        record = store._batches[batch.id]
+        batch.expires_at = "2000-01-01T00:00:00.000Z"
+        assert store.get(batch.id).processing_status == "ended"
+        with pytest.raises(asyncio.CancelledError):
+            await record.task
+
+        assert batch.request_counts.processing == 0
+        assert batch.request_counts.expired == 2
+        assert batch.request_counts.succeeded == 0
+        assert store.results(batch.id) == [
+            {"custom_id": item, "result": {"type": "expired"}} for item in ("late", "queued")
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_expiry_preserves_already_skipped_canceled_items():
+    async def scenario():
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        finish_second = asyncio.Event()
+
+        async def run(request):
+            text = request.messages[0].content
+            if text == "first":
+                first_started.set()
+                await asyncio.Future()
+            if text == "second":
+                second_started.set()
+                await finish_second.wait()
+            return "succeeded", {"type": "message"}
+
+        store = AnthropicBatchStore(runner=run, concurrency=2)
+        items = [_item(item, text=item) for item in ("first", "second", "queued")]
+        batch = store.create(items)
+        await asyncio.wait_for(
+            asyncio.gather(first_started.wait(), second_started.wait()), timeout=1
+        )
+        store.cancel(batch.id)
+        finish_second.set()
+        await asyncio.sleep(0)
+
+        batch.expires_at = "2000-01-01T00:00:00.000Z"
+        done = store.get(batch.id)
+        assert done.processing_status == "ended"
+        counts = done.request_counts
+        assert (counts.processing, counts.succeeded, counts.canceled, counts.expired) == (
+            0,
+            1,
+            1,
+            1,
+        )
+        states = {item["custom_id"]: item["result"]["type"] for item in store.results(batch.id)}
+        assert states == {"first": "expired", "second": "succeeded", "queued": "canceled"}
+
+    asyncio.run(scenario())
+
+
 # ---------------------------------------------------------------------------
 # Admission control
 # ---------------------------------------------------------------------------
@@ -604,22 +676,31 @@ def test_counts_track_progress_while_the_batch_runs():
     processing=N, succeeded=0 for the whole run, then flips in one step.
     """
 
-    async def slow_after_first(request):
-        text = request.messages[0].content
-        if text != "a":
-            await asyncio.sleep(30.0)
-        return "succeeded", {"type": "message", "role": "assistant", "content": []}
-
     async def scenario():
-        store = AnthropicBatchStore(runner=slow_after_first, concurrency=4)
-        items = [_item(cid, text=cid) for cid in ("a", "b", "c")]
-        batch = store.create(items)
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            if store.get(batch.id).request_counts.succeeded:
-                break
-        return store.get(batch.id).request_counts
+        last_item_started = asyncio.Event()
+        finish_last_item = asyncio.Event()
 
-    counts = asyncio.run(scenario())
-    assert counts.succeeded == 1, "finished work must be visible before the batch ends"
-    assert counts.processing == 2, "the rest must still read as in flight"
+        async def run(request):
+            if request.messages[0].content == "errored":
+                return "errored", {"type": "api_error", "message": "test error"}
+            if request.messages[0].content == "last":
+                last_item_started.set()
+                await finish_last_item.wait()
+            return "succeeded", {"type": "message", "role": "assistant", "content": []}
+
+        store = AnthropicBatchStore(runner=run, concurrency=1)
+        batch = store.create([_item(item, text=item) for item in ("first", "errored", "last")])
+        await asyncio.wait_for(last_item_started.wait(), timeout=1)
+        running = store.get(batch.id)
+        assert running.processing_status == "in_progress"
+        assert running.results_url is None
+        counts = running.request_counts
+        assert (counts.processing, counts.succeeded, counts.errored) == (1, 1, 1)
+
+        finish_last_item.set()
+        await _drain(store, batch.id)
+        assert (counts.processing, counts.succeeded, counts.errored) == (1, 1, 1)
+        counts = store.get(batch.id).request_counts
+        assert (counts.processing, counts.succeeded, counts.errored) == (0, 2, 1)
+
+    asyncio.run(scenario())
