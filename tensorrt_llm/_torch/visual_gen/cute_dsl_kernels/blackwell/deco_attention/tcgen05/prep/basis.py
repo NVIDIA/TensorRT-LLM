@@ -109,7 +109,8 @@ def _gram(
         if st.tidx < 256:
             sample = cutlass.min(ch * 256 + st.tidx, NQK - 1)
             if cutlass.const_expr(lens is None):
-                tok_bits = load_invariant(Uint32, rowsb + Int64(sample) * Int64(4))
+                r = Int32(load_invariant(Uint32, rowsb + Int64(sample) * Int64(4)))
+                tok_bits = Uint32(cutlass.max(cutlass.min(r, S - 1), Int32(0)))
             else:
                 # with lengths: the row of the batch element, mapped into its valid prefix or kept below its end
                 if cutlass.const_expr(lens[1]):
@@ -124,12 +125,16 @@ def _gram(
             cute.arch.store(sptr(Uint32, st.rbb + st.tidx * 4), tok_bits)
         cute.arch.sync_threads()
         if st.tidx < 256:
+            # a batch element without valid tokens copies zeros: its rows stand for no token
+            alive = Int32(1)
+            if cutlass.const_expr(lens is not None):
+                alive = Int32(valid_len(lens[0], batch, S) > 0)
             for j in cutlass.range_constexpr(16):
                 it = st.tidx + 256 * j
                 tt = it >> 4
                 cc = it & 15
                 tok = Int32(cute.arch.load(sptr(Uint32, st.rbb + tt * 4), Uint32))
-                nb = Int32(16) * Int32((ch * 256 + tt) < NQK)
+                nb = Int32(16) * Int32((ch * 256 + tt) < NQK) * alive
                 off = ((Int64(batch) * Int64(S) + Int64(tok)) * Int64(H) + Int64(head)) * Int64(
                     256
                 ) + Int64(cc * 16)
