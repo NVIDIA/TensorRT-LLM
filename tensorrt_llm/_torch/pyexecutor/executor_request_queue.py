@@ -26,6 +26,8 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+# Rank 0 asks every rank to vote on draining the current benchmark stage.
+BENCHMARK_STAGE_VOTE_REQUEST_ID = -6
 # Shortest wait between two idle_tick calls in get_from_request_queue.
 _MIN_IDLE_TICK_WAIT_S = 0.001
 
@@ -89,7 +91,8 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request)
+                    or self.is_prefix_load_completion_request
+                    or self.is_benchmark_stage_vote_request)
 
     @property
     def is_prefix_load_completion_request(self):
@@ -106,6 +109,10 @@ class RequestQueueItem:
     @property
     def is_profile_stop_request(self):
         return self.id == PROFILE_STOP_REQUEST_ID
+
+    @property
+    def is_benchmark_stage_vote_request(self):
+        return self.id == BENCHMARK_STAGE_VOTE_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -346,6 +353,12 @@ class ExecutorRequestQueue:
         """Enqueue a profile-stop control item. Broadcasted to every rank."""
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
+
+    def enqueue_benchmark_stage_vote_request(self):
+        """Enqueue a stage-drain vote item. Broadcasted to every rank."""
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(id=BENCHMARK_STAGE_VOTE_REQUEST_ID))
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:

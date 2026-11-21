@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -507,15 +508,17 @@ class TestHelixZeroKvMask(unittest.TestCase):
     """
 
     @parameterized.expand([(False,), (True,)])
-    def test_mla_skips_generic_mask_when_per_token_bounds_are_valid(self, is_cuda_graph):
+    def test_mla_derives_empty_mask_from_corrected_global_positions(self, is_cuda_graph):
         from tensorrt_llm._torch.attention.mla import MLA
 
         num_tokens = 3
         num_heads = 2
         kv_lora_rank = 4
-        helix_kv_bounds = torch.tensor([0, 5, 0], dtype=torch.int32)
+        positions = torch.tensor([31, 36, 20], dtype=torch.int32)
         attn_metadata = SimpleNamespace(
-            helix_kv_bounds=helix_kv_bounds,
+            helix_position_offsets=positions,
+            helix_kv_bounds=None,
+            kv_cache_manager=SimpleNamespace(tokens_per_block=32),
             _helix_spec_tokens_valid=True,
             num_contexts=0,
             num_generations=1,
@@ -524,7 +527,7 @@ class TestHelixZeroKvMask(unittest.TestCase):
         attn_backend = Mock()
         attn_backend.forward.return_value = torch.empty(num_tokens, num_heads * kv_lora_rank)
         mla = SimpleNamespace(
-            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            mapping=SimpleNamespace(has_cp_helix=lambda: True, cp_rank=1),
             num_heads_tp=num_heads,
             num_heads_tp_cp=num_heads,
             kv_lora_rank=kv_lora_rank,
@@ -541,7 +544,7 @@ class TestHelixZeroKvMask(unittest.TestCase):
 
         generic_mask.assert_not_called()
         actual_mask = post_process.call_args.kwargs["zero_kv_mask"]
-        torch.testing.assert_close(actual_mask, helix_kv_bounds == 0)
+        torch.testing.assert_close(actual_mask, torch.tensor([True, False, True]))
         assert post_process.call_args.kwargs["is_cuda_graph"] is is_cuda_graph
 
     @parameterized.expand([(False,), (True,)])
@@ -719,6 +722,29 @@ class TestHelixNcclReformatCompile(unittest.TestCase):
                 torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
         assert self._num_compiled(_helix_nccl_pre_alltoall) == num_shapes
         assert self._num_compiled(_helix_nccl_post_alltoall) == num_shapes
+
+
+@pytest.mark.parametrize("cp_dim", [0, 1, 2], ids=["nccl", "fifo-v2", "fifo-v1"])
+def test_helix_lse_empty_rows(cp_dim):
+    """Each layout must ignore empty partials and return zero for all-empty rows."""
+    torch.manual_seed(42)
+    partial = torch.randn(4, 8, 3, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.randn(4, 8, 3, 1, device="cuda") * 80
+    lse[3] = -torch.inf
+    partial[3] = torch.nan
+    lse[:, 0] = -torch.inf
+    partial[:, 0] = torch.nan
+    weights = (lse.double() * math.log(2)).softmax(dim=0).nan_to_num()
+    expected = torch.where(weights > 0, partial.double() * weights, 0).sum(dim=0).flatten(1)
+    if cp_dim == 0:
+        output = torch.ops.trtllm.helix_post_process(partial.flatten(2), lse, 1.0, True)
+    else:
+        order = (1, 0, 2, 3) if cp_dim == 1 else (1, 2, 0, 3)
+        output = torch.ops.trtllm.helix_post_process_native(
+            partial.permute(order).contiguous(), lse.permute(order).contiguous(), 1.0, cp_dim, True
+        )
+    torch.testing.assert_close(output.double(), expected, atol=1e-3, rtol=1e-2)
+    assert torch.count_nonzero(output[0]) == 0
 
 
 if __name__ == "__main__":

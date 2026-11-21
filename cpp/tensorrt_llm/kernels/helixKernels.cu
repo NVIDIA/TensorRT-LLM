@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ namespace
 static constexpr int WARP_SIZE = 32;
 
 // Utility: warp-level corrected sum
-template <int N>
+template <int N, bool IsLse>
 __device__ inline void warpReduceCorrectedSum(float (&correctedVal)[N], float (&maxVal)[N], float (&sumVal)[N])
 {
     float warp_max = maxVal[0];
@@ -59,16 +59,51 @@ __device__ inline void warpReduceCorrectedSum(float (&correctedVal)[N], float (&
 #pragma unroll
     for (int nn = 0; nn < N; ++nn)
     {
-        corrected_max_exp[nn] = sumVal[nn] * expf(maxVal[nn] - warp_max);
+        if constexpr (IsLse)
+        {
+            corrected_max_exp[nn] = sumVal[nn] > 0.F ? exp2f(maxVal[nn] - warp_max) : 0.F;
+        }
+        else
+        {
+            corrected_max_exp[nn] = sumVal[nn] * expf(maxVal[nn] - warp_max);
+        }
         global_sum += corrected_max_exp[nn];
     }
 #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset *= 2)
         global_sum += __shfl_xor_sync(0xffffffff, global_sum, offset);
-    auto norm = 1.F / global_sum;
+    auto norm = IsLse && global_sum == 0.F ? 0.F : 1.F / global_sum;
 #pragma unroll
     for (int nn = 0; nn < N; ++nn)
         correctedVal[nn] = corrected_max_exp[nn] * norm;
+}
+
+template <bool IsLse>
+__device__ __forceinline__ float2 loadHelixNormalizer(void const* values, int index)
+{
+    if constexpr (IsLse)
+    {
+        float const lse = static_cast<float const*>(values)[index];
+        return make_float2(lse, lse == -INFINITY ? 0.F : 1.F);
+    }
+    else
+    {
+        return static_cast<float2 const*>(values)[index];
+    }
+}
+
+template <bool IsLse, typename T>
+__device__ __forceinline__ float weightedHelixValue(T value, float weight)
+{
+    // Empty LSE rows may contain arbitrary output, including NaN.
+    if constexpr (IsLse)
+    {
+        return weight == 0.F ? 0.F : static_cast<float>(value) * weight;
+    }
+    else
+    {
+        return static_cast<float>(value) * weight;
+    }
 }
 
 static constexpr int MAX_CP_VAL_PER_THREAD = 8;
@@ -79,12 +114,12 @@ static constexpr int NUM_PRE_LOAD = 8;
 // Kernel: fused helix post-processing
 // output: [num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_o: [cp_size, num_tokens, num_heads * kv_lora_rank] (half)
-// gathered_stats: [cp_size, num_tokens, num_heads, 2] (fp32)
+// gathered_stats: [cp_size, num_tokens, num_heads, IsLse ? 1 : 2] (fp32)
 // Note: we explicitly avoid using restrict here, to avoid getting ld.global.nc,
 // which may have longer latency.
-template <typename T>
+template <typename T, bool IsLse>
 __global__ void helix_postprocess_kernel(
-    T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size, int kv_lora_rank)
+    T* output, T const* gathered_o, void const* gathered_stats, int cp_size, int kv_lora_rank)
 {
     // Each block processes one (token, head)
     // gridDim.x: num_tokens, gridDim.y: num_heads
@@ -119,12 +154,13 @@ __global__ void helix_postprocess_kernel(
         {
             auto cp_idx = cp_val_idx * WARP_SIZE + lane_idx;
             auto stats_offset = cp_idx * num_tokens * num_heads + tok_idx * num_heads + head_idx;
-            float2 stats = cp_idx < cp_size ? gathered_stats[stats_offset] : make_float2(-INFINITY, 0.F);
+            float2 stats = cp_idx < cp_size ? loadHelixNormalizer<IsLse>(gathered_stats, stats_offset)
+                                            : make_float2(-INFINITY, 0.F);
             max_values[cp_val_idx] = stats.x;
             sum_values[cp_val_idx] = stats.y;
         }
         float corrected_values[MAX_CP_VAL_PER_THREAD];
-        warpReduceCorrectedSum(corrected_values, max_values, sum_values);
+        warpReduceCorrectedSum<MAX_CP_VAL_PER_THREAD, IsLse>(corrected_values, max_values, sum_values);
 #pragma unroll
         for (int cp_val_idx = 0; cp_val_idx < MAX_CP_VAL_PER_THREAD; ++cp_val_idx)
         {
@@ -177,7 +213,7 @@ __global__ void helix_postprocess_kernel(
 #pragma unroll
                 for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
                 {
-                    final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+                    final_sum[o_idx] += weightedHelixValue<IsLse>(vals[cp_idx][o_idx], corr_vals[cp_idx]);
                 }
             }
 #pragma unroll
@@ -195,7 +231,7 @@ __global__ void helix_postprocess_kernel(
 #pragma unroll
             for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
             {
-                final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+                final_sum[o_idx] += weightedHelixValue<IsLse>(vals[cp_idx][o_idx], corr_vals[cp_idx]);
             }
         }
         T output_typed[NUM_O_PER_THREAD];
@@ -216,12 +252,12 @@ static constexpr int MAX_KV_LORA_BYTES = (MAX_THREADS - WARP_SIZE) * BYTES_O_PER
 // Kernel: fused helix post-processing
 // output: [num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_o: [num_tokens, num_heads, cp_size, kv_lora_rank] (half)
-// gathered_stats: [num_tokens, num_heads, cp_size, 2] (fp32)
+// gathered_stats: [num_tokens, num_heads, cp_size, IsLse ? 1 : 2] (fp32)
 // Note: we explicitly avoid using restrict here, to avoid getting ld.global.nc,
 // which may have longer latency.
-template <typename T>
+template <typename T, bool IsLse>
 __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v1(
-    T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size, int kv_lora_rank)
+    T* output, T const* gathered_o, void const* gathered_stats, int cp_size, int kv_lora_rank)
 {
     // Each block processes one (token, head)
     // gridDim.x: num_tokens, gridDim.y: num_heads
@@ -273,12 +309,13 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
         {
             auto cp_idx = cp_val_idx * WARP_SIZE + lane_idx;
             auto stats_idx = stats_offset + cp_idx * stats_stride;
-            float2 stats = cp_idx < cp_size ? gathered_stats[stats_idx] : make_float2(-INFINITY, 0.F);
+            float2 stats = cp_idx < cp_size ? loadHelixNormalizer<IsLse>(gathered_stats, stats_idx)
+                                            : make_float2(-INFINITY, 0.F);
             max_values[cp_val_idx] = stats.x;
             sum_values[cp_val_idx] = stats.y;
         }
         float corrected_values[MAX_CP_VAL_PER_THREAD];
-        warpReduceCorrectedSum(corrected_values, max_values, sum_values);
+        warpReduceCorrectedSum<MAX_CP_VAL_PER_THREAD, IsLse>(corrected_values, max_values, sum_values);
 #pragma unroll
         for (int cp_val_idx = 0; cp_val_idx < MAX_CP_VAL_PER_THREAD; ++cp_val_idx)
         {
@@ -326,7 +363,7 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
             for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
             {
-                final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+                final_sum[o_idx] += weightedHelixValue<IsLse>(vals[cp_idx][o_idx], corr_vals[cp_idx]);
             }
         }
 #pragma unroll
@@ -344,7 +381,7 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
         for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
         {
-            final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+            final_sum[o_idx] += weightedHelixValue<IsLse>(vals[cp_idx][o_idx], corr_vals[cp_idx]);
         }
     }
 #pragma unroll
@@ -360,12 +397,12 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 // Kernel: fused helix post-processing for cp_dim=1 layout (Version 2)
 // output: [num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_o: [num_tokens, cp_size, num_heads, kv_lora_rank] (half)
-// gathered_stats: [num_tokens, cp_size, num_heads, 2] (fp32)
+// gathered_stats: [num_tokens, cp_size, num_heads, IsLse ? 1 : 2] (fp32)
 // Note: we explicitly avoid using restrict here, to avoid getting ld.global.nc,
 // which may have longer latency.
-template <typename T>
+template <typename T, bool IsLse>
 __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v2(
-    T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size, int kv_lora_rank)
+    T* output, T const* gathered_o, void const* gathered_stats, int cp_size, int kv_lora_rank)
 {
     // Each block processes one (token, head)
     // gridDim.x: num_tokens, gridDim.y: num_heads
@@ -419,12 +456,13 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
         {
             auto cp_idx = cp_val_idx * WARP_SIZE + lane_idx;
             auto stats_idx = stats_offset + cp_idx * stats_stride;
-            float2 stats = cp_idx < cp_size ? gathered_stats[stats_idx] : make_float2(-INFINITY, 0.F);
+            float2 stats = cp_idx < cp_size ? loadHelixNormalizer<IsLse>(gathered_stats, stats_idx)
+                                            : make_float2(-INFINITY, 0.F);
             max_values[cp_val_idx] = stats.x;
             sum_values[cp_val_idx] = stats.y;
         }
         float corrected_values[MAX_CP_VAL_PER_THREAD];
-        warpReduceCorrectedSum(corrected_values, max_values, sum_values);
+        warpReduceCorrectedSum<MAX_CP_VAL_PER_THREAD, IsLse>(corrected_values, max_values, sum_values);
 #pragma unroll
         for (int cp_val_idx = 0; cp_val_idx < MAX_CP_VAL_PER_THREAD; ++cp_val_idx)
         {
@@ -472,7 +510,7 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
             for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
             {
-                final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+                final_sum[o_idx] += weightedHelixValue<IsLse>(vals[cp_idx][o_idx], corr_vals[cp_idx]);
             }
         }
 #pragma unroll
@@ -490,7 +528,7 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
         for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
         {
-            final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+            final_sum[o_idx] += weightedHelixValue<IsLse>(vals[cp_idx][o_idx], corr_vals[cp_idx]);
         }
     }
 #pragma unroll
@@ -517,7 +555,7 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     // Check that cp_size is not larger than the max fallback CP size
     TLLM_CHECK_WITH_INFO(params.cp_size <= MAX_CP, "cp_size > fallback max CP size");
 
-    auto* kernel_instance = &helix_postprocess_kernel<T>;
+    auto* kernel_instance = params.isLse ? &helix_postprocess_kernel<T, true> : &helix_postprocess_kernel<T, false>;
     cudaLaunchConfig_t config;
     config.gridDim = dim3(params.num_tokens, params.num_heads);
     config.blockDim = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
@@ -553,7 +591,8 @@ void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t
     // Check that cp_size is not larger than the max fallback CP size.
     TLLM_CHECK_WITH_INFO(params.cp_size <= MAX_CP, "cp_size > fallback max CP size");
 
-    auto kernel_instance = helix_postprocess_kernel_native_v1<T>;
+    auto kernel_instance
+        = params.isLse ? helix_postprocess_kernel_native_v1<T, true> : helix_postprocess_kernel_native_v1<T, false>;
     cudaLaunchConfig_t config;
     config.gridDim = dim3(params.num_tokens, params.num_heads);
     config.blockDim = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
@@ -589,7 +628,8 @@ void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t
     // Check that cp_size is not larger than the max fallback CP size.
     TLLM_CHECK_WITH_INFO(params.cp_size <= MAX_CP, "cp_size > fallback max CP size");
 
-    auto kernel_instance = helix_postprocess_kernel_native_v2<T>;
+    auto kernel_instance
+        = params.isLse ? helix_postprocess_kernel_native_v2<T, true> : helix_postprocess_kernel_native_v2<T, false>;
     cudaLaunchConfig_t config;
     config.gridDim = dim3(params.num_tokens, params.num_heads);
     config.blockDim = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
