@@ -7841,7 +7841,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2_of_4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
-        "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
+        "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 2],
+        "GR100-PyTorch-Post-Merge-2": ["auto:gr100-x1", "l0_gr100", 2, 2],
         // Single-GPU Rubin PerfSanity post-merge test: a Rubin copy of the B200 Qwen3.8-Flash-Next case, on the same builds
         "GR100-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:gr100-x1", "l0_gr100_perf_sanity", 1, 1],
     ]
