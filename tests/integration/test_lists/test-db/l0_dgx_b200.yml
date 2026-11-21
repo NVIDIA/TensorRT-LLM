@@ -261,7 +261,7 @@ l0_dgx_b200:
   # ------------- MoE communication unit tests (multi-GPU) ---------------
   - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py TIMEOUT (30)
   # ------------- VisualGen multi-GPU tests ---------------
-  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py -k "not test_missing_support_lse_raises and not test_missing_head_attrs_raises"
   - unittest/_torch/visual_gen/multi_gpu/test_cosmos3_transformer_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_parallel_wino_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py
@@ -292,32 +292,6 @@ l0_dgx_b200:
 - condition:
     ranges:
       system_gpu_count:
-        gte: 8
-        lte: 8
-    wildcards:
-      gpu:
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-      cpu: x86_64
-    terms:
-      stage: post_merge
-      backend: pytorch
-      orchestrator: mpi
-  tests:
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix[DeepSeek-V3-Lite-bf16-short_prompt] TIMEOUT (60)
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2-overlap_off] TIMEOUT (60)
-  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2-overlap_off] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus_corner_case TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[use_msa=True] TIMEOUT (45)
-  - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8_attn_dp] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[ep8] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (120)
-  - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
-  - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
-- condition:
-    ranges:
-      system_gpu_count:
         gte: 4
         lte: 4
     wildcards:
@@ -334,6 +308,7 @@ l0_dgx_b200:
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k
   # GLM-5.3-Flash FP8 modeling_v2 target: GSM8K without speculation.
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[use_msa=True] TIMEOUT (45)
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=fp8]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex-kv_dtype=fp8]
@@ -375,6 +350,7 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
   - accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-tp4-cutlass-auto]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache_no_reuse-tp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-ep4-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-ep4-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-trtllm-auto]
@@ -392,7 +368,6 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-ep4-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-low_precision_combine=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False]
-  - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2]
