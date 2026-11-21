@@ -1103,6 +1103,7 @@ class CUDAGraphRunner:
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: Optional[torch.dtype] = None,
         use_lora_graph: bool = False,
+        lora_slots_fit: bool = True,
     ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
@@ -1115,6 +1116,10 @@ class CUDAGraphRunner:
         ``promoted_context_request_ids`` is execution-view metadata. It does
         not change request state or type and is used only to build a graph key
         consistent with the final-context token that will be executed.
+
+        ``lora_slots_fit`` is False when the batch has more distinct LoRA
+        adapters than the LoRA CUDA graph has adapter slots. Such a batch is
+        not graph-eligible on this rank and runs eagerly.
         """
         self._adp_replay_key = None
         # disable when doing statistic
@@ -1125,7 +1130,7 @@ class CUDAGraphRunner:
         # A batch of an uncaptured sampling variant runs eagerly; under attention
         # DP the agreement below then takes every rank's step eager with it.
         can_run_cuda_graph = (
-            self._can_run_cuda_graph_batch(batch) and
+            self._can_run_cuda_graph_batch(batch) and lora_slots_fit and
             (spec_metadata is None or self.config.sampling_variants is None or
              sampling_variant(spec_metadata) in self.config.sampling_variants))
         if can_run_cuda_graph and getattr(

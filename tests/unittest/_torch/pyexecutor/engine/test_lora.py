@@ -6,10 +6,11 @@ from collections.abc import Sequence
 from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, decoder_graphs
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
@@ -21,6 +22,7 @@ from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor import _util as executor_util
 from tensorrt_llm._torch.pyexecutor import resource_manager as resource_manager_module
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.engine.lora import (
     LoraParamBuilder,
     make_cuda_graph_lora_manager,
@@ -589,6 +591,65 @@ def test_cuda_graph_lora_reserves_workspace_only_on_decoder(
 
     assert model.encoder[0].workspace_reservations == []
     assert model.language_model[0].workspace_reservations == [(reserved_tokens, 8, 4)]
+
+
+def _decoder_graph_runner(captured_key: KeyType) -> Mock:
+    """A decoder graph runner whose only captured graph is ``captured_key``.
+
+    Graph eligibility and lookup run the real CUDAGraphRunner code; only key
+    construction and the captured graphs are stubbed.
+    """
+    runner = Mock(enabled=True, is_warmup_only=False, enable_encoder_decoder_mixed_cuda_graph=False)
+    runner.config = SimpleNamespace(enable_attention_dp=False, use_mrope=False)
+    runner._is_mixed_encoder_decoder_batch.return_value = False
+    runner.get_graph_key.return_value = captured_key
+    runner.graph_metadata = {captured_key: {"attn_metadata": object(), "spec_metadata": None}}
+    for name in ("maybe_get_cuda_graph", "_can_run_cuda_graph_batch", "_agree_graph_shape"):
+        setattr(runner, name, getattr(CUDAGraphRunner, name).__get__(runner))
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("max_loras", "lora_task_ids", "runs_as_graph"),
+    [
+        (None, [*range(8), None], True),
+        (None, list(range(9)), False),
+        (4, list(range(5)), False),
+    ],
+    ids=["default-slots-filled", "default-slots-exceeded", "max-loras-slots-exceeded"],
+)
+def test_lora_graph_runs_only_batches_whose_adapters_fit_its_slots(
+    graph_lora_settings: tuple[LoraConfig, LoraModelConfig],
+    max_loras: int | None,
+    lora_task_ids: list[int | None],
+    runs_as_graph: bool,
+) -> None:
+    """A batch with more distinct adapters than the LoRA graph's slots runs eagerly."""
+    graph_lora_settings[0].max_loras = max_loras
+    manager = _graph_manager(torch.nn.Sequential(_LoraBlock(7, [96])), graph_lora_settings)
+    captured_key = KeyType(batch_size=len(lora_task_ids), draft_len=0, use_lora_graph=True)
+    graphs = decoder_graphs(
+        decoder_config(),
+        cuda_graph_runner=_decoder_graph_runner(captured_key),
+        lora=LoraParamBuilder(attn_backend=object(), cuda_graph_manager=manager),
+    )
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = SimpleNamespace(data_type=torch.float16)
+    batch = _batch(generation=[_request(i, task) for i, task in enumerate(lora_task_ids)])
+
+    selection = graphs.select(
+        batch,
+        resource_manager,
+        enable_spec_decode=False,
+        attn_metadata=object(),
+        spec_metadata=None,
+        draft_tokens_cuda=None,
+        new_tensors_device=None,
+        spec_resource_manager=None,
+        promoted_context_request_ids=frozenset(),
+    )
+
+    assert selection.key == (captured_key if runs_as_graph else None)
 
 
 def _runner_for_lora(
