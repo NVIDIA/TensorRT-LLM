@@ -73,6 +73,28 @@ _DECODE_REFRESH_MAX_ROWS = 64
 _DEFAULT_ENGRAM_VOCAB_SIZE = 129280 * 5
 
 
+@dataclass(frozen=True)
+class DecodeRefreshPlan:
+    """Buffers of a one-launch decode refresh that later steps of the batch repeat: ``moduli``
+    ``[layers, max_ngram - 1, heads]``, ``hashes`` ``[layers, tokens, (max_ngram - 1) * heads]``."""
+
+    rows: torch.Tensor
+    lookup: torch.Tensor
+    history: torch.Tensor
+    multipliers: torch.Tensor
+    moduli: torch.Tensor
+    hashes: torch.Tensor
+    pad_id: int
+    dead: int
+    n_head: int
+    max_ngram: int
+    request_ids: Tuple[int, ...]
+    request_rows: Tuple[int, ...]
+    row_record: tuple
+    shape_key: tuple
+    cached: Dict[int, torch.Tensor]
+
+
 @dataclass
 class EngramConfig:
     """Configuration for the Engram module.
@@ -448,6 +470,7 @@ class EngramHashProvider:
         self._cached_hash_stacks: Dict[tuple, torch.Tensor] = {}
         self._multiplier_stack: Optional[torch.Tensor] = None
         self._moduli_stack = tuple(self._moduli_keys[layer_id] for layer_id in config.layer_ids)
+        self._decode_refresh_moduli: Optional[torch.Tensor] = None
 
         # Per-request history of compressed token ids, so that an n-gram at a
         # decode step can reach the tokens that preceded it. Without this the
@@ -746,6 +769,174 @@ class EngramHashProvider:
         )
         self._decode_row_map = (key, row_map)
         return row_map
+
+    def decode_refresh_plan(
+        self,
+        request_ids: List[int],
+        seq_lens_host: torch.Tensor,
+        num_tokens: int,
+        max_seq_len: int,
+    ) -> Optional[DecodeRefreshPlan]:
+        """This batch's last one-launch refresh for a caller to repeat; None if host work is due."""
+        request_ids = tuple(request_ids)
+        history = self._history
+        record = self._decode_row_map
+        multipliers = self._multiplier_stack
+        if (
+            not is_blackwell_datacenter()
+            or history is None
+            or record is None
+            or multipliers is None
+            or self._pad_id is None
+            or not request_ids
+            or len(set(request_ids)) != len(request_ids)
+            or len(request_ids) == num_tokens
+            or num_tokens > _DECODE_REFRESH_MAX_ROWS
+            or type(max_seq_len) is not int
+            or history.shape[1] < max_seq_len
+            or self._pending_history_seeds.keys() & set(request_ids)
+        ):
+            return None
+        device = history.device
+        rows = tuple(self._history_row_of.get(request_id) for request_id in request_ids)
+        lengths = tuple(seq_lens_host[: len(request_ids)].tolist())
+        stream = torch._C._cuda_getCurrentRawStream(
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        if record[0] != (device, stream, rows, lengths) or sum(lengths) != num_tokens:
+            return None
+        num_heads = (self.config.max_ngram_size - 1) * self.config.n_head_per_ngram
+        shape_key = ((num_tokens, num_heads),) * len(self.config.layer_ids)
+        cached = self._cached_hashes_store.get(shape_key)
+        hashes = self._cached_hash_stacks.get(shape_key)
+        if (
+            cached is None
+            or hashes is None
+            or any(t.device != device for t in (multipliers, self._lookup_table, hashes))
+        ):
+            return None
+        return DecodeRefreshPlan(
+            rows=record[1],
+            lookup=self._lookup_table,
+            history=history,
+            multipliers=multipliers,
+            moduli=self._get_decode_refresh_moduli(device),
+            hashes=hashes,
+            pad_id=self._pad_id,
+            dead=self._DEAD,
+            n_head=self.config.n_head_per_ngram,
+            max_ngram=self.config.max_ngram_size,
+            request_ids=request_ids,
+            request_rows=rows,
+            row_record=record,
+            shape_key=shape_key,
+            cached=cached,
+        )
+
+    def admission_refresh_plan(
+        self,
+        request_ids: List[int],
+        seq_lens_host: torch.Tensor,
+        num_tokens: int,
+        max_seq_len: int,
+        max_seed_cells: int,
+    ) -> Optional[Tuple[DecodeRefreshPlan, List[int], Tuple[list, list, list, list]]]:
+        """Reserve the rows and take the pending seeds of requests that all join this forward:
+        (plan, history rows, seed cells as rows / positions / ids / text flags) for one launch."""
+        request_ids = tuple(request_ids)
+        history = self._history
+        multipliers = self._multiplier_stack
+        if (
+            history is None
+            or multipliers is None
+            or self._pad_id is None
+            or num_tokens > _DECODE_REFRESH_MAX_ROWS
+            or type(max_seq_len) is not int
+            or history.shape[1] < max_seq_len
+        ):
+            return None
+        lengths = tuple(seq_lens_host[: len(request_ids)].tolist())
+        num_heads = (self.config.max_ngram_size - 1) * self.config.n_head_per_ngram
+        shape_key = ((num_tokens, num_heads),) * len(self.config.layer_ids)
+        cached = self._cached_hashes_store.get(shape_key)
+        hashes = self._cached_hash_stacks.get(shape_key)
+        device = history.device
+        seeds = [self._pending_history_seeds.get(request_id) for request_id in request_ids]
+        if (
+            sum(lengths) != num_tokens
+            or cached is None
+            or hashes is None
+            or any(t.device != device for t in (multipliers, self._lookup_table, hashes))
+            or sum(len(seed[1]) for seed in seeds if seed is not None) > max_seed_cells
+        ):
+            return None
+        rows = self._reserve_history_rows(list(request_ids), max_seq_len, device)
+        cells = ([], [], [], [])
+        top = self._lookup_table.shape[0] - 1
+        for request_id, row, seed in zip(request_ids, rows, seeds):
+            if seed is None:
+                continue
+            start, token_ids, token_mask = seed
+            if start + len(token_ids) > self._history.shape[1]:
+                raise ValueError("Engram history seed exceeds the configured sequence length")
+            cells[0].extend([row] * len(token_ids))
+            cells[1].extend(range(start, start + len(token_ids)))
+            cells[2].extend(max(0, min(token, top)) for token in token_ids)
+            cells[3].extend(token_mask if token_mask is not None else [True] * len(token_ids))
+            del self._pending_history_seeds[request_id]
+        stream = torch._C._cuda_getCurrentRawStream(
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        row_map = torch.empty(num_tokens, dtype=torch.long, device=device)
+        self._decode_row_map = ((device, stream, tuple(rows), lengths), row_map)
+        plan = DecodeRefreshPlan(
+            rows=row_map,
+            lookup=self._lookup_table,
+            history=self._history,
+            multipliers=multipliers,
+            moduli=self._get_decode_refresh_moduli(device),
+            hashes=hashes,
+            pad_id=self._pad_id,
+            dead=self._DEAD,
+            n_head=self.config.n_head_per_ngram,
+            max_ngram=self.config.max_ngram_size,
+            request_ids=request_ids,
+            request_rows=tuple(rows),
+            row_record=self._decode_row_map,
+            shape_key=shape_key,
+            cached=cached,
+        )
+        return plan, rows, cells
+
+    def _get_decode_refresh_moduli(self, device: torch.device) -> torch.Tensor:
+        """Materialize the hash moduli for the fused staging kernel on first use."""
+        moduli = self._decode_refresh_moduli
+        if moduli is None or moduli.device != device:
+            moduli = torch.tensor(self._moduli_stack, dtype=torch.long, device=device)
+            self._decode_refresh_moduli = moduli
+        return moduli
+
+    def decode_refresh_plan_current(self, plan: DecodeRefreshPlan) -> bool:
+        """Whether ``plan`` still describes this provider's refresh of its batch."""
+        if (
+            self._history is not plan.history
+            or self._decode_row_map is not plan.row_record
+            or self._cached_hashes_store.get(plan.shape_key) is not plan.cached
+            or self._cached_hash_stacks.get(plan.shape_key) is not plan.hashes
+        ):
+            return False
+        pending = self._pending_history_seeds
+        if pending and any(request_id in pending for request_id in plan.request_ids):
+            return False
+        row_of = self._history_row_of
+        return all(
+            row_of.get(request_id) == row
+            for request_id, row in zip(plan.request_ids, plan.request_rows)
+        )
+
+    def adopt_decode_refresh(self, plan: DecodeRefreshPlan) -> None:
+        """Leave the provider as its own refresh of ``plan``'s batch would (the caller ran it)."""
+        self._cached_hashes = plan.cached
 
     def _compute_decode_hashes(
         self,

@@ -7,6 +7,8 @@ from __future__ import annotations
 import functools
 import itertools
 import math
+import os
+import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from itertools import accumulate, chain
@@ -34,6 +36,10 @@ _TMA_MIN_BACKING_BYTES = 128 << 10
 # Decode tokens per request that DeepGEMM paged MQA logits score per request.
 _BATCHED_DECODE_NEXT_N = range(2, 9)
 
+
+# Steady steps re-check the pages their moved requests write only in debug mode; the full prepare
+# of every changed batch checks every request.
+_STEADY_PAGE_CHECKS = os.environ.get("TLLM_DEBUG_MODE", "")[0:1] == "1"
 
 # Below this many decode requests DeepGEMM's two 3-row passes cost less than one split-row pass.
 _SPLIT_ROW_MIN_REQUESTS = 4
@@ -81,6 +87,9 @@ def split_row_logits_heads(
 _FORWARD_SERIALS = itertools.count(1)
 # Buffer-bank entry: serial of the prepare that last wrote the bank's tables.
 _BANK_WRITER = "prepare_serial"
+# Bank entry: copied page-table buffer address -> (weak reference, int64 [rows] columns past
+# which the buffer holds BAD_PAGE_INDEX).
+_BANK_TABLE_LIVE = "table_live"
 
 
 def csa2_side_stream(device, index: int = 0) -> torch.cuda.ExternalStream:
@@ -163,12 +172,14 @@ class _CoalescedUploads:
         self._tables = []
         self._bytes = 0
 
-    def copy(self, key: str, value) -> torch.Tensor:
+    def copy(self, key: str, value, live: np.ndarray | None = None) -> torch.Tensor:
+        """``live`` (device page tables only): per row, the columns past which ``value``
+        holds BAD_PAGE_INDEX."""
         metadata = self._metadata
         if isinstance(value, torch.Tensor):
             if value.device.type != "cpu":
                 result = metadata._get_csa2_buffer(key, value.shape, value.dtype, like=value)
-                self._tables.append((result, value))
+                self._tables.append((result, value, live))
                 return result
             value = value.numpy()
         if not value.flags.c_contiguous:
@@ -187,18 +198,33 @@ class _CoalescedUploads:
         from . import kernel
 
         metadata = self._metadata
-        if self._tables:
-            targets, values = zip(*self._tables)
+        tables, self._tables = self._tables, []
+        copy_tables = None
+        if tables:
+            targets, values, lives = zip(*tables)
             if targets[0].is_cuda and kernel.dsl_available():
-                rows = [kernel.table_copy_descriptor(*pair) for pair in self._tables]
-                kernel.copy_tables_(
-                    metadata._device_descriptors("prepared_page_tables", rows),
-                    max(target.shape[0] for target in targets),
-                    max(target.shape[1] for target in targets),
-                )
+                descriptors = [kernel.table_copy_descriptor(t, v) for t, v, _ in tables]
+                max_rows = max(target.shape[0] for target in targets)
+                bounds = metadata._table_copy_bounds(targets, lives, max_rows)
+                # The per-row bounds ride this upload.
+                columns = None if bounds is None else self.copy("table_copy_columns", bounds)
+                copy_tables = (descriptors, max_rows, columns)
             else:
                 torch._foreach_copy_(targets, values)
-            self._tables.clear()
+        self._upload_pending()
+        if copy_tables is not None:
+            descriptors, max_rows, columns = copy_tables
+            kernel.copy_tables_(
+                metadata._device_descriptors("prepared_page_tables", descriptors),
+                max_rows,
+                max(target.shape[1] for target in targets),
+                columns,
+            )
+        if tables:
+            metadata._track_table_live(targets, lives)
+
+    def _upload_pending(self) -> None:
+        metadata = self._metadata
         if not self._pending:
             return
         packed = np.empty(self._bytes, dtype=np.uint8)
@@ -1547,6 +1573,48 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             super().prepare()
             self.prepare_csa2(swa_publication=publication)
 
+    @property
+    def supports_steady_decode_step(self) -> bool:
+        """Whether prepare_steady_decode_step may stand in for prepare(): the previous prepare()
+        was a plain CSA2 generation prepare that seeded prepare_csa2's steady branch (plain KV)."""
+        from .cache_manager import CSA2CacheManager
+
+        return (
+            isinstance(self.kv_cache_manager, CSA2CacheManager)
+            and getattr(self, "_csa2_steady_snapshot", None) is not None
+            # prepare() checks a replay signature against this; a steady step has none.
+            and getattr(self, "_csa2_replay_capture_signature", None) is None
+            and self.draft_kv_cache_manager is None
+            and not self.enable_flash_mla
+            and not self.enable_helix
+            and self.fp4_mla_state is None
+            and not self._has_mixed_precision_staging()
+            and self.mixed_precision_high_block_table is None
+            and not self.kv_cache_params.use_full_generation_page_table
+        )
+
+    def key_prepared_block_offsets(self) -> None:
+        """No key: every steady step converts the per-layer tables (unchanged rows keep theirs)."""
+
+    def prepare_steady_decode_step(
+        self, kv_lens: list[int], prompt_lens: list[int] | None = None
+    ) -> None:
+        """prepare() of a generation step on the rows of the previous prepare() (one step later, or
+        new requests with ``prompt_lens``), as in TrtllmAttentionMetadata, then prepare_csa2."""
+        from .cache_manager import CSA2CacheManager
+
+        self._csa2_deferred_decode_outputs = False
+        self._csa2_context_geometry = None
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Prepare CSA2 request metadata before CUDA Graph capture")
+        self._csa2_ready_for_kv_update = False
+        self._csa2_pending_prepare = None
+        manager = self.kv_cache_manager
+        assert isinstance(manager, CSA2CacheManager)
+        with manager._swa_publication_scope() as publication:
+            super().prepare_steady_decode_step(kv_lens, prompt_lens)
+            self.prepare_csa2(swa_publication=publication)
+
     def _get_csa2_buffer(self, key, shape, dtype, *, like=None) -> torch.Tensor:
         # Preserve manager-local, shape-keyed addresses across graph replays.
         if not hasattr(self, "_csa2_buffers"):
@@ -1739,6 +1807,40 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 )
             rows.append((table.data_ptr(), table.stride(0), table.shape[0], table.shape[1]))
         return self._device_descriptors("swa_table_desc", rows)
+
+    def _table_copy_bounds(self, targets, lives, rows: int) -> np.ndarray | None:
+        """Per row, the columns a copy of ``lives``-bounded sources into ``targets`` must cover (both
+        sides hold BAD_PAGE_INDEX past them); None when a side is unknown or off SM100/SM103."""
+        from tensorrt_llm._utils import is_blackwell_datacenter
+
+        if not is_blackwell_datacenter():
+            return None
+        tracked = self._csa2_buffers.get(_BANK_TABLE_LIVE, {})
+        bound = np.zeros(rows, dtype=np.int64)
+        for target, live in zip(targets, lives):
+            entry = tracked.get(target.data_ptr())
+            if (
+                live is None
+                or len(live) != rows
+                or entry is None
+                or entry[0]() is not target
+                or len(entry[1]) != rows
+            ):
+                return None
+            np.maximum(bound, live, out=bound)
+            np.maximum(bound, entry[1], out=bound)
+        return bound.astype(np.int32)
+
+    def _track_table_live(self, targets, lives) -> None:
+        """Record that each of ``targets`` holds BAD_PAGE_INDEX past ``lives`` (None: unknown)."""
+        tracked = self._csa2_buffers.setdefault(_BANK_TABLE_LIVE, {})
+        for key in [key for key, (ref, _) in tracked.items() if ref() is None]:
+            del tracked[key]
+        for target, live in zip(targets, lives):
+            if live is None:
+                tracked.pop(target.data_ptr(), None)
+            else:
+                tracked[target.data_ptr()] = (weakref.ref(target), np.array(live, dtype=np.int64))
 
     def _device_descriptors(self, kind: str, rows) -> torch.Tensor:
         """Device int64 table of the host descriptor ``rows``, uploaded only when they change."""
@@ -2022,18 +2124,27 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # Under the overlap scheduler, generation rows reserve the previous
         # step's full verification width; positions beyond the allocated
         # capacity stay unmapped and on_update_kv_lens narrows them later.
+        published = manager.published_batch_caches(swa_publication, request_ids)
+        caches = (
+            [manager.kv_cache_map[request_id] for request_id in request_ids]
+            if published is None
+            else published[0]
+        )
         allocated_until = np.full(len(lengths), manager.max_seq_len, dtype=np.int64)
         allocated_until[self.num_contexts :] = [
-            manager.kv_cache_map[request_id].capacity
-            for request_id in request_ids[self.num_contexts :]
+            cache.capacity for cache in caches[self.num_contexts :]
         ]
         lengths_np = np.asarray(lengths, dtype=np.int64)
         starts_np = np.asarray(starts, dtype=np.int64)
         # Versions also catch compressor-state pages that change without a page crossing.
-        page_versions = np.fromiter(
-            (manager.kv_cache_map[request_id].page_storage_version for request_id in request_ids),
-            dtype=np.uint64,
-            count=len(request_ids),
+        page_versions = (
+            np.fromiter(
+                (cache.page_storage_version for cache in caches),
+                dtype=np.uint64,
+                count=len(request_ids),
+            )
+            if published is None
+            else np.asarray(published[1], dtype=np.uint64)
         )
         snapshot = (
             tuple(request_ids),
@@ -2082,7 +2193,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                         page_versions,
                     )
                 joined = np.flatnonzero(rows < 0) if remapped else ()
-                if len(joined):
+                if len(joined) and not _STEADY_PAGE_CHECKS:
                     # No earlier prepare checked a joining request's pages.
                     self._check_swa_write_pages(
                         starts_np[joined],
@@ -2294,6 +2405,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 "source_cu", np.cumsum(np.concatenate(([0], source_lengths)), dtype=np.int32)
             )
             self._check_owner_pages(owners, source_starts, ends, allocated_until, page_count)
+        table_live = manager.batch_table_live()
         if self.num_contexts:
             # Reserve every currently addressable logical row, including
             # upward live-end corrections within already published pages.
@@ -2364,7 +2476,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                         "CSA2 bounded replay requires the cached GLOBAL prefix pages to be ready"
                     )
             self.csa2_global_page_tables[owner] = copy(
-                f"global_pages/{owner}", manager.batch_page_table(global_spec, page_count)
+                f"global_pages/{owner}",
+                manager.batch_page_table(global_spec, page_count),
+                live=table_live,
             )
             self.csa2_global_page_sizes[owner] = block // ratio
             self.csa2_global_max_positions[owner] = manager.max_seq_len // ratio
@@ -2391,10 +2505,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 kv_spec = (owner, CSA2CacheRole.COMPRESSOR_KV)
                 score_spec = (owner, CSA2CacheRole.COMPRESSOR_SCORE)
                 kv_pages = copy(
-                    f"kv_state_pages/{owner}", manager.batch_page_table(kv_spec, page_count)
+                    f"kv_state_pages/{owner}",
+                    manager.batch_page_table(kv_spec, page_count),
+                    live=table_live,
                 )
                 score_pages = copy(
-                    f"score_state_pages/{owner}", manager.batch_page_table(score_spec, page_count)
+                    f"score_state_pages/{owner}",
+                    manager.batch_page_table(score_spec, page_count),
+                    live=table_live,
                 )
                 self._csa2_compression[owner] = CSA2CompressionBatch(
                     manager.get_buffers(owner, CSA2CacheRole.COMPRESSOR_KV),
@@ -2511,13 +2629,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     ) -> None:
         """Re-read the page tables of a steady step that crossed a page.
 
-        The device-converted tables changed while the geometry did not: check
-        the pages written by requests with nonzero ``lengths`` like a full
-        prepare (the others write inside pages an earlier prepare checked),
-        then copy every table into the buffers the consumers already hold.
-        ``starts``, ``lengths`` and ``floors`` are int64 arrays; only the
-        requests with nonzero ``lengths`` are checked. The copy plan holds for
-        every steady step that reads the same converted tables.
+        The device-converted tables changed while the geometry did not: in
+        debug mode, check the pages written by requests with nonzero
+        ``lengths`` like a full prepare (the others write inside pages an
+        earlier prepare checked), then copy every table into the buffers the
+        consumers already hold. ``starts``, ``lengths`` and ``floors`` are
+        int64 arrays. The copy plan holds for every steady step that reads the
+        same converted tables.
         """
         from . import kernel
         from .cache_manager import CSA2CacheRole
@@ -2530,19 +2648,20 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             manager.compute_batch_page_tables(
                 request_ids, self.num_contexts, page_versions=page_versions.tolist()
             )
-        rows = np.flatnonzero(lengths)
-        starts, lengths, floors, allocated_until = (
-            values[rows] for values in (starts, lengths, floors, allocated_until)
-        )
-        self._check_swa_write_pages(starts, lengths, floors, allocated_until, page_count, rows)
-        self._check_owner_pages(
-            manager.layout.kv_source_layer_ids,
-            starts,
-            starts + lengths,
-            allocated_until,
-            page_count,
-            rows,
-        )
+        if _STEADY_PAGE_CHECKS:
+            rows = np.flatnonzero(lengths)
+            starts, lengths, floors, allocated_until = (
+                values[rows] for values in (starts, lengths, floors, allocated_until)
+            )
+            self._check_swa_write_pages(starts, lengths, floors, allocated_until, page_count, rows)
+            self._check_owner_pages(
+                manager.layout.kv_source_layer_ids,
+                starts,
+                starts + lengths,
+                allocated_until,
+                page_count,
+                rows,
+            )
         tables = manager._batch_page_tables
         key = (
             tables.data_ptr(),
@@ -2553,7 +2672,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         )
         plan = self._csa2_steady_refresh
         if plan is None or plan[0] != key:
-            targets, sources, published_copies = [], [], []
+            targets, sources, published_copies, owner_copies = [], [], [], []
 
             def refresh(target, spec, published=None):
                 source = (
@@ -2563,6 +2682,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     targets.append(target)
                     sources.append(source)
                     published_copies.append(published is not None)
+                    owner_copies.append(published is None and spec[1] != CSA2CacheRole.SWA)
 
             for owner, table in self.csa2_global_page_tables.items():
                 refresh(table, (owner, CSA2CacheRole.GLOBAL))
@@ -2590,8 +2710,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 max((target.shape[0] for target in targets), default=0),
                 any(published_copies),
                 None,
+                owner_copies,
             ]
-        _, targets, sources, descriptors, max_rows, copies_published, copied = plan
+        _, targets, sources, descriptors, max_rows, copies_published, copied, owner_copies = plan
         if descriptors is not None:
             # Converted tables hold BAD_PAGE_INDEX past their live columns, so only the columns
             # either side may hold pages in are copied.
@@ -2604,6 +2725,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             plan[6] = None if copies_published else live
         elif targets:
             torch._foreach_copy_(targets, sources)
+        # Every target equals its source here, which holds BAD_PAGE_INDEX past its live columns.
+        table_live = manager.batch_table_live()
+        self._track_table_live(targets, [table_live if owner else None for owner in owner_copies])
 
     def _finish_prepare_csa2(self, snapshot, *, defer_outputs: bool) -> None:
         manager = self.kv_cache_manager

@@ -6126,6 +6126,8 @@ def instantiate_sampler(
                 logger.info(
                     "[M3 host] spec sampler store copies on the D2H side stream"
                 )
+            if engine.steady_mtp_reads_output_rows:
+                sampler.stores_on_side_stream = True
         return sampler
 
     return TorchSampler(sampler_args)

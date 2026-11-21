@@ -73,6 +73,7 @@ from ..modules.multi_stream_utils import do_multi_stream
 from ..moe.fused_moe.impl_contract import MOE_DECODE_OPTIONS, MoEDecodeOptions
 from ..moe.fused_moe.moe_scheduler import routes_padding_nowhere
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import SpecMetadata
 from ..speculative.dspark import DSparkSpecMetadata
 from ..utils import AuxStreamType, MxFp8QuantizedTensor, decode_stream_priority
@@ -3631,6 +3632,14 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     model_cls = DeepseekV41Model
     weight_loader_cls = DeepseekV41WeightLoader
+    # Unchanged DSpark decode batches take the steady decode-step prepare (DecoderRunnerConfig).
+    steady_decode_prepare = True
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """V4's hooks; its ranks step in lockstep (attention DP, TP), so they also merge their tuned
+        tactics."""
+        return replace(super().runtime_hooks, merge_tuned_tactics_across_ranks=True)
 
     def __pp_init__(self) -> None:
         super().__pp_init__()
@@ -4041,4 +4050,6 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
                 refresh=True,
             )
 
+        # A steady decode prepare may do this refresh in its own launch (steady_spec_prepare).
+        _refresh.engram_provider = self.model.engram_hash_provider
         runner.register_pre_replay_hook(_refresh)

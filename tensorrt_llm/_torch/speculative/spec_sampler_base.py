@@ -29,7 +29,7 @@ from typing import Optional
 import torch
 
 from ..._device_copy import DeviceCopyBuffer
-from ..._utils import prefer_pinned
+from ..._utils import current_cuda_stream, prefer_pinned
 from ...bindings.executor import FinishReason
 from ...sampling_params import SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
@@ -141,6 +141,16 @@ def one_model_sampling_rejection_reason(
 
 
 @dataclass(kw_only=True)
+class StepOutputRows:
+    """A decode-only step's forward outputs in request order, with the requests' slots."""
+
+    next_new_tokens: torch.Tensor  # int32 [rows, >= tokens per step]
+    new_tokens_lens: torch.Tensor  # int32 [rows]
+    next_draft_tokens: torch.Tensor  # int32 [rows, >= draft length]
+    slots: tuple[int, ...]
+
+
+@dataclass(kw_only=True)
 class SampleStateTensorsSpec(SampleStateTensors):
     """Tensors for speculative decoding sample state."""
 
@@ -149,6 +159,11 @@ class SampleStateTensorsSpec(SampleStateTensors):
     # Actual token windows, aligned with SampleStateSpec.requests, when the
     # worker selects verification lengths on device.
     verify_lens: Optional[torch.Tensor] = None
+    # Recorded on the sampler's side stream once it has written this step into the stores,
+    # when that update runs there: a reader of the stores on another stream waits on it.
+    stores_ready: Optional[torch.cuda.Event] = None
+    # The forward's outputs the stores are updated from (a decode-only step's, with stores_ready).
+    rows: Optional[StepOutputRows] = None
 
 
 @dataclass(kw_only=True)
@@ -191,6 +206,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     static_slot_ids: bool = False
     _slot_ids_host: Optional[list[int]] = None
     _slot_ids_cuda: Optional[torch.Tensor] = None
+    # Set where the engine's steady MTP prepare reads a step's output rows: the store update then
+    # runs on the D2H side stream.
+    stores_on_side_stream = False
 
     SampleState = SampleStateSpec
 
@@ -640,6 +658,35 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             self.store.next_draft_tokens,
         )
 
+    def _scatter_on_side_stream(
+        self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
+    ) -> bool:
+        """Update the stores from the outputs on the D2H side stream; False, writing nothing, if
+        the store update kernel does not take the step."""
+        side = self._d2h_side_stream
+        # The update reads the outputs this step's forward wrote on the current stream.
+        side.wait_stream(current_cuda_stream())
+        with self._d2h_side_stream_ctx:
+            # A step whose batch is unchanged leaves the slot table as it is.
+            if slots != self._slot_table_slots:
+                self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
+                self._slot_table_slots = slots
+            scattered = self._store_scatter.scatter(
+                outputs,
+                num_skip,
+                len(slots),
+                self._slot_table_buffer.tensor,
+                self.store.new_tokens,
+                self.store.next_new_tokens,
+                self.store.new_tokens_lens,
+                self.store.next_draft_tokens,
+            )
+        if scattered:
+            for name in ("new_tokens", "next_new_tokens", "new_tokens_lens", "next_draft_tokens"):
+                # Keep the caching allocator from reusing the outputs before the side stream read them.
+                outputs[name].record_stream(side)
+        return scattered
+
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
@@ -723,15 +770,37 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
 
         runtime_draft_len = outputs["next_draft_tokens"].shape[1]
-        if self._store_copies_done is not None:
-            # The previous step's host copies may still be reading the stores.
-            torch.cuda.current_stream().wait_event(self._store_copies_done)
         slots = [r.py_seq_slot for r in sampling_requests]
         step_fold = self.spec_step_fold
-        forward_stored_rows = step_fold is not None and step_fold.sampler_rows_stored(
-            outputs, num_skip, slots
-        )
-        scattered = forward_stored_rows
+        stores_ready, rows = None, None
+        scattered = False
+        if (
+            self.stores_on_side_stream
+            and step_fold is None
+            and self._store_scatter is not None
+            and o_verify_lens is None
+            and not self._async_worker_active()
+        ):
+            scattered = self._scatter_on_side_stream(outputs, num_skip, slots)
+            if scattered:
+                stores_ready = torch.cuda.Event()
+                stores_ready.record(self._d2h_side_stream)
+                if num_skip == 0 and not finished_context_requests:
+                    n = len(slots)
+                    rows = StepOutputRows(
+                        next_new_tokens=outputs["next_new_tokens"][:n],
+                        new_tokens_lens=outputs["new_tokens_lens"][:n],
+                        next_draft_tokens=outputs["next_draft_tokens"][:n],
+                        slots=tuple(slots),
+                    )
+        if not scattered and self._store_copies_done is not None:
+            # The previous step's host copies may still be reading the stores.
+            current_cuda_stream().wait_event(self._store_copies_done)
+        forward_stored_rows = False
+        if not scattered and step_fold is not None:
+            scattered = forward_stored_rows = step_fold.sampler_rows_stored(
+                outputs, num_skip, slots
+            )
         # A model's step fold scatters the stores itself, in _scatter_to_stores.
         if not scattered and step_fold is None and self._store_scatter is not None:
             # A step whose batch is unchanged leaves the slot table as it is.
@@ -756,6 +825,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self.store.next_new_tokens,
             new_tokens_lens=self.store.new_tokens_lens,
             next_draft_tokens=self.store.next_draft_tokens,
+            stores_ready=stores_ready,
+            rows=rows,
         )
 
         store_copies_done = getattr(step_fold, "store_copies_done", None) if step_fold else None

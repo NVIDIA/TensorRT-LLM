@@ -26,12 +26,14 @@ class PreparedInputs:
     ``runtime_draft_len`` is the draft length the prepared step runs with.
     ``static_inputs_staged`` is the number of tokens whose input ids and
     positions the preparation already wrote to the CUDA graph's static inputs
-    (0: none).
+    (0: none). ``pre_replay_staged``: it also did the graph's pre-replay hook
+    work for those tokens.
     """
 
     kwargs: dict[str, Any]
     runtime_draft_len: int = 0
     static_inputs_staged: int = 0
+    pre_replay_staged: bool = False
 
 
 @dataclass(frozen=True)
