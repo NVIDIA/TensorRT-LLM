@@ -45,6 +45,7 @@ def _executor() -> PyExecutor:
     executor.kv_connector_manager.defer_load_termination.return_value = False
     executor.kv_connector_manager.has_outstanding_save.return_value = False
     executor.kv_connector_manager.has_pending_loads.return_value = False
+    executor.kv_connector_manager.has_pending_load.return_value = False
     executor.kv_connector_manager.get_finished.return_value = []
     executor.kv_connector_manager.take_finished_load_terminations.return_value = []
     executor.kv_cache_manager = Mock()

@@ -2273,6 +2273,7 @@ class TestDisaggTerminationGuard:
         final claim is released, the departed request must be terminated even
         when the PP=1 early-termination optimization was requested."""
         req = Mock()
+        req.py_request_terminated = True
         coordinator, _, effects = _make_transfer_coordinator(
             active_requests=[],  # early termination deferred until transfer release
         )
@@ -3271,6 +3272,8 @@ class _StubADPExecutor:
 def _run_pad(stub):
     for helper in (
         "_count_schedulable_active_requests",
+        "_is_request_schedulable",
+        "_is_preemption_pending",
         "_get_non_overlap_adp_forward_intent",
         "_has_adp_dummy_kv_capacity",
         "_should_skip_dummy_for_benchmark_disagg",
@@ -4181,6 +4184,8 @@ def test_pad_dummy_no_op_when_attention_dp_disabled():
 def _run_pad_empty(stub, scheduled_batch):
     for helper in (
         "_count_schedulable_active_requests",
+        "_is_request_schedulable",
+        "_is_preemption_pending",
         "_has_adp_dummy_kv_capacity",
         "_should_skip_dummy_for_benchmark_disagg",
     ):
