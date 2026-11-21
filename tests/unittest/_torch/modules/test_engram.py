@@ -113,7 +113,7 @@ def test_v41_engram_gate_parity(monkeypatch: pytest.MonkeyPatch, add_residual: b
     table_pointers = (table.weight.data_ptr(), table.scale.data_ptr())
     module.cuda()
     table.to(device="cuda", dtype=torch.bfloat16)
-    assert table._requires_standard_hf_loading
+    assert table._requires_regular_checkpoint_loading
     assert table.weight.device.type == table.scale.device.type == "cpu"
     assert table.weight.is_pinned() and table.scale.is_pinned()
     assert table.weight.dtype == torch.float8_e4m3fn
@@ -168,7 +168,7 @@ def test_v41_engram_gate_parity(monkeypatch: pytest.MonkeyPatch, add_residual: b
             gate_module.warmup_kernels()
         assert [call.kwargs["PRECOMPUTED_WEIGHT"] for call in launch.call_args_list] == [
             False,
-            torch.cuda.get_device_capability() == (10, 3),
+            torch.cuda.get_device_capability() in ((10, 3), (10, 7)),
         ]
         gate_hidden = torch.randn(3, 4, 5120, dtype=torch.bfloat16, device="cuda")
         gate_kv = torch.randn(3, 25600, dtype=torch.bfloat16, device="cuda")

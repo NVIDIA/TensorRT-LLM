@@ -15,7 +15,7 @@ For AST-based validation (no pytest or model weights needed):
 
 Options:
 --l0:       Check only the L0 tests located in $LLM_ROOT/tests/integration/test_list/test_db/*.yml.
---qa:       Check QA text lists and YAML case lists under tests/integration/test_lists/qa/.
+--qa:       Check QA lists under tests/integration/test_lists/qa/, including functional/ lists.
 --waive:    Check only the tests in $LLM_ROOT/tests/integration/test_list/waives.txt.
 --validate: Run AST-based validation of test list entries against source files.
 --report-unverifiable [PATH]: With --validate, write the list of active entries
@@ -58,6 +58,7 @@ MARKER_LIST_IN_TEST = [" TIMEOUT"]
 # AST validation defaults
 _DEFAULT_TEST_LISTS_DIR = "tests/integration/test_lists"
 _DEFAULT_TEST_BASE_DIR = "tests/integration/defs"
+_COLLECTION_TRACEBACK_DELAY_SECONDS = 15 * 60
 # Paths whose tests are generated dynamically — skip AST validation
 _EXCLUDED_PATH_PREFIXES = ("perf/", )
 
@@ -971,15 +972,19 @@ def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
 
 
 def _run_collection_pytest(llm_src: str, test_list: str) -> None:
-    """Run pytest --co with the collection bindings stub plugin."""
+    """Run stubbed pytest collection with a one-shot diagnostic traceback."""
     defs_dir = os.path.join(llm_src, "tests", "integration", "defs")
     with tempfile.TemporaryDirectory(
             prefix="trtllm-collection-models-root-") as models_root:
         subprocess.run(
             [
                 sys.executable,
-                "-m",
-                "pytest",
+                "-u",
+                "-c",
+                "import faulthandler, runpy; "
+                "faulthandler.dump_traceback_later("
+                f"{_COLLECTION_TRACEBACK_DELAY_SECONDS}, repeat=False, exit=False); "
+                "runpy.run_module('pytest', run_name='__main__')",
                 "-p",
                 "stubify_bindings",
                 f"--test-list={test_list}",
@@ -1058,7 +1063,10 @@ def verify_qa_test_lists(llm_src):
     # Remove dynamically generated perf tests
     subprocess.run(f"rm -f {test_qa_path}/*perf*", shell=True, check=True)
     test_def_files = sorted(
-        glob.glob(f"{test_qa_path}/*.txt") + glob.glob(f"{test_qa_path}/*.yml"))
+        glob.glob(f"{test_qa_path}/*.txt") +
+        glob.glob(f"{test_qa_path}/*.yml") +
+        glob.glob(f"{test_qa_path}/functional/**/*.txt", recursive=True) +
+        glob.glob(f"{test_qa_path}/functional/**/*.yml", recursive=True))
     with tempfile.TemporaryDirectory(
             prefix="trtllm-qa-lists-") as text_lists_dir:
         for test_def_file in test_def_files:

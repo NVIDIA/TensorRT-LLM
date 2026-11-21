@@ -8,6 +8,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
                     Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
                     Union)
@@ -42,6 +43,7 @@ from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
 
 if TYPE_CHECKING:
+    from ..recurrent_state_spec import RecurrentStateSpec
     # The checkpoints package imports this module, so import its loader base
     # classes for type checking only.
     from .checkpoints.base_config_loader import BaseConfigLoader
@@ -58,6 +60,22 @@ def timing_metric(metric_name: str, metric_dict: dict[str,
     finally:
         metric_dict[metric_name] = (metric_dict.get(metric_name, 0.0) +
                                     time.perf_counter() - start)
+
+
+class ModelLoaderMetricNames(Enum):
+    """Names of the model loader's startup timing metrics."""
+
+    TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
+    CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
+    WEIGHT_POPULATION_SECONDS = "weight_population_seconds"
+    CHECKPOINT_FINALIZATION_SECONDS = "checkpoint_finalization_seconds"
+    DRAFT_CHECKPOINT_PREPARATION_SECONDS = (
+        "draft_checkpoint_preparation_seconds")
+    DRAFT_WEIGHT_POPULATION_SECONDS = "draft_weight_population_seconds"
+    DRAFT_CHECKPOINT_FINALIZATION_SECONDS = (
+        "draft_checkpoint_finalization_seconds")
+    POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+    WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
 @dataclass
@@ -523,7 +541,9 @@ def apply_quant_config_exclude_modules(
     kv_cache_quant_algo takes precedence over exclude_modules.
     kv_cache_quant_algo, if not None, is set for non-Attention
     modules too, which is the same practice as when there's no
-    exclude_modules.
+    exclude_modules. An excluded module that sets
+    _preserve_kv_cache_quant_algo keeps its own kv_cache_quant_algo
+    instead of the global one.
     """
     quant_config = model_config.quant_config
     kv_cache_quant_algo = None
@@ -567,7 +587,12 @@ def apply_quant_config_exclude_modules(
                     for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
-                    module.quant_config = new_config
+                    if getattr(module, '_preserve_kv_cache_quant_algo', False):
+                        module.quant_config = QuantConfig(
+                            kv_cache_quant_algo=module.quant_config.
+                            kv_cache_quant_algo)
+                    else:
+                        module.quant_config = new_config
                     # Reset _weights_created so create_weights() in
                     # __post_init__ will re-create this module's weights
                     # with the updated (non-quantized) config. Some
@@ -632,6 +657,10 @@ class DecoderModelForCausalLM(nn.Module,
 
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
+    # True when a fresh cache slot's recurrent state is reset by the context
+    # forward and not by the decode forward. The CUDA-graph runner then keeps
+    # one-token context requests out of decode graphs.
+    resets_recurrent_state_in_context: ClassVar[bool] = False
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
@@ -868,6 +897,31 @@ class DecoderModelForCausalLM(nn.Module,
             pretrained_config: The loaded Hugging Face config. Shared model
                 implementations can inspect it to select a preference for the
                 original checkpoint architecture.
+        """
+        return None
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> Optional['RecurrentStateSpec']:
+        """Return the layer kinds and base recurrent state of the model.
+
+        Architectures whose layers carry recurrent state between steps
+        override this. The answer depends on the configuration alone, so it is
+        available before the model or its cache manager is built. A VLM
+        wrapper forwards to the class of its language model.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config.
+            quant_config: Quantization config; it can select a state dtype.
+
+        Returns:
+            ``None`` for an architecture without recurrent layers. A recurrent
+            architecture whose configuration selects no recurrent layer
+            returns a declaration that has none.
         """
         return None
 
@@ -1315,6 +1369,28 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def resolve_recurrent_state_spec(
+    pretrained_config: Any,
+    *,
+    quant_config: Optional[QuantConfig] = None,
+) -> Optional['RecurrentStateSpec']:
+    """Return the recurrent-state declaration of the model class of a config.
+
+    The class is the one registered for ``pretrained_config.architectures[0]``.
+    ``None`` means that class declares no recurrent state, or that no class
+    can be found: the config names no architecture, or the name is not
+    registered.
+    """
+    architectures = getattr(pretrained_config, 'architectures', None)
+    if not architectures:
+        return None
+    model_cls = get_registered_model_class(architectures[0])
+    get_spec = getattr(model_cls, 'get_recurrent_state_spec', None)
+    if get_spec is None:
+        return None
+    return get_spec(pretrained_config, quant_config=quant_config)
 
 
 def is_model_arch_known(model_arch: str) -> bool:

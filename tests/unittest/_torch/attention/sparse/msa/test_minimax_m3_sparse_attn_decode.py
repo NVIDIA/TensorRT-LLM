@@ -138,7 +138,7 @@ def _make_inputs(
     decode_query_len=1,
     topk=MSA_REQUIRED_TOPK,
     seed=0,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (q, k_paged, v_paged, topk_idx, block_table, seq_lens), in that order.
 
     The order matches both the kernel wrapper and the oracle, so a test can
@@ -1395,6 +1395,8 @@ def test_msa_jit_cache_tracks_sources_and_build_modes(
     monkeypatch.setattr(jit, "_FMHA_VARLEN_DIR", csrc)
     for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
         monkeypatch.delenv(name, raising=False)
+    # The OnlyScore proxy modes resolve from the device and name their own cache directories; pin the default ones.
+    monkeypatch.setattr(jit, "_proxy_modes_cache", (False, False))
     cache_root = tmp_path / "cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(cache_root))
     with caplog.at_level(logging.INFO, logger=jit.__name__):

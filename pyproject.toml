@@ -570,13 +570,11 @@ exclude = [
     "tests/integration/defs/test_e2e.py",
     "tests/integration/defs/test_fmha.py",
     "tests/integration/defs/test_list_parser.py",
-    "tests/integration/defs/test_list_validation.py",
     "tests/integration/defs/test_sanity.py",
     "tests/integration/defs/test_unittests.py",
     "tests/integration/defs/triton_server/__init__.py",
     "tests/integration/defs/triton_server/common.py",
     "tests/integration/defs/triton_server/conftest.py",
-    "tests/integration/defs/triton_server/test_list_parser.py",
     "tests/integration/defs/triton_server/trt_test_alternative.py",
     "tests/integration/defs/trt_test_alternative.py",
     "tests/integration/defs/utils/__init__.py",
@@ -810,6 +808,7 @@ select = [
     "I", # isort
     # "N",   # pep8 naming # no naming convention enforced for now the reduce the burden
     "PLE", # pylint errors
+    "TID251",
     "W",   # pycodestyle warnings
 ]
 extend-ignore = [
@@ -829,6 +828,10 @@ extend-ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
 "*/_[a-zA-Z]*" = ["D"]                       # Private packages (_abc/*.py) or modules (_xyz.py)
+
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"tests".msg = "Import test helpers through __extra_import_path__ (tests/test_common/magic_import.py)"
 
 
 [tool.ruff.lint.pycodestyle]
@@ -861,7 +864,7 @@ project-excludes = [
     "tensorrt_llm/_torch/moe/kernels/**",
     "tensorrt_llm/_torch/attention/kernels/**",
     "tensorrt_llm/_torch/attention/backends/prims_ts/kernels/**",
-    "tensorrt_llm/_torch/_experimental/**",
+    "tensorrt_llm/_torch/modeling_v2/**",
 ]
 # Keep test helper paths out of product import resolution.
 search-path = ["."]
@@ -944,6 +947,8 @@ unexpected-positional-argument = "error"
 [tool.pyrefly-tests]
 project-includes = ["tests"]
 # Paths are relative to the repository root and apply only to the test pass.
+# The wrapper appends literal __extra_import_path__ directories found under tests/.
+# Ancestor directories use fallback resolution instead of becoming global roots.
 search-path = [
     ".",
     "tests",
@@ -967,11 +972,6 @@ search-path = [
 ]
 enable-fallback-search-path = true
 
-[tool.pyrefly-tests.errors]
-missing-argument = "ignore"
-unexpected-keyword = "ignore"
-bad-argument-count = "ignore"
-
 # Diagnostics for dynamically loaded modules and unresolved names.
 [tool.pyrefly-exclusions]
 symbols = [
@@ -986,4 +986,6 @@ symbols = [
     "SpecMetadata",
     "ParakeetEncoderConfig",
     "AttentionMetadata",
+    "FlashInferAttentionMetadata",
+    "_SparseMqaGqaMetadata",
 ]

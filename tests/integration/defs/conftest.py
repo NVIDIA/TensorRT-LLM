@@ -59,8 +59,6 @@ from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
 from .utils.periodic_junit import (PeriodicJUnitXML,
                                    register_pytest_timeout_evidence)
 
-ALL_PYTEST_ITEMS: list[pytest.Item] | None = None
-
 # Logger
 logger = logging.getLogger(__name__)
 
@@ -768,6 +766,8 @@ skip_no_mxfp4_swizzle = pytest.mark.skipif(
 
 skip_no_sm120 = pytest.mark.skipif(not is_sm_120f(),
                                    reason="This test is for SM120")
+skip_no_sm100f = pytest.mark.skipif(
+    not is_sm_100f(), reason="This test is for the SM100 family (SM100-SM109)")
 
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
@@ -1057,18 +1057,11 @@ def pytest_collection_modifyitems(session, config, items):
     test_model_suites = config.getoption("--test-model-suites")
 
     if perf_test:
-        global ALL_PYTEST_ITEMS
-        ALL_PYTEST_ITEMS = None
-
-        import copy
-
         # Do not import at global level since that would create cyclic imports.
         from .perf.test_perf import generate_perf_tests
 
         # Perf tests are generated based on the test list to speed up the test collection time.
         items = generate_perf_tests(session, config, items)
-
-        ALL_PYTEST_ITEMS = copy.copy(items)
 
     if test_prefix:
         # Override the internal nodeid of each item to contain the correct test prefix.
@@ -1274,15 +1267,6 @@ def pytest_runtest_makereport(item, call):
         report.file = str(item.fspath)
         report.line = str(item.location[1])
         report.url = ""
-
-
-@pytest.fixture(scope="session")
-def all_pytest_items():
-    """
-    Provides all pytest items available in the current test definitions, before any
-    filtering has been applied.
-    """
-    return ALL_PYTEST_ITEMS
 
 
 @pytest.fixture(scope="session")

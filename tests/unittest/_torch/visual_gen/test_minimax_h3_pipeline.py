@@ -1081,18 +1081,40 @@ def test_ref2va_tensor_parallel_text_encoder_rejects_vision_inputs() -> None:
         pipeline._encode_reference_text_tokens([11], {"pixel_values": torch.zeros(1)})
 
 
-def test_default_generation_steps_match_reference_app() -> None:
+def test_default_generation_steps() -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
-    assert pipeline.default_generation_params["num_inference_steps"] == 28
+    assert pipeline.default_generation_params["num_inference_steps"] == 50
 
 
 @pytest.mark.parametrize(
     "manifest, expected_steps",
     [
-        (None, 28),
+        (None, 50),
         ({"schema_version": "fasth3-inference-contract-v1", "num_inference_steps": 9}, 9),
-        ({"schema_version": "fasth3-inference-contract-v1"}, 28),
-        ({"schema_version": "other-model-v1", "num_inference_steps": 5}, 28),
+        ({"schema_version": "fasth3-inference-contract-v1"}, 50),
+        (
+            {
+                "schema_version": "fasth3-inference-contract-v1",
+                "dmd_denoising_steps": list(range(999, 972, -1)),
+            },
+            28,
+        ),
+        (
+            {
+                "schema_version": "fasth3-inference-contract-v1",
+                "dmd_denoising_steps": [999, 500],
+            },
+            3,
+        ),
+        (
+            {
+                "schema_version": "fasth3-inference-contract-v1",
+                "dmd_denoising_steps": [999, 500],
+                "num_inference_steps": 9,
+            },
+            9,
+        ),
+        ({"schema_version": "other-model-v1", "num_inference_steps": 5}, 50),
     ],
 )
 def test_fasth3_generation_steps_follow_inference_contract(
@@ -1155,8 +1177,8 @@ def test_fasth3_v2_trained_schedule() -> None:
     with pytest.raises(ValueError, match="video_scheduler_shift"):
         pipeline._set_timesteps(9)
     pipeline._fastvideo_inference = {}
-    pipeline._set_timesteps(28)
-    assert len(pipeline.scheduler.timesteps) == 27
+    pipeline._set_timesteps(50)
+    assert len(pipeline.scheduler.timesteps) == 49
 
 
 @pytest.mark.parametrize("steps", [[], [999, 999], [999, 1000], [1001, 500], [999, 0]])
@@ -1809,7 +1831,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         return torch.ones(1, 1, 4), layout, torch.full((1, 8), 7.0), torch.full((1, 3), 9.0)
 
     monkeypatch.setattr(h3_pipeline, "prepare_references", prepare)
-    original = pipeline.transformer.__class__.__call__
+    original = _FakeMiniMaxH3Transformer.__call__
 
     def observe(
         self: _FakeMiniMaxH3Transformer, **kwargs: object
@@ -1819,7 +1841,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         )
         return original(self, **kwargs)
 
-    monkeypatch.setattr(pipeline.transformer.__class__, "__call__", observe)
+    monkeypatch.setattr(_FakeMiniMaxH3Transformer, "__call__", observe)
     pipeline.forward(
         prompt="subject",
         seed=42,

@@ -42,10 +42,8 @@ def sm100() -> bool:
 def load_ops():
     """Register the C++ ops and the K3 KDA CuTe DSL ops; return the k3_kda_attn op module (its constants)."""
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
-        op,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_verify import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_verify import (
         op as _verify,  # noqa: F401
     )
 
@@ -55,7 +53,9 @@ def load_ops():
 # ---------------------------------------------------------------------------------------------------------------
 # The cache objects
 # ---------------------------------------------------------------------------------------------------------------
-def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: int = 8):
+def build_manager(
+    num_layers: int, num_spec: int | None = None, max_batch_size: int = 8, max_tokens: int = 512
+):
     """A real KimiK3HybridCacheManager with ``num_layers`` KDA layers (and one attention layer). With ``num_spec``:
     MTP-style speculation of ``num_spec`` drafts, the KDA replay caches and the drafts' records
     (``kda_draft_records``) that k3_kda_verify / k3_kda_attn read and write."""
@@ -75,7 +75,7 @@ def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: 
         mamba_layer_mask=[True] * num_layers + [False],
         mamba_cache_dtype=torch.bfloat16,
         mamba_ssm_cache_dtype=torch.float32,
-        kv_cache_config=KvCacheConfig(max_tokens=512, enable_block_reuse=False),
+        kv_cache_config=KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=1,
         num_kv_heads=4,

@@ -84,7 +84,9 @@ def _make_creator(
     c._mapping = Mock()
     c._draft_config = None
     c._model_engine = Mock(cuda_graph_batch_sizes=[], cuda_graph_padding_enabled=False)
-    c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
+    c._llm_args = SimpleNamespace(
+        kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+    )
     c._disable_overlap_scheduler = False
 
     c._kv_cache_manager_cls = Mock()
@@ -387,6 +389,9 @@ class TestSplitGpuBudgetForDraft:
         creator._is_disagg = False
         creator._disable_overlap_scheduler = False
         creator._cache_transceiver_config = None
+        creator._llm_args = SimpleNamespace(
+            kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+        )
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
@@ -534,6 +539,8 @@ class TestSplitGpuBudgetForDraft:
         c._get_effective_draft_config = Mock(return_value=effective_draft_config)
         c._get_num_draft_layers = Mock(return_value=2)
         c._model_engine.model.model_config.pretrained_config.num_hidden_layers = 40
+        # The drafter declares no KV pool dtype (a bare Mock attribute is not a torch.dtype).
+        c._model_engine.model.draft_model.draft_kv_dtype = None
         c._fallback_if_unsupported_kv_cache_manager_v2 = Mock(
             side_effect=lambda manager_cls, *_: manager_cls
         )
@@ -1578,7 +1585,9 @@ class TestExternalDrafterKvDtype:
         c._max_num_tokens = 8192
         c._max_beam_width = 1
         c._cache_transceiver_config = None
-        c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
+        c._llm_args = SimpleNamespace(
+            kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+        )
         c._mapping = Mock(enable_attention_dp=True, tp_size=1)
         c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))

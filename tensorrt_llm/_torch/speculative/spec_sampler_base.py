@@ -194,9 +194,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
     SampleState = SampleStateSpec
 
-    def is_generation_model(self) -> bool:
-        return True
-
     def validate_request(self, request: LlmRequest) -> None:
         """Reject sampling parameters the one-model speculative path cannot honor.
 
@@ -403,7 +400,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.max_accepted_path_len = args.max_draft_len + 1
         self._store_scatter: Optional[spec_step_copies.SlotScatter] = None
         self._slot_table_buffer: Optional[DeviceCopyBuffer] = None
-        if spec_step_copies.is_supported():
+        self._slot_table_slots: Optional[list[int]] = None
+        if spec_step_copies.slot_scatter_supported():
             self._store_scatter = spec_step_copies.SlotScatter()
             self._slot_table_buffer = DeviceCopyBuffer(
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
@@ -490,16 +488,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.spec_step_fold = spec_step_fold
         spec_step_fold.bind_sampler_store(self.store)
 
-    def _request_common_handling(
-        self,
-        request: LlmRequest,
-        next_draft_tokens: list[list[int]],
-        runtime_draft_len: Optional[int],
-    ) -> None:
-        """Common handling for both context and generation requests."""
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
-        request.py_decoding_iter += 1
-
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -542,6 +530,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                         "the executed window, original proposals, and token storage"
                     )
 
+        max_accepted_path_len = self.max_accepted_path_len
+        max_seq_len = self.max_seq_len
+        draft_lens = state.draft_lens
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -549,13 +540,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             assert seq_slot is not None
             num_new_tokens = new_tokens_lens_list[seq_slot]
             # new_tokens is sized to this bound; fail clearly, not with an IndexError.
-            assert num_new_tokens <= self.max_accepted_path_len, (
+            assert num_new_tokens <= max_accepted_path_len, (
                 f"accepted {num_new_tokens} tokens in one step, but new_tokens is "
-                f"sized for {self.max_accepted_path_len}"
+                f"sized for {max_accepted_path_len}"
             )
             # handle_stop_criteria inlined, with the per-request reads hoisted.
             end_id = req.py_end_id
-            room = max_token_room(req, self.max_seq_len, beam_idx)
+            room = max_token_room(req, max_seq_len, beam_idx)
             stop_words = req.py_stop_words_list
             for i in range(num_new_tokens):
                 new_token = new_tokens[i][seq_slot][beam_idx]
@@ -569,19 +560,18 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 if stop_words and meet_stop_token_criteria(req, new_token, beam_idx):
                     req.finish_by(FinishReason.STOP_WORDS, beam_idx)
                     break
-            req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            # Pair the acceptance count with the draft count of the SAME step,
-            # snapshotted at sample_async time: _request_common_handling below
-            # replaces py_draft_tokens with the next step's buffer, so its
-            # length must not be used as the denominator (0 for the request's
-            # prefill step, where nothing was verified).
+            num_accepted = num_new_tokens - 1
+            req.py_num_accepted_draft_tokens = num_accepted
+            # Pair acceptance with the SAME step's draft count, snapshotted at sample_async time
+            # (0 at prefill): py_draft_tokens is replaced below with the next step's buffer.
             verified_len = (
                 token_windows[req_idx] - 1 if token_windows is not None else runtime_draft_len
             )
-            drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            drafted_len = draft_lens[req_idx] if draft_lens is not None else 0
             req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
-            req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
+            req.py_rewind_len = verified_len - num_accepted
+            req.py_draft_tokens = next_draft_tokens_list[seq_slot][:runtime_draft_len]
+            req.py_decoding_iter += 1
 
     def _scatter_to_stores(
         self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
@@ -745,7 +735,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # A model's step fold scatters the stores itself, in _scatter_to_stores.
         if not scattered and step_fold is None and self._store_scatter is not None:
             # A step whose batch is unchanged leaves the slot table as it is.
-            self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
+            if slots != self._slot_table_slots:
+                self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
+                self._slot_table_slots = slots
             scattered = self._store_scatter.scatter(
                 outputs,
                 num_skip,

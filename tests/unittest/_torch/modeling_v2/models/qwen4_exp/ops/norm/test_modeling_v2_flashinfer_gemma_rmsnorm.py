@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (  # noqa: E501
     flashinfer_gemma_rmsnorm as op,
 )
 

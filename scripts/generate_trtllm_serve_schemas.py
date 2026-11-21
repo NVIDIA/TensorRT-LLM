@@ -253,6 +253,13 @@ def _cross_field_rules(definitions: dict) -> None:
             ),
         ]
     )
+    # BlockReuseConfig.validate_drop_extended_turns_policy().
+    definitions["BlockReuseConfig"].setdefault("allOf", []).append(
+        when(
+            _is_set_to("drop_extended_turns", {"const": True}),
+            _is_set_to("policy", {"const": "per_conversation"}),
+        )
+    )
     # AttentionDpConfig.validate_attention_dp_config().
     home_wait = _is_set_to("kv_cache_routing_home_wait_rounds", {"type": "integer"})
     definitions["AttentionDpConfig"].setdefault("allOf", []).extend(
@@ -450,6 +457,14 @@ def _serve_schema() -> dict:
             mirror_moe_tactic_validators(
                 definition, "moe_backend", "moe_tactic", {"enum": ["AUTO", None]}
             )
+    # MultimodalConfig normalizes encoder backend names before Literal validation.
+    encoder_backend = schema["$defs"]["MultimodalConfig"]["properties"][
+        "encoder_attention_backend"
+    ]["anyOf"][0]["additionalProperties"]
+    alternatives = [
+        "".join(f"[{char}{char.lower()}]" for char in name) for name in encoder_backend.pop("enum")
+    ]
+    encoder_backend["pattern"] = "^(?:" + "|".join(alternatives) + r")$(?![\s\S])"
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

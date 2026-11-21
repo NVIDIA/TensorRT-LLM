@@ -12,10 +12,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.norm.m3_embedding_firstnorm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.norm.m3_embedding_firstnorm import (  # noqa: E501
     VOCAB,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.norm.m3_embedding_firstnorm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.norm.m3_embedding_firstnorm import (  # noqa: E501
     m3_embedding_firstnorm as op,
 )
 
