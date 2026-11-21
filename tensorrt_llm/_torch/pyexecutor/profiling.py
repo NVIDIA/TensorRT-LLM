@@ -39,6 +39,7 @@ timing and iteration log around the controller's windows.
 """
 
 import functools
+import hashlib
 import os
 import tempfile
 import threading
@@ -70,6 +71,36 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 # The iteration log refreshes kv_cache_util (a full KV cache stats build) once
 # per this many iterations and reuses the last value in between.
 ITER_LOG_KV_UTIL_REFRESH_ITERS = 16
+
+
+def _profile_trace_path(path: str, start_iter: int, stop_iter: int, multiple_ranges: bool) -> str:
+    """Add iteration boundaries within the filesystem's basename byte limit."""
+    if not multiple_ranges:
+        return path
+    base, extension = os.path.splitext(path)
+    directory, stem = os.path.split(base)
+    suffix = f"-iterations-{start_iter}-{stop_iter}"
+    try:
+        name_max = os.pathconf(directory or ".", "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError):
+        name_max = 255
+    if name_max <= 0:
+        name_max = 255
+    # Kineto writes an adjacent ".tmp" file; gzip export uses a separate temporary file.
+    if extension != ".gz":
+        name_max -= len(b".tmp")
+    if len(os.fsencode(stem + suffix + extension)) > name_max:
+        # Hash the complete rank-specific stem before shortening its visible prefix.
+        digest = hashlib.sha256(os.fsencode(stem)).hexdigest()[:16]
+        suffix = f"-{digest}{suffix}"
+        stem_budget = name_max - len(os.fsencode(suffix + extension))
+        if stem_budget < 0:
+            raise ValueError("Trace filename extension and iteration boundaries exceed NAME_MAX")
+        prefix = stem[:stem_budget]
+        while len(os.fsencode(prefix)) > stem_budget:
+            prefix = prefix[:-1]
+        base = base[: -len(stem)] + prefix
+    return f"{base}{suffix}{extension}"
 
 
 @functools.cache
@@ -180,6 +211,9 @@ class ProfileController:
         self._active_enable_torch_trace = False
         self._env_torch_trace_path: Optional[str] = None
         self._env_enable_torch_trace = False
+        self._active_profile_start_iter = 0
+        self._active_env_trace = False
+        self._env_multiple_ranges = False
 
     @property
     def enabled(self) -> bool:
@@ -657,6 +691,8 @@ class ProfileController:
             trace_base, trace_ext = os.path.splitext(env_torch_trace_path)
             env_torch_trace_path = f"{trace_base}-rank-{self.rank}{trace_ext}"
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME, None)
+        env_start_iters, _ = load_iteration_indexes(PROFILE_START_STOP_ENV_VAR_NAME)
+        self._env_multiple_ranges = len(env_start_iters) > 1
         self._env_torch_trace_path = env_torch_trace_path
         self._env_enable_torch_trace = bool(env_torch_trace_path and profile_start_stop)
         if env_torch_trace_path and profile_start_stop is None:
@@ -742,6 +778,8 @@ class ProfileController:
             # from ``start_profile()`` take precedence over the
             # environment variables.
             runtime_trace_path = self._runtime_profile_trace_path
+            self._active_profile_start_iter = iteration
+            self._active_env_trace = runtime_trace_path is None
             runtime_cuda_only = self._runtime_profile_cuda_only
             runtime_activities = self._runtime_profile_activities
             if runtime_trace_path is not None:
@@ -797,16 +835,47 @@ class ProfileController:
     def _stop_window(self) -> None:
         # The trace flush stalls every rank for longer than the hang timeout.
         with self._pause_hang_detector():
-            if self._active_enable_torch_trace and self._torch_profiler is not None:
-                self._torch_profiler.stop()
-                self._torch_profiler.export_chrome_trace(self._active_torch_trace_path)
-                logger.info(
-                    f"Profiling stopped at iteration "
-                    f"{self._current_iteration()}, "
-                    f"trace saved to {self._active_torch_trace_path}"
-                )
-            torch.cuda.cudart().cudaProfilerStop()
-            self._calibrator.stop()
+            failure: Exception | None = None
+            try:
+                try:
+                    if self._active_enable_torch_trace and self._torch_profiler is not None:
+                        self._torch_profiler.stop()
+                        trace_path = _profile_trace_path(
+                            self._active_torch_trace_path,
+                            self._active_profile_start_iter,
+                            self._current_iteration(),
+                            self._active_env_trace and self._env_multiple_ranges,
+                        )
+                        self._torch_profiler.export_chrome_trace(trace_path)
+                        logger.info(
+                            f"Profiling stopped at iteration "
+                            f"{self._current_iteration()}, "
+                            f"trace saved to {trace_path}"
+                        )
+                except (AssertionError, OSError, RuntimeError, ValueError) as error:
+                    failure = error
+                finally:
+                    for stop in (
+                        lambda: torch.cuda.cudart().cudaProfilerStop(),
+                        self._calibrator.stop,
+                    ):
+                        try:
+                            stop()
+                        except (AssertionError, OSError, RuntimeError, ValueError) as error:
+                            if failure is None:
+                                failure = error
+                            else:
+                                logger.debug(f"profile cleanup after {failure!r}: {error!r}")
+            finally:
+                # Prevent context exit from retrying an already stopped observer.
+                self._window_open = False
+                self._torch_profiler = None
+                self._active_torch_trace_path = None
+                self._active_enable_torch_trace = False
+                with self._profile_state_lock:
+                    self._profile_enabled = False
+            if failure is not None:
+                raise failure
 
     # ---- shutdown --------------------------------------------------
 
