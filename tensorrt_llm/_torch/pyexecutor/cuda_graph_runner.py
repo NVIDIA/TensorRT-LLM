@@ -20,7 +20,8 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
-from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
+from ..hostfunc import (HOSTFUNC_USER_DATA_HANDLES, drain_captured_hostfuncs,
+                        record_hostfunc_graph_replay)
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
@@ -306,6 +307,9 @@ class CUDAGraphRunner:
     multiple graphs, keyed by batch shape and execution-path specializations.
     """
     WARMUP_STEPS = 1
+    # Keys of the graphs that captured host functions; __init__ sets the real
+    # set, this default keeps replay() and clear() safe on partial instances.
+    _hostfunc_graph_keys: frozenset = frozenset()
     # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
     _configured_seq_len_threshold: Optional[int] = None
     # Resolves a graph shape (batch size, draft length) to the ceilings of the
@@ -1335,6 +1339,9 @@ class CUDAGraphRunner:
         it may switch the MoE communication timeouts. ``record_tensor_ptrs``
         records the graph's metadata tensor addresses for moved_graph_tensors().
         """
+        # The warmup forwards run eagerly, so the host functions of a previous
+        # replay must run first; see drain_captured_hostfuncs.
+        drain_captured_hostfuncs()
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -2209,6 +2216,9 @@ class CUDAGraphRunner:
 
     def clear(self, *, release_nccl_window_owners: bool = True):
         """Releases all captured graphs and the associated memory pool."""
+        # Freeing the pool can synchronize the device while the GIL is held,
+        # so pending host functions of the last replay must run first.
+        drain_captured_hostfuncs()
         graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()

@@ -880,9 +880,11 @@ class DecoderRunner(ScheduledModelRunner):
 
             graph_key = key if can_run_graph else None
             captures_model_body = self._graphs.captures_model_body(graph_key)
-            # The encoder can hold the GIL while it waits on the device, so the host functions of
-            # the previous graph replay must run first.
-            if needs_multimodal_encoder(inputs.get("multimodal_params")):
+            # An eager forward can hold the GIL while it waits on the device: the multimodal
+            # encoder, and native extensions bound without gil_scoped_release (for example the
+            # MiniMax M3 MSA prefill path). The host functions of the previous graph replay take
+            # the GIL when they run, so they must run first.
+            if graph_key is None or needs_multimodal_encoder(inputs.get("multimodal_params")):
                 drain_captured_hostfuncs()
             with (
                 self._maybe_bypass_torch_compile(bypass=context_plan is not None),
