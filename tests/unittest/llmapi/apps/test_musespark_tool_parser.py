@@ -660,6 +660,102 @@ def test_musespark_header_patterns_are_linear_in_a_whitespace_run(text, musespar
     assert not result.calls and result.normal_text.endswith("done.")
 
 
+def test_musespark_held_header_tail_is_linear_in_a_whitespace_run(
+    monkeypatch, musespark_sample_tools
+):
+    """A held ` to=x` and the run after it are searched for a header tail from the run's start.
+
+    The stream holds the text from ` to=x` on while it could still grow into
+    a header, and searches it with `_HEADER_TAIL_RE`. Trying every start
+    inside a run of this length takes minutes.
+    """
+    parser = MuseSparkToolParser()
+    scanned = []
+    monkeypatch.setattr(
+        parser,
+        "_HEADER_TAIL_RE",
+        _ScanRecorder(MuseSparkToolParser._HEADER_TAIL_RE, scanned),
+    )
+    text = "set to=x" + " " * 100_000 + "done."
+    start = time.monotonic()
+    normal, calls = musespark_stream_chunks(
+        parser, musespark_sample_tools, text, [4] * (len(text) // 4)
+    )
+    assert time.monotonic() - start < 5
+    assert normal == text and not calls
+    # The search reached the held run.
+    assert max(scanned) > 100_000
+
+
+def _stream_through_reasoning_parser(tool_parser, tools, text, chunk=4):
+    """Stream `text` as the server does: reasoning parser content into the tool parser."""
+    rp = MuseSparkReasoningParser()
+    results = []
+    for pos in range(0, len(text), chunk):
+        content = rp.parse_delta(text[pos : pos + chunk]).content
+        if content:
+            results.append(tool_parser.parse_streaming_increment(content, tools))
+    content = rp.finish().content
+    if content:
+        results.append(tool_parser.parse_streaming_increment(content, tools))
+    results.append(tool_parser.finish(tools))
+    normal = "".join(r.normal_text for r in results)
+    return normal, [c.name for r in results for c in r.calls if c.name]
+
+
+_WHITESPACE_RUN_STREAMS = {
+    # id: (text around a run of n characters, normal text, call names)
+    "answer_spaces": (
+        lambda run: f" to=user{MS_M}Answer:{run}done.{MS_EOT}",
+        lambda run: f"Answer:{run}done.",
+        [],
+    ),
+    "held_header_tail": (
+        lambda run: f" to=user{MS_M}set to=x{run}done.{MS_EOT}",
+        lambda run: f"set to=x{run}done.",
+        [],
+    ),
+    "commentary_before_call": (
+        lambda run: f" to=commentary{MS_M}Checking.{run}{MS_EOM}"
+        f"{MS_S}assistant to=get_weather{MS_M}{MS_WEATHER}{MS_EOT}",
+        lambda run: f"Checking.{run}",
+        ["get_weather"],
+    ),
+}
+
+
+@pytest.mark.parametrize("run_char", [" ", "\n"], ids=["spaces", "newlines"])
+@pytest.mark.parametrize("stream", list(_WHITESPACE_RUN_STREAMS))
+def test_musespark_streamed_whitespace_run_is_scanned_a_bounded_number_of_times(
+    monkeypatch, musespark_sample_tools, stream, run_char
+):
+    """A streamed whitespace run is rescanned a bounded number of times.
+
+    The run is held while a header could still follow it. Rescanning the held
+    run on every delta made the stream quadratic in the run's length:
+    doubling the run quadrupled the characters scanned.
+    """
+    make_text, make_normal, expected_calls = _WHITESPACE_RUN_STREAMS[stream]
+    scanned = {}
+    for n in (8_000, 16_000):
+        parser = MuseSparkToolParser()
+        lengths = []
+        strip_header = parser._strip_header
+
+        def recording_strip_header(safe, lengths=lengths, strip_header=strip_header):
+            lengths.append(len(safe))
+            return strip_header(safe)
+
+        monkeypatch.setattr(parser, "_strip_header", recording_strip_header)
+        text = make_text(run_char * n)
+        normal, calls = _stream_through_reasoning_parser(parser, musespark_sample_tools, text)
+        assert normal == make_normal(run_char * n)
+        assert calls == expected_calls
+        scanned[n] = sum(lengths)
+        assert scanned[n] <= 3 * len(text)
+    assert scanned[16_000] <= 2.5 * scanned[8_000]
+
+
 def test_musespark_long_open_argument_is_parsed_once_per_closed_parameter(
     monkeypatch, musespark_sample_tools
 ):
