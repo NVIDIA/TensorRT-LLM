@@ -859,7 +859,7 @@ class CompletionPostprocArgs(PostprocArgs):
             num_choices=request.n if request.n else 1,
             stream_options=request.stream_options,
             detokenize=request.detokenize,
-            return_logprobs=bool(request.logprobs),
+            return_logprobs=request.logprobs is not None,
             ctx_usage=None if request.disaggregated_params is None else
             request.disaggregated_params.ctx_usage,
         )
