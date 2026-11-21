@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import errno
 import os
 import subprocess
 import time
@@ -105,29 +106,55 @@ def wait_for_endpoint_ready(
     )
 
 
-def wait_for_endpoint_down(url: str, timeout: int = 300, required_failures: int = 10) -> None:
-    """Wait until ``url`` fails ``required_failures`` consecutive probes.
+def wait_for_endpoint_down(url: str, timeout: float = 300, required_failures: int = 10) -> None:
+    """Wait for ``required_failures`` consecutive connection refusals.
 
-    Only ``requests.RequestException`` counts as a failed probe. Any HTTP
-    response, including an error response, means that the endpoint is still
-    reachable and resets the failure streak. A single missed probe therefore
-    cannot be mistaken for shutdown. Because probes are one second apart, the
-    timeout must allow at least ``required_failures`` probes.
+    An HTTP response or any other request error resets the count. Probes run
+    one second apart, so the timeout must allow enough time for the full streak.
     """
     deadline = time.monotonic() + timeout
-    consecutive_failures = 0
-    while time.monotonic() < deadline:
+    consecutive_refusals = 0
+    while (remaining := deadline - time.monotonic()) > 0:
         try:
-            status_code = requests.get(url, timeout=5).status_code
-            consecutive_failures = 0
-            print(f"endpoint {url} returned status code {status_code}")
+            response = requests.get(url, timeout=min(5, remaining))
         except requests.RequestException as err:
-            consecutive_failures += 1
-            if consecutive_failures >= required_failures:
-                print(f"endpoint {url} is down, with exception: {err}")
-                return
-        time.sleep(1)
+            if isinstance(err, requests.ConnectionError) and _is_connection_refused(err):
+                consecutive_refusals += 1
+                if consecutive_refusals >= required_failures:
+                    print(f"endpoint {url} refused the connection and is down")
+                    return
+            else:
+                consecutive_refusals = 0
+                print(f"Shutdown probe for {url} will retry after a request error: {err}")
+        else:
+            consecutive_refusals = 0
+            print(f"endpoint {url} returned status code {response.status_code}")
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise RuntimeError(
-        f"Endpoint {url} did not fail {required_failures} consecutive probes "
+        f"Endpoint {url} did not refuse {required_failures} consecutive probes "
         f"within {timeout} seconds"
     )
+
+
+def _is_connection_refused(error: BaseException) -> bool:
+    """Return whether an HTTP connection error wraps ECONNREFUSED."""
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if getattr(current, "errno", None) == errno.ECONNREFUSED:
+            return True
+        pending.extend(
+            nested
+            for nested in (
+                current.__cause__,
+                current.__context__,
+                getattr(current, "reason", None),
+                *current.args,
+            )
+            if isinstance(nested, BaseException)
+        )
+    return False
