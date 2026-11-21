@@ -132,7 +132,7 @@ def createKubernetesPodConfig()
                 qosClass: Guaranteed
         """.stripIndent(),
     ]
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "TensorRT_LLM_PLC"])
 }
 
 boolean isValidGithubUser(String owner) {
@@ -197,6 +197,8 @@ def savePipelineScripts() {
     sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
     sh "cp scripts/generate_lock_file.py /tmp/generate_lock_file.py"
     sh "cp jenkins/scripts/get_image_key_to_tag.py /tmp/get_image_key_to_tag.py"
+    // get_image_key_to_tag.py reads through the fetch_build_artifact.sh beside it.
+    sh "cp jenkins/scripts/fetch_build_artifact.sh /tmp/fetch_build_artifact.sh"
 }
 
 def checkoutSource ()
@@ -352,7 +354,7 @@ def sonarScan()
 
                 // Generated and experimental Python code
                 "tensorrt_llm/_torch/cute_dsl_kernels/**",
-                "tensorrt_llm/_torch/_experimental/modeling_v2/**",
+                "tensorrt_llm/_torch/modeling_v2/**",
                 "tensorrt_llm/grpc/openengine/_generated/**",
                 "**/*_pb2*.py",
 
@@ -436,16 +438,88 @@ def getImageScriptArgs() {
     return "'${branch}'"
 }
 
+// Credential with which jenkins/scripts/fetch_build_artifact.sh reads from artifactory.nvidia.com:
+// the one that trtllm_utils.writeArtifactoryNetrc puts in the helper's netrc.
+LLM_ARTIFACTS_CREDENTIALS_ID = trtllm_utils.llmArtifactsLocation("aws").credential
+
+// The time limit of the image-tag lookup, in minutes. The lookup takes seconds, but neither its
+// query of Jenkins nor the read helper has an overall limit, and it runs in "Prepare Environment",
+// a stage without one. The limit leaves room for the read helper to give up by itself on a
+// location that stalls on every attempt, so that such a lookup fails with the helper's message.
+IMAGE_KEY_TO_TAG_LOOKUP_MINUTES = 30
+
+// Returns the image-tag map that /tmp/get_image_key_to_tag.py prints for imageScriptArgs. The
+// script reads the map with /tmp/fetch_build_artifact.sh, which looks in the primary artifact
+// location first, by default artifactory.nvidia.com, and authenticates there with a netrc. The
+// netrc is removed when the lookup ends. It is in the cpu container's /tmp, which the pod's other
+// containers do not mount, so call this inside container("cpu"), and only while nothing from
+// params.ref runs in that container: see lookUpImageKeyToTag. A lookup that is still running after
+// IMAGE_KEY_TO_TAG_LOOKUP_MINUTES is ended, and fails like any other failed lookup.
+def readImageKeyToTag(String imageScriptArgs) {
+    def netrcPath = "/tmp/artifactory-netrc-${UUID.randomUUID().toString()}"
+    try {
+        trtllm_utils.writeArtifactoryNetrc(netrcPath)
+        def output = withEnv([
+            "ARTIFACTORY_NETRC=${netrcPath}",
+            "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+        ]) {
+            // timeout ends the lookup at its limit with exit status 124, which fails the step.
+            sh(
+                script: """
+                    timeout --kill-after=30 ${IMAGE_KEY_TO_TAG_LOOKUP_MINUTES}m \\
+                        python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs} || {
+                        status=\$?
+                        if [ "\$status" -eq 124 ]; then
+                            echo "The image-tag lookup did not end within ${IMAGE_KEY_TO_TAG_LOOKUP_MINUTES} minutes." >&2
+                        fi
+                        exit "\$status"
+                    }
+                """,
+                returnStdout: true
+            ).trim()
+        }
+        return output
+    } finally {
+        sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
+    }
+}
+
+// The outcome of the image-tag lookup that "Prepare Environment" makes for the container scanning
+// stages: [output: the map as JSON text], or [failure: why it could not be read].
+imageKeyToTagLookup = null
+
+// Reads the image-tag map when a container scanning stage will need it. It runs before the
+// parallel stages start, because one of them runs code from params.ref in the cpu container,
+// where the lookup's netrc would be readable. A failed lookup is kept for the container scanning
+// stages to report, so that the other stages still run. Call this inside container("cpu").
+def lookUpImageKeyToTag() {
+    if (!params.runContainerOssScanning && !params.runContainerMalwareScanning) {
+        return
+    }
+    try {
+        imageKeyToTagLookup = [output: readImageKeyToTag(getImageScriptArgs())]
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        imageKeyToTagLookup = [failure: e.toString()]
+        echo "The image-tag lookup failed, and the container scanning stages will report it: ${e}"
+    }
+}
+
+// Returns the image-tag map that lookUpImageKeyToTag read, or fails with that lookup's failure.
+def imageKeyToTagOutput() {
+    if (imageKeyToTagLookup?.output == null) {
+        error("The image-tag map could not be read in Prepare Environment: ${imageKeyToTagLookup?.failure}")
+    }
+    return imageKeyToTagLookup.output
+}
+
 def pulseLicenseScanContainer(llmRepo, ref) {
     // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
     def imageTags = [:]
     def token
     container("cpu") {
-        def imageScriptArgs = getImageScriptArgs()
-        def output = sh(
-            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
-            returnStdout: true
-        ).trim()
+        def output = imageKeyToTagOutput()
         println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
         def containerTagMap = new JsonSlurper().parseText(output)
         imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
@@ -514,11 +588,7 @@ def pulseMalwareScanContainer(llmRepo, ref) {
     def imageTags = [:]
     def token
     container("cpu") {
-        def imageScriptArgs = getImageScriptArgs()
-        def output = sh(
-            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
-            returnStdout: true
-        ).trim()
+        def output = imageKeyToTagOutput()
         println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
         def containerTagMap = new JsonSlurper().parseText(output)
         imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
@@ -782,6 +852,7 @@ pipeline {
                         savePipelineScripts()
                         checkoutSource()
                         validateRef()
+                        lookUpImageKeyToTag()
                     }
                 }
             }

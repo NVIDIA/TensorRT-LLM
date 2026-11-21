@@ -28,7 +28,8 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import get_sm_version, llm_models_root, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
-                               get_registered_worker_urls, run_ctx_worker,
+                               get_registered_worker_urls,
+                               resolve_server_start_timeout, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
@@ -670,7 +671,10 @@ def background_workers(llm_venv, config_file: str):
                                       env=env)
 
     try:
-        asyncio.run(wait_for_disagg_server_ready(disagg_port))
+        asyncio.run(
+            wait_for_disagg_server_ready(disagg_port,
+                                         timeout=resolve_server_start_timeout(
+                                             config, None)))
         ctx_urls, gen_urls = get_registered_worker_urls(disagg_port)
         assert len(ctx_urls) == num_ctx and len(gen_urls) == num_gen, (
             f"Expected {num_ctx} ctx and {num_gen} gen workers registered, "

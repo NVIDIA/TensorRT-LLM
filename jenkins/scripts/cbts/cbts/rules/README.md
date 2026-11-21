@@ -17,11 +17,11 @@ for the overall CBTS architecture.
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template, developer-assistant, and agent-skill (`skills/`) folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
 
 ## PythonFormattingRule
 
@@ -126,6 +126,20 @@ For each file under `tests/` in the diff:
    A complete set of direct `test_*.py` importers becomes the anchors; an
    ambiguous, dynamic, transitive, or non-test importer retains the directory
    fallback.
+   ModelingV2 tests also have explicit groups spanning component directories.
+   For the named test and helper inputs, a whole-file fallback adds their
+   group to the ordinary anchors. Function/class anchors retain precise
+   selection where test-db registers files or functions; directory registrations
+   retain their associated directories. MiniMax-M3 MoE groups pair target tests
+   with their matching target router configuration, while collective-launch
+   helpers select their target scope and that configuration. SM103 communication groups span `comm/` and
+   `ops/comm/`; the GLM GEMM group spans `gemm/` and its router test in
+   `ops/gemm/`. Inputs on both sides of these component boundaries select the
+   same group. The GLM spec launch helpers retain the target-root MTP CPU guard;
+   guard changes retain the GR100 spec selection without adding other
+   CPU siblings. YAML block and hardware conditions still determine where each
+   group runs. The shared FP4 helper selects the ModelingV2 test subtree, and
+   the K3 engine helper selects its target subtree.
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
    (bidirectional pytest-tree lineage) for each anchor; matches feed
    `block_filters`. For non-`test_*.py` paths, the lookup walks up
@@ -374,7 +388,7 @@ Outcomes:
 ## ModelingV2Rule
 
 Path and import rule. Claims non-documentation source changes under
-`tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
+`tensorrt_llm/_torch/modeling_v2/`, the self-contained second modeling
 path (one flat forward per checkpoint/arch/parallel triple, assembled
 from a catalog of op wrappers), including each family's native code
 (`models/<family>/csrc/`, `models/<family>/<target>/csrc/`: one torch-op library
@@ -398,12 +412,18 @@ name a target.
 
 | Changed file | Selects |
 |---|---|
-| Any file in a target, native code included | Only that target's tests |
+| Any file in a target, native code included | That target's tests |
 | Python family code | Its mirror unit directory under `models/<family>/`, else the family-level unit tests (test files directly in the family's unit directory and its non-target subdirectories); plus the tests of every target that imports it, and every unit test file that imports it |
 | Python family code no target imports (such as `routing.py`) | The whole family: `unittest/_torch/modeling_v2/models/<family>` and `accuracy/modeling_v2/<family>`; plus every unit test file that imports it |
 | Non-Python family file | The whole family |
 | Python file under `catalog/<category>/` | `unittest/_torch/modeling_v2/<category>` plus the tests of every target that imports it and every unit test file that imports it; every modeling_v2 entry if that directory does not exist |
 | Any other file: `catalog/_op.py`, files directly under the subtree, `models/` or `catalog/`, the shared native build | Every modeling_v2 entry |
+
+The MiniMax SM107 TP2, TP4 and TP8 router tests live under their respective
+`models/minimax_m3/minimax_m3_nvfp4__sm_107__tpN/ops/moe/` directories and
+are selected with those targets. Explicit M3 family-source associations also
+retain named communication and MoE cases outside the mirrored unit prefixes.
+These associations add file prefixes rather than the whole family or target.
 
 The rule reads imports from the checkout, which in CI is the PR head: it
 parses every Python file of the subtree and of `tests/unittest/_torch/modeling_v2/`
@@ -434,8 +454,9 @@ several files union.
 
 A covering directory entry is retained when no more specific entry exists,
 unless it ignores that path. Whole-tree unit checks directly under
-`unittest/_torch/modeling_v2/` are always retained. If no modeling_v2 entry
-matches, the rule falls back to baseline.
+`unittest/_torch/modeling_v2/` and the shared FP4 test-helper CPU guard at
+`unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_test_helpers.py` are always
+retained. If no modeling_v2 entry matches, the rule falls back to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -529,10 +550,12 @@ including at the repository root or under `scripts/` and `jenkins/`.
 | `scripts/templates/precommit-legacy-files.j2`, `scripts/templates/pyproject-format-exclude.j2`, `scripts/templates/ruff-legacy.toml.j2` | Lint configuration templates |
 
 `OUT_OF_SCOPE_PREFIXES` covers the complete root directories
-`.github/ISSUE_TEMPLATE/`, `.codex/`, and `.claude/`, including new files and all
-file types. The trailing slash preserves the directory boundary: sibling paths
-such as `.github/workflows/` and `.claude-extra/`, and nested paths such as
-`nested/.codex/`, are not exempt. Markdown, reStructuredText, and Python
+`.github/ISSUE_TEMPLATE/`, `.codex/`, `.claude/`, and `skills/`, including new
+files and all file types. `skills/` holds agent skills published to the NVIDIA
+skills catalog; NVSkills CI validates and signs them instead of L0. The trailing
+slash preserves the directory boundary: sibling paths such as
+`.github/workflows/`, `.claude-extra/`, and `skills-extra/`, and nested paths
+such as `nested/.codex/` and `nested/skills/`, are not exempt. Markdown, reStructuredText, and Python
 docstrings inside exempt subtrees do not contribute a docs stage. The input
 loader leaves those Python files available for `OutOfScopeRule` to claim.
 
@@ -607,3 +630,15 @@ and `OUT_OF_SCOPE_DIRECTORY_FILENAMES` in `out_of_scope.py` list the policies.
 | `lookup_paths_into_block_filters` | testdef | Runs `find_match_for_path` over a set of anchors; returns block_filters and miss set. |
 | `resolve_affected_stages` | all narrowing rules | Maps `block_filters` keys to stage names via `stages_by_yaml_stem`. |
 | `stages_by_yaml_stem` | all rules | Builds `{yaml_stem: [Stage, ...]}` index from the parsed Groovy stages. |
+
+
+ModelingV2 test-side cross-directory associations are declared in the
+`MODELING_V2_TEST_GROUPS` table in `tests_def.py`. They preserve the existing
+component selection scope while related tests occupy both category and
+ops/category directories.
+Whole-file associations add to the ordinary walk-up anchors. Function/class
+changes preserve associations for directory registrations while retaining
+precise file/function selection in other blocks. The shared FP4 MoE helper
+explicitly selects the ModelingV2 unit root, including its model-family
+consumers and CPU guard.
+The tables are checked against real repository paths and test-db registration.

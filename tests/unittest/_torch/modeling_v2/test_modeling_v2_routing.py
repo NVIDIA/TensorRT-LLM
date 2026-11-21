@@ -28,7 +28,6 @@ The things worth proving:
 
 from __future__ import annotations
 
-import importlib
 import re
 from dataclasses import replace
 
@@ -37,7 +36,9 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import (
     _RESOLVED_MODES,
     _ROUTES,
     ANY_MOE_IMPL,
@@ -48,11 +49,7 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     registered_routes,
     resolved_mode,
 )
-from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
-from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
@@ -867,7 +864,7 @@ def test_routes_on_the_kv_cache_algorithm_the_engine_runs(
 )
 def test_minimax_m3_parallel_names_the_target_topology(mapping_kwargs, parallel):
     """MiniMax-M3 has one target per tensor-parallel width: tp2, tp4 and tp8 load different per-rank shapes."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     assert routing._parallel(Mapping(**mapping_kwargs)) == parallel
 
@@ -892,12 +889,12 @@ _OTHER_LAYOUT = dict(
 
 
 def _m3_text_config(**layout):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     return dict(zip(_M3_SHAPE_FIELDS, routing._SHAPE), **(layout or _M3_LAYOUT))
 
 
-_M3_TARGETS = "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3"
+_M3_TARGETS = "tensorrt_llm._torch.modeling_v2.models.minimax_m3"
 _M3_TP2 = dict(world_size=2, tp_size=2, moe_tp_size=2, moe_ep_size=1)
 _M3_TP4 = dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1)
 _M3_TP8 = dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1)
@@ -923,8 +920,8 @@ def test_minimax_m3_route_picks_the_target_by_architecture_and_width(
     import sys
     import types
 
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
     from tensorrt_llm.quantization.mode import QuantAlgo
 
     for directory, name in (
@@ -960,7 +957,7 @@ def test_minimax_m3_route_picks_the_target_by_architecture_and_width(
 def test_minimax_m3_route_takes_the_released_checkpoint(monkeypatch, spec, tp):
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     monkeypatch.setattr(routing, "_eagle3_one_model_or_none", lambda spec: True)
@@ -1012,8 +1009,8 @@ def test_minimax_m3_route_declines_another_rope_base_or_sparse_layout(monkeypatc
     even with their quantization."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     text_config = _m3_text_config(**layout)
@@ -1049,8 +1046,8 @@ def test_minimax_m3_rubin_route_declines_another_layout(monkeypatch, mapping_kwa
     checkpoints."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     with pytest.raises(NoTarget, match="sparse attention layers other than 3-59|rope_theta"):
@@ -1067,7 +1064,7 @@ def test_minimax_m3_rubin_route_declines_another_layout(monkeypatch, mapping_kwa
 
 def test_minimax_m3_layout_reads_rope_theta_from_rope_parameters():
     """A config that keeps the RoPE base under ``rope_parameters`` (newer transformers) reads the same."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     sparse = _M3_LAYOUT["sparse_attention_config"]
     assert routing._layout_mismatch(_m3_text_config()) is None
@@ -1123,7 +1120,7 @@ def _minimax_m3_sm(_on_sm10x):
 @pytest.mark.parametrize("mode", ["auto", "require"])
 def test_minimax_m3_pr_runtime_resolves_to_the_target(monkeypatch, mode, tp):
     """The PR deployment (MSA, FP8 indexer, fused projection, kv_cache_config.dtype='nvfp4') takes the target."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(), None, tp)
@@ -1136,7 +1133,7 @@ def test_minimax_m3_pr_runtime_resolves_to_the_target(monkeypatch, mode, tp):
 def test_minimax_m3_bf16_kv_cache_falls_back_under_auto(monkeypatch, tp):
     """The targets run an FP8 or NVFP4 KV cache: ``auto`` with the BF16 cache resolves nothing, so the loader builds
     the registered built-in MiniMax-M3 model."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
@@ -1149,7 +1146,7 @@ def test_minimax_m3_bf16_kv_cache_falls_back_under_auto(monkeypatch, tp):
 
 @pytest.mark.usefixtures("_minimax_m3_sm")
 def test_minimax_m3_bf16_kv_cache_raises_under_require(monkeypatch):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
@@ -1165,7 +1162,7 @@ def test_minimax_m3_bf16_kv_cache_raises_under_require(monkeypatch):
 def test_minimax_m3_other_checkpoint_revision_is_declined(monkeypatch, tp):
     """Another checkpoint revision (same architecture class and shape, another RoPE base and sparse layout) with the
     PR runtime: ``auto`` builds the built-in model and ``require`` names the layout."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(), None, tp, layout=_OTHER_LAYOUT)
@@ -1177,7 +1174,7 @@ def test_minimax_m3_other_checkpoint_revision_is_declined(monkeypatch, tp):
 @pytest.mark.usefixtures("_minimax_m3_sm")
 def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
     """An explicit kv_cache_config.dtype is the KV cache the engine runs with, whatever the checkpoint declares."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
@@ -1191,7 +1188,7 @@ def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
 @pytest.mark.parametrize("role", ["aggregated", "context", "generation"])
 def test_minimax_m3_is_claimed_in_every_serving_role(monkeypatch, tp: int, role: str) -> None:
     """Every serving role builds the target, under the default mode as under a set one."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
@@ -1216,7 +1213,7 @@ def test_minimax_m3_honors_a_draft_moe_tactic_only(monkeypatch, tp):
     its own, which no tactic names."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
     monkeypatch.setattr(routing, "_eagle3_one_model_or_none", lambda spec: True)
@@ -1230,244 +1227,6 @@ def test_minimax_m3_honors_a_draft_moe_tactic_only(monkeypatch, tp):
     assert modeling_v2_resolve(trunk, _m3_llm_args("auto", "nvfp4")) is None
     with pytest.raises(ValueError, match=rf"moe_config.tactic='cutlass' .*{target.__name__}"):
         modeling_v2_resolve(trunk, _m3_llm_args("require", "nvfp4"))
-
-
-_SM100 = (10, 0)
-_TP16_MOETP4EP4 = dict(world_size=16, tp_size=16, moe_tp_size=4, moe_ep_size=4)
-_TP16_MOETP16EP1 = dict(world_size=16, tp_size=16, moe_tp_size=16, moe_ep_size=1)
-_K3_TARGET = (
-    "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling."
-    "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4"
-)
-_K3_TARGET_B = (
-    "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling."
-    "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1"
-)
-
-# The quantization the MXFP4 checkpoint declares in its config.json, inside ``text_config``.
-_K3_CHECKPOINT_QUANTIZATION = {
-    "quant_method": "compressed-tensors",
-    "format": "mxfp4-pack-quantized",
-    "config_groups": {
-        "group_0": {
-            "format": "mxfp4-pack-quantized",
-            "input_activations": None,
-            "output_activations": None,
-            "targets": ["Linear"],
-            "weights": {
-                "group_size": 32,
-                "num_bits": 4,
-                "strategy": "group",
-                "symmetric": True,
-                "type": "float",
-            },
-        }
-    },
-    "ignore": [
-        "re:.*self_attn.*",
-        "re:.*shared_experts.*",
-        r"re:.*mlp\.(gate|up|gate_up|down)_proj.*",
-        "re:.*lm_head.*",
-        "re:.*vision_tower.*",
-        "re:.*mm_projector.*",
-    ],
-    "kv_cache_scheme": None,
-}
-
-_K3_NVFP4_QUANTIZATION = {
-    "quant_method": "compressed-tensors",
-    "format": "nvfp4-pack-quantized",
-    "config_groups": {
-        "group_0": {
-            "format": "nvfp4-pack-quantized",
-            "input_activations": {
-                "group_size": 16,
-                "num_bits": 4,
-                "strategy": "tensor_group",
-                "type": "float",
-            },
-            "output_activations": None,
-            "targets": ["Linear"],
-            "weights": {
-                "group_size": 16,
-                "num_bits": 4,
-                "strategy": "tensor_group",
-                "symmetric": True,
-                "type": "float",
-            },
-        }
-    },
-    "ignore": ["re:.*lm_head.*"],
-    "kv_cache_scheme": None,
-}
-
-
-def _k3_config(text_as_dict=False, quantization=_K3_CHECKPOINT_QUANTIZATION, **text_overrides):
-    """The shape Kimi K3's own config.json declares: a vision-language wrapper whose language model is
-    ``text_config``, with the quantization ``KimiK3Config`` surfaces from it."""
-    text = dict(
-        model_type="kimi_linear",
-        num_hidden_layers=93,
-        hidden_size=7168,
-        num_experts=896,
-        routed_expert_hidden_size=3584,
-    )
-    text.update(text_overrides)
-    fields = dict(
-        architectures=["KimiK3ForConditionalGeneration"],
-        model_type="kimi_k3",
-        text_config=text if text_as_dict else PretrainedConfig(**text),
-    )
-    if quantization is not None:
-        fields["quantization_config"] = quantization
-    return PretrainedConfig(**fields)
-
-
-@pytest.fixture
-def _on_sm100(monkeypatch):
-    """Route as if this were a GB200."""
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM100)
-
-
-def test_kimi_k3_config_surfaces_the_text_config_quantization():
-    config = KimiK3Config(
-        text_config=dict(quantization_config=_K3_CHECKPOINT_QUANTIZATION),
-        architectures=["KimiK3ForConditionalGeneration"],
-    )
-    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
-        config.quantization_config, "TRTLLM"
-    )
-    assert layer_quant_config is None
-    assert quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
-    assert quant_config.group_size == 32
-
-
-@pytest.mark.usefixtures("_on_sm100")
-@pytest.mark.parametrize("mode", ["auto", "require"])
-@pytest.mark.parametrize("text_as_dict", [False, True], ids=["text-config", "text-dict"])
-@pytest.mark.parametrize(
-    "mapping_kwargs, target",
-    [(_TP16_MOETP4EP4, _K3_TARGET), (_TP16_MOETP16EP1, _K3_TARGET_B)],
-    ids=["tp16_moetp4ep4", "tp16_moetp16ep1"],
-)
-def test_kimi_k3_targets_match(mode, text_as_dict, mapping_kwargs, target):
-    """Route B is the experts split 16 ways by tensor, set explicitly."""
-    config = _model_config(_k3_config(text_as_dict=text_as_dict), **mapping_kwargs)
-    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == target
-
-
-@pytest.mark.usefixtures("_on_sm100")
-@pytest.mark.parametrize(
-    "quantization",
-    [_K3_NVFP4_QUANTIZATION, None],
-    ids=["nvfp4", "unquantized"],
-)
-def test_kimi_k3_other_quantizations_do_not_match(quantization):
-    """An NVFP4 declaration and an unquantized checkpoint have the MXFP4 checkpoint's shape; the quantization is
-    what keeps them out of a target whose loader reads packed MXFP4 experts."""
-    config = _model_config(_k3_config(quantization=quantization), **_TP16_MOETP4EP4)
-    assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match="quantization"):
-        modeling_v2_resolve(config, _llm_args("require"))
-
-
-@pytest.mark.usefixtures("_on_sm100")
-@pytest.mark.parametrize(
-    "text_overrides, mapping_kwargs, missed",
-    [
-        # a Kimi-family checkpoint of another depth
-        (dict(num_hidden_layers=61), _TP16_MOETP4EP4, "shape"),
-        # the expert split left unset: the mapping resolves to moe_tp 16 x moe_ep 1, but the built-in model runs
-        # that default as expert parallelism over the 16 ranks, a layout no target serves
-        (dict(), dict(world_size=16, tp_size=16), "split_set=False"),
-        # experts split 16 ways by expert, set explicitly
-        (dict(), dict(world_size=16, tp_size=16, moe_tp_size=1, moe_ep_size=16), "moe_ep=16"),
-        # attention data parallelism splits the requests, not the heads
-        (dict(), dict(_TP16_MOETP4EP4, enable_attention_dp=True), "attention_dp=True"),
-        (dict(), dict(_TP16_MOETP16EP1, enable_attention_dp=True), "attention_dp=True"),
-        # pipeline parallelism over the 16 ranks
-        (
-            dict(),
-            dict(world_size=16, tp_size=8, pp_size=2, moe_tp_size=8, moe_ep_size=1),
-            "pp=2",
-        ),
-        # one tray instead of four
-        (dict(), dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4), "ws=4"),
-    ],
-)
-def test_kimi_k3_near_misses_do_not_match(text_overrides, mapping_kwargs, missed):
-    config = _model_config(_k3_config(**text_overrides), **mapping_kwargs)
-    assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match=missed):
-        modeling_v2_resolve(config, _llm_args("require"))
-
-
-def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
-    """Routed as a GB300 (sm 10.3), the K3 targets, sm 10.0 only, match nothing."""
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
-    config = _model_config(_k3_config(), **_TP16_MOETP4EP4)
-    assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
-        modeling_v2_resolve(config, _llm_args("require"))
-
-
-_K3_TARGETS = pytest.mark.parametrize(
-    "mapping_kwargs, target",
-    [(_TP16_MOETP4EP4, _K3_TARGET), (_TP16_MOETP16EP1, _K3_TARGET_B)],
-    ids=["tp16_moetp4ep4", "tp16_moetp16ep1"],
-)
-
-
-def _k3_model_config(mapping_kwargs, moe_tactic) -> ModelConfig:
-    """K3 as the model config reads the checkpoint, W4A16_MXFP4, with ``moe_tactic``."""
-    return replace(
-        _model_config(_k3_config(), **mapping_kwargs),
-        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
-        moe_tactic=moe_tactic,
-    )
-
-
-@pytest.mark.usefixtures("_on_sm100")
-@pytest.mark.parametrize(
-    "tactic", ["trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8", "trtllm.trtllm_gen", "trtllm_gen"]
-)
-@_K3_TARGETS
-def test_kimi_k3_targets_take_the_tactic_of_the_experts_their_kernels_read(
-    mapping_kwargs, target, tactic
-):
-    """Decode steps run k3_moe over the TRTLLM-Gen W4A8_MXFP4_MXFP8 experts' buffers. The model
-    config reads the checkpoint as W4A16_MXFP4, but K3 runs experts the checkpoint does not list
-    as W4A8_MXFP4_MXFP8, so a tactic is narrowed to that format."""
-    config = _k3_model_config(mapping_kwargs, tactic)
-    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == target
-
-
-@pytest.mark.usefixtures("_on_sm100")
-@_K3_TARGETS
-def test_kimi_k3_targets_decline_the_tactic_of_other_experts(mapping_kwargs, target):
-    config = _k3_model_config(mapping_kwargs, "cutlass")
-    assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match=rf"moe_config.tactic='cutlass' .*{target.split('.')[-1]}"):
-        modeling_v2_resolve(config, _llm_args("require"))
-
-
-@_K3_TARGETS
-def test_kimi_k3_targets_build_and_honor_the_format_loading_reads_unlisted_experts_as(
-    mapping_kwargs, target
-):
-    """Three places spell the format K3 runs the experts a checkpoint does not list in: the
-    loader's ``KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO``, which the router narrows a tactic by, each
-    target's own copy, which it builds the experts in, and the quant of the ids it honors."""
-    module_path, class_name = target.rsplit(".", 1)
-    module = importlib.import_module(f"tensorrt_llm._torch._experimental.modeling_v2.{module_path}")
-    assert module._K3_DEFAULT_ROUTED_QUANT_ALGO == KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO
-    loaded = ModelConfig._declared_moe_quants(
-        QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
-        None,
-        architecture="KimiK3ForConditionalGeneration",
-    )
-    honored = getattr(module, class_name).moe_impls_honored
-    assert {MoEImplId.parse(impl_id).quant for impl_id in honored} == loaded
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
@@ -1899,3 +1658,281 @@ def test_glm52_tp16_declines_a_tactic_its_kernels_do_not_read(
         ValueError, match=rf"{re.escape(refused)} .*ModelingV2Glm52Nvfp4Sm107LowLatency"
     ):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+# MiniMax-M3.1-Flash: the MiniMax-M3 architecture class and shape with a 1e7 RoPE base, sparse attention on every
+# layer, and MXFP8 dense projections with packed NVFP4 routed experts.
+_M31_LAYOUT = dict(
+    rope_theta=10_000_000, sparse_attention_config=dict(sparse_attention_freq=[1] * 60)
+)
+_M31_QUANTIZATION = dict(moe_quant_algo="NVFP4", moe_quant_format="nvfp4-pack-quantized")
+# The M3.1 target directories and classes ``route`` returns, by topology.
+_M31_TARGETS = {
+    "tp2": ("minimax_m3_1_flash_nvfp4__sm_107__tp2", "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2"),
+    "tp4": ("minimax_m3_1_flash_nvfp4__sm_107__tp4", "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4"),
+    "tp8": ("minimax_m3_1_flash_nvfp4__sm_107__tp8", "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8"),
+    "tp2ctx": (
+        "minimax_m3_1_flash_nvfp4__sm_107__tp2ctx",
+        "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx",
+    ),
+    "dep2ctx": (
+        "minimax_m3_1_flash_nvfp4__sm_107__dep2ctx",
+        "ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx",
+    ),
+    "dep": ("minimax_m3_1_flash_nvfp4__sm_107__dep", "ModelingV2MiniMaxM31FlashNvfp4Sm107Dep"),
+}
+_M31_LAYOUTS = {
+    "tp2": _M3_TP2,
+    "tp4": _M3_TP4,
+    "tp8": _M3_TP8,
+    "tp2ctx": dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
+    "dep2ctx": dict(
+        world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True
+    ),
+    "dep": dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8, enable_attention_dp=True),
+}
+# The standalone MiniMax DSpark drafter's config.json: the geometry and target layers the M3.1 targets serve.
+_M31_DRAFTER = dict(
+    architectures=["DSparkMiniMaxDraftModel"],
+    model_type="dspark_minimax",
+    hidden_size=6144,
+    vocab_size=200064,
+    num_key_value_heads=4,
+    head_dim=128,
+    dspark_target_layer_ids=[3, 17, 31, 45, 59],
+)
+
+
+@pytest.fixture
+def _m31_route(monkeypatch):
+    """``route`` with the M3.1 target modules stubbed and the checkpoint's quantization read as M3.1's.
+
+    The stubs check the decision, not that the modeling code imports on this host; the disaggregated serving role is
+    unset unless a test sets it.
+    """
+    import sys
+    import types
+
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
+
+    for directory, name in _M31_TARGETS.values():
+        stub = types.ModuleType(f"{_M3_TARGETS}.{directory}.modeling")
+        setattr(stub, name, type(name, (), {"__module__": stub.__name__}))
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    monkeypatch.setattr(routing, "_quant_algo", lambda _config: QuantAlgo.MXFP8)
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    monkeypatch.delenv("TRTLLM_M3_KV_POOL_ZERO_INIT", raising=False)
+    return routing
+
+
+def _m31_model_config(topology="tp2", spec_config=None, layout=None, kv_checkpoint=None):
+    """The M3.1 checkpoint as ``route`` reads it: text shape, layout, declared expert quantization and mapping."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            text_config=_m3_text_config(**(layout or _M31_LAYOUT)),
+            quantization_config=_M31_QUANTIZATION,
+        ),
+        mapping=Mapping(**(topology if isinstance(topology, dict) else _M31_LAYOUTS[topology])),
+        spec_config=spec_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=kv_checkpoint),
+    )
+
+
+def _m31_dspark(tmp_path, **drafter):
+    """A standalone DSpark speculative config whose drafter checkpoint declares ``_M31_DRAFTER`` + ``drafter``."""
+    import json
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps(dict(_M31_DRAFTER, **drafter)))
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+    return DSparkDecodingConfig(max_draft_len=7, speculative_model=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "topology, speculation",
+    [*((topology, "none") for topology in sorted(_M31_TARGETS)), ("tp2", "dspark")],
+)
+def test_minimax_m3_1_route_picks_the_target_by_topology(
+    _m31_route, tmp_path, topology, speculation
+):
+    """Each M3.1 topology has its own target directory on sm107, with no speculation or a standalone DSpark
+    drafter."""
+    spec_config = _m31_dspark(tmp_path) if speculation == "dspark" else None
+    resolved = _m31_route.route(
+        _m31_model_config(topology, spec_config), _m3_llm_args("auto", "nvfp4"), (10, 7)
+    )
+    directory, name = _M31_TARGETS[topology]
+    assert resolved.__module__ == f"{_M3_TARGETS}.{directory}.modeling"
+    assert resolved.__name__ == name
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+def test_minimax_m3_1_route_takes_an_fp8_or_nvfp4_kv_cache(_m31_route, kv_dtype):
+    resolved = _m31_route.route(_m31_model_config("tp8"), _m3_llm_args("auto", kv_dtype), (10, 7))
+    assert resolved.__name__ == _M31_TARGETS["tp8"][1]
+
+
+@pytest.mark.parametrize(
+    "capability, topology, kv_dtype, reason",
+    [
+        ((10, 3), "tp4", "nvfp4", r"not sm107 \(Rubin\)"),
+        ((10, 3), "tp8", "nvfp4", r"not sm107 \(Rubin\)"),
+        ((10, 0), "tp8", "nvfp4", r"not sm107 \(Rubin\)"),
+        ((10, 7), "tp2", "auto", "a KV cache other than FP8 or NVFP4"),
+        (
+            (10, 7),
+            dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4),
+            "nvfp4",
+            "a parallel layout no target runs",
+        ),
+        (
+            (10, 7),
+            dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1, enable_attention_dp=True),
+            "nvfp4",
+            "a parallel layout no target runs",
+        ),
+    ],
+    ids=["sm103_tp4", "sm103_tp8", "sm100", "bf16_kv_cache", "tp4_ep4", "dep8_tp_experts"],
+)
+def test_minimax_m3_1_route_declines_with_the_reason(
+    _m31_route, capability, topology, kv_dtype, reason
+):
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    with pytest.raises(NoTarget, match=f"^MiniMax-M3.1-Flash: .*{reason}"):
+        _m31_route.route(_m31_model_config(topology), _m3_llm_args("auto", kv_dtype), capability)
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        dict(layout=dict(_M31_LAYOUT, rope_theta=5_000_000)),
+        dict(
+            layout=dict(
+                _M31_LAYOUT, sparse_attention_config=dict(sparse_attention_freq=[0] * 3 + [1] * 57)
+            )
+        ),
+        dict(quantization=dict(_M31_QUANTIZATION, moe_quant_algo="FP8")),
+        dict(text=dict(num_key_value_heads=8)),
+    ],
+    ids=["m3_rope", "m3_layers", "wrong_experts", "num_key_value_heads_8"],
+)
+def test_minimax_m3_1_route_declines_another_checkpoint_on_tp8(_m31_route, checkpoint):
+    """A checkpoint that is not the M3.1 export (another RoPE base, sparse layout, expert quantization or shape) on
+    the M3.1 tp8 topology is declined, and not with the M3.1 targets' message."""
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    config = _m31_model_config("tp8", layout=checkpoint.get("layout"))
+    if "quantization" in checkpoint:
+        config.pretrained_config.quantization_config = checkpoint["quantization"]
+    config.pretrained_config.text_config.update(checkpoint.get("text", {}))
+    with pytest.raises(NoTarget) as excinfo:
+        _m31_route.route(config, _m3_llm_args("auto", "nvfp4"), (10, 7))
+    assert "MiniMax-M3.1-Flash" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "drafter, reason",
+    [
+        (dict(architectures=["DFlashDraftModel"]), r"drafter architecture \['DFlashDraftModel'\]"),
+        (dict(dspark_target_layer_ids=[1, 2, 3]), r"drafter target layers \[1, 2, 3\]"),
+        (dict(hidden_size=4096), "drafter hidden_size 4096, not 6144"),
+    ],
+    ids=["architecture", "target_layers", "geometry"],
+)
+def test_minimax_m3_1_route_declines_another_dspark_drafter(_m31_route, tmp_path, drafter, reason):
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    spec_config = _m31_dspark(tmp_path, **drafter)
+    with pytest.raises(NoTarget, match=reason):
+        _m31_route.route(
+            _m31_model_config("tp2", spec_config), _m3_llm_args("auto", "nvfp4"), (10, 7)
+        )
+
+
+def test_minimax_m3_1_route_declines_another_speculative_mode(_m31_route):
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    with pytest.raises(NoTarget, match="speculative decoding NGRAM, not standalone DSpark"):
+        _m31_route.route(_m31_model_config("tp2", _NGRAM), _m3_llm_args("auto", "nvfp4"), (10, 7))
+
+
+def test_minimax_m3_1_route_declines_a_windowed_draft_pool_that_needs_a_resize(
+    _m31_route, tmp_path
+):
+    """A windowed drafter with chunked prefill and no host KV cache needs the separate draft pool's history-first
+    resize, which this engine does not have; a host KV cache, or no chunked prefill, keeps the target."""
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    spec_config = _m31_dspark(tmp_path, sliding_window=4096)
+    config = _m31_model_config("tp2", spec_config)
+    chunked = _llm_args(
+        "auto", kv_cache_config=dict(dtype="nvfp4"), enable_chunked_prefill=True, max_seq_len=65536
+    )
+    with pytest.raises(NoTarget, match="history-first resize"):
+        _m31_route.route(config, chunked, (10, 7))
+    with_host_cache = _llm_args(
+        "auto",
+        kv_cache_config=dict(dtype="nvfp4", host_cache_size=1 << 30),
+        enable_chunked_prefill=True,
+        max_seq_len=65536,
+    )
+    assert _m31_route.route(config, with_host_cache, (10, 7)).__name__ == _M31_TARGETS["tp2"][1]
+    unchunked = _llm_args("auto", kv_cache_config=dict(dtype="nvfp4"), max_seq_len=65536)
+    assert _m31_route.route(config, unchunked, (10, 7)).__name__ == _M31_TARGETS["tp2"][1]
+
+
+@pytest.mark.parametrize("topology", ["tp2", "dep"])
+def test_minimax_m3_1_route_declines_a_windowed_drafter_on_a_generation_worker(
+    _m31_route, monkeypatch, tmp_path, topology
+):
+    """A disaggregated generation worker does not receive the drafter's windowed KV from the context worker on this
+    engine; the context worker itself is unaffected."""
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    spec_config = _m31_dspark(tmp_path, sliding_window=4096)
+    config = _m31_model_config(topology, spec_config)
+    args = _llm_args("auto", kv_cache_config=dict(dtype="nvfp4"), max_seq_len=65536)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+    with pytest.raises(NoTarget, match="disaggregated generation worker"):
+        _m31_route.route(config, args, (10, 7))
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    assert _m31_route.route(config, args, (10, 7)).__name__ == _M31_TARGETS[topology][1]
+
+
+def test_minimax_m3_1_route_declines_when_the_kv_pool_is_not_zeroed(_m31_route, monkeypatch):
+    """The targets rely on the engine's zero-initialized MSA KV pool when the engine has no hook for it."""
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import runtime_hooks_compat
+
+    if runtime_hooks_compat.has_hook("msa_kv_cache_fixes"):
+        pytest.skip("this engine carries the MSA KV cache fixes as a hook")
+    monkeypatch.setenv("TRTLLM_M3_KV_POOL_ZERO_INIT", "0")
+    with pytest.raises(NoTarget, match="must be zero-initialized"):
+        _m31_route.route(_m31_model_config("tp2"), _m3_llm_args("auto", "nvfp4"), (10, 7))
+
+
+@pytest.mark.parametrize("topology", ["tp2ctx", "dep2ctx", "dep"])
+def test_minimax_m3_checkpoint_keeps_its_message_on_an_m3_1_topology(
+    _m31_route, monkeypatch, topology
+):
+    """An M3 checkpoint on a topology only the M3.1 targets run is declined with the MiniMax-M3 message."""
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    monkeypatch.setattr(_m31_route, "_quant_algo", lambda _config: QuantAlgo.MIXED_PRECISION)
+    config = _m31_model_config(topology, layout=_M3_LAYOUT)
+    with pytest.raises(NoTarget) as excinfo:
+        _m31_route.route(config, _m3_llm_args("auto", "nvfp4"), (10, 7))
+    assert "MiniMax-M3.1-Flash" not in str(excinfo.value)
+    assert "sm107 (Rubin) with 2, 4 or 8 ranks" in str(excinfo.value)
+
+
+def test_minimax_m3_1_checkpoint_is_not_taken_by_the_m3_targets(_m31_route):
+    """The M3.1 checkpoint has the M3 shape, so the M3 layout check is what keeps it off the M3 tp4 / tp8 targets:
+    on sm107 it lands on the M3.1 Rubin tp4 target."""
+    assert _m31_route._layout_mismatch(_m3_text_config(**_M31_LAYOUT)) is not None
+    resolved = _m31_route.route(_m31_model_config(_M3_TP4), _m3_llm_args("auto", "nvfp4"), (10, 7))
+    assert resolved.__name__ == _M31_TARGETS["tp4"][1]

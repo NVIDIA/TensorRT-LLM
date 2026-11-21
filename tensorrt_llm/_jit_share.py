@@ -420,16 +420,19 @@ def _export_kernel(kernel, obj: str, name: str, meta: str) -> None:
     import json
 
     tvm_ffi = any(c.__name__.startswith("TVMFFI") for c in type(kernel).__mro__)
-    part = f"{obj[:-2]}.{os.getpid()}.part.o"  # Ends in ".o": the TVM-FFI export picks its format by suffix.
+    # A pid alone can repeat across the nodes that share the directory.
+    tag = f"{os.getpid()}.{os.urandom(8).hex()}"
+    # Ends in ".o": the TVM-FFI export picks its format by suffix.
+    part = f"{obj[:-2]}.{tag}.part.o"
     if tvm_ffi:
         # TVM-FFI functions export their entry as __tvm_ffi_<name>, which a TVM-FFI load looks up by name.
         kernel.export_to_c(part, function_name=name)
     else:
         with open(part, "wb") as f:
             f.write(kernel.dump_to_object(name))
-    with open(f"{meta}.{os.getpid()}.part", "w") as f:
+    with open(f"{meta}.{tag}.part", "w") as f:
         json.dump({"tvm_ffi": tvm_ffi}, f)
-    os.replace(f"{meta}.{os.getpid()}.part", meta)
+    os.replace(f"{meta}.{tag}.part", meta)
     _fsync(part)
     os.replace(part, obj)
 

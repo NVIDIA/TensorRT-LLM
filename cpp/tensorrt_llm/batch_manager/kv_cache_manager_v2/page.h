@@ -63,6 +63,8 @@ public:
     CacheLevel cacheLevel;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    //! Dedupes the pages of one batched call: the StorageManager::nextVisitStamp() of the last call that took it.
+    uint64_t visitStamp = 0;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
@@ -84,6 +86,9 @@ public:
     FuncGuard<std::function<void()>> borrowRetentionForCopy();
 
     PageStatus status() const noexcept;
+
+    // Locality domain whose memory backs this page's slot; nullopt off a localized GPU tier.
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainId() const;
 
     bool scheduledForEviction() const noexcept
     {

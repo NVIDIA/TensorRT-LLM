@@ -114,6 +114,8 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
 
     decode_tuning: bool = False
     decode_early_release_rows: int = 0
+    cute_fc2_rows: int = 0
+    one_cluster_route: bool = False
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Take the provider off the descriptor a leaf already publishes.
@@ -215,10 +217,13 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
-        # Declared by the model (MoEDecodeOptions): the FP4 block-scale op's decode tuning and kernels.
+        # Declared by the model (MoEDecodeOptions): the FP4 block-scale op's decode tuning and kernels, or its
+        # CuTe DSL FC2 alone, and the one-cluster route kernel.
         decode = MoEDecodeOptions.of(model_config.extra_attrs)
         self.decode_tuning = decode.tuning
         self.decode_early_release_rows = decode.early_release_rows
+        self.cute_fc2_rows = decode.cute_fc2_rows
+        self.one_cluster_route = decode.one_cluster_route
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 

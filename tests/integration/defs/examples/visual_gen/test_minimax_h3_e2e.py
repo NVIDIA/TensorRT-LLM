@@ -92,7 +92,7 @@ MINIMAX_H3_QUALITY_HEIGHT = 128
 MINIMAX_H3_QUALITY_WIDTH = 128
 MINIMAX_H3_SMOKE_NUM_FRAMES = 124
 MINIMAX_H3_QUALITY_NUM_FRAMES = 124
-MINIMAX_H3_NUM_INFERENCE_STEPS = 28
+MINIMAX_H3_NUM_INFERENCE_STEPS = 50
 MINIMAX_H3_SEED = 0
 # Keep explicit quality bounds; report measured distances for every run.
 MINIMAX_H3_LPIPS_THRESHOLD = 0.15
@@ -241,6 +241,9 @@ def test_minimax_h3_released_transformer_loads_and_runs() -> None:
             [[0, 0, 0], [1, 0, 0], [2, 0, 0], [2, 0, 1], [3, 0, 0]],
             device="cuda",
         )
+        # Clear code cached by earlier tests so this forward records its own
+        # newly compiled frames.
+        torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
         with torch.inference_mode():
             output = transformer(

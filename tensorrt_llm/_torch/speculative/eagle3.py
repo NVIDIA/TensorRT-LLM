@@ -19,6 +19,8 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
+from ..modules.bf16_draft_head import is_plain_mtp_shared_head
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.multi_stream_utils import do_multi_stream
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -33,6 +35,7 @@ from .kept_rows import (DraftKeptRows, generation_only_on_every_rank,
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
+from .vocab_parallel import is_vocab_sharded_lm_head
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -461,6 +464,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     ``eagle3_dynamic_tree.py``.
     """
 
+    verifies_on_target_shard = True
     # Declared by the MTP draft model (set_draft_model): pass 0 takes the kept
     # rows; the recurrent-state promotion runs beside the draft loop.
     _draft_takes_kept_rows: bool = False
@@ -520,9 +524,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MXFP8 copy of the LM head for greedy draft tokens (MTP Eagle), set
         # by the model once its weights are loaded.
         self.draft_head = None
-        self._samples_sharded_target = (key_exchange is not None
-                                        and supports_sharded_target_sampling(
-                                            spec_config, mapping))
+        self._samples_sharded_temperature = (
+            key_exchange is not None
+            and supports_sharded_target_sampling(spec_config, mapping))
+        if self._samples_sharded_temperature:
+            # The target LM head is sharded over this mapping's TP group.
+            self._target_head_mapping = mapping
 
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
@@ -558,26 +565,36 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def target_logits(self, hidden_states: torch.Tensor, lm_head,
-                      logits_processor, attn_metadata, spec_metadata,
-                      draft_model) -> torch.Tensor:
-        """This rank's vocabulary shard of the target logits ([rows, V / tp]
-        in the LM head dtype) for an all-greedy or temperature-only batch:
-        the target tokens then come from one local-argmax + key-exchange
-        launch, without the all-gather and the fp32 cast."""
-        from ..modules.linear import TensorParallelMode
-        spec_metadata.sharded_target_logits = False
-        if (self._samples_sharded_target and (spec_metadata.is_all_greedy_sample
-                                              or spec_metadata.temperature_only)
-                and not spec_metadata.enable_penalty
-                and self.guided_decoder is None and self._d2t is None
-                and lm_head.tp_mode == TensorParallelMode.COLUMN
-                and lm_head.gather_output and lm_head.padding_size == 0):
-            if 1 <= hidden_states.shape[0] <= self.key_exchange.MAX_ROWS:
-                spec_metadata.sharded_target_logits = True
-                return lm_head(hidden_states, gather_output=False)
-        return super().target_logits(hidden_states, lm_head, logits_processor,
-                                     attn_metadata, spec_metadata, draft_model)
+    def _verifies_target_by_argmax(self) -> bool:
+        # Relaxed acceptance reads the target's top-k distribution.
+        return not getattr(self.spec_config,
+                           "use_relaxed_acceptance_for_thinking", False)
+
+    def _draft_head_shards(self, draft_model,
+                           advanced_draft_sampling: bool) -> bool:
+        """Whether an Eagle3 draft step projects only this rank's vocab shard
+        of its draft LM head: greedy draft tokens (no advanced draft
+        sampling, no guided decoding, which masks the full draft vocab) from
+        a plain logits processor over a vocab-sharded head. Host-side and
+        identical on every TP rank."""
+        return (self._vocab_parallel_argmax and not advanced_draft_sampling
+                and self.guided_decoder is None
+                and type(draft_model.logits_processor) is LogitsProcessor
+                and is_vocab_sharded_lm_head(draft_model.lm_head))
+
+    def _fused_draft_lm_head(self, draft_model):
+        # MTP Eagle projects with its MTP layer's shared head; only a plain
+        # one makes the draft logits the LM head's shard of the layer output.
+        # Eagle3 projects with its own (possibly reduced-vocab) head.
+        if self.is_mtp_eagle:
+            mtp_layers = getattr(draft_model, "mtp_layers", None)
+            if not mtp_layers or not is_plain_mtp_shared_head(
+                    mtp_layers[0].shared_head):
+                return None
+        elif type(getattr(draft_model, "logits_processor",
+                          None)) is not LogitsProcessor:
+            return None
+        return getattr(draft_model, "lm_head", None)
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
@@ -643,13 +660,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
-            outputs = self.skip_drafting(input_ids, position_ids, hidden_states,
-                                         logits, attn_metadata, spec_metadata,
-                                         draft_model)
-            # The skip path samples from, and returns, the same shard.
-            if spec_metadata.sharded_target_logits:
-                outputs['logits_vocab_shard'] = True
-            return outputs
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -779,16 +792,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 num_contexts,
             )
 
-        outputs = {
+        return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens,
         }
-        if spec_metadata.sharded_target_logits:
-            outputs['logits_vocab_shard'] = True
-        return outputs
 
     def _forward_external_shared_target_kv_draft_loop(
         self,
@@ -975,8 +985,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # TrtllmAttentionMetadata, and sparse metadata all derive from it.
                 draft_scope.callback(_reset_mtp_index_share, attn_metadata)
             draft_attn_metadata = draft_scope.enter_context(
-                self.draft_kv_cache_context(attn_metadata,
-                                            draft_kv_cache_manager))
+                self.draft_kv_cache_context(
+                    attn_metadata,
+                    draft_kv_cache_manager,
+                    enable_draft_locality_domain_forkjoin=True))
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
             if self.is_mtp_eagle and is_dsa_cache_manager(
@@ -1128,6 +1140,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # (streaming GEMV + fused shard argmax + key exchange); no
                 # draft logits are materialized.
                 draft_head = None
+                # Set where this step projects only this rank's vocab shard
+                # of the draft head, for the greedy sampler.
+                draft_logits_are_shard = None
+                fused_draft_head = None
                 if (self.is_mtp_eagle and not lm_head_tp_in_adp_configured
                         and not advanced_draft_sampling
                         and self.guided_decoder is None and self._d2t is None
@@ -1135,9 +1151,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         and self.draft_head.supports(
                             request_hidden_states.shape[0])):
                     draft_head = self.draft_head
+                elif not lm_head_tp_in_adp_configured:
+                    # BF16 LM-head shard GEMV + argmax + key exchange in one
+                    # launch; Eagle3 applies d2t after the global argmax.
+                    fused_draft_head = self._fused_draft_head_for(
+                        request_hidden_states.shape[0]
+                        if self.is_mtp_eagle else batch_size, spec_metadata)
                 if draft_head is not None:
                     new_draft_token = draft_head.sample(
                         request_hidden_states,
+                        out=token_buffer[i + 1]
+                        if token_buffer is not None else None)
+                    next_draft_tokens.append(new_draft_token)
+                elif fused_draft_head is not None:
+                    new_draft_token = self._fused_draft_tokens(
+                        fused_draft_head,
+                        request_hidden_states
+                        if self.is_mtp_eagle else hidden_states[output_rows],
                         out=token_buffer[i + 1]
                         if token_buffer is not None else None)
                     next_draft_tokens.append(new_draft_token)
@@ -1188,12 +1218,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         logits = draft_model.mtp_layers[0].shared_head(
                             request_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
+                elif self._draft_head_shards(draft_model,
+                                             advanced_draft_sampling):
+                    # This rank's vocab shard of the draft logits; the greedy
+                    # sampler takes the global argmax across the TP group and
+                    # then applies d2t.
+                    logits = draft_model.lm_head(hidden_states[output_rows],
+                                                 gather_output=False)
+                    draft_logits_are_shard = True
                 else:
                     logits = draft_model.logits_processor(
                         hidden_states[output_rows], draft_model.lm_head,
                         attn_metadata, True)
 
-                if draft_head is None:
+                if draft_head is None and fused_draft_head is None:
                     if self.guided_decoder is not None:
                         if self.is_mtp_eagle:
                             self.guided_decoder.execute_draft_batch(
@@ -1230,7 +1268,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         batch_size,
                         draft_step=i,
                         mapping_lm_head_tp=mapping_lm_head_tp,
-                        out=token_row)
+                        out=token_row,
+                        vocab_sharded=draft_logits_are_shard)
                     if use_lm_head_tp_in_adp:
                         new_draft_token = new_draft_token[:token_count]
                     if token_buffer is not None and token_row is None:

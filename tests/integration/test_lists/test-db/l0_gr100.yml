@@ -14,12 +14,33 @@ l0_gr100:
       backend: pytorch
   tests:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
+  # MiniMax-M3 family code shared with MiniMax-M3.1-Flash.
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/dspark
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_capture_norm.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_chunk_norm.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_draft_input.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_fold_tail.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_force_vec.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_slot_scatter.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_step_gather.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_add_rmsnorm_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_native_swiglu_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_tp_gumbel_draft_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_fixed_e8m0.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/kernels/megamoe
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/embedding
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/gemm
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/m3_moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/norm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_capture_boundary.py
@@ -31,7 +52,8 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/embedding
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/gemm
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/ops/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/ops/m3_moe
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/norm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/spec
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_modeling_v2_m3_capture_boundary.py
@@ -42,20 +64,64 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/embedding
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/gemm
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/norm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/spec
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_capture_boundary.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_dispatch.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_rank_agreement.py
+  # MiniMax-M3.1-Flash Rubin dep, tp2ctx and dep2ctx target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2ctx
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep2ctx
+  # MiniMax-M3.1-Flash sm_107 tp8 target: one entry per op directory plus its top-level GPU tests. Its helpers
+  # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 2 to 8 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/activation --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/attention --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/gemm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/moe --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/sampling --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m31_fc_shard.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/spec --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_fsel_topk_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_served_class.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m3_dispatch.py --import-mode=importlib
+  # MiniMax-M3.1-Flash sm_107 tp4 target: one entry per op directory plus its top-level GPU tests. Its helpers
+  # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 4 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/attention --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/moe --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/spec --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_m31_tp4_qkv_front_gpu.py --import-mode=importlib
+  # MiniMax-M3.1-Flash sm_107 tp2 target: one entry per op directory plus its top-level GPU tests. Its helpers
+  # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 2 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/activation --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/sampling --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/attention --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/gemm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/moe --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/spec --import-mode=importlib
+  # The family MSA attention (msa/): backend, indexer, prefill, prewarm and the NVFP4 index-K reader.
+  - unittest/_torch/modeling_v2/models/minimax_m3/msa
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - unittest/_torch/attention/test_fp4_mla.py
   - unittest/_torch/attention/test_fp4_mla_packed.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
+  # DeepSeek-V4.1 on SM107: query/prefill GEMMs, Top-K routing and packed schedules in CUDA graphs.
+  - unittest/_torch/attention/sparse/csa2/test_query_projection.py
+  - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_topk_opt_in_native_and_graph
+  - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_packed_prefill_logits_schedule_matches_grid_stride
+  - unittest/_torch/kernels/parallel/test_gvr_selfsampling_topk.py TIMEOUT (90)
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_prefill_linear_matches_reference
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_o_b_loaded_tactic_graph
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py
+  # CuteDSL MoE locality-domain split (NVFP4/BF16 grouped GEMM): module lifecycle and forward.
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_locality_domain_correctness_rubin
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_locality_domain_lifecycle_and_forward_rubin
   - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py::test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay
   - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
@@ -97,11 +163,56 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/dsa
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/embedding
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/gemm
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/moe
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/quantization
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/ops/gemm
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/ops/moe
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/ops/quantization
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec
   - unittest/_torch/visual_gen/kernels/parallel/test_fmha_dense_fp8.py
   - unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_qk_norm_rope_fp8.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput
   # Kimi K3 MXFP8 shared experts (fused FC12 and two-GEMM path).
   - unittest/_torch/modules/test_mxfp8_fused_mlp.py
+  # The Kimi K3 Rubin target's unit tests, one entry per op directory plus its
+  # top-level files; core/ and ops/gemm/ are listed per file because their
+  # all-reduce and GEMM-push tests run several ranks. The multi-rank tests
+  # (comm/, core all-reduce, ops/gemm push) are in l0_gb300_multi_gpus until
+  # there is a multi-GPU GR100 stage. Its cpu_only cases are in l0_cpu.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_fp4_mla
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_helix
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_kda
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_mla_ctx
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_mla_q
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_moe
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_spec
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_state_upload
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/cache/test_k3_sm107_cache_manager.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_fp4_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_mla_latent_row.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_rmsnorm_release_at_launch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_fp8w_gemm_cells.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_mxfp8_gemm_fp8_out.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_k3_moe_entry_cells.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3r_experts.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_k3_attn_res_norm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_dspark_mla_rope.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_markov_entries.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_spec_tail_entries.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_vocab_parallel_entries.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_fused_kda_conv_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_fused_kda_post_conv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_k3_kda_fab.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_k3_l2_prefetch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_kda_decode_fused_fab.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_kda_mtp_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_kda_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated/test_k3r_rms_norm_gated.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_core_linear.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_core_mxfp8_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/common/test_core_norm_mlp_embedding.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_engine_probes.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1

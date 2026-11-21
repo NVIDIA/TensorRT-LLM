@@ -19,11 +19,12 @@ l0_gb300:
       backend: pytorch
   tests:
   # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_fixed_e8m0.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/embedding
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/gemm
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/norm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/spec
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_capture_boundary.py
@@ -34,7 +35,7 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/embedding
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/gemm
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/norm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/spec
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_capture_boundary.py
@@ -42,6 +43,8 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_prebuild.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_rank_agreement.py
   # ------------- PyTorch tests ---------------
+  # EPLB host-accessible memory takes the GPU NUMA path on Grace Blackwell; checks its memory-monitor records.
+  - unittest/_torch/memory/test_memory_monitor_native.py::test_eplb_host_accessible_memory_is_recorded
   # MLA context head slices, including FP8 scale-block boundaries.
   - unittest/_torch/modules/test_linear_output_slice.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
@@ -146,9 +149,10 @@ l0_gb300:
   # DSpark Markov chain and forked draft prep over IPC and MNNVL.
   - unittest/_torch/speculative/test_dspark_markov_chain.py
   - unittest/_torch/multi_gpu/test_dspark_draft_prep.py
-  # NVFP4 DSpark accuracy and acceptance gates cover TP4 and attention-DP4.
+  # NVFP4 DSpark accuracy and acceptance gates cover TP4 and attention-DP4; attention-DP4 runs the
+  # 1017 export with MXFP4 Engram tables (its FP8-table variant runs post-merge).
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-1017-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
   # Exact LongBench v2 offload parity: TP2/EP2 context and generation workers. Pre-merge
   # keeps GLM with an NVFP4 latent and V4 with block reuse; the FP8 variants run post-merge
@@ -165,8 +169,16 @@ l0_gb300:
   - unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
   - unittest/_torch/multi_gpu/test_ll_exchange.py
+  # qwen4_exp FP8 target, pre-merge: its 2- and 4-rank collective matrices (l0_b300 skips them),
+  # tep4 MTP3 over an FP8 KV pool, and tep4 MTP3 with IndexShare over 3k-6k-token pass keys (the
+  # sparse attention path) with their acceptance-length floor. dep4 and dep2 disaggregated run
+  # post-merge.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/comm
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_long_context TIMEOUT (60)
 
-# K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
+# K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
+# NVLink domain.
 - condition:
     ranges:
       system_gpu_count:
@@ -182,22 +194,27 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16/test_k3_megamoe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_latent_reduce.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_markov/test_k3_markov.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_markov/test_k3_markov.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_k3_mnnvl_comm.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_moe_front.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_fused_moe_push.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_push.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/kernels/k3_moe_engines/test_k3_moe_push.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_sandwich/test_k3_sandwich.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_spec_accept/test_k3_spec_accept_sharded.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_spec_accept/test_k3_spec_accept_sharded.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_latent_reduce_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3_moe_front_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_sandwich_plain_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp4ep4_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_mcast_workspace_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_spec_accept_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_markov_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp16ep1_op_matrix.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_decode_moe_tp16_moetp16ep1_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_allreduce_op_matrix.py

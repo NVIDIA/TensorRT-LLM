@@ -855,7 +855,8 @@ def test_context_parallelism_mapping_keeps_cp_config():
         "cp_type": CpType.HELIX,
         "tokens_per_block": 32
     }
-    assert not args._kv_cache_estimation_runs()
+    # Aggregated Helix (no cache transceiver) profiles a forward to size KV.
+    assert args._kv_cache_estimation_runs()
 
 
 @pytest.mark.cpu_only
@@ -963,6 +964,23 @@ kv_cache_config:
         llm_args = TorchLlmArgs.from_yaml(yaml_path)
 
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
+
+    def test_from_yaml_enable_locality_domains(self, tmp_path):
+        assert TorchLlmArgs(
+            model=llama_model_path).enable_locality_domains is False
+
+        yaml_path = tmp_path / "locality_domains.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump({
+                "model": str(llama_model_path),
+                "enable_locality_domains": True,
+            }),
+            encoding="utf-8",
+        )
+
+        llm_args = TorchLlmArgs.from_yaml(yaml_path)
+
+        assert llm_args.enable_locality_domains is True
 
     def test_from_yaml_empty_file_reports_missing_model(self, tmp_path):
         yaml_path = tmp_path / "empty.yaml"
@@ -1333,6 +1351,22 @@ def test_dspark_requires_positive_max_draft_len(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_dspark_ancestral_draft_sampling_rejects_embedded_drafter(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type": "deepseek_v4"}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    use_rejection_sampling=True,
+                                    use_ancestral_draft_sampling=True)
+
+    with pytest.raises(ValueError, match="drafter embedded in the target"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+@pytest.mark.cpu_only
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
     """post_processor_hook + skip_tokenizer_init must fail fast.
 
@@ -1374,6 +1408,106 @@ class TestModelDefaults:
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
+
+    def test_applied_defaults_leave_other_fields_unset(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model", max_batch_size=8)
+        before = set(llm_args.model_fields_set)
+        apply_model_defaults_to_llm_args(llm_args, {
+            "enable_chunked_prefill": False,
+            "max_batch_size": 4,
+        })
+        assert llm_args.max_batch_size == 8
+        assert not llm_args.enable_chunked_prefill
+        assert llm_args.model_fields_set == before | {"enable_chunked_prefill"}
+        assert "modeling_v2" not in llm_args.model_fields_set
+
+    def test_applied_defaults_leave_nested_fields_unset(self):
+        """Nested configs keep only the fields the user set or a default applied."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config={"free_gpu_memory_fraction": 0.5},
+            sparse_attention_config={
+                "algorithm": "deepseek_v4",
+                "index_n_heads": 64,
+            },
+        )
+        sparse_before = set(llm_args.sparse_attention_config.model_fields_set)
+        assert "index_topk" not in sparse_before
+        scheduler_before = set(llm_args.scheduler_config.model_fields_set)
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "kv_cache_config": {
+                    "tokens_per_block": 128,
+                    "free_gpu_memory_fraction": 0.9,
+                }
+            })
+        assert llm_args.kv_cache_config.free_gpu_memory_fraction == 0.5
+        assert llm_args.kv_cache_config.tokens_per_block == 128
+        assert llm_args.kv_cache_config.model_fields_set == {
+            "free_gpu_memory_fraction", "tokens_per_block"
+        }
+        assert llm_args.sparse_attention_config.model_fields_set == sparse_before
+        assert llm_args.scheduler_config.model_fields_set == scheduler_before
+
+    def test_applied_defaults_leave_configs_in_containers_unset(self):
+        """Configs held in a dict keep only the fields the user set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                multimodal_config={
+                                    "encoder_side_stream_max_ahead": 0,
+                                    "encoder_cuda_graph": {
+                                        "image": {
+                                            "max_batch_size": 4
+                                        }
+                                    },
+                                })
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"enable_chunked_prefill": False})
+        image = llm_args.multimodal_config.encoder_cuda_graph["image"]
+        assert image.max_batch_size == 4
+        assert image.model_fields_set == {"max_batch_size"}
+
+    def test_config_object_default_keeps_its_nested_fields_set(self):
+        """A default given as a config object counts its nested fields as set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "scheduler_config":
+                SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+            })
+        scheduler_config = llm_args.scheduler_config
+        assert scheduler_config.gen_preemption.tpot_budget == 0.1
+        assert scheduler_config.model_fields_set == {"gen_preemption"}
+        assert scheduler_config.gen_preemption.model_fields_set == {
+            "tpot_budget"
+        }
+        assert llm_args.model_dump(exclude_unset=True)["scheduler_config"] == {
+            "gen_preemption": {
+                "tpot_budget": 0.1
+            }
+        }
+
+    def test_empty_nested_default_counts_as_set(self):
+        """An empty nested default still counts as set.
+
+        It constructs the config, so the field must survive
+        ``model_dump(exclude_unset=True)``.
+        """
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert llm_args.attention_dp_config is None
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {"attention_dp_config": {}}
+        assert llm_args.attention_dp_config is not None
+        assert "attention_dp_config" in llm_args.model_fields_set
+        assert "attention_dp_config" in llm_args.model_dump(exclude_unset=True)
+
+    def test_empty_nested_default_under_a_user_setting_applies_nothing(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                attention_dp_config={"enable_balance": True})
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {}
+        assert llm_args.attention_dp_config.enable_balance
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -1921,6 +2055,10 @@ def test_KvCacheConfig_declaration(offload_field):
         BlockReuseConfig(policy="invalid")
     with pytest.raises(ValidationError):
         BlockReuseConfig(max_num_turns=0)
+    assert BlockReuseConfig(policy="per_conversation",
+                            drop_extended_turns=True).drop_extended_turns
+    with pytest.raises(ValidationError, match="drop_extended_turns"):
+        BlockReuseConfig(drop_extended_turns=True)
 
 
 @pytest.mark.cpu_only
@@ -6797,6 +6935,26 @@ class TestDSparkConfidenceScheduling:
         with pytest.raises(ValidationError,
                            match="confidence_min_predicted_gain"):
             self._scheduled(confidence_min_predicted_gain=-0.01)
+
+    @pytest.mark.parametrize("kw", [
+        {
+            "draft_len_schedule": {
+                4: 5,
+                8: 2
+            }
+        },
+        {
+            "max_concurrency": 8
+        },
+    ])
+    def test_scheduling_excludes_a_draft_len_schedule(self, kw):
+        with pytest.raises(ValueError,
+                           match="draft_len_schedule or max_concurrency"):
+            self._scheduled(**kw)
+
+    def test_draft_len_schedule_is_accepted_without_scheduling(self):
+        c = self._cfg(draft_len_schedule={8: 2, 4: 5})
+        assert c.draft_len_schedule == {4: 5, 8: 2}
 
     @pytest.mark.parametrize("field", [
         "validate_confidence_artifact_freshness",

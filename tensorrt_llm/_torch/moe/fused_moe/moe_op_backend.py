@@ -174,6 +174,8 @@ class MoEOpBackend:
         decode_early_release_rows: int = 0,
         decode_spare_sms: int = 0,
         routing_tables: Optional[MoERoutingTables] = None,
+        cute_fc2_rows: int = 0,
+        dynamic_experts: int = 0,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
         computed (native op backend only). ``decode_tuning``: the native NVFP4 op
@@ -182,7 +184,11 @@ class MoEOpBackend:
         ``lamport_fc2_out`` / ``decode_early_release_rows`` /
         ``decode_spare_sms``: see ``fp4_block_scale_moe_decode_runner``.
         ``routing_tables`` replace the kernel's routing pass for tactics of their tiles
-        (calls without the decode kernels only).
+        (calls without the decode kernels only). ``cute_fc2_rows``: the model's
+        ``MoEDecodeOptions.cute_fc2_rows`` for the native NVFP4 op.
+        ``dynamic_experts`` > 0: the per-expert inputs hold that many experts, of which
+        ``[local_expert_offset, local_expert_offset + local_num_experts)`` is this rank's static
+        slot range, and ``routing_tables`` assign this call's share of all of them.
         """
         raise NotImplementedError
 
@@ -360,6 +366,8 @@ class TRTLLMOpBackend(MoEOpBackend):
         decode_early_release_rows=0,
         decode_spare_sms=0,
         routing_tables=None,
+        cute_fc2_rows=0,
+        dynamic_experts=0,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -442,8 +450,10 @@ class TRTLLMOpBackend(MoEOpBackend):
                     or isinstance(prerouted, EngineRouting)
                 )
                 if decode_call:
-                    if routing_tables is not None:
-                        raise ValueError("routing tables do not combine with the decode kernels")
+                    if routing_tables is not None or dynamic_experts:
+                        raise ValueError(
+                            "routing tables and dynamic experts do not combine with the decode kernels"
+                        )
                     fp4_op = torch.ops.trtllm.fp4_block_scale_moe_decode_runner
                     op_kwargs = dict(
                         prerouted_candidates=(
@@ -461,6 +471,9 @@ class TRTLLMOpBackend(MoEOpBackend):
                         routing_tiles=None
                         if routing_tables is None
                         else list(routing_tables.tiles),
+                        routing_max_ctas=0 if routing_tables is None else routing_tables.max_ctas,
+                        cute_fc2_rows=cute_fc2_rows,
+                        dynamic_experts=dynamic_experts,
                     )
                 outputs = fp4_op(
                     router_logits,

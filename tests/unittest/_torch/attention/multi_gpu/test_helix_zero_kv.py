@@ -22,6 +22,7 @@ mask is withheld. A single-process case checks that the native op rejects a
 mask on another device than its inputs.
 """
 
+import math
 import pickle
 import sys
 import time
@@ -116,6 +117,7 @@ def _zero_kv_rank(
     comms_medium: str,
     use_cuda_graph: bool,
     withhold_mask: bool,
+    is_lse: bool,
 ) -> tuple[int, float]:
     """Run one rank and return its output NaN count and maximum reference error."""
     comm = tensorrt_llm.mpi_comm()
@@ -138,6 +140,8 @@ def _zero_kv_rank(
     all_stats = [torch.from_numpy(value) for value in comm.allgather(stats.cpu().numpy())]
     all_mask = [torch.from_numpy(value) for value in comm.allgather(mask.cpu().numpy())]
     reference = _reference(all_o, all_stats, all_mask, rank, world_size).to(device)
+    if is_lse:
+        stats = ((stats[..., 0] + stats[..., 1].log()) / math.log(2)).unsqueeze(-1)
 
     use_nccl_for_alltoall, fifo_version = parse_comms_medium(comms_medium)
     mapping = Mapping(
@@ -164,6 +168,8 @@ def _zero_kv_rank(
                     NUM_HEADS,
                     VALUE_DIM,
                     zero_kv_mask=zero_kv_mask,
+                    is_cuda_graph=True,
+                    is_lse=is_lse,
                 )
         torch.cuda.current_stream().wait_stream(side_stream)
         torch.cuda.synchronize()
@@ -177,6 +183,8 @@ def _zero_kv_rank(
                 NUM_HEADS,
                 VALUE_DIM,
                 zero_kv_mask=zero_kv_mask,
+                is_cuda_graph=True,
+                is_lse=is_lse,
             )
         torch.cuda.synchronize()
         _bounded_barrier(comm, "after capture")
@@ -190,6 +198,7 @@ def _zero_kv_rank(
             NUM_HEADS,
             VALUE_DIM,
             zero_kv_mask=zero_kv_mask,
+            is_lse=is_lse,
         )
 
     output = output.double()
@@ -204,9 +213,18 @@ def _launch(
     *,
     use_cuda_graph: bool = False,
     withhold_mask: bool = False,
+    is_lse: bool = False,
 ) -> list[tuple[int, float]]:
     """Run the regression on both ranks and collect their results."""
-    args = (_zero_kv_rank, WORLD_SIZE, num_tokens, comms_medium, use_cuda_graph, withhold_mask)
+    args = (
+        _zero_kv_rank,
+        WORLD_SIZE,
+        num_tokens,
+        comms_medium,
+        use_cuda_graph,
+        withhold_mask,
+        is_lse,
+    )
     with MPIPoolExecutor(max_workers=WORLD_SIZE) as executor:
         return list(executor.map(run_single_rank, *zip(*[args] * WORLD_SIZE)))
 
@@ -223,17 +241,22 @@ def _assert_neutral(results: list[tuple[int, float]]) -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @skip_pre_blackwell
-@pytest.mark.parametrize(("comms_medium", "num_tokens"), [("nccl", 17), ("fifo_v2", 17)])
-def test_zero_kv_rows_are_neutral(comms_medium: str, num_tokens: int) -> None:
+@pytest.mark.parametrize(
+    ("comms_medium", "num_tokens", "is_lse"),
+    [("nccl", 17, False), ("fifo_v2", 17, False), ("nccl", 17, True), ("fifo_v1", 17, True)],
+)
+def test_zero_kv_rows_are_neutral(comms_medium: str, num_tokens: int, is_lse: bool) -> None:
     """Masked rows must contribute nothing on both optimized exchange paths."""
-    _assert_neutral(_launch(num_tokens, comms_medium))
+    _assert_neutral(_launch(num_tokens, comms_medium, is_lse=is_lse))
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @skip_pre_blackwell
-def test_zero_kv_rows_are_neutral_under_cuda_graph() -> None:
-    """The fifo-v2 sender must preserve the contract under graph replay."""
-    _assert_neutral(_launch(96, "fifo_v2", use_cuda_graph=True))
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v2"])
+@pytest.mark.parametrize("is_lse", [False, True], ids=["max-sum", "lse"])
+def test_zero_kv_rows_are_neutral_under_cuda_graph(comms_medium: str, is_lse: bool) -> None:
+    """The compiled NCCL reformat and the fifo-v2 sender must hold under graph replay."""
+    _assert_neutral(_launch(96, comms_medium, use_cuda_graph=True, is_lse=is_lse))
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")

@@ -90,6 +90,9 @@ _MAP_BITMAP_COLUMNS = 1 << 16
 # Index page-footer geometry of quantization.py in 32-bit words: 64 rows of
 # 16 data words, then one scale word per row.
 INDEX_PAGE_ROWS = 64
+# Flag (bits 31..30 = 01) of an unallocated page's DeepGEMM paged-logits block-table entry: DeepGEMM
+# loads the low bits' page and writes -inf below the row's context length.
+DEEPGEMM_MASKED_PAGE = 1 << 30
 INDEX_ROW_WORDS = 16
 INDEX_PAGE_WORDS = INDEX_PAGE_ROWS * (INDEX_ROW_WORDS + 1)
 # Packed prefill piece: request, key width, key offset, first query row, row in group.
@@ -145,11 +148,12 @@ def _glue_kernels():
 
     @cute.jit
     def tensor1d(ptr: cute.Pointer, count: Int64):
-        return cute.make_tensor(ptr, cute.make_layout(count))
+        # Keep offsets beyond 2 GiB in 64 bits on CuTe DSL builds with 32-bit default strides.
+        return cute.make_tensor(ptr, cute.make_layout(count, stride=Int64(1)))
 
     @cute.jit
     def tensor2d(ptr: cute.Pointer, rows: Int64, cols: Int64, row_stride: Int64):
-        return cute.make_tensor(ptr, cute.make_layout((rows, cols), stride=(row_stride, 1)))
+        return cute.make_tensor(ptr, cute.make_layout((rows, cols), stride=(row_stride, Int64(1))))
 
     @cute.jit
     def _int32_ptr(address: Int64):
@@ -672,14 +676,16 @@ def _glue_kernels():
 
         Each thread writes ``PAGES`` native pages of a query, one per ``THREADS``
         stride: its block-table entry and one validity byte that is set when the
-        page is allocated.
+        page is allocated. With ``masked`` it also writes the table with an admitted
+        query's unallocated pages flagged ``DEEPGEMM_MASKED_PAGE``.
         """
 
         THREADS = 128
         PAGES = 4
 
-        def __init__(self, pages_per_source_page: int):
+        def __init__(self, pages_per_source_page: int, masked: bool = False):
             self.pages_per_source_page = pages_per_source_page
+            self.masked = masked
 
         @cute.jit
         def __call__(
@@ -691,6 +697,7 @@ def _glue_kernels():
             context: cute.Pointer,  # int32 [count, 1] (out)
             visible: cute.Pointer,  # int32 [count] (out)
             valid: cute.Pointer,  # uint8 [count, page_capacity] strided (out)
+            masked_blocks: cute.Pointer,  # int32 laid out as ``blocks`` (out, ``masked``)
             count: Int32,
             request_count: Int32,
             source_pages: Int32,
@@ -710,6 +717,7 @@ def _glue_kernels():
                 context,
                 visible,
                 valid,
+                masked_blocks,
                 count,
                 request_count,
                 source_pages,
@@ -734,6 +742,7 @@ def _glue_kernels():
             context: cute.Pointer,
             visible: cute.Pointer,
             valid: cute.Pointer,
+            masked_blocks: cute.Pointer,
             count: Int32,
             request_count: Int32,
             source_pages: Int32,
@@ -773,6 +782,13 @@ def _glue_kernels():
                             backed = cutlass.Uint8(1)
                     tensor2d(blocks, n, Int64(page_capacity), blocks_stride)[q, index] = native
                     tensor2d(valid, n, Int64(page_capacity), valid_stride)[q, index] = backed
+                    if cutlass.const_expr(self.masked):
+                        entry = native
+                        if admitted & (backed == cutlass.Uint8(0)):
+                            entry = native | Int32(DEEPGEMM_MASKED_PAGE)
+                        tensor2d(masked_blocks, n, Int64(page_capacity), blocks_stride)[
+                            q, index
+                        ] = entry
             if (chunk == 0) & (tid == 0):
                 tensor1d(visible, n)[q] = end
                 clamped = end
@@ -780,15 +796,105 @@ def _glue_kernels():
                     clamped = Int32(1)
                 tensor1d(context, n)[q] = clamped
 
+    @dsl_user_op
+    def prefetch_l2_bulk(addr, nbytes, *, loc=None, ip=None):
+        llvm.inline_asm(
+            None,
+            [Int64(addr).ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
+            "cp.async.bulk.prefetch.L2.global [$0], $1;",
+            "l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    class CandidateBlockPrefetchKernel:
+        """L2 prefetch of each decode row's published candidate blocks (``block_rows`` index rows:
+        data, then scales) in its block table's native pages, over ``CTAS`` CTAs per row."""
+
+        THREADS = 128
+        CTAS = 16
+
+        def __init__(self, block_rows: int):
+            self.block_rows = block_rows
+
+        @cute.jit
+        def __call__(
+            self,
+            pages: cute.Pointer,  # uint8 index pages, ``page_stride`` bytes apart
+            table: cute.Pointer,  # int32 [rows, table_width] strided
+            blocks: cute.Pointer,  # int32 [rows, block_capacity] strided
+            counts: cute.Pointer,  # int32 [rows] candidate columns
+            rows: Int32,
+            table_width: Int32,
+            table_stride: Int64,
+            block_capacity: Int32,
+            blocks_stride: Int64,
+            page_stride: Int64,
+            stream: cuda.CUstream,
+        ):
+            self.kernel(
+                pages,
+                table,
+                blocks,
+                counts,
+                rows,
+                table_width,
+                table_stride,
+                block_capacity,
+                blocks_stride,
+                page_stride,
+            ).launch(grid=[rows, self.CTAS, 1], block=[self.THREADS, 1, 1], stream=stream)
+
+        @cute.kernel
+        def kernel(
+            self,
+            pages: cute.Pointer,
+            table: cute.Pointer,
+            blocks: cute.Pointer,
+            counts: cute.Pointer,
+            rows: Int32,
+            table_width: Int32,
+            table_stride: Int64,
+            block_capacity: Int32,
+            blocks_stride: Int64,
+            page_stride: Int64,
+        ):
+            tid, _, _ = cute.arch.thread_idx()
+            row, cta, _ = cute.arch.block_idx()
+            block_rows = self.block_rows
+            per_page = INDEX_PAGE_ROWS // block_rows
+            used = (Int32(tensor1d(counts, Int64(rows))[row]) + (block_rows - 1)) // block_rows
+            if used > block_capacity:
+                used = block_capacity
+            ids = tensor2d(blocks, Int64(rows), Int64(block_capacity), blocks_stride)
+            table_t = tensor2d(table, Int64(rows), Int64(table_width), table_stride)
+            base = pages.toint()
+            for j in cutlass.range(cta + self.CTAS * tid, used, self.CTAS * self.THREADS):
+                block = Int32(ids[row, j])
+                page = base + Int64(table_t[row, block // per_page]) * page_stride
+                offset = block % per_page
+                prefetch_l2_bulk(page + Int64(offset * block_rows * 64), block_rows * 64)
+                prefetch_l2_bulk(
+                    page + Int64(INDEX_PAGE_ROWS * 64 + offset * block_rows * 4), block_rows * 4
+                )
+
     # ------------------------------------- K4: map Top-K candidate offsets
 
     class MaskLogitsKernel:
         """Mask unallocated pages among each row's leading ``row_lengths`` columns of
         ``[count, width]`` logits, one page per thread under its validity byte.
+
+        With ``pdl`` it releases its dependents first and waits before any load.
         """
 
         THREADS = 256
         COLUMNS = INDEX_PAGE_ROWS
+
+        def __init__(self, pdl: bool = False):
+            self.pdl = pdl
 
         @cute.jit
         def __call__(
@@ -809,6 +915,7 @@ def _glue_kernels():
                 grid=[count, (width + span - 1) // span, 1],
                 block=[self.THREADS, 1, 1],
                 stream=stream,
+                use_pdl=self.pdl,
             )
 
         @cute.kernel
@@ -822,6 +929,9 @@ def _glue_kernels():
             logits_stride: Int64,
             valid_stride: Int64,
         ):
+            if cutlass.const_expr(self.pdl):
+                griddepcontrol_launch_dependents()
+                griddepcontrol_wait()
             tid, _, _ = cute.arch.thread_idx()
             q, chunk, _ = cute.arch.block_idx()
             logits_t = tensor2d(logits, Int64(count), Int64(width), logits_stride)
@@ -1188,6 +1298,144 @@ def _glue_kernels():
                 if key == Int32(_INT32_MAX):
                     key = Int32(-1)
                 indices_t[q, k] = key
+
+    class FinalizeShuffleSelectionKernel:
+        """``FinalizeSelectionKernel``'s paged sort (same output) with the bitonic network in
+        registers and shuffles; with ``pdl`` it waits before any load and releases right after."""
+
+        def __init__(self, top_k: int, pdl: bool):
+            if top_k <= 0 or top_k > 2048:
+                raise ValueError("CSA2 shuffle finalize supports 1..2048 selections")
+            self.top_k = top_k
+            self.padded = max(64, 1 << (top_k - 1).bit_length())
+            self.threads = self.padded // 2
+            self.pdl = pdl
+            rounds = []
+            size = 2
+            while size <= self.padded:
+                stride = size // 2
+                while stride >= 1:
+                    rounds.append((size, stride))
+                    stride //= 2
+                size *= 2
+            self.rounds = tuple(rounds)
+
+        @cute.jit
+        def __call__(
+            self,
+            indices: cute.Pointer,  # int32 [count, top_k] strided (in/out)
+            valid: cute.Pointer,  # uint8 [count, pages] strided, one byte per page
+            lengths: cute.Pointer,  # int32 [count] visible prefix lengths
+            count: Int32,
+            width: Int32,
+            indices_stride: Int64,
+            valid_stride: Int64,
+            stream: cuda.CUstream,
+        ):
+            self.kernel(indices, valid, lengths, count, width, indices_stride, valid_stride).launch(
+                grid=[count, 1, 1],
+                block=[self.threads, 1, 1],
+                stream=stream,
+                use_pdl=self.pdl,
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            indices: cute.Pointer,
+            valid: cute.Pointer,
+            lengths: cute.Pointer,
+            count: Int32,
+            width: Int32,
+            indices_stride: Int64,
+            valid_stride: Int64,
+        ):
+            if cutlass.const_expr(self.pdl):
+                griddepcontrol_wait()
+                griddepcontrol_launch_dependents()
+            tid, _, _ = cute.arch.thread_idx()
+            q, _, _ = cute.arch.block_idx()
+            smem = SmemAllocator()
+            exchange = smem.allocate_tensor(Int32, cute.make_layout(2 * self.padded), 16)
+            n = Int64(count)
+            indices_t = tensor2d(indices, n, Int64(self.top_k), indices_stride)
+            valid_t = tensor1d(valid, Int64(2**62))
+            limit = width
+            length = Int32(tensor1d(lengths, n)[q])
+            if length < limit:
+                limit = length
+            key0 = Int32(_INT32_MAX)
+            key1 = Int32(_INT32_MAX)
+            for r in cutlass.range_constexpr(2):
+                k = 2 * tid + r
+                key = Int32(_INT32_MAX)
+                if k < self.top_k:
+                    offset = Int32(indices_t[q, k])
+                    if (offset >= 0) & (offset < limit):
+                        page = Int64(q) * valid_stride + Int64(offset // INDEX_PAGE_ROWS)
+                        if cutlass.Uint8(valid_t[page]) != 0:
+                            key = offset
+                if cutlass.const_expr(r == 0):
+                    key0 = key
+                else:
+                    key1 = key
+            buffer = 0
+            for round_index in cutlass.range_constexpr(len(self.rounds)):
+                size, stride = self.rounds[round_index]
+                ascending = ((2 * tid) & size) == 0
+                if cutlass.const_expr(stride == 1):
+                    lo = key0
+                    hi = key1
+                    if key1 < key0:
+                        lo = key1
+                        hi = key0
+                    if ascending:
+                        key0 = lo
+                        key1 = hi
+                    else:
+                        key0 = hi
+                        key1 = lo
+                else:
+                    half = stride // 2
+                    keep_min = ((tid & half) == 0) == ascending
+                    if cutlass.const_expr(stride <= 32):
+                        other0 = cute.arch.shuffle_sync_bfly(key0, offset=half)
+                        other1 = cute.arch.shuffle_sync_bfly(key1, offset=half)
+                    else:
+                        # Halves alternate per round, so one barrier per round orders the exchange.
+                        base = buffer * self.padded
+                        exchange[base + 2 * tid] = key0
+                        exchange[base + 2 * tid + 1] = key1
+                        cute.arch.barrier()
+                        partner = tid ^ half
+                        other0 = exchange[base + 2 * partner]
+                        other1 = exchange[base + 2 * partner + 1]
+                        buffer = 1 - buffer
+                    lo0 = key0
+                    hi0 = other0
+                    if other0 < key0:
+                        lo0 = other0
+                        hi0 = key0
+                    lo1 = key1
+                    hi1 = other1
+                    if other1 < key1:
+                        lo1 = other1
+                        hi1 = key1
+                    if keep_min:
+                        key0 = lo0
+                        key1 = lo1
+                    else:
+                        key0 = hi0
+                        key1 = hi1
+            for r in cutlass.range_constexpr(2):
+                k = 2 * tid + r
+                if k < self.top_k:
+                    key = key1
+                    if cutlass.const_expr(r == 0):
+                        key = key0
+                    if key == Int32(_INT32_MAX):
+                        key = Int32(-1)
+                    indices_t[q, k] = key
 
     class PackedSortFinalizeKernel:
         """``FinalizeSelectionKernel``'s packed bitmap mode (rows up to ``_FINALIZE_BITMAP_COLUMNS``
@@ -2032,10 +2280,12 @@ def _glue_kernels():
     ns.TableCopyKernel = TableCopyKernel
     ns.OwnerSlotsKernel = OwnerSlotsKernel
     ns.IndexerDescriptorsKernel = IndexerDescriptorsKernel
+    ns.CandidateBlockPrefetchKernel = CandidateBlockPrefetchKernel
     ns.MaskLogitsKernel = MaskLogitsKernel
     ns.MaskPackedLogitsKernel = MaskPackedLogitsKernel
     ns.CandidateGatherKernel = CandidateGatherKernel
     ns.FinalizeSelectionKernel = FinalizeSelectionKernel
+    ns.FinalizeShuffleSelectionKernel = FinalizeShuffleSelectionKernel
     ns.PackedSortFinalizeKernel = PackedSortFinalizeKernel
     ns.MapSelectionKernel = MapSelectionKernel
     ns.PrefixGatherKernel = PrefixGatherKernel
@@ -2473,6 +2723,7 @@ def fill_indexer_descriptors(
     context: torch.Tensor,
     visible: torch.Tensor,
     valid: torch.Tensor,
+    masked_blocks: torch.Tensor | None = None,
 ) -> None:
     """Device implementation of ``CSA2TrtllmMetadata._fill_indexer_descriptors``."""
     count = int(blocks.shape[0])
@@ -2494,11 +2745,19 @@ def fill_indexer_descriptors(
         valid.dtype == torch.bool and valid.stride(1) == 1 and valid.shape[1] >= page_capacity,
         "valid",
     )
+    masked = masked_blocks is not None
+    if masked:
+        _check(
+            masked_blocks.dtype == torch.int32
+            and masked_blocks.shape == blocks.shape
+            and masked_blocks.stride() == blocks.stride(),
+            "masked blocks",
+        )
     ns = _glue_kernels()
     per_cta = ns.IndexerDescriptorsKernel.THREADS * ns.IndexerDescriptorsKernel.PAGES
     _launch(
-        ("indexer_descriptors", blocks.device.index, int(pages_per_source_page)),
-        lambda: ns.IndexerDescriptorsKernel(int(pages_per_source_page)),
+        ("indexer_descriptors", blocks.device.index, int(pages_per_source_page), masked),
+        lambda: ns.IndexerDescriptorsKernel(int(pages_per_source_page), masked),
         _ptr(table),
         _ptr(token_requests, align=8),
         _ptr(decode_visible, align=8),
@@ -2506,6 +2765,7 @@ def fill_indexer_descriptors(
         _ptr(context),
         _ptr(visible),
         _ptr(valid, torch.uint8, align=1),
+        _ptr(masked_blocks if masked else blocks),
         count,
         int(table.shape[0]),
         int(table.shape[1]),
@@ -2519,16 +2779,65 @@ def fill_indexer_descriptors(
     )
 
 
+def prefetch_candidate_blocks_(
+    pages: torch.Tensor,
+    table: torch.Tensor,
+    blocks: torch.Tensor,
+    counts: torch.Tensor,
+    block_rows: int,
+) -> None:
+    """Start reading into L2 the native index rows (data and scales) of each decode row's
+    published candidate ``blocks`` below its ``counts`` columns (``CandidateBlockPrefetchKernel``)."""
+    rows = int(blocks.shape[0])
+    if rows == 0:
+        return
+    _check(
+        pages.dim() == 4
+        and pages.shape[1] == INDEX_PAGE_ROWS
+        and pages.stride(1) == pages.shape[3]
+        and pages.stride(3) == 1
+        and pages.element_size() == 1
+        and pages.stride(0) % 16 == 0,
+        "native index pages",
+    )
+    # Whole 16-byte bulk copies: a block's rows of 64 data bytes, then of 4 scale bytes.
+    _check(block_rows in (4, 8, 16, 32, 64), "block rows")
+    _check(table.dtype == torch.int32 and table.stride(1) == 1 and table.shape[0] >= rows, "table")
+    _check(blocks.dtype == torch.int32 and blocks.stride(1) == 1, "blocks")
+    _check(
+        counts.dtype == torch.int32 and counts.is_contiguous() and counts.numel() >= rows,
+        "counts",
+    )
+    ns = _glue_kernels()
+    _launch(
+        ("candidate_block_prefetch", blocks.device.index, int(block_rows)),
+        lambda: ns.CandidateBlockPrefetchKernel(int(block_rows)),
+        _ptr(pages, torch.uint8, align=16),
+        _ptr(table),
+        _ptr(blocks),
+        _ptr(counts),
+        rows,
+        int(table.shape[1]),
+        int(table.stride(0)),
+        int(blocks.shape[1]),
+        int(blocks.stride(0)),
+        int(pages.stride(0)),
+        _stream(blocks.device),
+    )
+
+
 def mask_logits_(
     logits: torch.Tensor,
     valid: torch.Tensor,
     *,
     row_lengths: torch.Tensor,
+    pdl: bool = False,
 ) -> torch.Tensor:
     """Mask unallocated pages in place among each row's leading ``row_lengths[q]`` columns.
 
     Reads ``valid[count, >=pages]``, one byte per ``INDEX_PAGE_ROWS``-column page, and
     leaves the columns past a row's length as they are: the decode TopK never reads them.
+    ``pdl`` releases its dependents before its wait: only for a next kernel that waits first.
     """
     count, width = logits.shape
     if count == 0 or width == 0:
@@ -2547,9 +2856,10 @@ def mask_logits_(
         "valid",
     )
     ns = _glue_kernels()
+    pdl = bool(pdl) and _pdl()
     _launch(
-        ("mask_logits", logits.device.index),
-        ns.MaskLogitsKernel,
+        ("mask_logits", pdl, logits.device.index),
+        lambda: ns.MaskLogitsKernel(pdl),
         _ptr(logits),
         _ptr(valid, torch.uint8, align=1),
         _ptr(row_lengths, torch.int32),
@@ -2656,12 +2966,14 @@ def finalize_selection_(
     positions: torch.Tensor | None = None,
     row_starts: torch.Tensor | None = None,
     row_lengths: torch.Tensor | None = None,
+    shuffle: bool = False,
 ) -> torch.Tensor:
     """Sort validated selections ascending in place with ``-1`` padding.
 
     Paged mode passes the pages' ``valid`` with the rows' visible ``row_lengths``;
     mapped mode passes ``scores`` and ``positions``; packed mode passes the gathered
     keys' ``valid`` with the rows' bounds, as ``mask_packed_logits_`` takes them.
+    ``shuffle``: paged rows past the bitmap sort in ``FinalizeShuffleSelectionKernel``.
     """
     count, top_k = indices.shape
     if count == 0 or width == 0:
@@ -2714,6 +3026,21 @@ def finalize_selection_(
         return indices
     limit = _FINALIZE_BITMAP_COLUMNS if packed else _PAGED_FINALIZE_BITMAP_COLUMNS
     bitmap = not mapped and width <= limit
+    if shuffle and not mapped and not packed and not bitmap and top_k <= 2048:
+        pdl = _pdl()
+        _launch(
+            ("finalize_shuffle", int(top_k), pdl, indices.device.index),
+            lambda: ns.FinalizeShuffleSelectionKernel(int(top_k), pdl),
+            _ptr(indices),
+            _ptr(valid, torch.uint8, align=1),
+            _ptr(row_lengths),
+            int(count),
+            int(width),
+            int(indices.stride(0)),
+            int(valid.stride(0)),
+            _stream(indices.device),
+        )
+        return indices
     int64 = mapped and positions.dtype == torch.int64
     _launch(
         ("finalize", int(top_k), mapped, packed, bitmap, indices.device.index),
@@ -2733,6 +3060,11 @@ def finalize_selection_(
         _stream(indices.device),
     )
     return indices
+
+
+def paged_finalize_sorts(width: int) -> bool:
+    """Whether :func:`finalize_selection_` sorts paged rows of this width (past its bitmap)."""
+    return width > _PAGED_FINALIZE_BITMAP_COLUMNS
 
 
 def map_selection_(
@@ -7494,13 +7826,22 @@ def _mapping_args(main_mapping, main_slots, main_logical, count: int, device):
     ``(page_table, page_size, max_positions, requests, visible)``; otherwise
     ``main_slots`` already hold physical rows.
     """
+    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
     identity = _constant_zeros(device, (1, 1), torch.int32)
     if main_mapping is None:
         _check(main_slots is not None, "CSA2 staging requires physical main slots or a mapping")
         slots = main_slots if main_slots.dtype == torch.int64 else main_slots.long()
         logical = main_logical if main_logical is not None else slots
         table_args = (_ptr(identity), 1, 1, 1, 1, 2**62)
-        zeros = _constant_zeros(device, (count,), torch.int64)
+        # Pooled rather than a constant per shape: the row count changes from step to step.
+        zeros = get_memory_buffers().get_buffer(
+            [count],
+            torch.int64,
+            buffer_name="csa2_unmapped_rows",
+            reserve_buffer=torch.cuda.is_current_stream_capturing(),
+        )
+        zeros.zero_()
         return (
             True,
             logical,

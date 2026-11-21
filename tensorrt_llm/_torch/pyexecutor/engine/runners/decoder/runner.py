@@ -332,7 +332,10 @@ class DecoderRunner(ScheduledModelRunner):
         self, mm_item_scheduler: MultimodalItemScheduler | None
     ) -> DecoderInputPreparer:
         """Build the input preparer over this runner's buffers."""
-        return DecoderInputPreparer(**self._input_preparer_kwargs(mm_item_scheduler))
+        return DecoderInputPreparer(
+            **self._input_preparer_kwargs(mm_item_scheduler),
+            attention_runtime_features=self._attention_runtime_features,
+        )
 
     def _make_cuda_graphs(self) -> DecoderCudaGraphs:
         """Build the CUDA graph component; call after the input preparer."""
@@ -455,6 +458,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
 
     def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        if self._host_uploader is not None:
+            self._host_uploader.synchronize()
         self._graphs.release(release_nccl_window_owners=release_nccl_window_owners)
 
     def wait_for_input_copy(self) -> None:
@@ -516,6 +521,7 @@ class DecoderRunner(ScheduledModelRunner):
         return cuda_graph_runner
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
+        sampling_variants = getattr(self._config.cuda_graph_config, "sampling_variants", None)
         return CUDAGraphRunnerConfig(
             use_cuda_graph=self._config.cuda_graph_config is not None,
             cuda_graph_padding_enabled=self._config.cuda_graph_padding_enabled,
@@ -537,7 +543,9 @@ class DecoderRunner(ScheduledModelRunner):
             private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
             prioritize_decode_graphs=self.runtime_hooks.prioritize_decode_graphs,
             stage_decode_inputs=self.runtime_hooks.stage_decode_inputs,
+            skip_adp_count_gather=self.runtime_hooks.skip_adp_count_gather,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
+            sampling_variants=None if sampling_variants is None else frozenset(sampling_variants),
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
             static_input_ids=(
@@ -697,7 +705,7 @@ class DecoderRunner(ScheduledModelRunner):
         # through the padding exchange (sync_group_all_greedy_sample).
         sampling_mode = None
         if samples_from_adp_head_shards(spec_metadata, self._mapping):
-            sampling_mode = one_model_sampling_mode(graph_requests.all_requests())
+            sampling_mode = one_model_sampling_mode(graph_requests.all_requests(), spec_metadata)
         with self._graphs.pad_batch(
             graph_requests, resource_manager, runtime_draft_len, sampling_mode=sampling_mode
         ) as padded_graph_requests:
@@ -754,6 +762,13 @@ class DecoderRunner(ScheduledModelRunner):
                 and context_plan is None
                 and not (ced_enabled and scheduled_requests.num_context_requests > 0)
             )
+            if (
+                key is None
+                and not is_dummy
+                and spec_metadata is not None
+                and scheduled_requests.num_context_requests == 0
+            ):
+                self._graphs.warn_uncaptured_sampling_variant(spec_metadata)
             if can_run_graph:
                 attn_metadata = selection.attn_metadata
                 spec_metadata = selection.spec_metadata
@@ -954,8 +969,14 @@ class DecoderRunner(ScheduledModelRunner):
         is_dummy: bool,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
+        # Lets a model start work that reads only graph inputs beside the input corrections.
         inputs = self._inputs.preprocess_inputs(
-            inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
+            inputs,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            mark_prologue_start=getattr(
+                getattr(self._model, "model", None), "mark_prologue_start", None
+            ),
         )
         spec_metadata = inputs.get("spec_metadata")
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
@@ -1116,23 +1137,24 @@ class DecoderRunner(ScheduledModelRunner):
             # logits instead whenever a request needed them.
             return
 
-        if outputs.get("logits_vocab_shard", False):
+        vocab_shard = outputs.get("logits_vocab_shard", False)
+        if vocab_shard and self._mapping.enable_attention_dp:
+            raise RuntimeError(
+                "vocabulary-sharded spec-worker logits need every TP rank "
+                "to schedule the same requests, which attention DP does "
+                "not"
+            )
+        if not any(
+            getattr(request, "py_logits_post_processors", None)
+            for request in scheduled_requests.all_requests()
+        ):
+            return
+
+        if vocab_shard:
             # The spec worker kept the logits vocabulary-sharded (this TP
             # rank's columns). A post-processor sees the whole vocabulary, so
             # gather them first, only when a request has one. Every TP rank
-            # schedules the same requests, so all of them take the gather;
-            # under attention DP they would not.
-            if self._mapping.enable_attention_dp:
-                raise RuntimeError(
-                    "vocabulary-sharded spec-worker logits need every TP rank "
-                    "to schedule the same requests, which attention DP does "
-                    "not"
-                )
-            if not any(
-                getattr(request, "py_logits_post_processors", None)
-                for request in scheduled_requests.all_requests()
-            ):
-                return
+            # schedules the same requests, so all of them take the gather.
             from tensorrt_llm._torch.distributed import allgather
 
             logits_tensor = allgather(logits_tensor, self._mapping, dim=-1).float()

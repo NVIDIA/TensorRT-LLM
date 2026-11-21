@@ -58,16 +58,15 @@ def prefetcher(monkeypatch):
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     p = SessionPrefetcher()
     # Record build/warm triggers instead of spawning MPI pools/reading weights.
-    built, warmed, overlays = [], [], []
+    built, warmed = [], []
 
-    def _fake_build(self, spec, gen, env_overlay=None):
+    def _fake_build(self, spec, gen):
         built.append(spec)
-        overlays.append(env_overlay)
 
     monkeypatch.setattr(SessionPrefetcher, "_build", _fake_build)
     monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
     monkeypatch.setattr(session_prefetcher, "_prefetched_workers_alive", lambda session: True)
-    p.built, p.warmed, p.overlays = built, warmed, overlays
+    p.built, p.warmed = built, warmed
     return p
 
 
@@ -158,23 +157,13 @@ def test_factory_single_worker_also_prefetches(prefetcher):
     assert prefetcher.built == [1]  # shadow armed for the next 1-GPU test
 
 
-def test_schedule_shadow_passes_env_overlay_to_build(prefetcher):
-    # session_reuse restocks shadows with its worker-side weight-cache env;
-    # the overlay must reach the build (frozen into workers via the library's
-    # env_overrides channel — the parent env is never touched).
-    prefetcher.schedule_shadow(2, env_overlay={"TRTLLM_HF_WEIGHT_CACHE": "1"})
-    prefetcher._thread.join(timeout=10)
-    assert prefetcher.built == [2]
-    assert prefetcher.overlays == [{"TRTLLM_HF_WEIGHT_CACHE": "1"}]
-
-
 def test_take_wrong_size_in_flight_waits_before_miss(prefetcher, monkeypatch):
     # A wrong-size shadow is a miss, but the caller must not start its sync
     # pool until that in-flight bootstrap finishes. Otherwise a group-size
     # transition can make two MPI pools compete on the same allocation.
     release = threading.Event()
 
-    def _slow_build(self, spec, gen, env_overlay=None):
+    def _slow_build(self, spec, gen):
         release.wait()
         self._publish(spec, _FakePool(spec), session_prefetcher._spawn_snapshot(), gen)
 
