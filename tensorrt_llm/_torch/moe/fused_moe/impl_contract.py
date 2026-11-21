@@ -53,8 +53,9 @@ class MoEStaticCapability:
     # weights may be published concurrently with shared-expert computation.
     supports_per_layer_dynamic_eplb: bool = False
     # Whether the backend runs with the unbacked spare EPLB slots of Wide-EP
-    # fault tolerance: its autotuner profiles and its workspaces cover only the
-    # active slots.
+    # fault tolerance: its expert weights keep their slot-first storage through
+    # loading, its autotuner profiles only the active slots, and its runtime
+    # workspaces cover every local slot.
     supports_spare_slots: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
     # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
