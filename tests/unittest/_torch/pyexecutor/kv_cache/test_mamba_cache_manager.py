@@ -4195,6 +4195,7 @@ def _run_v2_hybrid_context(
     request.context_current_position = request.prompt_len
     assert request.context_remaining_length == 0
     manager.update_context_resources(batch)
+    manager.commit_scheduled_kv_cache_stats(batch)
 
 
 def _build_v2_inforward_snapshot_manager():
@@ -4764,6 +4765,10 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
+    mgr.local_num_mamba_layers = 1
+    mgr.enable_joint_kv_cache_reuse = False
+    mgr._iter_prefix_matched_tokens = 0
+    mgr._iter_prefix_snapshot_lost_tokens = 0
     mgr._stats_life_cycle_metadata = MagicMock(
         return_value={
             0: (4, 4096, "attention"),
@@ -5150,10 +5155,18 @@ def _branch_snapshot_manager(
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
         ),
     )
+    mgr.is_estimating_kv_cache = False
+    mgr.mapping = SimpleNamespace(rank=0)
     mgr._branch_snapshot_points = {}
     mgr._context_fork_hints = {}
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
+    mgr.enable_joint_kv_cache_reuse = False
+    mgr._pending_prefix_loss = {}
+    mgr._prefix_matched_tokens_total = 0
+    mgr._iter_prefix_matched_tokens = 0
+    mgr._iter_prefix_snapshot_lost_tokens = 0
+    mgr._snapshot_loss_warned = False
     mgr._branch_snapshots_taken_total = 0
     mgr._branch_snapshots_skipped_total = {}
     return mgr
@@ -5183,6 +5196,7 @@ def _fake_context_request(
         prompt_len=prompt_len,
         context_current_position=context_current_position,
         is_dummy_request=is_dummy_request,
+        is_dummy=is_dummy_request,
         is_disagg_generation_init_state=is_disagg_generation_init_state,
         expect_snapshot_points=list(expect_snapshot_points or []),
     )
@@ -5377,6 +5391,8 @@ def test_branch_snapshot_points_match_on_attention_only_pp_rank():
 
     mamba_mgr._record_branch_snapshot_point(mamba_request, kv_cache, num_lookup_tokens=255)
     attention_mgr._record_branch_snapshot_point(attention_request, kv_cache, num_lookup_tokens=255)
+    mamba_mgr._commit_prefix_loss(mamba_request.py_request_id)
+    attention_mgr._commit_prefix_loss(attention_request.py_request_id)
 
     assert mamba_request.expect_snapshot_points == [192, 256]
     assert attention_request.expect_snapshot_points == [192, 256]
@@ -5514,6 +5530,7 @@ def test_branch_snapshot_counters_separate_snapshot_loss_from_page_loss():
     kv_cache = _fake_reuse_match(divergence=512, hybrid=320, reused=128)
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=1023)
+    mgr._commit_prefix_loss(request.py_request_id)
 
     # Matched in attention but pruned for want of a snapshot.
     assert mgr._snapshot_pruned_tokens_total == 320 - 128
@@ -5527,6 +5544,7 @@ def test_branch_snapshot_counters_are_zero_when_nothing_was_pruned():
     kv_cache = _fake_reuse_match(divergence=192, hybrid=192, reused=192)
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    mgr._commit_prefix_loss(request.py_request_id)
 
     assert mgr._snapshot_pruned_tokens_total == 0
     assert mgr._page_pruned_tokens_total == 0
@@ -5541,6 +5559,7 @@ def test_branch_snapshot_counters_accumulate_across_requests():
             _fake_reuse_match(divergence=512, hybrid=320, reused=128),
             num_lookup_tokens=1023,
         )
+        mgr._commit_prefix_loss(rid)
 
     assert mgr._branch_snapshots_taken_total == 0
     assert mgr._snapshot_pruned_tokens_total == 3 * (320 - 128)
@@ -6408,6 +6427,8 @@ def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft
     mgr._stream = None
     mgr._request_id_to_state_index = {}
     mgr._request_id_to_is_dummy = {}
+    mgr.enable_joint_kv_cache_reuse = False
+    mgr._pending_prefix_loss = {}
     mgr._kda_replay.seed_on_resume = set()
     mgr._kda_replay.acceptance_pending = set()
     mgr._kda_replay.unseeded_requests = set()
@@ -10315,5 +10336,39 @@ def test_v2_hybrid_mixed_precision_beside_private_mamba2_replay():
         for group, layer_ids in enumerate(mgr._layer_ids_by_group):
             ids.update(zip(layer_ids, _compute_global_layer_ids(mgr, group)))
         assert ids == {0: 0, 1: 2, 2: 4, 3: 5}
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_iteration_stats_report_prefix_lost_to_missing_snapshot() -> None:
+    """Attention pages can match deeper than any recurrent-state snapshot; the gap is recomputed."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True, additional_snapshot_offsets_from_end=[0], enable_stats=True
+    )
+    # The only snapshot of the first prompt is at its end, token 64.
+    first = _make_v2_prompt_request(1, list(range(64)))
+    # Shares 48 tokens with it, then diverges: no snapshot covers the shared part.
+    diverged = _make_v2_prompt_request(2, list(range(48)) + list(range(1000, 1016)))
+    # Extends it: its end snapshot covers the whole match.
+    extended = _make_v2_prompt_request(3, list(range(64)) + list(range(2000, 2016)))
+    try:
+        _run_v2_hybrid_context(mgr, first)
+        mgr.free_resources(first)
+        mgr.get_iteration_stats()
+
+        _run_v2_hybrid_context(mgr, diverged)
+        report = mgr.get_iteration_stats()
+        assert diverged.prepopulated_prompt_len == 0
+        assert report.prefix_matched_tokens == 48
+        assert report.prefix_snapshot_lost_tokens == report.prefix_matched_tokens
+        mgr.free_resources(diverged)
+
+        _run_v2_hybrid_context(mgr, extended)
+        report = mgr.get_iteration_stats()
+        assert extended.prepopulated_prompt_len == 64
+        assert report.prefix_matched_tokens == 64
+        assert report.prefix_snapshot_lost_tokens == 0
+        mgr.free_resources(extended)
     finally:
         mgr.shutdown()
