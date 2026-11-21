@@ -1355,12 +1355,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             dim=1,
             unpad_to=sequence_length,
         )
-        video_output = self.proj_out(
-            self._projection_input(self.proj_out, packed_hidden_states)
-        ).index_select(1, video_indices)
-        audio_output = self.audio_proj_out(
-            self._projection_input(self.audio_proj_out, packed_hidden_states)
-        ).index_select(1, audio_indices)
+        video_input, audio_input = self._head_inputs(packed_hidden_states)
+        video_output = self.proj_out(video_input).index_select(1, video_indices)
+        audio_output = self.audio_proj_out(audio_input).index_select(1, audio_indices)
 
         if not return_dict:
             return video_output, audio_output
@@ -1458,6 +1455,13 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 f"MiniMax-H3 checkpoint is missing {len(missing)} required tensors: "
                 f"{preview}{suffix}"
             )
+
+    def _head_inputs(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The inputs of the video and the audio output projection."""
+        return (
+            self._projection_input(self.proj_out, hidden_states),
+            self._projection_input(self.audio_proj_out, hidden_states),
+        )
 
     def _projection_input(self, projection: Linear, hidden_states: torch.Tensor) -> torch.Tensor:
         """Cast a media-projection input to the dtype that projection runs in.

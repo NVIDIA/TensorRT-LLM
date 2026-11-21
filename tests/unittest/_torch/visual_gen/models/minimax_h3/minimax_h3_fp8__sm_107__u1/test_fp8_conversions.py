@@ -17,7 +17,10 @@ def conversion_modules(tmp_path_factory):
     )
 
     scales = torch.tensor([0.01, 0.1, 1.0, 10.0, 100.0] * 10, device="cuda", dtype=torch.float32)
-    return prepare(scales, tmp_path_factory.mktemp("h3_fp8_conversions"))
+    modules = prepare(scales, tmp_path_factory.mktemp("h3_fp8_conversions"))
+    if modules[0] is None:
+        pytest.skip(f"The conversion kernels were not built: {modules[3]['reason']}")
+    return modules
 
 
 @pytest.mark.parametrize("length", [1, 7, 8, 9, 255, 256, 257, 2049])

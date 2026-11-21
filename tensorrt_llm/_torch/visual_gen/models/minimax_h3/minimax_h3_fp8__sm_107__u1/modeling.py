@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Instance-scoped FP8 H3 attention, blocks and final media projections."""
+"""FP8 H3 attention, blocks and final media projections.
+
+``Fp8Transformer.initialize_fp8`` prepares one loaded model for the fused path: it compiles the
+kernels, stores the GateUp weights in the kernel's tile order, installs the QKV and GateUp Linear
+methods and the conditioning cache. Compiled kernels are cached per device at module level.
+"""
 
 from pathlib import Path
 
-import cuda.bindings.driver as cuda
 import torch
-import triton
-import triton.language as tl
 
 from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod
 
@@ -16,10 +18,8 @@ from ..minimax_h3_nvfp4__sm_107__u1_u4.modeling import ScenarioAttention, Scenar
 from ..transformer_minimax_h3 import MiniMaxH3TransformerBlock
 from . import ops
 from .conditioning import ConditioningCache
-from .kernels import attention_output, gate_up_swiglu
+from .kernels import gate_up_swiglu, projection_residual
 from .kernels.conversion import prepare
-from .kernels.rope import half_rope_tensor_cast
-from .transformer_forward import shared_output_forward
 
 
 @torch.library.custom_op("h3_fp8::qk_norm_rope", mutates_args=())
@@ -49,7 +49,7 @@ def qk_norm_rope(
         layer_idx,
         valid_len,
         0,
-        cast_g_kernel=half_rope_tensor_cast,
+        rope_halves_equal=True,
     )
     return outputs[0], outputs[1], outputs[2], scales
 
@@ -76,7 +76,6 @@ class Fp8QkvMethod(FP8QDQLinearMethod):
             or module.dtype != torch.bfloat16
             or self.get_static_input_scale(module) is None
             or getattr(module, "all_reduce", None) is not None
-            or input.numel() // input.shape[-1] not in ops.FULL_SEQUENCE_LENGTHS
         ):
             return super().apply(module, input, bias)
         shape = input.shape
@@ -89,6 +88,16 @@ class Fp8QkvMethod(FP8QDQLinearMethod):
         if len(shape) > 2:
             output = output.reshape(*shape[:-1], output.shape[-1])
         return output + bias if bias is not None else output
+
+
+class PackedGateUpMethod(FP8QDQLinearMethod):
+    """Marks a GateUp Linear whose weight rows are stored in the fused kernel's tile order."""
+
+    def apply(self, module, input: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        raise RuntimeError(
+            "This GateUp weight is stored in the fused kernel's tile order; only "
+            "ops.gate_up reads it"
+        )
 
 
 class Fp8Attention(ScenarioAttention):
@@ -165,17 +174,7 @@ class Fp8Block(MiniMaxH3TransformerBlock):
             or hidden_states.shape[2] != 5376
             or hidden_states.dtype != torch.bfloat16
         ):
-            raise ValueError("The fused FP8 block needs a qualified BF16 [1,S,5376] packed layout")
-        if hidden_states.shape[1] not in ops.FULL_SEQUENCE_LENGTHS:
-            return super()._forward_fused_adaln(
-                hidden_states,
-                temb,
-                adaln_indices,
-                rotary_emb,
-                key_padding_mask,
-                timestep,
-                valid_seq_len,
-            )
+            raise ValueError("The fused FP8 block needs a BF16 [1,S,5376] packed layout")
         modulation = self.adaln_proj.table(temb)
         codes = ops.norm(
             hidden_states,
@@ -203,7 +202,7 @@ class Fp8Block(MiniMaxH3TransformerBlock):
         gate_up, down = self.ff.gate_up_proj, self.ff.down_proj
         activated = ops.gate_up(
             codes.reshape(-1, codes.shape[-1]),
-            self._fp8_packed_gate_up,
+            gate_up.weight,
             gate_up.input_scale,
             gate_up.weight_scale,
             down.input_scale,
@@ -219,24 +218,19 @@ class Fp8Block(MiniMaxH3TransformerBlock):
         )
 
 
-@triton.jit
-def _reciprocal(scale, inverse):
-    tl.store(inverse, tl.div_rn(1.0, tl.load(scale).to(tl.float32)))
-
-
 class Fp8Transformer(ScenarioTransformer):
     """The H3 transformer with FP8-only blocks and one shared final FP32 cast."""
 
     block_cls = Fp8Block
-    forward = shared_output_forward
 
-    def _projection_input(self, projection, hidden_states: torch.Tensor) -> torch.Tensor:
-        if projection is self.proj_out:
-            return ops.output_cast(hidden_states)
-        return super()._projection_input(projection, hidden_states)
+    def _head_inputs(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        shared = ops.output_cast(hidden_states)  # both heads are FP32: one cast serves them
+        return shared, shared
 
     def initialize_fp8(self, kernel_cache: Path) -> None:
-        """Prepare fixed kernels and derived weights before torch.compile and warmup."""
+        """Prepare kernels and derived weights before torch.compile and warmup; runs once."""
+        if getattr(self, "fp8_conditioning_cache", None) is not None:
+            return
         with torch.cuda.device(self.proj_out.weight.device):
             self._initialize_fp8(kernel_cache)
 
@@ -308,36 +302,35 @@ class Fp8Transformer(ScenarioTransformer):
             if projection.has_any_quant or projection.weight.dtype != torch.float32:
                 raise ValueError("The shared output cast requires the original FP32 media heads")
         device = self.proj_out.weight.device
-        status, capacity = cuda.cuDeviceGetAttribute(
-            cuda.CUdevice_attribute(150), cuda.CUdevice(device.index)
-        )
         settings = gate_up_swiglu._CFG
         required = 3 * 128 * settings["mma_tile_k"] * settings["num_ab_stage"] + 4096
-        if int(status) != 0 or int(capacity) < required:
+        if projection_residual.block_shared_memory_bytes(device.index) < required:
             raise RuntimeError("The fused GateUp oversized shared-memory capacity is unavailable")
         scales = torch.cat(
             [block.attn.to_out[0].input_scale.detach().reshape(1) for block in blocks]
         )
         _, _, factors, self.fp8_kernel_qualification = prepare(scales, kernel_cache)
-        attention_output._CFG = dict(
-            tile_n=256,
-            cluster_shape_mn=(4, 1),
-            num_ab_stage=4,
-            swizzle_size=7,
-            fallback_cluster_shape_mn=(2, 1),
-            mma_tile_k=128,
-        )
         for index, block in enumerate(blocks):
             block.attn.qkv_proj.quant_method = Fp8QkvMethod()
-            packed = gate_up_swiglu.pack_weight(block.ff.gate_up_proj.weight)
-            block.register_buffer("_fp8_packed_gate_up", packed, persistent=False)
+            # The kernel's tile order replaces the checkpoint's row order in place of a second copy.
+            gate_up = block.ff.gate_up_proj
+            gate_up.weight.data = gate_up_swiglu.pack_weight(gate_up.weight)
+            gate_up.quant_method = PackedGateUpMethod()
             for name, linear in [("qkv", block.attn.qkv_proj), ("gate_up", block.ff.gate_up_proj)]:
-                inverse = torch.empty_like(linear.input_scale)
-                _reciprocal[(1,)](linear.input_scale, inverse, num_warps=4)
+                # FP32 division on the host is correctly rounded, as the kernels' div.rn is.
+                inverse = torch.reciprocal(linear.input_scale.detach().cpu()).to(device)
                 block.register_buffer(f"_fp8_{name}_reciprocal", inverse, persistent=False)
             block.register_buffer(
                 "_fp8_output_quant_factor", factors[index : index + 1], persistent=False
             )
         gate_up_swiglu._get_compiled(device.index)
+        table_dtype = blocks[0].adaln_proj.linear.dtype
+        for width, gate in (
+            (7168, projection_residual.ATTENTION_OUTPUT_GATE),
+            (14336, projection_residual.DOWN_GATE),
+        ):
+            projection_residual.compile_kernel(
+                device.index, 5376, width, gate, table_dtype, torch.int64
+            )
         self.fp8_conditioning_cache = ConditioningCache(self)
         torch.cuda.synchronize(device)

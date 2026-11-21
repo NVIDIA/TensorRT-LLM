@@ -32,7 +32,7 @@ PRESET = {
 
 
 def missing_build_tools() -> list[str]:
-    """The tools the conversion kernels are built and checked with at load that this process lacks."""
+    """The tools the optional conversion kernels are built and checked with that this process lacks."""
     missing = [tool for tool in ("ninja", "cuobjdump") if shutil.which(tool) is None]
     if CUDA_HOME is None or not os.path.isfile(os.path.join(CUDA_HOME, "bin", "nvcc")):
         missing.insert(0, "nvcc")
@@ -42,12 +42,6 @@ def missing_build_tools() -> list[str]:
 def select() -> None:
     """Fix shared attention/decoder settings before their modules are imported.
 
-    Raises RuntimeError when the scenario cannot run in this process: a build tool is missing, or
-    the shared settings are already selected with other values.
+    Raises RuntimeError when the shared settings are already selected with other values.
     """
-    missing = missing_build_tools()
-    if missing:
-        raise RuntimeError(
-            "the conversion kernels are built at load and need " + ", ".join(missing)
-        )
     shared_config.apply(PRESET)

@@ -112,7 +112,12 @@ def launch(x, a, w, mod, idx, scale, eps, gate_col, scale_col, shift_col):
     x2 = x.reshape(-1, width)
     has_res = a is not None
     a2 = a.reshape_as(x2) if has_res else x2
-    assert x2.stride(-1) == 1 and a2.stride(-1) == 1 and mod.stride(-1) == 1
+    if x2.stride(-1) != 1 or a2.stride(-1) != 1 or mod.stride(-1) != 1:
+        raise ValueError("The FP8 AdaLN kernel needs unit-stride rows")
+    if idx.numel() != sequence:
+        raise ValueError(
+            f"The modulation index has {idx.numel()} entries for a sequence of {sequence}"
+        )
     codes = torch.empty(x2.shape, dtype=torch.float8_e4m3fn, device=x.device)
     residual = torch.empty_like(x2) if has_res else x2
     _adaln_fp8_kernel[(x2.shape[0],)](

@@ -5,6 +5,7 @@
 import itertools
 import types
 import weakref
+from collections import OrderedDict
 
 import torch
 
@@ -26,9 +27,8 @@ def time_project(conditioning: torch.Tensor, cache_id: int) -> torch.Tensor:
         value = conditioning.detach().contiguous().cpu()
         key = (tuple(value.shape), str(value.dtype), bytes(value.view(torch.uint8).tolist()))
         owner.key_reads += 1
-        if key in owner.keys or len(owner.keys) < owner.max_keys:
-            owner.keys.add(key)
-            owner.key = key
+        owner.remember(key)
+        owner.key = key
     return owner.original_time(conditioning)
 
 
@@ -91,8 +91,9 @@ class ConditioningCache:
     """One immutable pipeline's scalar-conditioning lookup; no latents are cached.
 
     The exact conditioning bytes, shape and dtype form the request key. The key
-    read and its synchronization execute inside each Transformer call. A bounded
-    key set keeps requests with new schedules from growing the cache indefinitely.
+    read and its synchronization execute inside each Transformer call. At most
+    ``max_keys`` keys are kept; a new key evicts the least recently used one with
+    its tables, so the cache follows the schedules in use and stays bounded.
     LoRA, weight offload and in-place weight reload are outside this scenario.
     """
 
@@ -100,8 +101,9 @@ class ConditioningCache:
         self.identifier = next(_IDENTIFIERS)
         self.max_keys = max_keys
         self.key = None
-        self.keys = set()
+        self.keys = OrderedDict()
         self.cache = {}
+        self.evictions = 0
         self.hits = self.misses = self.fallbacks = self.key_reads = 0
         self.time_dim = int(transformer.time_proj.num_channels)
         self.original_time = transformer.time_proj.forward
@@ -110,6 +112,21 @@ class ConditioningCache:
             block.adaln_proj.linear.dtype for block in transformer.transformer_blocks
         ]
         _OWNERS[self.identifier] = self
+        self._install(transformer)
+
+    def remember(self, key) -> None:
+        """Mark ``key`` as the most recently used; evict the oldest key beyond ``max_keys``."""
+        if key in self.keys:
+            self.keys.move_to_end(key)
+            return
+        self.keys[key] = None
+        while len(self.keys) > self.max_keys:
+            old, _ = self.keys.popitem(last=False)
+            for entry in [entry for entry in self.cache if entry[1] == old]:
+                del self.cache[entry]
+            self.evictions += 1
+
+    def _install(self, transformer) -> None:
         transformer.time_proj._h3_fp8_cache_id = self.identifier
         transformer.time_proj.forward = types.MethodType(_time_forward, transformer.time_proj)
         for index, block in enumerate(transformer.transformer_blocks):

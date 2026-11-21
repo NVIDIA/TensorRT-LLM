@@ -427,13 +427,12 @@ def _launch_cast_g(
     amax_n,
     amax_stride,
     vfold_args=None,
-    cast_g_kernel=None,
+    rope_halves_equal=False,
 ):
     """One grouped Q / K cast launch (tensor ``i``); ``vfold_args`` = (V view, V amax slot, valid_len)
     folds V's amax into it."""
     v, vamax, valid_len = vfold_args if vfold_args is not None else (None, None, None)
-    selected_cast = _tensor_cast_g_kernel if cast_g_kernel is None else cast_g_kernel
-    selected_cast[grid](
+    _tensor_cast_g_kernel[grid](
         qkv[..., i * width : (i + 1) * width],
         weights[i],
         cos,
@@ -464,6 +463,7 @@ def _launch_cast_g(
         len_ptr=valid_len if valid_len is not None else descale,
         VAMAX=v is not None,
         HAS_LEN=valid_len is not None,
+        HALF_EQ=rope_halves_equal,
         num_warps=num_warps,
     )
 
@@ -487,7 +487,7 @@ def _qk_norm_rope_fp8_split(
     packed_hl=0,
     qk_static=False,
     tensor_major=False,
-    cast_g_kernel=None,
+    rope_halves_equal=False,
 ):
     width = h * d
     grid = (rows,)
@@ -554,7 +554,7 @@ def _qk_norm_rope_fp8_split(
             1,
             1,
             vfold_args=(qkv[..., 2 * width : 3 * width], amax[2:3], valid_len),
-            cast_g_kernel=cast_g_kernel,
+            rope_halves_equal=rope_halves_equal,
         )
     if not static and not vfold:
         for i in (2,) if qk_static else range(3):
@@ -609,8 +609,7 @@ def _qk_norm_rope_fp8_split(
         if vfold and i == 0:
             continue
         if v2 and i < 2:
-            selected_cast = _tensor_cast_g_kernel if cast_g_kernel is None else cast_g_kernel
-            selected_cast[grid](
+            _tensor_cast_g_kernel[grid](
                 qkv[..., i * width : (i + 1) * width],
                 weights[i],
                 cos,
@@ -637,6 +636,7 @@ def _qk_norm_rope_fp8_split(
                 AMAX_N=amax_n,
                 AMAX_STRIDE=amax_stride,
                 PLANES=planes,
+                HALF_EQ=rope_halves_equal,
                 num_warps=num_warps,
             )
             continue
@@ -684,7 +684,7 @@ def _qk_norm_rope_fp8_impl(
     layer_idx: int,
     valid_len: Optional[torch.Tensor],
     ulysses: int,
-    cast_g_kernel=None,
+    rope_halves_equal=False,
 ) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
     """Shared body of the two ops. ``ulysses == 0``: three ``[B, S, H * D]`` FP8 outputs.
     ``ulysses = U > 1``: one packed Ulysses send buffer ``[U, S, 3, H / U, D]`` (B must be 1)."""
@@ -738,7 +738,7 @@ def _qk_norm_rope_fp8_impl(
             packed_hl=hl,
             qk_static=qk_static,
             tensor_major=hl > 0 and RECV_INPLACE,
-            cast_g_kernel=cast_g_kernel,
+            rope_halves_equal=rope_halves_equal,
         )
         if _AMAX_LOG is not None and not static:
             _record_descale(layer_idx, descale)
@@ -1083,14 +1083,28 @@ def _bf16x2_round(a, b):
 
 
 @triton.jit
-def _group_vectors(cos_ptr, sin_ptr, w_ptr, t, c0, ROT: tl.constexpr, HALF: tl.constexpr):
+def _group_vectors(
+    cos_ptr,
+    sin_ptr,
+    w_ptr,
+    t,
+    c0,
+    ROT: tl.constexpr,
+    HALF: tl.constexpr,
+    HALF_EQ: tl.constexpr = False,
+):
     """cos / sin (BF16-rounded as the eager path) and the norm weight for the rotated column
-    group ``c0`` (first half, ``sign = -1``) and its partner group ``c0 + HALF`` (``sign = +1``)."""
+    group ``c0`` (first half, ``sign = -1``) and its partner group ``c0 + HALF`` (``sign = +1``).
+    ``HALF_EQ``: the table's two halves hold the same values, so the partner's are not loaded."""
     c1 = c0 + HALF
     cos_a = tl.load(cos_ptr + t * ROT + c0).to(tl.float32).to(tl.bfloat16).to(tl.float32)
     sin_a = tl.load(sin_ptr + t * ROT + c0).to(tl.float32).to(tl.bfloat16).to(tl.float32)
-    cos_b = tl.load(cos_ptr + t * ROT + c1).to(tl.float32).to(tl.bfloat16).to(tl.float32)
-    sin_b = tl.load(sin_ptr + t * ROT + c1).to(tl.float32).to(tl.bfloat16).to(tl.float32)
+    if HALF_EQ:
+        cos_b = cos_a
+        sin_b = sin_a
+    else:
+        cos_b = tl.load(cos_ptr + t * ROT + c1).to(tl.float32).to(tl.bfloat16).to(tl.float32)
+        sin_b = tl.load(sin_ptr + t * ROT + c1).to(tl.float32).to(tl.bfloat16).to(tl.float32)
     # (sign * sin) of the shipping kernel: -1.0 * sin for the first half, 1.0 * sin for the second
     ss_a = -1.0 * sin_a
     ss_b = 1.0 * sin_b
@@ -1225,6 +1239,7 @@ def _tensor_cast_g_kernel(
     len_ptr=None,
     VAMAX: tl.constexpr = False,
     HAS_LEN: tl.constexpr = False,
+    HALF_EQ: tl.constexpr = False,
 ):
     HALF: tl.constexpr = ROT // 2
     r = tl.program_id(0)
@@ -1249,12 +1264,12 @@ def _tensor_cast_g_kernel(
     f = _div_rn(1.0, s)
     g0 = tl.arange(0, C0)
     cos_a0, ss_a0, w_a0, cos_b0, ss_b0, w_b0 = _group_vectors(
-        cos_ptr, sin_ptr, w_ptr, t, g0, ROT, HALF
+        cos_ptr, sin_ptr, w_ptr, t, g0, ROT, HALF, HALF_EQ
     )
     if C1 > 0:
         g1 = C0 + tl.arange(0, C1)
         cos_a1, ss_a1, w_a1, cos_b1, ss_b1, w_b1 = _group_vectors(
-            cos_ptr, sin_ptr, w_ptr, t, g1, ROT, HALF
+            cos_ptr, sin_ptr, w_ptr, t, g1, ROT, HALF, HALF_EQ
         )
     if TAIL > 0:
         gt = ROT + tl.arange(0, TAIL)
