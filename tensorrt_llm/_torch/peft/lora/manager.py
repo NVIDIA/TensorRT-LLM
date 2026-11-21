@@ -589,6 +589,8 @@ class LoraManager(object):
         for model_dir in new_model_dirs:
             with open(f"{model_dir}/adapter_config.json", "r") as f:
                 config = json.load(f)
+                if config.get("use_dora", False):
+                    raise NotImplementedError("DoRA adapters are not supported")
                 lora_hf_configs.append(config)
 
         self.lora_target_modules = model_config.lora_target_modules
@@ -686,6 +688,15 @@ class LoraManager(object):
                 owner=getattr(model_config, "owner", DecoderLoraOwner()),
                 hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
             )
+            for layer_weights in all_weights.values():
+                for module_weights in layer_weights.values():
+                    weights_to_check = (
+                        module_weights.values()
+                        if _is_moe_module_weights(module_weights)
+                        else [module_weights]
+                    )
+                    if any("magnitude" in weights for weights in weights_to_check):
+                        raise NotImplementedError("DoRA adapters are not supported")
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
             model_dtype = str_dtype_to_torch(model_config.dtype)
@@ -781,11 +792,6 @@ class LoraManager(object):
 
                         t_in = torch.stack(t_in_list)
                         t_out = torch.stack(t_out_list)
-                        for weights in module_weights.values():
-                            if "mag" in weights:
-                                # TODO(oargov): this might work, but I had no MoE DoRA models to test
-                                raise ValueError("DoRA with MoE is not supported")
-                        t_mag = None
                     else:
                         # Not MoE - validate required matrices are present
                         _check_lora_in_out(
@@ -797,9 +803,6 @@ class LoraManager(object):
 
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
-                        t_mag = module_weights.get("magnitude", None)
-
-                    is_dora = t_mag is not None
                     rank_dim = 1 if has_expert_indices else 0
                     t_out = prepare_fused_lora_modules_for_tp(lora_module, t_out, rank_dim)
 
@@ -820,15 +823,9 @@ class LoraManager(object):
                             layer_idx=layer_idx,
                             lora_module=lora_module,
                         )
-                        if is_dora:
-                            raise NotImplementedError(
-                                "DoRA is not supported with FP8 LoRA weights on SM90/SM100"
-                            )
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
-                    if is_dora and t_mag is not None:
-                        t_mag = t_mag.cuda().contiguous()
 
                     if rs_lora:
                         scale = float(hf_config["lora_alpha"]) / np.sqrt(effective_rank)
@@ -849,33 +846,25 @@ class LoraManager(object):
                         t_in = t_in.to(model_dtype)
                         t_out = t_out.to(model_dtype)
                         t_out = t_out * scale
-                        if is_dora and t_mag is not None:
-                            t_mag = t_mag.to(model_dtype)
 
                     uid_to_low_ranks[layer_idx][lora_module] = effective_rank
                     if self._retain_device_tensors:
                         lora_weights_pointers[layer_idx][lora_module] = [
                             t_in.data_ptr(),
                             t_out.data_ptr(),
-                            t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
+                            0,
                         ]
                         retained_lora_weights.append(t_in)
                         retained_lora_weights.append(t_out)
-                        if is_dora and t_mag is not None:
-                            retained_lora_weights.append(t_mag)
 
                     t_in_cpu = t_in.flatten().cpu()
                     t_out_cpu = t_out.flatten().cpu()
                     weights_to_concat = [t_in_cpu, t_out_cpu]
 
-                    if is_dora and t_mag is not None:
-                        t_mag_cpu = t_mag.flatten().cpu()
-                        weights_to_concat.append(t_mag_cpu)
-
                     cpp_lora_weights.append(torch.cat(weights_to_concat))
                     cpp_lora_config.append(
                         torch.tensor(
-                            [self.LORA_MODULE_IDS[lora_module], layer_idx, effective_rank, is_dora],
+                            [self.LORA_MODULE_IDS[lora_module], layer_idx, effective_rank, False],
                             dtype=torch.int32,
                         )
                     )
