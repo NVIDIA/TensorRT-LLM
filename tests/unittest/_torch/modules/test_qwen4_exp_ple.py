@@ -164,6 +164,17 @@ def test_scaled_fp8_ngram_config_accepts_a_single_exclusion_string() -> None:
     assert _uses_scaled_fp8_ngram_table(included)
 
 
+@pytest.mark.parametrize("fp8_dtype", ["float8_e4m3fn", "torch.float8_e4m3fn", torch.float8_e4m3fn])
+def test_scaled_fp8_ngram_config_accepts_ple_embedding_dtype(fp8_dtype) -> None:
+    nvfp4 = {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["*.ple.*"]}
+    declared = SimpleNamespace(ple_embedding_dtype=fp8_dtype, quantization_config=nvfp4)
+    bf16 = SimpleNamespace(ple_embedding_dtype="bfloat16", quantization_config=nvfp4)
+
+    assert _uses_scaled_fp8_ngram_table(declared)
+    assert not _uses_scaled_fp8_ngram_table(bf16)
+    assert not _uses_scaled_fp8_ngram_table(SimpleNamespace(quantization_config=nvfp4))
+
+
 def test_scaled_fp8_ngram_lookup_requires_checkpoint_scale() -> None:
     config = SimpleNamespace(
         ngram_size=3,
