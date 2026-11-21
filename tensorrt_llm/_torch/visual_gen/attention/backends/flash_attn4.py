@@ -276,3 +276,12 @@ class FlashAttn4Attention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
+
+    @classmethod
+    def support_key_padding_mask(cls) -> bool:
+        return True
+
+    @classmethod
+    def requires_trailing_padding(cls) -> bool:
+        """``seqused_k`` is the token count of the mask: the tokens must be a prefix."""
+        return True

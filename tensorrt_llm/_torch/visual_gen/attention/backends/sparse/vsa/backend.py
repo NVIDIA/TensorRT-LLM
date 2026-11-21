@@ -195,6 +195,11 @@ class VSATrtllmAttention(TrtllmAttention):
     def support_fused_qkv(cls) -> bool:
         return True
 
+    @classmethod
+    def support_valid_seq_len(cls) -> bool:
+        """The sparse path attends every row of the sequence."""
+        return False
+
 
 class VSACuTeDSLAttention(CuTeDSLAttention):
     """CuTe DSL VSA backend reusing TRTLLM's predictor and post-processing."""
