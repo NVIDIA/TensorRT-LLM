@@ -8,6 +8,7 @@ from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
@@ -101,6 +102,8 @@ def _v2_manager(*, is_draft: bool):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.kv_connector_manager = None
+    manager.is_estimating_kv_cache = False
     manager.kv_cache_type = CacheType.SELF
     manager.enable_block_reuse = False
     manager.kv_compression_manages_history = False
@@ -375,6 +378,16 @@ class TestFactory:
         )
 
 
+def _new_cache_creator() -> util_mod.KvCacheCreator:
+    creator = object.__new__(util_mod.KvCacheCreator)
+    creator._cache_transceiver_config = None
+    return verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
+
+
 class TestKvCacheCreatorLifecycle:
     def test_estimation_still_creates_triattention_manager(self) -> None:
         config = SimpleNamespace(algorithm="triattention")
@@ -383,7 +396,7 @@ class TestKvCacheCreatorLifecycle:
             provides_cold_page_codec=False,
             uses_iteration_lifecycle=True,
         )
-        creator = object.__new__(util_mod.KvCacheCreator)
+        creator = _new_cache_creator()
         creator._skip_est = False
         creator._max_seq_len = 1024
         creator._kv_cache_config = SimpleNamespace(
@@ -414,7 +427,7 @@ class TestKvCacheCreatorLifecycle:
         expected_manager.bind_kv_cache_managers.assert_not_called()
 
     def test_teardown_pops_and_shuts_down_compression_manager(self) -> None:
-        creator = object.__new__(util_mod.KvCacheCreator)
+        creator = _new_cache_creator()
         compression_manager = MagicMock()
         resources = {
             ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression_manager,
@@ -478,7 +491,7 @@ def test_executor_binds_iteration_manager_after_extra_resource_registration() ->
 def test_build_routes_compression_manager_by_capabilities(
     provides_cold_page_codec: bool,
 ) -> None:
-    creator = object.__new__(util_mod.KvCacheCreator)
+    creator = _new_cache_creator()
     creator._skip_est = False
     creator._max_seq_len = 1024
     creator._kv_cache_config = SimpleNamespace(enable_block_reuse=False)

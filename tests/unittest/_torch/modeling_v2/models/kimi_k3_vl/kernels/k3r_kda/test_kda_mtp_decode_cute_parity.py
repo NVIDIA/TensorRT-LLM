@@ -426,7 +426,7 @@ def _fla_sequential_reference(data, num_accepted):
     Returns out rows (new tokens only) and the committed state (after the
     first new token, FLA/cute ``[B, H, V, K]`` layout).
     """
-    from fla.ops.kda import fused_recurrent_kda
+    from test_common.fla_utils import fused_recurrent_kda_reference as fused_recurrent_kda
 
     B, H, K, V, W = data["B"], data["H"], data["K"], data["V"], data["W"]
     M, T = data["M"], data["T"]
@@ -455,8 +455,6 @@ def _fla_sequential_reference(data, num_accepted):
                 xk = data["cs_k"][n, :, W - 1 + i_t].float()
                 xv = data["cs_v"][n, :, W - 1 + i_t].float()
                 tok = None
-                g_t = data["g_cache"][n, i_t].float()
-                beta_t = data["beta_cache"][n, i_t].float()
                 replay = True
             else:
                 tok = bos + i_t
@@ -475,6 +473,8 @@ def _fla_sequential_reference(data, num_accepted):
             cv, hist["v"] = conv_step(hist["v"], xv, w_v)
 
             if replay:
+                g_t = data["g_cache"][n, i_t].float()
+                beta_t = data["beta_cache"][n, i_t].float()
                 # Replayed tokens use the cached post-processed k/g/v/beta
                 # exactly as the kernel does (delta rule applied directly).
                 k_t = data["k_cache"][n, i_t].float().view(H, K)

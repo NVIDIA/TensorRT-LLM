@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Run Pyrefly on supplied product or test Python files, or the whole project when
-# --full-project is used. With no eligible file paths, return success without
-# checking. Pre-commit supplies the file list with pass_filenames: true.
+# --full-project is used. With no eligible file paths, skip normal type checking.
+# Checker/config-only inputs still check mocks; no inputs skip both checks.
+# Pre-commit supplies the file list with pass_filenames: true.
 # Paths from tool.pyrefly.project-excludes and symbols from
 # tool.pyrefly-exclusions in pyproject.toml are removed from the JSON report by
 # scripts/pyrefly_exclusion.py. Whole-project checks are always advisory;
@@ -18,6 +19,8 @@
 # Path and symbol exclusions are enabled by default; use --no-path-module-filter
 # to also disable Pyrefly's configured project and import exclusions.
 # Product and test checks use separate configurations to isolate import resolution.
+# Registered mock interfaces are checked across all tests, without diff filtering,
+# and included in the same report. Use --no-mock-interfaces for Pyrefly alone.
 
 set -euo pipefail
 
@@ -25,6 +28,7 @@ FULL_PROJECT=0
 DIFF_BASE=""
 DIFF_FILTER=1
 PATH_MODULE_FILTER=1
+MOCK_CHECK_ENABLED=1
 STRICT=0
 while (( $# > 0 )); do
     case "$1" in
@@ -40,17 +44,21 @@ while (( $# > 0 )); do
             cat <<'EOF'
 Run Pyrefly on supplied product or test Python files, or the whole project.
 
-Pre-commit passes filenames to this script. With no eligible filenames, skip
-the check. Use --full-project to check all configured sources explicitly.
+Pre-commit passes filenames to this script. With no inputs, skip both checks.
+Checker/config-only inputs check mocks without a normal source-file pass.
+Use --full-project to check all configured sources explicitly.
 
 Options:
   --full-project           Check all configured product and test Python files.
   --strict                 Fail file-list checks on diagnostics or check failures.
   --no-diff-filter         Keep diagnostics from all lines in supplied files.
   --no-path-module-filter  Include diagnostics from excluded paths and modules.
+  --no-mock-interfaces      Run only Pyrefly.
 
 Path and module exclusions and diff-line filtering are enabled by default.
 PYREFLY_REPORT_PATH overrides the report path (default: project root).
+Registered mock interfaces are checked across all tests and added to this report.
+Mock diagnostics are not filtered by changed lines or product/test exclusions.
 EOF
             exit 0
             ;;
@@ -60,6 +68,10 @@ EOF
             ;;
         --no-path-module-filter)
             PATH_MODULE_FILTER=0
+            shift
+            ;;
+        --no-mock-interfaces)
+            MOCK_CHECK_ENABLED=0
             shift
             ;;
         *)
@@ -91,9 +103,19 @@ CANDIDATE_PATHS=""
 ALLOWED_PATHS=""
 FILTERED_ARG_COUNT=0
 SKIP_CHECK=0
+MOCK_CHECK=0
 
 cleanup() {
     local status=$?
+    local mock_status=0
+    trap - EXIT
+    if (( MOCK_CHECK && status != 130 && status != 143 )); then
+        python3 "$WORKFLOW_SCRIPT" check-mock-interfaces "$REPORT_FILE" "$PROJECT_DIR" \
+            || mock_status=$?
+        if (( mock_status > status )); then
+            status=$mock_status
+        fi
+    fi
     for file in "$FILTERED_REPORT" "$DIFF_FILTERED_OUTPUT" \
                 "$CANDIDATE_PATHS" "$ALLOWED_PATHS"; do
         if [[ -n "$file" ]]; then
@@ -103,8 +125,10 @@ cleanup() {
     if [[ -n "$CHECK_DIR" ]]; then
         rm -rf "$CHECK_DIR" || true
     fi
+    if (( status == 130 || status == 143 )); then
+        exit "$status"
+    fi
     if (( SKIP_CHECK )); then
-        trap - EXIT
         exit 0
     fi
     if (( FULL_PROJECT )); then
@@ -112,7 +136,6 @@ cleanup() {
     else
         python3 "$WORKFLOW_SCRIPT" print-diagnostics "$REPORT_FILE" >&3 || true
     fi
-    trap - EXIT
     if (( STRICT )); then
         printf 'Pyrefly check exit status: %s\n' "$status" >&3 || true
         exit "$status"
@@ -127,12 +150,17 @@ cleanup() {
 
 exec 3>&1
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cd "$PROJECT_DIR"
 
 if (( FULL_PROJECT && $# > 0 )); then
     printf '{"tool":"pyrefly","report_error":"--full-project does not accept file paths"}\n' \
         > "$REPORT_FILE"
     exit 2
+fi
+if (( FULL_PROJECT )); then
+    STRICT=0
 fi
 FILTERED_ARGS=()
 for argument in "$@"; do
@@ -150,6 +178,23 @@ for argument in "$@"; do
     FILTERED_ARGS+=("$argument")
     FILTERED_ARG_COUNT=$((FILTERED_ARG_COUNT + 1))
 done
+
+if (( MOCK_CHECK_ENABLED )); then
+    MOCK_CHECK=$FULL_PROJECT
+    for argument in "$@"; do
+        argument="${argument#"$PROJECT_DIR/"}"
+        argument="${argument#./}"
+        case "$argument" in
+            tensorrt_llm/*.py|tensorrt_llm/*.pyi|tests/*.py|tests/*.pyi|\
+            scripts/check_mock_interfaces.py|\
+            scripts/pyrefly_workflow.py|scripts/pyrefly_exclusion.py|scripts/run_pyrefly.sh|\
+            pyproject.toml|.pre-commit-config.yaml)
+                MOCK_CHECK=1
+                break
+                ;;
+        esac
+    done
+fi
 
 if (( FULL_PROJECT || FILTERED_ARG_COUNT > 0 )); then
     printf '{"tool":"pyrefly","report_error":"Pyrefly check did not complete"}\n' > "$REPORT_FILE"
@@ -181,12 +226,14 @@ if (( ! FULL_PROJECT && FILTERED_ARG_COUNT > 0 )); then
 fi
 
 if (( ! FULL_PROJECT && FILTERED_ARG_COUNT == 0 )); then
+    if (( MOCK_CHECK )); then
+        printf '{"tool":"pyrefly","pyrefly_skipped":true,"result":{"errors":[]}}\n' \
+            > "$REPORT_FILE"
+        exit 0
+    fi
     SKIP_CHECK=1
     printf 'No eligible supplied product or test Python files; skipping Pyrefly check.\n' >&3
     exit 0
-fi
-if (( FULL_PROJECT )); then
-    STRICT=0
 fi
 
 if ! command -v pyrefly >/dev/null 2>&1; then
@@ -230,6 +277,9 @@ for scope in tensorrt_llm tests; do
     PASS_STATUS=0
     pyrefly "${PYREFLY_ARGS[@]}" > "$CHECK_DIR/$scope.raw.json" \
         2> "$CHECK_DIR/$scope.stderr" || PASS_STATUS=$?
+    if (( PASS_STATUS == 130 || PASS_STATUS == 143 )); then
+        exit "$PASS_STATUS"
+    fi
     if (( PASS_STATUS > PYREFLY_STATUS )); then
         PYREFLY_STATUS=$PASS_STATUS
     fi

@@ -682,10 +682,14 @@ class TestMnnvlSleepWakeupCoordination:
             ("local_mnnvl", action)
         )
 
+        def _record_release(*tags: str) -> int:
+            events.append(("local_vmm", "sleep"))
+            return 0
+
         with (
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=lambda *tags: events.append(("local_vmm", "sleep")),
+                side_effect=_record_release,
             ),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
             patch("torch.cuda.synchronize"),
@@ -1291,7 +1295,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
             def send(self, payload, dest, tag):
                 sent_acks.append(payload)
 
-        # Minimal PyExecutor shell — only the fields the listener loop touches.
+        # Populate the fields used by the listener loop.
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         executor = object.__new__(PyExecutor)

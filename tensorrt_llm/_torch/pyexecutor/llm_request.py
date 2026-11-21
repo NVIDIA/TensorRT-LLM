@@ -904,6 +904,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
     but detour some features to Python implementation"""
 
+    # Read-only property exposed by the native base class.
+    if TYPE_CHECKING:
+
+        @property
+        def kv_cache_retention_config(
+                self) -> "tllm_executor.KvCacheRetentionConfig | None":
+            ...
+
     def __init__(
             self,
             *args,

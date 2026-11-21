@@ -40,7 +40,11 @@ def providers(monkeypatch):
                 for layer in layers
             },
         )
-        monkeypatch.setattr(engram_module, "NgramHashMapping", lambda **kwargs: mapping)
+        monkeypatch.setattr(
+            engram_module,
+            "NgramHashMapping",
+            (lambda **kwargs: mapping),
+        )
         config = EngramConfig(layer_ids=list(layers), max_ngram_size=ngram, n_head_per_ngram=heads)
         candidate, reference = EngramHashProvider(config), EngramHashProvider(config)
         monkeypatch.setattr(reference, "_compute_decode_hashes", lambda *args: None)
@@ -532,8 +536,16 @@ def test_engram_decode_padded_batches_take_the_fused_path(
     monkeypatch.setattr(candidate, "_lookback_from_history", Mock(side_effect=AssertionError))
     scatter = Mock(wraps=engram_module.engram_history_scatter)
     refresh = Mock(wraps=engram_module.compile_engram_decode_refresh)
-    monkeypatch.setattr(engram_module, "engram_history_scatter", scatter)
-    monkeypatch.setattr(engram_module, "compile_engram_decode_refresh", refresh)
+    monkeypatch.setattr(
+        engram_module,
+        "engram_history_scatter",
+        (scatter),
+    )
+    monkeypatch.setattr(
+        engram_module,
+        "compile_engram_decode_refresh",
+        (refresh),
+    )
     dummy_id = (1 << 64) - 1
     real_ids = list(range(1, real_requests + 1))
     request_ids = real_ids + [dummy_id] * padding
@@ -566,6 +578,7 @@ def test_engram_decode_padded_batches_take_the_fused_path(
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     observed = []
+    cached = captured = graph = None
     with torch.cuda.stream(stream):
         if use_graph:
             warmup = inputs(0)

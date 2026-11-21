@@ -5,11 +5,21 @@
 import contextlib
 import math
 import os
+from collections.abc import Sequence
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from test_common.interface_checks import mock_target
+from test_common.llm_request_stubs import make_llm_request_stub
+from transformers import PretrainedConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import PagePriorityCallback
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import TokenIdExt
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
@@ -31,6 +41,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
@@ -127,6 +138,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
+    LlmRequestState,
     SamplingConfig,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -584,9 +596,13 @@ def test_kimi_explicit_v2_manager_enables_owned_kda_replay_policy(
     kv_dtype: str,
 ) -> None:
     spec_config = MTPDecodingConfig(max_draft_len=3)
+
+    def _mock_kda_mtp_available() -> bool:
+        return True
+
     monkeypatch.setattr(
         "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
-        lambda: True,
+        _mock_kda_mtp_available,
     )
 
     _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config, kv_dtype=kv_dtype)
@@ -597,6 +613,8 @@ def test_kimi_explicit_v2_manager_enables_owned_kda_replay_policy(
         assert kwargs["tokens_per_block"] == FP4_MLA_TOKENS_PER_BLOCK
     assert "speculative_state" not in kwargs
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.spec_config = spec_config
     mgr._mamba_ssm_stochastic_rounding = False
     mgr._requested_num_spec = None
@@ -653,6 +671,8 @@ def test_kimi_kda_replay_respects_fused_verify_draft_limit(
 
     assert "kda_replay_num_spec" not in kwargs
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.spec_config = spec_config
     mgr._mamba_ssm_stochastic_rounding = False
     mgr._requested_num_spec = None
@@ -1440,16 +1460,14 @@ def test_kimi_disagg_explicit_v1_python_nixl_routes_to_mixed_manager(
 
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.kv_connector_manager = None
+    manager.is_estimating_kv_cache = False
     manager.local_num_mamba_layers = 0
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
     transceiver._page_table = SimpleNamespace(layer_groups=[])
-    request = SimpleNamespace(
-        is_generation_only_request=False,
-        prompt_len=0,
-        py_request_id=123,
-    )
+    request = _make_v2_prompt_request(123, [])
 
     chunk = transceiver._create_chunk(request)
 
@@ -1459,6 +1477,8 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
 def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_tokens():
     manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.kv_connector_manager = None
+    manager.is_estimating_kv_cache = False
     manager.local_num_mamba_layers = 1
     # The incoming recurrent state replaces the whole local slot, so nothing survives as a hit.
     assert manager._disagg_transfer_overwrites_whole_cached_prefix()
@@ -1466,6 +1486,8 @@ def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_toke
 
 def test_v2_disagg_gen_init_without_local_mamba_layers_keeps_complete_blocks():
     manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.kv_connector_manager = None
+    manager.is_estimating_kv_cache = False
     manager.local_num_mamba_layers = 0
     assert not manager._disagg_transfer_overwrites_whole_cached_prefix()
 
@@ -1474,6 +1496,8 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 
     manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.kv_connector_manager = None
+    manager.is_estimating_kv_cache = False
     manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {123: 7}
     manager.get_state_indices = MagicMock(
@@ -1485,11 +1509,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
     transceiver._page_table = SimpleNamespace(layer_groups=[mamba_lg])
-    request = SimpleNamespace(
-        is_generation_only_request=False,
-        prompt_len=0,
-        py_request_id=123,
-    )
+    request = _make_v2_prompt_request(123, [])
 
     chunk = transceiver._create_chunk(request)
 
@@ -1512,36 +1532,52 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     ],
 )
 def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
-    max_beam_width, has_connector, expected
-):
-    config = SimpleNamespace(
+    monkeypatch: pytest.MonkeyPatch,
+    max_beam_width: int,
+    has_connector: bool,
+    expected: str | None,
+) -> None:
+    config = PretrainedConfig(
         architectures=["Qwen3_5MoeForCausalLM"],
         num_hidden_layers=2,
         layer_types=["linear_attention", "full_attention"],
     )
-    model_config = SimpleNamespace(
+    model_config = ModelConfig(
         pretrained_config=config,
         sparse_attention_config=None,
     )
-    creator = object.__new__(KvCacheCreator)
-    creator._kv_connector_manager = object() if has_connector else None
-    creator._max_beam_width = max_beam_width
-    creator._is_disagg = False
-    creator._llm_args = SimpleNamespace(sleep_config=None)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+        lambda *args, **kwargs: MambaHybridCacheManagerV2,
+    )
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model", kv_cache_config=kv_cache_config)
+
+    def make_creator() -> KvCacheCreator:
+        return KvCacheCreator(
+            model_engine=SimpleNamespace(model=SimpleNamespace(model_config=model_config)),
+            mapping=model_config.mapping,
+            net_max_seq_len=64,
+            kv_connector_manager=object() if has_connector else None,
+            max_num_tokens=64,
+            max_beam_width=max_beam_width,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            kv_cache_config=kv_cache_config,
+            llm_args=llm_args,
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
 
     if expected is None:
-        assert (
-            creator._validate_or_fallback_kv_cache_manager_v2(
-                MambaHybridCacheManagerV2, model_config, KvCacheConfig()
-            )
-            is MambaHybridCacheManagerV2
-        )
+        assert make_creator()._kv_cache_manager_cls is MambaHybridCacheManagerV2
         return
 
     with pytest.raises(NotImplementedError, match=expected):
-        creator._validate_or_fallback_kv_cache_manager_v2(
-            MambaHybridCacheManagerV2, model_config, KvCacheConfig()
-        )
+        make_creator()
 
 
 def _make_mgr(
@@ -1981,7 +2017,7 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(monkeypatch,
     if not hasattr(mgr, "_dummy_request_mask"):
         mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
-        SimpleNamespace(num_seqs=2, num_contexts=0),
+        (SimpleNamespace(num_seqs=2, num_contexts=0)),
         torch.tensor([3, 2], dtype=torch.int32),
         state_indices=torch.tensor([0, 1], dtype=torch.int32),
     )
@@ -2200,6 +2236,8 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
 
 def test_v2_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -2226,6 +2264,8 @@ def test_v2_hybrid_prepare_expect_snapshot_points():
 
 def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -2244,6 +2284,8 @@ def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
 
 def _fp4_mla_snapshot_manager(**state_config) -> MambaHybridCacheManagerV2:
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.enable_block_reuse = True
     mgr.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
     mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
@@ -2302,19 +2344,18 @@ def test_v2_hybrid_fp4_mla_branch_snapshot_point_aligns_prompt_end():
 @pytest.mark.parametrize("fp4_mla", [False, True])
 def test_v2_hybrid_fp4_mla_advances_history_with_pending_snapshot(fp4_mla: bool):
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.enable_block_reuse = True
     mgr.is_draft = False
     mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
     mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy if fp4_mla else None
     mgr.conversation_manager = None
-    request = SimpleNamespace(
-        py_request_id=7,
-        is_dummy_request=False,
-        context_current_position=128,
-        context_remaining_length=172,
-        expect_snapshot_points=[256],
-        is_last_context_chunk=False,
-    )
+    request = _make_v2_prompt_request(7, [0] * 300)
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 128
+    request.context_chunk_size = 128
+    request.expect_snapshot_points = [256]
     # History stays at the committed end while the snapshot is pending.
     kv_cache = SimpleNamespace(
         is_active=True,
@@ -2351,6 +2392,8 @@ def test_mamba_snapshot_rule_count_deduplicates_and_filters_unreachable_points()
 
 def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.max_batch_size = 4
     mgr.mapping = Mapping(world_size=2, rank=0, tp_size=1, pp_size=2)
     mgr.max_seq_len = 128
@@ -2410,6 +2453,8 @@ def test_v2_hybrid_cold_typical_step(states, num_tiers, reuse, pool_ratio, expec
         ),
     )
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.max_seq_len = 256
     step = mgr._cold_typical_step(config, num_tiers)
     if expected is None:
@@ -2481,6 +2526,8 @@ def test_v2_hybrid_typical_state_count(
     # The conservative estimate can exceed runtime placement for a particular
     # prompt length; expected_states includes one live state plus snapshots.
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.max_seq_len = 256
     assert mgr._num_ssm_states_per_typical_request(capacity, config) == expected_states
 
@@ -2893,6 +2940,8 @@ def test_v2_hybrid_fp4_disagg_role_mapping_covers_mla_and_ssm_roles(
 
 def test_v2_hybrid_without_fp4_mla_keeps_its_disagg_role_mapping() -> None:
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr._use_kda_replay_update = False
     mgr.local_num_mamba_layers = 1
 
@@ -3138,25 +3187,32 @@ def test_v2_hybrid_fp4_mla_snapshot_realignment_logs_once(
     )
 
     messages = []
-    monkeypatch.setattr(fp4_mla_cache_manager.logger, "info", messages.append)
+    monkeypatch.setattr(
+        fp4_mla_cache_manager.logger,
+        "info",
+        (messages.append),
+    )
     mgr = SimpleNamespace(
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         _fp4_mla_snapshot_realignment_logged=False,
     )
     align = Fp4MlaV2CacheLayoutPolicy.align_snapshot_points
 
-    aligned = SimpleNamespace(py_request_id=1, expect_snapshot_points=[128, 256])
+    aligned = _make_v2_prompt_request(1, [1])
+    aligned.expect_snapshot_points = [128, 256]
     align(mgr, aligned)
     assert aligned.expect_snapshot_points == [128, 256]
     assert messages == []
 
-    moved = SimpleNamespace(py_request_id=2, expect_snapshot_points=[100, 1000])
+    moved = _make_v2_prompt_request(2, [1])
+    moved.expect_snapshot_points = [100, 1000]
     align(mgr, moved)
     assert moved.expect_snapshot_points == [896]
     assert len(messages) == 1
     assert "[100, 1000] -> [896]" in messages[0]
 
-    again = SimpleNamespace(py_request_id=3, expect_snapshot_points=[300])
+    again = _make_v2_prompt_request(3, [1])
+    again.expect_snapshot_points = [300]
     align(mgr, again)
     assert again.expect_snapshot_points == [256]
     assert len(messages) == 1
@@ -3254,6 +3310,8 @@ def test_v2_hybrid_fp4_invalid_iterator_scans_physical_pools() -> None:
     ssm = torch.empty((1, 2), dtype=torch.float32)
     conv = torch.empty((1, 2), dtype=torch.float32)
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
     mgr._iter_fp4_mla_physical_pool_views = MagicMock(return_value=iter((physical,)))
     mgr.get_fp4_mla_hp_pool = MagicMock()
@@ -3262,7 +3320,7 @@ def test_v2_hybrid_fp4_invalid_iterator_scans_physical_pools() -> None:
         (0, MambaRole.CONV_STATE): conv,
     }
 
-    views = list(MambaHybridCacheManagerV2._iter_cache_buffers_for_invalid_check(mgr))
+    views = list(MambaHybridCacheManagerV2._iter_cache_buffers_for_invalid_check((mgr)))
 
     expected = [physical, ssm, conv]
     assert [layer_id for layer_id, _ in views] == [-1, -1, -1]
@@ -3291,6 +3349,8 @@ def _replay_layout_bytes(replay_layouts):
 
 def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.kv_cache_type = CacheTypeCpp.SELF
     mgr.head_dim_per_layer = [64, 64]
     mgr.pp_layers = [0, 1]
@@ -3449,6 +3509,8 @@ def test_v2_hybrid_typical_batch_accounts_for_snapshot_retention(
 
 def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.max_seq_len = 4096
     warnings_seen = []
     monkeypatch.setattr(
@@ -3485,6 +3547,8 @@ def test_v2_hybrid_fallback_warns_about_snapshot_retention(monkeypatch) -> None:
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
@@ -3570,6 +3634,8 @@ def test_v2_hybrid_snapshot_retention_preserves_live_state_floor(
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
@@ -3671,25 +3737,23 @@ def test_cpp_hybrid_state_indices_skip_context_placeholders(
 
 def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.enable_block_reuse = True
     mgr.is_draft = False
     mgr.local_num_mamba_layers = 1
     mgr._branch_snapshot_points = {}
     mgr._branch_snapshots_taken_total = 0
-    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: list(
+        tokens[start:end]
+    )
     mgr._mark_context_position_as_history = MagicMock()
 
     token_ids = list(range(150))
-    request = SimpleNamespace(
-        prompt_len=150,
-        context_current_position=137,
-        context_remaining_length=13,
-        expect_snapshot_points=[137],
-        is_dummy_request=False,
-        is_dummy=False,
-        py_request_id=0,
-        get_tokens_view=lambda beam_idx: token_ids,
-    )
+    request = _make_v2_prompt_request(0, token_ids)
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 137
+    request.expect_snapshot_points = [137]
     kv_cache = SimpleNamespace(
         num_committed_tokens=0,
         commit=MagicMock(),
@@ -3706,7 +3770,6 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
     # second attention/SSM snapshot beyond the configured boundary.
     kv_cache.num_committed_tokens = 137
     request.context_current_position = 150
-    request.context_remaining_length = 0
     mgr.try_commit_blocks(request, kv_cache)
 
     kv_cache.commit.assert_called_once_with(token_ids[:137])
@@ -3715,6 +3778,8 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
 
 def test_v2_hybrid_add_dummy_requests_forwards_encoder_output_lens(mocker):
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     base_add_dummy_requests = mocker.patch.object(
         KVCacheManagerV2, "add_dummy_requests", return_value=[]
     )
@@ -3801,6 +3866,8 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr.kv_connector_manager = None
+        mgr.is_estimating_kv_cache = False
         mgr.layer_specs = None
         mgr._generation_kv_capacity_headroom = 1
         mgr._has_cp_helix = False
@@ -4509,16 +4576,18 @@ def test_v2_hybrid_metadata_supports_attention_only_pp_rank():
         metadata = Mamba2Metadata(max_batch_size=1, chunk_size=8)
         seq_lens = torch.tensor([8], dtype=torch.int32)
         metadata.prepare(
-            SimpleNamespace(
-                seq_lens=seq_lens,
-                seq_lens_cuda=seq_lens.cuda(),
-                num_contexts=1,
-                num_ctx_tokens=8,
-                kv_cache_manager=mgr,
-                request_ids=[123],
-                kv_cache_params=SimpleNamespace(
-                    num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int32)
-                ),
+            (
+                SimpleNamespace(
+                    seq_lens=seq_lens,
+                    seq_lens_cuda=seq_lens.cuda(),
+                    num_contexts=1,
+                    num_ctx_tokens=8,
+                    kv_cache_manager=mgr,
+                    request_ids=[123],
+                    kv_cache_params=SimpleNamespace(
+                        num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int32)
+                    ),
+                )
             )
         )
 
@@ -4685,15 +4754,40 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
         _get_num_reusable_tokens_before_pruning=get_num_reusable_tokens_before_pruning,
         num_committed_tokens=64,
     )
-    create_kv_cache = MagicMock(return_value=kv_cache)
+
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2._create_kv_cache"
+    )
+    def create_kv_cache(
+        self: KVCacheManagerV2,
+        request_id: int,
+        lora_task_id: int | None,
+        input_tokens: "Sequence[TokenIdExt] | None",
+        *,
+        cache_salt: str | None = None,
+        is_dummy: bool = False,
+        enable_request_stats: bool = False,
+        expected_prompt_length: int | None = None,
+        kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        custom_priority_callback: "PagePriorityCallback | None" = None,
+        locality_domain_id: int | None = None,
+    ) -> SimpleNamespace:
+        return kv_cache
+
     log_debug = MagicMock()
-    monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
+    monkeypatch.setattr(
+        KVCacheManagerV2,
+        "_create_kv_cache",
+        create_kv_cache,
+    )
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2.logger.debug",
         log_debug,
     )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.mapping = SimpleNamespace(rank=rank)
     mgr.local_num_mamba_layers = 1
     result = mgr._create_kv_cache(
@@ -4755,7 +4849,14 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
             7: SimpleNamespace(stats=second_stats),
         },
     )
-    monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
+
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_iteration_stats"
+    )
+    def get_iteration_stats(self: KVCacheManagerV2) -> SimpleNamespace:
+        return report
+
+    monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", get_iteration_stats)
     log_debug = MagicMock()
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2.logger.debug",
@@ -4763,6 +4864,8 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.mapping = SimpleNamespace(rank=rank)
     mgr._stats_life_cycle_metadata = MagicMock(
         return_value={
@@ -5139,6 +5242,8 @@ def _branch_snapshot_manager(
 ):
     """Bare V2 hybrid manager carrying only what branch snapshotting reads."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.enable_block_reuse = enable_block_reuse
     mgr.tokens_per_block = tokens_per_block
     mgr.local_num_mamba_layers = local_num_mamba_layers
@@ -5178,7 +5283,7 @@ def _fake_context_request(
     expect_snapshot_points=None,
     is_disagg_generation_init_state=False,
 ):
-    return SimpleNamespace(
+    return make_llm_request_stub(
         py_request_id=rid,
         prompt_len=prompt_len,
         context_current_position=context_current_position,
@@ -5613,6 +5718,8 @@ def test_branch_snapshot_coexists_with_per_conversation_and_zero_interval():
 
 def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.enable_block_reuse = True
     mgr.is_draft = False
     mgr.local_num_mamba_layers = 1
@@ -5620,23 +5727,20 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
     mgr._branch_snapshots_taken_total = 0
     mgr.block_reuse_policy = BlockReusePolicy.PER_CONVERSATION
     events = []
-    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: list(
+        tokens[start:end]
+    )
     mgr._mark_context_position_as_history = MagicMock()
     mgr.conversation_manager = MagicMock()
     mgr.conversation_manager.save_drop_plan.side_effect = lambda request, kv_cache: events.append(
         "save"
     )
 
-    request = SimpleNamespace(
-        py_request_id=7,
-        is_dummy_request=False,
-        context_current_position=128,
-        context_remaining_length=0,
-        expect_snapshot_points=[128],
-        prompt_len=128,
-        is_last_context_chunk=True,
-        get_tokens_view=lambda beam_idx: list(range(128)),
-    )
+    request = _make_v2_prompt_request(7, list(range(128)))
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 128
+    request.context_chunk_size = 0
+    request.expect_snapshot_points = [128]
     kv_cache = SimpleNamespace(
         is_active=True,
         num_committed_tokens=0,
@@ -6040,6 +6144,8 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
     layer."""
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
@@ -6284,6 +6390,8 @@ def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
 @skip_no_cuda
 def test_v2_kda_replay_policy_records_acceptance_and_skips_dummy_rows():
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.local_num_mamba_layers = 1
     policy = KDAReplayState(
         num_speculative_tokens=2,
@@ -6315,6 +6423,8 @@ def test_legacy_mamba_cache_manager_delegates_kda_replay_capability() -> None:
 
 def test_v2_kda_replay_policy_resets_context_slots():
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     policy = KDAReplayState(
         num_speculative_tokens=2,
     )
@@ -6333,6 +6443,8 @@ def test_v2_kda_replay_policy_resets_context_slots():
 @skip_no_cuda
 def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.local_num_mamba_layers = 1
     mgr.spec_config = SimpleNamespace(decoding_type="NGram")
     mgr._request_id_to_state_index = {101: 1, 303: 2}
@@ -6345,7 +6457,23 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     mgr._speculative_state = policy
     policy.acceptance_pending = {101, 202, 404}
     base_update = MagicMock()
-    monkeypatch.setattr(KVCacheManagerV2, "update_resources", base_update)
+
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.update_resources"
+    )
+    def update_resources(
+        self: KVCacheManagerV2,
+        scheduled_batch: ScheduledRequests,
+        attn_metadata: "AttentionMetadata | None" = None,
+        kv_cache_dtype_byte_size: float | None = None,
+    ) -> None:
+        base_update(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+
+    monkeypatch.setattr(
+        KVCacheManagerV2,
+        "update_resources",
+        update_resources,
+    )
     active = SimpleNamespace(
         py_request_id=101,
         py_draft_tokens=[11, 12],
@@ -6524,7 +6652,18 @@ def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
     it resumes, in the slot it resumes in; a transfer completion while it is suspended seeds nothing. A seeded request
     keeps its replay state across the suspend, and the resume seeds nothing."""
     mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
-    monkeypatch.setattr(KVCacheManagerV2, "prepare_resources", MagicMock())
+
+    @mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.prepare_resources"
+    )
+    def prepare_resources(self: KVCacheManagerV2, scheduled_batch: ScheduledRequests) -> None:
+        pass
+
+    monkeypatch.setattr(
+        KVCacheManagerV2,
+        "prepare_resources",
+        prepare_resources,
+    )
     request = SimpleNamespace(py_request_id=1, is_dummy=False, is_disagg_generation_init_state=True)
     mgr.kv_cache_map[1] = _SlotCache(0)
     _write_kda_replay_slot(mgr, 0, accepted=0, value=5.0)
@@ -7563,6 +7702,8 @@ def test_v2_kda_draft_records_seed_disaggregated_generation_slots():
     """Without the per-draft replay caches, seeding a transferred request's slot sets its conv caches and clears its
     draft count; its drafts' records stay as they are, since with no pending drafts none of them is read."""
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr._kda_replay = KDAReplayState(2, draft_records=True)
     mgr._speculative_state = mgr._kda_replay
     mgr.local_num_mamba_layers = 2
@@ -7645,6 +7786,8 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     """
     torch.manual_seed(0)
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr.local_num_mamba_layers = 2
     policy = KDAReplayState(num_speculative_tokens=2)
     mgr._kda_replay = policy
@@ -8359,16 +8502,18 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     metadata = Mamba2Metadata(max_batch_size=1, chunk_size=8)
     seq_lens = torch.tensor([8], dtype=torch.int32)
     metadata.prepare(
-        SimpleNamespace(
-            seq_lens=seq_lens,
-            seq_lens_cuda=seq_lens.cuda(),
-            num_contexts=1,
-            num_ctx_tokens=8,
-            kv_cache_manager=mgr,
-            request_ids=[123],
-            kv_cache_params=SimpleNamespace(
-                num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int32)
-            ),
+        (
+            SimpleNamespace(
+                seq_lens=seq_lens,
+                seq_lens_cuda=seq_lens.cuda(),
+                num_contexts=1,
+                num_ctx_tokens=8,
+                kv_cache_manager=mgr,
+                request_ids=[123],
+                kv_cache_params=SimpleNamespace(
+                    num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int32)
+                ),
+            )
         )
     )
     assert metadata.state_indices[0].item() == 0
@@ -8401,6 +8546,8 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
     synchronize the stream (the previous step is still queued)."""
     num_slots, num_layers, num_spec, dim, window = 8, 2, 2, 2, 3
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     policy = KDAReplayState(num_spec)
     mgr._kda_replay = policy
     mgr._speculative_state = policy
@@ -9122,7 +9269,11 @@ def _kda_cache_budget(monkeypatch, available, model, mapping, **kwargs):
     from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
 
     monkeypatch.setattr(_kda_kernels, "is_kda_mtp_verify_available", lambda: available)
-    monkeypatch.setattr(_kda_kernels, "kda_mtp_max_num_spec", lambda: 7)
+
+    def _mock_max_num_spec() -> int:
+        return 7
+
+    monkeypatch.setattr(_kda_kernels, "kda_mtp_max_num_spec", _mock_max_num_spec)
     return KimiK3HybridCacheManager.get_cache_size_per_token(model, mapping, **kwargs)
 
 
@@ -9227,6 +9378,8 @@ def test_kda_cache_budget_counts_one_replay_slot_per_living_cache(
 
 def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.kv_connector_manager = None
+    mgr.is_estimating_kv_cache = False
     mgr._kda_replay = KDAReplayState(2)
     mgr.local_num_mamba_layers = 2
     mgr.conv_state_shape = [6, 4]
@@ -9578,7 +9731,10 @@ def test_gdn_replay_cache_estimate_matches_declared_buffers(
     declared = sum(
         dtype.itemsize * math.prod(shape)
         for layer_id in layout.mamba_pp_layers
-        for dtype, shape in state.replay_layout(layout, layer_id).values()
+        for dtype, shape in state.replay_layout(
+            (layout),
+            layer_id,
+        ).values()
     )
     kv_cache_config = KvCacheConfig(max_util_for_resume=0.8)
     max_batch_size = 4

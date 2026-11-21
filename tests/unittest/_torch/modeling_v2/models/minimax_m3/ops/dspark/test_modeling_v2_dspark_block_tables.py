@@ -166,7 +166,15 @@ def test_inputs_and_refresh_is_inputs_plus_refresh(parallel, dtype, n, block):
     assert refresh_block_tables(off, pool_idx, n, divisor, want_t, want_c)
     want = drafter_inputs(*args)
     got_t, got_c = _buffers(rows, width)
-    got = drafter_inputs_and_refresh(*args, off, pool_idx, n, divisor, got_t, got_c)
+    got = drafter_inputs_and_refresh(
+        *args,
+        offsets=off,
+        pool_idx=pool_idx,
+        num_seqs=n,
+        divisor=divisor,
+        tables=got_t,
+        counts=got_c,
+    )
     assert got is not None and len(got) == len(want) == 4
     for x, y in zip(got, want):
         assert x.dtype == y.dtype and x.shape == y.shape and torch.equal(x, y)

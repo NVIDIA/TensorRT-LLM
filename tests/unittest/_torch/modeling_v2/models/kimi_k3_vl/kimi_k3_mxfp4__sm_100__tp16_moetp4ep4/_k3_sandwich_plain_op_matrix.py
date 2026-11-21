@@ -38,11 +38,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ops" / "comm"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "comm"))
-import _k3_sandwich_common as cm  # noqa: E402
 
 if TYPE_CHECKING:
     from _torch.modeling_v2.comm import _lockstep as ls
+    from _torch.modeling_v2.models.kimi_k3_vl.ops.comm import _k3_sandwich_common as cm
 else:
+    import _k3_sandwich_common as cm  # noqa: E402
     import _lockstep as ls  # noqa: E402
 
 assert torch.cuda.is_available(), "k3_sandwich_plain requires CUDA devices"

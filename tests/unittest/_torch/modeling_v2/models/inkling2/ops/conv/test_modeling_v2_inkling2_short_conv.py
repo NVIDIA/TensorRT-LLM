@@ -149,10 +149,21 @@ def test_dynamic_taps_are_per_head() -> None:
     """Swapping the two heads' dynamic taps changes the output: one head's taps never reach the
     other head's channels."""
     spec = dict(channels=256, heads=2, requests=((7, 0),))
-    args = list(_build(spec, 3, dynamic=True))
-    out = inkling2_dynamic_short_conv(*args[:3], args[3].clone(), *args[4:])
-    swapped = args[2].view(-1, 2, 4).flip(1).reshape(-1, 8).contiguous()
-    out_swapped = inkling2_dynamic_short_conv(args[0], args[1], swapped, args[3].clone(), *args[4:])
+    (
+        x,
+        taps,
+        dynamic_taps,
+        state,
+        slots,
+        query_start,
+        has_state,
+        token_request,
+        channels_per_head,
+    ) = _build(spec, 3, dynamic=True)
+    state_args = (slots, query_start, has_state, token_request, channels_per_head)
+    out = inkling2_dynamic_short_conv(x, taps, dynamic_taps, state.clone(), *state_args)
+    swapped = dynamic_taps.view(-1, 2, 4).flip(1).reshape(-1, 8).contiguous()
+    out_swapped = inkling2_dynamic_short_conv(x, taps, swapped, state.clone(), *state_args)
     assert not torch.equal(out[:, :128], out_swapped[:, :128])
 
 

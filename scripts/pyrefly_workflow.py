@@ -184,7 +184,7 @@ def write_test_config(
 
 
 def report_status(report_path: Path) -> int:
-    """Fail strict checks on remaining diagnostics or an unsuccessful tool invocation."""
+    """Determine the strict exit status of the Pyrefly pass."""
     report = json.loads(report_path.read_text())
     if report.get("report_error"):
         return 2
@@ -197,6 +197,59 @@ def report_status(report_path: Path) -> int:
     return int(bool(result["errors"]))
 
 
+def check_mock_interfaces(report_path: Path, project_root: Path) -> int:
+    """Check all registrations and append only failed or incomplete mock results."""
+    report = json.loads(report_path.read_text())
+    report["mock_interfaces"] = {
+        "report_error": "Mock interface check did not complete",
+        "check_exit_code": 2,
+    }
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
+    from check_mock_interfaces import check, check_status
+
+    mocks = check(project_root, list((project_root / "tests").rglob("*.py")))
+    status = check_status(mocks)
+    mocks["check_exit_code"] = status
+    mocks["results"] = [
+        result
+        for result in mocks["results"]
+        if result["diagnostics"]
+        or not result["complete"]
+        or result["status"] in ("mismatched", "unverified")
+    ]
+    report["mock_interfaces"] = mocks
+    errors = report.setdefault("result", {}).setdefault("errors", [])
+    for result in mocks["results"]:
+        for diagnostic in result["diagnostics"]:
+            message = f"{result['target']}: {diagnostic['message']}"
+            errors.append(
+                {
+                    "path": result["path"],
+                    "line": diagnostic["line"],
+                    "name": "mock-interface/" + diagnostic["code"],
+                    "description": message,
+                    "concise_description": message,
+                    "severity": "error",
+                    "source": "mock-interface",
+                }
+            )
+    for error in mocks["analysis_errors"]:
+        errors.append(
+            {
+                "path": error["path"],
+                "line": error["line"],
+                "name": "mock-interface/analysis-error",
+                "description": error["message"],
+                "concise_description": error["message"],
+                "severity": "error",
+                "source": "mock-interface",
+            }
+        )
+    report["remaining_diagnostic_count"] = len(errors)
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    return status
+
+
 def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
     """Print diagnostics from a Pyrefly report."""
     try:
@@ -204,21 +257,37 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
     except (OSError, json.JSONDecodeError) as error:
         print(f"Could not read Pyrefly report: {error}")
     else:
-        if report.get("report_error"):
-            print(f"Pyrefly report error: {report['report_error']}")
+        if mocks := report.get("mock_interfaces"):
+            if mocks.get("report_error"):
+                print(f"Mock interface report error: {mocks['report_error']}")
+            else:
+                print(
+                    f"Mock interfaces: {mocks['registrations']} registrations across all tests; "
+                    f"{mocks['counts']}"
+                )
         result = report.get("result", report)
         errors = result.get("errors", []) if isinstance(result, dict) else []
         if not isinstance(errors, list):
             errors = []
-        if not errors:
+        pyrefly_errors = [error for error in errors if error.get("source") != "mock-interface"]
+        mock_errors = [error for error in errors if error.get("source") == "mock-interface"]
+        if report.get("report_error"):
+            print(f"Pyrefly report error: {report['report_error']}")
+        elif report.get("pyrefly_skipped"):
+            print("Pyrefly skipped. No eligible Python files were supplied.")
+        elif not pyrefly_errors:
             print("No Pyrefly diagnostics.")
-        else:
-            if all_diagnostics:
-                print("Pyrefly type check on your changed files. Please fix the type errors below.")
-                print(
-                    "They are only warnings for now, but in the future they may block your commits and PR merges."
-                )
-            for error in errors if all_diagnostics else errors[:8]:
+        elif all_diagnostics:
+            print("Pyrefly type check on your changed files. Please fix the type errors below.")
+            print(
+                "They are only warnings for now, but in the future they may block your commits and PR merges."
+            )
+        shown_count = 0
+        for diagnostics in (pyrefly_errors, mock_errors):
+            shown = diagnostics if all_diagnostics else diagnostics[: 8 - shown_count]
+            if shown and diagnostics is mock_errors:
+                print("Mock interface diagnostics across all registered tests.")
+            for error in shown:
                 path = str(error.get("path", "<unknown>"))
                 line = error.get("line")
                 column = error.get("column")
@@ -236,8 +305,9 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
                 if not all_diagnostics:
                     message = str(message).replace("\n", " ")
                 print(f"{location}: [{kind}] {message}")
-            if not all_diagnostics and len(errors) > 8:
-                print(f"Showing 8 of {len(errors)} diagnostics.")
+            shown_count += len(shown)
+        if shown_count < len(errors):
+            print(f"Showing {shown_count} of {len(errors)} diagnostics.")
     print(f"See full Pyrefly report at: {report_path}")
 
 
@@ -453,6 +523,10 @@ def main() -> int:
     status_parser = subparsers.add_parser("report-status")
     status_parser.add_argument("report", type=Path)
 
+    mocks_parser = subparsers.add_parser("check-mock-interfaces")
+    mocks_parser.add_argument("report", type=Path)
+    mocks_parser.add_argument("project_root", type=Path)
+
     config_parser = subparsers.add_parser("clear-exclusions-config")
     config_parser.add_argument("source", type=Path)
     config_parser.add_argument("destination", type=Path)
@@ -491,6 +565,12 @@ def main() -> int:
         print_summary(args.report, all_diagnostics=True)
     elif args.command == "report-status":
         return report_status(args.report)
+    elif args.command == "check-mock-interfaces":
+        try:
+            return check_mock_interfaces(args.report, args.project_root)
+        except Exception as error:
+            print(f"Mock interface check failed: {type(error).__name__}: {error}", file=sys.stderr)
+            return 2
     elif args.command == "clear-exclusions-config":
         clear_path_module_exclusions(args.source, args.destination)
     elif args.command == "write-test-config":

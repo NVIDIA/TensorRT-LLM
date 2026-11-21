@@ -18,6 +18,7 @@ import pytest
 import torch
 from coordinator_harness import CoordinatorHarness
 from fake_dist import FakeDistGroup
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
@@ -132,6 +133,13 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
     engine = object.__new__(PyExecutor)
+    engine.model_engine = SimpleNamespace(wait_for_input_copy=Mock(), is_spec_decode=False)
+    engine.dense_dwdp_manager = None
+    verify_instance(
+        engine,
+        "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+        members=("model_engine", "dense_dwdp_manager"),
+    )
     engine.active_requests = []
     engine.canceled_req_ids = []
     engine.waiting_queue = FCFSWaitingQueue()
@@ -161,7 +169,6 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine._prefetched_request_ids = set()
     engine.resource_manager = Mock(spec=["free_resources"])
     engine.sampler = Mock(spec=["release_request"])
-    engine.model_engine = SimpleNamespace(wait_for_input_copy=Mock(), is_spec_decode=False)
     engine.draft_model_engine = None
     engine._maybe_record_hang_diagnostic_phase = Mock()
     engine.async_transfer_manager = SimpleNamespace(
@@ -1901,9 +1908,16 @@ def test_adp_receive_retirement_snapshot_keeps_empty_peer_live(
         "tp_allgather",
         {"error_ids": [], "blocked_ids": [], "retiring_gen_receives": True},
     )
-    engines = []
-    for rank in ranks:
+
+    def make_executor(rank: CoordinatorHarness) -> PyExecutor:
         engine = object.__new__(PyExecutor)
+        engine.model_engine = None
+        engine.dense_dwdp_manager = None
+        verify_instance(
+            engine,
+            "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+            members=("model_engine", "dense_dwdp_manager"),
+        )
         engine._disagg_coordinator = rank.coordinator
         engine.dist = rank.dist
         engine.enable_attention_dp = True
@@ -1912,7 +1926,9 @@ def test_adp_receive_retirement_snapshot_keeps_empty_peer_live(
         engine.waiting_queue = FCFSWaitingQueue()
         engine.is_shutdown = True
         engine.control_requests = [SimpleNamespace(control_requires_drain=True)]
-        engines.append(engine)
+        return engine
+
+    engines = [make_executor(rank) for rank in ranks]
     synchronize = Mock(side_effect=AssertionError("control crossed pending retirement"))
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.synchronize", synchronize
@@ -1983,6 +1999,12 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
     assert executor.active_requests == [healthy]
     assert not healthy.is_finished
     _assert_released_once(executor, cancelled)
+
+
+def _previous_generation_batch(request: LlmRequest) -> BatchState:
+    scheduled = ScheduledRequests()
+    scheduled.generation_requests = [request]
+    return BatchState(scheduled_requests=scheduled, sample_state=None)
 
 
 @pytest.mark.parametrize(
@@ -2056,9 +2078,7 @@ def test_legacy_tp_cancel_reaches_multimodal_model_generation_work(
 
     # The previous model batch still owns the request: the vote must hold it.
     for rank, engine in enumerate(engines):
-        scheduled = ScheduledRequests()
-        scheduled.generation_requests = [requests[rank]]
-        engine.previous_batch = SimpleNamespace(scheduled_requests=scheduled)
+        engine.previous_batch = _previous_generation_batch(requests[rank])
     group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
     assert all(not request.is_finished for request in requests)
     assert all(engine.canceled_req_ids == [1] for engine in engines)
@@ -2126,9 +2146,7 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     # A receive still referenced by a prior model batch cannot be closed by
     # the loop-head retry, even when local transport retirement reports ready.
     for rank, engine in enumerate(engines):
-        scheduled = ScheduledRequests()
-        scheduled.generation_requests = [requests[rank]]
-        engine.previous_batch = SimpleNamespace(scheduled_requests=scheduled)
+        engine.previous_batch = _previous_generation_batch(requests[rank])
     group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
     assert all(not request.is_finished for request in requests)
     for engine in engines:

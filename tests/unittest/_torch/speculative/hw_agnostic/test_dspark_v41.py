@@ -20,7 +20,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn.functional as F
+from test_common.interface_checks import mock_target
 from torch import nn
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch import model_config as model_config_module
 from tensorrt_llm._torch.model_config import ModelConfig, MoESelection
@@ -56,9 +58,9 @@ def test_dspark_generation_never_silently_substitutes_missing_captures():
     accepted = torch.zeros(1, 6, dtype=torch.int32)
     with pytest.raises(RuntimeError, match="requires captured target hidden states"):
         DSv4DSparkWorker._draft_gen_block_batched(
-            worker,
+            (worker),
             Mock(),
-            metadata,
+            (metadata),
             Mock(),
             accepted,
             torch.ones(1, dtype=torch.int32),
@@ -304,9 +306,15 @@ def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
     monkeypatch.setattr(
         ModelConfig,
         "_get_safetensors_header_for_tensor",
-        staticmethod(lambda checkpoint_dir, name: {"dtype": "I8", "shape": [8, 8]}),
+        mock_target(
+            "tensorrt_llm._torch.model_config:ModelConfig._get_safetensors_header_for_tensor"
+        )(staticmethod(lambda checkpoint_dir, tensor_name: {"dtype": "I8", "shape": [8, 8]})),
     )
-    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(
+        model_config_module,
+        "get_sm_version",
+        (lambda: 100),
+    )
     monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
     main_experts = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     quant_config_dict = {f"model.layers.{i}.mlp.experts": main_experts for i in range(4)}
@@ -470,6 +478,7 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch, batched)
         attention,
     )
     kwargs = {}
+    rope_metadata = None
     if batched:
         rope_metadata = (
             torch.empty(1, 1, 1, dtype=torch.complex64),
@@ -481,8 +490,8 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch, batched)
             "rope_metadata": rope_metadata,
         }
     result, next_pre = modeling_dspark.DSv4DSparkDraftModel._forward_stage(
-        model,
-        stage,
+        (model),
+        (stage),
         hidden,
         torch.zeros(1, 3),
         torch.ones(1, dtype=torch.long) if batched else 1,
@@ -559,7 +568,7 @@ def test_v41_draft_csa2_layout_has_no_target_cache_sources(monkeypatch):
         self._attn_params = {}
 
     monkeypatch.setattr(modeling_dspark.DSv4DSparkDraftModel, "__init__", fake_init)
-    target = SimpleNamespace(
+    target = PretrainedConfig(
         n_routed_experts=384,
         num_experts_per_tok=6,
         dspark_n_routed_experts=128,
@@ -576,7 +585,7 @@ def test_v41_draft_csa2_layout_has_no_target_cache_sources(monkeypatch):
         candidate_block_size=8,
         index_topk=512,
     )
-    config = SimpleNamespace(
+    config = ModelConfig(
         pretrained_config=target, sparse_attention_config=CSA2SparseAttentionConfig()
     )
     DSv41DSparkDraftModel(config, {}, 3, 5)
@@ -749,9 +758,15 @@ def test_v41_explicit_draft_backend_preserves_nvfp4_conversion(monkeypatch):
     monkeypatch.setattr(
         ModelConfig,
         "_get_safetensors_header_for_tensor",
-        staticmethod(lambda checkpoint_dir, name: {"dtype": "I8", "shape": [8, 8]}),
+        mock_target(
+            "tensorrt_llm._torch.model_config:ModelConfig._get_safetensors_header_for_tensor"
+        )(staticmethod(lambda checkpoint_dir, tensor_name: {"dtype": "I8", "shape": [8, 8]})),
     )
-    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(
+        model_config_module,
+        "get_sm_version",
+        (lambda: 100),
+    )
     model_config = ModelConfig(
         pretrained_config=SimpleNamespace(
             _name_or_path="/unused", architectures=["DeepseekV41ForCausalLM"]

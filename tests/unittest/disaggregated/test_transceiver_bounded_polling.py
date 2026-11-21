@@ -25,6 +25,8 @@ from typing import Optional
 from unittest.mock import Mock
 
 import pytest
+from test_common.host_cache_manager import make_host_cache_manager
+from test_common.llm_request_stubs import make_llm_request_stub
 
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
@@ -41,8 +43,11 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.bindings import LlmRequestState, SamplingConfig
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -341,7 +346,7 @@ def test_timeout_description_selects_local_session_without_polling(context: bool
     session.wait_complete = Mock(side_effect=AssertionError("timeout description must not poll"))
     transceiver = _make_transceiver({16: session} if context else {})
     transceiver._recv_sessions = {} if context else {16: session}
-    req = SimpleNamespace(
+    req = make_llm_request_stub(
         py_request_id=16,
         request_id=16,
         py_disaggregated_params=None,
@@ -847,11 +852,11 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
     )
 
     assert session._deadline_monotonic_s is None
-    session.send(Mock(is_last=False))
+    session.send((Mock(is_last=False)))
     assert session._deadline_monotonic_s == 12.0
 
     clock.advance(0.5)
-    session.send(Mock(is_last=False))
+    session.send((Mock(is_last=False)))
     assert session._deadline_monotonic_s == 12.0
     assert sender.dispatch_task.call_count == 2
     session.close()
@@ -899,15 +904,23 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     monkeypatch.setattr(
         KvCacheTransceiverV2,
         "_broadcast_instance_name",
-        lambda _self: "ctx",
+        (lambda _self: "ctx"),
     )
     monkeypatch.setattr(
         KvCacheTransceiverV2,
         "_broadcast_context_endpoint",
-        lambda _self: "endpoint",
+        (lambda _self: "endpoint"),
     )
-    monkeypatch.setattr(KvCacheTransceiverV2, "_init_sync_policy", lambda _self: None)
-    monkeypatch.setattr(KvCacheTransceiverV2, "_exchange_rank_info", lambda _self: None)
+    monkeypatch.setattr(
+        KvCacheTransceiverV2,
+        "_init_sync_policy",
+        (lambda _self: None),
+    )
+    monkeypatch.setattr(
+        KvCacheTransceiverV2,
+        "_exchange_rank_info",
+        (lambda _self: None),
+    )
     # Everything the constructor can reach, not only what it reaches with these values: the
     # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
@@ -925,7 +938,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     KvCacheTransceiverV2(
         mapping=mapping,
         dist=Mock(allgather=Mock(side_effect=lambda value: [value])),
-        kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4, is_disagg=False),
+        kv_cache_manager=make_host_cache_manager(max_batch_size=4),
         cache_transceiver_config=cache_config,
     )
 
@@ -941,14 +954,27 @@ def test_transceiver_activates_fail_stop_only_for_ownership_bridge(
     """Only an opt-in bridge with a qualified executor world enables fail-stop."""
     from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
 
+    def _mock_bridge_profile(
+        mapping: Mapping,
+        kv_cache_manager: KVCacheManagerV2,
+        cache_transceiver_config: CacheTransceiverConfig,
+        *,
+        enabled: bool | None = None,
+    ) -> bool:
+        return ownership_enabled
+
     monkeypatch.setattr(
         transceiver_module,
         "_validate_fp4_mla_bridge_profile",
-        lambda *_args: ownership_enabled,
+        _mock_bridge_profile,
     )
     communicator = Mock()
     qualify_world = Mock(return_value=communicator)
-    monkeypatch.setattr(transceiver_module, "_retirement_executor_comm", qualify_world)
+    monkeypatch.setattr(
+        transceiver_module,
+        "_retirement_executor_comm",
+        (qualify_world),
+    )
     config = _construct_worker_config(monkeypatch, _make_cache_config())
     assert config.enforce_physical_ownership is ownership_enabled
     callback = config.quiescence_fatal_callback
@@ -1016,7 +1042,7 @@ def test_transceiver_rejects_unset_transfer_timeout() -> None:
         KvCacheTransceiverV2(
             mapping=Mock(),
             dist=Mock(),
-            kv_cache_manager=Mock(spec=KVCacheManagerV2),
+            kv_cache_manager=make_host_cache_manager(),
             cache_transceiver_config=cache_config,
         )
 
@@ -1037,12 +1063,14 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
     )
     worker._sender = Mock()
     worker._aux_buffer = Mock()
-    request = SimpleNamespace(
-        py_disaggregated_params=Mock(),
-        py_request_id=41,
-        prompt_len=128,
-        py_beam_width=1,
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=1,
+        input_tokens=[0] * 128,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
     )
+    request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=41)
 
     worker.create_tx_session(request)
 
@@ -1429,7 +1457,7 @@ class _RecvFetch:
 
 
 def _gen_request(rid: int) -> SimpleNamespace:
-    return SimpleNamespace(
+    return make_llm_request_stub(
         py_request_id=rid,
         request_id=rid,
         state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,

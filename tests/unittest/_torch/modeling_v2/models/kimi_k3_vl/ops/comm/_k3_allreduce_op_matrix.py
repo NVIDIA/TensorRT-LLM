@@ -28,8 +28,13 @@ Checks:
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
@@ -47,6 +52,8 @@ AUTO_ROWS = (1, 2048)
 EPS = 1e-6
 NORM_TOL = 1e-2  # norm_out: max |err| / max |ref|; the kernels round each square to bf16
 
+MNNVL_STOCK: "AllReduce"
+MNNVL_NEW: "K3AllReduce"
 R = None
 STATS = {
     "plain_bitwise": 0,

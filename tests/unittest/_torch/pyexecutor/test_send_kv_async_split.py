@@ -17,18 +17,27 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from test_common.interface_checks import verify_instance
+from test_common.llm_request_stubs import make_llm_request_stub
 
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
 pytestmark = pytest.mark.cpu_only
 
 
 def _stub_executor() -> PyExecutor:
-    return object.__new__(PyExecutor)
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.dense_dwdp_manager = None
+    return verify_instance(
+        executor,
+        "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+        members=("model_engine", "dense_dwdp_manager"),
+    )
 
 
 def _wrapper_calls(executor: PyExecutor) -> list:
@@ -72,7 +81,7 @@ def test_connector_save_leg_is_noop_without_connector() -> None:
 
 
 def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(
+    return make_llm_request_stub(
         is_context_only_request=True,
         is_context_finished=True,
         is_finished_due_to_length=False,
@@ -100,8 +109,9 @@ def test_connector_save_uses_previous_batch_with_overlap_scheduler() -> None:
     executor = _connector_executor()
     executor.disable_overlap_scheduler = False
     prev_req = SimpleNamespace(is_finished=True, request_id=2, py_request_id=2)
-    executor.previous_batch = SimpleNamespace(
-        scheduled_requests=SimpleNamespace(all_requests=lambda: [prev_req])
+    executor.previous_batch = BatchState(
+        scheduled_requests=SimpleNamespace(all_requests=lambda: [prev_req]),
+        sample_state=None,
     )
     current_req = SimpleNamespace(is_finished=True, request_id=3, py_request_id=3)
 

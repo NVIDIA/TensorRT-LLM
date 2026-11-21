@@ -670,13 +670,15 @@ def test_try_finish_gen_receive_declines_requests_that_did_not_complete(state) -
 
 
 def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyExecutor:
-    """Bare executor whose receive tail runs for real over ``coordinator``.
+    """Build an executor that runs the receive tail over ``coordinator``.
 
     Seq-slot preparation, sampler setup, each finish attempt and the
     first-token logprobs step append to ``events`` in call order; the two
     batch-level steps record the request states they observed.
     """
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor._disagg_coordinator = coordinator
 
     def record_batch(name):
@@ -761,6 +763,7 @@ def test_receive_tail_does_nothing_without_a_completed_receive(coordinator_kind)
     that reports itself complete but whose receive this coordinator never
     started is not visited, and the no-op coordinator reports nothing."""
     events = []
+    receiving = None
     if coordinator_kind == "real":
         h = CoordinatorHarness()
         coordinator = h.coordinator
@@ -873,8 +876,10 @@ class _ClosingRequest(_GenRequest):
 def _closing_executor(
     coordinator: DisaggTransferCoordinator, active, attention_dp=False, max_seq_len=64, cp_size=1
 ) -> PyExecutor:
-    """Bare executor over ``coordinator`` whose response and termination sinks are mocks."""
+    """Build an executor with mock response and termination sinks."""
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor._disagg_coordinator = coordinator
     executor.active_requests = list(active)
     executor.enable_attention_dp = attention_dp
@@ -1467,6 +1472,8 @@ def _adp_stats_rank(
     stats for ``pending_iters``; fanned-out rows reach ``_append_stats_rows``,
     a mock."""
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.disable_overlap_scheduler = True
     executor.dist = group.rank(rank)
     executor.dist.has_cp_helix = helix_cp

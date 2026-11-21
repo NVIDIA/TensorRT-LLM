@@ -245,6 +245,7 @@ def test_k3_fused_select_accept_cells(cell, certifying) -> None:  # noqa: F811 â
     force, counter = _force(cell, draft_len, g)
     counter_before = None if counter is None else counter.clone()
 
+    records = records_before = None
     kda_replay = kv_lens = None
     if s["replay"]:
         # The replay count is the first int32 of each slot's 16-byte record.

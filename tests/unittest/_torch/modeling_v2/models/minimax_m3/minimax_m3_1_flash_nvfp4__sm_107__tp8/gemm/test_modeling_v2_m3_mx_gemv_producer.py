@@ -77,8 +77,10 @@ def _fused(case, caches, eps=EPS):
     q = torch.zeros(tokens, HEADS_Q, 128, dtype=torch.float8_e4m3fn, device="cuda")
     iq = torch.zeros(tokens, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
     kv_data, kv_scale, index_k = caches
+    q_weight, k_weight, index_q_weight, index_k_weight = norms
     ok = gemv.m3_mx_gemv_producer(
-        xq, xsf, wq, wsf, q, iq, kv_data, kv_scale, index_k, slots, quant, eps, *norms, rotary, positions,
+        xq, xsf, wq, wsf, q, iq, kv_data, kv_scale, index_k, slots, quant, eps,
+        q_weight, k_weight, index_q_weight, index_k_weight, rotary, positions,
         use_pdl=True,
     )  # fmt: skip
     assert ok, "the producer GEMV must serve the sparse QKV shape at <= 8 tokens"

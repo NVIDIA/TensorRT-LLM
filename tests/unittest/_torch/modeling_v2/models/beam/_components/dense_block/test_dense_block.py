@@ -35,6 +35,7 @@ Dependencies: a TensorRT-LLM build for sm_103 with flashinfer importable. No mod
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import types
@@ -48,7 +49,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
 try:
-    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+    builtin_beam = importlib.import_module("tensorrt_llm._torch.models.modeling_beam")
 except ModuleNotFoundError as exc:
     if exc.name != "tensorrt_llm._torch.models.modeling_beam":
         raise

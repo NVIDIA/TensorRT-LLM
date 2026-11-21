@@ -16,6 +16,7 @@ from unittest.mock import Mock, call
 
 import pytest
 from fake_dist import FakeDistGroup, FakeDistRank
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -32,7 +33,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -84,6 +85,13 @@ def _request(
 def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     """Keep lifecycle methods real while replacing model, transport, and output effects."""
     engine = object.__new__(PyExecutor)
+    engine.model_engine = None
+    engine.dense_dwdp_manager = None
+    verify_instance(
+        engine,
+        "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+        members=("model_engine", "dense_dwdp_manager"),
+    )
     engine.active_requests = []
     engine.canceled_req_ids = []
     engine.waiting_queue = FCFSWaitingQueue()
@@ -339,8 +347,9 @@ def test_previous_model_batch_defers_cancellation_until_post_forward(executor: P
     """The logical-result path cannot free resources owned by an outstanding model batch."""
     request = _request()
     executor.active_requests.append(request)
-    executor.previous_batch = SimpleNamespace(
-        scheduled_requests=SimpleNamespace(all_requests=lambda: [request])
+    executor.previous_batch = BatchState(
+        scheduled_requests=SimpleNamespace(all_requests=lambda: [request]),
+        sample_state=None,
     )
     executor.canceled_req_ids = [11]
 

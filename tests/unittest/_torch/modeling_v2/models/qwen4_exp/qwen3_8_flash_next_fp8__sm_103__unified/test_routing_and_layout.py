@@ -97,8 +97,12 @@ def _qualified(target) -> str:
 @pytest.fixture
 def on_sm103(monkeypatch):
     """Route as if on a GB300, with the GDN cached replay at its default (on)."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    monkeypatch.setattr(torch.cuda, "is_available", (lambda: True))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        (lambda *a, **k: (10, 3)),
+    )
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
     for env in (
         "TRTLLM_USE_GDN_FLASHINFER_REPLAY",
@@ -220,7 +224,7 @@ def _mtp_with(**attributes):
 def test_each_member_is_admitted_as_the_llm_api_spells_it(on_sm103, member, parallel, monkeypatch):
     """Each member's LLM API spelling builds its mapping and is admitted. The node size is pinned:
     inferred from one visible GPU, a multi-rank world would span nodes, which `layout` declines."""
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "device_count", (lambda: 1))
     mapping = _llm_args(gpus_per_node=4, **parallel).parallel_config.to_mapping()
     assert routing.layout(mapping, routing._FP8_LAYOUTS) == member
     _admitted(_routed_config(member))
@@ -400,10 +404,18 @@ def test_another_moe_backend_or_gpu_or_no_gdn_replay_declines(on_sm103, monkeypa
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
     with pytest.raises(ValueError, match="TRTLLM_USE_GDN_REPLAY=0"):
         modeling_v2_resolve(_routed_config("tep4", _MTP3), _llm_args("require"))
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        (lambda *a, **k: (10, 0)),
+    )
     with pytest.raises(ValueError, match=r"compute capability \(10, 0\)"):
         modeling_v2_resolve(_routed_config("tep4"), _llm_args("require"))
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        (lambda *a, **k: (10, 3)),
+    )
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
     monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "1")
     with pytest.raises(ValueError, match="TRTLLM_USE_GDN_FLASHINFER_REPLAY"):
@@ -603,13 +615,35 @@ def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, monkeypatch
         asked.append(explicitly_requested)
         return True
 
-    monkeypatch.setattr(M.MNNVLAllReduce, "is_mnnvl", staticmethod(is_mnnvl))
-    monkeypatch.setattr(dist_ops, "get_allreduce_workspace", lambda mapping: "ipc workspace")
-    monkeypatch.setattr(utils, "mpi_disabled", lambda: False)
-    monkeypatch.setattr(M, "mnnvl_workspace_args", lambda *args: dict(buffers="mnnvl workspace"))
-    monkeypatch.setattr(M, "mnnvl_tp_sum", lambda x, buffers: ("mnnvl", buffers))
     monkeypatch.setattr(
-        M, "allreduce", lambda x, *args, **kwargs: ("raw", kwargs["strategy"], kwargs["workspace"])
+        M.MNNVLAllReduce,
+        "is_mnnvl",
+        (staticmethod(is_mnnvl)),
+    )
+    monkeypatch.setattr(
+        dist_ops,
+        "get_allreduce_workspace",
+        (lambda mapping: "ipc workspace"),
+    )
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(utils, "mpi_disabled", _mock_mpi_disabled)
+    monkeypatch.setattr(
+        M,
+        "mnnvl_workspace_args",
+        (lambda *args: dict(buffers="mnnvl workspace")),
+    )
+    monkeypatch.setattr(
+        M,
+        "mnnvl_tp_sum",
+        (lambda x, buffers: ("mnnvl", buffers)),
+    )
+    monkeypatch.setattr(
+        M,
+        "allreduce",
+        (lambda x, *args, **kwargs: ("raw", kwargs["strategy"], kwargs["workspace"])),
     )
     tp_sum = core._tp_sum_op()
     narrow = torch.zeros(M._TP_SUM_MNNVL_MAX_ROWS, 8)
@@ -643,16 +677,30 @@ def test_the_target_opens_its_own_ipc_buffers_at_auto_or_mnnvl_only(
     )
 
     built = []
-    monkeypatch.setattr(M, "can_access_peer", lambda mapping: True)
-    monkeypatch.setattr(M, "get_env_enable_pdl", lambda: True)
-    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+
+    def _mock_can_access_peer(mapping: Mapping) -> bool:
+        return True
+
+    monkeypatch.setattr(M, "can_access_peer", _mock_can_access_peer)
+
+    def _mock_get_env_enable_pdl() -> bool:
+        return True
+
+    monkeypatch.setattr(M, "get_env_enable_pdl", _mock_get_env_enable_pdl)
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(M, "mpi_disabled", _mock_mpi_disabled)
     monkeypatch.setattr(
-        M, "_selection_lamport_build", lambda mapping, size: built.append("lamport") or "lamport"
+        M,
+        "_selection_lamport_build",
+        (lambda mapping, size: built.append("lamport") or "lamport"),
     )
     monkeypatch.setattr(
         CopyEngineExchange,
         "create",
-        classmethod(lambda cls, mapping, capacity: built.append("ce") or "ce"),
+        (classmethod(lambda cls, mapping, capacity: built.append("ce") or "ce")),
     )
     core = SimpleNamespace(
         attn_tp_size=2,
@@ -670,12 +718,32 @@ def test_the_target_opens_its_own_ipc_buffers_at_auto_or_mnnvl_only(
     assert M._own_ipc(core) is own
     assert (M._index_split_lamport(core) is not None) is own
     # The prefill target's construction, its views and graphs stubbed out.
-    monkeypatch.setattr(M, "_layer_views", lambda core: None)
-    monkeypatch.setattr(M, "_stack_views", lambda core: None)
-    monkeypatch.setattr(M, "_keyed_eager_on_graph", lambda *args, **kwargs: None)
-    monkeypatch.setattr(M._KvRangeProbe, "for_target", classmethod(lambda cls, core, on: None))
-    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: SimpleNamespace(**kwargs))
-    monkeypatch.setattr(torch.cuda, "Event", lambda: None)
+    monkeypatch.setattr(
+        M,
+        "_layer_views",
+        (lambda core: None),
+    )
+    monkeypatch.setattr(
+        M,
+        "_stack_views",
+        (lambda core: None),
+    )
+    monkeypatch.setattr(
+        M,
+        "_keyed_eager_on_graph",
+        (lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        M._KvRangeProbe,
+        "for_target",
+        (classmethod(lambda cls, core, on: None)),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "Stream",
+        (lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    monkeypatch.setattr(torch.cuda, "Event", (lambda: None))
     assert (M.PrefillTarget(core)._ce_exchange is not None) is own
     assert built == (["lamport", "ce"] if own else [])
 
@@ -697,8 +765,16 @@ def test_the_fused_decode_sum_runs_at_auto_with_fp32_accumulation(
     """`hc_allreduce_inject_norm` sums in fp32 only: under the stock all-reduce's opt-out
     (`AR_FP32_ACC_ENV=0`) and at a strategy other than AUTO the decode sites sum through
     `tp_sum`."""
-    monkeypatch.setattr(M, "can_access_peer", lambda mapping: True)
-    monkeypatch.setattr(M, "allreduce_group_args", lambda mapping, s: dict(workspace="ipc"))
+
+    def _mock_can_access_peer(mapping: Mapping) -> bool:
+        return True
+
+    monkeypatch.setattr(M, "can_access_peer", _mock_can_access_peer)
+    monkeypatch.setattr(
+        M,
+        "allreduce_group_args",
+        (lambda mapping, s: dict(workspace="ipc")),
+    )
     if fp32_acc is None:
         monkeypatch.delenv(M.AR_FP32_ACC_ENV, raising=False)
     else:
@@ -829,7 +905,11 @@ def test_a_moe_layer_enters_the_fp8_runner_over_its_window(
     monkeypatch.setattr(M, "fp8_quantize_1x128", quantize)
     monkeypatch.setattr(M, "fp8_block_scale_moe_runner", runner)
     monkeypatch.setattr(M, "moe_prefill_grouped", grouped)
-    monkeypatch.setattr(M, "prefill_grouped_ready", lambda local: local == 128)
+
+    def _mock_prefill_grouped_ready(local: int) -> bool:
+        return local == 128
+
+    monkeypatch.setattr(M, "prefill_grouped_ready", _mock_prefill_grouped_ready)
     monkeypatch.setattr(M, "_MOE_PREFILL_GROUPED_MIN_ROWS", grouped_min)
     out = M._routed_experts(core, x, "router", experts)
     assert [(kind, xq.shape[0]) for kind, xq, *_ in seen] == calls
@@ -879,15 +959,23 @@ def test_a_decode_router_under_attention_dp_follows_the_graphed_step(
     monkeypatch.setattr(
         M,
         "renorm_moe_routing_op",
-        lambda logits, topk, output_dtype: (
-            logits.int().expand(-1, topk).contiguous(),
-            logits.expand(-1, topk).contiguous(),
+        (
+            lambda logits, topk, output_dtype: (
+                logits.int().expand(-1, topk).contiguous(),
+                logits.expand(-1, topk).contiguous(),
+            )
         ),
     )
     monkeypatch.setattr(
-        M, "fp8_quantize_1x128", lambda chunk, use_ue8m0: (chunk, chunk[:, :2].t().contiguous())
+        M,
+        "fp8_quantize_1x128",
+        (lambda chunk, use_ue8m0: (chunk, chunk[:, :2].t().contiguous())),
     )
-    monkeypatch.setattr(M, "fp8_block_scale_moe_runner", lambda **kw: kw["hidden_states"])
+    monkeypatch.setattr(
+        M,
+        "fp8_block_scale_moe_runner",
+        (lambda **kw: kw["hidden_states"]),
+    )
     M._routed_experts(core, x, "router", experts, mm=M._decode_projection)
     assert seen == [want]
     assert M._step_projection(core) is (M._decode_projection if graphed else cublas)
@@ -920,21 +1008,43 @@ class _HostMoe:
         monkeypatch.setattr(M, "_MOE_MAX_ROWS_TP", chunk_rows)
         monkeypatch.setattr(M, "_MOE_PREFILL_GROUPED_MIN_ROWS", 0)  # the runner path
         monkeypatch.setattr(M, "_ADP_WINDOW_MAX_ROWS", 2 * chunk_rows)
-        monkeypatch.setattr(M, "cublas_mm", lambda a, b, *args, **kwargs: a @ b)
+        monkeypatch.setattr(
+            M,
+            "cublas_mm",
+            (lambda a, b, *args, **kwargs: a @ b),
+        )
         monkeypatch.setattr(M, "renorm_moe_routing_op", self.routing)
         # Scales in the `[hidden / 128, rows]` layout, which grouped chunks concatenate.
         monkeypatch.setattr(
-            M, "fp8_quantize_1x128", lambda t, use_ue8m0: (t, t.new_zeros(HIDDEN // 128, len(t)))
+            M,
+            "fp8_quantize_1x128",
+            (lambda t, use_ue8m0: (t, t.new_zeros(HIDDEN // 128, len(t)))),
         )
         monkeypatch.setattr(M, "fp8_block_scale_moe_runner", self.runner)
-        monkeypatch.setattr(M, "silu_and_mul_rows", lambda gug, inter: gug[:, :inter])
+        monkeypatch.setattr(
+            M,
+            "silu_and_mul_rows",
+            (lambda gug, inter: gug[:, :inter]),
+        )
         # The shared expert and its gate are replicated and checked elsewhere.
-        monkeypatch.setattr(M, "fused_sigmoid_gate_mul_add", lambda routed, gate, shared: routed)
+        monkeypatch.setattr(
+            M,
+            "fused_sigmoid_gate_mul_add",
+            (lambda routed, gate, shared: routed),
+        )
         # `_mtp_moe_block` forks the shared expert onto a side stream; the host runs it in order.
-        monkeypatch.setattr(torch.cuda, "current_stream", lambda *args, **kwargs: _HOST_STREAM)
-        monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            (lambda *args, **kwargs: _HOST_STREAM),
+        )
+        monkeypatch.setattr(
+            torch.cuda,
+            "stream",
+            (lambda stream: contextlib.nullcontext()),
+        )
 
-    def route(self, x):
+    def route(self, x) -> tuple[torch.Tensor, torch.Tensor]:
         top_logits, top_ids = torch.topk(x @ self.router, TOPK, dim=-1)
         return top_ids, torch.softmax(top_logits, dim=-1)
 
@@ -1025,7 +1135,11 @@ def test_the_attention_dp_round_trip_returns_each_ranks_rows(counts, draft, monk
 
     monkeypatch.setattr(M, "allgather", fake_allgather)
     monkeypatch.setattr(M, "reducescatter", fake_reducescatter)
-    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(M, "mpi_disabled", _mock_mpi_disabled)
     per_rank = []
     for rank in range(world):
         core = _core(f"dep{world}", rank, _mtp() if draft else None)
@@ -1091,7 +1205,8 @@ class _HostA2a:
         rows, ids, w, lo, count = self.got
         torch.testing.assert_close(partials, _expert_out(rows, ids, w, lo, count))
         own = self.xs[self.rank]
-        return _expert_out(own, *self.routes[self.rank], 0, NUM_EXPERTS)
+        own_ids, own_weights = self.routes[self.rank]
+        return _expert_out(own, own_ids, own_weights, 0, NUM_EXPERTS)
 
 
 @pytest.mark.cpu_only
@@ -1113,13 +1228,21 @@ def test_the_attention_dp_alltoall_round_trip(counts, draft, monkeypatch) -> Non
         raise AssertionError("the all-to-all round trip took the default collectives")
 
     monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "NVLINK_ONE_SIDED")
-    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+
+    def _mock_mpi_disabled() -> bool:
+        return False
+
+    monkeypatch.setattr(M, "mpi_disabled", _mock_mpi_disabled)
     for name in ("allgather", "reducescatter"):
         monkeypatch.setattr(M, name, forbidden)
     for rank in range(world):
         core = _core(f"dep{world}", rank, _mtp() if draft else None)
         a2a = _HostA2a(xs, routes, rank)
-        monkeypatch.setattr(M, "_build_moe_a2a", lambda mapping, max_tokens: a2a)
+        monkeypatch.setattr(
+            M,
+            "_build_moe_a2a",
+            (lambda mapping, max_tokens: a2a),
+        )
         core.expert_sum, core.tp_sum = core._expert_sum_op(), forbidden
         assert core.moe_a2a is a2a
         if draft:
@@ -1182,10 +1305,14 @@ def _sp_share(monkeypatch, num_tokens, world, rank, want, configured=True):
         target._sequence_parallel = None
     calls = []
     monkeypatch.setattr(
-        M, "allgather", lambda t, sizes, group, pg: calls.append(("ag", sizes, group)) or t
+        M,
+        "allgather",
+        (lambda t, sizes, group, pg: calls.append(("ag", sizes, group)) or t),
     )
     monkeypatch.setattr(
-        M, "reducescatter", lambda t, sizes, group, pg: calls.append(("rs", sizes, group)) or t
+        M,
+        "reducescatter",
+        (lambda t, sizes, group, pg: calls.append(("rs", sizes, group)) or t),
     )
     sp = target._sp_split(num_tokens)
     if want is None:
@@ -1210,16 +1337,26 @@ def _sp_moe_own_rows(monkeypatch, rows, step, padded):
     weights = torch.rand(rows, topk, generator=gen).to(torch.bfloat16)
     codes = (torch.randn(rows, hidden, generator=gen) * 8).to(torch.float8_e4m3fn)
     scales = torch.rand(hidden // 128, rows, generator=gen)
-    monkeypatch.setattr(M, "cublas_mm", lambda a, b, *args: ("logits", a.shape[0]))
     monkeypatch.setattr(
-        M, "renorm_moe_routing_op", lambda logits, topk, output_dtype: (ids.clone(), weights)
+        M,
+        "cublas_mm",
+        (lambda a, b, *args: ("logits", a.shape[0])),
     )
-    monkeypatch.setattr(M, "fp8_quantize_1x128", lambda t, use_ue8m0: (codes, scales))
+    monkeypatch.setattr(
+        M,
+        "renorm_moe_routing_op",
+        (lambda logits, topk, output_dtype: (ids.clone(), weights)),
+    )
+    monkeypatch.setattr(
+        M,
+        "fp8_quantize_1x128",
+        (lambda t, use_ue8m0: (codes, scales)),
+    )
     calls = []
     monkeypatch.setattr(
         M,
         "fp8_block_scale_moe_runner",
-        lambda **kw: calls.append(kw) or torch.zeros(kw["hidden_states"].shape[0], 4),
+        (lambda **kw: calls.append(kw) or torch.zeros(kw["hidden_states"].shape[0], 4)),
     )
     mask = (torch.arange(rows) >= rows - padded)[:, None] if padded else None
     want_ids = ids.clone()
@@ -1260,7 +1397,11 @@ def _sp_ce_scatter(monkeypatch, rank):
             sent.append(x)
             return partial[1 - rank][rank * rows : (rank + 1) * rows].clone()
 
-    monkeypatch.setattr(M, "reducescatter", lambda *a: pytest.fail("NCCL reduce-scatter called"))
+    monkeypatch.setattr(
+        M,
+        "reducescatter",
+        (lambda *a: pytest.fail("NCCL reduce-scatter called")),
+    )
     lo, hi, _, scatter = _sp_target(rank, 2, ce=Exchange())._sp_split(num_tokens)
     got = scatter(partial[rank])
     assert (lo, hi) == (rank * rows, (rank + 1) * rows)
@@ -1269,8 +1410,20 @@ def _sp_ce_scatter(monkeypatch, rank):
     assert torch.equal(got, partial[1][lo:hi] + partial[0][lo:hi])
     four = SimpleNamespace(tp_size=4, gpus_per_node=4, tp_rank=0)
     across = SimpleNamespace(tp_size=2, gpus_per_node=1, tp_rank=0)
-    assert CopyEngineExchange.create(four, 1 << 20) is None
-    assert CopyEngineExchange.create(across, 1 << 20) is None
+    assert (
+        CopyEngineExchange.create(
+            four,
+            1 << 20,
+        )
+        is None
+    )
+    assert (
+        CopyEngineExchange.create(
+            across,
+            1 << 20,
+        )
+        is None
+    )
 
 
 def _sp_project(monkeypatch, rank, overlap):
@@ -1942,9 +2095,21 @@ def _decode_stream(monkeypatch):
     for chosen, n, want in ((target, rows, hi), (target, rows + 1, caller), (prefill, 3, caller)):
         ids = torch.zeros(n, dtype=torch.int32, device="cuda")
         core.__dict__.update(_step_begun=True, _select_target=lambda md, t=chosen: t)
-        M.Qwen4ExpUnifiedModelingV2.forward(core, None, input_ids=ids)
+        M.Qwen4ExpUnifiedModelingV2.forward(
+            (core),
+            None,
+            input_ids=ids,
+        )
         assert seen[-1] == want, (n, chosen)
-        M.MTPLayer.forward(SimpleNamespace(core=core), None, None, ids, None, None, None)
+        M.MTPLayer.forward(
+            (SimpleNamespace(core=core)),
+            None,
+            None,
+            ids,
+            None,
+            None,
+            None,
+        )
         assert seen[-1] == want, (n, chosen)
     M._on_decode_stream(SimpleNamespace(), 3, step, 1.0)
     assert seen[-1] == caller, "a core without the stream runs on the caller's"
@@ -1969,7 +2134,11 @@ class _ShardHead:
 def _draft_head_shard(monkeypatch, case, sharded):
     """With the worker's TP key exchange a greedy draft pass keeps this rank's vocab shard of the
     logits; rejection sampling, guidance, excess rows, a padded vocab or no exchange gather them."""
-    monkeypatch.setattr(M, "_hc_site", lambda *args: (None, torch.zeros(3, 8), None))
+    monkeypatch.setattr(
+        M,
+        "_hc_site",
+        (lambda *args: (None, torch.zeros(3, 8), None)),
+    )
     core = SimpleNamespace(_mtp=SimpleNamespace(fhc_norm=None, fhc_first=None, fhc_up=None))
     head = _ShardHead(padding_size=16 if case == "padded_vocab" else 0)
     worker = SimpleNamespace(key_exchange=SimpleNamespace(MAX_ROWS=8), guided_decoder=None)

@@ -41,7 +41,7 @@ def _gen_request(conv_id="c0", prompt_tokens=1000, cls=CompletionRequest):
     kwargs["prompt" if cls is CompletionRequest else "messages"] = (
         "hi" if cls is CompletionRequest else [{"role": "user", "content": "hi"}]
     )
-    request = cls(**kwargs)
+    request = cls.model_validate(kwargs)
     if conv_id is not None:
         request.conversation_params = ConversationParams(conversation_id=conv_id)
     request.disaggregated_params = DisaggregatedParams(
@@ -338,7 +338,7 @@ def test_fit_does_not_block_predictions():
 
 def test_real_tree_fit_matches_sklearn():
     np = pytest.importorskip("numpy")
-    pytest.importorskip("sklearn")
+    sklearn_ensemble = pytest.importorskip("sklearn.ensemble")
     olp.check_gbm_dependencies()
     rng = np.random.default_rng(0)
     n = 3000
@@ -351,9 +351,7 @@ def test_real_tree_fit_matches_sklearn():
     result = fitter.poll()
     assert "error" not in result, result.get("error")
     assert result["export_max_abs_diff"] <= olp.GBM_EXPORT_TOL
-    from sklearn.ensemble import HistGradientBoostingRegressor
-
-    ref = HistGradientBoostingRegressor(**olp.GBM_PARAMS).fit(x, y)
+    ref = sklearn_ensemble.HistGradientBoostingRegressor(**olp.GBM_PARAMS).fit(x, y)
     ensemble = olp.TreeEnsemble(result["baseline"], result["trees"])
     got = [ensemble.raw([float(v) for v in row]) for row in x[:200]]
     assert got == pytest.approx(list(ref.predict(x[:200])), abs=1e-5)
@@ -483,7 +481,11 @@ async def test_continuous_usage_stream_decodes_only_its_final_chunk(monkeypatch)
     """With continuous usage stats every chunk carries usage; only the usage-only one is decoded."""
     decoded = []
     real = olp._sse_json
-    monkeypatch.setattr(olp, "_sse_json", lambda event: decoded.append(event) or real(event))
+    monkeypatch.setattr(
+        olp,
+        "_sse_json",
+        (lambda event: decoded.append(event) or real(event)),
+    )
     coordinator = _FakeCoordinator()
     frontend = olp.OutputLengthPriority(coordinator, "ridge")
     ticket = olp._Ticket("c1", 2000.0, 7)
@@ -636,7 +638,11 @@ def test_conversationless_replies_train_the_global_models():
 
 def test_nothing_learned_is_reported(monkeypatch):
     warnings = []
-    monkeypatch.setattr(olp.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    monkeypatch.setattr(
+        olp.logger,
+        "warning",
+        (lambda msg, *a, **k: warnings.append(msg)),
+    )
     monkeypatch.setattr(olp, "NOTHING_LEARNED_WARN_AFTER", 5)
     predictor = olp.OnlineLengthPredictor("ridge")
     for _ in range(5):
@@ -816,7 +822,9 @@ def test_generated_subagent_ids_stay_out_of_the_conversation_table():
     for i in range(3):
         request = _gen_request(None, 1000 + i)
         OpenAIDisaggServer._extract_conversation_id(
-            request, SimpleNamespace(headers={"x-parent-id": "parent"}), "x-parent-id"
+            request,
+            (SimpleNamespace(headers={"x-parent-id": "parent"})),
+            "x-parent-id",
         )
         assert request.conversation_params.conversation_id.startswith("subagent:")
         conv, isl = olp.request_inputs(request)

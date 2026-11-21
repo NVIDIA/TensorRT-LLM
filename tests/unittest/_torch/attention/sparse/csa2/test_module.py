@@ -149,16 +149,26 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         indexer=indexer,
     )
     backend._native_slot_mapping = lambda logical: CSA2TrtllmAttention._native_slot_mapping(
-        backend, logical
+        backend,
+        logical,
     )
     backend._resolve_sparse_inputs = lambda count, args: (
-        CSA2TrtllmAttention._resolve_sparse_inputs(backend, count, args)
+        CSA2TrtllmAttention._resolve_sparse_inputs(
+            backend,
+            count,
+            args,
+        )
     )
 
     def compute(query, k, v, metadata, *, forward_args):
         start = forward_args.sparse_backend_args.query_start
         calls.append((forward_args.attention_input_type, start, query.shape[0]))
-        selected = CSA2TrtllmAttention.prepare_sparse_inputs(backend, query, metadata, forward_args)
+        selected = CSA2TrtllmAttention.prepare_sparse_inputs(
+            backend,
+            query,
+            metadata,
+            forward_args,
+        )
         torch.testing.assert_close(
             selected.swa_indices[:, 0], row_ids[start : start + query.shape[0]], atol=0, rtol=0
         )
@@ -829,11 +839,20 @@ def test_decode_graph_q_b_normalizes_without_indexer(monkeypatch, rows):
     AutoTuner.get().clear_cache()
     norms = []
     norm = projection.rms_norm_mxfp8
-    monkeypatch.setattr(
-        projection,
-        "rms_norm_mxfp8",
-        lambda *args, **kwargs: norms.append(1) or norm(*args, **kwargs),
-    )
+
+    def record_norm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        prefetch: tuple[torch.Tensor, ...] = (),
+        normalized: bool = True,
+        quantize: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        norms.append(1)
+        return norm(x, weight, eps, prefetch=prefetch, normalized=normalized, quantize=quantize)
+
+    monkeypatch.setattr(projection, "rms_norm_mxfp8", record_norm)
     with flashinfer_mxfp8_decode_graph_capture():
         with flashinfer_mxfp8_autotune():
             model._project_query_and_swa(x, decode_only=True)
@@ -1101,7 +1120,11 @@ def test_small_step_query_amax_word_decode_and_graph(monkeypatch, module_cache, 
     )
 
     # FP8 staging path: keep the direct decode, which takes <= 16-row generation tiles, out.
-    monkeypatch.setattr(CSA2TrtllmAttention, "direct_decode_serves", lambda *args: False)
+    monkeypatch.setattr(
+        CSA2TrtllmAttention,
+        "direct_decode_serves",
+        lambda *args: False,
+    )
     torch.manual_seed(949)
     manager, request = module_cache
     model, _ = _native_model(
@@ -1194,7 +1217,11 @@ def test_fp8_query_projection_decode_and_graph(monkeypatch, module_cache, overla
     from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
 
     # FP8 staging path: keep the direct decode, which takes <= 16-row generation tiles, out.
-    monkeypatch.setattr(CSA2TrtllmAttention, "direct_decode_serves", lambda *args: False)
+    monkeypatch.setattr(
+        CSA2TrtllmAttention,
+        "direct_decode_serves",
+        lambda *args: False,
+    )
     torch.manual_seed(948)
     manager, request = module_cache
     model, _ = _native_model(
@@ -1395,8 +1422,11 @@ def test_fused_compression_step_matches_native(monkeypatch, ratio):
         for parameter in (*compressor.parameters(), *index_wk.parameters()):
             parameter.normal_(std=0.05)
         compressor.norm.weight.normal_(1.0, 0.2)
-        native = [torch.randn(pages, page_size, width) for _ in range(2)]
-        fused = [pool.clone() for pool in native]
+        native = (
+            torch.randn(pages, page_size, width),
+            torch.randn(pages, page_size, width),
+        )
+        fused = native[0].clone(), native[1].clone()
         kv_pages, score_pages = (torch.randperm(pages).int().view(2, 8) for _ in range(2))
 
     def ints(values):
@@ -1410,7 +1440,7 @@ def test_fused_compression_step_matches_native(monkeypatch, ratio):
         ends = [start + length for start, length in zip(starts, lengths)]
         windows = [end // 2 - start // 2 for start, end in zip(starts, ends)]
 
-        def batch(pools):
+        def batch(pools: tuple[torch.Tensor, torch.Tensor]):
             if ratio == 1:
                 return None
             return CSA2CompressionBatch(
@@ -1426,9 +1456,17 @@ def test_fused_compression_step_matches_native(monkeypatch, ratio):
                 max(-(-length // 2) for length in lengths),
             )
 
-        monkeypatch.setattr(CSA2Compressor, "_fuses", lambda *args: False)
+        monkeypatch.setattr(
+            CSA2Compressor,
+            "_fuses",
+            lambda *args: False,
+        )
         latent_ref, index_ref = compressor.project(x, batch(native), index_wk)
-        monkeypatch.setattr(CSA2Compressor, "_fuses", fuses)
+        monkeypatch.setattr(
+            CSA2Compressor,
+            "_fuses",
+            fuses,
+        )
         assert compressor._fuses(x, batch(fused), index_wk.weight)
         latent, index_k = compressor.project(x, batch(fused), index_wk)
         for pool, pool_ref in zip(fused, native):
@@ -2573,7 +2611,11 @@ def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings():
         max_position_embeddings=8,
     )
     with torch.device("cuda"):
-        reference = DeepseekV41Attention.from_hf_config(config, 0, kv_cache_dtype="auto")
+        reference = DeepseekV41Attention.from_hf_config(
+            config,
+            0,
+            kv_cache_dtype="auto",
+        )
     # Either FP8 spelling reaches native E4M3 staging on its own, because this
     # factory builds the trtllm-gen path that serves it. ``auto`` requests no FP8
     # at all, and an explicit ``False`` still pins BF16 against an FP8 KV dtype.
@@ -2591,7 +2633,10 @@ def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings():
         )
         with torch.device("cuda"):
             model = DeepseekV41Attention.from_hf_config(
-                config, 0, kv_cache_dtype=requested, sparse_params=params
+                config,
+                0,
+                kv_cache_dtype=requested,
+                sparse_params=params,
             )
         assert model.backend.compute_backend == "trtllm"
         assert model.backend.native_fp8 is fp8
@@ -3166,7 +3211,10 @@ def test_mxfp8_quantize_rows_and_prefetch(monkeypatch, rows, width, pdl):
     """Row quantization is mxfp8_quantize byte for byte; L2 prefetches change no output."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
 
-    monkeypatch.setattr(projection, "_pdl", lambda: pdl)
+    def _mock_pdl() -> bool:
+        return pdl
+
+    monkeypatch.setattr(projection, "_pdl", _mock_pdl)
     gen = torch.Generator(device="cuda").manual_seed(rows * 13 + width)
     x = torch.randn(rows, width, device="cuda", generator=gen) * 4
     x[0, :64] = 0.0

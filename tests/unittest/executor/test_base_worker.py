@@ -80,7 +80,11 @@ def test_prompt_logprobs_computation_and_streaming_cache(
     logits = object()
     calls = []
 
-    def compute(k, context_logits, prompt_token_ids, *, simple_prompt_logprobs):
+    def compute(k_prompt_logprobs: int,
+                context_logits: torch.Tensor | None,
+                prompt_token_ids: list[int] | None = None,
+                simple_prompt_logprobs: bool = False) -> LogProbsResult:
+        k = k_prompt_logprobs
         calls.append(
             (k, context_logits, prompt_token_ids, simple_prompt_logprobs))
         return LogProbsResult(prompt=prompt_logprobs)
@@ -130,7 +134,11 @@ def test_prompt_logprobs_computation_and_streaming_cache(
 @pytest.mark.cpu_only
 def test_generation_logprobs_do_not_recompute_logits(monkeypatch):
 
-    def unexpected_compute(*args, **kwargs):
+    def unexpected_compute(
+            k_prompt_logprobs: int,
+            context_logits: torch.Tensor | None,
+            prompt_token_ids: list[int] | None = None,
+            simple_prompt_logprobs: bool = False) -> LogProbsResult:
         pytest.fail("Generation logprobs must come from the sampler")
 
     monkeypatch.setattr(base_worker, "compute_prompt_logprobs",
@@ -142,7 +150,7 @@ def test_generation_logprobs_do_not_recompute_logits(monkeypatch):
     worker = SimpleNamespace(_results={1: generation_result})
     response = SimpleNamespace(client_id=1,
                                result=SimpleNamespace(is_final=True))
-    assert base_worker._get_logprobs(worker, response) is None
+    assert base_worker._get_logprobs(worker, (response)) is None
     assert not hasattr(generation_result, "_logprob_params")
 
 
@@ -177,7 +185,11 @@ def test_queued_context_cancellation_without_prompt_logits(
     for child_id in range(2, num_sequences + 1):
         request.create_child_request(child_id)
 
-    def unexpected_compute(*args, **kwargs):
+    def unexpected_compute(
+            k_prompt_logprobs: int,
+            context_logits: torch.Tensor | None,
+            prompt_token_ids: list[int] | None = None,
+            simple_prompt_logprobs: bool = False) -> LogProbsResult:
         pytest.fail("A queued cancellation cannot have prompt logits")
 
     monkeypatch.setattr(base_worker, "compute_prompt_logprobs",
@@ -424,7 +436,7 @@ def test_lora_identity_rejects_conflicting_request(
     conflict = LoRARequest("second", 7,
                            path if change_source else str(tmp_path / "other"),
                            "nemo" if change_source else "hf")
-    with patch("tensorrt_llm.executor.base_worker.logger.warning") as warning:
+    with (patch("tensorrt_llm.executor.base_worker.logger.warning")) as warning:
         with pytest.raises(RequestError, match="ID 7 is already bound"):
             worker._enqueue_request(
                 SimpleNamespace(id=1,
@@ -806,7 +818,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
     response = SimpleNamespace(client_id=7,
                                result=response_result,
                                clear_context_logits=clear_context_logits)
-    result = _get_logprobs(worker, response)
+    result = _get_logprobs(worker, (response))
 
     normalizer = math.log(sum(math.exp(i) for i in range(4)))
     # Context logits predict the next prompt token; the last row predicts
@@ -823,7 +835,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
     if streaming:
         # Later streaming responses can omit the already-consumed logits.
         response_result.context_logits = None
-        cached_result = _get_logprobs(worker, response)
+        cached_result = _get_logprobs(worker, (response))
         assert cached_result.prompt is result.prompt
 
 
@@ -836,7 +848,7 @@ def test_generation_logprobs_need_no_worker_recomputation():
     # Generation logprobs come directly from the sampler's response tensors.
     response = SimpleNamespace(client_id=7,
                                result=SimpleNamespace(is_final=False))
-    assert _get_logprobs(worker, response) is None
+    assert _get_logprobs(worker, (response)) is None
 
 
 @pytest.mark.cpu_only
@@ -859,7 +871,7 @@ def test_prompt_adapter_rejected_before_loading_or_changing_tokens() -> None:
     request.id = 1
     # An unsupported adapter must fail before accessing any worker resources.
     with pytest.raises(RequestError, match="Prompt adapters are not supported"):
-        BaseWorker._enqueue_request(SimpleNamespace(), request)
+        BaseWorker._enqueue_request((SimpleNamespace()), request)
 
     worker = MagicMock(rank=0,
                        _results={},
@@ -867,9 +879,9 @@ def test_prompt_adapter_rejected_before_loading_or_changing_tokens() -> None:
                        _handle_background_error=None)
     worker._get_logprob_params.return_value = None
     worker._enqueue_request.side_effect = lambda req: BaseWorker._enqueue_request(
-        worker, req)
+        (worker), req)
     with pytest.raises(RequestError, match="Prompt adapters are not supported"):
-        BaseWorker.submit(worker, request)
+        BaseWorker.submit((worker), request)
     assert worker._results == {}
     assert worker._client_id_to_request_id == {}
     assert request.prompt_token_ids == [10, 11]
@@ -900,12 +912,12 @@ def test_submit_cleans_up_failed_enqueue(
     worker._enqueue_request.side_effect = enqueue
     if error is not None:
         with pytest.raises(error_type, match="enqueue failed") as exc_info:
-            BaseWorker.submit(worker, request)
+            BaseWorker.submit((worker), request)
         assert exc_info.value is error
         assert worker._results == {8: peer_result}
         assert worker._client_id_to_request_id == {8: 80}
     else:
-        result = BaseWorker.submit(worker, request)
+        result = BaseWorker.submit((worker), request)
         assert worker._results == {7: result, 8: peer_result}
         assert worker._client_id_to_request_id == {7: 70, 8: 80}
 

@@ -15,31 +15,27 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config
+from _torch.pyexecutor.engine.runners.decoder.utils import cpu_decoder_runner, decoder_config
 from _torch.pyexecutor.engine_test_utils import _make_request_stub
 
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs, ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import (
     get_model_extra_attrs,
     is_torch_compiling,
     set_per_request_prefill_cuda_graph_flag,
     torch_compiling,
 )
-from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
     from typing import Any
@@ -85,30 +81,12 @@ def _make_decoder_runner(
     backend.needs_capture.return_value = False
     backend.is_warmup_only = False
     backend.replay.return_value = outputs
-    buffers = SimpleNamespace(
-        input_ids_cuda=torch.zeros(2, dtype=torch.int32),
-        draft_tokens_cuda=None,
-        previous_pos_id_offsets_cuda=None,
+    decoder, input_ids = cpu_decoder_runner(
+        config,
+        model=model,
+        backend=backend,
+        get_runtime_tokens_per_gen_step=Mock(return_value=1),
     )
-    with (
-        patch.object(DecoderInputBuffers, "for_config", return_value=buffers),
-        patch.object(decoder_runner_module, "CUDAGraphRunner", return_value=backend),
-        patch.object(decoder_runner_module, "CutlassWorkspaceReclaimer"),
-    ):
-        decoder = DecoderRunner(
-            model,
-            config,
-            model_caller=Mock(),
-            mapping=Mapping(),
-            dist=None,
-            moe_load_balancer=None,
-            sparse_attention_config=None,
-            attention_runtime_features=AttentionRuntimeFeatures(),
-            get_runtime_tokens_per_gen_step=Mock(return_value=1),
-            warmup_timer=_WarmupTimer(rank=0),
-            iter_states={},
-            metrics={},
-        )
     metadata = Mock()
     decoder._metadata.attn_metadata = metadata
     decoder._metadata.setup_attention = Mock(return_value=metadata)
@@ -124,7 +102,7 @@ def _make_decoder_runner(
         return_value=PreparedInputs(
             {
                 "prepared": True,
-                "input_ids": buffers.input_ids_cuda,
+                "input_ids": input_ids,
             }
         )
     )

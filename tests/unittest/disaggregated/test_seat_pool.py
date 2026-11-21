@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, Mock
 
 import msgpack
 import pytest
+import uvicorn
 from fastapi import HTTPException
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
@@ -162,7 +163,11 @@ def test_pool_pick_does_not_scan_every_waiter(monkeypatch):
         pool.add(rid, (rid % 97) / 97.0, "ctx0" if rid % 2 else None, None)
     calls = []
     real = pool.sort_key
-    monkeypatch.setattr(pool, "sort_key", lambda w, now: calls.append(w) or real(w, now))
+    monkeypatch.setattr(
+        pool,
+        "sort_key",
+        (lambda w, now: calls.append(w) or real(w, now)),
+    )
     order = []
     while len(pool) > 1990:
         waiter, _ = pool.pick(["s"])
@@ -604,7 +609,7 @@ async def test_coordinator_shutdown_answers_parked_selects_at_once(tmp_path, mon
     created = []
     real_create = coordinator_server.create_uvicorn_server
 
-    def create(config):
+    def create(config: uvicorn.Config) -> uvicorn.Server:
         created.append(real_create(config))
         return created[-1]
 
@@ -630,6 +635,7 @@ async def test_coordinator_shutdown_answers_parked_selects_at_once(tmp_path, mon
                 async with session.post(f"{base}/select", data=body) as resp:
                     return resp.status, msgpack.unpackb(await resp.read(), raw=False)
 
+            status = None
             for _ in range(200):
                 try:
                     status, _ = await select(1)  # takes the only seat
@@ -681,6 +687,8 @@ async def test_parked_select_of_a_disconnected_client_takes_no_seat(tmp_path, mo
                 break
             except OSError:
                 await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("Coordinator did not accept a connection after 200 attempts")
         body = msgpack.packb({"role": "generation", "routing_key": {}, "req_id": rid})
         writer.write(
             b"POST /select HTTP/1.1\r\nHost: c\r\nContent-Type: application/msgpack\r\n"
@@ -774,7 +782,10 @@ def test_seat_timeout_reaches_the_client_as_503(monkeypatch):
     assert msgpack.unpackb(raw.content, raw=False)["no_generation_seat"] is True
     server = SimpleNamespace(_perf_metrics_collector=Mock())
     with pytest.raises(HTTPException) as error:
-        OpenAIDisaggServer._handle_exception(server, NoGenerationSeatError("no seat"))
+        OpenAIDisaggServer._handle_exception(
+            (server),
+            NoGenerationSeatError("no seat"),
+        )
     assert error.value.status_code == 503
 
 
@@ -1014,7 +1025,7 @@ async def test_pooled_finish_stops_on_a_malformed_reply_or_at_the_expiry(monkeyp
     monkeypatch.setattr(
         CoordinatorDelegatingRouter,
         "__init__",
-        _with_finish_window(CoordinatorDelegatingRouter.__init__, 0.05),
+        (_with_finish_window(CoordinatorDelegatingRouter.__init__, 0.05)),
     )
     fake = _FlakyCoordinatorFinish(AsyncMock(), failures=10**6)
     router = await _finish_through_flaky_coordinator(_router(), fake, (1,), monkeypatch)
