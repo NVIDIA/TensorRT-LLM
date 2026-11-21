@@ -284,6 +284,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         "_run_attention_warmup",
         "_run_autotuner_warmup",
         "_run_mamba_hybrid_warmup",
+        "_prewarm_lowm_mma_row_buckets",
         "_general_warmup",
     ):
         monkeypatch.setattr(warmup, method, observe(method))
@@ -313,6 +314,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),
         ("_run_mamba_hybrid_warmup", not enabled),
+        ("_prewarm_lowm_mma_row_buckets", True),
         ("_run_cuda_graph_warmup", True),
         ("_run_cuda_graph_warmup", True),
         ("_general_warmup", not enabled),

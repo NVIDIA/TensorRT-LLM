@@ -1619,7 +1619,7 @@ class TestBatchedSampling:
 
         if include_all or include_mixed:
 
-            class OneContinguous:
+            class OneContiguous:
                 pass
 
             class Shuffle:
@@ -1635,7 +1635,7 @@ class TestBatchedSampling:
                 None,  # all sub-batches have at least two requests
                 0,  # one sub-batch omitted
                 1,  # one size-1 sub-batch
-                OneContinguous(),  # one contiguous sub-batch, rest shuffled
+                OneContiguous(),  # one contiguous sub-batch, rest shuffled
                 Shuffle(),  # random ordering
                 VaryParams(),  # random ordering + randomized request parameter values
             ]:
@@ -1655,17 +1655,21 @@ class TestBatchedSampling:
                             )
                     mixed_params_list += [params] * sub_batch_size
                 label = "mixed_batch"
-                if isinstance(constraint_value, OneContinguous):
+                if isinstance(constraint_value, OneContiguous):
                     assert constrained_indices is not None
                     no_shuffle_start_idx, no_shuffle_end_idx = constrained_indices
-                    head_shuffled = mixed_params_list[:no_shuffle_start_idx]
-                    rng.shuffle(head_shuffled)  # inplace
-                    tail_shuffled = mixed_params_list[no_shuffle_end_idx:]
-                    rng.shuffle(tail_shuffled)  # inplace
+                    shuffled = (
+                        mixed_params_list[:no_shuffle_start_idx]
+                        + mixed_params_list[no_shuffle_end_idx:]
+                    )
+                    rng.shuffle(shuffled)  # inplace
+                    split_idx = rng.integers(
+                        low=min(1, len(shuffled) - 1), high=max(1, len(shuffled))
+                    )
                     mixed_params_list = (
-                        head_shuffled
+                        shuffled[:split_idx]
                         + mixed_params_list[no_shuffle_start_idx:no_shuffle_end_idx]
-                        + tail_shuffled
+                        + shuffled[split_idx:]
                     )
                     label += "_oneContiguous"
                 elif isinstance(constraint_value, Shuffle):

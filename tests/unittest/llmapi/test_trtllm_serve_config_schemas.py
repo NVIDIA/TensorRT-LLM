@@ -295,6 +295,25 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": 7}}}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": -1}}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_batch_size": 4, "max_queue_delay_ms": 5}},
+            True,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": True}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_queue_delay_ms": -1}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 3_000_000_000}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 2_147_483_647}},
+            True,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_szie": 4}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 1}}, True),
@@ -1019,6 +1038,24 @@ _GIB = 1 << 30
         (
             "kv_cache_config",
             {"defer_generation_only_release": True, "use_kv_cache_manager_v2": False},
+            False,
+        ),
+        # BlockReuseConfig
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_conversation", "drop_extended_turns": True}},
+            True,
+        ),
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_request", "drop_extended_turns": False}},
+            True,
+        ),
+        ("kv_cache_config", {"block_reuse_config": {"drop_extended_turns": False}}, True),
+        ("kv_cache_config", {"block_reuse_config": {"drop_extended_turns": True}}, False),
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_request", "drop_extended_turns": True}},
             False,
         ),
         # AttentionDpConfig

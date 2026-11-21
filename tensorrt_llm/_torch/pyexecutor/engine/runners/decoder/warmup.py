@@ -332,6 +332,8 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
+        from tensorrt_llm._torch.modules.low_m_gemm import release_mma_staging_buffers
+
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
@@ -340,11 +342,16 @@ class DecoderWarmup:
         # Retain a partial summary when a phase raises. The memory-profiling warmup is
         # KernelBuilder's build mode: as calls reach new shapes, ops build their kernels on
         # worker processes before they go on, and the workers stop when the pass ends.
-        with (
-            self._warmup_timer,
-            KernelBuilder.get().warmup_pass(self._warmup_timer.purpose),
-        ):
-            return self._warmup_scheduled(resource_manager, kv_cache_manager)
+        try:
+            with (
+                self._warmup_timer,
+                KernelBuilder.get().warmup_pass(self._warmup_timer.purpose),
+            ):
+                return self._warmup_scheduled(resource_manager, kv_cache_manager)
+        finally:
+            # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage
+            # their rows in buffers of its own: free the ones the warmup forwards left on this thread.
+            release_mma_staging_buffers()
 
     def rehearse(self, resource_manager: ResourceManager) -> None:
         """The autotuner warmup's forwards, run eagerly in the autotuner's build state
@@ -661,6 +668,8 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        with self._warmup_timer.phase("lowm_mma_row_buckets"):
+            self._prewarm_lowm_mma_row_buckets()
         with self._warmup_timer.phase("cuda_graph_capture"):
             # KV-cache estimation always uses both passes, so the KV-cache size ignores the switch.
             self._graphs.warmup_and_capture(
@@ -1027,6 +1036,47 @@ class DecoderWarmup:
                 self.dist.tp_allgather(1)
         if ready:
             logger.info(f"Throwaway Top-K prewarm complete ({time.perf_counter() - start:.1f} s)")
+
+    def _prewarm_lowm_mma_row_buckets(self) -> None:
+        """Compile the row buckets of the low-M MMA GEMMs the warmup forwards ran eagerly, then
+        barrier.
+
+        Eager forwards run these GEMMs on their row count rounded up to a bucket
+        (``low_m_gemm._MMA_ROW_BUCKETS``), and the warmup forwards reach only the buckets of their
+        own row counts. Runs before CUDA graph capture, so that a capture outside the decode graphs
+        finds its buckets compiled. Without a drafter that computes, no such GEMM has more rows than
+        a step's tokens, which attention DP gathers over the TP group, so the buckets stop at the one
+        that holds them; NGram drafts are prefix lookups. Any other drafter, a user-provided one
+        included, can run more rows than its target verifies, so with one every bucket compiles. The
+        TP group is held until its slowest rank has finished: the GEMMs a rank ran eagerly, and so
+        its compiles, can differ between ranks.
+        """
+        from tensorrt_llm._torch.modules.low_m_gemm import prewarm_mma_row_buckets
+
+        start = time.perf_counter()
+        compiled = gemms = 0
+        try:
+            spec_config = self._config.spec_config
+            max_rows = None
+            if spec_config is None or spec_config.spec_dec_mode.is_ngram():
+                max_rows = self._config.max_num_tokens
+                if self.mapping.enable_attention_dp:
+                    max_rows *= self.mapping.tp_size
+            compiled, gemms = prewarm_mma_row_buckets(max_rows)
+        except Exception as e:
+            # A prewarm miss only defers a compile to the first call that needs it, so it must not
+            # fail startup; the rank still meets its peers below.
+            logger.warning(f"Low-M MMA GEMM row-bucket prewarm stopped. {type(e).__name__}: {e}")
+        if self.dist is not None:
+            if self.mapping.cp_size > 1:
+                self.dist.tp_cp_allgather(1)
+            elif self.mapping.tp_size > 1:
+                self.dist.tp_allgather(1)
+        if compiled:
+            logger.info(
+                f"Low-M MMA GEMM row-bucket prewarm complete ({compiled} kernels for {gemms} GEMMs, "
+                f"{time.perf_counter() - start:.1f} s)"
+            )
 
     def _prewarm_model_decode_kernels(self, kv_cache_manager) -> None:
         """Call ``prewarm_decode_kernels`` on every module of the model that defines it, then

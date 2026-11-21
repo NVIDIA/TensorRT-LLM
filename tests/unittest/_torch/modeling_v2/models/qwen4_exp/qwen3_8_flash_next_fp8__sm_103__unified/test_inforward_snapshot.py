@@ -33,8 +33,8 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.ssm.gdn_inforward_tail import (  # noqa: E501
     gdn_inforward_tail_reference,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 
 assert torch.cuda.is_available(), "the in-forward snapshot test requires a CUDA device"
 
@@ -72,7 +72,7 @@ def _batch_split(batch):
         request_ids=[rid for rid, *_ in batch],
         seq_lens=torch.tensor([length for _, _, length, _, _ in batch], dtype=torch.int32),
     )
-    metadata = Mamba2Metadata(max_batch_size=32, chunk_size=128)
+    metadata = GDNMambaMetadata(max_batch_size=32, chunk_size=128)
     metadata._prepare_inforward_split(attn, manager, plan, len(batch), len(batch))
     return metadata
 

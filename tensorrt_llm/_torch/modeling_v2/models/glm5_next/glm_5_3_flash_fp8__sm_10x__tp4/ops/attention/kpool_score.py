@@ -92,7 +92,7 @@ class KpoolScore(OpWrapper):
     kv_lens[r] // kpool)`` are its scores, every other column is the FP32 minimum.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # The indexer has 32 heads of 128 and scores pools of 4 over 32-token blocks. The tables
     # are 4,100 pages wide, so the capacity is num_pools_max = 32,800 pools. The cells give the
     # requests' KV length after the step; a verify step scores its rows on per-row copies of

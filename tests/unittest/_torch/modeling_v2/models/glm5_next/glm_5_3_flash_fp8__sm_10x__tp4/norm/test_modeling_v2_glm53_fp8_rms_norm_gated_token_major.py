@@ -20,7 +20,9 @@ from tensorrt_llm._utils import get_sm_version
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 -- path above; fixture by name
 
-pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
+pytestmark = pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="certified on sm_100 and sm_103"
+)
 
 # The shapes the shipped target normalizes, by target directory under `models/`: GLM-5.3-Flash's KDA output
 # gate at TP4 (16 of 64 heads, head_dim 128, rms_norm_eps 1e-5, sigmoid gate), on the prefill path (decode and
