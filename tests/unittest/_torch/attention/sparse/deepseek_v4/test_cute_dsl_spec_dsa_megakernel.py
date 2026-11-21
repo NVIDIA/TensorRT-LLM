@@ -615,10 +615,11 @@ def test_fp4_matches_reference(specs, attn):
     assert int(op.error_bits(state).max()) == 0, "kernel error bits set"
 
 
-# The FP4 threshold knobs of ``megakernel_op._FP4_SMALL`` (lpoll, lfence, lbin, tpoll1) change how the threshold lead
-# polls the sampled board, finds the three rank bins and how the stream CTAs poll the threshold line, not what is
-# published: the bins come from a histogram instead of the bitwise key search and must give the same line bit for bit
-# (including the [SMIN, SMAX] range of the key search, which leaves out the first warp's top-1 keys of one sign).
+# The FP4 threshold knobs of ``megakernel_op._FP4_SMALL`` / ``_FP4_MID`` (lpoll, lfence, lbin, tpoll1) change how the
+# threshold lead polls the sampled board, finds the three rank bins and how the stream CTAs poll the threshold line, not
+# what is published: the bins come from a histogram instead of the bitwise key search and must give the same line bit
+# for bit (including the [SMIN, SMAX] range of the key search, which leaves out the first warp's top-1 keys of one
+# sign).
 _T_KNOBS = ("lpoll", "lfence", "lbin", "tpoll1")
 _PLAIN_ENGINES: dict = {}
 T_LINE_CASES = [
@@ -630,6 +631,11 @@ T_LINE_CASES = [
         [{"n": 262127}, {"n": 700, "ties": 5}, {"n": 98309, "flat": True}], id="b3-short-ties-flat"
     ),
     pytest.param(_fp4_rows(4, short=(1,), flat=(3,)), id="b4-short-flat"),
+    # five to eight rows: the T lead of the dedicated T-server CTAs (lbin from five rows on, b1l_u 3 at eight rows)
+    pytest.param(_fp4_rows(5, short=(2,), flat=(4,)), id="b5-short-flat"),
+    pytest.param(_fp4_rows(6, ties={1: 7, 4: 9}), id="b6-ties"),
+    pytest.param(_fp4_rows(7, short=(0, 5)), id="b7-short"),
+    pytest.param(_fp4_rows(8, short=(3,), flat=(6,), step=2987), id="b8-short-flat"),
 ]
 
 

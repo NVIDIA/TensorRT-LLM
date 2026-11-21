@@ -398,11 +398,17 @@ def test_megakernel_knob_tables():
             "lpoll": True,
             "lfence": True,
             "cls4": True,
-            "fwarm": True,
             **thr,
         },
-        2: {"dpf": True, "drot": 37, **thr},
-        3: {"dpf": True, "drot": 37, **thr},
+        2: {
+            "dpf": True,
+            "drot": 37,
+            "b1l": True,
+            "b1l_pub": True,
+            "b1l_upub": 3,
+            **thr,
+        },
+        3: {"dpf": True, "drot": 37, "b1l": True, "b1l_u": 3, **thr},
         4: {"dpf": True, "drot": 37, **thr},
     }
     for b in range(5, 21):
@@ -415,10 +421,16 @@ def test_megakernel_knob_tables():
             False,
         ), b
         assert k["drot"] > 0 and k.get("ring", False) == (b >= 9), b
-        # everything else is the FP8 set of the batch size
-        assert {x: v for x, v in k.items() if x not in megakernel_op._FP4_SHARED} == {
-            x: v for x, v in fp8[b].items() if x not in megakernel_op._FP4_SHARED
+        # five to eight rows: the T lead's 256-bin rank search (lbin) on top of the shared-team set, and at eight rows
+        # the last row's candidate publish four per lane; everything else is the FP8 set of the batch size
+        mid = {"lbin": True} if b <= 8 else {}
+        if b == 8:
+            mid["b1l_u"] = 4
+        skip = set(megakernel_op._FP4_SHARED) | set(mid)
+        assert {x: v for x, v in k.items() if x not in skip} == {
+            x: v for x, v in fp8[b].items() if x not in skip
         }, b
+        assert all(k[x] == v for x, v in mid.items()), b
 
 
 def _fp8_teams(b):

@@ -140,10 +140,13 @@ _FP4_SHARED = dict(team4=True, nteams=4, rs24_dry=False, b1l_upub=3, drot=37, tc
 # already do. The threshold chain (board poll of the T lead, rank bins, T poll of the stream CTAs, classification of the
 # buffered tiles) is shortened by _FP4_THRESHOLD: the rank bins come from a histogram instead of a key search and the
 # stream CTAs read the threshold line in one round trip (lbin, tpoll1: the same threshold line bit for bit); at one row
-# the T lead also starts polling the board without the two fences of the start (lpoll, lfence), the followers' dry pass
-# of the threshold code starts at once and covers the T stores (fwarm) and the classification loads four tiles at a
-# time (cls4).
+# the T lead also starts polling the board without the two fences of the start (lpoll, lfence) and the classification
+# loads four tiles at a time (cls4). The followers' dry pass of the threshold code (fwarm) is off: it measures 0.15 us
+# slower in the nsys A / B of the unstamped kernel.
 _FP4_THRESHOLD = dict(lbin=True, tpoll1=True)
+# Two to three rows: the candidate publish of the last row goes out in batches (b1l: the first batch is issued before
+# the stream-end barrier; three per lane at three rows, b1l_u 3) and, at two rows, the publisher warps of the first row
+# batch theirs as well (b1l_pub, b1l_upub 3).
 _FP4_SMALL = {
     1: dict(
         early=True,
@@ -151,14 +154,22 @@ _FP4_SMALL = {
         lpoll=True,
         lfence=True,
         cls4=True,
-        fwarm=True,
         **_FP4_THRESHOLD,
     ),
-    2: dict(dpf=True, drot=37, **_FP4_THRESHOLD),
-    3: dict(dpf=True, drot=37, **_FP4_THRESHOLD),
+    2: dict(dpf=True, drot=37, b1l=True, b1l_pub=True, b1l_upub=3, **_FP4_THRESHOLD),
+    3: dict(dpf=True, drot=37, b1l=True, b1l_u=3, **_FP4_THRESHOLD),
     4: dict(dpf=True, drot=37, **_FP4_THRESHOLD),
 }
-_FP4_OVERRIDES = {**_FP4_SMALL, **{b: _FP4_SHARED for b in range(5, 33)}}
+# Five to eight rows: the T lead ranks the sampled logits with the 256-bin histogram (lbin, as at one to four rows; the
+# published threshold line is bit for bit the same) and, at eight rows, the last row's candidate publish goes out four
+# per lane (b1l_u 4).
+_FP4_MID = {b: dict(_FP4_SHARED, lbin=True) for b in range(5, 9)}
+_FP4_MID[8] = dict(_FP4_MID[8], b1l_u=4)
+_FP4_OVERRIDES = {
+    **_FP4_SMALL,
+    **{b: _FP4_SHARED for b in range(5, 33)},
+    **_FP4_MID,
+}
 
 # The knob sets of the megakernel per spec (kernel_key) and batch size: the base knobs plus the set of the batch size
 # (and, for the FP4 spec, its overrides).
