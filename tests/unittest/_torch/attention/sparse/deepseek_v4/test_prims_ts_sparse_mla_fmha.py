@@ -1128,17 +1128,12 @@ def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
         ("disabled", False, False, torch.bfloat16),
         ("prims", False, False, torch.float16),
         ("fallback_first", False, True, torch.bfloat16),
-        ("covered_first", False, True, torch.bfloat16),
     ):
         attn = Mock(spec=DeepseekV4TrtllmAttention)
         attn.compress_ratio = 4
         attn.attn_sink = object() if sinks else None
         attn.is_mla_enable = True
-        if enabled == "fallback_first":
-            first = FallbackFmha(attn)
-        else:
-            first = SimpleNamespace(covers_dsv4_generation_warmup=enabled == "covered_first")
-        libraries = [first]
+        libraries = [FallbackFmha(attn)] if enabled == "fallback_first" else []
         if enabled != "disabled":
             libraries.append(PrimsTSSparseMlaFmha(attn))
         attn._fmha_manager = SimpleNamespace(fmha_libs=libraries)
@@ -1171,6 +1166,7 @@ def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
     assert [(p.extra, p.q_dtype, p.has_sinks, p.fused_groups) for p in captured] == [
         (512, torch.float8_e4m3fn, True, 8),
         (512, torch.float8_e4m3fn, False, None),
+        (512, torch.float8_e4m3fn, True, None),
     ]
     metadata.is_cuda_graph = True
     with pytest.raises(RuntimeError, match="outside graph capture"):
@@ -1313,6 +1309,8 @@ def _fake_sparse_plan(monkeypatch, planned, *, signature_div=8):
     import os
     from functools import cache
 
+    from flashinfer.jit.core import MissingJITCacheError
+
     import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
 
     class _FakeWrapper:
@@ -1322,7 +1320,8 @@ def _fake_sparse_plan(monkeypatch, planned, *, signature_div=8):
         @staticmethod
         @cache
         def compile_kernel(spec):
-            assert not os.environ.get("FLASHINFER_DISABLE_JIT"), f"unexpected JIT for {spec}"
+            if os.environ.get("FLASHINFER_DISABLE_JIT") and spec not in _FakeWrapper.cached_specs:
+                raise MissingJITCacheError(f"Missing kernel for {spec}")
             return object()
 
         def is_kernel_cached(self):
@@ -1374,6 +1373,8 @@ def _attn_and_profile():
 def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> None:
     """Workers see only representative plans; their failure falls back to the parent."""
     import json
+
+    from flashinfer.jit.core import MissingJITCacheError
 
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla as mod
@@ -1436,6 +1437,17 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
     with pytest.raises(OSError):
         mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], eager)
+
+    # The smaller cached variant is still loaded after the larger variants miss.
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    cached.add((0, 32))
+    mla_decode.BatchSparseMLADecodePagedTSWrapper.compile_kernel.cache_clear()
+    planned.clear()
+    fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+    mod._warmup_profiles([mod._PlanProfile(lib, extra=32, **profile)], fresh)
+    assert planned == [(7, 32)]
+    with pytest.raises(MissingJITCacheError):
+        lib._get_plan(metadata=fresh, rows=20, extra=32, **profile)
 
 
 def test_precompile_worker_count_follows_the_env(monkeypatch) -> None:
