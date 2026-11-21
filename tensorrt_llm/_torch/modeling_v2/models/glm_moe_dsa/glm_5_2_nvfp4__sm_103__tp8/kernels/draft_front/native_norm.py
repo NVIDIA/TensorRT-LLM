@@ -38,7 +38,7 @@ from torch import nn
 
 # FlashInfer releases whose CuTe DSL ``RMSNormKernel`` the draft_front kernel was written
 # against and verified bit for bit (thread-value layout, reduction tree, rsqrt).
-VERIFIED_FLASHINFER_VERSIONS = ("0.6.18", "0.7.2")
+VERIFIED_FLASHINFER_VERSIONS = ("0.6.18", "0.7.2", "0.7.3")
 
 
 def norm_module_reason(name: str, norm: nn.Module) -> str | None:
