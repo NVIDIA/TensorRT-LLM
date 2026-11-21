@@ -74,6 +74,21 @@ scheduler_config:
   enable_prefix_aware_scheduling: false
 ```
 
+### Reproducible Logits With Block Reuse
+
+Block reuse does not change which tokens a request attends to, but it can change the low-order bits of the result. A request that reuses a cached prefix computes only the remaining tokens, so its layers run at a different batch height than the first call for that prompt did. Two effects make the results differ:
+
+- cuBLAS picks a GEMM kernel from the matrix shape and different kernels round differently, so the same row of a `Linear` layer can produce different bits at different batch heights.
+- With CUDA graphs enabled, a request with one uncached prompt token left runs on the decode attention path instead of the context path.
+
+The first call for a prompt and its repeats can therefore return slightly different logits, occasionally enough to change the most likely token and the text that follows. The batch height effect also applies when a request shares a batch with different requests, even with block reuse disabled.
+
+To make logits independent of cache state and batch shape, apart from the cases listed at the end of this section, set both `FORCE_BATCH_INVARIANT=1` and `FORCE_ATTENTION_KERNEL_DETERMINISTIC=1` before the process starts. The first keeps block reuse, runs unquantized `Linear` layers on the default GEMM path as GEMMs of one fixed height, and keeps the final prompt token on the context path. The second turns off multi-block decode attention, whose layout otherwise depends on the load. `FORCE_DETERMINISTIC=1` applies both and also disables block reuse.
+
+Both lower throughput, so they are off by default. The fixed height is 64 rows: short batches are padded to it, and a long prefill runs as one GEMM per 64 tokens, so prefill cost grows in this mode. `TLLM_CUDA_GRAPH_GEMM_TUNING=1` is ignored in this mode, because tuned CUDA graphs and eager steps would round the same GEMM differently.
+
+Some layers are not covered: quantized `Linear` layers, layers that use the CuTe DSL, low-M or custom cuBLAS GEMM kernels, and MoE expert GEMMs, which run in the fused MoE backends instead of `Linear`. `FORCE_MOE_KERNEL_DETERMINISTIC=1` turns off the fused expert reduction, whose accumulation order can change between runs, but it does not make expert GEMMs independent of batch shape. Decode can also still differ when the KV cache is too small for the concurrent requests. On attention configurations that the XQA decode kernels do not support, decode runs on the MMHA kernel, which still splits a sequence across blocks when it needs more shared memory than one block has. That depends on the longest sequence in the batch, and the kernel logs a warning when it happens.
+
 ### Selecting the KV Cache Manager
 
 ```{warning}

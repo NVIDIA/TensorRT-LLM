@@ -362,6 +362,37 @@ def test_llm_prefix_cache_reuse(attn_backend):
 
 @skip_ray
 @pytest.mark.part3
+def test_llm_kv_reuse_deterministic_logits(monkeypatch):
+    monkeypatch.setenv("FORCE_BATCH_INVARIANT", "1")
+    model_path = get_model_path("Qwen3/Qwen3-0.6B")
+    prompt = "The future of AI is " * 20
+    sampling_params = SamplingParams(temperature=0,
+                                     max_tokens=1,
+                                     ignore_eos=True,
+                                     return_perf_metrics=True,
+                                     return_generation_logits=True)
+
+    with LLM(
+            model=model_path,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            gather_generation_logits=True,
+    ) as llm:
+        cold, warm, again = (llm.generate(prompt, sampling_params).outputs[0]
+                             for _ in range(3))
+
+    # Without reuse the logits would match trivially.
+    reused_blocks = [
+        output.request_perf_metrics.kv_cache_metrics.num_reused_blocks
+        for output in (cold, warm, again)
+    ]
+    assert reused_blocks[0] == 0
+    assert reused_blocks[1] > 0 and reused_blocks[2] > 0
+    assert torch.equal(cold.generation_logits, warm.generation_logits)
+    assert torch.equal(warm.generation_logits, again.generation_logits)
+
+
+@skip_ray
+@pytest.mark.part3
 def test_llm_prometheus():
     test_prompts = [
         "Hello, my name is",

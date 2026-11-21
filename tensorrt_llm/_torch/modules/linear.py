@@ -55,8 +55,9 @@ from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
-                     get_model_extra_attrs, is_torch_compiling,
-                     replace_parameter_and_save_metadata, unswizzle_sf)
+                     get_model_extra_attrs, is_batch_shape_deterministic,
+                     is_torch_compiling, replace_parameter_and_save_metadata,
+                     unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                          low_m_gemm_dispatcher, low_m_gemm_takes_rows,
                          lowm_fp8_supported)
@@ -740,6 +741,61 @@ class LinearMethodBase(ABC):
         return 1
 
 
+# Rows in every GEMM when a row's output must not depend on its batch shape.
+# Larger values pad short batches more, smaller ones split long prompts into
+# more GEMMs.
+FIXED_GEMM_HEIGHT = 64
+
+
+def _fixed_height_gemm(rows: torch.Tensor, weight: torch.Tensor,
+                       bias: Optional[torch.Tensor], out: torch.Tensor) -> None:
+    """Write ``F.linear(rows, weight, bias)`` into ``out``.
+
+    ``F.linear`` runs a 2D input as this same ``addmm`` or ``mm``.
+    """
+    if bias is None:
+        torch.mm(rows, weight.t(), out=out)
+    else:
+        torch.addmm(bias, rows, weight.t(), out=out)
+
+
+@torch.library.custom_op("trtllm::fixed_height_linear", mutates_args=())
+def _fixed_height_linear(input: torch.Tensor, weight: torch.Tensor,
+                         bias: Optional[torch.Tensor]) -> torch.Tensor:
+    """Apply a linear layer with every GEMM at ``FIXED_GEMM_HEIGHT`` rows.
+
+    cuBLAS picks its kernel from the matrix shape and kernels round differently,
+    so one row can produce different bits at different batch heights. A short
+    last chunk is padded. The output has room for the padding rows, so every
+    GEMM writes its rows in place. This is a custom op so that torch.compile
+    sees one op instead of a loop over the row count.
+    """
+    if input.numel() == 0:
+        return F.linear(input, weight, bias)
+    # The padded chunk is a new contiguous tensor, so the other chunks must be
+    # contiguous too: cuBLAS takes its arguments from the strides.
+    rows = input.reshape(-1, input.shape[-1]).contiguous()
+    num_rows = rows.shape[0]
+    padded_rows = ((num_rows + FIXED_GEMM_HEIGHT - 1) // FIXED_GEMM_HEIGHT *
+                   FIXED_GEMM_HEIGHT)
+    output = rows.new_empty(padded_rows, weight.shape[0])
+    for start in range(0, num_rows, FIXED_GEMM_HEIGHT):
+        chunk = rows[start:start + FIXED_GEMM_HEIGHT]
+        count = chunk.shape[0]
+        if count < FIXED_GEMM_HEIGHT:
+            padding = chunk[-1:].expand(FIXED_GEMM_HEIGHT - count, -1)
+            chunk = torch.cat((chunk, padding))
+        _fixed_height_gemm(chunk, weight, bias,
+                           output[start:start + FIXED_GEMM_HEIGHT])
+    return output[:num_rows].view(*input.shape[:-1], -1)
+
+
+@_fixed_height_linear.register_fake
+def _(input: torch.Tensor, weight: torch.Tensor,
+      bias: Optional[torch.Tensor]) -> torch.Tensor:
+    return input.new_empty(*input.shape[:-1], weight.shape[0])
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method for unquantized (BF16 / FP16 / FP32) weights.
 
@@ -842,6 +898,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 out_dtype=None,
                 output_buffer_kind=output_buffer_kind,
                 group=group)
+        elif getattr(module, "use_fixed_height_gemm", False):
+            output = _fixed_height_linear(input, weight, bias)
         else:
             output = F.linear(input, weight, bias)
         return output
@@ -3802,6 +3860,10 @@ def cuda_graph_gemm_tuning(tune: bool, world_size: int = 1) -> Iterator[None]:
     tactics the results cannot be merged across ranks, so ranks could pick different
     algorithms, with different rounding, for a GEMM they all compute on the same input.
     With ``world_size > 1`` the knob is ignored.
+
+    It is also ignored when a row's output must not depend on its batch shape
+    (``FORCE_BATCH_INVARIANT`` or ``FORCE_DETERMINISTIC``): a decode row would then round
+    differently in a captured graph than in an eager mixed batch.
     """
     if not cuda_graph_gemm_tuning_enabled():
         yield
@@ -3811,6 +3873,13 @@ def cuda_graph_gemm_tuning(tune: bool, world_size: int = 1) -> Iterator[None]:
             f"{CUDA_GRAPH_GEMM_TUNING_ENV}=1 is ignored with world size {world_size}: "
             "TunableOp results are tuned per rank and cannot be kept the same across ranks.",
             key="cuda_graph_gemm_tuning_multi_rank")
+        yield
+        return
+    if is_batch_shape_deterministic():
+        logger.warning_once(
+            f"{CUDA_GRAPH_GEMM_TUNING_ENV}=1 is ignored with batch-shape determinism: "
+            "tuned graphs and eager steps would round the same GEMM differently.",
+            key="cuda_graph_gemm_tuning_batch_shape_deterministic")
         yield
         return
     from torch.cuda import tunable
@@ -4588,6 +4657,7 @@ class Linear(nn.Module):
         self.reduce_output = reduce_output
         self._output_slice_cache: Optional[Fp8BlockScaleWeightSliceCache] = None
         self.use_custom_cublas_mm = use_custom_cublas_mm
+        self.use_fixed_height_gemm = is_batch_shape_deterministic()
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
         self.lora = lora
 

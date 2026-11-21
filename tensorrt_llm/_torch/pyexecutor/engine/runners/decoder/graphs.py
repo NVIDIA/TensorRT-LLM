@@ -51,7 +51,10 @@ from tensorrt_llm._torch.speculative import (
     restore_attn_metadata_after_draft_replay,
 )
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
-from tensorrt_llm._torch.utils import get_per_request_prefill_cuda_graph_flag
+from tensorrt_llm._torch.utils import (
+    get_per_request_prefill_cuda_graph_flag,
+    is_batch_shape_deterministic,
+)
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
@@ -233,6 +236,8 @@ class DecoderCudaGraphs:
 
     # Whether a warmup batch already ran an in-forward Mamba snapshot split (its Triton copy kernels compiled).
     _inforward_split_warmed: bool = False
+    # Whether a row's output must not depend on the batch shape it ran in; read once, like Linear's.
+    _batch_shape_deterministic: bool = False
     # Whether TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1 may capture these graphs in one pass.
     supports_single_pass_capture: ClassVar[bool] = True
 
@@ -277,6 +282,7 @@ class DecoderCudaGraphs:
         self._torch_compile_bypass = torch_compile_bypass
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
+        self._batch_shape_deterministic = is_batch_shape_deterministic()
         self._force_lora_graph_for_capture: bool | None = None
         self._inforward_split_warmed = False
         # The one-engine sampling variants captured when cuda_graph_config.sampling_variants lists them.
@@ -660,6 +666,9 @@ class DecoderCudaGraphs:
             # Promoted rows are re-sorted by domain with the generation rows,
             # while sampling still walks the semantic batch in its own order.
             and not locality_domain_forkjoin_enabled(kv_cache_manager)
+            # The decode kernels round differently from the context kernels, so
+            # promotion would make a repeat differ from the prompt's first call.
+            and not self._batch_shape_deterministic
         ):
             return scheduled_requests, frozenset()
         return _make_single_token_context_graph_batch(
