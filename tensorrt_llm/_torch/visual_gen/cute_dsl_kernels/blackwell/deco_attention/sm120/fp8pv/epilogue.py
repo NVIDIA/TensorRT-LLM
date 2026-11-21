@@ -121,35 +121,27 @@ def store_partials(part_ptr, bid, tidx, O, anc0, anc1, l0, l1):
         cute.arch.store(gptr(Float32, pbase + (64 + i) * (NTHR * 4)), x)
 
 
-@cute.kernel
-def merge_partial_kernel(
-    part_ptr: cute.Pointer,
-    o_ptr: cute.Pointer,
-    vs_ptr: cute.Pointer,
+@cute.jit
+def _merge_rows(
+    part_ptr,
+    vs_ptr,
+    ob,
+    bid,
+    tidx,
+    warp,
+    lane,
+    g,
+    q,
+    qt,
+    bb,
+    hh,
+    split: cutlass.Constexpr,
     S: cutlass.Constexpr,
     H: cutlass.Constexpr,
-    nT: cutlass.Constexpr,
-    split: cutlass.Constexpr,
-    unit0: cutlass.Constexpr,
-    lens_ptr,
+    nv,
 ):
-    """The merge of the split key-range pieces of unit unit0 + CTA index, in the thread mapping of the attention: the
-    partials of the pieces are brought to their common anchor (the anchors are in log2 units already) and summed, then
-    the rows are normalized and stored as in a whole unit. lens_ptr: None, or the valid prefix lengths: the rows
-    from the length of the batch element on are zeros (a piece without a valid key tile has left an anchor of -inf
-    and zeros; a unit without a valid query row has no partials)."""
-    bid_, _, _ = cute.arch.block_idx()
-    tidx_, _, _ = cute.arch.thread_idx()
-    bid = Int32(bid_)
-    tidx = Int32(tidx_)
-    unit = unit0 + bid
-    qt = unit % nT
-    hh = (unit // nT) % H
-    bb = unit // (nT * H)
-    warp = tidx >> 5
-    lane = tidx & 31
-    g = lane >> 2
-    q = lane & 3
+    """The merge of the pieces of one unit (merge_partial_kernel): the partials brought to their common anchor and
+    summed, the rows normalized and stored as in a whole unit, those from nv on as zeros."""
     pb = [
         part_ptr.toint() + Int64((bid * split + p) * PART_N) * (NTHR * 4) + tidx * 4
         for p in range(split)
@@ -185,7 +177,50 @@ def merge_partial_kernel(
             O[i] = fma_rn_f32(load_invariant(Float32, pb[p] + i * (NTHR * 4)), factor, O[i])
     f = inv_row_sums(l0, l1, q)
     vsc = load_invariant(Float32, vs_ptr.toint())
-    ob = o_ptr.toint()
     smem = Int32(cute.arch.get_dyn_smem(cutlass.Uint8, alignment=16).toint())
-    nv = None if cutlass.const_expr(lens_ptr is None) else valid_len(lens_ptr.toint(), bb, S)
     store_rows(O, f, vsc, smem + warp * (16 * EP), g, q, lane, warp, qt, ob, bb, hh, S, H, nv)
+
+
+@cute.kernel
+def merge_partial_kernel(
+    part_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    vs_ptr: cute.Pointer,
+    S: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    nT: cutlass.Constexpr,
+    split: cutlass.Constexpr,
+    unit0: cutlass.Constexpr,
+    lens_ptr,
+):
+    """The merge of the split key-range pieces of unit unit0 + CTA index, in the thread mapping of the attention: the
+    partials of the pieces are brought to their common anchor (the anchors are in log2 units already) and summed, then
+    the rows are normalized and stored as in a whole unit. lens_ptr: None, or the valid prefix lengths: the rows
+    from the length of the batch element on are zeros (a piece without a valid key tile has left an anchor of -inf
+    and zeros; a unit without a valid query row has no partials and stores zeros without reading any)."""
+    bid_, _, _ = cute.arch.block_idx()
+    tidx_, _, _ = cute.arch.thread_idx()
+    bid = Int32(bid_)
+    tidx = Int32(tidx_)
+    unit = unit0 + bid
+    qt = unit % nT
+    hh = (unit // nT) % H
+    bb = unit // (nT * H)
+    warp = tidx >> 5
+    lane = tidx & 31
+    g = lane >> 2
+    q = lane & 3
+    ob = o_ptr.toint()
+    if cutlass.const_expr(lens_ptr is None):
+        _merge_rows(
+            part_ptr, vs_ptr, ob, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H, None
+        )
+    else:
+        nv = valid_len(lens_ptr.toint(), bb, S)
+        if qt * QT >= nv:
+            # the unit has no valid query row: its pieces wrote no partials, its rows are zeros
+            store_zero_rows(lane, warp, qt, ob, bb, hh, S, H)
+        else:
+            _merge_rows(
+                part_ptr, vs_ptr, ob, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H, nv
+            )

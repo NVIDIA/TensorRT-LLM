@@ -157,15 +157,14 @@ class DeCoAttention(AttentionBackend):
         A model's cross-attention layers take this path on every call, inside the compiled
         model, so it logs nothing; ``forward`` warns once when a self-attention call takes it.
         VANILLA takes no ``valid_seq_len``: the valid prefix of a self-attention call is
-        attended alone and the padded rows come back zero, as from the kernels.
+        attended alone, with the prefix of its key padding mask, and the padded rows come back
+        zero, as from the kernels.
         """
         valid_seq_len = kwargs.pop("valid_seq_len", None)
-        if (
-            valid_seq_len is not None
-            and valid_seq_len < q.shape[1]
-            and q.shape == k.shape
-            and kwargs.get("key_padding_mask") is None
-        ):
+        if valid_seq_len is not None and valid_seq_len < q.shape[1] and q.shape == k.shape:
+            mask = kwargs.get("key_padding_mask")
+            if mask is not None:
+                kwargs = {**kwargs, "key_padding_mask": mask[:, :valid_seq_len]}
             out = torch.zeros_like(q)
             if valid_seq_len > 0:
                 out[:, :valid_seq_len] = self._delegate(
@@ -272,6 +271,8 @@ class DeCoAttention(AttentionBackend):
             reason = "an attention mask"
         elif q.dtype != torch.bfloat16:
             reason = f"{q.dtype} inputs"
+        elif q.numel() == 0:
+            reason = "empty inputs"
         else:
             reason = "inputs that are not on a CUDA device"
         logger.warning_once(

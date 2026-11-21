@@ -93,7 +93,8 @@ def sampled_token(st, sidx):
     whose row r stands for token floor(r nv / S); modes 1 and 2 are the caller's rows, shared by the batch [NQK] or
     per batch element [B, NQK], taken as given below nv and as the last valid token from nv on."""
     if cutlass.const_expr(st.lens is None):
-        return load_invariant(Uint32, st.rows_p + Int64(sidx) * 4)
+        r = Int32(load_invariant(Uint32, st.rows_p + Int64(sidx) * 4))
+        return Uint32(cutlass.max(cutlass.min(r, st.S - 1), Int32(0)))
     mode = st.lens[1]
     own = Int64(cutlass.select_(mode == 2, st.b * st.NQK, Int32(0)))
     r = Int32(load_invariant(Uint32, st.rows_p + (own + Int64(sidx)) * 4))
@@ -721,9 +722,9 @@ def _eig(
     st.t = st.lane & 3
     b = bh // H
     st.h = bh - b * H  # head, of batch b
+    st.S = S
     if cutlass.const_expr(lens is not None):
         st.b = b
-        st.S = S
         st.nv = valid_len(lens[0], b, S)  # the valid tokens of the batch element
     st.work = sb + SM_WORK
     st.zb = st.work  # Z [128][32], once G has left SM_WORK
