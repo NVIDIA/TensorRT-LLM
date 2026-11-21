@@ -12,6 +12,10 @@ as it is::
     trtllm-modeling-v2 gate acceptance --task task.yaml \
         --unit dspark --member tep4 --tree .dev-worktrees/pre-fix
 
+``gate test --test <name>`` runs a test of the spec's own (``verify.tests``) as its
+check does: on its feature, at ``--member`` (a whole-model test's first member by
+default), handed that member's configuration.
+
 Exit status: 0 when the gate passed, 1 when it failed, 2 on a usage or spec
 error. ``--json`` prints the verdict as JSON instead of its summary line.
 """
@@ -31,6 +35,7 @@ from ..infra.compute.environment import RunEnvironment, resolve_environment, sch
 from ..infra.compute.executor import FEATURE, select_command_executor, shell_runner_for
 from ..infra.git import resolve_commit
 from ..spec import variants as variants_mod
+from ..spec import verify as verify_mod
 from ..spec.task_schema import (
     TaskSchemaError,
     assembly_units,
@@ -42,7 +47,7 @@ from ..spec.task_schema import (
 from . import acceptance as acceptance_checks
 from . import accuracy as accuracy_checks
 from . import boot as boot_checks
-from . import check_config, check_runtime
+from . import check_config, check_runtime, user_tests
 from . import verdict as check_result
 
 #: The gates this command runs, by the name it takes.
@@ -52,6 +57,7 @@ GATE_NAMES: tuple[str, ...] = (
     "acceptance",
     "serve",
     "disagg",
+    "test",
 )
 
 
@@ -62,6 +68,12 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("name", choices=GATE_NAMES, help="the gate to run")
     parser.add_argument("--task", type=Path, required=True, help="the run's task.yaml")
+    parser.add_argument(
+        "--test",
+        default=None,
+        help="test only: the name of the spec's own test to run (verify.tests); its feature "
+        "is the unit",
+    )
     parser.add_argument(
         "--unit",
         default="core",
@@ -178,6 +190,19 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
     unit = args.unit
     world = args.world_size
     member = args.member
+    test = None
+    if args.name == "test":
+        test = verify_mod.find(task_data, str(args.test or ""))
+        if test is None:
+            raise TaskSchemaError(
+                f"verify.tests declares no test {args.test!r}: name one with --test "
+                f"({', '.join(t.name for t in verify_mod.user_tests(task_data)) or 'none'})"
+            )
+        unit = test.feature
+        if not test.whole_model:
+            member = verify_mod.module_member(test.devices)
+        elif member is None and list(test.members) != [verify_mod.ALL_MEMBERS]:
+            member = test.members[0]
     if variants_mod.is_variant(task_data, unit):
         task_data = check_config.variant_spec(
             task_data,
@@ -223,15 +248,32 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         )  # fmt: skip
         runner = shell_runner_for(executor)
         runner = pin.runner(runner) if pin is not None else check_runtime.in_tree(runner, tree)
-        result = _run_named(
-            args,
-            task_data,
-            environment,
-            runner,
-            unit=unit,
-            member=member,
-            declared=(declared, unit_environment),
-        )
+        if test is not None:
+            if args.timeout:
+                test = replace(test, timeout=args.timeout)
+            result = user_tests.run_user_test(
+                environment,
+                task_data=task_data,
+                test=test,
+                workdir=args.workdir.resolve() / unit,
+                runner=runner,
+                member=member,
+                features=(
+                    [f for f in args.features.split(",") if f]
+                    if args.features is not None
+                    else features_for(task_data, unit)
+                ),
+            )
+        else:
+            result = _run_named(
+                args,
+                task_data,
+                environment,
+                runner,
+                unit=unit,
+                member=member,
+                declared=(declared, unit_environment),
+            )
         return pin.stamp(result) if pin is not None else result
 
 

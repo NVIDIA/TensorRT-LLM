@@ -4,17 +4,17 @@
 """The contract: every check a run must pass, compiled from the resolved task spec.
 
 The contract is the run's definition of "done". It names each check by unit,
-gate and member, with a tier:
+gate and member, with the stage it runs at:
 
-- ``inner``: what shows a unit runs and scores (boot, accuracy, and the serve
-  gate where the spec turns it on or can derive it);
-- ``proof``: what proves a feature is on (acceptance, the disaggregated-serving
-  test), and the checks of each configuration variant (``spec/variants.py``);
-- ``delivery``: once every other required check has passed (the serve gate
-  at one rank). Its pass stands like any other, and it runs again when a task
-  that claims it lands.
+- ``landing``: when a landing claims it. A unit's boot, accuracy and serve
+  gate, what proves a feature is on (acceptance, the disaggregated-serving
+  test), each configuration variant's checks (``spec/variants.py``), and the
+  spec's own tests that say so (``spec/verify.py``);
+- ``delivery``: once every other required check has passed. The serve gate at
+  one rank, and the spec's own tests that say so. Its pass stands like any
+  other, and it runs again when a task that claims it lands.
 
-A check runs when the task that claims it lands. Verdicts are appended to
+A check runs when the task that claims it lands, a delivery check with its stage. Verdicts are appended to
 ``contract_status.jsonl`` as gates return, keyed by unit. Delivery evaluates
 the contract (:func:`evaluate`): every required check's latest verdict must
 have passed. A check that passed stands, whatever landed after it. A verdict
@@ -50,6 +50,7 @@ from ...checks.check_config import (
 )
 from ...infra.files import write_text_atomic
 from ...spec import variants as variants_mod
+from ...spec import verify as verify_mod
 from ...spec.task_schema import (
     DISAGG_FEATURE,
     PROFILE_BRINGUP,
@@ -63,10 +64,7 @@ from ...spec.task_schema import (
     profile_of,
     resolve_per_unit,
 )
-
-TIER_INNER = "inner"
-TIER_PROOF = "proof"
-TIER_DELIVERY = "delivery"
+from ...spec.verify import STAGE_DELIVERY, STAGE_LANDING
 
 CONTRACT_FILENAME = "contract.yaml"
 STATUS_FILENAME = "contract_status.jsonl"
@@ -81,12 +79,12 @@ MILESTONE_CORRECTNESS = "correctness"
 
 @dataclass(frozen=True)
 class Check:
-    """One check: a gate, at one member, for one unit."""
+    """One check: a gate, at one member, for one unit, run at one stage."""
 
     unit: str
     gate: str
     member: str
-    tier: str
+    stage: str
     required: bool = True
     #: What the check reads from outside the checkout, as a digest; see :func:`check_inputs`.
     inputs: str = field(default="", compare=False)
@@ -113,8 +111,8 @@ class Contract:
     def required(self) -> tuple[Check, ...]:
         return tuple(c for c in self.checks if c.required)
 
-    def by_tier(self, tier: str) -> tuple[Check, ...]:
-        return tuple(c for c in self.checks if c.tier == tier)
+    def by_stage(self, stage: str) -> tuple[Check, ...]:
+        return tuple(c for c in self.checks if c.stage == stage)
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -131,10 +129,10 @@ class Contract:
 
     def render(self) -> str:
         """A markdown table, one row per check."""
-        lines = ["| unit | gate | member | tier | required |", "|---|---|---|---|---|"]
+        lines = ["| unit | gate | member | stage | required |", "|---|---|---|---|---|"]
         for c in self.checks:
             lines.append(
-                f"| {c.unit} | {c.gate} | {c.member} | {c.tier} | {'yes' if c.required else 'no'} |"
+                f"| {c.unit} | {c.gate} | {c.member} | {c.stage} | {'yes' if c.required else 'no'} |"
             )
         if self.notes:
             lines += ["", *(f"- {note}" for note in self.notes)]
@@ -258,6 +256,10 @@ def check_inputs(
         "env": environment.get("env") if isinstance(environment, Mapping) else None,
         "variant": variants_mod.variants(task_data).get(unit),
     }
+    name = verify_mod.test_of_gate(gate)
+    if name is not None:
+        test = verify_mod.find(task_data, name)
+        payload["test"] = asdict(test) if test is not None else None
     text = json.dumps(_with_contents(payload, checkout), sort_keys=True, default=str)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
@@ -303,6 +305,53 @@ def relative_to(base: str, gate: str, member: str, owned: Collection[str]) -> st
     return key if gate.startswith("accuracy[") and key in owned else ""
 
 
+def user_test_members(
+    task_data: Mapping[str, Any], test: verify_mod.UserTest, world_size: int
+) -> list[str]:
+    """Where a test of the spec runs: its members (each feature's own for ``all``), or one place.
+
+    A module test (``devices``) runs once, recorded at ``tp<N>`` for its devices.
+    """
+    if not test.whole_model:
+        return [verify_mod.module_member(test.devices)]
+    if list(test.members) != [verify_mod.ALL_MEMBERS]:
+        return list(test.members)
+    if variants_mod.is_variant(task_data, test.feature):
+        spec = check_config.variant_spec(task_data, test.feature, world_size=world_size)
+        return order_members_by_cost(members_for(spec, test.feature, world_size))
+    return order_members_by_cost(members_for(task_data, test.feature, world_size))
+
+
+def user_test_checks(
+    task_data: Mapping[str, Any], world_size: int, notes: list[str] | None = None
+) -> list[Check]:
+    """The checks of the spec's own tests (``verify.tests``): one per test and member.
+
+    Each is named by its test (``<feature>:test[<name>]@<member>``), runs at the
+    test's stage, and is owed whatever the profile: the spec asks for it by name.
+    """
+    units = assembly_units(task_data)
+    out: list[Check] = []
+    for test in verify_mod.user_tests(task_data):
+        feature = test.feature
+        if variants_mod.is_variant(task_data, feature):
+            base = variants_mod.base_unit(task_data, feature)
+            built = units[1 : units.index(base) + 1] if base in units else []
+        else:
+            built = units[1 : units.index(feature) + 1] if feature in units else []
+        members = user_test_members(task_data, test, world_size)
+        for member in members:
+            inputs = check_inputs(task_data, feature, test.gate, member, built)
+            out.append(Check(feature, test.gate, member, test.stage, inputs=inputs))
+        if notes is not None:
+            where = ", ".join(members) if test.whole_model else f"{test.devices} device(s), once"
+            notes.append(
+                f"{feature}: `{test.name}`, a test of the spec's own, at {test.stage} "
+                f"({where}): {test.purpose}"
+            )
+    return out
+
+
 def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     """Every check the run's units and delivery owe, in the order they run.
 
@@ -322,7 +371,9 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     every member of its unit and runs its benchmark at one
     (:func:`benchmark_member`) unless it names its members; a variant of
     ``disagg`` owes nothing of its own, its axis being proven on core. A
-    ``smoke`` or ``bringup`` run owes no variant and no delivery check.
+    ``smoke`` or ``bringup`` run owes no variant and no delivery check. The spec's
+    own tests (``verify.tests``) are owed whatever the profile
+    (:func:`user_test_checks`).
     """
     accuracy = task_data.get("accuracy") or {}
     serving = serve.ServeSpec.from_task(task_data).enabled
@@ -346,25 +397,27 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         features = units[1 : index + 1]
         implemented = set(features)
 
-        def add(gate: str, tier: str, at=members, unit=unit, features=features) -> None:
+        def add(gate: str, stage: str, at=members, unit=unit, features=features) -> None:
             for m in at:
                 inputs = check_inputs(task_data, unit, gate, m, features)
-                checks.append(Check(unit, gate, m, tier, inputs=inputs))
+                checks.append(Check(unit, gate, m, stage, inputs=inputs))
 
         if unit == DISAGG_FEATURE:
             # The test sets its own engines' layout on one node: it runs once, at the
             # member the request validates fully (benchmark_member).
             member, why = benchmark_member(task_data, members)
-            add(disagg.GATE_NAME, TIER_PROOF, at=[member])
+            add(disagg.GATE_NAME, STAGE_LANDING, at=[member])
             notes.append(
                 f"{unit}: its disaggregated-serving test alone proves it, once at {member} "
                 f"({why}); its boot and accuracy would run one aggregated engine"
             )
             continue
         if level == PROFILE_SMOKE:
-            add("boot", TIER_INNER)
+            add("boot", STAGE_LANDING)
             notes.append(f"{unit}: the smoke profile owes its boot alone")
-            boot_alone = Check(unit, "boot", members[0], TIER_INNER).key if members else boot_alone
+            boot_alone = (
+                Check(unit, "boot", members[0], STAGE_LANDING).key if members else boot_alone
+            )
             continue
         benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
         benchmarked = benchmark_members(task_data, unit, members)
@@ -372,22 +425,22 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         loaded = set(members) if drafts else set(benchmarked)
         if _boot_observes(unit in reuses, drafts, "multimodal" in implemented):
             loaded = set()
-        add("boot", TIER_INNER, at=[m for m in members if m not in loaded])
+        add("boot", STAGE_LANDING, at=[m for m in members if m not in loaded])
         if loaded:
             notes.append(
                 f"{unit}: no boot at {', '.join(m for m in members if m in loaded)}; a stronger "
                 "check loads the same engine there"
             )
-        add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmarked)
+        add(f"accuracy[{benchmark}]", STAGE_LANDING, at=benchmarked)
         if benchmarked:
-            confirm = Check(unit, f"accuracy[{benchmark}]", benchmarked[0], TIER_INNER).key
+            confirm = Check(unit, f"accuracy[{benchmark}]", benchmarked[0], STAGE_LANDING).key
         if serving:
-            add(serve.GATE_NAME, TIER_INNER, at=[serve.serve_member(members)])
+            add(serve.GATE_NAME, STAGE_LANDING, at=[serve.serve_member(members)])
         # Speculative decoding preserves the output distribution by construction, so a
         # draft path that computes the wrong thing passes boot and accuracy and shows
         # only as speed: per-prompt acceptance is the detector.
         if drafts:
-            add("acceptance", TIER_PROOF)
+            add("acceptance", STAGE_LANDING)
     for name in () if lean else variants_mod.variants(task_data):
         level = profile_of(task_data, name)
         if level == PROFILE_BRINGUP:
@@ -433,14 +486,14 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             elif gate == "accuracy":
                 at = scored
                 if scored:
-                    variant_confirm = Check(name, gate_names[gate], scored[0], TIER_PROOF).key
+                    variant_confirm = Check(name, gate_names[gate], scored[0], STAGE_LANDING).key
             owned = {c.key for c in checks}
             checks.extend(
                 Check(
                     name,
                     gate_names[gate],
                     m,
-                    TIER_PROOF,
+                    STAGE_LANDING,
                     inputs=check_inputs(spec, name, gate_names[gate], m, built),
                     after=relative_to(base, gate_names[gate], m, owned) if relative else "",
                 )
@@ -451,13 +504,14 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             f"the {profile_of(task_data)} profile gates no configuration variant: "
             + ", ".join(variants_mod.variants(task_data))
         )
+    checks.extend(user_test_checks(task_data, world_size, notes))
     last_features = units[1:]
     if units and serving and not lean:
         last = units[-1]
         single = serve.delivery_member(members_for(task_data, last, world_size))
         if single is not None:
             inputs = check_inputs(task_data, last, serve.GATE_NAME, single, last_features)
-            checks.append(Check(last, serve.GATE_NAME, single, TIER_DELIVERY, inputs=inputs))
+            checks.append(Check(last, serve.GATE_NAME, single, STAGE_DELIVERY, inputs=inputs))
     return Contract(
         checks=tuple(checks), notes=tuple(notes), confirm=confirm or variant_confirm or boot_alone
     )
@@ -889,7 +943,7 @@ def bringup_checks(contract: Contract) -> tuple[Check, ...]:
         c
         for c in contract.required()
         if c.unit == first
-        and c.tier == TIER_INNER
+        and c.stage == STAGE_LANDING
         and (c.gate == "boot" or c.gate.startswith("accuracy["))
     ]
     measured = {c.member for c in own if c.gate.startswith("accuracy[")}
@@ -961,9 +1015,8 @@ __all__ = [
     "MILESTONE_FILENAME",
     "Milestone",
     "STATUS_FILENAME",
-    "TIER_DELIVERY",
-    "TIER_INNER",
-    "TIER_PROOF",
+    "STAGE_DELIVERY",
+    "STAGE_LANDING",
     "Verdict",
     "benchmark_members",
     "bringup_checks",
@@ -974,6 +1027,8 @@ __all__ = [
     "cells_holding",
     "check_inputs",
     "compile_contract",
+    "user_test_checks",
+    "user_test_members",
     "evaluate",
     "latest_milestone",
     "load_cells",

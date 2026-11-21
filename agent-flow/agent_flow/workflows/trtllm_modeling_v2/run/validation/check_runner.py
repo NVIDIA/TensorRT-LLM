@@ -17,7 +17,7 @@ from agent_flow.console import print_message
 from ...checks import acceptance as acceptance_checks
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, disagg, serve
+from ...checks import check_config, disagg, serve, user_tests
 from ...checks import verdict as check_result
 from ...checks.accuracy import resolve_model_key
 from ...infra.compute.environment import RunEnvironment
@@ -34,6 +34,7 @@ from ...infra.compute.executor import (
 from ...infra.compute.sessions import session_wait_from_task
 from ...infra.git import resolve_commit
 from ...spec import variants as variants_mod
+from ...spec import verify as verify_mod
 from ...spec.task_schema import assembly_units, features_through, parse_parallel_segment
 from ..startup import datasets as datasets_mod
 from ..workspace import snapshots as snapshots_mod
@@ -228,11 +229,16 @@ class CheckRunner:
     def _prioritized_check(self, check: contract_mod.Check, log) -> Any:
         """:meth:`_run_contract_check`, its jobs queued at the check's class (:func:`job_priority`).
 
-        The first unit's inner checks are on the way to its accuracy, and go
-        ahead of every other check in a session's spool.
+        The first unit's own landing checks are on the way to its accuracy, and go
+        ahead of every other check in a session's spool. The spec's own tests do not.
         """
         units = assembly_units(self.task_data)
-        first = bool(units) and check.unit == units[0] and check.tier == contract_mod.TIER_INNER
+        first = (
+            bool(units)
+            and check.unit == units[0]
+            and check.stage == contract_mod.STAGE_LANDING
+            and verify_mod.test_of_gate(check.gate) is None
+        )
         with job_priority(ACCURACY if first else FEATURE):
             return self._run_contract_check(check, log)
 
@@ -329,6 +335,14 @@ class CheckRunner:
                 boot=boot_checks.resolve_boot_spec(spec, unit, features),
                 **common(runner),
             )  # fmt: skip
+        name = verify_mod.test_of_gate(gate)
+        if name is not None:
+            test = verify_mod.find(self.task_data, name)
+            if test is not None:
+                return lambda runner: user_tests.run_user_test(
+                    env, task_data=spec, test=test, workdir=workdir, runner=runner,
+                    member=member, features=features,
+                )  # fmt: skip
         raise ValueError(f"contract check {check.key} names no gate this workflow runs")
 
     def _with_dataset(self, spec: Any, gate: str) -> Any:
@@ -438,7 +452,7 @@ class CheckRunner:
             score, why = verdict.measured, verdict.detail
         else:
             first = self._gate_call(
-                contract_mod.Check(base, check.gate, check.member, contract_mod.TIER_INNER)
+                contract_mod.Check(base, check.gate, check.member, contract_mod.STAGE_LANDING)
             )(runner)
             self.journal.event("gate", f"{first.summary()} (measured as {check.unit}'s anchor)")
             if first.infrastructure:
@@ -487,7 +501,10 @@ class CheckRunner:
         self.journal.event("gate", result.summary())
         if not result.passed:
             print_message(f"[bold yellow]↻ {escape_markup(result.summary())}[/bold yellow]", log)
-            if check.gate == disagg.GATE_NAME and result.stdout_tail.strip():
+            ran_a_test = (
+                check.gate == disagg.GATE_NAME or verify_mod.test_of_gate(check.gate) is not None
+            )
+            if ran_a_test and result.stdout_tail.strip():
                 self.journal.section(
                     f"`{check.key}` failed: the test's last lines",
                     f"```\n{result.stdout_tail.rstrip()}\n```",

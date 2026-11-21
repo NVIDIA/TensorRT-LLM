@@ -118,7 +118,11 @@ must change before that.
    - *The final code is scored once.* Before delivery a benchmark has passed on the final
      tree; if none has, the cheapest one runs.
 
-   The report names the commit each check measured. Delivery requires the contract, tests
+   Each check runs at one of two stages: `landing`, when a landing names it, or `delivery`,
+   once the work is done and every other required check has passed (a landing that names it
+   then only owes it). The spec adds tests of its own under `verify.tests`, by the feature each
+   proves: a pytest node of the tree, its stage, and where it runs (`members`, once per member
+   with that member's configuration, or `devices`). The report names the commit each check measured. Delivery requires the contract, tests
    and files to agree.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;

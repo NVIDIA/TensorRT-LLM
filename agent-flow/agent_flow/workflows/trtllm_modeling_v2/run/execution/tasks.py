@@ -1016,7 +1016,7 @@ class ExecutionStage:
             evaluation,
             self.workflow._contract.required(),
             f"all {len(evaluation.passed)} required checks of the contract passed, the "
-            "delivery tier's included, and a check that passed on it confirms it",
+            "delivery stage's included, and a check that passed on it confirms it",
         )
 
     def _take_stage_notes(self) -> list[str]:

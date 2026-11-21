@@ -28,6 +28,8 @@ from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
+from .verify import VERIFY_FIELD
+from .verify import validate as validate_verify
 
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
     "checkpoint_path",
@@ -175,6 +177,7 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     COMMIT_POLICY_FIELD,
     VARIANTS_FIELD,
     "profile",
+    VERIFY_FIELD,
 )
 #: ``profile``: how much the contract owes, for the run or per unit (a mapping
 #: from unit or variant name, and ``default``, to a profile). ``smoke`` owes a
@@ -1268,6 +1271,17 @@ def _unit_names(data: Mapping[str, Any]) -> set[str]:
     return named
 
 
+def _member_error(member: str) -> str | None:
+    """What is wrong with ``member`` as a concrete member; ``None`` when nothing is."""
+    try:
+        kind, size = parse_parallel_segment(member)
+    except TaskSchemaError as exc:
+        return str(exc)
+    if size is None:
+        return f"name a concrete member (tp<N>, tep<N> or dep<N>), not {kind!r}"
+    return None
+
+
 def _require_named_units(data: Mapping[str, Any], errors: list[str]) -> None:
     """A unit's entry under ``accuracy.acceptance`` or ``accuracy.boot`` names a unit of this spec.
 
@@ -1536,6 +1550,9 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
 
     _validate_profile(data, errors)
     _require_named_units(data, errors)
+    validate_verify(
+        data, errors, features=_unit_names(data) - {"default"}, member_error=_member_error
+    )
 
     if ENVIRONMENT_FIELD not in data:
         errors.append(

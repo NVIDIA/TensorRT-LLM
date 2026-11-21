@@ -483,7 +483,7 @@ class GraphOrchestrator:
         return next((c for c in self.contract.checks if c.key == key), None)
 
     def _delivery_keys(self) -> set[str]:
-        return {c.key for c in self.contract.by_tier(contract_mod.TIER_DELIVERY)}
+        return {c.key for c in self.contract.by_stage(contract_mod.STAGE_DELIVERY)}
 
     def _check_lock(self, key: str) -> threading.RLock:
         with self._check_locks_guard:
@@ -577,7 +577,7 @@ class GraphOrchestrator:
     def _run_task(self, task: graph_mod.Task) -> tuple[str, list[str]]:
         """A task's worker, then, in the same thread, the checks it claims.
 
-        The delivery-tier checks it claims wait for the delivery tier. They are
+        The delivery-stage checks it claims wait for their stage. They are
         owed from here on: an earlier pass of one does not answer for the tree
         this task left.
         """
@@ -782,7 +782,7 @@ class GraphOrchestrator:
           otherwise at once. A benchmark among them waits until no required
           task is open, unless the bring-up still needs it;
         - with no required task open and every other required check passed,
-          the delivery tier: its checks with no pass, and those a task that
+          the delivery stage: its checks with no pass, and those a task that
           landed since claims;
         - then, when no benchmark has scored the target as it is, the one check
           that confirms the final tree (:attr:`~.contract.Contract.confirm`).
@@ -1314,8 +1314,8 @@ class GraphOrchestrator:
         No agent turn runs and no task slot is taken: its checks wait for
         devices on the check pool as every check does.
         The future holds what a worker's thread returns, :data:`CHECKED` and
-        the keys that failed, once every check is in. Its delivery-tier checks
-        wait for the delivery tier, as any task's do.
+        the keys that failed, once every check is in. Its delivery-stage checks
+        wait for their stage, as any task's do.
         """
         delivery = self._delivery_keys()
         self._claim(k for k in task.satisfies if k in delivery)
@@ -1591,7 +1591,7 @@ class GraphOrchestrator:
             )
             # What is due with no task to ask for it: a failed check once the target
             # has changed, a check whose run was lost, and, once no required task is
-            # open, the delivery tier and the check of the final tree.
+            # open, the delivery stage and the check of the final tree.
             if self._settling is None:
                 self._settle(busy=bool(running))
             spent = not running and self._settling is None and self._planner is None

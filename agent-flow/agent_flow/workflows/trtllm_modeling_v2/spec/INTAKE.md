@@ -113,6 +113,18 @@ built), and say so in `notes`; a benchmark you start by hand runs captured too.
 - **What fails a check.** Nothing generated, or a benchmark under its floor: the golden rule
   is the benchmark score close to its reference. Kernel entries are judged by their output
   distribution against their reference (`trtllm-modeling-v2-entry`).
+- **Tests of your own.** When the request names a test the flow does not run (a feature's
+  own test, another accuracy script, a check suited to this model), declare it under
+  `verify.tests.<feature>.<name>`: its `purpose` (what it proves and what passing means) and
+  `pytest` (a repository-relative node id of the tree, or a list of them). A whole-model test
+  says `members` (a member, a list, or `all`): it runs once per member and reads that member's
+  configuration from `MV2FLOW_LLM_OPTIONS` (a YAML of LLM-API options) and `MV2FLOW_MODEL`, with
+  `MV2FLOW_FEATURE` and `MV2FLOW_MEMBER`; `{member}` in the node id stands for the member. A
+  module test says `devices` (default 1) and runs once. `stage` is `landing` (the default: when
+  a landing names it) or `delivery` (once the work is done); `timeout` is per node, default
+  3600 seconds; `env` adds variables. The test must be in the tree before launch (preflight
+  reads its file, class and function); it passes when every test it selects passed, and a skip
+  fails it.
 - **Drafting floors.** A unit's `accuracy.acceptance` entry holds its own drafter; a later
   unit that runs the same drafter (`features: [mtp, multimodal]`) is held to the entry of the
   speculator it builds on unless it has its own, then to `default`.
