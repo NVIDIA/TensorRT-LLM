@@ -64,6 +64,15 @@ bool ipcNvlsSupported();
 //! NCCL_NVLS when this returns false. The (heavy) result is cached.
 bool ipcNvlsFabricUsable();
 
+//! \brief Set TRTLLM's NCCL environment defaults, keeping any value that is already set.
+//!
+//! NCCL reads these variables when the first communicator of the process is created and keeps
+//! the values, so every code path that may create that communicator needs to call this first.
+//! It sets NCCL_RUNTIME_CONNECT=0, NCCL_GRAPH_REGISTER=0 and when ipcNvlsFabricUsable()
+//! returns false, NCCL_NVLS_ENABLE=0. It does nothing if there is no multi-device support.
+//! It caches ipcNvlsFabricUsable() result, so OK to call it a second time with no perf impact.
+void setNcclEnvDefaults();
+
 //! \brief Allocate NVLS multicast memory shared by \p ranks, exchanging the memory handles over
 //! the MPI session communicator. The process must therefore be part of an MPI job.
 //!
