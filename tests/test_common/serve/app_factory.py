@@ -231,7 +231,9 @@ class ServeTestEnv:
             ipc_dir = self.tmp_dir / "multi_frontend_ipc"
             ipc_dir.mkdir(parents=True, exist_ok=True)
             multi_frontend_serving = MultiFrontendServing(
-                launcher_uds=str(ipc_dir / "launcher.sock"), is_launcher=False
+                launcher_uds=str(ipc_dir / "launcher.sock"),
+                is_launcher=False,
+                launcher_pid=os.getppid(),
             )
 
         server = OpenAIServer(
