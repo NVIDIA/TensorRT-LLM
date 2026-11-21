@@ -868,6 +868,8 @@ def _warmup_profiles(
     """Precompile missing kernels in parallel and prepare all plans locally."""
     if not profiles:
         return
+    from flashinfer.jit.core import MissingJITCacheError
+
     from . import prims_ts_precompile
 
     candidates = range(1, _max_warmup_rows(metadata) + 1)
@@ -895,12 +897,18 @@ def _warmup_profiles(
     if payloads:
         prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
     # Allocate the largest workspace first so all profiles can share it. The
-    # serving process must load every artifact even when the disk cache is warm.
+    # serving process loads each available artifact into its own address space.
+    deferred = 0
     for _, profile, rows in sorted(plans, key=lambda plan: plan[0], reverse=True):
-        profile.load(metadata, rows)
+        try:
+            profile.load(metadata, rows)
+        except MissingJITCacheError:
+            # With JIT disabled, let a forward that selects this variant report the miss.
+            deferred += 1
     logger.info(
-        f"PrimTS sparse MLA warmup loaded {len(plans)} variants across {len(seen)} profiles "
-        f"in {time.perf_counter() - start:.1f} s"
+        f"PrimTS sparse MLA warmup loaded {len(plans) - deferred} variants across "
+        f"{len(seen)} profiles in {time.perf_counter() - start:.1f} s "
+        f"({deferred} cache misses deferred)"
     )
 
 
@@ -929,9 +937,6 @@ def warmup_prims_ts_sparse_mla(
                 profile = library.warmup_profile(layer, metadata)
                 if profile is not None:
                     profiles.append(profile)
-                break
-            if library.covers_dsv4_generation_warmup:
-                break
     _warmup_profiles(profiles, metadata)
 
 
