@@ -36,7 +36,7 @@ from tensorrt_llm._torch.pyexecutor.engine import model_setup
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.utils import model_extra_attrs, torch_compiling
 from tensorrt_llm.llmapi import PrefillCudaGraphBackend, TorchCompileConfig
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import _DEFAULT_PREFILL_CAPTURE_NUM_TOKENS, TorchLlmArgs
 
 pytestmark = pytest.mark.cpu_only
 _TARGETS = {
@@ -292,6 +292,7 @@ class _GraphRecorder:
 
 _TARGET_IDS = ((tp2, "tp2"), (tp4, "tp4"), (tp8, "tp8"))
 _ATTENTION = "trtllm.modeling_v2_m3_prefill_attention.default"
+_ROUTED_EXPERTS = "trtllm.modeling_v2_m3_prefill_routed_experts.default"
 
 
 @pytest.mark.parametrize(
@@ -311,26 +312,29 @@ _ATTENTION = "trtllm.modeling_v2_m3_prefill_attention.default"
             for modeling, name in _TARGET_IDS
             for fused in (True, False)
         ),
-        # TP2's tensor-core router takes 9..48 rows, splitting those buckets off as the eager dispatch does.
+        # TP2's tensor-core router takes up to 48 rows: one graph above them, one at or below.
         pytest.param(
             tp2,
             True,
             {"moe_max_num_tokens": 64, "router_tc_cluster16": True},
-            (64, 48, 9),
+            (64, 48, 9, 8, 2),
             "trtllm.minimax_m3_router_tc",
             [0, 1],
             id="tp2-router-tc",
         ),
-        # 16-row MoE chunks compile once per chunk count, whatever the last chunk's size. Eager prefill overlaps
-        # chunks on a stream the compiled graph must not trace.
+        # 16-row MoE chunks over the default capture buckets: the chunk loop is one op per MoE layer, so no chunk
+        # count compiles a graph of its own (the one-row bucket is Dynamo's size-1 specialization).
         *(
             pytest.param(
                 modeling,
                 True,
-                {"moe_max_num_tokens": 16, "aux_stream_moe_chunk": object()},
-                (64, 48, 40, 34),
-                "trtllm.fp4_block_scale_moe_runner",
-                [4, 3],
+                {
+                    "moe_max_num_tokens": 16,
+                    "max_num_tokens": max(_DEFAULT_PREFILL_CAPTURE_NUM_TOKENS),
+                },
+                sorted(_DEFAULT_PREFILL_CAPTURE_NUM_TOKENS, reverse=True),
+                _ROUTED_EXPERTS,
+                [1, 1],
                 id=f"{name}-moe-chunks",
             )
             for modeling, name in _TARGET_IDS
@@ -349,10 +353,16 @@ def test_compiled_prefill_core_graphs(
     core = make_meta_core(modeling, fused_projection=fused_projection)
     for name, value in core_attrs.items():
         setattr(core, name, value)
+    # TRTLLM_MODELING_V2_VALIDATE's step-contract check is pending until the first eager prefill clears it.
+    core._prefill._contract_pending = True
     recorder = _GraphRecorder()
     torch._dynamo.reset()
     compiled = torch.compile(core, fullgraph=True, dynamic=True, backend=recorder)
-    with torch_compiling(True), model_extra_attrs({}):
+    with (
+        torch._dynamo.config.patch(cache_size_limit=model_setup.DYNAMO_RECOMPILE_LIMIT),
+        torch_compiling(True),
+        model_extra_attrs({}),
+    ):
         for rows in buckets:
             output = compiled(
                 attn_metadata=_UnreadCaches(),
@@ -361,6 +371,7 @@ def test_compiled_prefill_core_graphs(
                 has_context=True,
             )
             assert output.shape == (rows, core.hidden)
+            core._prefill._contract_pending = False
 
     assert [recorder.ops(graph).count(op) for graph in recorder.graphs] == calls_per_graph
     for graph in recorder.graphs:

@@ -181,8 +181,9 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm.mxfp8_state impo
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_router_tc import m3_router_tc
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_draft_input import m3_draft_input
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec import m3_force_vec
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.prefill_attention import (
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.prefill_ops import (
     prefill_attention,
+    prefill_routed_experts,
     register_prefill_core,
 )
 from tensorrt_llm._torch.models.modeling_speculative import (
@@ -2684,14 +2685,50 @@ def _msa_attention_live(
     )
 
 
+def _prefill_routed_chunks(core, i: int, x, router_logits):
+    """The finalized routed experts of a prefill MoE from the bf16 activation over at most ``moe_max_num_tokens``
+    rows per runner call: the MoE scheduler's even split, even chunks on the MoE chunking stream. Compiled prefill
+    runs it inside ``prefill_routed_experts``."""
+    rows = x.shape[0]
+    num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
+    if num_chunks <= 1:
+        return _routed_experts(core, i, x, None, router_logits, True)
+    sizes = _split_chunk(rows, num_chunks)
+    xs, logits = x.split(sizes), router_logits.split(sizes)
+    aux = core.aux_stream_moe_chunk
+    if aux is None:
+        return torch.cat(
+            [_routed_experts(core, i, xs[c], None, logits[c], True) for c in range(num_chunks)]
+        )
+    ev_main, ev_overlap = core.moe_chunk_events[i]
+    ev_main.record()
+    with torch.cuda.stream(aux):
+        ev_main.wait()
+    outs: List[torch.Tensor] = []
+    for c in range(num_chunks):
+        if c % 2 == 0:
+            with torch.cuda.stream(aux):
+                outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
+        else:
+            outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
+    with torch.cuda.stream(aux):
+        ev_overlap.record()
+    ev_overlap.wait()
+    return torch.cat(outs)
+
+
 class PrefillTarget:
     """A step with context rows: prefill chunks, and the mixed steps that carry generation rows beside them. Every
     layer runs in its generic form; the attention core is the MSA backend's for every row."""
 
     def __init__(self, core: MiniMaxM3Tp4ModelingV2) -> None:
         self.core = core
-        self._compiled_attention_key = register_prefill_core(
-            core, _sparse_qkv_producer, _msa_attention_live, _fp8_index_qk_norm_rope
+        self._core_key = register_prefill_core(
+            core,
+            _sparse_qkv_producer,
+            _msa_attention_live,
+            _fp8_index_qk_norm_rope,
+            _prefill_routed_chunks,
         )
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._contract_pending = step_contract_enabled()
@@ -2699,7 +2736,7 @@ class PrefillTarget:
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast (TRTLLM_MODELING_V2_VALIDATE): the metadata fields this target consumes
         must exist (they are private trtllm surface). Calling ``step_args`` is the check; once per target instance."""
-        if not self._contract_pending or torch.compiler.is_compiling():
+        if torch.compiler.is_compiling() or not self._contract_pending:
             return
         try:
             self.step_args(md)
@@ -2763,45 +2800,13 @@ class PrefillTarget:
         return out
 
     def _routed_chunks(self, i: int, x, router_logits):
-        """The routed experts from the bf16 activation over at most ``moe_max_num_tokens`` rows per runner call:
-        the MoE scheduler's even split, even chunks on the MoE chunking stream."""
+        """The routed experts from the bf16 activation in ``moe_max_num_tokens``-row runner calls
+        (``_prefill_routed_chunks``)."""
         core = self.core
-        rows = x.shape[0]
-        num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
-        if num_chunks <= 1:
-            return _routed_experts(core, i, x, None, router_logits, True)
-        if is_torch_compiling():
-            # Full chunks in order: the compiled graph specializes on the chunk count but not on the remainder, and
-            # the piecewise scheduler places streams.
-            chunk = core.moe_max_num_tokens
-            return torch.cat(
-                [
-                    _routed_experts(core, i, x_c, None, logits_c, True)
-                    for x_c, logits_c in zip(x.split(chunk), router_logits.split(chunk))
-                ]
-            )
-        sizes = _split_chunk(rows, num_chunks)
-        xs, logits = x.split(sizes), router_logits.split(sizes)
-        aux = core.aux_stream_moe_chunk
-        if aux is None:
-            return torch.cat(
-                [_routed_experts(core, i, xs[c], None, logits[c], True) for c in range(num_chunks)]
-            )
-        ev_main, ev_overlap = core.moe_chunk_events[i]
-        ev_main.record()
-        with torch.cuda.stream(aux):
-            ev_main.wait()
-        outs: List[torch.Tensor] = []
-        for c in range(num_chunks):
-            if c % 2 == 0:
-                with torch.cuda.stream(aux):
-                    outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-            else:
-                outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-        with torch.cuda.stream(aux):
-            ev_overlap.record()
-        ev_overlap.wait()
-        return torch.cat(outs)
+        if is_torch_compiling() and core.moe_max_num_tokens < core.max_num_tokens:
+            # One op for any number of chunks: the graph neither unrolls them nor guards on their count.
+            return prefill_routed_experts(x, router_logits, self._core_key, i)
+        return _prefill_routed_chunks(core, i, x, router_logits)
 
     def _routed(self, i: int, h: torch.Tensor):
         """Router + routed experts, finalized: the fp32 router logits and the experts quantizing their bf16 input
@@ -2913,7 +2918,7 @@ class PrefillTarget:
                 None,
                 None,
                 output,
-                self._compiled_attention_key,
+                self._core_key,
                 i,
             )
             return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
@@ -2982,9 +2987,7 @@ class PrefillTarget:
         core = self.core
         output = q.new_empty((q.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16)
         if is_torch_compiling():
-            prefill_attention(
-                None, position_ids, q, k, v, idx_qk, output, self._compiled_attention_key, i
-            )
+            prefill_attention(None, position_ids, q, k, v, idx_qk, output, self._core_key, i)
             return output
         _msa_attention_live(core, i, q, k, v, idx_q, step["metadata"], output)
         return output

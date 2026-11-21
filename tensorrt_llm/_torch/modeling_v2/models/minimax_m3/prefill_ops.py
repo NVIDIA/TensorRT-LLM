@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Keep request-dependent M3 attention outside captured prefill segments."""
+"""Custom ops that keep request- and chunk-dependent M3 prefill work out of the compiled graph."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,6 +19,7 @@ class _PrefillCore:
     producer: Callable[..., tuple[torch.Tensor, torch.Tensor] | None]
     attention: Callable[..., None]
     indexer: Callable[..., torch.Tensor]
+    routed_experts: Callable[..., torch.Tensor]
 
 
 _CORES: dict[str, _PrefillCore] = {}
@@ -33,14 +34,25 @@ def register_prefill_core(
     producer: Callable[..., tuple[torch.Tensor, torch.Tensor] | None],
     attention: Callable[..., None],
     indexer: Callable[..., torch.Tensor],
+    routed_experts: Callable[..., torch.Tensor],
 ) -> str:
-    """Register ``core``'s live-row attention callbacks and return the key the boundary takes.
+    """Register ``core``'s prefill callbacks and return the key the ops take.
 
     The registry holds ``core`` weakly, so releasing the model drops its entry.
     """
     key = f"m3_prefill_{id(core)}"
-    _CORES[key] = _PrefillCore(ref(core, partial(_forget_core, key)), producer, attention, indexer)
+    _CORES[key] = _PrefillCore(
+        ref(core, partial(_forget_core, key)), producer, attention, indexer, routed_experts
+    )
     return key
+
+
+def _live_core(core_key: str) -> tuple[_PrefillCore, nn.Module]:
+    entry = _CORES[core_key]
+    core = entry.core()
+    if core is None:
+        raise RuntimeError("MiniMax-M3 prefill core is no longer available")
+    return entry, core
 
 
 def run_prefill_attention(
@@ -64,10 +76,7 @@ def run_prefill_attention(
     Breakable prefill graphs call this function directly at every replay. Compiled prefill calls it through
     ``prefill_attention``, a piecewise boundary op.
     """
-    entry = _CORES[core_key]
-    core = entry.core()
-    if core is None:
-        raise RuntimeError("MiniMax-M3 prefill core is no longer available")
+    entry, core = _live_core(core_key)
     metadata = get_model_extra_attrs()["attention_metadata"]()
     live = int(metadata.num_tokens)
     if position_ids is not None:
@@ -131,3 +140,24 @@ def _prefill_attention_fake(
     layer: int,
 ) -> None:
     pass
+
+
+@torch.library.custom_op("trtllm::modeling_v2_m3_prefill_routed_experts", mutates_args=())
+def prefill_routed_experts(
+    x: torch.Tensor, router_logits: torch.Tensor, core_key: str, layer: int
+) -> torch.Tensor:
+    """The finalized routed experts of MoE layer ``layer`` over the bf16 rows ``x``, as the eager prefill runs them:
+    in ``moe_max_num_tokens``-row runner calls.
+
+    One op for any number of chunks, so the compiled graph neither unrolls the chunks nor guards on their count. It is
+    not a piecewise boundary: each bucket's segment captures the calls its rows make.
+    """
+    entry, core = _live_core(core_key)
+    return entry.routed_experts(core, layer, x, router_logits)
+
+
+@prefill_routed_experts.register_fake
+def _prefill_routed_experts_fake(
+    x: torch.Tensor, router_logits: torch.Tensor, core_key: str, layer: int
+) -> torch.Tensor:
+    return x.new_empty(x.shape)
