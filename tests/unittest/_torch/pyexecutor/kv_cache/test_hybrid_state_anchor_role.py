@@ -36,7 +36,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, Lay
 _WINDOW_ROLE = DataRole("test_window")
 _WINDOW_SHAPE = [3, 64]
 _SCRATCH_BYTES_PER_SLOT = 128
-#: Layer 0 is recurrent, layer 1 is attention.
+#: Layer 0 is recurrent, layer 1 is attention (when the manager has one).
 _RECURRENT_LAYER, _ATTENTION_LAYER = 0, 1
 
 
@@ -62,7 +62,7 @@ class _WindowStateManager(MambaHybridCacheManagerV2):
         ]
 
 
-def _build(manager_cls: type) -> MambaHybridCacheManagerV2:
+def _build(manager_cls: type, *, attention: bool = True) -> MambaHybridCacheManagerV2:
     return manager_cls(
         mamba_d_state=8,
         mamba_d_conv=4,
@@ -70,19 +70,19 @@ def _build(manager_cls: type) -> MambaHybridCacheManagerV2:
         mamba_n_groups=1,
         mamba_head_dim=8,
         mamba_num_layers=1,
-        mamba_layer_mask=[True, False],
+        mamba_layer_mask=[True, False] if attention else [True],
         mamba_cache_dtype=torch.float16,
         mamba_ssm_cache_dtype=torch.float16,
         kv_cache_config=KvCacheConfig(max_tokens=512),
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=1,
+        num_layers=1 if attention else 0,
         num_kv_heads=4,
         head_dim=64,
         tokens_per_block=32,
         max_seq_len=128,
         max_batch_size=4,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-        layer_mask=[False, True],
+        layer_mask=[False, True] if attention else [False],
         dtype=DataType.HALF,
     )
 
@@ -123,3 +123,13 @@ def test_a_request_gets_a_slot_of_the_anchor_group(manager):
     slot = kv_cache.get_ssm_block_base_index(manager.ssm_layer_group_id)
     assert manager.get_state_indices([7], [False]) == [slot]
     assert 0 <= slot < manager.windows[0].shape[0]
+
+
+def test_a_recurrent_only_manager_counts_free_blocks_in_anchor_slots():
+    """Without attention layers, the free blocks are the slots of the anchor buffer."""
+    manager = _build(_WindowStateManager, attention=False)
+    try:
+        assert manager.windows[0].shape[0] > 0
+        assert manager.get_num_free_blocks() == manager.windows[0].shape[0]
+    finally:
+        manager.shutdown()
