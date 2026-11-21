@@ -7902,9 +7902,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-2": ["auto:gb300-x4", "l0_gb300", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-3": ["auto:gb300-x4", "l0_gb300", 3, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus", 4, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus", 5, 5, 4, 1, true, false],
     ]
     // PerfSanity post-merge stages end in -k_of_N and run on the official post-merge builds whose
     // BUILD_NUMBER % N == k % N: key models (DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash,
