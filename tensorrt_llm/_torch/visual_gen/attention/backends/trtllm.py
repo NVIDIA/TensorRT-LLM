@@ -874,6 +874,12 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         """Standard path fuses QKV; SageAttention path does not."""
         return self.quant_attention_config is None
 
+    @classmethod
+    def support_valid_seq_len(cls) -> bool:
+        """Dense unquantized self-attention with ``discard_padded_queries`` takes the valid
+        prefix; ``key_padding_mask`` is ignored."""
+        return True
+
     def support_kv_cache(self) -> bool:
         return self.quant_attention_config is None and self.sparse_params is None
 

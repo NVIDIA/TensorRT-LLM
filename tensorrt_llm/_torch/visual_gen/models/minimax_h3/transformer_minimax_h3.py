@@ -36,6 +36,10 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends import (
+    AttentionBackend,
+    get_visual_gen_attention_backend,
+)
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
@@ -108,6 +112,17 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
     dense_config.attention = model_config.attention.model_copy(deep=True)
     dense_config.attention.sparse_attention_config = None
     return dense_config
+
+
+def _attention_backend_class(model_config: DiffusionModelConfig) -> type[AttentionBackend]:
+    """Return the backend class the dense attention layers of the config run on; its
+    capabilities say how the padding of a sequence reaches it."""
+
+    attention = model_config.attention
+    return get_visual_gen_attention_backend(
+        getattr(attention, "backend", "VANILLA"),
+        quant_attention_config=getattr(attention, "quant_attention_config", None),
+    )
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -235,6 +250,7 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_async_ulysses:
             return self.forward_async(
@@ -243,6 +259,7 @@ class MiniMaxH3Attention(Attention):
                 key_padding_mask=key_padding_mask,
                 timestep=timestep,
                 valid_seq_len=valid_seq_len,
+                token_tags=token_tags,
             )
         batch_size, sequence_length = hidden_states.shape[:2]
         if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
@@ -302,6 +319,7 @@ class MiniMaxH3Attention(Attention):
             discard_padded_queries=True,
             valid_seq_len=valid_seq_len,
             timestep=timestep,
+            token_tags=token_tags,
         )
         return self.to_out[0](hidden_states)
 
@@ -312,6 +330,7 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``forward`` with each projection pushed to the peers as soon as it is
         computed: V, then Q and K with their per-head norm and RoPE, run on the
@@ -345,6 +364,7 @@ class MiniMaxH3Attention(Attention):
             discard_padded_queries=True,
             valid_seq_len=valid_seq_len,
             timestep=timestep,
+            token_tags=token_tags,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
@@ -536,11 +556,12 @@ class MiniMaxH3TokenRefiner(nn.Module):
     ) -> None:
         super().__init__()
         self._attn_backend = model_config.attention.backend.upper()
-        self._supports_key_padding_mask = self._attn_backend in (
-            "VANILLA",
-            "FA4",
-            "TRTLLM",
-            "FLASHINFER",
+        # Padding goes to the backend as a key padding mask, or as the length of the valid
+        # prefix when the backend takes no mask.
+        backend_cls = _attention_backend_class(model_config)
+        self._passes_key_padding_mask = backend_cls.support_key_padding_mask()
+        self._supports_key_padding_mask = (
+            self._passes_key_padding_mask or backend_cls.support_valid_seq_len()
         )
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
@@ -576,10 +597,11 @@ class MiniMaxH3TokenRefiner(nn.Module):
         if pad:
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
-                    "Padded token-refiner sequences require key_padding_mask support; "
-                    "use VANILLA, FA4, TRTLLM or FLASHINFER."
+                    "Padded token-refiner sequences need an attention backend that takes "
+                    f"key_padding_mask or valid_seq_len; the {self._attn_backend} backend "
+                    "takes neither."
                 )
-            if self._attn_backend != "TRTLLM":
+            if self._passes_key_padding_mask:
                 # Attention caches use the mask version to detect changes.
                 with torch.inference_mode(False):
                     valid = hidden_states.new_ones(
@@ -667,6 +689,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
             return self._forward_fused_adaln(
@@ -677,6 +700,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 key_padding_mask,
                 timestep,
                 valid_seq_len,
+                token_tags,
             )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
@@ -691,6 +715,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             key_padding_mask,
             timestep,
             valid_seq_len,
+            token_tags,
         )
 
         residual = hidden_states
@@ -712,6 +737,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor],
         timestep: Optional[torch.Tensor],
         valid_seq_len: Optional[int],
+        token_tags: Optional[torch.Tensor],
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
@@ -719,7 +745,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
         attn_output = self.attn(
-            norm_hidden_states, rotary_emb, key_padding_mask, timestep, valid_seq_len
+            norm_hidden_states, rotary_emb, key_padding_mask, timestep, valid_seq_len, token_tags
         )
         hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
             hidden_states,
@@ -750,12 +776,22 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        # Only VANILLA supports arbitrary padding between packed modalities.
-        self._supports_key_padding_mask = self._attn_backend in (
-            "VANILLA",
-            "FA4",
-            "TRTLLM",
-            "FLASHINFER",
+        self._padded_token_tags: tuple[torch.Tensor, int, torch.Tensor] | None = None
+        self._key_padding_mask: tuple[torch.Tensor, int, torch.Tensor] | None = None
+        # Padding goes to the backend as a key padding mask, or as the length of the valid
+        # prefix when the backend takes no mask. A backend that reads either as one prefix
+        # needs the padding after the tokens; the others take padding between packed
+        # modalities.
+        backend_cls = _attention_backend_class(model_config)
+        self._passes_key_padding_mask = backend_cls.support_key_padding_mask()
+        self._passes_valid_seq_len = (
+            not self._passes_key_padding_mask and backend_cls.support_valid_seq_len()
+        )
+        self._supports_key_padding_mask = (
+            self._passes_key_padding_mask or self._passes_valid_seq_len
+        )
+        self._requires_trailing_padding = (
+            self._passes_valid_seq_len or backend_cls.requires_trailing_padding()
         )
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
@@ -1074,16 +1110,28 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         pad = _padding_to_multiple(sequence_length, self.sharder.size)
         has_existing_padding = bool((token_tags < 0).any())
         valid_seq_len = None
-        if self._attn_backend == "TRTLLM" and (pad or has_existing_padding):
+        if self._passes_valid_seq_len and (pad or has_existing_padding):
             valid_seq_len = sequence_length
             if has_existing_padding:
                 valid_seq_len = int((token_tags >= 0).sum().item())
-        token_tags_for_mask = token_tags
+        # One tags tensor of the padded sequence per tags content: an attention backend keeps
+        # what it derives from the tags and from the mask with the tensors it is given. The
+        # memo holds its own copy of the tags, so a caller that refills one tags buffer in
+        # place gets the tags and the mask of the new content.
+        padded_tags = self._padded_token_tags
+        if (
+            padded_tags is None
+            or padded_tags[1] != pad
+            or not torch.equal(padded_tags[0], token_tags)
+        ):
+            tags = token_tags.clone()
+            padded_tags = (tags, pad, _pad_tensor_dim(tags, 0, pad, -1) if pad else tags)
+            self._padded_token_tags = padded_tags
+        token_tags_for_mask = padded_tags[2]
         if pad:
             packed_hidden_states = _pad_tensor_dim(packed_hidden_states, 1, pad)
             adaln_indices = _pad_tensor_dim(adaln_indices, 0, pad)
             timestep_indices_for_norm = _pad_tensor_dim(timestep_indices, 0, pad)
-            token_tags_for_mask = _pad_tensor_dim(token_tags, 0, pad, -1)
             rotary_emb = _pad_rotary_emb(rotary_emb, pad)
 
         key_padding_mask = None
@@ -1091,26 +1139,32 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded packed sequences (negative token_tags) need an attention "
-                    "backend that honours key_padding_mask; the "
-                    f"{self._attn_backend} backend cannot express it. Use "
-                    "VANILLA, FA4, TRTLLM or FLASHINFER."
+                    "backend that takes key_padding_mask or valid_seq_len; the "
+                    f"{self._attn_backend} backend takes neither."
                 )
-            # FA4 seqused_k and TRTLLM prefix trimming require trailing padding.
-            # Ulysses appends padding in this layout.
-            if self._attn_backend in ("FA4", "TRTLLM") and bool(
+            # A backend that reads the padding as one valid prefix requires trailing
+            # padding. Ulysses appends padding in this layout.
+            if self._requires_trailing_padding and bool(
                 ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
             ):
                 raise NotImplementedError(
-                    f"{self._attn_backend} requires trailing packed-row padding; use VANILLA for interior padding."
+                    f"{self._attn_backend} requires trailing packed-row padding; use a "
+                    "backend that takes interior padding, such as VANILLA."
                 )
-            if self._attn_backend != "TRTLLM":
-                # Attention caches use the mask version to detect changes.
-                with torch.inference_mode(False):
-                    key_padding_mask = (
-                        (token_tags_for_mask >= 0)
-                        .unsqueeze(0)
-                        .expand(packed_hidden_states.shape[0], -1)
-                    )
+            if self._passes_key_padding_mask:
+                # One mask per tags tensor: attention caches key on the mask tensor and
+                # use its version to detect changes.
+                batch_size = packed_hidden_states.shape[0]
+                mask = self._key_padding_mask
+                if mask is None or mask[0] is not token_tags_for_mask or mask[1] != batch_size:
+                    with torch.inference_mode(False):
+                        mask = (
+                            token_tags_for_mask,
+                            batch_size,
+                            (token_tags_for_mask >= 0).unsqueeze(0).expand(batch_size, -1),
+                        )
+                    self._key_padding_mask = mask
+                key_padding_mask = mask[2]
 
         padded_sequence_length = packed_hidden_states.shape[1]
         packed_hidden_states = self.sharder.shard(packed_hidden_states, dim=1)
@@ -1131,6 +1185,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 key_padding_mask,
                 timestep,
                 valid_seq_len=valid_seq_len,
+                # Each attention call sees the whole packed sequence, so the tags of the
+                # padded sequence describe its rows; a backend that samples tokens by
+                # modality reads them.
+                token_tags=token_tags_for_mask,
             )
 
         packed_hidden_states = self.norm_out(

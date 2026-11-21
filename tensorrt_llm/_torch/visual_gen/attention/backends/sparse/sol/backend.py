@@ -324,6 +324,11 @@ class SOLCuTeDSLAttention(AttentionBackend):
     def support_fused_qkv(cls) -> bool:
         return False
 
+    @classmethod
+    def support_key_padding_mask(cls) -> bool:
+        """A call with a key padding mask runs on VANILLA, which honours it."""
+        return True
+
 
 class SOLTrtllmAttention(TrtllmAttention):
     """Predict SOL routes inside the core prediction hook, then execute them
@@ -411,6 +416,11 @@ class SOLTrtllmAttention(TrtllmAttention):
     def support_fused_qkv(cls) -> bool:
         """SOL prediction requires separate Q, K, and V tensors."""
 
+        return False
+
+    @classmethod
+    def support_valid_seq_len(cls) -> bool:
+        """The sparse path attends every row of the sequence."""
         return False
 
 

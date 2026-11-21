@@ -28,6 +28,7 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
 from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
 from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import deco as deco_backend
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -38,7 +39,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, QuantAttentionConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -486,7 +487,118 @@ def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
     )
 
 
+def _deco_model() -> h3.MiniMaxH3Transformer3DModel:
+    """A one-layer model under a DeCo-Attention recipe; skips on a GPU without its kernels."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
+    try:
+        deco_attention.pv_formats()
+    except NotImplementedError:
+        pytest.skip("DeCo-Attention kernels need an SM100, SM103, SM107 or SM120 GPU.")
+    config = _make_model_config(
+        num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
+    )
+    config.attention = AttentionConfig(
+        backend="CUTEDSL",
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
+        ),
+    )
+    config.attention_metadata_state = create_attention_metadata_state()
+    model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
+    _initialize_weights(model, scale=0.1)
+    model.requires_grad_(False)
+    return model
+
+
 @requires_cuda
+def test_deco_recipe_runs_every_attention_layer_on_its_backend(monkeypatch):
+    """Under a DeCo-Attention recipe every attention layer is a DeCo layer: the transformer
+    blocks hand it the token tags of the packed sequence, and the text sequence of the token
+    refiner is too short for the kernels, so the backend runs it unquantized."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
+
+    model = _deco_model()
+
+    backends = {
+        name: module.attn
+        for name, module in model.named_modules()
+        if isinstance(module, h3.MiniMaxH3Attention)
+    }
+    joint = [b for name, b in backends.items() if "token_refiner" not in name]
+    assert joint and len(joint) < len(backends)
+    assert all(type(b) is DeCoAttention for b in backends.values())
+
+    seen = []
+
+    def plan(self, key_padding_mask, valid_seq_len, token_tags, *shape):
+        seen.append(token_tags)
+        return None, None, None
+
+    def launch(self, q, k, v, rows=None, valid_seq_lens=None, order=None):
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(DeCoAttention, "_plan", plan)
+    monkeypatch.setattr(DeCoAttention, "_launch", launch)
+    inputs = _model_inputs("cuda")
+    with torch.inference_mode():
+        model(**inputs)
+    assert not seen
+
+    # With kernels that take every length, the calls with token tags are the joint blocks'.
+    monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", 1)
+    with torch.inference_mode():
+        model(**inputs)
+    tagged = [tags for tags in seen if tags is not None]
+    assert len(tagged) == len(joint) and len(seen) == len(backends)
+    assert all(torch.equal(tags, inputs["token_tags"]) for tags in tagged)
+
+
+@requires_cuda
+def test_deco_recipe_takes_the_padding_of_a_packed_sequence_as_a_mask(monkeypatch):
+    """Under a DeCo-Attention recipe the padding of a packed sequence reaches the backend as a
+    key padding mask, like for VANILLA: trailing padding becomes one length per sample, and
+    padding between the tokens the order that puts the tokens first."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
+
+    model = _deco_model()
+    assert model._passes_key_padding_mask and not model._requires_trailing_padding
+    assert model.token_refiner._passes_key_padding_mask
+    monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", 1)
+
+    seen = []
+
+    def launch(self, q, k, v, rows=None, valid_seq_lens=None, order=None):
+        if rows is not None:
+            seen.append((rows, valid_seq_lens, order))
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(DeCoAttention, "_launch", launch)
+    inputs = _model_inputs("cuda")
+    inputs["token_tags"] = torch.tensor([1, 0, 2, -1], device="cuda")
+    with torch.inference_mode():
+        model(**inputs)
+    assert seen and all(order is None for _, _, order in seen)
+    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in seen)
+    # The tags mark the padding: the batch shares one draw, from the tokens.
+    assert all(rows.dim() == 1 and int(rows.max()) < 3 for rows, _, _ in seen)
+
+    # The padding follows the content of the tags, also when one tags buffer is refilled.
+    seen.clear()
+    inputs["token_tags"].copy_(torch.tensor([1, 2, -1, -1], device="cuda"))
+    with torch.inference_mode():
+        model(**inputs)
+    assert seen and all(order is None for _, _, order in seen)
+    assert all(lens.tolist() == [2] * lens.numel() for _, lens, _ in seen)
+
+    seen.clear()
+    inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
+    with torch.inference_mode():
+        model(**inputs)
+    assert seen and all(order[0].tolist() == [0, 2, 3, 1] for _, _, order in seen)
+    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in seen)
+
+
 @pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])
 def test_rope_preserves_autograd_fallback(grad_input):
     hidden_states = torch.randn((1, 7, 2, 8), device="cuda", dtype=torch.bfloat16)
@@ -790,8 +902,9 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
             key_padding_mask: torch.Tensor | None,
             timestep: torch.Tensor,
             valid_seq_len: int | None = None,
+            token_tags: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            del temb, rotary_emb, key_padding_mask
+            del temb, rotary_emb, key_padding_mask, token_tags
             self.adaln_indices = adaln_indices.clone()
             self.attention_timestep = timestep.clone()
             return hidden_states
@@ -935,15 +1048,31 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 
 @pytest.mark.parametrize(
-    ("backend", "supported"),
-    [("VANILLA", True), ("FA4", True), ("TRTLLM", True), ("FLASHINFER", True), ("CUTEDSL", False)],
+    ("backend", "mask", "length", "trailing"),
+    [
+        ("VANILLA", True, False, False),
+        ("FA4", True, False, True),
+        ("TRTLLM", False, True, True),
+        ("FLASHINFER", True, False, False),
+        ("CUTEDSL", False, False, False),
+        ("CUDNN", False, False, False),
+    ],
 )
-def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
+def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
+    backend: str, mask: bool, length: bool, trailing: bool
+) -> None:
+    """The model reads from the backend class how padding reaches it: as a key padding mask,
+    as the length of the valid prefix, or not at all."""
     config = _make_model_config()
     config.attention = AttentionConfig(backend=backend)
     model = h3.MiniMaxH3Transformer3DModel(config)
 
-    assert model._supports_key_padding_mask is supported
+    assert model._passes_key_padding_mask is mask
+    assert model._passes_valid_seq_len is length
+    assert model._supports_key_padding_mask is (mask or length)
+    assert model._requires_trailing_padding is trailing
+    assert model.token_refiner._passes_key_padding_mask is mask
+    assert model.token_refiner._supports_key_padding_mask is (mask or length)
 
 
 @requires_cuda
@@ -1465,6 +1594,7 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
         nn.Module.__init__(refiner)
         refiner._attn_backend = backend
         refiner._supports_key_padding_mask = True
+        refiner._passes_key_padding_mask = backend != "TRTLLM"
         refiner.sharder = RankSharder()
         refiner.refiner_blocks = nn.ModuleList([MaskedBlock()])
         refiner.final_norm = nn.Identity()
@@ -1543,6 +1673,7 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
                 key_padding_mask,
                 timestep,
                 valid_seq_len=None,
+                token_tags=None,
             ):
                 torch.testing.assert_close(adaln_indices, full_indices.chunk(world_size)[rank])
                 for actual, expected_rope in zip(rotary_emb, full_rope):
@@ -1564,6 +1695,8 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
             torch.testing.assert_close(args[2], full_timesteps.chunk(world_size)[rank])
 
         model._attn_backend = backend
+        model._passes_key_padding_mask = backend != "TRTLLM"
+        model._passes_valid_seq_len = backend == "TRTLLM"
         model.sharder = RankSharder()
         model.transformer_blocks = nn.ModuleList([CaptureBlock()])
         handle = model.norm_out.register_forward_pre_hook(check_norm_indices)
@@ -1577,6 +1710,7 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
 def test_refiner_rejects_padding_without_mask_support() -> None:
     refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
     nn.Module.__init__(refiner)
+    refiner._attn_backend = "CUTEDSL"
     refiner._supports_key_padding_mask = False
     refiner.sharder = SimpleNamespace(size=2)
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
