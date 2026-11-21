@@ -15,11 +15,15 @@
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Dict
 
 import pytest
 from prometheus_client import REGISTRY
 
+from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
+from tensorrt_llm.bindings.executor import IterationStats
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MAX_SPEC_DECODE_POSITION_LABELS, MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
@@ -192,6 +196,62 @@ class TestKVCacheStats:
     def test_kv_cache_hit_rate(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
         assert _get_gauge_value(collector, "kv_cache_hit_rate", dp_rank=0) == pytest.approx(0.85)
+
+
+class TestRequestTransferMetrics:
+    @pytest.mark.parametrize("request_type", ["generation_only", "context_only"])
+    def test_transfer_perf_metrics_count_once_across_candidates(
+        self, collector, scrape, request_type
+    ):
+        from tensorrt_llm.disaggregated_params import DisaggregatedParams
+        from tensorrt_llm.executor.result import GenerationResultBase
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        result = GenerationResultBase(id=1, sampling_params=SamplingParams())
+        result._disaggregated_params = DisaggregatedParams(request_type=request_type)
+        result.prompt_token_ids = [1, 2]
+        output = SimpleNamespace(
+            finish_reason="end_id",
+            token_ids=[3, 4],
+            request_perf_metrics=None,
+            prompt_logprobs=None,
+            length=2,
+            cumulative_logprob=None,
+            logprobs=None,
+        )
+        stats = {
+            RequestEventTiming.KV_CACHE_TRANSFER_START: 10.0,
+            RequestEventTiming.KV_CACHE_TRANSFER_END: 10.003,
+            RequestEventTiming.KV_CACHE_SIZE: 2048,
+            RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_SIZE: 1024,
+        }
+        for sequence_index in [0, 1]:
+            result.record_stats(output, stats, sequence_index)
+        for candidate in result.candidate_metrics:
+            collector.log_request_metrics_dict(candidate)
+        if request_type == "context_only":
+            assert not scrape("kv_cache_transfer_duration_seconds_count")
+            assert not scrape("kv_cache_transfer_bytes_total")
+            return
+        assert _get_counter_value(collector, "kv_cache_transfer_bytes") == 1024
+        assert _get_histogram_count(collector, "histogram_kv_cache_transfer_duration") == 1
+        assert _get_histogram_sum(
+            collector, "histogram_kv_cache_transfer_duration"
+        ) == pytest.approx(0.003)
+        buckets = "kv_cache_transfer_duration_seconds_bucket"
+        assert scrape(buckets, le="0.0025") == [0]
+        assert scrape(buckets, le="0.005") == [1]
+        assert scrape(buckets, le="600.0") == [1]
+        assert MetricNames.KV_CACHE_TRANSFER_BYTES not in result.candidate_metrics[1]
+        assert MetricNames.KV_CACHE_TRANSFER_TIME not in result.candidate_metrics[1]
+        invalid = process_req_perf_metrics(
+            {
+                RequestEventTiming.KV_CACHE_TRANSFER_START: 2.0,
+                RequestEventTiming.KV_CACHE_TRANSFER_END: 1.0,
+            },
+            2,
+        )
+        assert MetricNames.KV_CACHE_TRANSFER_TIME not in invalid
 
 
 class TestAttentionDpIterationMetrics:
@@ -1778,3 +1838,156 @@ class TestRequestErrorCounter:
         collector.log_request_error()
         labels = {**collector.labels, "http_code": ""}
         assert _counter_value_with_labels(collector.counter_request_error, labels) == 1
+
+
+@pytest.fixture
+def scrape(collector):
+    def read(name: str, **labels):
+        return [
+            sample.value
+            for family in REGISTRY.collect()
+            for sample in family.samples
+            if sample.name == "trtllm_" + name
+            and all(sample.labels.get(key) == str(value) for key, value in labels.items())
+        ]
+
+    return read
+
+
+def test_iteration_record_exports_rank_owned_timings_and_transfer_outcomes(collector, scrape):
+    for rank, outcomes in ((1, (1, 0, 2)), (0, (2, 1, 0)), (0, (2, 1, 0)), (0, (5, 2, 1))):
+        collector.log_iteration_stats(
+            IterationStatsRecord(
+                IterationStats(),
+                attention_dp_rank=rank,
+                host_step_time_ms=4.0,
+                gpu_forward_time_ms=2.0,
+                prev_device_step_time_ms=3.0,
+                scheduler_mode="overlap",
+            ).to_dict()
+        )
+        collector.log_iteration_stats(
+            {
+                "attentionDpRank": rank,
+                "kvTransferOutcomes": dict(zip(("success", "error", "timeout"), outcomes)),
+            }
+        )
+    collector.log_iteration_stats(
+        {
+            "isQueueSnapshot": True,
+            "schedulerMode": "overlap",
+            "hostStepTimeMS": 0.0,
+            "prevDeviceStepTimeMS": 0.0,
+            "gpuForwardTimeMS": 0.0,
+        }
+    )
+    assert scrape("host_step_time_seconds", scheduler_mode="overlap") == [0.004]
+    assert scrape("prev_device_step_time_seconds", scheduler_mode="overlap") == [0.003]
+    assert scrape("gpu_forward_duration_seconds_sum", scheduler_mode="overlap") == [0.006]
+    assert scrape("host_step_duration_seconds_count", scheduler_mode="overlap") == [3]
+    assert scrape("kv_cache_transfer_requests_total", dp_rank=0, outcome="success") == [5]
+    assert scrape("kv_cache_transfer_requests_total", dp_rank=1, outcome="timeout") == [2]
+
+
+def test_storage_report_exports_capacity_and_cumulative_movement(collector, scrape, mocker):
+    report = KVCacheV2IterationStatsReport(
+        {},
+        {},
+        cache_level_tiers=["gpu", "host"],
+        num_conversations=7,
+        storage_stats=[
+            {
+                "cacheLevel": 1,
+                "poolGroupId": 2,
+                "slotSize": (32, 32),
+                "totalNumBlocks": 10,
+                "freeNumBlocks": 2,
+                "evictableNumBlocks": 3,
+                "restoredBlocks": 4,
+                "evictedBlocks": 0,
+            }
+        ],
+    )
+    record = IterationStatsRecord(IterationStats(), kv_iteration_stats=report, attention_dp_rank=3)
+    collector.log_iteration_stats(record.to_dict())
+    blocks = mocker.spy(collector.kv_cache_tier_moved_blocks, "labels")
+    moved_bytes = mocker.spy(collector.kv_cache_tier_moved_bytes, "labels")
+    collector.log_iteration_stats(record.to_dict())
+    blocks.assert_not_called()
+    moved_bytes.assert_not_called()
+    for restored in (6, 1, 2):
+        report.storage_stats[0]["restoredBlocks"] = restored
+        collector.log_iteration_stats(record.to_dict())
+    labels = dict(dp_rank=3, cache_level=1, cache_tier="host", pool_group=2)
+    assert scrape("kv_cache_tier_blocks", **labels, state="unavailable") == [5]
+    assert scrape("kv_cache_tier_bytes", **labels, state="evictable") == [192]
+    assert scrape("kv_cache_tier_moved_blocks_total", **labels, operation="restore") == [7]
+    assert scrape("kv_cache_tier_moved_bytes_total", **labels, operation="restore") == [448]
+    assert scrape("kv_cache_tier_moved_blocks_total", **labels, operation="evict") == [0]
+    assert not scrape("kv_cache_tier_blocks", dp_rank=0)
+    assert scrape("kv_cache_num_conversations", dp_rank=3) == [7]
+
+
+def _conversation_request(conversation_id="session", *, lora=None, salt=None):
+    return SimpleNamespace(
+        py_conversation_params=SimpleNamespace(conversation_id=conversation_id)
+        if conversation_id is not None
+        else None,
+        is_dummy_request=False,
+        lora_task_id=lora,
+        cache_salt=salt,
+    )
+
+
+def test_worker_conversations_export_namespace_refresh_and_idle_expiry(collector, scrape):
+    from tensorrt_llm._torch.pyexecutor.conversation_activity import ConversationActivityTracker
+
+    manager = ConversationActivityTracker(now=0.0, max_entries=3)
+    for request in (
+        _conversation_request(" session "),
+        _conversation_request(),
+        _conversation_request(lora=1),
+        _conversation_request(salt="other"),
+        _conversation_request(None),
+    ):
+        manager.observe_admission(request, 1.0)
+    manager.observe_admission(_conversation_request(), 500.0)
+    for now, short, long, complete in (
+        (600.0, 3, 3, 0),
+        (601.0, 1, 3, 0),
+        (1100.0, 0, 3, 0),
+        (3600.0, 0, 3, 1),
+        (4100.0, 0, 0, 1),
+    ):
+        collector.log_iteration_stats(
+            {"attentionDpRank": 3, "conversationActivity": manager.snapshot_activity(now).to_dict()}
+        )
+        assert scrape("conversation_unique_seen", dp_rank=3, window="10m") == [short]
+        assert scrape("conversation_unique_seen", dp_rank=3, window="1h") == [long]
+        assert scrape("conversation_unique_seen_complete", dp_rank=3, window="1h") == [complete]
+    assert not scrape("conversation_unique_seen", dp_rank=0)
+
+
+@pytest.mark.parametrize("limit", ["entries", "identity_bytes"])
+def test_worker_conversation_overflow_preserves_refresh_and_recovers(collector, scrape, limit):
+    from tensorrt_llm._torch.pyexecutor.conversation_activity import ConversationActivityTracker
+
+    limits = {"max_entries": 1} if limit == "entries" else {"max_identity_bytes": 1024}
+    manager = ConversationActivityTracker(now=0.0, **limits)
+    request = _conversation_request()
+    manager.observe_admission(request, 1.0)
+    rejected = _conversation_request("other" if limit == "entries" else "x" * 2048)
+    manager.observe_admission(rejected, 10.0)
+    manager.observe_admission(request, 11.0)
+    for now, count, complete in ((600.0, 1, 0), (610.0, 1, 1), (611.0, 0, 1)):
+        row = {
+            "attentionDpRank": 2,
+            "conversationActivity": manager.snapshot_activity(now).to_dict(),
+        }
+        collector.log_iteration_stats(row)
+        collector.log_iteration_stats(row)
+        assert scrape("conversation_unique_seen", dp_rank=2, window="10m") == [count]
+        assert scrape("conversation_unique_seen_complete", dp_rank=2, window="10m") == [complete]
+        assert scrape(
+            "conversation_tracking_overflow_total", dp_rank=2, window="10m", reason=limit
+        ) == [1]

@@ -130,6 +130,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
+from ..conversation_activity import request_conversation_key
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -525,16 +526,6 @@ def _swa_endpoint_priority(
     return priority
 
 
-def _request_conversation_id(request: LlmRequest) -> Optional[str]:
-    if request.is_dummy_request:
-        return None
-    conversation_params = request.py_conversation_params
-    if conversation_params is None:
-        return None
-    conversation_id = conversation_params.conversation_id.strip()
-    return conversation_id or None
-
-
 _TOKEN_WORD_BYTES = 8
 
 
@@ -577,14 +568,6 @@ class _RetainedTurn:
     committed_digest: bytes = b""
 
 
-def _request_conversation_key(request: LlmRequest) -> tuple[str, int | None, str | None] | None:
-    conversation_id = _request_conversation_id(request)
-    if conversation_id is None:
-        return None
-    # Retention plans must use the same namespace as prefix reuse.
-    return conversation_id, request.lora_task_id, request.cache_salt
-
-
 @dataclass(slots=True)
 class _ConversationState:
     current_request_id: Optional[int] = None
@@ -594,17 +577,22 @@ class _ConversationState:
 
 
 class ConversationManager:
-    """Track the current request and drop plan for each conversation."""
+    """Own conversation KV retention state."""
 
     def __init__(self, max_num_turns: int, drop_extended_turns: bool = False) -> None:
         self._max_num_turns = max_num_turns
         self._drop_extended_turns = drop_extended_turns
         self._conversation_states: Dict[tuple[str, int | None, str | None], _ConversationState] = {}
 
+    @property
+    def num_conversations(self) -> int:
+        """Number of tracked conversation IDs scoped by LoRA task and cache salt."""
+        return len(self._conversation_states)
+
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
         """Save a completed context's drop plan and apply the preceding plan on success."""
         request_id = request.py_request_id
-        conversation_key = _request_conversation_key(request)
+        conversation_key = request_conversation_key(request)
         if conversation_key is None:
             return
 
@@ -687,7 +675,7 @@ class ConversationManager:
 
     def prepare_request(self, request: LlmRequest) -> None:
         """Register a context request unless its conversation has another active one."""
-        conversation_key = _request_conversation_key(request)
+        conversation_key = request_conversation_key(request)
         if conversation_key is None:
             return
         request_id = request.py_request_id
@@ -705,7 +693,7 @@ class ConversationManager:
 
     def finish_request(self, request: LlmRequest) -> None:
         """Clear a request as active while preserving any saved drop plan."""
-        conversation_key = _request_conversation_key(request)
+        conversation_key = request_conversation_key(request)
         if conversation_key is None:
             return
         state = self._conversation_states.get(conversation_key)
@@ -717,7 +705,7 @@ class ConversationManager:
             self._conversation_states.pop(conversation_key)
 
     def clear(self) -> None:
-        """Clear state after reusable KV-cache blocks have been cleared."""
+        """Clear retention state after a KV-cache clear, preserving admission history."""
         self._conversation_states.clear()
 
 
@@ -9249,6 +9237,33 @@ class KVCacheManagerV2(BaseResourceManager):
             disk_prefetch_blocks=disk_prefetch_blocks,
             cached_tokens_by_level=list(cached_tokens_by_level),
             cache_level_tiers=self._stats_cache_level_tier_names(),
+            num_conversations=(
+                self.conversation_manager.num_conversations
+                if self.conversation_manager is not None
+                else None
+            ),
+            storage_stats=[
+                {
+                    "cacheLevel": level,
+                    "poolGroupId": pool_group_id,
+                    "slotSize": self._stats_slot_sizes(stats),
+                    "totalNumBlocks": int(stats.total),
+                    "freeNumBlocks": int(stats.free),
+                    "evictableNumBlocks": int(stats.evictable),
+                    **{
+                        key: value
+                        for key, attr in (
+                            ("restoredBlocks", "restored_blocks"),
+                            ("evictedBlocks", "evicted_blocks"),
+                            ("capacityDroppedBlocks", "capacity_dropped_blocks"),
+                            ("priorityDroppedBlocks", "priority_dropped_blocks"),
+                        )
+                        if (value := getattr(stats, attr, None)) is not None
+                    },
+                }
+                for level, level_stats in enumerate([primary_stats, *secondary_stats_by_level])
+                for pool_group_id, stats in enumerate(level_stats)
+            ],
             connector_cached_tokens=(
                 connector_cached_tokens if self._connector_reports_cached_tokens() else None
             ),

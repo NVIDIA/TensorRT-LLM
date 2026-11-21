@@ -14,7 +14,49 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple, cast
+
+
+class ConversationActivityStats(NamedTuple):
+    """Bounded-window activity snapshot; identity data stays in the owning manager."""
+
+    unique_10m: int
+    complete_10m: int
+    overflow_entries_10m: int
+    overflow_bytes_10m: int
+    unique_1h: int
+    complete_1h: int
+    overflow_entries_1h: int
+    overflow_bytes_1h: int
+    refresh_after_ms: int = 0
+
+    @classmethod
+    def wire_size(cls) -> int:
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, values: list[int | float]) -> "ConversationActivityStats":
+        """Restore the activity snapshot from its integer wire fields."""
+        if len(values) != cls.wire_size() or any(
+            value < 0 or value != int(value) for value in values
+        ):
+            raise ValueError("Conversation activity requires nonnegative integer fields")
+        activity = cls(*(int(value) for value in values))
+        if activity.complete_10m not in (0, 1) or activity.complete_1h not in (0, 1):
+            raise ValueError("Conversation activity requires boolean completeness")
+        return activity
+
+    def to_dict(self) -> dict[str, dict[str, int]]:
+        return {
+            window: dict(
+                zip(
+                    ("unique", "complete", "overflowEntries", "overflowIdentityBytes"),
+                    self[offset : offset + 4],
+                )
+            )
+            for window, offset in (("10m", 0), ("1h", 4))
+        }
+
 
 KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
     "iterReusedBlocks",
@@ -143,6 +185,8 @@ class KVCacheV2IterationStatsReport:
     # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
     # None when no connector can serve tokens.
     connector_cached_tokens: int | None = None
+    storage_stats: list[dict[str, int | tuple[int, ...]]] = field(default_factory=list)
+    num_conversations: int | None = None
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -239,6 +283,13 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     stats_dict["iterCachedTokensByLevel"] = list(kv_iter_stats.cached_tokens_by_level)
     if kv_iter_stats.cache_level_tiers:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
+    if kv_iter_stats.storage_stats:
+        stats_dict["kvCacheStorageStats"] = [
+            {**row, "slotSize": list(cast(tuple[int, ...], row["slotSize"]))}
+            for row in kv_iter_stats.storage_stats
+        ]
+    if kv_iter_stats.num_conversations is not None:
+        stats_dict["kvCacheNumConversations"] = kv_iter_stats.num_conversations
     if kv_iter_stats.connector_cached_tokens is not None:
         stats_dict["iterConnectorCachedTokens"] = kv_iter_stats.connector_cached_tokens
 

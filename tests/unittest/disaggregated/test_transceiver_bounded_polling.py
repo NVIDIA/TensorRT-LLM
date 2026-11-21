@@ -443,7 +443,9 @@ def test_context_transfer_status_retires_quiesced_cancelled_session() -> None:
     req = _FakeRequest()
     transceiver = _make_transceiver({18: session}, {18: req})
 
-    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+    status = transceiver.check_context_transfer_status(at_least_request_num=0)
+    completed, failed = status
+    assert status.cancelled_request_ids == (18,)
 
     assert completed == []
     assert failed == []
@@ -536,12 +538,19 @@ def test_consensus_outcome_uses_single_batched_allgather() -> None:
     assert new_quiesced == [7]
 
 
-def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
+@pytest.mark.parametrize("peer_failed", [False, True])
+def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    req = SimpleNamespace(py_kv_transfer_timed_out=False)
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {21: req}
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
     transceiver._dist = SimpleNamespace(
-        tp_allgather=lambda payload: [payload, [[], [], [], []]],
+        tp_allgather=lambda payload: [
+            payload,
+            [[], [21], [], [21], [21]] if peer_failed else [[], [], [], [], [21]],
+        ],
     )
 
     cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
@@ -549,18 +558,21 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
     )
 
     assert cancelled == []
-    assert failed == []
+    assert failed == ([21] if peer_failed else [])
+    assert req.py_kv_transfer_timed_out is peer_failed
     assert completed == []
-    assert quiesced == []
+    assert quiesced == ([21] if peer_failed else [])
 
 
 def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = True
     transceiver._dist = SimpleNamespace(
         tp_allgather=Mock(side_effect=AssertionError("TP allgather must be skipped")),
-        pp_allgather=lambda payload: [payload, [[], [], [], []]],
+        pp_allgather=lambda payload: [payload, [[], [], [], [], []]],
     )
 
     cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
@@ -1437,6 +1449,7 @@ def _gen_request(rid: int) -> SimpleNamespace:
         set_kv_cache_transfer_start=lambda _t: None,
         set_kv_cache_transfer_end=lambda _t: None,
         set_kv_cache_size=lambda _s: None,
+        set_kv_cache_transfer_local_size=lambda _s: None,
     )
 
 

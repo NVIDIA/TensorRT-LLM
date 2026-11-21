@@ -1848,6 +1848,8 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
 
     auto temporarySlots = storage.newGpuSlots(twoSlots, migrationRecorder, dropRecorder);
     EXPECT_EQ(offloaded, 2);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).movement.evictedBlocks, 2);
+    EXPECT_EQ(storage.getStatistics(CacheLevel{1}).movement.restoredBlocks, 0);
     EXPECT_EQ(onboarded, 0);
     EXPECT_EQ(dropped, 0);
     for (auto& slot : temporarySlots[lifeCycle])
@@ -1864,6 +1866,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     }
     storage.batchedMigrate(kHotLevel, firstPages, migrationRecorder);
     EXPECT_EQ(onboarded, 2);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).movement.restoredBlocks, 2);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     for (size_t index = 0; index < firstPages.size(); ++index)
     {
@@ -1891,6 +1894,10 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     EXPECT_EQ(offloaded, 6);
     EXPECT_EQ(onboarded, 2);
     EXPECT_EQ(dropped, 2);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).movement.evictedBlocks, 6);
+    EXPECT_EQ(storage.getStatistics(CacheLevel{1}).movement.capacityDroppedBlocks, 2);
+    EXPECT_EQ(storage.getStatistics(CacheLevel{1}).movement.priorityDroppedBlocks, 0);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).movement.restoredBlocks, 2);
     for (auto& slot : finalSlots[lifeCycle])
     {
         storage.releaseSlot(lifeCycle, kHotLevel, std::move(slot));
@@ -2111,6 +2118,47 @@ TEST(KvCacheManagerV2StatsTest, HostDropIsRecordedForAttentionAndSsmLifeCycles)
 
     fourth->close();
     third->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, GpuOnlyCacheDoesNotCountHostDrops)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto config = makeHybridTieredConfig();
+    config.cacheTiers.pop_back();
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const tokens = makeTokens(*manager, 0);
+    auto first = manager->createKvCache();
+    ASSERT_TRUE(first->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(first->resize(static_cast<int>(tokens.size())));
+    first->commit(toSpan(tokens));
+    first->close();
+    manager->getAndResetIterationStats();
+
+    auto countDrops = [&]
+    {
+        int64_t total = 0;
+        for (auto const& pool : manager->getStorageStatistics(kHotLevel))
+        {
+            total += pool.movement.capacityDroppedBlocks;
+        }
+        return total;
+    };
+    auto const before = countDrops();
+    auto second = manager->createKvCache();
+    ASSERT_TRUE(second->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(second->resize(static_cast<int>(tokens.size())));
+
+    auto const dropped = manager->getAndResetIterationStats();
+    EXPECT_GT(countDrops(), before);
+    for (auto const& [lifeCycle, stats] : dropped)
+    {
+        EXPECT_EQ(stats.iterHostDroppedBlocks, 0) << "life cycle " << lifeCycle.value();
+        EXPECT_EQ(stats.iterHostDroppedBytes, 0) << "life cycle " << lifeCycle.value();
+    }
+    second->close();
     EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 

@@ -843,6 +843,13 @@ class GenerationResultBase:
             metrics_stats.update({FINISH_REASON_LABEL: output.finish_reason})
         processed_metrics_stat = _process_req_perf_metrics(
             stats, len(output.token_ids))
+        # Count the transfer once on the generation endpoint.
+        if sequence_index != 0 or (self.disaggregated_params is not None
+                                   and self.disaggregated_params.request_type
+                                   == "context_only"):
+            processed_metrics_stat.pop(MetricNames.KV_CACHE_TRANSFER_TIME, None)
+            processed_metrics_stat.pop(MetricNames.KV_CACHE_TRANSFER_BYTES,
+                                       None)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
         # Record prompt tokens only for the first candidate to avoid
@@ -1556,7 +1563,7 @@ def _build_perf_metrics_dict(
 ) -> dict[RequestEventTiming, float]:
     if not (req_perf_metrics and req_perf_metrics.timing_metrics):
         return {}
-    return {
+    metrics = {
         RequestEventTiming.ARRIVAL_TIME:
         req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
         RequestEventTiming.FIRST_TOKEN_TIME:
@@ -1572,6 +1579,16 @@ def _build_perf_metrics_dict(
         RequestEventTiming.KV_CACHE_SIZE:
         req_perf_metrics.timing_metrics.kv_cache_size,
     }
+    local_size = getattr(req_perf_metrics.timing_metrics,
+                         "kv_cache_transfer_local_size", None)
+    if local_size is not None:
+        metrics[RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_SIZE] = local_size
+    local_duration = getattr(req_perf_metrics.timing_metrics,
+                             "kv_cache_transfer_local_duration", None)
+    if local_duration is not None:
+        metrics[RequestEventTiming.
+                KV_CACHE_TRANSFER_LOCAL_DURATION] = local_duration
+    return metrics
 
 
 def get_metrics_dict(

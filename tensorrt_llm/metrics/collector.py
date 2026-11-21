@@ -12,18 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Utilities for Prometheus Metrics Collection."""
+"""Long-lived Prometheus exposure for collected performance observations."""
 
 import math
 import time
+from collections.abc import Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from tensorrt_llm.logger import logger
 
 from .enums import MetricNames
-from .perf import (FINISH_REASON_LABEL, PerfMetricsCollector, PerfMetricsRecord,
-                   kv_cache_utilization)
+from .perf import (FINISH_REASON_LABEL, KV_MOVEMENT_WINDOW_FIELDS,
+                   PerfMetricsCollector, PerfMetricsRecord,
+                   kv_cache_utilization, kv_pool_rows, pool_counts,
+                   total_pool_count)
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry, Counter
@@ -70,81 +73,7 @@ class PrometheusExposure:
         distinguishing between multiple series of the same metric name. Example:
         {"model_name": "nemotron-nano-3", "engine_type": "trtllm"}
 
-    Created Prometheus metrics:
-        Per-request metrics:
-            trtllm_request_success_total
-            trtllm_e2e_request_latency_seconds
-            trtllm_time_to_first_token_seconds
-            trtllm_time_per_output_token_seconds
-            trtllm_request_queue_time_seconds
-            trtllm_request_prefill_time_seconds
-            trtllm_request_decode_time_seconds
-            trtllm_request_inference_time_seconds
-            trtllm_prompt_tokens_total
-            trtllm_generation_tokens_total
-            trtllm_prompt_cached_tokens_total
-            trtllm_prompt_cache_hit_tokens_total
-            trtllm_prompt_cached_tokens_per_request
-            trtllm_spec_decode_drafted_tokens_total
-            trtllm_spec_decode_accepted_tokens_total
-            trtllm_prefill_perplexity
-            trtllm_generation_perplexity
-            trtllm_request_error_total
-            trtllm_input_processing_seconds
-            trtllm_input_processing_queue_seconds
-            trtllm_media_processing_seconds
-
-        Iteration-level metrics:
-            trtllm_kv_cache_hit_rate
-            trtllm_kv_cache_utilization
-            trtllm_kv_cache_host_utilization
-            trtllm_kv_cache_iter_reuse_rate
-            trtllm_kv_cache_reused_blocks_total
-            trtllm_kv_cache_missed_blocks_total
-            trtllm_kv_cache_iter_reused_blocks_total
-            trtllm_kv_cache_iter_full_reused_blocks_total
-            trtllm_kv_cache_iter_partial_reused_blocks_total
-            trtllm_kv_cache_iter_missed_blocks_total
-            trtllm_kv_cache_iter_connector_reused_blocks_total
-            trtllm_kv_cache_gen_alloc_blocks_total
-            trtllm_kv_cache_onboard_bytes_total
-            trtllm_kv_cache_offload_bytes_total
-            trtllm_kv_cache_disk_prefetch_blocks_total
-            trtllm_kv_cache_intra_device_copy_bytes_total
-            trtllm_num_requests_running
-            trtllm_num_requests_waiting
-            trtllm_num_requests_completed_total
-            trtllm_max_num_active_requests
-            trtllm_iteration_latency_seconds
-            trtllm_gpu_memory_usage_bytes
-            trtllm_cpu_memory_usage_bytes
-            trtllm_pinned_memory_usage_bytes
-            trtllm_max_batch_size_static
-            trtllm_max_batch_size_runtime
-            trtllm_max_num_tokens_runtime
-            trtllm_kv_cache_max_blocks
-            trtllm_kv_cache_free_blocks
-            trtllm_kv_cache_used_blocks
-            trtllm_kv_cache_tokens_per_block
-            trtllm_num_context_requests
-            trtllm_num_generation_requests
-            trtllm_num_paused_requests
-            trtllm_num_scheduled_requests
-            trtllm_total_context_tokens
-            trtllm_avg_decoded_tokens_per_iter
-            trtllm_spec_decode_num_draft_tokens_total
-            trtllm_spec_decode_num_accepted_tokens_total
-            trtllm_spec_decode_acceptance_length
-            trtllm_spec_decode_draft_overhead
-            trtllm_prefill_batch_occupancy
-            trtllm_prefill_batch_tokens
-            trtllm_multimodal_encoder_gpu_time_seconds
-
-        Config info metrics (logged once at startup via log_config_info):
-            trtllm_model_config_info
-            trtllm_parallel_config_info
-            trtllm_speculative_config_info
-            trtllm_kv_cache_config_info
+    See Shared performance metrics collection in the serving documentation.
     """
     labelname_finish_reason = FINISH_REASON_LABEL
     labelname_cache_level = "cache_level"
@@ -320,6 +249,66 @@ class PrometheusExposure:
             "Cumulative number of generation (output) tokens produced.",
             labelnames=self.labels.keys())
 
+        storage_labels = [
+            *iteration_labelnames, self.labelname_cache_level,
+            self.labelname_cache_tier, "pool_group"
+        ]
+        self.kv_cache_tier_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_tier_blocks",
+            documentation=
+            "Storage slots by configured level, pool group and disjoint state",
+            labelnames=[*storage_labels, "state"])
+        self.kv_cache_tier_bytes = Gauge(
+            name=self.metric_prefix + "kv_cache_tier_bytes",
+            documentation=
+            "Logical slot bytes by configured level, pool group and disjoint state",
+            labelnames=[*storage_labels, "state"])
+        self.kv_cache_movement_window_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_movement_window_blocks",
+            documentation=
+            "Hot-pool block movements in the last observed KV statistics window",
+            labelnames=[*iteration_labelnames, "operation"])
+        self.kv_cache_movement_window_blocks_by_pool = Gauge(
+            name=self.metric_prefix + "kv_cache_movement_window_blocks_by_pool",
+            documentation=
+            "Block movements in the last observed KV statistics window by hot pool",
+            labelnames=[*iteration_labelnames, "pool_group", "operation"])
+        self._kv_movement_window_pools: dict[str, set[int]] = {}
+        self.kv_cache_tier_moved_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_tier_moved_blocks_total",
+            documentation=
+            "Cumulative restored, evicted or dropped storage slots",
+            labelnames=[*storage_labels, "operation"])
+        self.kv_cache_tier_moved_bytes = Counter(
+            name=self.metric_prefix + "kv_cache_tier_moved_bytes_total",
+            documentation=
+            "Cumulative restored, evicted or dropped logical slot bytes",
+            labelnames=[*storage_labels, "operation"])
+        self._prev_tier_movement: dict[tuple[str, int, int, str], int] = {}
+        activity_labelnames = (*iteration_labelnames, "window")
+        self.conversation_unique_seen = Gauge(
+            name=self.metric_prefix + "conversation_unique_seen",
+            documentation=
+            "Namespace-scoped conversations admitted by this worker in the rolling window; a lower bound when incomplete",
+            labelnames=activity_labelnames)
+        self.conversation_unique_seen_complete = Gauge(
+            name=self.metric_prefix + "conversation_unique_seen_complete",
+            documentation=
+            "Whether the full activity window was observed without skipped identities",
+            labelnames=activity_labelnames)
+        self.conversation_tracking_overflow = Counter(
+            name=self.metric_prefix + "conversation_tracking_overflow_total",
+            documentation=
+            "Admission observations skipped because conversation tracking storage was full",
+            labelnames=(*activity_labelnames, "reason"))
+        self._prev_conversation_overflow: dict[tuple[str, str, str], int] = {}
+
+        self.kv_cache_num_conversations = Gauge(
+            name=self.metric_prefix + "kv_cache_num_conversations",
+            documentation=
+            "Tracked KV-cache conversation entries scoped by LoRA task and cache salt",
+            labelnames=iteration_labelnames)
+
         self.kv_cache_hit_rate = Gauge(name=self.metric_prefix +
                                        "kv_cache_hit_rate",
                                        documentation="KV cache hit rate",
@@ -401,6 +390,104 @@ class PrometheusExposure:
             "Total bytes copied within GPU (intra-device block copies)",
             labelnames=iteration_labelnames)
 
+        self.kv_cache_allocated_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_allocated_blocks_total",
+            documentation="Positive deltas of cumulative KV block allocations",
+            labelnames=iteration_labelnames)
+        self.kv_cache_new_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_new_blocks_total",
+            documentation=
+            "Positive deltas of cumulative new KV block allocations",
+            labelnames=iteration_labelnames)
+        self._prev_allocated_blocks: dict[str, int] = {}
+        self._prev_new_blocks: dict[str, int] = {}
+        self.kv_cache_transfer_requests = Counter(
+            name=self.metric_prefix + "kv_cache_transfer_requests_total",
+            documentation="Whole-request KV-transfer outcomes on this rank",
+            labelnames=[*iteration_labelnames, "outcome"])
+        self._prev_transfer_outcomes: dict[tuple[str, str], int] = {}
+        self.kv_cache_evictable_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_evictable_blocks",
+            documentation=
+            "Reclaimable primary KV blocks in reported pool groups",
+            labelnames=iteration_labelnames)
+        self.kv_cache_peak_used_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_peak_used_blocks",
+            documentation=
+            "Sum of reported pool-group peak-used KV blocks; an upper bound on simultaneous usage",
+            labelnames=iteration_labelnames)
+        self.kv_cache_host_dropped_bytes = Counter(
+            name=self.metric_prefix + "kv_cache_host_dropped_bytes_total",
+            documentation=
+            "Host KV-cache bytes discarded from reported iteration deltas",
+            labelnames=iteration_labelnames)
+        self._kv_request_counters = {
+            field:
+            Counter(self.metric_prefix + name,
+                    description,
+                    labelnames=iteration_labelnames)
+            for field, name, description in (
+                ("iterSuspendedRequests", "kv_cache_requests_suspended_total",
+                 "Requests suspended by the KV-cache manager"),
+                ("iterResumedRequests", "kv_cache_requests_resumed_total",
+                 "Previously suspended requests resumed by the KV-cache manager"
+                 ),
+            )
+        }
+        self._kv_token_gauges = {
+            field:
+            Gauge(self.metric_prefix + name,
+                  description,
+                  labelnames=iteration_labelnames)
+            for field, name, description in (
+                ("numCtxKvTokens", "context_kv_tokens",
+                 "Existing KV context tokens read by scheduled prefill requests"
+                 ),
+                ("numGenKvTokens", "generation_kv_tokens",
+                 "KV context tokens of scheduled generation requests"),
+                ("numPausedKvTokens", "paused_kv_tokens",
+                 "KV context tokens of paused requests"),
+            )
+        }
+        self.histogram_kv_cache_transfer_duration = Histogram(
+            name=self.metric_prefix + "kv_cache_transfer_duration_seconds",
+            documentation=
+            "Completed-request KV-transfer elapsed time in seconds",
+            buckets=(*_PROCESSING_TIME_BUCKETS, 60.0, 120.0, 300.0, 600.0),
+            labelnames=self.labels.keys())
+        self.kv_cache_transfer_bytes = Counter(
+            name=self.metric_prefix + "kv_cache_transfer_bytes_total",
+            documentation=
+            "KV bytes received by the generation rank that reports the request",
+            labelnames=self.labels.keys())
+
+        self._loop_gauges = {
+            field:
+            Gauge(name=self.metric_prefix + name,
+                  documentation=description,
+                  labelnames=[*self.labels, "global_rank"])
+            for field, name, description in (
+                ("numScheduledRequests", "loop_scheduled_requests",
+                 "Scheduled requests at the captured loop boundary"),
+                ("numActiveRequests", "loop_active_requests",
+                 "Active requests at the captured loop boundary"),
+                ("numUnscheduledRequests", "loop_unscheduled_requests",
+                 "Unscheduled requests at the captured loop boundary"),
+                ("numDummyRequests", "loop_dummy_requests",
+                 "Dummy requests at the captured loop boundary"),
+                ("adpDummyCtxTokens", "loop_adp_dummy_context_tokens",
+                 "Context dummy tokens in the captured loop"),
+                ("adpDummyGenTokens", "loop_adp_dummy_generation_tokens",
+                 "Generation dummy tokens in the captured loop"),
+            )
+        }
+        self.loop_requests_fetched = Counter(
+            name=self.metric_prefix + "loop_requests_fetched_total",
+            documentation=
+            "Requests assigned to the producing rank, from cumulative loop snapshots",
+            labelnames=[*self.labels, "global_rank"])
+        self._prev_loop_fetched: dict[str, int] = {}
+
         # Queue & load metrics
         self.num_requests_running = Gauge(
             name=self.metric_prefix + "num_requests_running",
@@ -424,6 +511,38 @@ class PrometheusExposure:
             name=self.metric_prefix + "iteration_latency_seconds",
             documentation="Iteration latency in seconds",
             labelnames=self.labels.keys())
+
+        # Timing values shared across ADP rows are owned by rank 0.
+        timing_labelnames = (*self.labels, "scheduler_mode")
+        self.host_step_time_seconds = Gauge(
+            name=self.metric_prefix + "host_step_time_seconds",
+            documentation="Latest rank-0 executor loop wall time in seconds",
+            labelnames=timing_labelnames)
+        self.prev_device_step_time_seconds = Gauge(
+            name=self.metric_prefix + "prev_device_step_time_seconds",
+            documentation="Latest rank-0 lagged device step time in seconds",
+            labelnames=timing_labelnames)
+        self.gpu_forward_time_seconds = Gauge(
+            name=self.metric_prefix + "gpu_forward_time_seconds",
+            documentation=
+            "Latest rank-0 batch-matched GPU forward time in seconds",
+            labelnames=timing_labelnames)
+        timing_buckets = [
+            0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+            0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+        ]
+        self.histogram_host_step_duration = Histogram(
+            name=self.metric_prefix + "host_step_duration_seconds",
+            documentation=
+            "Rank-0 executor loop wall times from exported iteration samples",
+            buckets=timing_buckets,
+            labelnames=timing_labelnames)
+        self.histogram_gpu_forward_duration = Histogram(
+            name=self.metric_prefix + "gpu_forward_duration_seconds",
+            documentation=
+            "Rank-0 batch-matched GPU forward times from exported iteration samples",
+            buckets=timing_buckets,
+            labelnames=timing_labelnames)
 
         # Memory usage
         self.gpu_memory_usage_bytes = Gauge(
@@ -689,6 +808,24 @@ class PrometheusExposure:
             documentation="Total request errors, labeled by HTTP status code.",
             labelnames=self.labels_with_http_code.keys())
 
+    def _expose_loop_metrics(self, values: dict) -> None:
+        """Expose actual producing-rank loop observations, separately from batch stats."""
+        global_rank = values.get("globalRank")
+        if global_rank is None:
+            return
+        labels = {"global_rank": str(global_rank)}
+        for field, gauge in self._loop_gauges.items():
+            value = values.get(field)
+            if value is not None:
+                self._log_gauge(gauge, value, labels=labels)
+        fetched = values.get("numFetchedRequestsTotal")
+        if isinstance(fetched, int) and fetched >= 0:
+            delta = self._snapshot_delta(self._prev_loop_fetched,
+                                         labels["global_rank"],
+                                         fetched,
+                                         reset_to_zero=True)
+            self._log_counter(self.loop_requests_fetched, labels, delta)
+
     def log_config_from_args(self, args: "BaseLlmArgs", model: str) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
         from tensorrt_llm.logger import logger
@@ -828,6 +965,78 @@ class PrometheusExposure:
                           documentation="KV cache configuration info",
                           labelnames=info_labels.keys())
             gauge.labels(**info_labels).set(1)
+
+    @staticmethod
+    def _snapshot_delta(previous: dict,
+                        key,
+                        value: int,
+                        *,
+                        reset_to_zero: bool = False) -> int:
+        before = previous.get(key, 0)
+        previous[key] = value
+        if value >= before:
+            return value - before
+        return value if reset_to_zero else 0
+
+    def _log_storage_stats(self, iteration_stats: dict, rank: str) -> None:
+        """Export measured level/pool snapshots and deltas of cumulative movement counts."""
+        tiers = iteration_stats.get("kvCacheLevelTiers", [])
+        for snapshot in iteration_stats.get("kvCacheStorageStats", []):
+            level = snapshot.get("cacheLevel")
+            pool_group = snapshot.get("poolGroupId")
+            counts = [
+                snapshot.get(key) for key in ("totalNumBlocks", "freeNumBlocks",
+                                              "evictableNumBlocks")
+            ]
+            sizes = snapshot.get("slotSize", [])
+            if (not all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    and value >= 0 for value in [level, pool_group, *counts])
+                    or not sizes or not all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        and value > 0 for value in sizes)):
+                continue
+            total, free, evictable = counts
+            if free + evictable > total:
+                continue
+            slot_bytes = sum(sizes)
+            labels = {
+                self.labelname_dp_rank:
+                rank,
+                **self._cache_level_labels(level, tiers),
+                "pool_group":
+                str(pool_group),
+            }
+            for state, value in (("free", free), ("evictable", evictable),
+                                 ("unavailable", total - free - evictable)):
+                state_labels = {**labels, "state": state}
+                self._log_gauge(self.kv_cache_tier_blocks,
+                                value,
+                                labels=state_labels)
+                self._log_gauge(self.kv_cache_tier_bytes,
+                                value * slot_bytes,
+                                labels=state_labels)
+            for field, operation in (
+                ("restoredBlocks", "restore"),
+                ("evictedBlocks", "evict"),
+                ("capacityDroppedBlocks", "drop_capacity"),
+                ("priorityDroppedBlocks", "drop_priority"),
+            ):
+                value = snapshot.get(field)
+                if not isinstance(value, int) or isinstance(value,
+                                                            bool) or value < 0:
+                    continue
+                key = (rank, level, pool_group, operation)
+                first = key not in self._prev_tier_movement
+                delta = self._snapshot_delta(self._prev_tier_movement, key,
+                                             value)
+                if not delta and not first:
+                    continue
+                movement_labels = {**labels, "operation": operation}
+                self._log_counter(self.kv_cache_tier_moved_blocks,
+                                  movement_labels, delta)
+                self._log_counter(self.kv_cache_tier_moved_bytes,
+                                  movement_labels, delta * slot_bytes)
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
@@ -1051,6 +1260,18 @@ class PrometheusExposure:
                 self._log_histogram(self.histogram_tokens_cached_prompt,
                                     cached_tokens)
 
+            transfer_time = metrics_dict.get(MetricNames.KV_CACHE_TRANSFER_TIME)
+            if transfer_time is not None and math.isfinite(
+                    transfer_time) and transfer_time > 0:
+                self._log_histogram(self.histogram_kv_cache_transfer_duration,
+                                    transfer_time)
+            transfer_bytes = metrics_dict.get(
+                MetricNames.KV_CACHE_TRANSFER_BYTES)
+            if transfer_bytes is not None and math.isfinite(
+                    transfer_bytes) and transfer_bytes > 0:
+                self._log_counter(self.kv_cache_transfer_bytes, {},
+                                  transfer_bytes)
+
             per_pos_drafted = metrics_dict.get(
                 MetricNames.SPEC_DEC_DRAFTED_PER_POS)
             per_pos_accepted = metrics_dict.get(
@@ -1114,6 +1335,8 @@ class PrometheusExposure:
                 Top-level fields: numActiveRequests, numQueuedRequests, numCompletedRequests,
                 maxNumActiveRequests, iterLatencyMS, gpuMemUsage, cpuMemUsage, pinnedMemUsage,
                 maxBatchSizeStatic, maxBatchSizeRuntime, maxNumTokensRuntime.
+                Optional loop timings: hostStepTimeMS, prevDeviceStepTimeMS,
+                gpuForwardTimeMS, with schedulerMode describing the scheduler.
                 Nested dicts: kvCacheStats, inflightBatchingStats, specDecodingStats.
 
         Note:
@@ -1122,6 +1345,10 @@ class PrometheusExposure:
             - KV and local scheduling metrics use the dp_rank label, resolved from
               attentionDpRank, then rank, then 0 for unranked rows. Other iteration
               metrics are rank-0-owned measurements, not global aggregates.
+            - Timing histograms observe exported rank-0 records only. With
+              iter_perf_stats_interval > 1, they describe sampled iterations.
+              prevDeviceStepTimeMS lags hostStepTimeMS and must not be
+              subtracted from it to estimate CPU overhead.
             - Rows must arrive once, in producer order within each rank. A decrease
               in a rank's cumulative KV count emits a warning and updates its baseline
               without incrementing the counter. Stale or reordered rows are unsupported.
@@ -1137,6 +1364,9 @@ class PrometheusExposure:
             self._log_rank0_iteration_stats(iteration_stats)
 
         self._log_rank_iteration_stats(iteration_stats, rank)
+        loop = iteration_stats.get("executorLoop")
+        if loop is not None:
+            self._expose_loop_metrics(loop.get("per_iter", {}))
 
     def _log_rank0_iteration_stats(self, iteration_stats: dict) -> None:
         """Log fields owned by rank 0 using the existing model labels.
@@ -1169,6 +1399,8 @@ class PrometheusExposure:
         if "iterLatencyMS" in iteration_stats:
             self._log_gauge(self.iteration_latency_seconds,
                             iteration_stats["iterLatencyMS"] / 1000.0)
+
+        self._log_iteration_timing(iteration_stats)
 
         # Memory usage
         if "gpuMemUsage" in iteration_stats:
@@ -1217,6 +1449,29 @@ class PrometheusExposure:
                 self._log_gauge(self.spec_decode_draft_overhead,
                                 spec_stats["draftOverhead"])
 
+    def _log_iteration_timing(self, iteration_stats: dict) -> None:
+        """Export rank-0 timing samples without treating lagged GPU time as CPU overhead."""
+        if iteration_stats.get("isQueueSnapshot"):
+            return
+        mode = iteration_stats.get("schedulerMode")
+        if mode not in ("overlap", "non_overlap"):
+            mode = "unknown"
+        labels = {"scheduler_mode": mode}
+        for field, gauge, histogram in (
+            ("hostStepTimeMS", self.host_step_time_seconds,
+             self.histogram_host_step_duration),
+            ("prevDeviceStepTimeMS", self.prev_device_step_time_seconds, None),
+            ("gpuForwardTimeMS", self.gpu_forward_time_seconds,
+             self.histogram_gpu_forward_duration),
+        ):
+            value_ms = iteration_stats.get(field)
+            if value_ms is None or not math.isfinite(value_ms) or value_ms < 0:
+                continue
+            value_seconds = value_ms / 1000.0
+            self._log_gauge(gauge, value_seconds, labels=labels)
+            if histogram is not None:
+                self._log_histogram(histogram, value_seconds, labels=labels)
+
     def _log_scheduling_decisions(self, ifb_stats: dict,
                                   rank_labels: Dict[str, str]) -> None:
         """Log one rank's KV scheduling decision counters from its inflightBatchingStats."""
@@ -1248,6 +1503,33 @@ class PrometheusExposure:
                             ifb_stats["numDeferredGenReceives"],
                             labels=rank_labels)
 
+    def _log_kv_movement_window(self, iteration_stats: Mapping,
+                                rank_labels: dict) -> None:
+        if not isinstance(
+                iteration_stats.get("kvCacheIterationStatsByPoolGroup"),
+                Mapping):
+            return
+        hot_pools, movements = kv_pool_rows(iteration_stats)
+        groups = set(hot_pools or ()) | set(movements or ())
+        rank = rank_labels[self.labelname_dp_rank]
+        seen = self._kv_movement_window_pools.setdefault(rank, set())
+        seen.update(groups)
+        for operation, _, field in KV_MOVEMENT_WINDOW_FIELDS:
+            counts = pool_counts(movements, groups, field)
+            labels = {**rank_labels, "operation": operation}
+            # NaN clears stale pool values for multiprocess scrapes.
+            for group in seen:
+                count = counts.get(group)
+                self._log_gauge(self.kv_cache_movement_window_blocks_by_pool,
+                                math.nan if count is None else count,
+                                labels={
+                                    **labels, "pool_group": str(group)
+                                })
+            total = total_pool_count(counts) if movements is not None else None
+            self._log_gauge(self.kv_cache_movement_window_blocks,
+                            math.nan if total is None else total,
+                            labels=labels)
+
     def _log_rank_iteration_stats(self, iteration_stats: dict,
                                   rank: str) -> None:
         """Log local KV and scheduling measurements for one rank.
@@ -1257,9 +1539,73 @@ class PrometheusExposure:
             rank: Normalized data-parallel rank label.
         """
         rank_labels = {self.labelname_dp_rank: rank}
+        self._log_kv_movement_window(iteration_stats, rank_labels)
+        activity = iteration_stats.get("conversationActivity", {})
+        for window in ("10m", "1h"):
+            observation = activity.get(window)
+            if observation is None:
+                continue
+            labels = {**rank_labels, "window": window}
+            for field, metric in (("unique", self.conversation_unique_seen),
+                                  ("complete",
+                                   self.conversation_unique_seen_complete)):
+                value = observation.get(field)
+                if isinstance(value, int) and not isinstance(
+                        value, bool) and value >= 0 and (field != "complete"
+                                                         or value in (0, 1)):
+                    self._log_gauge(metric, value, labels=labels)
+            for reason, field in (("entries", "overflowEntries"),
+                                  ("identity_bytes", "overflowIdentityBytes")):
+                value = observation.get(field)
+                if not isinstance(value, int) or isinstance(value,
+                                                            bool) or value < 0:
+                    continue
+                delta = self._snapshot_delta(self._prev_conversation_overflow,
+                                             (rank, window, reason),
+                                             value,
+                                             reset_to_zero=True)
+                self._log_counter(self.conversation_tracking_overflow, {
+                    **labels, "reason": reason
+                }, delta)
+
+        conversations = iteration_stats.get("kvCacheNumConversations")
+        if (isinstance(conversations, int)
+                and not isinstance(conversations, bool) and conversations >= 0):
+            self._log_gauge(self.kv_cache_num_conversations,
+                            conversations,
+                            labels=rank_labels)
+        outcomes = iteration_stats.get("kvTransferOutcomes", {})
+        for outcome in ("success", "error", "timeout"):
+            value = outcomes.get(outcome)
+            if not isinstance(value, int) or isinstance(value,
+                                                        bool) or value < 0:
+                continue
+            delta = self._snapshot_delta(self._prev_transfer_outcomes,
+                                         (rank, outcome), value)
+            self._log_counter(self.kv_cache_transfer_requests, {
+                **rank_labels, "outcome": outcome
+            }, delta)
+
+        for field, counter in self._kv_request_counters.items():
+            value = iteration_stats.get(field, 0)
+            if value > 0:
+                self._log_counter(counter, rank_labels, value)
 
         # KV cache stats
         if kv_stats := iteration_stats.get("kvCacheStats"):
+            for field, counter, previous in (
+                ("allocTotalBlocks", self.kv_cache_allocated_blocks,
+                 self._prev_allocated_blocks),
+                ("allocNewBlocks", self.kv_cache_new_blocks,
+                 self._prev_new_blocks),
+            ):
+                value = kv_stats.get(field)
+                if value is not None:
+                    self._log_cumulative_kv_counter(counter,
+                                                    value,
+                                                    previous,
+                                                    rank,
+                                                    field_name=field)
             cache_hit_rate = kv_stats.get("cacheHitRate")
             if cache_hit_rate is not None:
                 self._log_gauge(self.kv_cache_hit_rate,
@@ -1320,6 +1666,9 @@ class PrometheusExposure:
 
         # Inflight batching stats
         if ifb_stats := iteration_stats.get("inflightBatchingStats"):
+            for field, gauge in self._kv_token_gauges.items():
+                if field in ifb_stats:
+                    self._log_gauge(gauge, ifb_stats[field], labels=rank_labels)
             if "numContextRequests" in ifb_stats:
                 self._log_gauge(self.num_context_requests,
                                 ifb_stats["numContextRequests"],
@@ -1391,6 +1740,22 @@ class PrometheusExposure:
             # own a cold one, and this view accounts for every cold block exactly once. Legacy V1 has
             # no such view and keeps its cold counters on the window stats, hence the fallback.
             secondary_stats = kv_iter_by_cold_pool_group or pool_group_stats
+            for field, gauge in (
+                ("primaryEvictableNumBlocks", self.kv_cache_evictable_blocks),
+                ("primaryPeakUsedNumBlocks", self.kv_cache_peak_used_blocks),
+            ):
+                values = [
+                    stats[field] for stats in pool_group_stats.values()
+                    if field in stats
+                ]
+                if values:
+                    self._log_gauge(gauge, sum(values), labels=rank_labels)
+            dropped_bytes = sum(
+                stats.get("iterHostDroppedBytes", 0)
+                for stats in pool_group_stats.values())
+            if dropped_bytes > 0:
+                self._log_counter(self.kv_cache_host_dropped_bytes, rank_labels,
+                                  dropped_bytes)
             total_secondary_max = 0
             total_secondary_used = 0
             total_reused = 0
@@ -1463,6 +1828,8 @@ class PrometheusExposure:
             if total_intra_device_copy_bytes > 0:
                 self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
                                   rank_labels, total_intra_device_copy_bytes)
+
+        self._log_storage_stats(iteration_stats, rank)
 
     def log_request_error(self, http_code: Union[int, str] = "") -> None:
         """Increment the error counter, labeled by HTTP status code."""

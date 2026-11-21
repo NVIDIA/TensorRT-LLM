@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -1319,6 +1320,36 @@ public:
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
 
+    void setKvCacheTransferTimedOut() noexcept
+    {
+        mKvCacheTransferTimedOut = true;
+    }
+
+    [[nodiscard]] bool getKvCacheTransferTimedOut() const noexcept
+    {
+        return mKvCacheTransferTimedOut;
+    }
+
+    void markKvCacheTransferCancelled() noexcept
+    {
+        mKvCacheTransferCancelled = true;
+    }
+
+    [[nodiscard]] bool getKvCacheTransferCancelled() const noexcept
+    {
+        return mKvCacheTransferCancelled;
+    }
+
+    void markKvCacheTransferFailed() noexcept
+    {
+        mKvCacheTransferFailed = true;
+    }
+
+    [[nodiscard]] bool getKvCacheTransferFailed() const noexcept
+    {
+        return mKvCacheTransferFailed;
+    }
+
     [[nodiscard]] double getKvCacheTransferTimeMS() const
     {
         // get max with 0 in case this function is called while end time is not recorded
@@ -1330,17 +1361,32 @@ public:
 
     void updateKvCacheSize(size_t targetBufferSize) const
     {
-        mPerfMetrics.timingMetrics.kvCacheSize += targetBufferSize;
+        std::atomic_ref(mPerfMetrics.timingMetrics.kvCacheSize).fetch_add(targetBufferSize, std::memory_order_relaxed);
     }
 
     void setKvCacheSize(size_t targetBufferSize) const
     {
-        mPerfMetrics.timingMetrics.kvCacheSize = targetBufferSize;
+        std::atomic_ref(mPerfMetrics.timingMetrics.kvCacheSize).store(targetBufferSize, std::memory_order_relaxed);
     }
 
     [[nodiscard]] size_t getKvCacheSize() const
     {
-        return mPerfMetrics.timingMetrics.kvCacheSize;
+        return std::atomic_ref(mPerfMetrics.timingMetrics.kvCacheSize).load(std::memory_order_relaxed);
+    }
+
+    void setKvCacheTransferLocalDuration(double seconds) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheTransferLocalDuration = seconds;
+    }
+
+    void setKvCacheTransferLocalSize(size_t bytes) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheTransferLocalSize = bytes;
+    }
+
+    [[nodiscard]] size_t getKvCacheTransferLocalSize() const
+    {
+        return mPerfMetrics.timingMetrics.kvCacheTransferLocalSize.value_or(0);
     }
 
     void updateAllocTotalBlocksPerRequest(SizeType32 allocTotalBlocksPerRequest)
@@ -1599,6 +1645,9 @@ protected:
     // Performance metrics. Should be updatable even from a const LlmRequest reference.
     bool mReturnPerfMetrics{false};
     mutable executor::RequestPerfMetrics mPerfMetrics;
+    bool mKvCacheTransferTimedOut{false};
+    bool mKvCacheTransferCancelled{false};
+    bool mKvCacheTransferFailed{false};
 
     // Timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
