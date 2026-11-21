@@ -28,6 +28,7 @@
 ```text
 inkling2/
 ├── config.py               # InklingDims: the decoder's shape and per-layer expert formats
+├── routing.py              # Inkling2ForConditionalGeneration -> target, or NoTarget
 ├── kernels/                # Triton: short convolution, paged attention with the relative bias
 ├── ops/                    # OpWrappers: conv, attention prologue and core, residual mix,
 │                           # router, NVFP4 experts (FlashInfer CuTe DSL), MXFP8 experts
@@ -41,10 +42,25 @@ inkling2/
 
 The released checkpoint on one GB300 tray: attention TP4 (12 query and 2 KV heads per rank), MoE
 EP4 (96 experts per rank), BF16 KV cache. The baseline runs eagerly, without CUDA graphs, the
-overlap scheduler, chunked prefill, KV cache block reuse or speculative decoding.
+overlap scheduler, chunked prefill, KV cache block reuse or speculative decoding, at an explicit
+`max_seq_len` of at most 262144. Routing refuses any other deployment and says which condition
+failed.
 
-The family is not routed yet: these are the operators and the target's components; the route that
-serves the target through `LLM()` and `trtllm-serve` follows separately.
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig
+
+llm = LLM(
+    "thinkingmachines/Inkling-2-Small",
+    tensor_parallel_size=4,
+    moe_expert_parallel_size=4,
+    max_seq_len=32768,
+    max_num_tokens=32768,
+    kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+    cuda_graph_config=None,
+    disable_overlap_scheduler=True,
+)
+```
 
 The NVFP4 experts run FlashInfer's CuTe DSL fused MoE with SiTU and per-token 4/6 activations. The
 MXFP8 experts run a grouped Triton MoE that expands the E4M3 weights to bf16 in registers (exactly)
