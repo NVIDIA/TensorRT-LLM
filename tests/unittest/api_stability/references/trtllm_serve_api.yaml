@@ -670,6 +670,12 @@ models:
         default: null
         status: stable
         required: false
+      safety_identifier:
+        kind: openai
+        type: Optional[str]
+        default: null
+        status: stable
+        required: false
       reasoning_effort:
         kind: openai
         type: Optional[ReasoningEffort | Literal['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'none']]
