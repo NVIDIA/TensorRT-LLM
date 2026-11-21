@@ -162,6 +162,7 @@ class LlmManager:
         messages: List[dict] = []
         total_input_tokens = 0
         all_output_tokens: List[int] = []
+        total_decoding_iterations = 0
 
         async with semaphore_guard(self._concurrency_semaphore):
             # Enforce the duration limit at execution time (see
@@ -198,6 +199,7 @@ class LlmManager:
                     chain(*(beam.token_ids for beam in response.outputs)))
                 all_output_tokens.extend(turn_tokens)
                 total_input_tokens += len(input_ids)
+                total_decoding_iterations += response.decoding_iter + 1
 
                 assistant_text = await loop.run_in_executor(
                     None, lambda: tokenizer.decode(turn_tokens,
@@ -226,7 +228,9 @@ class LlmManager:
             response_is_final=last_response.finished,
             error=False,
             tokens=all_output_tokens,
-            decoding_iteration=last_response.decoding_iter,
+            # PerfItemTuple stores a zero-based index, while each turn starts
+            # its own decoding iteration count at zero.
+            decoding_iteration=total_decoding_iterations - 1,
             time_on_first_token=time_on_first_token,
         )
 
