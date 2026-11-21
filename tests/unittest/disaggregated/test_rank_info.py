@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -22,7 +23,11 @@ from tensorrt_llm import bindings
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    _LEGACY_PROTOCOL_VERSION,
+    NATIVE_TRANSFER_PROTOCOL_VERSION,
+    RankInfo,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -205,6 +210,92 @@ def test_rank_info_represents_cache_element_bytes(
     assert isinstance(restored.attention.element_bytes, expected_type)
 
 
+@pytest.mark.parametrize(
+    ("shares_draft_layers", "draft_layer_ids", "hosts", "expected", "reshards"),
+    [
+        (False, (), False, 0, False),
+        # Folded MTP/Eagle draft layers have no explicit storage and travel as
+        # ordinary layers, so they are not advertised.
+        (False, (36,), False, 0, False),
+        # Explicit draft layers: a plain manager's layer specs or the layers a
+        # hybrid manager appends.
+        (True, (36, 37), False, 2, False),
+        # A manager hosting the draft layers reshards them across attention TP.
+        (True, (36, 37), True, 2, True),
+        (False, (36, 37), True, 0, False),
+    ],
+)
+def test_from_kv_cache_manager_reports_unified_draft_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    shares_draft_layers: bool,
+    draft_layer_ids: tuple,
+    hosts: bool,
+    expected: int,
+    reshards: bool,
+) -> None:
+    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
+    manager = SimpleNamespace(
+        mapping=SimpleNamespace(
+            rank=0,
+            tp_size=1,
+            tp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=1,
+            cp_size=1,
+            cp_rank=0,
+            enable_attention_dp=False,
+        ),
+        num_kv_heads_per_layer=[8, 8],
+        pp_layers=[0, 1],
+        tokens_per_block=32,
+        head_dim=128,
+        dtype=bindings.DataType.HALF,
+        kv_factor=2,
+        draft_layer_ids=draft_layer_ids,
+        hosts_unified_draft_layers=hosts,
+    )
+    manager.get_draft_kv_cache_view = lambda: manager if shares_draft_layers else None
+    # The drafter declares an FP8 pool (draft_kv_dtype); the target keeps HALF.
+    manager.get_layer_dtype = lambda layer_id: bindings.DataType.FP8
+
+    info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+
+    assert info.num_draft_layers == expected
+    assert info.draft_kv_dtype == ("FP8" if expected else None)
+    assert info.draft_layers_reshard_across_tp is reshards
+    payload = msgpack.unpackb(info.to_bytes(), strict_map_key=False)
+    # Without shared draft layers the wire shape is unchanged, and only a hosting
+    # manager's peers carry the reshard flag.
+    assert ("draft_kv_dtype" in payload) == bool(expected)
+    assert ("draft_layers_reshard_across_tp" in payload) is reshards
+    restored = RankInfo.from_bytes(info.to_bytes())
+    assert (
+        restored.num_draft_layers,
+        restored.draft_kv_dtype,
+        restored.draft_layers_reshard_across_tp,
+    ) == (expected, info.draft_kv_dtype, reshards)
+
+
+def test_rank_info_from_bytes_defaults_missing_draft_layer_count() -> None:
+    ri = RankInfo(
+        instance_name="gen_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[32],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+    payload = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    del payload["num_draft_layers"]
+
+    assert RankInfo.from_bytes(msgpack.packb(payload)).num_draft_layers == 0
+
+
 def _mamba_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0, attention_dp=None):
     # MambaPolicy reads tp_size / tp_rank / cp_size / cp_rank /
     # attention.enable_attention_dp.
@@ -276,3 +367,46 @@ class TestMambaHelixCP:
         # Paired sender
         paired_ri = _mamba_rank_info(tp_size=2, tp_rank=1)
         assert MambaPolicy.is_paired(paired_ri, peer_ri)
+
+
+def test_from_bytes_rejects_another_protocol_version_before_decoding_fields():
+    import msgpack
+
+    ri = RankInfo(
+        instance_name="gen_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+    # A current RankInfo defaults to the current version and carries it on the wire.
+    assert ri.protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
+    assert RankInfo.from_bytes(ri.to_bytes()).protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
+
+    # A peer that predates the versioned frames sends no version field; it is
+    # read as the legacy version and rejected rather than adopting ours.
+    assert _LEGACY_PROTOCOL_VERSION != NATIVE_TRANSFER_PROTOCOL_VERSION
+    older = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    older.pop("protocol_version")
+    with pytest.raises(ValueError, match=f"peer={_LEGACY_PROTOCOL_VERSION}"):
+        RankInfo.from_bytes(msgpack.packb(older))
+
+    # A newer peer may add fields this release does not define; the version
+    # mismatch is reported instead of a TypeError from the dataclass.
+    newer = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    newer["protocol_version"] = NATIVE_TRANSFER_PROTOCOL_VERSION + 1
+    newer["field_from_a_newer_release"] = 1
+    with pytest.raises(ValueError, match="protocol version mismatch"):
+        RankInfo.from_bytes(msgpack.packb(newer))
+
+    # On the same version, a field this build does not define (a peer built
+    # with a newer RankInfo) is an incompatible peer, not a TypeError.
+    same_version = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    same_version["field_from_a_newer_build"] = True
+    with pytest.raises(ValueError, match=r"does not define: \['field_from_a_newer_build'\]"):
+        RankInfo.from_bytes(msgpack.packb(same_version))

@@ -16,7 +16,7 @@
 Unified Communication Strategy Tests for MoE
 
 Tests all Communication subclasses (AllGatherReduceScatter, DeepEP,
-DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided, NVLinkTwoSidedFlashinfer) via the public
+DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided, NcclEP) via the public
 dispatch() and combine() interfaces defined in Communication base class.
 
 Each test runs the full pipeline: dispatch -> verify dispatch -> simple_moe
@@ -47,16 +47,18 @@ Run with: mpirun -np 8 pytest test_moe_comm.py -x -v
 """
 
 import atexit
+import contextlib
 import os
 import pickle
 import sys
 import threading
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Set, Tuple
-from unittest.mock import MagicMock
+from typing import ContextManager, Dict, List, Optional, Set, Tuple
+from unittest.mock import MagicMock, patch
 
 import cloudpickle
 import pytest
@@ -73,15 +75,13 @@ from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-    FORCE_CFT_ENV,
+    SENTINEL_MAX_TOKENS_ENV,
+    SYNC_PROTOCOL_ENV,
     NVLinkOneSided,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
     MnnvlMoe,
     NVLinkTwoSided,
-)
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer import (
-    NVLinkTwoSidedFlashinfer,
 )
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
@@ -89,7 +89,15 @@ from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
     is_nccl_ep_installed,
     nccl_ep_supports_version,
 )
-from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
+from tensorrt_llm._torch.nccl_window_tensor_scope import (
+    discard_nccl_window_tensor_outputs,
+    nccl_window_tensor_scope,
+)
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -109,7 +117,6 @@ COMM_DEEP_EP = "DeepEP"
 COMM_DEEP_EP_LL = "DeepEPLowLatency"
 COMM_NVLINK_ONE_SIDED = "NVLinkOneSided"
 COMM_NVLINK_TWO_SIDED = "NVLinkTwoSided"
-COMM_NVLINK_TWO_SIDED_FLASHINFER = "NVLinkTwoSidedFlashinfer"
 COMM_NCCL_EP = "NcclEP"
 
 ALL_COMM_TYPES = [
@@ -118,7 +125,6 @@ ALL_COMM_TYPES = [
     COMM_DEEP_EP_LL,
     COMM_NVLINK_ONE_SIDED,
     COMM_NVLINK_TWO_SIDED,
-    COMM_NVLINK_TWO_SIDED_FLASHINFER,
     COMM_NCCL_EP,
 ]
 
@@ -301,8 +307,8 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
@@ -340,8 +346,8 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
 
@@ -611,17 +617,6 @@ def create_comm_object(
             alltoall_result_do_sum=True,
         )
 
-    elif comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        # FlashInfer requires reduced combine output and does not support the
-        # low-precision combine path.
-        return NVLinkTwoSidedFlashinfer(
-            mapping=mapping,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            top_k=config.top_k,
-            alltoall_result_do_sum=True,
-        )
-
     elif comm_type == COMM_NCCL_EP:
         return NcclEP(
             mapping=mapping,
@@ -699,14 +694,6 @@ def _comm_reuse_key(config: CommTestConfig) -> Tuple:
             config.use_low_precision_combine,
         )
 
-    if config.comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        return (
-            config.comm_type,
-            config.ep_size,
-            config.num_experts,
-            config.top_k,
-        )
-
     return (config.comm_type,)
 
 
@@ -754,17 +741,6 @@ def _check_mnnvl_support() -> Optional[str]:
 
 
 @lru_cache(maxsize=None)
-def _check_flashinfer_mnnvl_support() -> Optional[str]:
-    """Return skip reason if FlashInfer MNNVL is not supported, else None."""
-    try:
-        if not NVLinkTwoSidedFlashinfer.is_platform_supported():
-            return "FlashInfer MNNVL not supported"
-    except Exception:
-        return "FlashInfer MNNVL initialization failed"
-    return None
-
-
-@lru_cache(maxsize=None)
 def check_platform_support(comm_type: str) -> Optional[str]:
     """Return skip reason string if comm type is unsupported, else None."""
     if comm_type == COMM_ALLGATHER_RS:
@@ -780,9 +756,6 @@ def check_platform_support(comm_type: str) -> Optional[str]:
 
     if comm_type == COMM_NVLINK_TWO_SIDED:
         return _check_mnnvl_support()
-
-    if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        return _check_flashinfer_mnnvl_support()
 
     if comm_type == COMM_NCCL_EP:
         if not is_nccl_ep_installed():
@@ -849,16 +822,6 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
             return f"NcclEP does not support quant_mode={config.quant_mode}"
         if config.top_k > NCCL_EP_MAX_TOP_K:
             return f"NcclEP MAX_TOP_K={NCCL_EP_MAX_TOP_K}, got top_k={config.top_k}"
-
-    if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        # FlashInfer alltoallv requires every 2D payload row to be 16-byte aligned.
-        # This test dispatches both int32 slots [N, top_k] and bf16 scales
-        # [N, top_k], so top_k must satisfy both alignments.
-        if config.top_k % 8 != 0:
-            return (
-                "NVLinkTwoSidedFlashinfer requires top_k to be a multiple of 8 "
-                f"for 16-byte row alignment, got top_k={config.top_k}"
-            )
 
     # W4AFP8: encode_source_info writes token_idx into fp8 low byte.
     # token_idx >= 127 can create fp8 NaN which may not survive bf16 roundtrip.
@@ -1064,7 +1027,7 @@ def _run_worker_dispatch(
     config: CommTestConfig,
 ) -> DispatchOutputs:
     """Prepare dispatch metadata if needed, then run dispatch()."""
-    if config.comm_type in (COMM_NVLINK_TWO_SIDED, COMM_NVLINK_TWO_SIDED_FLASHINFER):
+    if config.comm_type == COMM_NVLINK_TWO_SIDED:
         comm.prepare_dispatch(worker_inputs.slots, config.all_num_tokens)
 
     recv_hs, recv_sf, recv_slots, recv_scales = comm.dispatch(
@@ -1240,8 +1203,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         traceback.print_exc()
         raise
     finally:
-        # A CFT workspace holds a process-global binding only destroy() frees,
-        # and the cache does not survive to the next pool task.
+        # The cache does not survive to the next pool task.
         _destroy_cached_worker_comm()
 
 
@@ -1257,11 +1219,17 @@ def _nccl_ep_replay_slots(
     return (target_rank * experts_per_rank + local_experts).view(num_tokens, 1)
 
 
-def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: torch.dtype) -> dict:
-    """Capture LL dispatch, change routing, and verify replay sees the change."""
+def _worker_nccl_ep_cuda_graph_replay(
+    config: CommTestConfig, routing_dtype: torch.dtype, force_window_fallback: bool | None = None
+) -> dict:
+    """Verify routing replay; a non-None fallback flag also requires the selected window path."""
+    # Keep torch.ops out of the globals serialized by cloudpickle.
+    import torch
+
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
+    graph = pool = None
     try:
         mapping = Mapping(
             rank=rank,
@@ -1296,21 +1264,47 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             experts_per_rank=experts_per_rank,
         )
 
-        with nccl_window_tensor_scope(hidden_states):
-            # Initialize the context and handle eagerly. Capture is intentionally
-            # rejected before this point, matching production graph setup.
-            comm.dispatch(
+        # Release the warmup lease before capture claims its graph-owned window.
+        with discard_nccl_window_tensor_outputs(hidden_states):
+            warmup_recv, *_ = comm.dispatch(
                 hidden_states,
                 None,
                 local_routes,
                 weights,
                 all_rank_num_tokens,
             )
-            torch.cuda.synchronize()
+            warmup_uses_window = warmup_recv.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
+        torch.cuda.synchronize()
 
+        availability = MPI.COMM_WORLD.allgather((comm._ctx.zerocopy_enabled, warmup_uses_window))
+        zerocopy_enabled = availability[0][0]
+        assert all(enabled == zerocopy_enabled for enabled, _ in availability), availability
+        if force_window_fallback is not None:
+            assert zerocopy_enabled, "Window-specific replay requires NCCL-EP zero-copy support"
+        if force_window_fallback is False:
+            assert all(available for _, available in availability), availability
+
+        allocate = torch.ops.trtllm.allocate_output_with_nccl_window
+
+        def refuse_window(
+            input_tensor: torch.Tensor, _kind: int, group: list[int]
+        ) -> tuple[torch.Tensor, int, int]:
+            """Use the native plain allocator to inject an ordinary window refusal."""
+            return allocate(input_tensor, int(BufferKind.DEFAULT), group)
+
+        allocation_context = (
+            patch.object(
+                torch.ops.trtllm, "allocate_output_with_nccl_window", side_effect=refuse_window
+            )
+            if force_window_fallback and zerocopy_enabled
+            else nullcontext()
+        )
+
+        with nccl_window_tensor_scope(hidden_states):
             static_routes = local_routes.clone()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            pool = torch.cuda.graph_pool_handle()
+            with allocation_context as refused, nccl_window_graph_capture(graph, pool):
                 recv_hs, _, recv_slots, recv_scales = comm.dispatch(
                     hidden_states,
                     None,
@@ -1320,7 +1314,22 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 )
             torch.cuda.synchronize()
 
-            assert recv_scales.dtype == routing_dtype
+            uses_window = recv_hs.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
+            capture_states = MPI.COMM_WORLD.allgather(
+                (
+                    uses_window,
+                    refused.call_count if refused is not None else 0,
+                    recv_scales.dtype == routing_dtype,
+                )
+            )
+            # Validate on every rank before any rank enters collective replay.
+            if force_window_fallback is not None:
+                assert all(
+                    window == (not force_window_fallback) and calls == int(force_window_fallback)
+                    for window, calls, _ in capture_states
+                ), capture_states
+            assert all(dtype_matches for _, _, dtype_matches in capture_states), capture_states
+            output_ptr = recv_hs.data_ptr()
 
             def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
                 graph.replay()
@@ -1328,6 +1337,8 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 valid = recv_slots[:, 0] >= 0
                 received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
                 return {
+                    "pointer_stable": recv_hs.data_ptr() == output_ptr,
+                    "uses_persistent_output": output_ptr == comm._ctx.output_tokens_buf.data_ptr(),
                     "valid_count": int(valid.sum().item()),
                     "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
                     "weights_match": bool(
@@ -1341,11 +1352,22 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             static_routes.copy_(peer_routes)
             weights.fill_(0.25)
             peer_result = replay_and_check(peer_rank, 0.25)
-            return {"rank": rank, "local": local_result, "peer": peer_result}
+            return {
+                "rank": rank,
+                "zerocopy_enabled": zerocopy_enabled,
+                "uses_window": uses_window,
+                "local": local_result,
+                "peer": peer_result,
+            }
     except Exception:
         traceback.print_exc()
         raise
     finally:
+        torch.cuda.synchronize()
+        if graph is not None:
+            graph.reset()
+        if pool is not None:
+            release_nccl_window_graph_owner(pool)
         if comm is not None:
             comm.destroy()
 
@@ -1739,7 +1761,7 @@ def verify_dispatch_alltoall(
     """Verify AllToAll dispatch: slot validity, content integrity, completeness.
 
     Slot semantics differ by communication backend:
-      - NVLinkOneSided / NVLinkTwoSided / NVLinkTwoSidedFlashinfer:
+      - NVLinkOneSided / NVLinkTwoSided:
         valid tokens keep global expert IDs
         [0, num_experts), padding tokens are set to -1 by sanitize kernel.
       - DeepEP: valid tokens keep global expert IDs [0, num_experts), empty-
@@ -2090,7 +2112,6 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
         COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
-        COMM_NVLINK_TWO_SIDED_FLASHINFER,
         COMM_DEEP_EP_LL,
         COMM_ALLGATHER_RS,
     ],
@@ -2098,7 +2119,6 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
         COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
-        COMM_NVLINK_TWO_SIDED_FLASHINFER,
         COMM_DEEP_EP,
         COMM_DEEP_EP_LL,
         COMM_ALLGATHER_RS,
@@ -2107,7 +2127,7 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
 }
 """Only valid (quant_mode, comm_type) combinations for post-quant tests.
 
- - fp8: NVLink (payload-agnostic, including FlashInfer variant) + DeepEP LL
+ - fp8: NVLink (payload-agnostic) + DeepEP LL
    (fp8 branch) + AllGatherRS.
   DeepEP normal only supports nvfp4 post-quant, NOT fp8.
  - nvfp4: All tested COMM types except w4afp8-only branches support nvfp4
@@ -2205,7 +2225,6 @@ def _make_boundary_test_params():
     configs = []
     for target_ep_size in [2, 4]:
         for comm_type in ALL_COMM_TYPES:
-            aligned_top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
             boundary_cases = []
             if comm_type == COMM_NVLINK_ONE_SIDED:
                 # DSpark routes to three experts; include an idle ADP peer.
@@ -2223,21 +2242,20 @@ def _make_boundary_test_params():
                         f"{comm_type}_topk3",
                     )
                 )
-            if comm_type != COMM_NVLINK_TWO_SIDED_FLASHINFER:
-                boundary_cases.append(
-                    (
-                        2,
-                        CommTestConfig(
-                            comm_type=comm_type,
-                            ep_size=2,
-                            num_experts=FIXED_NUM_EXPERTS,
-                            top_k=1,
-                            hidden_size=DEFAULT_HIDDEN_SIZE,
-                            all_num_tokens=[8, 8],
-                        ),
-                        f"{comm_type}_topk1",
-                    )
+            boundary_cases.append(
+                (
+                    2,
+                    CommTestConfig(
+                        comm_type=comm_type,
+                        ep_size=2,
+                        num_experts=FIXED_NUM_EXPERTS,
+                        top_k=1,
+                        hidden_size=DEFAULT_HIDDEN_SIZE,
+                        all_num_tokens=[8, 8],
+                    ),
+                    f"{comm_type}_topk1",
                 )
+            )
             boundary_cases.extend(
                 [
                     (
@@ -2246,7 +2264,7 @@ def _make_boundary_test_params():
                             comm_type=comm_type,
                             ep_size=2,
                             num_experts=FIXED_NUM_EXPERTS,
-                            top_k=aligned_top_k,
+                            top_k=2,
                             hidden_size=2048,
                             all_num_tokens=[16, 16],
                         ),
@@ -2258,7 +2276,7 @@ def _make_boundary_test_params():
                             comm_type=comm_type,
                             ep_size=4,
                             num_experts=FIXED_NUM_EXPERTS,
-                            top_k=aligned_top_k,
+                            top_k=2,
                             hidden_size=DEFAULT_HIDDEN_SIZE,
                             all_num_tokens=[1, 1, 1, 1],
                         ),
@@ -2276,7 +2294,7 @@ def _make_boundary_test_params():
                             comm_type=comm_type,
                             ep_size=4,
                             num_experts=FIXED_NUM_EXPERTS,
-                            top_k=aligned_top_k,
+                            top_k=2,
                             hidden_size=DEFAULT_HIDDEN_SIZE,
                             all_num_tokens=[32, 0, 16, 0],
                         ),
@@ -2352,8 +2370,7 @@ def _make_postquant_test_params():
     configs = []
     for quant_mode, comm_types in POSTQUANT_COMM_MAP.items():
         for comm_type in comm_types:
-            top_ks = [8] if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else [2, 16]
-            for top_k in top_ks:
+            for top_k in [2, 16]:
                 for use_low_precision_combine in [False, True]:
                     config = CommTestConfig(
                         comm_type=comm_type,
@@ -2497,7 +2514,9 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
     _verify_full_test_results(all_results, pending.config)
 
 
-def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.dtype) -> None:
+def _run_nccl_ep_cuda_graph_replay_test(
+    mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool | None
+) -> None:
     """Verify graph replay observes routing changed between replays."""
     ep_size = mpi_pool_executor.num_workers
     config = CommTestConfig(
@@ -2513,14 +2532,22 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.
         pytest.skip(skip_reason)
 
     futures = [
-        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config, routing_dtype)
+        mpi_pool_executor.submit(
+            _worker_nccl_ep_cuda_graph_replay, config, routing_dtype, force_window_fallback
+        )
         for _ in range(config.ep_size)
     ]
     results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
     for result in results:
         rank = result["rank"]
+        if force_window_fallback is not None:
+            assert result["zerocopy_enabled"], result
+            assert result["uses_window"] == (not force_window_fallback), result
         for replay_name in ("local", "peer"):
             replay = result[replay_name]
+            assert replay["pointer_stable"], result
+            if force_window_fallback:
+                assert replay["uses_persistent_output"], result
             valid_count = replay["valid_count"]
             assert valid_count == 16, (
                 f"rank {rank}: {replay_name} replay received {valid_count} valid rows, expected 16"
@@ -2637,9 +2664,33 @@ def _run_rank_mask_one_rank_masked_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+# These two use torch only through a local import: this module is pickled by value, and a function
+# that names torch.ops next to the global torch makes cloudpickle serialize the ops namespace.
+def _sentinel_available() -> bool:
+    import torch as _torch
+
+    return bool(_torch.ops.trtllm.moe_a2a_sentinel_available())
+
+
+def _record_sentinel_steps(steps: List[bool]) -> ContextManager:
+    """Patch moe_a2a_dispatch to append whether each launch takes the sentinel transport."""
+    from unittest import mock
+
+    import torch as _torch
+
+    dispatch_op = _torch.ops.trtllm.moe_a2a_dispatch
+
+    def record_dispatch(*args, **kwargs):
+        steps.append(bool(kwargs.get("use_sentinel", False)))
+        return dispatch_op(*args, **kwargs)
+
+    return mock.patch.object(_torch.ops.trtllm, "moe_a2a_dispatch", record_dispatch)
+
+
 def _exercise_mnnvl_checkpoint_graph_replay(
     config: CommTestConfig, rank: int, communication
 ) -> bool:
+    any_allocation_is_mapped = None
     worker_inputs = _prepare_worker_inputs(rank, config)
     _, local_slot_start, local_slot_end = _compute_ep_partition(
         config.num_experts, config.ep_size, rank
@@ -2702,6 +2753,11 @@ def _exercise_mnnvl_checkpoint_graph_replay(
         def any_allocation_is_mapped() -> bool:
             return communication.mnnvl_mem.mapped
 
+    sentinel_steps: List[bool] = []
+    if config.comm_type == COMM_NVLINK_ONE_SIDED and _sentinel_available():
+        # The default policy carries these small steps on the sentinel transport.
+        assert communication.sentinel_max_tokens >= max(config.all_num_tokens)
+
     for cycle in range(3):
         free_before_prepare = torch.cuda.mem_get_info()[0]
         communication.checkpoint_prepare()
@@ -2724,9 +2780,20 @@ def _exercise_mnnvl_checkpoint_graph_replay(
             )
         assert restored_addresses == stable_addresses
 
-        with torch.inference_mode():
+        sentinel_steps.clear()
+        record = (
+            _record_sentinel_steps(sentinel_steps)
+            if config.comm_type == COMM_NVLINK_ONE_SIDED
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), record:
             worker_inputs.hs.add_(cycle + 1)
             expected = forward().clone()
+        if config.comm_type == COMM_NVLINK_ONE_SIDED:
+            # The step after restore takes the transport the instance selects for it.
+            assert sentinel_steps == [
+                communication.sentinel_max_tokens >= max(config.all_num_tokens)
+            ]
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(graph_output, expected)
@@ -2745,9 +2812,9 @@ def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
         world_size=config.ep_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     try:
         return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
@@ -2782,9 +2849,9 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
         world_size=world_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
     control_comm = MPI.COMM_WORLD.Dup()
@@ -3068,11 +3135,14 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
     @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize(
+        "force_window_fallback", [None, False, True], ids=["routing", "window", "fallback"]
+    )
     def test_nccl_ep_cuda_graph_replay_uses_updated_routing(
-        self, mpi_pool_executor, routing_dtype: torch.dtype
+        self, mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool | None
     ) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""
-        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype)
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype, force_window_fallback)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(

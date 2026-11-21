@@ -170,6 +170,21 @@ inline __device__ void quantizeAndWriteMlaFp4Residual(PackedVec<T> const& values
     residualOut[1] = fp32_vec_to_e2m1(residualHigh);
 }
 
+template <typename T>
+inline __device__ uint2 convertMlaVecToE4m3(PackedVec<T> const& values)
+{
+    static_assert(sizeof(T) * 8 == sizeof(PackedVec<T>));
+    auto const* elements = reinterpret_cast<T const*>(&values);
+    uint2 packed;
+    auto* output = reinterpret_cast<__nv_fp8_e4m3*>(&packed);
+#pragma unroll
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        output[index] = __nv_fp8_e4m3(static_cast<float>(elements[index]));
+    }
+    return packed;
+}
+
 template <typename T, int32_t kMainVecsPerToken, int32_t kResidualVecsPerToken>
 inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& dataCache, KVBlockArray const& scaleCache,
     int32_t batchIdx, int32_t tokenIdx, int32_t inBlockIdx, uint32_t* dst, PackedVec<T>& values, float secondLevelScale)
@@ -178,6 +193,36 @@ inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& dataCache, KVB
     static_assert(kResidualVecsPerToken % 2 == 0);
     int32_t const dataBytesPerToken = dataCache.mBytesPerBlock / dataCache.mTokensPerBlock;
     int32_t const scaleBytesPerToken = scaleCache.mBytesPerBlock / scaleCache.mTokensPerBlock;
+
+    // Inline-scale record (FlashInfer PrimTS D576 "nvfp4.fp8rope"): E2M1 NoPE codes, the last
+    // kResidualVecsPerToken vectors (RoPE) as E4M3, then the NoPE block scales with block b at
+    // 8 * (b % 4) + b / 4. The scale pool is unused, and the block scales and the RoPE values are
+    // real-valued: the second-level scale of the other layouts does not apply.
+    constexpr int32_t kNopeVecsPerToken = kMainVecsPerToken - kResidualVecsPerToken;
+    constexpr int32_t kRecordRopeOffset = kNopeVecsPerToken * static_cast<int32_t>(sizeof(uint32_t));
+    constexpr int32_t kRecordScaleOffset
+        = kRecordRopeOffset + kResidualVecsPerToken * static_cast<int32_t>(sizeof(uint2));
+    constexpr int32_t kRecordBytesPerToken = kRecordScaleOffset + kNopeVecsPerToken / 2;
+    if (dataBytesPerToken == kRecordBytesPerToken)
+    {
+        int32_t const tokenLocalIdx = inBlockIdx / kMainVecsPerToken;
+        int32_t const vecIdx = inBlockIdx % kMainVecsPerToken;
+        auto* record = reinterpret_cast<uint8_t*>(dst) + static_cast<int64_t>(tokenLocalIdx) * kRecordBytesPerToken;
+        if (vecIdx < kNopeVecsPerToken)
+        {
+            int32_t const scaleBlock = vecIdx / 2;
+            uint8_t* scaleOut
+                = (vecIdx & 1) == 0 ? record + kRecordScaleOffset + 8 * (scaleBlock % 4) + scaleBlock / 4 : nullptr;
+            reinterpret_cast<uint32_t*>(record)[vecIdx] = cvt_warp_fp16_to_fp4<T, 16, false>(values, 1.F, scaleOut);
+        }
+        else
+        {
+            reinterpret_cast<uint2*>(record + kRecordRopeOffset)[vecIdx - kNopeVecsPerToken]
+                = convertMlaVecToE4m3(values);
+        }
+        return;
+    }
+
     constexpr int32_t kResidualDataBytesPerToken
         = (kMainVecsPerToken + kResidualVecsPerToken) * static_cast<int32_t>(sizeof(uint32_t));
     constexpr int32_t kResidualScaleBytesPerToken = (kMainVecsPerToken + kResidualVecsPerToken) / 2;
@@ -1839,17 +1884,18 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 template <typename T>
 void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(total_kv_len >= 0, "MLA Context: total_kv_len must be nonnegative");
     TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8 || params.cache_type == KvCacheDataType::NVFP4,
         "MLA Context: cache_type must be FP8 or NVFP4");
     TLLM_CHECK_WITH_INFO(params.q_buf != nullptr, "MLA Context: q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.k_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.k_buf != nullptr,
         "MLA Context: k_buf must be non-null in non-absorption mode");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.v_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.v_buf != nullptr,
         "MLA Context: v_buf must be non-null in non-absorption mode");
     TLLM_CHECK_WITH_INFO(params.quant_q_buf != nullptr, "MLA Context: quant_q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_k_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.quant_k_buf != nullptr,
         "MLA Context: quant_k_buf must be non-null in non-absorption mode");
-    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_v_buf != nullptr,
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || total_kv_len == 0 || params.quant_v_buf != nullptr,
         "MLA Context: quant_v_buf must be non-null in non-absorption mode");
     TLLM_CHECK_WITH_INFO(params.absorption_mode || params.v_token_stride_elements >= 0,
         "MLA Context: V token stride must be nonnegative");
@@ -1866,12 +1912,15 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         // Convert Q to FP8 in absorption mode.
         if (params.absorption_mode)
         {
+            // Q-sized grids can reduce idle blocks but also useful CTA parallelism.
+            static bool const useQLenForQuantGrid = getBoolEnv("TRTLLM_MLA_Q_QUANT_GRID_USE_Q_LEN");
+            int const quantGridLen = useQLenForQuantGrid ? params.acc_q_len : total_kv_len;
 
             if (params.meta.rope_append)
             {
                 constexpr int threads_per_block = 288;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
-                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                dim3 grid(int(tensorrt_llm::common::divUp(quantGridLen, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
@@ -1890,7 +1939,7 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             {
                 constexpr int threads_per_block = 256;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 512 * sizeof(T);
-                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                dim3 grid(int(tensorrt_llm::common::divUp(quantGridLen, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
@@ -1906,27 +1955,71 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                         params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
             }
         }
-        else
+        else if (params.fp8_kv_input)
         {
-            // The Q or K tensor has layout of [num_tokens, head_num, 192] in the non-absorption mode.
-            // The V tensor has layout of [num_tokens, head_num, 128] in the non-absorption mode.
-            // Convert Q, K, V to FP8 in non-absorption mode.
-
+            // K and V are FP8 already: quantize Q only, or nothing when it is FP8 too. Block 0 still
+            // writes the BMM scales.
             constexpr int threads_per_block = 384;
             constexpr int num_tokens_per_block = threads_per_block * 16 / 192 * sizeof(T);
-            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+            int const q_len = params.fp8_q_input ? 0 : params.acc_q_len;
+            dim3 grid(std::max(1, int(tensorrt_llm::common::divUp(q_len, num_tokens_per_block))), 1,
+                params.fp8_q_input ? 1 : params.head_num);
 
             TLLM_LOG_DEBUG(
-                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+                "Launching quantizeCopyInputToFp8Kernel (FP8 K/V input) with grid_size: (%d, %d, %d), "
+                "threads_per_block: %d, acc_q_len: %d, fp8_q_input: %d",
+                grid.x, grid.y, grid.z, threads_per_block, params.acc_q_len, params.fp8_q_input);
 
             quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
                 <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, srcVTokenStride,
-                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+                    /*k_buf=*/nullptr, /*quant_k_buf=*/nullptr, /*v_buf=*/nullptr, /*quant_v_buf=*/nullptr, q_len,
+                    /*total_kv_len=*/0, srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        }
+        else
+        {
+            // Expanded Q/K and V can have different widths. Keep the D192/V128
+            // launch geometry while admitting the equal-width context kernels.
+            auto launch = [&](auto nopeDimTag, auto valueDimTag, auto blockSizeTag)
+            {
+                constexpr int kNopeDim = decltype(nopeDimTag)::value;
+                constexpr int kValueDim = decltype(valueDimTag)::value;
+                constexpr int kRopeDim = 64;
+                constexpr int kQkDim = kNopeDim + kRopeDim;
+                constexpr int kThreadsPerBlock = decltype(blockSizeTag)::value;
+                constexpr int kTokensPerBlock = kThreadsPerBlock * 16 / kQkDim * sizeof(T);
+                // Empty cached partitions still need the Q quantization and scales.
+                int const tokens = std::max(params.acc_q_len, total_kv_len);
+                dim3 grid(int(tensorrt_llm::common::divUp(tokens, kTokensPerBlock)), 1, params.head_num);
+                quantizeCopyInputToFp8Kernel<T, kThreadsPerBlock, kNopeDim, kRopeDim, kValueDim, false>
+                    <<<grid, kThreadsPerBlock, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                        params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            };
+            TLLM_CHECK_WITH_INFO(
+                params.meta.qk_rope_head_dim == 64, "Expanded MLA FP8 quantization requires RoPE dimension 64");
+            if (params.meta.qk_nope_head_dim == 64 && params.meta.v_head_dim == 128)
+            {
+                launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{},
+                    std::integral_constant<int, 256>{});
+            }
+            else if (params.meta.qk_nope_head_dim == 128 && params.meta.v_head_dim == 128)
+            {
+                launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{},
+                    std::integral_constant<int, 384>{});
+            }
+            else if (params.meta.qk_nope_head_dim == 192 && params.meta.v_head_dim == 256)
+            {
+                launch(std::integral_constant<int, 192>{}, std::integral_constant<int, 256>{},
+                    std::integral_constant<int, 256>{});
+            }
+            else
+            {
+                TLLM_THROW("Expanded MLA FP8 quantization supports QK/V=(128,128), (192,128) or (256,256)");
+            }
         }
     }
     else
@@ -2313,6 +2406,78 @@ void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos
 
 INSTANTIATE_MLA_ROPE_INPLACE(__nv_bfloat16);
 INSTANTIATE_MLA_ROPE_INPLACE(half);
+
+template <typename T>
+__global__ void reorderHelixMlaKVKernel(T const* gathered, T* compressedKv, T* kPe, int64_t const* cuGlobal,
+    int64_t const* globalOffsets, int64_t const* cuLocal, int64_t const* localOffsets, int64_t const* rankOffsets,
+    int numTokens, int numContexts, int cpSize, int tokensPerBlock, int loraSize, int ropeSize)
+{
+    constexpr int kWarpSize = 32;
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kElementsPerVector = sizeof(uint4) / sizeof(T);
+    int const token = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpSize;
+    if (token >= numTokens)
+    {
+        return;
+    }
+    // Repeated boundaries represent requests with no history in this chunk.
+    int left = 0;
+    int right = numContexts;
+    while (left < right)
+    {
+        int const mid = (left + right) / 2;
+        if (cuGlobal[mid + 1] <= token)
+        {
+            left = mid + 1;
+        }
+        else
+        {
+            right = mid;
+        }
+    }
+    int const request = left;
+    int64_t const position = globalOffsets[request] + token - cuGlobal[request];
+    int const owner = (position / tokensPerBlock) % cpSize;
+    int64_t const slot
+        = position / (static_cast<int64_t>(tokensPerBlock) * cpSize) * tokensPerBlock + position % tokensPerBlock;
+    int64_t const sourceRow = rankOffsets[owner] + cuLocal[owner * (numContexts + 1) + request] + slot
+        - localOffsets[owner * numContexts + request];
+    int const kvVectors = loraSize / kElementsPerVector;
+    int const peVectors = ropeSize / kElementsPerVector;
+    auto const* source = reinterpret_cast<uint4 const*>(gathered) + sourceRow * (kvVectors + peVectors);
+    int const lane = threadIdx.x % kWarpSize;
+    for (int column = lane; column < kvVectors; column += kWarpSize)
+    {
+        reinterpret_cast<uint4*>(compressedKv)[static_cast<int64_t>(token) * kvVectors + column] = source[column];
+    }
+    for (int column = lane; column < peVectors; column += kWarpSize)
+    {
+        reinterpret_cast<uint4*>(kPe)[static_cast<int64_t>(token) * peVectors + column] = source[kvVectors + column];
+    }
+}
+
+template <typename T>
+void invokeReorderHelixMlaKV(T const* gathered, T* compressedKv, T* kPe, int64_t const* cuGlobal,
+    int64_t const* globalOffsets, int64_t const* cuLocal, int64_t const* localOffsets, int64_t const* rankOffsets,
+    int numTokens, int numContexts, int cpSize, int tokensPerBlock, int loraSize, int ropeSize, cudaStream_t stream)
+{
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kThreadsPerBlock = 128;
+    if (numTokens > 0)
+    {
+        reorderHelixMlaKVKernel<T><<<divUp(numTokens, kWarpsPerBlock), kThreadsPerBlock, 0, stream>>>(gathered,
+            compressedKv, kPe, cuGlobal, globalOffsets, cuLocal, localOffsets, rankOffsets, numTokens, numContexts,
+            cpSize, tokensPerBlock, loraSize, ropeSize);
+    }
+}
+
+template void invokeReorderHelixMlaKV<half>(half const*, half*, half*, int64_t const*, int64_t const*, int64_t const*,
+    int64_t const*, int64_t const*, int, int, int, int, int, int, cudaStream_t);
+template void invokeReorderHelixMlaKV<__nv_bfloat16>(__nv_bfloat16 const*, __nv_bfloat16*, __nv_bfloat16*,
+    int64_t const*, int64_t const*, int64_t const*, int64_t const*, int64_t const*, int, int, int, int, int, int,
+    cudaStream_t);
+template void invokeReorderHelixMlaKV<float>(float const*, float*, float*, int64_t const*, int64_t const*,
+    int64_t const*, int64_t const*, int64_t const*, int, int, int, int, int, int, cudaStream_t);
 
 } // namespace kernels
 

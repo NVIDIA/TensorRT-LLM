@@ -32,9 +32,13 @@ from ...spec.schema_keys import reject_unknown_keys
 from . import SCHEDULER_PATH
 from .scheduler import latest_watcher, parse_duration, utc_iso
 
-#: What a session is for: gate jobs go to ``environment.spool`` or a ``gates`` session
-#: (``select_command_executor``); otherwise the role only informs the prompts and the operator.
+#: What a session is for: ``gates`` takes gate jobs, ``work`` only what a worker submits to it,
+#: and ``any`` (the default) both. Gate jobs go to ``environment.spool`` and every session of a
+#: :data:`GATE_ROLES` role (``select_command_executor``); a worker picks its session from the
+#: roles in its prompt (:func:`describe_sessions`).
 SESSION_ROLES: tuple[str, ...] = ("gates", "work", "any")
+#: The roles whose sessions take gate jobs.
+GATE_ROLES: tuple[str, ...] = ("gates", "any")
 
 SESSION_KEYS: tuple[str, ...] = (
     "name",

@@ -34,13 +34,16 @@ isolation -- it is spread across three points inside
 ``test_py_executor.py`` does for the PP scheduling path.
 """
 
+from contextlib import nullcontext
 from types import MethodType
 from unittest.mock import MagicMock, call
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager, OutOfPagesError
 
@@ -539,11 +542,11 @@ class TestConsumePreviousBatch:
             exe.dist.world_size = 2
             exe.dist.mapping.tp_group = [0, 1]
             exe.gather_all_responses = False
-            exe.responses = {}
-            exe.response_cv = MagicMock()
-            exe.result_wait_queues = {}
+            exe._response_channel = ResponseChannel()
             exe._pending_transfer_responses = []
             exe._pending_response_terminations = []
+            exe._merged_transfer_flush = None
+            exe._stage_responses = False
             exe._is_preemption_pending.return_value = False
             exe.enable_early_first_token_response = False
             exe.enable_iter_perf_stats = False
@@ -609,7 +612,11 @@ class TestConsumePreviousBatch:
                 wraps=MethodType(PyExecutor._process_previous_batch, exe)
             )
             exe._handle_responses = MethodType(PyExecutor._handle_responses, exe)
+            exe._create_request_response = MethodType(PyExecutor._create_request_response, exe)
             exe._enqueue_responses = MethodType(PyExecutor._enqueue_responses, exe)
+            exe._gather_and_publish_responses = MethodType(
+                PyExecutor._gather_and_publish_responses, exe
+            )
             exe._add_kv_cache_events = MethodType(PyExecutor._add_kv_cache_events, exe)
             return exe
 
@@ -620,8 +627,10 @@ class TestConsumePreviousBatch:
         expected_calls = ["transfer", "response"] + (["events"] if enable_events else [])
         assert transcripts == [expected_calls, expected_calls]
         assert batch_order == expected_batch_order
-        assert executors[0].responses == {rank + 1: [responses[rank]] for rank in batch_ranks}
-        assert executors[1].responses == {}
+        assert executors[0]._response_channel.responses == {
+            rank + 1: [responses[rank]] for rank in batch_ranks
+        }
+        assert executors[1]._response_channel.responses == {}
         for rank, exe in enumerate(executors):
             assert exe.previous_batch is None
             assert exe._pending_transfer_responses == []
@@ -1175,7 +1184,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe._pending_recompute_pause_ids = set()
     # The loop wraps forward+sample in ``_step_scope()``, which reads this to
     # decide whether to open a profiler range. False keeps it at nullcontext.
-    exe._profile_enabled = False
+    exe._profile_controller = MagicMock(enabled=False)
 
     # Rebalance state uses the executor's global KV manager gate.
     exe._is_kv_manager_v2 = True
@@ -1193,15 +1202,21 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # No tentative attention-DP dummy is pending, so a skipped microbatch's
     # rollback (_finalize_adp_dummy_allocation(False)) is a no-op.
     exe._pending_adp_dummy_request = None
-    exe._revert_gen_alloc = MagicMock()
+    exe._revert_unexecuted_alloc = MagicMock()
     exe._add_inflight_ids = MagicMock()
     exe._handle_dynamic_draft_len = MagicMock()
     exe.resource_manager = MagicMock()
     exe.wait_on_pp_send_handles = MagicMock()
     exe.kv_cache_transceiver = None
-    # Empty: the loop's idle recompute-pause progress hook must find nothing
-    # pending, so it never reaches the PP termination handler.
+    # Empty: an idle iteration finds no deferred recompute pause, so it needs no
+    # PP termination handler.
     exe._pending_recompute_pause_ids = set()
+    # An iteration that executes no batch flushes responses buffered outside a
+    # batch and advances deferred PP terminations; none are pending here.
+    exe._pending_transfer_responses = []
+    exe._pending_response_terminations = []
+    exe._disagg_pp_termination_handler = None
+    exe.enable_attention_dp = False
 
     # Loop termination: the loop breaks when should_stop_processing goes true,
     # which is a property over these three.
@@ -1280,18 +1295,53 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
 class TestPpLoopDrainWiring:
     """The three points in ``_executor_loop_pp`` that make the drain work."""
 
-    def test_loop_queues_normally_when_no_rebalance_is_pending(self, monkeypatch):
-        """Control case: without a drain the loop reaches the forward.
+    def test_last_pp_rank_samples_owned_logits_without_rebalance(self, monkeypatch):
+        """Without a drain, the last PP rank forwards and samples owned outputs."""
 
-        Without this the drain test below would pass even if ``can_queue`` were
-        never honored -- e.g. if the loop simply never queued anything.
-        """
+        class StopAfterSampling(RuntimeError):
+            pass
+
         exe = _make_pp_loop_executor(monkeypatch, agreement=(False,))
+        exe.dist.rank = exe.dist.pp_rank = 1
+        exe.dist.is_first_pp_rank = False
+        exe.dist.is_last_pp_rank = True
+        exe.scheduler = MagicMock()
+        exe.kv_cache_manager = MagicMock()
+        exe.inflight_req_ids = set()
+        exe.guided_decoder = None
+        exe.perf_manager = MagicMock()
+        exe.pp_multi_stream_sample = True
+        exe.finish_sample_event = MagicMock()
+        exe.sample_stream = MagicMock()
+        outputs = {"logits": torch.arange(6).reshape(2, 3), "context_logits_handled": True}
+        exe._forward_step = MagicMock(return_value=outputs)
+        exe._sample_async = MagicMock()
+        sampling_calls = MagicMock()
+        sampling_calls.attach_mock(exe.finish_sample_event.wait, "event_wait")
+        sampling_calls.attach_mock(exe.sample_stream.wait_stream, "stream_wait")
+        sampling_calls.attach_mock(exe._sample_async, "sample")
+        sampling_calls.attach_mock(exe.finish_sample_event.record, "event_record")
+        exe._handle_guided_decoder_errors = MagicMock(side_effect=StopAfterSampling)
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
-        with pytest.raises(_ReachedForward):
+        with pytest.raises(StopAfterSampling):
             PyExecutor._executor_loop_pp(exe)
 
-        exe._forward_step_inter_pp.assert_called_once()
+        exe._forward_step.assert_called_once()
+        exe._sample_async.assert_called_once()
+        sampled = exe._sample_async.call_args.args[1]
+        assert sampled["context_logits_handled"] is True
+        assert sampled["logits"].data_ptr() != outputs["logits"].data_ptr()
+        torch.testing.assert_close(sampled["logits"], outputs["logits"])
+        outputs["logits"].zero_()
+        torch.testing.assert_close(sampled["logits"], torch.arange(6).reshape(2, 3))
+        exe.sample_stream.wait_stream.assert_called_once_with(torch.cuda.current_stream())
+        assert sampling_calls.mock_calls == [
+            call.event_wait(),
+            call.stream_wait(torch.cuda.current_stream()),
+            call.sample(*exe._sample_async.call_args.args),
+            call.event_record(),
+        ]
         exe._rebalance_kv_pools_now.assert_not_called()
 
     def test_drain_suppresses_queueing_then_rebalances_and_resumes(self, monkeypatch):
@@ -1309,7 +1359,7 @@ class TestPpLoopDrainWiring:
 
         # Two drain iterations queued nothing, the third one did.
         exe._forward_step_inter_pp.assert_called_once()
-        assert exe._revert_gen_alloc.call_count == 2
+        assert exe._revert_unexecuted_alloc.call_count == 2
         assert exe.micro_batches == [None, None]
 
         # And the rebalance ran exactly once, at the end of the drain.
@@ -1341,7 +1391,7 @@ class TestPpLoopDrainWiring:
         with pytest.raises(_ReachedForward):
             PyExecutor._executor_loop_pp(exe)
 
-        assert exe._revert_gen_alloc.call_count == 4
+        assert exe._revert_unexecuted_alloc.call_count == 4
         exe._rebalance_kv_pools_now.assert_called_once()
 
     def test_no_drain_is_started_while_one_is_pending(self, monkeypatch):

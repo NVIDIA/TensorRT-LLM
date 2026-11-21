@@ -69,6 +69,8 @@ from typing import Any
 import pytest
 import yaml
 
+pytestmark = pytest.mark.cpu_only
+
 REFERENCE_PATH = pathlib.Path(__file__).parent / "references" / "trtllm_serve_api.yaml"
 
 _PROTOCOL_MODULE = "tensorrt_llm.serve.openai_protocol"
