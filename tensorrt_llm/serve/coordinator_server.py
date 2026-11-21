@@ -49,6 +49,7 @@ from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.output_length_predictor import MAX_TOKENS, RECORD_BATCH_MAX, is_token_count
+from tensorrt_llm.serve.router import ServerPreparationPending
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -177,6 +178,10 @@ class CoordinatorServer:
         except NoGenerationSeatError as e:
             # Overload, not a fault: the frontend answers its client 503 too.
             return self._response({"error": str(e), "no_generation_seat": True}, status_code=503)
+        except ServerPreparationPending as e:
+            return self._response(
+                {"error": str(e), "context_preparation_pending": True}, status_code=503
+            )
         except ValueError as e:
             return self._response({"error": str(e)}, status_code=503)
         except Exception as e:  # noqa: BLE001
@@ -208,7 +213,18 @@ class CoordinatorServer:
         success = body.get("success", True)
         if not isinstance(success, bool):
             return self._response({"error": "success must be a boolean"}, status_code=400)
-        await self._coordinator.finish(role, req_id, success)
+        if "context_admission" in body:
+            admission = body["context_admission"]
+            if (
+                role not in ("ctx", "context")
+                or success
+                or not isinstance(admission, str)
+                or not admission
+            ):
+                return self._response({"error": "Invalid rejected CTX admission"}, status_code=400)
+            await self._coordinator.finish(role, req_id, False, context_admission=admission)
+        else:
+            await self._coordinator.finish(role, req_id, success)
         return self._response({})
 
     @staticmethod

@@ -79,7 +79,7 @@ from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
                                                 stream_error_event)
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import Router, ServerPreparationPending
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -840,6 +840,9 @@ class OpenAIDisaggServer:
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
+        elif isinstance(exception, ServerPreparationPending):
+            self._perf_metrics_collector.http_exceptions.inc()
+            raise HTTPException(status_code=503, detail=str(exception)) from exception
         elif isinstance(exception, NoGenerationSeatError):
             # Overload (no generation seat in time, or shutdown): the client
             # should retry, so 503 without a traceback.

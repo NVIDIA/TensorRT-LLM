@@ -40,7 +40,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import aiohttp
 import msgpack
@@ -102,6 +102,13 @@ POOLED_RESERVATION_TIMEOUT_S = 6 * 3600.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
 COORDINATOR_READINESS_TIMEOUT_S = 5.0
+
+
+class _Reservation(NamedTuple):
+    """Coordinator expiry and, for protected CTX, the admission actually granted."""
+
+    expiry: asyncio.Task
+    context_admission: str | None = None
 
 
 def coordinator_reservation_timeout() -> float:
@@ -263,7 +270,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._reservation_timeout_secs = reservation_timeout(
             reservation_timeout_secs, request_timeout_secs
         )
-        self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
+        self._reservation_tasks: dict[tuple[str, int], _Reservation] = {}
         self._context_worker_registrations: dict[str, str] = {}
         self._context_admission_tasks: dict[str, asyncio.Task] = {}
         self._context_admission_closed = False
@@ -354,7 +361,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         async with self._reservation_lock(reservation_key):
             previous = self._reservation_tasks.pop(reservation_key, None)
             if previous is not None:
-                previous.cancel()
+                previous.expiry.cancel()
                 await router.finish_request_by_id(req_id, False)
             server, info, request_id = await router.get_next_server_by_key(
                 routing_key, req_id=req_id, exclude_server=exclude_server
@@ -362,8 +369,17 @@ class DisaggCoordinatorService(DisaggCoordinator):
             # A router that placed nothing asks for more routing input; the
             # worker repeats the select with it, so nothing is reserved.
             if server is not None:
-                self._reservation_tasks[reservation_key] = asyncio.create_task(
-                    self._expire_reservation(reservation_key, router)
+                admission = None
+                if reservation_key[0] == "context" and self._context_cancellation_enabled:
+                    # Use the metadata captured by the grant, not another lookup by URL.
+                    admission = info.get("server_info", {}).get("_ctx_admission")
+                    if not admission:
+                        await router.finish_request_by_id(req_id, False)
+                        raise ServerPreparationPending("Selected CTX has no verified admission")
+                    info["context_admission"] = admission
+                self._reservation_tasks[reservation_key] = _Reservation(
+                    asyncio.create_task(self._expire_reservation(reservation_key, router)),
+                    admission,
                 )
         return server, info, request_id
 
@@ -451,9 +467,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         )
         previous = self._reservation_tasks.pop(reservation_key, None)
         if previous is not None:
-            previous.cancel()
-        self._reservation_tasks[reservation_key] = asyncio.create_task(
-            self._expire_reservation(reservation_key, router)
+            previous.expiry.cancel()
+        self._reservation_tasks[reservation_key] = _Reservation(
+            asyncio.create_task(self._expire_reservation(reservation_key, router))
         )
         self._api_lat(f"select[{role}]").record(time.monotonic() - t0)
         return server, self._compact_route_info(info), request_id
@@ -462,7 +478,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
     def _compact_route_info(info: dict) -> dict:
         compact = {
             key: info[key]
-            for key in ("match_length", "num_tokens", ROUTING_CONTENT_REQUIRED)
+            for key in ("match_length", "num_tokens", ROUTING_CONTENT_REQUIRED, "context_admission")
             if key in info
         }
         disaggregated_params = info.get("server_info", {}).get("disaggregated_params")
@@ -490,7 +506,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         now = time.monotonic()
         return sum(predictor.record(conv, isl, out, key, now) for conv, isl, out, key in records)
 
-    async def finish(self, role: str, req_id, success: bool = True) -> None:
+    async def finish(
+        self, role: str, req_id, success: bool = True, *, context_admission: str | None = None
+    ) -> None:
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         reservation_key = (normalized_role, req_id)
@@ -498,9 +516,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
             # Its frontend reports the reply (or the failure) by the key itself.
             self._prediction_keys.pop(req_id, None)
         async with self._reservation_lock(reservation_key):
-            reservation = self._reservation_tasks.pop(reservation_key, None)
+            reservation = self._reservation_tasks.get(reservation_key)
+            if context_admission is not None and (
+                reservation is None or reservation.context_admission != context_admission
+            ):
+                return
             if reservation is not None:
-                reservation.cancel()
+                self._reservation_tasks.pop(reservation_key)
+                reservation.expiry.cancel()
             await self._router_for_role(normalized_role).finish_request_by_id(req_id, success)
         self._api_lat(f"finish[{role}]").record(time.monotonic() - _t0)
 
@@ -514,9 +537,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 raise ValueError(
                     f"No active coordinator reservation for role={normalized_role}, req_id={req_id}"
                 )
-            reservation.cancel()
-            self._reservation_tasks[reservation_key] = asyncio.create_task(
-                self._expire_reservation(reservation_key, self._router_for_role(normalized_role))
+            reservation.expiry.cancel()
+            self._reservation_tasks[reservation_key] = _Reservation(
+                asyncio.create_task(
+                    self._expire_reservation(
+                        reservation_key, self._router_for_role(normalized_role)
+                    )
+                ),
+                reservation.context_admission,
             )
 
     async def _expire_reservation(self, key: tuple[str, int], router: Router) -> None:
@@ -526,7 +554,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
         except asyncio.CancelledError:
             raise
         async with self._reservation_lock(key):
-            if self._reservation_tasks.get(key) is not asyncio.current_task():
+            reservation = self._reservation_tasks.get(key)
+            if reservation is None or reservation.expiry is not asyncio.current_task():
                 return
             self._reservation_tasks.pop(key, None)
             logger.warning(
@@ -633,7 +662,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         if admissions:
             await asyncio.gather(*admissions, return_exceptions=True)
         await self.fail_seat_waiters()
-        reservations = list(self._reservation_tasks.values())
+        reservations = [reservation.expiry for reservation in self._reservation_tasks.values()]
         self._reservation_tasks.clear()
         for reservation in reservations:
             reservation.cancel()
