@@ -33,6 +33,8 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2ctx
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep2ctx
+  - disaggregated/test_benchmark_start_timeout.py::test_benchmark_preserves_cluster_startup_default
+  - disaggregated/test_benchmark_start_timeout.py::test_benchmark_forwards_explicit_startup_override
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
