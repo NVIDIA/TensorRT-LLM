@@ -20,9 +20,10 @@ Each rank owns one segment with two slot sets and one slot per sender::
     segment: | slot set 0: slot 0 | slot 1 | ... | slot set 1: slot 0 | slot 1 | ... |
     slot:    | header | payload packet 1 | payload packet 2 | ... |
 
-A slot is a run of 8-byte packets. The lower 32 bits hold the payload length in the header and 4
-payload bytes in a payload packet. The upper 32 bits hold the round's epoch, so a packet is new when
-it carries the current epoch and a slot needs no ready flag.
+A slot is a run of 8-byte packets. The lower 32 bits hold, in the header, the payload bytes that the
+sender has left from this round on, capped at 0xFFFFFFFF, and in a payload packet 4 payload bytes.
+The upper 32 bits hold the round's epoch, so a packet is new when it carries the current epoch and a
+slot needs no ready flag.
 """
 
 from __future__ import annotations

@@ -24,6 +24,7 @@ membership change interrupted. ``MnnvlHostExchangeGroup`` moves the slots throug
 from __future__ import annotations
 
 import functools
+import itertools
 import pickle  # nosec B403
 from typing import Callable, Iterator, Optional, Protocol, Sequence
 
@@ -64,7 +65,11 @@ class HostExchangeGroup(Protocol):
     def start_round(
         self, epoch: int, words: np.ndarray, length: int, recipients: Optional[int]
     ) -> None:
-        """Stage this rank's slot of round ``epoch``, its payload for ``recipients`` (None: all)."""
+        """Stage this rank's slot of round ``epoch``, its payload for ``recipients`` (None: all).
+
+        ``words`` holds the round's payload bytes, at most one slot. ``length`` goes in the header:
+        the payload bytes this rank has left from this round on, capped at 0xFFFFFFFF.
+        """
 
     def wait(
         self,
@@ -114,6 +119,8 @@ class HostExchange:
 
     # Sized so that a step's request broadcast and response gather usually take one round.
     DEFAULT_SLOT_PAYLOAD_BYTES = 64 * 1024
+    # The largest length a header holds in its 32 bits.
+    _MAX_HEADER_LENGTH = 0xFFFFFFFF
 
     def __init__(self, group: HostExchangeGroup):
         self.group = group
@@ -270,8 +277,9 @@ class HostExchange:
         ranks = self._ranks_of(readers)[1]
         out = np.zeros((self.nranks, data.size), dtype=np.uint8)
         step = 4 * self._words
+        expected = min(data.size, self._MAX_HEADER_LENGTH)
         for k, (lengths, rows) in enumerate(self._rounds(data.tobytes(), readers)):
-            if k == 0 and (lengths[self._ranks_of(readers & ~self._failed)[0]] != data.size).any():
+            if k == 0 and (lengths[self._ranks_of(readers & ~self._failed)[0]] != expected).any():
                 raise ValueError(
                     f"allgather_array rows differ in size across ranks: {lengths.tolist()}"
                 )
@@ -303,15 +311,20 @@ class HostExchange:
     def _rounds(
         self, data: bytes, readers: int, recipients: Optional[int] = None, idle: bool = False
     ) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
-        """Yield header lengths and packets per round, sending one slot of ``data`` per round."""
+        """Yield header lengths and packets per round, sending one slot of ``data`` per round.
+
+        Each header carries the bytes its sender has left from that round on, up to the largest
+        32-bit length. Another round follows while some header carries more than a slot.
+        """
         self._round_readers = readers
         self._failed = 0
         step = 4 * self._words
-        lengths, rows = self._round(data[:step], len(data), readers, recipients, idle)
-        yield lengths, rows
-        for k in range(1, ceil_div(int(lengths.max()), step)):
-            chunk = data[step * k : step * (k + 1)]
-            yield self._round(chunk, len(chunk), readers, recipients, idle)
+        for start in itertools.count(0, step):
+            left = min(max(len(data) - start, 0), self._MAX_HEADER_LENGTH)
+            lengths, rows = self._round(data[start : start + step], left, readers, recipients, idle)
+            yield lengths, rows
+            if int(lengths.max()) <= step:
+                return
 
     def _round(
         self,
@@ -359,7 +372,7 @@ class HostExchange:
         return lengths, (rows[:, :packets] if packets > 1 else None)
 
     def _header_lengths(self, headers: np.ndarray, active: int) -> np.ndarray:
-        """Return the payload length in each rank's header, or 0 for a rank outside ``active``."""
+        """Return the length in each rank's header, or 0 for a rank outside ``active``."""
         return headers.view(np.uint32)[:, 0] * self._ranks_of(active)[0]
 
     @property

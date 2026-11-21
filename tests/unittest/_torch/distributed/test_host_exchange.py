@@ -609,6 +609,66 @@ def test_long_payloads_reach_only_recipients(monkeypatch, seed):
         assert not rows[others, :, r, header_poll:].any()
 
 
+class _ZeroBytes:
+    """``size`` zero bytes, made only for the slices taken."""
+
+    def __init__(self, size):
+        self._size = size
+
+    def __len__(self):
+        return self._size
+
+    def __getitem__(self, part):
+        return bytes(len(range(*part.indices(self._size))))
+
+
+def test_payload_longer_than_header_length(monkeypatch):
+    """Check that a payload of 4 GiB or more sends its rounds, whose headers hold 32 bits.
+
+    The test stops the exchange at its third round, so the payload's bytes are never made.
+    """
+    exchange = _host_exchange_group(monkeypatch, 1, _SLOT_BYTES)[0]
+    start_round, lengths = exchange.group.start_round, []
+
+    def start_three_rounds(epoch, words, length, recipients):
+        start_round(epoch, words, length, recipients)
+        lengths.append(length)
+        if len(lengths) == 3:
+            raise _Replaced
+
+    exchange.group.start_round = start_three_rounds
+    with pytest.raises(_Replaced):
+        exchange.exchange(_ZeroBytes(1 << 32))
+    assert lengths == [0xFFFFFFFF, (1 << 32) - _SLOT_BYTES, (1 << 32) - 2 * _SLOT_BYTES]
+
+
+@pytest.mark.timeout(60)
+def test_header_with_more_than_a_slot_left_runs_another_round(monkeypatch):
+    """Check that a rank runs another round while a peer's header says more than a slot is left.
+
+    Rank 1 sends three slots with its headers capped at two slots, as a payload of 4 GiB or more
+    caps them at 32 bits, so its first header says less than it has left.
+    """
+    exchange = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)[0]
+    group, rows = exchange.group, exchange.group.rows
+    start_round = group.start_round
+    payload = b"a" * _SLOT_BYTES + b"b" * _SLOT_BYTES + b"c" * _SLOT_BYTES
+    headers = iter([2 * _SLOT_BYTES, 2 * _SLOT_BYTES, _SLOT_BYTES])
+
+    def start_with_rank_1(epoch, words, length, recipients):
+        start_round(epoch, words, length, recipients)
+        # Rank 1's slot of this round, written into rank 0's row.
+        start = (epoch - 1) * _SLOT_BYTES
+        packets = _slot(epoch, payload[start : start + _SLOT_BYTES], length=next(headers))
+        slot = (epoch & 1) * group._slot_set_bytes + group._slot_bytes
+        rows._memory[slot : slot + packets.nbytes] = packets.view(np.uint8)
+
+    group.start_round = start_with_rank_1
+    results = _run_ranks([exchange], [lambda e: e.exchange(b"x0")])
+    assert results[0] == [b"x0", payload]
+    assert exchange.epoch == 3
+
+
 def _row_chunk_by_slicing(rows, size, k):
     """Return round ``k`` of ``size``-byte rows by slicing the packets' lower halves in numpy."""
     words = rows.shape[1] - 1
@@ -629,8 +689,8 @@ def test_unpack_payloads_into_matches_slicing():
         size = int(rng.integers(1, 12 * words))
         k = int(rng.integers(-(-size // (4 * words))))
         ranks = sorted(rng.choice(nranks, rng.integers(1, nranks + 1), replace=False).tolist())
-        # Round 0 carries the whole row size in the header, later rounds their chunk size.
-        length = size if k == 0 else min(4 * words, size - 4 * words * k)
+        # Each round's header carries the bytes left from that round on.
+        length = size - 4 * words * k
         lengths = np.full(nranks, length, dtype=np.uint32)
         out = np.zeros((nranks, size), dtype=np.uint8)
         host_exchange.unpack_payloads_into(rows, lengths, ranks, out, 4 * words * k)
