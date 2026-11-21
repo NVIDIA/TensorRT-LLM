@@ -163,6 +163,10 @@ class StepInputPack:
     ALIGN = 16
     # The pinned window a graph's prologue copies (in_graph): the header, the descriptors and up to ~10 KB of data.
     GRAPH_WINDOW = 1 << 14
+    # A model's own pack (RuntimeHooks.step_input_pack_factory) may set this on its class; the stock pack keeps it
+    # off. The engine then issues the pack right after the step's input preparation, before it records the
+    # input-copy event, instead of at the graph replay, and the uploads routed through ``copy_metadata_`` join it.
+    issue_after_prepare = False
 
     def __init__(
         self,
@@ -468,6 +472,16 @@ def copy_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
         out = dst.copy_(src, non_blocking=True)
         pack.begin()
         return out
+    return dst.copy_(src, non_blocking=True)
+
+
+def copy_metadata_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """``copy_`` when the active open pack is issued right after the input preparation
+    (``StepInputPack.issue_after_prepare``), else ``dst.copy_(src, non_blocking=True)``. The same staging contract
+    as ``copy_`` applies at the call site."""
+    pack = _active.get()
+    if pack is not None and pack.open and pack.issue_after_prepare:
+        return copy_(dst, src)
     return dst.copy_(src, non_blocking=True)
 
 

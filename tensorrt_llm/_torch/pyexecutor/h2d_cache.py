@@ -208,7 +208,10 @@ def copy_h2d_pool_shared(dst: torch.Tensor, src: torch.Tensor, pack: bool = Fals
     """
     cache = _active.get()
     if cache is None:
-        dst.copy_(src, non_blocking=True)
+        if pack:
+            step_inputs.copy_metadata_(dst, src)
+        else:
+            dst.copy_(src, non_blocking=True)
         return True
     if SKIP_POOL_SHARED_UPLOADS:
         return cache.copy(dst, src, pack)
