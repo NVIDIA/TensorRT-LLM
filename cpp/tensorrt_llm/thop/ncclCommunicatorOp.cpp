@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #if TRTLLM_ENABLE_NCCL_PROFILING && ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/common/profiler.h"
+#include "tensorrt_llm/thop/ncclProfilerUtils.h"
 #include <numeric>
 #endif
 
@@ -45,12 +46,7 @@ void addP2pMetadata(common::ProfilerMetadata& metadata, std::string_view operati
     metadata.add("nccl.parallelism_dimension", "pp");
     metadata.add("nccl.kind", "p2p");
     metadata.add("nccl.logical_bytes", static_cast<std::int64_t>(bytes));
-    cudaStreamCaptureStatus captureStatus{};
-    auto const captureError = cudaStreamIsCapturing(stream, &captureStatus);
-    metadata.add("nccl.cuda_graph_state",
-        captureError != cudaSuccess                        ? "unknown"
-            : captureStatus == cudaStreamCaptureStatusNone ? "eager"
-                                                           : "capture");
+    metadata.add("nccl.cuda_graph_state", detail::getNcclCudaGraphState(stream));
     metadata.add("nccl.src_rank", send ? rank : peer);
     metadata.add("nccl.dst_rank", send ? peer : rank);
     metadata.add(send ? "nccl.input_shape" : "nccl.output_shape", tensor.sizes().vec());
