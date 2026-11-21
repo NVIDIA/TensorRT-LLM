@@ -2003,6 +2003,9 @@ def fp_modules(tmp_path, monkeypatch):
         path.write_text(text.replace(old, new))
 
     def fingerprints(*runner_classes):
+        # As a new process would: an edit that keeps a file's size can share
+        # its mtime with the previous write, so the source index is dropped.
+        autotuner._SOURCE_INDEXES.clear()
         autotuner._code_fingerprint.cache_clear()
         autotuner._candidates_fingerprint.cache_clear()
         return [autotuner._code_fingerprint(k) for k in runner_classes]
@@ -2014,6 +2017,7 @@ def fp_modules(tmp_path, monkeypatch):
                           load=load,
                           edit=edit,
                           fingerprints=fingerprints)
+    autotuner._candidates_fingerprint.cache_clear()
     # Drop the fp_* modules a fingerprint imported.
     for name in set(sys.modules) - before:
         if name.startswith("fp_"):
@@ -2085,6 +2089,16 @@ def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
 
 
         Config.tile = 2
+
+        # Tables and values decided by a loop or a branch around them.
+        REGS = {}
+        for atom in range(9, 17):
+            REGS[atom] = 16
+
+        if BLOCK > 64:
+            MODE = 1
+        else:
+            MODE = 2
         """)
     runners = fp_modules.load(
         "fp_runners", """
@@ -2139,31 +2153,48 @@ def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
         class UsesPatchedClass(Base):
             def get_valid_tactics(self, inputs, profile, **kwargs):
                 return [fp_util.Config.tile]
-        """)
-    classes = (runners.UsesDerivedConstant, runners.UsesTable,
-               runners.UsesClassAttribute, runners.UsesDefaultArgument,
-               runners.UsesBuiltTable, runners.UsesNoneConstant,
-               runners.ImportsNoneConstant, runners.UsesCompletedTable,
-               runners.UsesPatchedClass)
 
-    # Each edit, and which of the runners above it must re-key.
+
+        class UsesLoopTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.REGS.get(7, 0)]
+
+
+        class UsesBranchConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.MODE]
+        """)
+    names = ("UsesDerivedConstant", "UsesTable", "UsesClassAttribute",
+             "UsesDefaultArgument", "UsesBuiltTable", "UsesNoneConstant",
+             "ImportsNoneConstant", "UsesCompletedTable", "UsesPatchedClass",
+             "UsesLoopTable", "UsesBranchConstant")
+    classes = [getattr(runners, name) for name in names]
+
+    # Each edit, and the runners it must re-key (no other runner may).
     edits = [
-        (("BLOCK = 128", "BLOCK = 1024"), [1, 0, 1, 1, 0, 0, 0, 0, 0]),
-        (('{"small": 1}', '{"small": 1, "large": 2}'),
-         [0, 1, 0, 0, 0, 0, 0, 0, 0]),
-        (("return [0]", "return [0, 1]"), [0, 0, 0, 0, 1, 0, 0, 0, 0]),
-        (("OVERRIDE = None", "OVERRIDE = 1024"), [0, 0, 0, 0, 0, 1, 1, 0, 0]),
+        (("BLOCK = 128", "BLOCK = 1024"), {
+            "UsesDerivedConstant", "UsesClassAttribute", "UsesDefaultArgument",
+            "UsesBranchConstant"
+        }),
+        (('{"small": 1}', '{"small": 1, "large": 2}'), {"UsesTable"}),
+        (("return [0]", "return [0, 1]"), {"UsesBuiltTable"}),
+        (("OVERRIDE = None", "OVERRIDE = 1024"),
+         {"UsesNoneConstant", "ImportsNoneConstant"}),
         # The repository's _SILU_AND_MUL_2IN_LAUNCH_PARAMS is completed so.
         (("LAUNCH[103] = LAUNCH[100]", "LAUNCH[103] = (1024, 8)"),
-         [0, 0, 0, 0, 0, 0, 0, 1, 0]),
-        (("{90: (512, 2)}", "{90: (512, 32)}"), [0, 0, 0, 0, 0, 0, 0, 1, 0]),
-        (("Config.tile = 2", "Config.tile = 32"), [0, 0, 0, 0, 0, 0, 0, 0, 1]),
+         {"UsesCompletedTable"}),
+        (("{90: (512, 2)}", "{90: (512, 32)}"), {"UsesCompletedTable"}),
+        (("Config.tile = 2", "Config.tile = 32"), {"UsesPatchedClass"}),
+        # Only the loop's range changes (as for fp4_paged_mqa_logits' tables).
+        (("range(9, 17)", "range(7, 17)"), {"UsesLoopTable"}),
+        (("if BLOCK > 64:", "if BLOCK > 512:"), {"UsesBranchConstant"}),
     ]
     before = fp_modules.fingerprints(*classes)
     for (old, new), expected in edits:
         fp_modules.edit("fp_util", old, new)
         after = fp_modules.fingerprints(*classes)
-        assert _changed(before, after) == [bool(e) for e in expected], old
+        changed = {name for name, b, a in zip(names, before, after) if b != a}
+        assert changed == expected, old
         before = after
 
 
@@ -2572,7 +2603,7 @@ def test_candidates_fingerprint_covers_every_candidate(fp_modules):
     assert _changed(before, fingerprints()) == [False, False, True, True]
 
 
-def test_code_fingerprint_marks_sources_edited_after_start(
+def test_code_fingerprint_warns_about_sources_edited_after_start(
         fp_modules, monkeypatch):
     runners = fp_modules.load(
         "fp_runners", """
@@ -2583,10 +2614,126 @@ def test_code_fingerprint_marks_sources_edited_after_start(
             pass
         """)
     [unchanged_since_start] = fp_modules.fingerprints(runners.Runner)
+    warnings = []
+    monkeypatch.setattr(autotuner.logger,
+                        "warning_once",
+                        lambda message, key=None: warnings.append(key))
     monkeypatch.setattr(autotuner, "_EPOCH_NS", 0)
-    [edited_since_start] = fp_modules.fingerprints(runners.Runner)
-    assert edited_since_start != unchanged_since_start
-    assert fp_modules.fingerprints(runners.Runner) == [edited_since_start]
+    # The same key on every rank, whenever each imported the tuner.
+    assert fp_modules.fingerprints(runners.Runner) == [unchanged_since_start]
+    assert any(key and key[0] == "autotuner_source_edited" for key in warnings)
+
+
+def test_code_fingerprint_keeps_no_object_a_global_held_alive(fp_modules):
+    import gc
+    import weakref
+
+    util = fp_modules.load(
+        "fp_util", """
+        class Weights:
+            pass
+
+
+        CURRENT = None
+        """)
+    runners = fp_modules.load(
+        "fp_runners", """
+        import fp_util
+        from fp_base import Base
+
+
+        class Runner(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return fp_util.CURRENT
+        """)
+    util.CURRENT = util.Weights()  # As a layer sets its weights for one call.
+    alive = weakref.ref(util.CURRENT)
+    fp_modules.fingerprints(runners.Runner)
+    util.CURRENT = None
+    gc.collect()
+    assert alive() is None
+
+
+def test_code_fingerprint_walks_a_runner_class_built_per_call_once(
+        fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def make_runner():
+            class Runner(Base):
+                pass
+
+            return Runner
+        """)
+    walks = []
+
+    class _CountingWalk(autotuner._FingerprintWalk):
+
+        def digest(self):
+            walks.append(self)
+            return super().digest()
+
+    monkeypatch.setattr(autotuner, "_FingerprintWalk", _CountingWalk)
+    first, second = runners.make_runner(), runners.make_runner()
+    assert first is not second
+    fp_modules.fingerprints()
+    assert autotuner._code_fingerprint(first) == autotuner._code_fingerprint(
+        second)
+    assert len(walks) == 1
+
+
+def test_code_fingerprint_falls_back_to_the_build_when_the_walk_fails(
+        fp_modules, monkeypatch):
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class Runner(Base):
+            pass
+        """)
+
+    def fail(self):
+        raise RuntimeError("walk failed")
+
+    warnings = []
+    monkeypatch.setattr(autotuner._FingerprintWalk, "digest", fail)
+    monkeypatch.setattr(autotuner, "_native_build_id", lambda: "build")
+    monkeypatch.setattr(autotuner.logger,
+                        "warning_once",
+                        lambda message, key=None: warnings.append(key))
+    [fingerprint] = fp_modules.fingerprints(runners.Runner)
+    assert fingerprint == autotuner._coarse_fingerprint(runners.Runner)
+    assert any(key and key[0] == "autotuner_fingerprint_failed"
+               for key in warnings)
+
+
+def test_code_fingerprint_of_a_runner_in_a_fileless_main(
+        fp_modules, monkeypatch):
+    import types
+
+    main = types.ModuleType("__main__")  # As under `python -c`, or a notebook.
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    exec("from fp_base import Base\n\n\nclass Runner(Base):\n    pass\n",
+         main.__dict__)
+    assert main.Runner.__module__ == "__main__"
+    assert fp_modules.fingerprints(main.Runner)[0]
+
+
+def test_code_fingerprint_package_versions_skip_dists_without_metadata(
+        monkeypatch):
+    # An interrupted install can leave a dist-info without METADATA.
+    autotuner._package_versions.cache_clear()
+    monkeypatch.setattr(autotuner, "_packages_distributions",
+                        lambda: {"fp_pkg": ["fp-dist", None]})
+    monkeypatch.setattr(autotuner.importlib.metadata, "version",
+                        lambda dist: {"fp-dist": "1.0"}[dist])
+    try:
+        assert autotuner._package_versions("fp_pkg") == "fp-dist==1.0"
+    finally:
+        autotuner._package_versions.cache_clear()
 
 
 def test_native_library_id_is_the_elf_build_id(tmp_path):
@@ -2641,6 +2788,57 @@ def test_search_cache_reopens_the_comparison_when_a_loser_changes(fp_modules):
     fp_modules.edit("fp_util", "return 0", "return 42")
     fp_modules.fingerprints()  # A new process: fingerprints recomputed.
     assert not search([winner, loser])[0]
+
+
+def test_ranks_adopt_the_tuning_group_roots_fingerprint(fp_modules):
+    fp_modules.load("fp_util", "def helper():\n    return 0\n")
+    runners = fp_modules.load("fp_runners", _CANDIDATE_RUNNERS)
+    candidates = [runners.Winner(), runners.Loser()]
+    classes = (runners.Winner, runners.Loser)
+
+    def agree(gather):
+        tuner = SimpleNamespace(_dist=SimpleNamespace(tp_cp_allgather=gather))
+        return autotuner.AutoTuner._agree_on_cache_hit(tuner, candidates, True)
+
+    # Ranks that agree keep their keys and their hits.
+    mine = autotuner._candidates_fingerprint(classes)
+    assert agree(lambda obj: [obj, obj])
+    # A rank that fingerprints differently tunes again under the root's key.
+    assert not agree(lambda obj: [(True, "root-fingerprint"), obj])
+    assert autotuner._candidates_fingerprint(classes) == "root-fingerprint"
+    assert mine != "root-fingerprint"
+    assert agree(lambda obj: [(True, "root-fingerprint"), obj])
+
+
+def test_cache_key_mode_none_leaves_the_fingerprint_out(monkeypatch):
+    monkeypatch.setattr(autotuner, "_CACHE_KEY_MODE", "none")
+    cache = autotuner.AutoTuner().profiling_cache
+    key = _tactic_space_cache_key(cache, _TacticSpaceRunner())
+    assert key == ("test_tactic_space", "_TacticSpaceRunner", "()", ((16,
+                                                                      64), ))
+    cache.cache = {key: (0, 7, 1.0)}
+    assert list(cache.entries_of("test_tactic_space", _TacticSpaceRunner)) == [
+        ("()", ((16, 64), ), (0, 7, 1.0))
+    ]
+
+
+def test_choose_one_round_trip_among_two_runner_classes():
+    """Entries tuned among two runner classes are found when serving: every
+    store and lookup keys them by both classes' code."""
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [
+        GemmRunner(),
+        GemmRunnerWithAttributes(block_size=128, num_warps=4)
+    ]
+    config = TuningConfig()
+    op = "test_two_runner_classes"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        tuned = tuner.choose_one(op, runners, config, [x, w])
+    assert tuner.profiling_cache.search_cache(op, runners, (x.shape, w.shape),
+                                              config)[0]
+    assert tuner.choose_one(op, runners, config, [x, w]) == tuned
 
 
 def test_entries_of_skips_older_key_layouts_and_fingerprints():
