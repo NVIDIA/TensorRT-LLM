@@ -246,7 +246,7 @@ def test_setup_helix_mappings_dual_mapping_swap_restore():
     assert obj._repurposed_tp_mapping.moe_tp_ep_user_specified == original_moe_tp_ep_user_specified
 
     # --- _load_trunk_params tp_rank selection via production code ---
-    import tensorrt_llm._torch.models.modeling_kimi_linear as prod_mod
+    import tensorrt_llm._torch.models.modeling_kimi_k3_loader as loader_mod
 
     def _capture_run_concurrently(fn, jobs, *args, **kwargs):
         for job in jobs:
@@ -273,8 +273,8 @@ def test_setup_helix_mappings_dual_mapping_swap_restore():
 
     instance_helix = _MinimalInstanceHelix()
 
-    with patch.object(prod_mod, "run_concurrently", _capture_run_concurrently):
-        prod_mod.KimiLinearForCausalLM._load_trunk_params(
+    with patch.object(loader_mod, "run_concurrently", _capture_run_concurrently):
+        loader_mod.KimiK3WeightLoaderMixin._load_trunk_params(
             instance_helix,
             fake_weights,
             {sharded_name: sharded_param_helix},
@@ -299,8 +299,8 @@ def test_setup_helix_mappings_dual_mapping_swap_restore():
 
     instance_no_helix = _MinimalInstanceNoHelix()
 
-    with patch.object(prod_mod, "run_concurrently", _capture_run_concurrently):
-        prod_mod.KimiLinearForCausalLM._load_trunk_params(
+    with patch.object(loader_mod, "run_concurrently", _capture_run_concurrently):
+        loader_mod.KimiK3WeightLoaderMixin._load_trunk_params(
             instance_no_helix,
             fake_weights,
             {sharded_name: sharded_param_no_helix},
