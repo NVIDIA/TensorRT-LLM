@@ -1721,6 +1721,35 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_kv_mgr_id = id(kv_cache_manager)
         self._pool_cache_valid = True
 
+    def can_skip_shared_topk_copy(self, local_layer_idx: int, topk_shape: tuple[int, ...]) -> bool:
+        """Whether generation followers consume only their leader's grouped remap.
+
+        Offload and mixed-precision readers still need the local TopK values.
+        Keep the copy until the current cache manager's group layout is built.
+        """
+        struct = self._group_remap_struct
+        shared_topk_indices = self.shared_topk_indices
+        if (
+            self.in_mtp_draft_loop
+            or self.sparse_metadata_params.enable_kv_cache_offload
+            or self.has_mixed_precision_high_rows
+            or struct is None
+            or self._group_remap_struct_kv_id != id(self.kv_cache_manager)
+            or shared_topk_indices is None
+        ):
+            return False
+        leader_of = struct.get("leader_of")
+        if (
+            leader_of is None
+            or not 0 <= local_layer_idx < len(leader_of)
+            or leader_of[local_layer_idx] != local_layer_idx
+        ):
+            return False
+        return struct["group_active"].get(local_layer_idx, False) and topk_shape == (
+            self.num_tokens - self.num_ctx_tokens,
+            shared_topk_indices.shape[1],
+        )
+
     def _ensure_group_remap_struct(self):
         """Build (once) the static full+shared indexer group layout used by the
         cross-layer fan-out remap (``TRTLLM_DISABLE_DSA_GROUP_REMAP``).
