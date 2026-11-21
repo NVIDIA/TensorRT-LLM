@@ -16,4 +16,6 @@
 
 ``token_sharded_tp`` holds the token plan, the collectives and the model's sharder,
 ``token_sharded_modules`` the adapters that convert a model's tensor-parallel modules.
+``symm_mem_pool`` holds the symmetric-memory allocation for copy-engine collectives (the first
+follow-up).
 """
