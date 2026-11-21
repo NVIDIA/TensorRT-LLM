@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparsePa
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNIntermediateState,
+    GDNMtpReplayState,
     GDNReplayState,
     ReplayStateUpdateMetadata,
     create_gdn_state,
@@ -206,6 +207,9 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
     # Whether the model's GDN layers verify drafts with the fused kernels, which
     # commit in-layer at every batch size.
     gdn_fused_verify = False
+    # Whether the model's GDN layers can verify drafts with the GDN MTP replay
+    # kernels (modules/mamba/gdn_mixer.py) instead of the cached replay.
+    gdn_mtp_replay = False
 
     # The parent opts in because its draft pool is attention-only. QSA's is
     # not: each draft layer adds a Role.INDEX_KEY buffer and a
@@ -234,12 +238,14 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         use_replay_state_update: bool | None = None,
         qwen4_exp_ple_cache_params: Qwen4ExpPLECacheParams | None = None,
         gdn_fused_verify: bool = False,
+        gdn_mtp_replay: bool = False,
         inforward_snapshot_min_main: int = 0,
         **kwargs,
     ) -> None:
         kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
         self.gdn_fused_verify = gdn_fused_verify
+        self.gdn_mtp_replay = gdn_mtp_replay
         # A disaggregated context server never decodes and keeps no replay history.
         self._context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._replay_region = None
@@ -801,6 +807,13 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         )
         return state
 
+    def get_replay_dummy_request_mask(self) -> torch.Tensor | None:
+        """The batch-ordered dummy-request mask of the last state-index setup.
+
+        The GDN MTP replay skips dummy rows; the buffer address stays fixed.
+        """
+        return self._dummy_request_mask
+
     def gdn_replay_partitioned(self, num_decodes: int) -> bool:
         """Whether a GDN decode batch of num_decodes requests takes the
         partitioned cached replay and one all-layer checkpoint commit; other
@@ -994,7 +1007,15 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         state = self._speculative_state
-        return isinstance(state, GDNReplayState) and state.has_bound_states
+        return (
+            isinstance(state, GDNReplayState)
+            and not isinstance(state, GDNMtpReplayState)
+            and state.has_bound_states
+        )
+
+    @property
+    def use_gdn_mtp_replay(self) -> bool:
+        return isinstance(self._speculative_state, GDNMtpReplayState)
 
 
 def get_qwen4_exp_ple_cache_params(config, *, total_layers: int, is_draft: bool):
