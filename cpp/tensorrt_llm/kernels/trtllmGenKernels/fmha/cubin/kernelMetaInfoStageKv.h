@@ -38,7 +38,7 @@ struct TllmGenFmhaStageKvKernelMetaInfo
 // clang-format off
 // BEGIN decls sm100 h256p64s256
 #ifndef EXCLUDE_SM_100
-// Kernel inputs sha256: 3e76c3ff74f8430380bef415162164c9b00cd10636164e1d17ce49a10bdc93e0
+// Kernel inputs sha256: 1ff5959e6fe56d37435f9166f65460f7e409d102f4e4bb0fb4c2990710f49ade
 extern unsigned char const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin[];
 extern unsigned int const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len;
 extern unsigned char const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin[];
@@ -47,7 +47,7 @@ extern unsigned int const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64V
 // END decls sm100 h256p64s256
 // BEGIN decls sm103 h256p64s256
 #ifndef EXCLUDE_SM_103
-// Kernel inputs sha256: 3e76c3ff74f8430380bef415162164c9b00cd10636164e1d17ce49a10bdc93e0
+// Kernel inputs sha256: 1ff5959e6fe56d37435f9166f65460f7e409d102f4e4bb0fb4c2990710f49ade
 extern unsigned char const FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin[];
 extern unsigned int const FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len;
 extern unsigned char const FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin[];
@@ -60,14 +60,14 @@ inline std::vector<TllmGenFmhaStageKvKernelMetaInfo> const& getTllmGenFmhaStageK
     static std::vector<TllmGenFmhaStageKvKernelMetaInfo> const sInfos = {
 // BEGIN entries sm100 h256p64s256
 #ifndef EXCLUDE_SM_100
-{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_100, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len, "fmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4", 198016, 384, 2, 64, 1, 0, 1, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "0588ddb8fce8c1a699503b67a8f9a84735dbd4e25d6d58dd7ba4f2a78e8e848b", false } },
-{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_100, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin_len, "fmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4", 197904, 384, 2, 64, 1, 0, 0, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "a3944cc754c4ab3969df1812d98b96ed067b88ea414b42245c7e43ed3904f905", false } },
+{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_100, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len, "fmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4", 198016, 384, 2, 64, 1, 0, 1, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "0b37706f49c774ed741b9c3ef08a6f897008f1c270df29cb25b73764666e36da", false } },
+{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_100, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin, FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin_len, "fmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4", 197904, 384, 2, 64, 1, 0, 0, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "6cdbb28bb26d0472e800f327d2865f7c09c4e17cbf3a3ce61a4b72d0b1b84e13", false } },
 #endif
 // END entries sm100 h256p64s256
 // BEGIN entries sm103 h256p64s256
 #ifndef EXCLUDE_SM_103
-{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_103, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len, "fmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4", 198016, 384, 2, 64, 1, 0, 1, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "0ee976b55d36a81d5f0cd110fa67c1f74c596d8db30fec61718b084dcca64dad", false } },
-{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_103, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin_len, "fmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4", 197904, 384, 2, 64, 1, 0, 0, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "9fc0140692fc562c39a2bc99e8fd07d6ce483dc6cb8630c9baadad076eef81ae", false } },
+{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_103, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len, "fmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4", 198016, 384, 2, 64, 1, 0, 1, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "ac97552aced6332863676c98ec2f4a73b6dcab967f822ff498013f90dc3abb14", false } },
+{ 256, { DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_BF16, 128, 128, 128, 128, 256, 256, 256, kSM_103, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin, FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin_len, "fmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4", 197904, 384, 2, 64, 1, 0, 0, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false, false, false, false, false, false, "765634adecb36a7f46c4e14e4811acbfcf196d709d2ea45e484bf9d729c3883b", false } },
 #endif
 // END entries sm103 h256p64s256
     };
