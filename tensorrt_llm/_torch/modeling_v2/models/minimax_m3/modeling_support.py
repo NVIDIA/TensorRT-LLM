@@ -117,8 +117,11 @@ def _pinned_mxfp8_quantize(state: PinnedModelingSupport, /, x: Any) -> Any:
 
 
 def _split_chunk(state: ModelingSupport, /, rows: int, num_chunks: int) -> List[int]:
-    """The MoE scheduler's even split: the first ``rows % num_chunks`` chunks take one more row."""
-    base, extra = divmod(rows, num_chunks)
+    """The MoE scheduler's even split: the first ``rows % num_chunks`` chunks take one more row.
+
+    Floor division and modulo (rather than ``divmod``) keep the split traceable on a symbolic row count.
+    """
+    base, extra = rows // num_chunks, rows % num_chunks
     return [base + 1] * extra + [base] * (num_chunks - extra)
 
 

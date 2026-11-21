@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compile real prefill host dispatch, substituting CPU math for GPU kernels."""
 
+import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
@@ -88,7 +89,7 @@ def make_cpu_model(monkeypatch, make_m3_config):
                 lambda *args, **kwargs: Mock(spec=modeling.MiniMaxM3MsaSparseAttention),
             )
             if shell:
-                setup.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
+                setup.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 7))
                 setup.setattr(modeling, "_require", [False])
                 return shell_type(config)
             return core_type(config)
@@ -238,87 +239,157 @@ def test_compiled_prefill_disables_mxfp8_decode_and_autotune_modes() -> None:
         assert _mx_mode(state) == eager
 
 
+def test_compiled_mxfp8_mode_ignores_warmup_tuning_flags() -> None:
+    state = _Mxfp8GemmState()
+    method = state.quant_method
+
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        mode = _mx_mode(state)
+        assert not (mode.decode_graph or mode.autotune or mode.tuned_quantize_gemm)
+        return x + mode.native_tuning + 2 * mode.flashinfer
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(forward, fullgraph=True, backend=counter)
+    x = torch.zeros(4)
+    with torch_compiling(True):
+        expected = compiled(x)
+        # The engine's warmup flips every tuning flag after the first compile and before capture.
+        method.enable_native_autotune()
+        method.backend = "auto"
+        method.tune_mxfp8_backends = True
+        with flashinfer_mxfp8_autotune(), flashinfer_mxfp8_decode_graph_capture():
+            torch.testing.assert_close(compiled(x), expected)
+        method.mark_native_autotuned()
+        method.mark_flashinfer_autotuned()
+        torch.testing.assert_close(compiled(x), expected)
+    assert counter.frame_count == 1
+
+
+@pytest.fixture
+def make_meta_core(make_cpu_model):
+    """A real core with its weights on the meta device. Tracing it runs every op's fake, so the compiled prefill
+    dispatch runs exactly as written, with no GPU kernel and nothing stubbed."""
+
+    def make_core(modeling: ModuleType, *, fused_projection: bool) -> torch.nn.Module:
+        core = make_cpu_model(modeling, fused_projection=fused_projection)
+        for weight in core.w.values():
+            weight.data.fill_(1)
+        # post_load_weights derives the MoE kernel scalars on the host before the targets are built.
+        moe = {i: core._derive_moe(i) for i in sorted(core.moe_layers)}
+        core.to("meta")
+        core.moe = {
+            i: dataclasses.replace(
+                scalars,
+                **{
+                    field.name: getattr(scalars, field.name).to("meta")
+                    for field in dataclasses.fields(scalars)
+                },
+            )
+            for i, scalars in moe.items()
+        }
+        core._prefill = modeling.PrefillTarget(core)
+        core._decode = modeling.DecodeTarget(core)
+        return core
+
+    return make_core
+
+
+@dataclass
+class _UnreadCaches:
+    """The metadata handles ``step_args`` borrows. Compiled prefill reads them only inside the attention boundary."""
+
+    kv_cache_manager: object = None
+    msa_out_cache_loc: object = None
+
+    def msa_idx_k_cache(self, layer: int) -> torch.Tensor:
+        raise AssertionError("traced prefill code read the index-K cache")
+
+
+class _GraphRecorder:
+    def __init__(self) -> None:
+        self.graphs: list[torch.fx.GraphModule] = []
+
+    def __call__(self, gm: torch.fx.GraphModule, inputs: list[torch.Tensor]) -> Callable:
+        self.graphs.append(gm)
+        return gm.forward
+
+    def ops(self, graph: torch.fx.GraphModule) -> list[str]:
+        return [str(node.target) for node in graph.graph.nodes if node.op == "call_function"]
+
+
+def _run_compiled_prefill(compiled: Callable, core: torch.nn.Module, rows: int) -> None:
+    output = compiled(
+        attn_metadata=_UnreadCaches(),
+        input_ids=torch.empty(rows, dtype=torch.long, device="meta"),
+        position_ids=torch.empty(1, rows, dtype=torch.int32, device="meta"),
+        has_context=True,
+    )
+    assert output.shape == (rows, core.hidden)
+
+
 @pytest.mark.parametrize("modeling", [tp2, tp4, tp8], ids=["tp2", "tp4", "tp8"])
-@pytest.mark.parametrize("rows", [1, 8, 32])
-def test_small_prefill_fullgraph_uses_compile_safe_dispatch(
-    monkeypatch: pytest.MonkeyPatch, make_cpu_model, modeling: ModuleType, rows: int
+@pytest.mark.parametrize("fused_projection", [True, False], ids=["fused", "unfused"])
+def test_compiled_prefill_core_shares_one_graph_across_buckets(
+    make_meta_core, modeling: ModuleType, fused_projection: bool
 ) -> None:
-    core = make_cpu_model(modeling)
-    core._decode = modeling.DecodeTarget(core)
-    target = modeling.PrefillTarget(core)
-
-    def unexpected_fast_path(*args, **kwargs):
-        raise AssertionError("compiled prefill selected an eager fast path")
-
-    monkeypatch.setattr(modeling, "_mc_allreduce_norm", unexpected_fast_path)
-    monkeypatch.setattr(type(core), "engine", unexpected_fast_path)
-    monkeypatch.setattr(type(modeling.m3_dense_swiglu), "__call__", unexpected_fast_path)
-    if modeling is tp2:
-        monkeypatch.setattr(modeling.DecodeTarget, "_mc_finalize", unexpected_fast_path)
-
-    # Each stub represents GPU work. The actual layers still choose the path.
-    monkeypatch.setattr(target, "_attention", lambda layer, pos, x, step: (x, False))
-    monkeypatch.setattr(modeling, "_native_allreduce_norm", lambda core, x, r, w: (x, r))
-    monkeypatch.setattr(modeling, "_linear", lambda core, x, *args: (x, False))
-    monkeypatch.setattr(modeling, "m3_silu_and_mul", lambda x, *args: x.clone())
-    monkeypatch.setattr(target, "_routed", lambda layer, x: x)
-
-    def forward(hidden: torch.Tensor) -> torch.Tensor:
-        dense, residual = target._layer(0, None, hidden, hidden, {}, None, None)
-        moe, _ = target._layer(1, None, dense, residual, {}, None, None)
-        return moe
-
+    core = make_meta_core(modeling, fused_projection=fused_projection)
+    core.moe_max_num_tokens = 64
+    recorder = _GraphRecorder()
     torch._dynamo.reset()
-    counter = CompileCounter()
-    compiled = torch.compile(forward, fullgraph=True, dynamic=False, backend=counter)
-    with torch_compiling(True):
-        hidden = torch.ones((rows, core.hidden), dtype=torch.bfloat16)
-        # The dense path preserves the input. MoE sums the shared and routed outputs.
-        torch.testing.assert_close(compiled(hidden), 2 * hidden)
-    assert counter.frame_count == 1
+    compiled = torch.compile(core, fullgraph=True, dynamic=True, backend=recorder)
+    with torch_compiling(True), model_extra_attrs({}):
+        # Descending buckets across the eager dispatch's row thresholds (8, 9..48, 32).
+        for rows in (64, 48, 33, 32, 9, 8, 2):
+            _run_compiled_prefill(compiled, core, rows)
+        assert len(recorder.graphs) == 1
+        # Dynamo specializes a one-row input on its own.
+        _run_compiled_prefill(compiled, core, 1)
+    assert len(recorder.graphs) == 2
+
+    for graph in recorder.graphs:
+        ops = recorder.ops(graph)
+        # Request-dependent attention runs at a piecewise boundary, once per layer.
+        assert ops.count("trtllm.modeling_v2_m3_prefill_attention.default") == core.num_layers
+        # Eager-only kernels stay out: the C++ dense SwiGLU and directly launched Triton kernels.
+        assert not [op for op in ops if "swiglu_oai" in op or "triton_kernel_wrapper" in op]
 
 
-@pytest.mark.parametrize("rows", [64, 128])
-def test_tp2_compiled_prefill_finalizes_inside_moe_runner(
-    monkeypatch: pytest.MonkeyPatch, make_cpu_model, rows: int
+def test_compiled_tp2_prefill_takes_the_tensor_core_router_on_its_rows(make_meta_core) -> None:
+    core = make_meta_core(tp2, fused_projection=True)
+    core.router_tc_cluster16 = True
+    recorder = _GraphRecorder()
+    torch._dynamo.reset()
+    compiled = torch.compile(core, fullgraph=True, dynamic=True, backend=recorder)
+    with torch_compiling(True), model_extra_attrs({}):
+        # The 9..48-row router splits the buckets, as it splits the eager dispatch.
+        for rows in (64, 48, 9):
+            _run_compiled_prefill(compiled, core, rows)
+    router_calls = [
+        recorder.ops(graph).count("trtllm.minimax_m3_router_tc") for graph in recorder.graphs
+    ]
+    assert router_calls == [0, len(core.moe_layers)]
+
+
+@pytest.mark.parametrize("modeling", [tp2, tp4, tp8], ids=["tp2", "tp4", "tp8"])
+def test_compiled_prefill_moe_chunks_compile_once_per_chunk_count(
+    make_meta_core, modeling: ModuleType
 ) -> None:
-    core = make_cpu_model(tp2)
-    core.moe_max_num_tokens = 128
-    target = tp2.PrefillTarget(core)
-
-    def run_experts(core, layer, hidden, scales, logits, do_finalize):
-        assert do_finalize, "compiled prefill requested unfinalized FP4 output"
-        return hidden * 2
-
-    monkeypatch.setattr(tp2, "_routed_experts", run_experts)
-    monkeypatch.setattr(tp2, "_router_logits", lambda core, layer, hidden: hidden)
-    monkeypatch.setattr(target, "_swiglu_mlp", lambda hidden, *args: hidden.clone())
-
-    def forward(hidden: torch.Tensor) -> torch.Tensor:
-        output, _ = target._moe(1, hidden, return_parts=False)
-        return output
-
+    core = make_meta_core(modeling, fused_projection=True)
+    core.moe_max_num_tokens = 16
+    # Eager prefill overlaps chunks on this stream; the compiled graph must not trace it.
+    core.aux_stream_moe_chunk = object()
+    recorder = _GraphRecorder()
     torch._dynamo.reset()
-    compiled = torch.compile(forward, fullgraph=True, backend="eager")
-    hidden = torch.ones((rows, core.hidden), dtype=torch.bfloat16)
-    with torch_compiling(True):
-        torch.testing.assert_close(compiled(hidden), hidden * 3)
-
-
-def test_tp2_large_prefill_rows_share_a_router_fallback_trace(make_cpu_model) -> None:
-    core = make_cpu_model(tp2)
-
-    def forward(hidden: torch.Tensor) -> torch.Tensor:
-        assert tp2._router_tc_fp4(core, 1, hidden) is None
-        return hidden + 1
-
-    torch._dynamo.reset()
-    counter = CompileCounter()
-    compiled = torch.compile(forward, fullgraph=True, dynamic=True, backend=counter)
-    for rows in (64, 128, 256):
-        hidden = torch.ones((rows, 16), dtype=torch.bfloat16)
-        torch.testing.assert_close(compiled(hidden), hidden + 1)
-    assert counter.frame_count == 1
+    compiled = torch.compile(core, fullgraph=True, dynamic=True, backend=recorder)
+    with torch_compiling(True), model_extra_attrs({}):
+        # Four chunks, then three chunks whose last chunk has 16, 8 or 2 rows.
+        for rows in (64, 48, 40, 34):
+            _run_compiled_prefill(compiled, core, rows)
+    runner_calls = [
+        recorder.ops(graph).count("trtllm.fp4_block_scale_moe_runner") for graph in recorder.graphs
+    ]
+    assert runner_calls == [4 * len(core.moe_layers), 3 * len(core.moe_layers)]
 
 
 @pytest.mark.parametrize("modeling", [tp2, tp4, tp8])
@@ -462,6 +533,37 @@ def test_prefill_trace_reuses_bucket_across_request_counts(
         metadata.num_contexts = metadata.num_ctx_tokens = 0
         output = caller(attn_metadata=metadata, inputs_embeds=hidden)
         torch.testing.assert_close(output, hidden[: metadata.num_tokens] - 1)
+
+
+class _TargetProbe:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def forward(self, *args: object) -> str:
+        return self.name
+
+
+class _NoCounts:
+    """Attention metadata whose step counts must not be read."""
+
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"the core read attn_metadata.{name}")
+
+
+@pytest.mark.parametrize("modeling", [tp2, tp4, tp8], ids=["tp2", "tp4", "tp8"])
+def test_core_dispatches_on_the_shell_phase(modeling: ModuleType) -> None:
+    core = Mock(_prefill=_TargetProbe("prefill"), _decode=_TargetProbe("decode"))
+    forward = _TARGETS[modeling][0].forward
+    input_ids = torch.ones(4, dtype=torch.long)
+
+    # Direct calls derive the phase from the context count: mixed steps belong to prefill.
+    for num_contexts, expected in ((0, "decode"), (1, "prefill"), (7, "prefill")):
+        metadata = _Batch(num_tokens=4, num_contexts=num_contexts)
+        assert forward(core, metadata, input_ids) == expected
+
+    # The shell's phase wins, and the core then reads no step count.
+    assert forward(core, _NoCounts(), input_ids, has_context=True) == "prefill"
+    assert forward(core, _NoCounts(), input_ids, has_context=False) == "decode"
 
 
 @pytest.mark.parametrize(

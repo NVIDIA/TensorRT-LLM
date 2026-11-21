@@ -28,6 +28,17 @@ class _Mxfp8GemmState(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.quant_method = MXFP8LinearMethod()
+        method = self.quant_method
+        # Compiled prefill bakes its dispatch into the graph, so it reads only state fixed here: never the warmup's
+        # tuning flags, whose flips would invalidate the traced graph. The autotuned native GEMM keeps profiling in
+        # the engine's tuning pass and uses the registered tactics after it.
+        self.compiled_mode = MxMode(
+            decode_graph=False,
+            autotune=False,
+            tuned_quantize_gemm=False,
+            flashinfer=method.backend == "flashinfer",
+            native_tuning=method.use_cutlass,
+        )
 
 
 @dataclass(frozen=True)
@@ -40,15 +51,15 @@ class MxMode:
         bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_mxfp8_backends)
     )
     flashinfer: bool  # FlashInfer's MXFP8 GEMM on the quantized activation
-    native_tuning: (
-        bool  # the native GEMM through the autotuner (warmup, before its tactics are registered)
-    )
+    native_tuning: bool  # the native GEMM through the autotuner (warmup, and compiled prefill)
 
 
 def _mx_mode(state: _Mxfp8GemmState) -> MxMode:
+    if is_torch_compiling():
+        return state.compiled_mode
     method = state.quant_method
-    decode_graph = not is_torch_compiling() and flashinfer_mxfp8_decode_graph_capture_active()
-    autotune = not is_torch_compiling() and flashinfer_mxfp8_autotune_active()
+    decode_graph = flashinfer_mxfp8_decode_graph_capture_active()
+    autotune = flashinfer_mxfp8_autotune_active()
     return MxMode(
         decode_graph=decode_graph,
         autotune=autotune,

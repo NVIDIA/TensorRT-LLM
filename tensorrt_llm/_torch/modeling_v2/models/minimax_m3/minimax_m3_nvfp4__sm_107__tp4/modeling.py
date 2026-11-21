@@ -2700,7 +2700,7 @@ class PrefillTarget:
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast (TRTLLM_MODELING_V2_VALIDATE): the metadata fields this target consumes
         must exist (they are private trtllm surface). Calling ``step_args`` is the check; once per target instance."""
-        if not self._contract_pending:
+        if not self._contract_pending or torch.compiler.is_compiling():
             return
         try:
             self.step_args(md)
@@ -2771,25 +2771,37 @@ class PrefillTarget:
         num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
         if num_chunks <= 1:
             return _routed_experts(core, i, x, None, router_logits, True)
+        if is_torch_compiling():
+            # Full chunks in order: the compiled graph specializes on the chunk count but not on the remainder, and
+            # the piecewise scheduler places streams.
+            chunk = core.moe_max_num_tokens
+            return torch.cat(
+                [
+                    _routed_experts(core, i, x_c, None, logits_c, True)
+                    for x_c, logits_c in zip(x.split(chunk), router_logits.split(chunk))
+                ]
+            )
         sizes = _split_chunk(rows, num_chunks)
         xs, logits = x.split(sizes), router_logits.split(sizes)
         aux = core.aux_stream_moe_chunk
+        if aux is None:
+            return torch.cat(
+                [_routed_experts(core, i, xs[c], None, logits[c], True) for c in range(num_chunks)]
+            )
         ev_main, ev_overlap = core.moe_chunk_events[i]
-        if aux is not None:
-            ev_main.record()
-            with torch.cuda.stream(aux):
-                ev_main.wait()
+        ev_main.record()
+        with torch.cuda.stream(aux):
+            ev_main.wait()
         outs: List[torch.Tensor] = []
         for c in range(num_chunks):
-            if aux is not None and c % 2 == 0:
+            if c % 2 == 0:
                 with torch.cuda.stream(aux):
                     outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
             else:
                 outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-        if aux is not None:
-            with torch.cuda.stream(aux):
-                ev_overlap.record()
-            ev_overlap.wait()
+        with torch.cuda.stream(aux):
+            ev_overlap.record()
+        ev_overlap.wait()
         return torch.cat(outs)
 
     def _routed(self, i: int, h: torch.Tensor):
@@ -2822,7 +2834,9 @@ class PrefillTarget:
             core.moe_events[i][1],
             # The warmup tuning pass profiles the shared expert's GEMMs: keep it on the main stream, between the
             # same collectives on every rank (the capture pass and serving still overlap it on the aux stream).
-            None if flashinfer_mxfp8_autotune_active() else core.aux_stream_moe,
+            None
+            if is_torch_compiling() or flashinfer_mxfp8_autotune_active()
+            else core.aux_stream_moe,
             disable_on_compile=True,
         )
         if return_parts:
