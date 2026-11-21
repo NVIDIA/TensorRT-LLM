@@ -314,11 +314,15 @@ def test_release_keeps_filled_spare_slots_during_update(monkeypatch):
     """Release only the empty spare slots while an online EPLB update swaps the placement."""
     # The old placement reads -1 during the swap, so only the unusable slots tell 2 from 3.
     load_balancer, layer = _online_balancer(monkeypatch, _placement(*[[-1] * 4] * WORLD_SIZE))
-    layer.single_layer_load_balancer_impl.get_unusable_local_slots.return_value = [3]
+    # Active slot 1 is unusable too: a stopped restore emptied it, and another replica kept its
+    # expert, so the next plan left it empty.
+    layer.single_layer_load_balancer_impl.get_unusable_local_slots.return_value = [1, 3]
     released = []
 
     def set_backed(tensors, slots, slot_counts, backed):
         assert not backed
+        # Like moe_unbacked_slots_set_backed, refuse a slot that is not a spare slot.
+        assert all(slot in layer.spare_slots for slot in slots), slots
         released.extend(slots)
         return len(slots) * (4 << 20)
 
