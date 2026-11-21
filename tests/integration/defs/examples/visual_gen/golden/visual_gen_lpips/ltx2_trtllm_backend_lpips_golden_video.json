@@ -35,7 +35,7 @@
   "generator": "_generate_ltx2_cuda_graph_trtllm_backend_video(output_path, enable_cuda_graph=False)",
   "reference_provenance": {
     "test_commit": "9d3921216c2df20adf2f46462173340677c69dce + NVBug 7003734 CUTLASS-pin test change",
-    "generation": "gpuenv run gpuenv-718a9db2eefd4ed1, Slurm job 6231169, node umbriel-b200-027: real pytest of this test with the NVFP4 GEMM pinned to CUTLASS in the spawned workers; golden = the graph-off reference worker video (byte-identical to the graph-on video)",
+    "generation": "pytest examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend on one B200 with the NVFP4 GEMM pinned to CUTLASS in the spawned workers; golden = the graph-off reference worker video (byte-identical to the graph-on video)",
     "container_image": "nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc5.dev202611190007",
     "container_digest": "sha256:a73ba95732d2cf11670843440e0baa02fd1f16f5d0454337e587cef2c9efe119",
     "source_overlay": "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py from 9d3921216c (git blob afa83122485857c383a3a488362c096cfef58dd2, includes #21220); all other package files from the image",
