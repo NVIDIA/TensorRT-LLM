@@ -1445,6 +1445,19 @@ def _candidates_fingerprint(runner_classes) -> Optional[str]:
     return fingerprint
 
 
+def _key_fingerprint(runner_cls: type, set_fingerprint: Optional[str]):
+    """The fingerprint in the key of `runner_cls`'s entry, tuned among runners
+    whose set has `set_fingerprint`: that alone for a runner tuned alone,
+    else the set's and the runner's own. Two candidates of one set can share
+    a class name and unique_id (classes one factory builds); their own
+    fingerprints keep their entries, and so their tactics, apart."""
+    if set_fingerprint is None:
+        return None
+    own = _code_fingerprint(runner_cls)
+    return set_fingerprint if own == set_fingerprint else (
+        f"{set_fingerprint}/{own}")
+
+
 def _edited_key(key: Tuple) -> bool:
     """Whether a cache key carries a fingerprint marked _EDITED_PREFIX."""
     return (len(key) > 4 and isinstance(key[4], str)
@@ -1769,12 +1782,13 @@ class AutoTunerProfilingCache:
         parallel = (tuning_config.distributed_tuning_strategy ==
                     DistributedTuningStrategy.PARALLEL)
         found = None
-        fingerprint = _candidates_fingerprint(tuple(type(r) for r in runners))
+        set_fingerprint = _candidates_fingerprint(
+            tuple(type(r) for r in runners))
         for idx, r in enumerate(runners):
-            if (cache_key :=
-                    self._cache_key(custom_op, r, input_shapes, tuning_config,
-                                    apply_map_to_tuning_buckets,
-                                    fingerprint)) in self.cache:
+            if (cache_key := self._cache_key(
+                    custom_op, r, input_shapes, tuning_config,
+                    apply_map_to_tuning_buckets,
+                    _key_fingerprint(type(r), set_fingerprint))) in self.cache:
                 # Return the current index in runners list, not the cached runner_id
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
                 if not parallel:
@@ -1799,11 +1813,13 @@ class AutoTunerProfilingCache:
         `(custom_op, runner class name, unique_id, shape profile,
         code fingerprint[, tactic space key])`. `candidates` are the runners
         it was tuned among (only `runner` when omitted); the fingerprint covers
-        their code, and is left out under TLLM_AUTOTUNER_CACHE_KEY=none."""
-        fingerprint = _candidates_fingerprint(
+        their code and `runner`'s own (_key_fingerprint), and is left out
+        under TLLM_AUTOTUNER_CACHE_KEY=none."""
+        set_fingerprint = _candidates_fingerprint(
             tuple(type(r) for r in candidates or (runner, )))
         return self._cache_key(custom_op, runner, input_shapes, tuning_config,
-                               apply_map_to_tuning_buckets, fingerprint)
+                               apply_map_to_tuning_buckets,
+                               _key_fingerprint(type(runner), set_fingerprint))
 
     def _cache_key(self, custom_op: str, runner: TunableRunner,
                    input_shapes: Tuple[torch.Size], tuning_config: TuningConfig,
@@ -1849,6 +1865,12 @@ class AutoTunerProfilingCache:
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
         return {k: v for k, v in self.cache.items() if k[0] == custom_op}
+
+    @staticmethod
+    def shareable(entries: Dict[Tuple, Tuple]) -> Dict[Tuple, Tuple]:
+        """`entries` other processes may use: without those keyed under an
+        edited source's fingerprint, which serve their own process only."""
+        return {k: v for k, v in entries.items() if not _edited_key(k)}
 
     def add_independent_op(self, custom_op: str,
                            strategy: DistributedTuningStrategy) -> None:
@@ -3898,15 +3920,27 @@ class AutoTuner:
         Ranks that fingerprint the runners differently may be running
         different code, with different valid tactics: their keys would not
         meet in the merge or broadcast, and tuning them together could pick a
-        tactic some rank cannot run. Every rank sees the same gathered values,
-        so they all raise here, before the collective profiling.
+        tactic some rank cannot run. So may ranks whose sources changed after
+        they started (an `edited-` fingerprint), even with equal fingerprints:
+        the disk no longer tells what each rank loaded. Every rank sees the
+        same gathered values, so they all raise here, before the collective
+        profiling.
         """
         classes = tuple(type(r) for r in runners)
         gathered = self._dist.tp_cp_allgather(
             obj=(bool(is_cache_hit), _candidates_fingerprint(classes)))
         fingerprints = {fingerprint for _, fingerprint in gathered}
+        names = sorted({".".join(_class_name(k)) for k in classes})
+        if any(
+                isinstance(f, str) and f.startswith(_EDITED_PREFIX)
+                for f in fingerprints):
+            raise RuntimeError(
+                f"[Autotuner] TensorRT-LLM sources used by {names} changed "
+                "after the ranks of a tuning group started, so their loaded "
+                "code cannot be compared (see the warnings). Restart the "
+                "workers, or set TLLM_AUTOTUNER_CACHE_KEY=none to key the "
+                "cache without code fingerprints.")
         if len(fingerprints) > 1:
-            names = sorted({".".join(_class_name(k)) for k in classes})
             raise RuntimeError(
                 f"[Autotuner] The ranks of a tuning group fingerprint the code "
                 f"of {names} differently ({sorted(fingerprints, key=str)}): "
@@ -3986,7 +4020,8 @@ class AutoTuner:
             return
 
     def _merge_cache_data(self, custom_op: str):
-        cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
+        cache_data = self.profiling_cache.shareable(
+            self.profiling_cache.get_specific_custom_op(custom_op))
         self.profiling_cache.merge_cache_data(
             _fastest_entries(self._dist.tp_cp_allgather(obj=cache_data)))
 
@@ -3998,11 +4033,11 @@ class AutoTuner:
         Returns how many of this rank's tactics changed."""
         if not self._is_distributed():
             return 0
-        mine = {
+        mine = self.profiling_cache.shareable({
             key: value
             for key, value in self.profiling_cache.cache.items()
             if custom_ops is None or key[0] in custom_ops
-        }
+        })
         per_rank = self._dist.tp_cp_allgather(obj=mine)
         merged = (_majority_entries(per_rank)
                   if majority else _fastest_entries(per_rank))
@@ -4016,7 +4051,8 @@ class AutoTuner:
         custom_op: str,
     ) -> None:
         """Broadcast tactics from root rank to all other ranks."""
-        cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
+        cache_data = self.profiling_cache.shareable(
+            self.profiling_cache.get_specific_custom_op(custom_op))
         root = 0
         cache_data = self._dist.tp_cp_broadcast(obj=cache_data, root=root)
 
@@ -4065,7 +4101,7 @@ class AutoTuner:
                 f"[AutoTuner] Sending cache data to next pp rank {self.mapping.next_pp_rank()}"
             )
             self._dist.isend_object(
-                self.profiling_cache.cache,
+                self.profiling_cache.shareable(self.profiling_cache.cache),
                 dest=self.mapping.next_pp_rank(),
                 tag=PP_COMM_TAG_AUTOTUNING,
             ).wait()

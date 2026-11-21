@@ -2627,28 +2627,30 @@ def test_code_fingerprint_marks_sources_edited_after_start(
     assert any(key and key[0] == "autotuner_source_edited" for key in warnings)
 
 
+_FACTORY_RUNNERS = """
+    from fp_base import Base
+
+
+    class Narrow(Base):
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0]
+
+
+    class Wide(Base):
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0, 1]
+
+
+    def factory(base):
+        class Runner(base):
+            pass
+
+        return Runner
+    """
+
+
 def test_code_fingerprint_tells_factory_built_runner_classes_apart(fp_modules):
-    runners = fp_modules.load(
-        "fp_runners", """
-        from fp_base import Base
-
-
-        class Narrow(Base):
-            def get_valid_tactics(self, inputs, profile, **kwargs):
-                return [0]
-
-
-        class Wide(Base):
-            def get_valid_tactics(self, inputs, profile, **kwargs):
-                return [0, 1]
-
-
-        def factory(base):
-            class Runner(base):
-                pass
-
-            return Runner
-        """)
+    runners = fp_modules.load("fp_runners", _FACTORY_RUNNERS)
     narrow = runners.factory(runners.Narrow)
     wide = runners.factory(runners.Wide)
     assert narrow.__qualname__ == wide.__qualname__
@@ -2661,6 +2663,21 @@ def test_code_fingerprint_tells_factory_built_runner_classes_apart(fp_modules):
     # Built again on the same base, it is the same runner.
     assert autotuner._code_fingerprint(runners.factory(
         runners.Narrow)) == cached[0]
+
+
+def test_candidates_fingerprint_keys_same_named_runners_apart(fp_modules):
+    runners = fp_modules.load("fp_runners", _FACTORY_RUNNERS)
+    narrow = runners.factory(runners.Narrow)
+    wide = runners.factory(runners.Wide)
+    fp_modules.fingerprints()
+    pair = autotuner._candidates_fingerprint((narrow, wide))
+    # Same class name and unique_id: only their own fingerprints differ.
+    assert autotuner._key_fingerprint(narrow,
+                                      pair) != autotuner._key_fingerprint(
+                                          wide, pair)
+    # A runner tuned alone keeps the key it had.
+    alone = autotuner._candidates_fingerprint((narrow, ))
+    assert autotuner._key_fingerprint(narrow, alone) == alone
 
 
 def test_code_fingerprint_keeps_no_object_a_global_held_alive(fp_modules):
@@ -2843,6 +2860,30 @@ def test_ranks_that_fingerprint_differently_raise(fp_modules):
     # Ranks that may run different code must not tune or reuse together.
     with pytest.raises(RuntimeError, match="fingerprint the code"):
         agree(lambda obj: [(True, "other-fingerprint"), obj])
+    # Nor ranks whose sources changed after they started, even when their
+    # fingerprints match: what each loaded is no longer on disk.
+    edited = (True, autotuner._EDITED_PREFIX + "0123456789abcdef")
+    with pytest.raises(RuntimeError, match="changed after"):
+        agree(lambda obj: [edited, edited])
+
+
+def test_search_cache_keeps_same_named_candidates_apart(fp_modules):
+    runners = fp_modules.load("fp_runners", _FACTORY_RUNNERS)
+    narrow = runners.factory(runners.Narrow)()
+    wide = runners.factory(runners.Wide)()
+    candidates = [narrow, wide]
+    cache = autotuner.AutoTuner().profiling_cache
+    cache.cache = {
+        cache.get_cache_key("test_same_named",
+                            wide,
+                            _TACTIC_SPACE_SHAPES,
+                            TuningConfig(),
+                            candidates=candidates): (1, 1, 1.0)
+    }
+    # Wide's tactic 1 stays Wide's: Narrow only runs tactic 0.
+    assert cache.search_cache("test_same_named", candidates,
+                              _TACTIC_SPACE_SHAPES,
+                              TuningConfig()) == (True, 1, 1, 1.0)
 
 
 def test_save_cache_leaves_out_entries_of_edited_sources(tmp_path):
@@ -2851,6 +2892,8 @@ def test_save_cache_leaves_out_entries_of_edited_sources(tmp_path):
     edited = ("test_edited", "R", "()", ((32, 64), ),
               autotuner._EDITED_PREFIX + "0123456789abcdef")
     src.cache = {current: (0, 1, 1.0), edited: (0, 2, 1.0)}
+    # Nor do they reach another rank (merge, broadcast, pipeline send).
+    assert src.shareable(src.cache) == {current: (0, 1, 1.0)}
     path = str(tmp_path / "cache.json")
     src.save_cache(path, rank=0)
     dst = autotuner.AutoTuner().profiling_cache
