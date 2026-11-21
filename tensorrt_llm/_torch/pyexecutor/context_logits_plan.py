@@ -12,6 +12,8 @@ import torch
 from tensorrt_llm.executor.result import reduce_prompt_logprobs
 from tensorrt_llm.logger import logger
 
+from .ced_replay import encoder_replay_tokens
+
 if TYPE_CHECKING:
     from ..modules.embedding import LMHead
     from .llm_request import LlmRequest
@@ -82,8 +84,16 @@ def _keeps_context_logits(request: LlmRequest) -> bool:
 class ContextLogitsPlan:
     """Consume context chunks directly; return only rows needed by the sampler."""
 
-    def __init__(self, batch: ScheduledRequests) -> None:
+    def __init__(self, batch: ScheduledRequests, *, project_in_forward: bool = True) -> None:
         self.batch = batch
+        self.project_in_forward = project_in_forward
+        # The model consumes the replay plan during forward. Input packing can
+        # reorder contexts, so key counts by request identity until projection.
+        self.replay_rows = {
+            id(request): count
+            for request in batch.context_requests
+            if (count := encoder_replay_tokens(request))
+        }
         self.handled = False
 
     @classmethod
@@ -94,7 +104,7 @@ class ContextLogitsPlan:
         *,
         is_spec_decode: bool,
     ) -> ContextLogitsPlan | None:
-        """Select eager projection only when a prepared, supported head can use it.
+        """Select bounded projection or account for replay in full-row logits.
 
         Args:
             heads: ``modules.context_logits.context_logits_heads`` of the model,
@@ -106,13 +116,38 @@ class ContextLogitsPlan:
             request.py_return_context_logits for request in batch.context_requests
         ):
             return None
-        if any(
+        project_in_forward = any(
+            head.context_logits_workspace is not None for head in heads
+        ) and not any(
             getattr(request, "py_logits_post_processors", None) for request in batch.all_requests()
-        ):
-            return None
-        if not any(head.context_logits_workspace is not None for head in heads):
-            return None
-        return cls(batch)
+        )
+        plan = cls(batch, project_in_forward=project_in_forward)
+        return plan if project_in_forward or plan.replay_rows else None
+
+    def _chunk_rows(self, contexts: Sequence[LlmRequest]) -> list[slice]:
+        """New prompt rows in packing order, excluding each replayed prefix."""
+        rows = []
+        end = 0
+        for request in contexts:
+            start = end + self.replay_rows.get(id(request), 0)
+            end = start + request.context_chunk_size
+            rows.append(slice(start, end))
+        return rows
+
+    def store_full_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Store logical prompt rows and keep one sampling row per context plus the decode tail."""
+        contexts = self.batch.context_requests
+        chunks = self._chunk_rows(contexts)
+        context_rows = chunks[-1].stop if chunks else 0
+        if context_rows > logits.shape[0]:
+            raise ValueError("Context logits input does not match scheduled token rows")
+        kept = []
+        for request, chunk in zip(contexts, chunks, strict=True):
+            if request.py_return_context_logits:
+                store_context_logits(request, logits[chunk], reusable=True)
+            kept.append(logits[chunk.stop - 1 : chunk.stop])
+        kept.append(logits[context_rows:])
+        return torch.cat(kept)
 
     def project(self, hidden: torch.Tensor, head: LMHead) -> torch.Tensor:
         """Store requested context rows and project the rows the sampler needs.
@@ -129,7 +164,8 @@ class ContextLogitsPlan:
         workspace = head.context_logits_workspace
         assert workspace is not None
         contexts = self.batch.context_requests
-        context_rows = sum(request.context_chunk_size for request in contexts)
+        chunks = self._chunk_rows(contexts)
+        context_rows = chunks[-1].stop if chunks else 0
         generation_rows = hidden.shape[0] - context_rows
         if generation_rows < 0:
             raise ValueError("Context logits input does not match scheduled token rows")
@@ -154,17 +190,15 @@ class ContextLogitsPlan:
 
         # A local storage failure is reported at the next TP vote, so no rank
         # raises while its peers enter a collective.
-        offset = 0
         tail_rows: list[int] = []
         tail_slots: list[int] = []
-        for index, request in enumerate(contexts):
+        for index, (request, chunk) in enumerate(zip(contexts, chunks, strict=True)):
             count = request.context_chunk_size
             if not request.py_return_context_logits:
-                tail_rows.append(offset + count - 1)
+                tail_rows.append(chunk.stop - 1)
                 tail_slots.append(index)
-                offset += count
                 continue
-            rows = hidden[offset : offset + count]
+            rows = hidden[chunk]
             host_storage = (
                 _keeps_context_logits(request) and request.py_result.context_logits_on_cpu
             )
@@ -188,7 +222,6 @@ class ContextLogitsPlan:
                 if end == count:
                     sampling[index].copy_(logits[-1])
             del logits, buffers
-            offset += count
 
         # Contexts without requested logits need only their last row; project
         # those together with the generation rows.
