@@ -15,10 +15,27 @@
 
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
 #
-# Do not add or change jobs, steps or other keys in this file. The Blossom runner compares it
-# with its template and rejects every /bot command when they differ. Only the `if` of the
-# Authorization job (command prefixes and user list) and the action versions may be changed.
-# A change cannot be tested in a pull request: this workflow always runs from the default branch.
+# IMPORTANT: this file must match the Blossom template. On every /bot command the Blossom
+# runner compares the parsed YAML of this file with the template. If they differ, the command
+# is rejected with "Workflow file integrity check failed".
+#
+# You can change:
+#   - the `if` of the Authorization job (command prefixes and the user list)
+#   - the version of an action in `uses:`, for example actions/checkout@v6. The action itself
+#     must stay the same.
+#   - comments
+#
+# You cannot change anything else. For example, do not:
+#   - add a job or a step
+#   - add a key such as `permissions`, `concurrency`, `env` or `needs`
+#   - change `on:`, `runs-on`, `needs`, a step name, or the `run`, `env` and `with` of a step
+#
+# A change cannot be tested in a pull request, because this workflow always runs from the
+# default branch.
+#
+# Before you change this file, read the code that does the comparison (`compareYaml` and
+# `checkWorkflowFile`) and make sure your change is allowed: http://nv/blossom-ci-yml-check
+# (NVIDIA internal link). The rules above come from that code and may be out of date.
 name: Blossom-CI
 on:
   issue_comment:
