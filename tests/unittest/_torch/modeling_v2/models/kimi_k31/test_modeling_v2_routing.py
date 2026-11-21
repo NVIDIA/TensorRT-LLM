@@ -710,7 +710,17 @@ def test_k31_mapping_rules(monkeypatch, mapping, missed, widened):
         assert reason is not None and missed in reason
 
 
-def test_k31_helix_routes_with_managed_cache():
+@pytest.mark.parametrize("reject", [False, True])
+def test_dflash2_watermark_rejected(reject):
+    spec = _dflash2(fields={"use_rejection_sampling": reject})
+    config = _model_config(_k31_config(), spec_config=spec, **_TEP8)
+    with pytest.raises(ValueError, match="DFlash2 verification does not support watermark_config"):
+        modeling_v2_resolve(config, _llm_args(watermark_config={"key": 1}))
+    assert modeling_v2_resolve(config, _llm_args()) is not None
+
+
+@pytest.mark.parametrize("kv", [{}, {"enable_block_reuse": False}])
+def test_k31_helix_routes_with_managed_cache(kv):
     # CP 8 with graphs, overlap and DFlash2: the padded batch sizes a helix generation server at
     # batch 16 captures. Routing reads neither the overlap nor the graph settings.
     graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4, 8, 16], enable_padding=True)
@@ -718,7 +728,7 @@ def test_k31_helix_routes_with_managed_cache():
         mode="require",
         cuda_graph_config=graph_config,
         disable_overlap_scheduler=False,
-        kv={"enable_block_reuse": False},
+        kv=kv,
     )
     config = _model_config(_k31_config(), spec_config=_DFLASH2, **_helix(8))
     assert _qualified(modeling_v2_resolve(config, args)) == _TARGET

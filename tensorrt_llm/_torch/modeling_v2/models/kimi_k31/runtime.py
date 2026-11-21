@@ -31,8 +31,8 @@ class K31CountFirstAdmission:
     An attention-DP decode step of Kimi K3.1 follows the busiest rank's request count more than its KV, so each
     admitted request goes to the rank with the fewest requests, then the least KV, among the ranks whose KV after it
     stays within ``_COUNT_FIRST_KV_SLACK`` of the mean KV per rank (else to the least-KV rank). When every candidate
-    fits, they are placed largest first; otherwise the first candidates in queue order are, forced ones first. Every
-    rank computes the same plan from the same all-gathered inputs.
+    fits, the planner places the largest first. Otherwise it admits groups in priority order and promotes forced
+    candidates within each group. Every rank computes the same plan from the same all-gathered inputs.
     """
 
     def window(self, max_new_requests: int, free_slots: int) -> int:
@@ -49,7 +49,6 @@ class K31CountFirstAdmission:
         max_new_requests: int,
         candidate_groups: list[int],
     ) -> list[tuple[int, int]]:
-        del candidate_groups  # Queue order already keeps the admission groups in order.
         loads = list(rank_tokens)
         counts = list(rank_num_requests)
         num_ranks = len(counts)
@@ -61,7 +60,9 @@ class K31CountFirstAdmission:
         if budget >= len(candidates):
             order = sorted(candidates, key=lambda i: (-candidate_tokens[i], i))
         else:
-            order = sorted(candidates, key=lambda i: (not candidate_forced[i], i))[:budget]
+            order = sorted(
+                candidates, key=lambda i: (candidate_groups[i], not candidate_forced[i], i)
+            )[:budget]
         plan = []
         for idx in order:
             tokens = candidate_tokens[idx]

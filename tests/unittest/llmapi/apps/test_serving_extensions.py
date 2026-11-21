@@ -610,6 +610,20 @@ class TestOpenAIChatIntegration:
                     rendered["generation"]["sampling_params"].guided_decoding is not None,
                     postproc.tool_parser_grammar_constrained,
                 )
+
+            server.generator.args.guided_decoding_backend = "xgrammar"
+
+            async def custom_tail(**kwargs):
+                return "user: hello\nassistant:"
+
+            monkeypatch.setattr(render_chat_module, "async_apply_chat_template", custom_tail)
+            body = self.required_body()
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 200, response.text
+            assert rendered["generation"]["sampling_params"].guided_decoding is None
+            body["tools"][0]["function"]["strict"] = True
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 400, response.text
         finally:
             serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
 
@@ -975,3 +989,56 @@ class TestExtensionHooks:
         tool = self._namespaced_tool(namespace=namespace, name=name)
 
         assert deepseek_v41.serialize_tool(tool) == tool.model_dump()
+
+
+@pytest.mark.parametrize(
+    "arguments,accepted",
+    [
+        ([("city", "string", "Paris"), ("days", "number", "2")], True),
+        (
+            [("city", "string", "Paris"), ("days", "number", "2"), ("hourly", "boolean", "true")],
+            True,
+        ),
+        ([("city", "string", "Paris")], False),
+        ([("city", "string", "Paris"), ("city", "string", "Lyon"), ("days", "number", "2")], False),
+        ([("city", "string", "Paris"), ("days", "string", "two")], False),
+        ([("city", "string", "LA"), ("days", "number", "2")], False),
+    ],
+)
+def test_k31_strict_required_arguments(arguments, accepted):
+    import xgrammar
+    from xgrammar import structural_tag as st
+
+    from tensorrt_llm.serve.extensions.kimi_k31 import _call_tag
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam
+
+    schema = {
+        "type": "object",
+        "$id": "#weather",
+        "$defs": {"duration": {"type": "integer"}},
+        "properties": {
+            "city": {"type": "string", "minLength": 3, "maxLength": 8},
+            "days": {"$ref": "#/$defs/duration"},
+            "hourly": {"type": "boolean"},
+        },
+        "required": ["city", "days"],
+        "additionalProperties": False,
+    }
+    tool = ChatCompletionToolsParam.model_validate(
+        {"type": "function", "function": {"name": "weather", "parameters": schema, "strict": True}}
+    )
+    grammar = st.StructuralTag(format=_call_tag(tool))
+    compiler = xgrammar.GrammarCompiler(
+        xgrammar.TokenizerInfo([bytes([i]) for i in range(256)] + [b"<eos>"], stop_token_ids=[256])
+    )
+    matcher = xgrammar.GrammarMatcher(compiler.compile_structural_tag(grammar))
+    body = "".join(
+        f'<|open|>argument key="{key}" type="{kind}"<|sep|>{value}<|close|>argument<|sep|>'
+        for key, kind, value in arguments
+    )
+    assert (
+        matcher.accept_string(
+            '<|open|>call tool="weather" index="1"<|sep|>' + body + "<|close|>call<|sep|>"
+        )
+        == accepted
+    )

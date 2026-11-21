@@ -453,6 +453,9 @@ class UnifiedDraftCacheWorkerMixin:
         self, draft_model, spec_metadata, attn_metadata, resource_manager
     ) -> None:
         """Refresh managed inputs before eager execution, capture, or graph replay."""
+        from .dflash2_sampling import dflash2_invalidate_arrived_rows
+
+        dflash2_invalidate_arrived_rows(self, spec_metadata, attn_metadata)
         manager = self.get_draft_kv_cache_manager(resource_manager)
         if not _has_standalone_draft_cache(manager):
             return

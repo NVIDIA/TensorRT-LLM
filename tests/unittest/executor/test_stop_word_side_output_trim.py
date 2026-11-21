@@ -27,8 +27,7 @@ This bites models whose ``generation_config.eos_token_id`` is a list: every
 entry other than the tokenizer's ``eos_token_id`` becomes a ``stop_token_ids``
 entry, so which EOS variant the model happens to emit decides whether the
 request finishes via END_ID (fine) or STOP_WORDS (trimmed).  An END_ID finish
-keeps its end token in ``token_ids`` but leaves it out of the text when
-special tokens are kept.  CPU-only; no engine needed.
+keeps its end token for the tokenizer to decode.  CPU-only; no engine needed.
 """
 
 from types import SimpleNamespace
@@ -37,12 +36,7 @@ import pytest
 import torch
 
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor.result import (
-    CompletionOutput,
-    GenerationResultBase,
-    Logprob,
-    _text_token_ids,
-)
+from tensorrt_llm.executor.result import GenerationResultBase, Logprob
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -240,29 +234,3 @@ def test_generation_only_response_preserves_sampler_logprobs(first_token_logprob
     assert output.token_ids == tokens
     assert output.logprobs == sampler_logprobs
     assert output.disaggregated_params is result.disaggregated_params
-
-
-@pytest.mark.parametrize(
-    "finish_reason, stop_reason, params, token_ids, expected",
-    [
-        # Finished on its end token with special tokens kept: the end token is left out.
-        ("stop", None, {}, [1, 2, END_ID], [1, 2]),
-        # Unfinished, length-capped and stop-word finishes keep every token.
-        (None, None, {}, [1, 2, END_ID], [1, 2, END_ID]),
-        ("length", None, {}, [1, 2, END_ID], [1, 2, END_ID]),
-        ("stop", 7, {}, [1, 2, END_ID], [1, 2, END_ID]),
-        # Asked for explicitly.
-        ("stop", None, {"include_stop_str_in_output": True}, [1, 2, END_ID], [1, 2, END_ID]),
-        # Special tokens skipped (the default): the detokenizer decides which tokens reach the text.
-        ("stop", None, {"skip_special_tokens": True}, [1, 2, END_ID], [1, 2, END_ID]),
-        # A streaming diff that does not end on the end token.
-        ("stop", None, {}, [3, 4], [3, 4]),
-        ("stop", None, {}, [], []),
-    ],
-)
-def test_end_token_is_left_out_of_the_text(finish_reason, stop_reason, params, token_ids, expected):
-    output = CompletionOutput(index=0, text="")
-    output.finish_reason = finish_reason
-    output.stop_reason = stop_reason
-    sampling_params = SamplingParams(end_id=END_ID, **{"skip_special_tokens": False, **params})
-    assert _text_token_ids(output, token_ids, sampling_params) == expected

@@ -107,3 +107,15 @@ def test_whole_window_is_placed_largest_first():
         candidate_groups=[0, 0, 0],
     )
     assert [idx for idx, _ in plan] == [1, 2, 0]
+
+
+def test_partial_window_respects_group_priority_before_skip_promotion():
+    assert _plan(
+        candidate_tokens=[1, 1],
+        candidate_forced=[False, True],
+        rank_tokens=[0],
+        rank_num_requests=[0],
+        max_requests_per_rank=1,
+        max_new_requests=1,
+        candidate_groups=[0, 1],
+    ) == [(0, 0)]

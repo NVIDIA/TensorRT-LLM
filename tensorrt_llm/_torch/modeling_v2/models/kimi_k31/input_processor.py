@@ -458,7 +458,10 @@ class K31InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsB
         images = mm_data.get("image", [])
 
         if not images:
-            return self._encode_prompt(text_prompt), {}
+            ids = self._encode_prompt(text_prompt)
+            if sampling_params is not None and sampling_params.truncate_prompt_tokens is not None:
+                ids = ids[-sampling_params.truncate_prompt_tokens :]
+            return ids, {}
 
         # The HF processor takes either chat ``messages`` or ``medias`` and the formatted ``text``; the prompt is
         # already formatted. The serving layer may pass images as tensors (format "pt"), the HF processor takes PIL.

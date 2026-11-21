@@ -100,3 +100,36 @@ def test_walk_matches_references():
     assert torch.equal(path.cpu(), vec_path)
     assert torch.equal(tokens.cpu(), vec_tokens)
     torch.testing.assert_close(q.cpu(), vec_q, rtol=1e-5, atol=1e-6)
+
+
+def test_arriving_generation_uses_fresh_proposal_probabilities(monkeypatch):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.spec import dflash2_sampling
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.spec.unified_draft_cache_worker import (
+        UnifiedDraftCacheWorkerMixin,
+    )
+
+    worker = UnifiedDraftCacheWorkerMixin()
+    store = dflash2_sampling.DFlash2ProposalStore(2, 1, 2, "cpu")
+    worker._dflash2_proposals = store
+    worker._dflash2_proposal_requests = {5}
+    slots = torch.tensor([0])
+    tokens = torch.tensor([[7]])
+    store.store(slots, torch.tensor([[[7, 8]]]), torch.tensor([[[0.3, 0.7]]]), tokens)
+    manager = SimpleNamespace(is_disagg=True, kv_cache_map={6: object()})
+    attn = SimpleNamespace(kv_cache_manager=manager, num_contexts=0)
+    spec = SimpleNamespace(
+        request_ids=[6], batch_slot_ids=slots, max_draft_len=1, use_rejection_sampling=True
+    )
+    monkeypatch.setattr(worker, "get_draft_kv_cache_manager", lambda _: None)
+    monkeypatch.setattr(
+        dflash2_sampling,
+        "async_tensor_h2d",
+        lambda data, dtype, device: torch.tensor(data, dtype=dtype, device=device),
+    )
+    worker.prepare_managed_draft_cache(None, spec, attn, None)
+    expected_ids, expected_q = store.load(torch.tensor([1]), tokens)
+    ids, q = store.load(slots, tokens)
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(q, expected_q)

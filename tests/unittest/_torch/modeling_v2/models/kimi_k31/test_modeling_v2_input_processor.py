@@ -201,3 +201,15 @@ def test_processor_matches_the_engine_k3_processor_on_a_fixed_image():
     our_input, engine_input = our_extra["multimodal_input"], engine_extra["multimodal_input"]
     assert our_input.multimodal_positions == engine_input.multimodal_positions
     assert our_input.multimodal_lengths == engine_input.multimodal_lengths
+
+
+@pytest.mark.parametrize("size", [17, 256])
+def test_text_prompt_truncates_encoded_ids(size):
+    processor = _processor()
+    ids = list(range(size))
+    processor._encode_prompt = lambda text: ids
+    result, extra = processor.call_with_text_prompt(
+        {"prompt": "example"}, SimpleNamespace(truncate_prompt_tokens=128)
+    )
+    assert result == ids[-128:]
+    assert extra == {}

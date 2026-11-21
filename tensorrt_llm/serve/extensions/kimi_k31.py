@@ -8,6 +8,7 @@ import functools
 import json
 from typing import Any, Dict, List, Optional
 
+import jsonschema
 import xgrammar
 from xgrammar import structural_tag as st
 
@@ -383,28 +384,50 @@ def _argument_tags(key: str, schema: Any, root: Dict[str, Any]) -> List[st.TagFo
     return tags
 
 
+def _strict_arguments(tool: Tool) -> st.JSONSchemaFormat:
+    """Constrain the entire argument object in the XTML form the checkpoint emits."""
+    schema = tool.function.parameters
+    if schema is None:
+        schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    arguments = st.JSONSchemaFormat(json_schema=schema, style="kimi_k3_xml")
+    try:
+        validator = jsonschema.validators.validator_for(schema, default=jsonschema.Draft7Validator)
+        validator.check_schema(schema, format_checker=None)
+        xgrammar.Grammar.from_structural_tag(st.StructuralTag(format=arguments))
+    except (jsonschema.SchemaError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid or unsupported strict parameter schema for {tool.function.name!r}."
+        ) from exc
+    return arguments
+
+
 def _call_tag(tool: Tool) -> st.TagFormat:
     """``<|open|>call tool="NAME" index="N"<|sep|>`` and the call's arguments."""
     parameters = tool.function.parameters
     properties = parameters.get("properties") if isinstance(parameters, dict) else None
-    if isinstance(properties, dict) and properties:
+    if tool.function.strict:
+        arguments = _strict_arguments(tool)
+    elif isinstance(properties, dict) and properties:
         argument_tags = [
             tag for key, prop in properties.items() for tag in _argument_tags(key, prop, parameters)
         ]
         required = parameters.get("required")
-        at_least_one = isinstance(required, list) and bool(required)
+        arguments = st.TagsWithSeparatorFormat(
+            tags=argument_tags,
+            separator="",
+            at_least_one=isinstance(required, list) and bool(required),
+        )
     else:
-        argument_tags = [_any_argument_tag()]
-        at_least_one = False
+        arguments = st.TagsWithSeparatorFormat(
+            tags=[_any_argument_tag()], separator="", at_least_one=False
+        )
     return st.TagFormat(
         begin=f'{_OPEN}call tool="{_escape_attr(tool.function.name)}" index="',
         content=st.SequenceFormat(
             elements=[
                 st.RegexFormat(pattern="[0-9]+"),
                 st.ConstStringFormat(value=f'"{_SEP}'),
-                st.TagsWithSeparatorFormat(
-                    tags=argument_tags, separator="", at_least_one=at_least_one
-                ),
+                arguments,
             ]
         ),
         end=f"{_CLOSE}call{_SEP}",
@@ -414,6 +437,8 @@ def _call_tag(tool: Tool) -> st.TagFormat:
 @register_serving_extension(model_types=("kimi_k31",), reasoning_parsers=("kimi_k31",))
 class K31ServingExtension(KimiK3ServingExtension):
     """Kimi K3's serving semantics for kimi_k31 chat requests, with a grammar for required tool calls."""
+
+    omit_chat_eos = True
 
     def required_tool_choice_mode(self) -> RequiredToolChoiceMode:
         """Enforce the call with the kimi_k3 tool grammar when the request allows it."""

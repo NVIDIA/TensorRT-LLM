@@ -70,6 +70,9 @@ class ServingExtension:
     # the prompt it renders, so prepared requests from the older revision are refused.
     render_version: int = 1
 
+    # The tokenizer EOS is protocol framing when the chat renderer keeps special tokens.
+    omit_chat_eos: bool = False
+
     # Chat-message parsing: keep an assistant tool call's arguments string verbatim when it is
     # not valid JSON, and keep the ``tools`` a system message declares.
     lenient_tool_call_arguments: bool = False

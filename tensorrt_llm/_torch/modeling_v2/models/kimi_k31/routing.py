@@ -1181,6 +1181,14 @@ def route(
         raise NoTarget(mismatch)
     from .config import mxfp4_experts, routes_to_nvfp4_targets
 
+    spec = model_config.spec_config or llm_args.speculative_config
+    if (
+        llm_args.watermark_config is not None
+        and spec is not None
+        and spec.spec_dec_mode.is_dflash()
+    ):
+        raise NoTarget("Kimi K3.1 DFlash2 verification does not support watermark_config")
+
     mxfp4 = mxfp4_experts(pretrained_config)
     nvfp4 = None
     if routes_to_nvfp4_targets(
@@ -1307,7 +1315,8 @@ def route(
         if (mismatch := _draft_cache_mismatch(llm_args, model_config.mapping)) is not None:
             raise NoTarget(mismatch)
     if model_config.mapping.has_cp_helix():
-        if llm_args.kv_cache_config.enable_block_reuse:
+        kv = llm_args.kv_cache_config
+        if "enable_block_reuse" in kv.model_fields_set and kv.enable_block_reuse:
             raise NoTarget("Kimi K3.1 Helix requires block reuse disabled")
     if (mismatch := _moe_mismatch(text, model_config.mapping)) is not None:
         raise NoTarget(mismatch)

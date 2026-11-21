@@ -360,7 +360,7 @@ Disaggregated serving runs separate context (prefill) and generation (decode) se
 
 **Settings common to the context and generation servers:**
 
-* The Python transceiver over NIXL on every context and generation server, with the same `kv_transfer_timeout_ms` on both sides. A context send whose generation peer never asks for it (for example, a client that disconnects between the legs) is released after three times this value. Do not set `max_tokens_in_buffer`: with the Python transceiver it bounds the transfer window, and sends that wait for a generation peer can then stall the context server.
+* The Python transceiver over NIXL on every context and generation server, with the same `kv_transfer_timeout_ms` on both sides. Do not set `max_tokens_in_buffer`: with the Python transceiver it bounds the transfer window, and sends that wait for a generation peer can then stall the context server.
 
   ```yaml
   cache_transceiver_config:

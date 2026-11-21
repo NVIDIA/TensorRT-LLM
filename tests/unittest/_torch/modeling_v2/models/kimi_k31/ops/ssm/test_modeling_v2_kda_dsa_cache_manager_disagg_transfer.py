@@ -61,6 +61,8 @@ _LATENT_DIM = 64
 _KDA_HEADS, _KDA_HEAD_DIM, _KDA_CONV = 4, 8, 4
 #: Prompt lengths: part of a block, exactly two blocks, part of a third, part of one.
 _PROMPT_LENGTHS = [33, 64, 95, 17]
+_DRAFT_LAYERS = 2
+_DRAFT_WINDOW = 32
 _SENTINEL = 0xA5
 _LATENT_DTYPES = {"fp8": DataType.FP8, "auto": DataType.BF16}
 
@@ -124,6 +126,12 @@ def _manager(tp: int, rank: int, attention_dp: bool, kv_dtype: str) -> KimiK3DSA
         layer_mask=_MLA_MASK,
         sparse_attention_config=_sparse_config(),
         pretrained_config=_text_config(),
+        draft_num_layers=_DRAFT_LAYERS,
+        draft_window_size=_DRAFT_WINDOW,
+        draft_num_kv_heads=1,
+        draft_total_num_kv_heads=1,
+        draft_kv_factor=1,
+        draft_head_dim=64,
         is_disagg=True,
     )
 
@@ -205,6 +213,12 @@ def _regions(manager, request_id: int, idx: int, num_blocks: int) -> list[_Regio
         for block, slot in enumerate(slots):
             page = pages[slot * manager.indexer_k_cache_page_scale]
             regions.append(_Region(page, (idx, "index_k", layer, block)))
+    draft_slots = manager.get_draft_block_indices([request_id])[0]
+    for layer in range(_DRAFT_LAYERS):
+        pages = manager.get_draft_buffers(layer)
+        for block, slot in enumerate(draft_slots[:num_blocks]):
+            if slot >= 0:
+                regions.append(_Region(pages[slot], (idx, "draft", layer, block)))
     state = manager._request_id_to_state_index[request_id]
     for layer in manager.mamba_layer_offsets:
         regions.append(_Region(manager.get_conv_states(layer)[state], (idx, "conv", layer)))
@@ -242,6 +256,10 @@ def _ground_truth(requests, manager) -> dict:
                 truth[key] = torch.randint(
                     0, 256, (latent_bytes,), generator=gen, dtype=torch.uint8
                 )
+            for layer in range(_DRAFT_LAYERS):
+                key = (request.idx, "draft", layer, block)
+                size = manager.get_draft_buffers(layer)[0].nbytes
+                truth[key] = torch.randint(1, 256, (size,), generator=gen, dtype=torch.uint8)
             for layer in _indexer_layers(manager):
                 key = (request.idx, "index_k", layer, block)
                 truth[key] = torch.randint(0, 256, (index_bytes,), generator=gen, dtype=torch.uint8)
@@ -389,6 +407,14 @@ def test_tep_to_dep_transfer(transfer_harness, monkeypatch, ctx_tp, gen_tp, kv_d
             r.idx: _regions(gen_managers[r.owner], r.gen.py_request_id, r.idx, r.num_blocks)
             for r in requests
         }
+        for r in requests:
+            first_tail_block = max(0, r.ctx.prompt_len - _DRAFT_WINDOW) // _TOKENS_PER_BLOCK
+            expected = {
+                (r.idx, "draft", layer, block)
+                for layer in range(_DRAFT_LAYERS)
+                for block in range(first_tail_block, r.num_blocks)
+            }
+            assert expected <= {region.key for region in gen_regions[r.idx]}
         gen_pools = [_pool_spans(manager) for manager in gen_managers]
         for spans in gen_pools:
             for start, end in spans:
