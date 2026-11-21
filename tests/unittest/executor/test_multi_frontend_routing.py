@@ -19,13 +19,18 @@ executor path. Covers client-id namespacing, worker-side response-lane routing, 
 attached-frontend proxy lifecycle over real ipc:// sockets.
 """
 
+import asyncio
 import os
+import queue
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
+import zmq
 
+from tensorrt_llm.executor.ipc import FusedIpcQueue, IpcQueue
 from tensorrt_llm.executor.utils import (
     FRONTEND_COUNTER_MASK,
     MAX_NUM_FRONTENDS,
@@ -34,6 +39,8 @@ from tensorrt_llm.executor.utils import (
     get_frontend_id,
     namespace_client_id,
 )
+from tensorrt_llm.executor.worker import _response_queue_lifetime
+from tensorrt_llm.llmapi.utils import ManagedThread
 
 pytestmark = pytest.mark.cpu_only
 
@@ -75,6 +82,90 @@ class TestClientIdNamespacing:
 
 def _response(client_id):
     return SimpleNamespace(client_id=client_id)
+
+
+@pytest.mark.parametrize("lanes", [1, 2])
+@pytest.mark.parametrize("mode", ["stopped", "finished", "never_started"])
+def test_response_owner_sends_last_batch_before_one_terminal_message(monkeypatch, lanes, mode):
+    monkeypatch.setenv("TLLM_LLMAPI_ZMQ_DEBUG", "1")
+    receivers = [IpcQueue(is_server=True, socket_type=zmq.PULL) for _ in range(lanes)]
+    senders = [
+        FusedIpcQueue(receiver.address, is_server=False, fuse_message=False, socket_type=zmq.PUSH)
+        for receiver in receivers
+    ]
+    entered, release = threading.Event(), threading.Event()
+    errors = queue.Queue()
+
+    def respond():
+        entered.set()
+        assert release.wait(3)
+        for sender in senders:
+            sender.put(["last-response"])
+        return False
+
+    thread = ManagedThread(respond, errors)
+    worker = SimpleNamespace(await_response_thread=thread)
+
+    def notify():
+        for sender in senders:
+            sender.put(None)
+
+    timer = None
+    try:
+        with _response_queue_lifetime(worker, notify):
+            if mode != "never_started":
+                thread.start()
+                assert entered.wait(3)
+                if mode == "finished":
+                    release.set()
+                    thread.join(3)
+                    assert not thread.is_alive()
+                else:
+                    # Exit while a response is still in flight: the terminal
+                    # notification must wait for that response's owner.
+                    timer = threading.Timer(0.05, release.set)
+                    timer.start()
+        assert errors.empty()
+        for receiver in receivers:
+            if mode != "never_started":
+                assert receiver.poll(3)
+                assert receiver.get() == ["last-response"]
+            assert receiver.poll(3)
+            assert receiver.get() == [None]
+            assert not receiver.poll(0.05)
+    finally:
+        release.set()
+        thread.stop()
+        if thread.ident is not None:
+            thread.join(3)
+        if timer is not None:
+            timer.join(3)
+        for sender in senders:
+            sender.queue.close()
+        for receiver in receivers:
+            receiver.close()
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("dispatch_failed", [False, True])
+def test_response_notification_failure_preserves_dispatch_failure(dispatch_failed):
+    errors = queue.Queue()
+    thread = ManagedThread(lambda: False, errors)
+    worker = SimpleNamespace(await_response_thread=thread)
+
+    def notify():
+        raise RuntimeError("notification failed")
+
+    expected = ValueError if dispatch_failed else RuntimeError
+    with pytest.raises(
+        expected, match="dispatch failed" if dispatch_failed else "notification failed"
+    ):
+        with _response_queue_lifetime(worker, notify):
+            thread.start()
+            thread.join(3)
+            assert not thread.is_alive()
+            if dispatch_failed:
+                raise ValueError("dispatch failed")
 
 
 class TestClassicResponseBucketing:
@@ -253,7 +344,7 @@ class TestClassicFrontendProxyEndToEnd:
         from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, _, _ = self._make_proxy_and_fake_worker(tmpdir)
+            proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmpdir)
 
             # Regression: this state lives in GenerationExecutorProxy.__init__,
             # which an attached frontend deliberately skips, so it must be
@@ -266,6 +357,127 @@ class TestClassicFrontendProxyEndToEnd:
             assert not proxy.check_health()
             with pytest.raises(EngineDeadError):
                 proxy.submit(GenerationRequest([1], SamplingParams()))
+            proxy.shutdown()
+            assert not worker_ingress.poll(1), (
+                "an attached frontend failure must never stop shared workers"
+            )
+            worker_ingress.close()
+
+    @pytest.mark.parametrize("drained_by", ["health", "request"])
+    def test_frontend_fatal_error_still_cancels_its_requests_on_the_engine(self, drained_by):
+        # After an attached frontend's own fatal error, its command sender stays
+        # open, so pre_shutdown cancels the frontend's in-flight requests on
+        # the shared engine, which may still be healthy. pre_shutdown runs
+        # whether /health or a request drains the error first.
+        from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
+        from tensorrt_llm.executor.utils import EngineDeadError
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+            result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
+            assert worker_ingress.poll(5)
+            assert isinstance(worker_ingress.get(), GenerationRequest)
+
+            # A frontend-local failure drained on the event loop.
+            proxy._error_queue.put(RuntimeError("dispatch thread failed"))
+            started = time.monotonic()
+            if drained_by == "health":
+                assert not proxy.check_health()
+            else:
+                with pytest.raises(EngineDeadError):
+                    proxy._handle_background_error()
+            assert time.monotonic() - started < 1.0, "the drain waited for shutdown writes"
+
+            assert worker_ingress.poll(5), "in-flight request was never cancelled"
+            cancel = worker_ingress.get()
+            assert isinstance(cancel, CancellingRequest) and cancel.id == result.request_id
+            proxy.shutdown()
+            assert not worker_ingress.poll(1), "an attached frontend sent the stop sentinel"
+            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+            worker_ingress.close()
+
+    def test_frontend_shutdown_after_engine_loss_does_not_wait_out_the_close_timeout(self):
+        from tensorrt_llm.executor.request import GenerationRequest
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+            proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
+            assert worker_ingress.poll(5)
+            worker_ingress.get()
+            # Rank 0 is gone; the frontend learns of it from the watchdog.
+            worker_ingress.close()
+            proxy._set_fatal_error(RuntimeError("launcher frontend exited"))
+            started = time.monotonic()
+            proxy.pre_shutdown()
+            assert time.monotonic() - started < 1.0
+            proxy.shutdown()
+            # Cancels to a gone peer stop at the disconnect, not after 7 s.
+            assert time.monotonic() - started < 4.0
+            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+
+    def test_command_loss_reaches_a_response_waiter_as_service_unavailable(self):
+        # With a response already queued ahead of the EngineDeadError, the
+        # waiter that drains the ConnectionError from the error queue still
+        # gets EngineDeadError, which the HTTP layer answers with 503.
+        from http import HTTPStatus
+
+        import tensorrt_llm.bindings.executor as tllm
+        from tensorrt_llm.executor.request import GenerationRequest
+        from tensorrt_llm.executor.utils import EngineDeadError
+        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        token = SimpleNamespace(
+            is_final=False,
+            decoding_iter=1,
+            avg_decoded_tokens_per_iter=None,
+            context_phase_params=None,
+            finish_reasons=[tllm.FinishReason.NOT_FINISHED],
+            output_token_ids=[[5]],
+            sequence_index=0,
+            cum_log_probs=None,
+            log_probs=None,
+            generation_logits=None,
+            time_breakdown_metrics=None,
+            context_logits=None,
+            request_perf_metrics=None,
+            additional_context_outputs=None,
+            additional_generation_outputs=None,
+            per_pos_drafted=None,
+            per_pos_accepted=None,
+            spec_dec_totals=None,
+        )
+
+        async def scenario(proxy, worker_ingress):
+            result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams(max_tokens=4)))
+            assert worker_ingress.poll(5)
+            worker_ingress.get()
+            # A partial response already dispatched for this request.
+            result.queue.put(
+                SimpleNamespace(client_id=result.request_id, result=token, has_error=lambda: False)
+            )
+            worker_ingress.close()
+            deadline = time.monotonic() + 5
+            while not proxy._engine_dead and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert proxy._engine_dead, "command-connection loss was not detected"
+            started = time.monotonic()
+            with pytest.raises(EngineDeadError) as error:
+                await result.aresult()
+            assert time.monotonic() - started < 1.0, "the waiter ran a blocking shutdown"
+            return error.value
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+            try:
+                error = asyncio.run(scenario(proxy, worker_ingress))
+                response = OpenAIServer._create_exception_response(error)
+                assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+            finally:
+                proxy.shutdown()
+                self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
 
     def test_dispatch_routes_own_lane_responses(self):
         import zmq

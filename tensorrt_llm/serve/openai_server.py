@@ -24,8 +24,8 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Callable, Dict, List, Optional, Tuple,
-                    TypeVar, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Sequence,
+                    Tuple, TypeVar, Union)
 
 import msgspec
 import torch
@@ -49,6 +49,8 @@ from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         EngineDeadError,
+                                         EngineUnavailableError,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
@@ -235,6 +237,10 @@ class _MsgspecRoute(KvHintsRoute):
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+# Admission rejections and terminal engine failures: answered with 503 and
+# logged without a traceback, since they are not request or server bugs.
+_ENGINE_ERRORS = (EngineUnavailableError, EngineDeadError)
 
 _warned_unresolvable_thinking = False
 
@@ -682,6 +688,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # the first request that consults it.
         load_builtin_extensions()
         self.generator = generator
+        self._uvicorn_server: Optional[uvicorn.Server] = None
+        self._http_shutdown_requested = False
         self._is_visual_gen = _is_visual_gen_instance(generator)
         # Keep the established embedding_* constructor keywords for API
         # compatibility; the underlying batcher is shared by encode-only roles.
@@ -895,6 +903,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
             yield
 
+            self._http_shutdown_requested = True
             await self._perf_metrics_writer.close()
             for task in (self._launcher_watchdog_task, self._clock_offset_task):
                 if task is not None:
@@ -1221,6 +1230,63 @@ class OpenAIServer(_VideoRoutesMixin):
                                        code=code)
         return JSONResponse(content=error_response.model_dump(),
                             status_code=status_code.value)
+
+    @staticmethod
+    def _create_exception_response(error: Exception,
+                                   err_type: str = "BadRequestError"
+                                   ) -> Response:
+        """HTTP error for ``error``: 503 for an engine error, else 400."""
+        if isinstance(error, _ENGINE_ERRORS):
+            return OpenAIServer.create_error_response(
+                str(error),
+                err_type="ServiceUnavailableError",
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+        return OpenAIServer.create_error_response(str(error), err_type=err_type)
+
+    def _request_failure_response(
+            self,
+            error: Exception,
+            admitted: Sequence[RequestOutput] = (),
+            *,
+            log_traceback: bool = True,
+            err_type: str = "BadRequestError") -> Response:
+        """Answer a request whose handler raised ``error`` before responding.
+
+        Requests already admitted for it are aborted, since no one reads their
+        results. Engine errors are expected under overload and after engine
+        loss, so only other errors are logged with a traceback.
+        """
+        for promise in admitted:
+            try:
+                promise.abort()
+            except Exception:
+                logger.warning("Failed to abort an admitted request:\n"
+                               f"{traceback.format_exc()}")
+        if log_traceback and not isinstance(error, _ENGINE_ERRORS):
+            logger.error("".join(traceback.format_exception(error)))
+        return self._create_exception_response(error, err_type)
+
+    @staticmethod
+    def _sse_error_event(error: Exception) -> str:
+        """SSE frame that reports ``error`` on a stream already answered 200.
+
+        An engine error carries the type and status code that a non-streaming
+        request would have received.
+        """
+        if isinstance(error, _ENGINE_ERRORS):
+            err_type, code = ("ServiceUnavailableError",
+                              HTTPStatus.SERVICE_UNAVAILABLE.value)
+        else:
+            err_type, code = "server_error", None
+        error_data = json.dumps({
+            "error": {
+                "message": str(error),
+                "type": err_type,
+                "code": code,
+                "param": None,
+            }
+        })
+        return f"data: {error_data}\n\n"
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -1921,6 +1987,16 @@ class OpenAIServer(_VideoRoutesMixin):
         logger.info(f"Following the launcher's steady clock offset between "
                     f"local and disagg server: {offset} second")
 
+    def _request_http_shutdown(self) -> None:
+        """Stop HTTP serving once, independently of executor cleanup."""
+        server = self._uvicorn_server
+        if (self._http_shutdown_requested
+                or (server is not None and server.should_exit)):
+            return
+        self._http_shutdown_requested = True
+        _record_generator_termination(self.generator)
+        signal.raise_signal(signal.SIGINT)
+
     def _on_launcher_lost(self, error: BaseException) -> None:
         """Watchdog callback: fail requests with EngineDeadError, then shut down.
 
@@ -1930,30 +2006,21 @@ class OpenAIServer(_VideoRoutesMixin):
         if executor is None:  # the LLM already shut down
             return
         executor._set_fatal_error(error)  # keeps only the first error
-        if not executor.doing_shutdown:
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+        self._request_http_shutdown()
 
     async def health(self) -> Response:
         if self._check_health():
             return Response(status_code=200)
         else:
-            # If the engine has a fatal error, trigger server shutdown so the
-            # pod doesn't linger as a zombie that accepts connections but never
-            # produces tokens.  Uses SIGINT (not SIGTERM) to match the
-            # existing CppExecutorError handlers and let uvicorn perform
-            # its graceful shutdown sequence.  The doing_shutdown guard
-            # ensures we only send SIGINT once — repeated health probes
-            # won't stack signals during an in-progress teardown.
+            # Executor cleanup can precede HTTP shutdown. A fatal engine must
+            # also stop serving, without stacking signals during HTTP teardown.
             executor = getattr(self.generator, '_executor', None)
             if executor is not None and getattr(executor, '_fatal_error',
                                                 None) is not None:
-                if not getattr(executor, 'doing_shutdown', True):
-                    logger.error(
-                        "Health check detected fatal engine error, initiating "
-                        f"server shutdown: {executor._fatal_error}")
-                    _record_generator_termination(self.generator)
-                    signal.raise_signal(signal.SIGINT)
+                logger.error(
+                    "Health check detected fatal engine error, initiating "
+                    f"server shutdown: {executor._fatal_error}")
+                self._request_http_shutdown()
             return Response(
                 status_code=503,
                 content=
@@ -2340,6 +2407,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
+            except _ENGINE_ERRORS as e:
+                # HTTP 200 is already committed: end the stream explicitly.
+                yield self._sse_error_event(e)
+                yield "data: [DONE]\n\n"
             except Exception:
                 # Only failures are logged: a consumer that stops reading closes
                 # the stream with GeneratorExit, and a client that disconnects
@@ -2348,6 +2419,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         input_started = _start_input_processing()
+        admitted: List[RequestOutput] = []
         try:
             # Extension preprocessing, the required-tool check and tool dumping
             # are the first stage of the shared prompt-preparation pipeline.
@@ -2750,6 +2822,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            admitted.append(promise)
             _record_input_processing("total", input_started)
             input_started = None
 
@@ -2789,13 +2862,13 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except ValueError as e:
-            return self.create_error_response(str(e))
+            return self._request_failure_response(e,
+                                                  admitted,
+                                                  log_traceback=False)
         except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._request_failure_response(e, admitted)
         finally:
             _record_input_processing("total", input_started)
 
@@ -3162,6 +3235,7 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
         input_started = _start_input_processing()
+        admitted: List[RequestOutput] = []
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -3222,6 +3296,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                              mm_item_order)
 
             promise = self.generator.generate_async(inputs=prompt, )
+            admitted.append(promise)
             _record_input_processing("total", input_started)
             input_started = None
 
@@ -3234,11 +3309,9 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._request_failure_response(e, admitted)
         finally:
             _record_input_processing("total", input_started)
 
@@ -3306,21 +3379,14 @@ class OpenAIServer(_VideoRoutesMixin):
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
             except Exception as e:
-                logger.error(traceback.format_exc())
+                if not isinstance(e, _ENGINE_ERRORS):
+                    logger.error(traceback.format_exc())
                 # StreamingResponse commits HTTP 200 before the first
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
-                # instead of breaking the HTTP connection.
-                error_data = json.dumps({
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": None,
-                        "param": None,
-                    }
-                })
-                yield f"data: {error_data}\n\n"
-                yield "data: [DONE]\n\n"
+                # instead of breaking the HTTP connection. generator_wrapper
+                # sends the one [DONE] after every prompt's generator ends.
+                yield self._sse_error_event(e)
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -3351,6 +3417,7 @@ class OpenAIServer(_VideoRoutesMixin):
             yield "data: [DONE]\n\n"
 
         input_started = _start_input_processing()
+        promises: List[RequestOutput] = []
         try:
             if isinstance(request.prompt, list) and not request.prompt:
                 return self.create_error_response("'prompt' must not be empty.")
@@ -3366,7 +3433,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 stream_response_id = f"cmpl-{uuid.uuid4().hex}"
                 stream_created = int(time.time())
 
-            promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -3432,13 +3498,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     kv_hints=request.kv_hints,
                     priority=request.priority if request.priority is not None
                     else DEFAULT_REQUEST_PRIORITY)
+                promises.append(promise)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
                     postproc_args.tokenizer = self.tokenizer
                     postproc_args.num_prompt_tokens = len(
                         promise.prompt_token_ids)
-                promises.append(promise)
                 postproc_params_collection.append(
                     None if self.postproc_worker_enabled else postproc_params)
 
@@ -3466,11 +3532,9 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._request_failure_response(e, promises)
         finally:
             _record_input_processing("total", input_started)
 
@@ -3505,11 +3569,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._extract_metrics(res, raw_request)
             except asyncio.CancelledError:
                 raise
+            except _ENGINE_ERRORS as e:
+                yield self._sse_error_event(e)
+                yield "data: [DONE]\n\n"
             except Exception:
                 logger.error(traceback.format_exc())
                 raise
 
         input_started = _start_input_processing()
+        admitted: List[RequestOutput] = []
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -3610,6 +3678,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            admitted.append(promise)
             _record_input_processing("total", input_started)
             input_started = None
 
@@ -3630,12 +3699,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 return JSONResponse(response.model_dump())
 
         except ValueError as e:
-            return self.create_error_response(str(e))
+            return self._request_failure_response(e,
+                                                  admitted,
+                                                  log_traceback=False)
         except Exception as e:
-            logger.error("Error in harmony chat completion: %s", e)
-            logger.debug("Error details: %s", traceback.format_exc())
-            return self.create_error_response(message=str(e),
-                                              err_type="internal_error")
+            return self._request_failure_response(e,
+                                                  admitted,
+                                                  err_type="internal_error")
         finally:
             _record_input_processing("total", input_started)
 
@@ -3721,6 +3791,7 @@ class OpenAIServer(_VideoRoutesMixin):
             await self._extract_metrics(res, raw_request)
 
         input_started = _start_input_processing()
+        admitted: List[RequestOutput] = []
         try:
             if request.background:
                 logger.warning(
@@ -3862,6 +3933,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            admitted.append(promise)
             _record_input_processing("total", input_started)
             input_started = None
 
@@ -3902,11 +3974,9 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
-            _record_generator_termination(self.generator)
-            signal.raise_signal(signal.SIGINT)
+            self._request_http_shutdown()
         except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._request_failure_response(e, admitted)
 
         finally:
             _record_input_processing("total", input_started)
@@ -4632,6 +4702,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
                                 **config_kwargs)
         server = create_uvicorn_server(config)
+        self._uvicorn_server = server
 
         async def _register_after_serving():
             with _StartupTimer("http_server_start"):

@@ -7,7 +7,7 @@ import asyncio
 import json
 import pickle
 import queue
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -362,9 +362,13 @@ def test_generation_request_pickle_preserves_snapshot() -> None:
     assert clone.kv_hints.envelope().model_dump() == _wire()
 
 
+@pytest.mark.timeout(15, method="thread")
 def test_proxy_batching_preserves_hint_snapshots() -> None:
     """Batched worker transport preserves hints, fallback and prompt tokens."""
-    from tensorrt_llm.executor.proxy import GenerationExecutorProxy, _RequestSender
+    from utils.executor_stubs import bare_proxy
+
+    from tensorrt_llm.executor.ipc import IpcQueue
+    from tensorrt_llm.executor.proxy import _RequestSender
     from tensorrt_llm.executor.worker import _incoming_requests
 
     hints = _hints()
@@ -373,23 +377,21 @@ def test_proxy_batching_preserves_hint_snapshots() -> None:
         fallback = _request({"protocol_version": "0.1"})
     assert fallback.kv_hints is None
 
-    request_queue = queue.Queue()
     error_queue = queue.Queue()
-    sender = _RequestSender(request_queue, error_queue)
-    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    proxy.workers_started = False
-    proxy._request_sender = sender
-    try:
-        proxy._send_request(request)
-        proxy._send_request(fallback)
-        hints.actions[0].payload["changed_after_submit"] = True
-    finally:
-        sender.close(timeout=10)
-    assert sender._thread is None
-    assert error_queue.empty()
-    request_queue.put(None)
-
-    received = list(_incoming_requests(request_queue))
+    with closing(IpcQueue(is_server=True)) as receiver:
+        request_queue = IpcQueue(
+            receiver.address, is_server=False, send_hwm=_RequestSender.send_hwm(batching=True)
+        )
+        sender = _RequestSender(request_queue, error_queue, batching=True)
+        proxy = bare_proxy(_request_sender=sender)
+        try:
+            proxy._send_request(request)
+            proxy._send_request(fallback)
+            hints.actions[0].payload["changed_after_submit"] = True
+        finally:
+            sender.close(timeout=10, send_sentinel=True)
+        assert error_queue.empty()
+        received = list(_incoming_requests(receiver))
     assert len(received) == 2
     assert received[0].kv_hints.envelope().model_dump() == _wire()
     assert received[1].kv_hints is None
@@ -452,6 +454,7 @@ def test_llm_async_forwards_hints_to_executor() -> None:
     llm = MagicMock()
     llm._encode_only = False
     llm._executor.is_shutdown.return_value = False
+    llm._executor.engine_dead = False
     llm._prepare_sampling_params.return_value = SamplingParams(max_tokens=4)
     llm._preprocess.return_value = ([1, 2], None, None, None)
     llm.args.return_perf_metrics = False

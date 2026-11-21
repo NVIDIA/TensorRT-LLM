@@ -23,17 +23,21 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.responses import StreamingResponse
 
+from tensorrt_llm import executor
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.executor import EngineDeadError, EngineUnavailableError
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import ErrorResponse
-from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.serve import openai_server
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
@@ -42,6 +46,11 @@ _KV_ERROR = (
     "Insufficient KV cache for gen-only benchmark mode: one or more requests "
     "are waiting for KV cache allocation"
 )
+
+
+def test_engine_errors_are_public_executor_exports():
+    assert {"RequestError", "EngineUnavailableError", "EngineDeadError"} <= set(executor.__all__)
+    assert issubclass(executor.EngineUnavailableError, executor.RequestError)
 
 
 class _FailingEngine:
@@ -57,6 +66,7 @@ class _FailingEngine:
         # exception the server's stream generator sees. Held here because the
         # result only keeps a weak reference to it.
         self._worker = object.__new__(BaseWorker)
+        self._worker.doing_shutdown = True
         self.args = SimpleNamespace(
             num_postprocess_workers=0,
             gather_generation_logits=False,
@@ -107,4 +117,307 @@ async def test_a_failed_request_ends_the_completion_stream_with_an_error_event()
     error = json.loads(chunks[0][len("data: ") :])["error"]
     assert error["message"] == _KV_ERROR
     assert error["type"] == "server_error"
-    assert chunks[1] == "data: [DONE]\n\n"
+    assert chunks[1:] == ["data: [DONE]\n\n"]
+
+
+class _EngineFailedStream:
+    """An admitted streaming request whose engine fails before any output."""
+
+    prompt_token_ids = [1, 2, 3]
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [EngineDeadError(RuntimeError("worker exited")), EngineUnavailableError("sender is stopping")],
+)
+@pytest.mark.parametrize("prompt", [[1, 2, 3], [[1], [2]]], ids=["one_prompt", "two_prompts"])
+@pytest.mark.asyncio
+async def test_an_engine_error_ends_the_completion_stream_without_a_traceback(
+    monkeypatch, error, prompt
+):
+    """Each prompt's stream reports the error; one [DONE] ends the response."""
+    log = Mock()
+    monkeypatch.setattr(openai_server, "logger", log)
+    engine = _FailingEngine("")
+    engine.generate_async = lambda *args, **kwargs: _EngineFailedStream(error)
+    server = _bare_server(engine)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    request = CompletionRequest(model="test-model", prompt=prompt, max_tokens=4, stream=True)
+
+    response = await server.openai_completion(request, raw_request)
+
+    chunks = [chunk async for chunk in response.body_iterator]
+    await asyncio.sleep(0)  # let the disconnect watcher tasks finish
+    expected = {
+        "error": {
+            "message": str(error),
+            "type": "ServiceUnavailableError",
+            "code": 503,
+            "param": None,
+        }
+    }
+    num_prompts = 2 if isinstance(prompt[0], list) else 1
+    assert [json.loads(chunk[len("data: ") :]) for chunk in chunks[:-1]] == [expected] * num_prompts
+    assert chunks[-1] == "data: [DONE]\n\n"
+    log.error.assert_not_called()
+
+
+class _UnreadablePromise:
+    """An admitted request whose prompt token ids cannot be read."""
+
+    def __init__(self) -> None:
+        self.abort = Mock()
+
+    @property
+    def prompt_token_ids(self):
+        raise RuntimeError("prompt token ids unavailable")
+
+
+@pytest.mark.asyncio
+async def test_a_completion_failure_right_after_admission_aborts_the_request():
+    promise = _UnreadablePromise()
+    engine = _FailingEngine("")
+    engine.generate_async = lambda *args, **kwargs: promise
+    server = _bare_server(engine)
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_completion(
+        CompletionRequest(model="test-model", prompt=[1], max_tokens=4), raw
+    )
+
+    await asyncio.sleep(0)  # let the disconnect watcher task finish
+    assert response.status_code == 400
+    promise.abort.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "temporary,partial,stream,abort_fails",
+    [
+        (False, False, True, False),
+        (False, True, True, False),
+        (False, True, False, False),
+        (True, False, True, False),
+        (True, True, True, False),
+        (True, True, True, True),
+        (True, True, False, True),
+        ("dead", False, False, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_admission_failure_preserves_retryable_status(
+    monkeypatch, temporary, partial, stream, abort_fails
+):
+    # Any failure aborts the requests admitted before it; only an error that
+    # is not an engine error is logged with a traceback.
+    log = Mock()
+    monkeypatch.setattr(openai_server, "logger", log)
+    engine = _FailingEngine("")
+
+    accepted = [
+        SimpleNamespace(
+            abort=Mock(side_effect=RuntimeError("abort failed") if abort_fails else None),
+            prompt_token_ids=[1],
+        ),
+        SimpleNamespace(abort=Mock(), prompt_token_ids=[2]),
+    ]
+    calls = []
+
+    def reject(*args, **kwargs):
+        calls.append(True)
+        if partial and len(calls) <= len(accepted):
+            return accepted[len(calls) - 1]
+        if temporary == "dead":
+            raise EngineDeadError(RuntimeError("worker exited"))
+        if temporary:
+            raise EngineUnavailableError("command queue is full")
+        raise ValueError("invalid request")
+
+    engine.generate_async = reject
+    server = _bare_server(engine)
+    request = CompletionRequest(
+        model="test-model", prompt=[[1], [2], [3]], max_tokens=4, stream=stream
+    )
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    response = await server.openai_completion(request, raw)
+    assert response.status_code == (503 if temporary else 400)
+    assert all(promise.abort.call_count == (1 if partial else 0) for promise in accepted)
+    assert log.error.called is (not temporary)
+    assert log.warning.called is abort_fails
+
+
+@pytest.mark.parametrize(
+    "executor", [None, SimpleNamespace(engine_dead=False, is_shutdown=lambda: True)]
+)
+@pytest.mark.asyncio
+async def test_llm_shutdown_admission_returns_service_unavailable(executor):
+    engine = _FailingEngine("")
+    stopped = SimpleNamespace(_encode_only=False, _executor=executor)
+    engine.generate_async = lambda *args, **kwargs: LLM.generate_async(stopped, *args, **kwargs)
+    server = _bare_server(engine)
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    response = await server.openai_completion(
+        CompletionRequest(model="test-model", prompt=[1], max_tokens=4), raw
+    )
+    assert response.status_code == 503
+    assert json.loads(response.body)["message"] == "LLM is shutting down"
+
+
+class _HarmonyPromise:
+    """A postprocessed partial response followed by an executor exception."""
+
+    def __init__(self, error: BaseException | None, partial: bool = False) -> None:
+        self.error = error
+        self.partial = partial
+        self.abort = Mock()
+
+    async def aresult(self) -> None:
+        assert self.error is not None
+        raise self.error
+
+    def __aiter__(self) -> "_HarmonyPromise":
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        if self.partial:
+            self.partial = False
+            return SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        _postprocess_result=[
+                            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n\n'
+                        ]
+                    )
+                ]
+            )
+        if self.error is not None:
+            raise self.error
+        raise StopAsyncIteration
+
+
+@pytest.fixture
+def harmony_server(monkeypatch) -> OpenAIServer:
+    engine = _FailingEngine("")
+    engine.args.num_postprocess_workers = 1
+    server = _bare_server(engine)
+    server.allow_request_chat_template = False
+    server.harmony_adapter = SimpleNamespace(get_stop_tokens=lambda: [])
+    server._extract_metrics = AsyncMock()
+    monkeypatch.setattr(openai_server, "tokenize_harmony_chat_request", lambda *_a, **_kw: [1])
+    return server
+
+
+@pytest.mark.parametrize(
+    "stage,error",
+    [
+        ("admission", EngineDeadError(RuntimeError("worker exited"))),
+        ("admission", EngineUnavailableError("command queue is full")),
+        ("nonstream", EngineDeadError(RuntimeError("worker exited"))),
+        ("first_chunk", EngineDeadError(RuntimeError("worker exited"))),
+        ("partial", EngineDeadError(RuntimeError("worker exited"))),
+    ],
+)
+@pytest.mark.asyncio
+async def test_harmony_engine_failure_returns_503_or_an_explicit_stream_error(
+    harmony_server, stage, error
+):
+    # Harmony must not turn worker loss into a bad request or a broken
+    # streaming connection, including after partial output.
+    def generate(**_kwargs):
+        if stage == "admission":
+            raise error
+        return _HarmonyPromise(error, partial=stage == "partial")
+
+    harmony_server.generator.generate_async = generate
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=4,
+        stream=stage != "nonstream",
+    )
+    response = await harmony_server.chat_harmony(request, raw)
+    if stage in ("admission", "nonstream"):
+        assert response.status_code == 503
+        assert json.loads(response.body)["type"] == "ServiceUnavailableError"
+    else:
+        assert isinstance(response, StreamingResponse)
+        assert response.status_code == 200
+        chunks = [chunk async for chunk in response.body_iterator]
+        frames = [json.loads(chunk[len("data: ") :]) for chunk in chunks[:-1]]
+        assert frames[-1]["error"] == {
+            "message": str(error),
+            "type": "ServiceUnavailableError",
+            "code": 503,
+            "param": None,
+        }
+        assert chunks[-1] == "data: [DONE]\n\n"
+        assert len(frames) == (2 if stage == "partial" else 1)
+        for frame in frames[:-1]:
+            assert frame["choices"][0]["delta"]["content"] == "Hello"
+            assert frame["choices"][0]["finish_reason"] is None
+    await asyncio.sleep(0)  # finish the disconnect watcher
+
+
+@pytest.mark.parametrize(
+    "error,status,err_type,traceback_logged",
+    [
+        (EngineDeadError(RuntimeError("worker exited")), 503, "ServiceUnavailableError", False),
+        (ValueError("postprocessor failed"), 400, "BadRequestError", False),
+        (RuntimeError("postprocessor failed"), 400, "internal_error", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_harmony_failure_after_admission_aborts_the_request(
+    harmony_server, monkeypatch, error, status, err_type, traceback_logged
+):
+    log = Mock()
+    monkeypatch.setattr(openai_server, "logger", log)
+    promise = _HarmonyPromise(error)
+    harmony_server.generator.generate_async = lambda **_kwargs: promise
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    response = await harmony_server.chat_harmony(
+        ChatCompletionRequest(model="test-model", messages=[{"role": "user", "content": "Hello"}]),
+        raw,
+    )
+    assert response.status_code == status
+    assert json.loads(response.body)["type"] == err_type
+    promise.abort.assert_called_once_with()
+    assert log.error.called is traceback_logged
+    await asyncio.sleep(0)  # finish the disconnect watcher
+
+
+@pytest.mark.parametrize(
+    "error", [asyncio.CancelledError(), ValueError("postprocessor failed"), None]
+)
+@pytest.mark.asyncio
+async def test_harmony_stream_preserves_cancellation_unexpected_errors_and_success(
+    harmony_server, error
+):
+    harmony_server.generator.generate_async = lambda **_kwargs: _HarmonyPromise(error, partial=True)
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    response = await harmony_server.chat_harmony(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=True,
+        ),
+        raw,
+    )
+    stream = response.body_iterator
+    assert "Hello" in await stream.__anext__()
+    if error is not None:
+        with pytest.raises(type(error)):
+            await stream.__anext__()
+    else:
+        assert [chunk async for chunk in stream] == ["data: [DONE]\n\n"]
+        harmony_server._extract_metrics.assert_awaited_once()
+    await asyncio.sleep(0)

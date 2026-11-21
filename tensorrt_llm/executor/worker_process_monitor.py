@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Linux process-liveness monitoring for locally spawned executor workers."""
+"""Process-liveness monitoring for local and remote executor workers."""
 
 from __future__ import annotations
 
@@ -22,7 +22,10 @@ import os
 import select
 import socket
 import threading
-from typing import Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    from .remote_worker_process_monitor import ProcessWatchEndpoint
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +89,9 @@ def capture_worker_process_identity(rank: int, pid: Optional[int] = None) -> Wor
 
 
 class WorkerProcessMonitor:
-    """Monitor locally spawned workers without relying on MPI futures.
+    """Monitor executor process loss without relying on MPI progress.
 
+    Remote sessions use independent process-watch helpers. For local workers,
     Linux pidfds are used when Python exposes ``os.pidfd_open``.  A procfs
     identity check is retained as a fallback for older Python versions.  If
     neither mechanism is available, the worker is left to the existing MPI
@@ -95,6 +99,7 @@ class WorkerProcessMonitor:
     """
 
     def __init__(self) -> None:
+        """Initialize local handles and optional remote supervision ownership."""
         self._pidfd_to_identity: Dict[int, WorkerProcessIdentity] = {}
         self._procfs_identities: List[WorkerProcessIdentity] = []
         self._dead_identity: Optional[WorkerProcessIdentity] = None
@@ -102,6 +107,42 @@ class WorkerProcessMonitor:
         self._lock = threading.Lock()
         self._local_hostname = socket.gethostname()
         self._local_pid_namespace = _read_pid_namespace(os.getpid())
+        self._remote = None
+
+    def start_remote(
+        self, world_size: int, wake: threading.Event
+    ) -> Optional[ProcessWatchEndpoint]:
+        """Watch remote ranks when TRTLLM_WORKER_WATCH=1 opts in.
+
+        Supervision needs worker-to-proxy TCP connectivity that MPI alone does
+        not provide, so it is off unless explicitly enabled. Without it, rank 0
+        loss is still detected through the command connection, but abrupt loss
+        of another rank or node may leave MPI stuck.
+
+        Args:
+            world_size: Number of worker ranks that must report readiness.
+            wake: Event to set when independent supervision detects a failure.
+
+        Returns:
+            The helper endpoint, or None when independent supervision is disabled.
+
+        Raises:
+            ConfigInputError: If a TRTLLM_WORKER_WATCH* setting is invalid.
+        """
+        # Imported here so this module stays loadable without TensorRT-LLM.
+        from .remote_worker_process_monitor import start_remote_monitor
+
+        self._remote = start_remote_monitor(world_size, wake)
+        return None if self._remote is None else self._remote.endpoint
+
+    def wait_remote_ready(self) -> bool:
+        """Do not admit requests before every remote worker is supervised."""
+        return self._remote is None or self._remote.wait_ready()
+
+    @property
+    def remote_failure(self) -> Optional[dict]:
+        """Return the remote supervision failure report, or None while healthy."""
+        return None if self._remote is None else self._remote.failure
 
     def register(self, identities: List[WorkerProcessIdentity]) -> None:
         """Register locally spawned worker identities for liveness checks."""
@@ -149,8 +190,17 @@ class WorkerProcessMonitor:
                 if identity.start_time is not None:
                     self._procfs_identities.append(identity)
 
-    def find_dead_worker(self) -> Optional[WorkerProcessIdentity]:
-        """Return the first worker known to have exited, if any."""
+    def find_dead_worker(self, include_remote: bool = True) -> Optional[WorkerProcessIdentity]:
+        """Return the first worker known to have exited, if any.
+
+        Args:
+            include_remote: Whether to report remote process supervision loss.
+        """
+        remote = self._remote if include_remote else None
+        if remote is not None and (failure := remote.failure) is not None:
+            return WorkerProcessIdentity(
+                failure["rank"], failure["pid"], None, failure["host"], None
+            )
         with self._lock:
             if self._dead_identity is not None:
                 return self._dead_identity
@@ -181,6 +231,9 @@ class WorkerProcessMonitor:
 
     def close(self) -> None:
         """Close all process handles and reset the monitor."""
+        remote, self._remote = self._remote, None
+        if remote is not None:
+            remote.close()
         with self._lock:
             self._close_unlocked()
 

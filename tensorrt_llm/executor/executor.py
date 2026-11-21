@@ -42,7 +42,7 @@ from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
-from .utils import ProcessPoolExecutorSession, RequestError
+from .utils import ProcessPoolExecutorSession, RequestError, sync_submission
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
@@ -198,33 +198,35 @@ class GenerationExecutor(ABC):
             prompt_token_ids = [prompt_token_ids]
 
         futures = []
-        for i, p in enumerate(prompt_token_ids):
-            if isinstance(sampling_params, list):
-                sp = sampling_params[i]
-            else:
-                sp = sampling_params
-            if isinstance(lora_request, list):
-                lora_req = lora_request[i]
-            else:
-                lora_req = lora_request
-            if isinstance(prompt_adapter_request, list):
-                pa_req = prompt_adapter_request[i]
-            else:
-                pa_req = prompt_adapter_request
-            cs = cache_salt[i] if isinstance(cache_salt, list) else cache_salt
-            future = self.generate_async(
-                p,
-                sampling_params=sp,
-                lora_request=lora_req,
-                prompt_adapter_request=pa_req,
-                streaming=False,
-                disaggregated_params=disaggregated_params,
-                conversation_params=conversation_params,
-                cache_salt=cs)
-            futures.append(future)
+        with sync_submission(futures):
+            for i, p in enumerate(prompt_token_ids):
+                if isinstance(sampling_params, list):
+                    sp = sampling_params[i]
+                else:
+                    sp = sampling_params
+                if isinstance(lora_request, list):
+                    lora_req = lora_request[i]
+                else:
+                    lora_req = lora_request
+                if isinstance(prompt_adapter_request, list):
+                    pa_req = prompt_adapter_request[i]
+                else:
+                    pa_req = prompt_adapter_request
+                cs = cache_salt[i] if isinstance(cache_salt,
+                                                 list) else cache_salt
+                future = self.generate_async(
+                    p,
+                    sampling_params=sp,
+                    lora_request=lora_req,
+                    prompt_adapter_request=pa_req,
+                    streaming=False,
+                    disaggregated_params=disaggregated_params,
+                    conversation_params=conversation_params,
+                    cache_salt=cs)
+                futures.append(future)
 
-        for future in futures:
-            future.result()
+            for future in futures:
+                future.result()
 
         if unbatched:
             futures = futures[0]
@@ -293,8 +295,7 @@ class GenerationExecutor(ABC):
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
-                self._set_fatal_error(error)
-                self.shutdown()
+                error = self._on_fatal_background_error(error)
             raise error
 
         # Called once per streamed response: skip the get_nowait() raise/catch
@@ -316,11 +317,16 @@ class GenerationExecutor(ABC):
             elif not isinstance(e, BaseException):
                 e = RuntimeError(repr(e))
             if not isinstance(e, RequestError):
-                self._set_fatal_error(e)
-                self.shutdown()
+                e = self._on_fatal_background_error(e)
             raise e
         except Empty:
             pass
+
+    def _on_fatal_background_error(self, error: BaseException) -> BaseException:
+        """Record a system-level background error and return the error to raise."""
+        self._set_fatal_error(error)
+        self.shutdown()
+        return error
 
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record an unrecoverable engine error.
@@ -336,6 +342,16 @@ class GenerationExecutor(ABC):
         if self._fatal_error is None:
             self._fatal_error = error
             logger.error(f"Fatal engine error recorded: {repr(error)}")
+
+    @property
+    def fatal_error(self) -> Optional[BaseException]:
+        """The recorded unrecoverable engine error, or None."""
+        return self._fatal_error
+
+    @property
+    def engine_dead(self) -> bool:
+        """Whether the engine failed terminally, as opposed to shutting down."""
+        return self._fatal_error is not None
 
     def is_shutdown(self) -> bool:
         """Return True if the executor is shutting down or fatally errored."""

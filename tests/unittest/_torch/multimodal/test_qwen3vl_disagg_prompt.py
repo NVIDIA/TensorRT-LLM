@@ -640,6 +640,7 @@ def test_encoder_submits_layout_without_mutating_caller_params(video_handoff, ex
     encoder.input_processor = processor
     encoder._executor = Mock()
     encoder._executor.is_shutdown.return_value = False
+    encoder._executor.engine_dead = False
     encoder._prepare_sampling_params = Mock(return_value=SamplingParams(max_tokens=1))
     encoder._preprocess = Mock(return_value=(token_ids, "video prompt", params, None))
     encoder._check_arguments = Mock()
@@ -672,6 +673,7 @@ def test_prefill_drops_consumed_layout_before_executor(video_handoff, preprocess
     llm.input_processor = processor
     llm._executor = Mock()
     llm._executor.is_shutdown.return_value = False
+    llm._executor.engine_dead = False
     llm._is_encoder_decoder_model = Mock(return_value=False)
     llm._prepare_sampling_params = Mock(return_value=SamplingParams(max_tokens=1))
     llm._configure_bart_decoder_prefix = Mock()
