@@ -34,13 +34,16 @@ def register_prefill_core(
     attention: Callable[..., None],
     indexer: Callable[..., torch.Tensor],
 ) -> str:
+    """Register ``core``'s live-row attention callbacks and return the key the boundary takes.
+
+    The registry holds ``core`` weakly, so releasing the model drops its entry.
+    """
     key = f"m3_prefill_{id(core)}"
     _CORES[key] = _PrefillCore(ref(core, partial(_forget_core, key)), producer, attention, indexer)
     return key
 
 
-@torch.library.custom_op("trtllm::modeling_v2_m3_prefill_attention", mutates_args=("output",))
-def prefill_attention(
+def run_prefill_attention(
     packed: torch.Tensor | None,
     position_ids: torch.Tensor | None,
     q: torch.Tensor | None,
@@ -51,6 +54,16 @@ def prefill_attention(
     core_key: str,
     layer: int,
 ) -> None:
+    """Run one prefill layer's attention over the live rows of the current attention metadata.
+
+    A sparse layer with the five-way projection passes ``packed``: the horizontal producer writes K, V and index-K
+    to the paged caches and returns Q and index-Q. An unfused sparse layer passes ``idx_qk``, whose index-K is
+    written before attention. A dense layer passes only ``q``, ``k`` and ``v``. Pad rows of ``output`` are left as
+    allocated.
+
+    Breakable prefill graphs call this function directly at every replay. Compiled prefill calls it through
+    ``prefill_attention``, a piecewise boundary op.
+    """
     entry = _CORES[core_key]
     core = entry.core()
     if core is None:
@@ -87,6 +100,22 @@ def prefill_attention(
             metadata.msa_out_cache_loc,
         )
     entry.attention(core, layer, q, k, v, idx_q, metadata, output)
+
+
+@torch.library.custom_op("trtllm::modeling_v2_m3_prefill_attention", mutates_args=("output",))
+def prefill_attention(
+    packed: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    q: torch.Tensor | None,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
+    idx_qk: torch.Tensor | None,
+    output: torch.Tensor,
+    core_key: str,
+    layer: int,
+) -> None:
+    """``run_prefill_attention`` as an op the piecewise optimizer splits on (it is not captured)."""
+    run_prefill_attention(packed, position_ids, q, k, v, idx_qk, output, core_key, layer)
 
 
 @prefill_attention.register_fake

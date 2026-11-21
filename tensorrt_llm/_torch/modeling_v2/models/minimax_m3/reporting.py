@@ -76,16 +76,21 @@ def capture_missed(state: ReportingTarget, /, path: str, rows: Optional[int], wh
 def taken(state: ReportingTarget, /, path: str, rows: Optional[int], what: str = "") -> None:
     """Report eager engagement once per (path, rows, what) on each rank.
 
-    Compiled regions do not report. ``what`` is an optional detail such as the projection.
+    Compiled regions do not report. ``what`` is an optional detail such as the projection. Hot paths call this on
+    every step, so a line already logged returns before the rank query, the lock and the message formatting.
     """
     if torch.compiler.is_compiling():
+        return
+    reason = f"taken: {rows}: {what}" if what else f"taken: {rows}"
+    # Lock-free read: keys are only added under the lock, and a stale miss falls through to _log_once's locked check.
+    if (path, reason) in state._logged:
         return
     at = "" if rows is None else f" at {rows} rows"
     detail = f" ({what})" if what else ""
     state._log_once(
         state.logger.info,
         path,
-        f"taken: {rows}" + (f": {what}" if what else ""),
+        reason,
         f"[M3 dispatch] rank {state.mpi_rank()}: {path} taken{at}{detail}",
     )
 

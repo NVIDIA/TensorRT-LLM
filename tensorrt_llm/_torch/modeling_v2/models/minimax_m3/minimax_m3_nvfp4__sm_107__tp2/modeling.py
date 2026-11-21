@@ -203,6 +203,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec imp
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.prefill_attention import (
     prefill_attention,
     register_prefill_core,
+    run_prefill_attention,
 )
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs as _draft_loader_moe_kwargs,
@@ -1672,8 +1673,8 @@ def _router_tc_fp4(core, i: int, h: torch.Tensor) -> Optional[tuple]:
     canon's router on these rows); None elsewhere (the caller routes on its fp32 router)."""
     rows = h.shape[0] if h.dim() == 2 else 0
     if not (
-        ROUTER_TC_GEN_MIN_ROWS <= rows <= ROUTER_TC_GEN_MAX_ROWS
-        and core.router_tc_cluster16
+        core.router_tc_cluster16
+        and ROUTER_TC_GEN_MIN_ROWS <= rows <= ROUTER_TC_GEN_MAX_ROWS
         and h.dtype == torch.bfloat16
         and h.stride(1) == 1
         and (h.stride(0) * 2) % 16 == 0
@@ -2062,6 +2063,9 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
     release so the down GEMV stages its weights during it) at the rows its cells certify, in any graph or eager step;
     otherwise the Triton kernel (``m3_silu_and_mul``). Indexer kdev17 (TP2 chain): -0.69 us per dense layer vs the
     Triton kernel. Every decline is logged once."""
+    if is_torch_compiling():
+        # Compiled prefill always takes the Triton kernel; comparing its symbolic rows would split the buckets.
+        return m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
     path = DENSE_SWIGLU_CPP_PATH
     rows = gu.shape[0]
     max_rows = max(cell.spec["rows"] for cell in m3_dense_swiglu.CELLS_BY_TP[2])
@@ -2071,7 +2075,7 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
         uncovered(path, f"more than {max_rows} rows")
     elif params != (DENSE_ALPHA, DENSE_LIMIT, DENSE_BETA):
         uncovered(path, f"activation parameters {params}")
-    elif not is_torch_compiling():
+    else:
         act = m3_dense_swiglu(
             gu,
             core.swiglu_limit,
@@ -2863,7 +2867,8 @@ def _msa_attention_live(core, i: int, q, k, v, idx_q, md, output) -> None:
     )
 
 
-_prefill_attention_eager = eager_on_graph(prefill_attention)
+# Breakable replays call the boundary body directly; the custom op is only for compiled graphs.
+_prefill_attention_eager = eager_on_graph(run_prefill_attention)
 
 #: Breakable drafter attention passes a key because replay arguments must be tensors or scalars.
 _BCG_DRAFTS: Dict[str, "M3Eagle3Draft"] = {}
@@ -2901,7 +2906,7 @@ class PrefillTarget:
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast (TRTLLM_MODELING_V2_VALIDATE): the metadata fields this target consumes
         must exist (they are private trtllm surface). Calling ``step_args`` is the check; once per target instance."""
-        if not self._contract_pending:
+        if not self._contract_pending or torch.compiler.is_compiling():
             return
         try:
             self.step_args(md)
@@ -2966,25 +2971,37 @@ class PrefillTarget:
         num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
         if num_chunks <= 1:
             return _routed_experts(core, i, x, None, router_logits, True)
+        if is_torch_compiling():
+            # Full chunks in order: the compiled graph specializes on the chunk count but not on the remainder, and
+            # the piecewise scheduler places streams.
+            chunk = core.moe_max_num_tokens
+            return torch.cat(
+                [
+                    _routed_experts(core, i, x_c, None, logits_c, True)
+                    for x_c, logits_c in zip(x.split(chunk), router_logits.split(chunk))
+                ]
+            )
         sizes = _split_chunk(rows, num_chunks)
         xs, logits = x.split(sizes), router_logits.split(sizes)
         aux = core.aux_stream_moe_chunk
+        if aux is None:
+            return torch.cat(
+                [_routed_experts(core, i, xs[c], None, logits[c], True) for c in range(num_chunks)]
+            )
         ev_main, ev_overlap = core.moe_chunk_events[i]
-        if aux is not None:
-            ev_main.record()
-            with torch.cuda.stream(aux):
-                ev_main.wait()
+        ev_main.record()
+        with torch.cuda.stream(aux):
+            ev_main.wait()
         outs: List[torch.Tensor] = []
         for c in range(num_chunks):
-            if aux is not None and c % 2 == 0:
+            if c % 2 == 0:
                 with torch.cuda.stream(aux):
                     outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
             else:
                 outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-        if aux is not None:
-            with torch.cuda.stream(aux):
-                ev_overlap.record()
-            ev_overlap.wait()
+        with torch.cuda.stream(aux):
+            ev_overlap.record()
+        ev_overlap.wait()
         return torch.cat(outs)
 
     def _routed(self, i: int, h: torch.Tensor):
@@ -3034,7 +3051,9 @@ class PrefillTarget:
             core.moe_events[i][1],
             # The warmup tuning pass profiles the shared expert's GEMMs: keep it on the main stream, between the
             # same collectives on every rank (the capture pass and serving still overlap it on the aux stream).
-            None if flashinfer_mxfp8_autotune_active() else core.aux_stream_moe,
+            None
+            if is_torch_compiling() or flashinfer_mxfp8_autotune_active()
+            else core.aux_stream_moe,
             disable_on_compile=True,
         )
         if return_parts:
@@ -3647,9 +3666,9 @@ class DecodeTarget:
         rows = h.shape[0] if h.dim() == 2 else 0
         cap = min(GENERIC_MC_FINALIZE_MAX_TOKENS, m3_mc_allreduce.FINALIZE_MAX_TOKENS)
         if (
-            not (DECODE_MAX_TOKENS < rows <= cap)
+            torch.compiler.is_compiling()
+            or not (DECODE_MAX_TOKENS < rows <= cap)
             or h.dtype != torch.bfloat16
-            or torch.compiler.is_compiling()
         ):
             return None
         if self._bucket_flags(rows) is None:
