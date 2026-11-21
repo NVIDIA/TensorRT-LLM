@@ -127,12 +127,13 @@ def workspace_size(batch, seq_len, heads, device="cuda", pv=None, rank=DEFAULT_R
 def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq_lens=None):
     """The preparation: the operands of the attention from BF16 q, k, v [B, S, H, 128] (contiguous, on one device),
     written into the workspace. workspace: a 1-D uint8 tensor on that device of at least workspace_size(B, S, H,
-    device, pv, rank) bytes whose address is a multiple of 256, with any content. rows: int32 indices in [0, S) of
-    the tokens the compensation basis is estimated on, one-dimensional, on that device and not empty; a caller's draw
-    should hold at least 2 * rank tokens, the floor of the default draw (a packed multimodal sequence passes the draw
-    of its token tags, sample_rows(seq_len, device, token_tags, rank)). None: the default draw, sample_rows(seq_len,
-    device, rank=rank). valid_seq_lens: None (every batch element is full), or an int32 tensor [B] on that device:
-    batch element b has valid tokens on its first n = clamp(valid_seq_lens[b], 0, S) positions and padding after
+    device, pv, rank) bytes whose address is a multiple of 256, with any content. rows: int32 indices of the tokens
+    the compensation basis is estimated on, one-dimensional, on that device and at least 2 * rank of them, the floor
+    of the default draw (a packed multimodal sequence passes the draw of its token tags, sample_rows(seq_len, device,
+    token_tags, rank)); the kernels clamp a row outside [0, S) to the sequence. None: the default draw,
+    sample_rows(seq_len, device, rank=rank). valid_seq_lens: None (every batch element is full), or an int32 tensor
+    [B] on that device: batch element b has valid tokens on its first n = clamp(valid_seq_lens[b], 0, S) positions
+    and padding after
     them; it attends only its valid keys, its output rows from n on are zero, and what q, k and v hold from n on
     has no influence. The kernels read the tensor in place, also in the attention (it must hold until then), and
     nothing reads it on the host. With lengths, the default draw is mapped into each valid prefix (its row r stands
@@ -177,8 +178,10 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
             f"rows must be a contiguous int32 tensor on {device}, one-dimensional or, with valid_seq_lens, "
             f"[{shape[0]}, m]"
         )
-    elif rows.numel() == 0:
-        raise ValueError("rows must hold at least one token: the basis is estimated on them")
+    elif rows.numel() < 2 * rank:
+        raise ValueError(
+            f"rows must hold at least {2 * rank} tokens: the basis of rank {rank} is estimated on them"
+        )
     if lens is None:
         return Operands(pv, rank, shape[:3], family.prepare(q, k, v, workspace, pv, rank, rows))
     buffers = family.prepare(

@@ -220,10 +220,19 @@ def test_deco_delegates_unsupported_calls() -> None:
     assert out.dtype == torch.float16
     assert _relative_error(out, _sdpa(q, k, v)) < 2e-2
 
-    # A delegated call with a valid prefix attends the prefix alone; its padded rows are zero.
+    # A delegated call with a valid prefix attends the prefix alone; its padded rows are zero,
+    # with or without a key padding mask, whose prefix the call keeps.
+    prefix = _sdpa(q[:, :200], k[:, :200], v[:, :200])
     out = attn.forward(q.half(), k.half(), v.half(), valid_seq_len=200)
     assert not out[:, 200:].any()
-    assert _relative_error(out[:, :200], _sdpa(q[:, :200], k[:, :200], v[:, :200])) < 2e-2
+    assert _relative_error(out[:, :200], prefix) < 2e-2
+    key_padding_mask[:, 150:] = False
+    out = attn.forward(
+        q.half(), k.half(), v.half(), key_padding_mask=key_padding_mask, valid_seq_len=200
+    )
+    assert not out[:, 200:].any()
+    ref = _sdpa(q[:, :200], k[:, :200], v[:, :200], attn_mask=key_padding_mask[:, None, None, :200])
+    assert _relative_error(out[:, :200], ref) < 2e-2
 
     assert "deco_workspace" not in attn._state
     # The causal call has the shape of a self-attention call: the layer notes it once.
@@ -275,10 +284,19 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
     assert int((mostly_text[rows.long()] == 0).sum()) == 5
     padding = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
     assert deco_attention.sample_rows(seq_len, device, padding).numel() == 0
-    with pytest.raises(ValueError, match="at least one token"):
-        deco_attention.prepare(
-            q, k, v, workspace, "fp8", rows=torch.empty(0, dtype=torch.int32, device=device)
-        )
+    with pytest.raises(ValueError, match="at least 64 tokens"):
+        deco_attention.prepare(q, k, v, workspace, "fp8", rows=rows[:63])
+
+    # A row outside the sequence stands for its nearest token.
+    beyond, last = rows.clone(), rows.clone()
+    beyond[0], last[0] = seq_len + 5, seq_len - 1
+    out_beyond = deco_attention.attention(
+        deco_attention.prepare(q, k, v, workspace, "fp8", rows=beyond), torch.empty_like(q)
+    )
+    out_last = deco_attention.attention(
+        deco_attention.prepare(q, k, v, workspace, "fp8", rows=last), torch.empty_like(q)
+    )
+    assert torch.equal(out_beyond, out_last)
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
@@ -311,6 +329,18 @@ def test_deco_valid_seq_len_attends_the_prefix(v_dtype: str) -> None:
 
     with pytest.raises(ValueError, match="valid_seq_len"):
         attn.forward(q, k, v, valid_seq_len=seq_len + 1)
+
+    # A batch element without valid tokens comes back zero, whatever its padding holds.
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
+    lens = torch.tensor([0, valid_seq_len], dtype=torch.int32, device=device)
+    num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, device, v_dtype)
+    workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    operands = deco_attention.prepare(q, k, v, workspace, v_dtype, valid_seq_lens=lens)
+    out = deco_attention.attention(operands, torch.empty_like(q))
+    assert not out[0].any()
+    assert torch.equal(out[1, :valid_seq_len], prefix[1])
+    assert not out[1, valid_seq_len:].any()
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
