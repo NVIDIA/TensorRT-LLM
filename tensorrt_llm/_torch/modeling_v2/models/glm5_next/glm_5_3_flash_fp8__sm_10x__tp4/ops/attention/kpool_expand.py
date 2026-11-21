@@ -102,7 +102,7 @@ class KpoolExpand(OpWrapper):
     Row ``n`` reads block table ``request_ids[n]`` when given, else table ``n``.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # select_k = index_topk / index_kpool = 512 pools of kpool 4, out_width the padded
     # kernel_output_width 2112, 32-token blocks. `kv` is the prompt length (context cells) or
     # the requests' KV length after the step (generation cells).

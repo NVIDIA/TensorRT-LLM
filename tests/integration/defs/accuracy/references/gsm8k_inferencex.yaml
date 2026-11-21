@@ -19,3 +19,14 @@ nvidia/MiniMax-M3-NVFP4:
     spec_dec_algo: Eagle3
     accuracy: 96.664
     threshold: 94.0
+MiniMaxAI/MiniMax-M3.1-Flash:
+  # modeling_v2 TP2 target on 2 Rubin GPUs (MSA, NVFP4 KV cache, FP8 indexer), template-default (adaptive) thinking;
+  # full 1319-sample split.
+  - quant_algo: MXFP8
+    kv_cache_quant_algo: NVFP4
+    accuracy: 97.043
+  # The same with the checkpoint's standalone DSpark drafter (max_draft_len 7).
+  - quant_algo: MXFP8
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: DSpark
+    accuracy: 97.043

@@ -45,6 +45,8 @@ import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.smem_allocator import SmemAllocator
 
+from ....cute_dsl_file_cache import KernelCache
+
 FLT_MAX = 3.4028234663852886e38
 DKCMAX = 12288  # direct-path candidate capacity (mirrors the CUDA development arm)
 
@@ -524,7 +526,7 @@ class DirectTopKKernel:
 # ---------------------------------------------------------------------------
 # torch-facing entry with a compiled-variant cache keyed (K, TB).
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE: dict = {}
+_COMPILE_CACHE: dict = KernelCache(f"{__name__}._COMPILE_CACHE", __file__)
 
 
 def _get_compiled(top_k: int, num_threads: int = 1024, next_n: int = 1, cr: int = 4):

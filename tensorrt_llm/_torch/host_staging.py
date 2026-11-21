@@ -8,7 +8,13 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (
+    CUASSERT,
+    cudart,
+    current_cuda_stream,
+    maybe_pin_memory,
+    prefer_pinned,
+)
 
 _STAGING_RING = 2
 _COPY_BLOCK = 1024
@@ -62,10 +68,11 @@ def copy_host_to_device(store: dict, key, destination: torch.Tensor, value: torc
         ring["buffers"][index] = buffer
     view = buffer[: value.numel()].view(value.shape)
     view.copy_(value)
+    # Tensor.copy_ holds the pinned block until the copy ran, even if the ring is dropped.
     destination.copy_(view, non_blocking=True)
     if event is None:
         event = ring["events"][index] = torch.cuda.Event()
-    event.record(torch.cuda.current_stream(destination.device))
+    event.record(current_cuda_stream(destination.device.index))
 
 
 @triton.jit(do_not_specialize=["count"], do_not_specialize_on_alignment=["count"])
@@ -101,8 +108,9 @@ class HostUploader:
     Each key owns two slots of a pinned and a device buffer: a pinned buffer is
     rewritten only after the copy that read it has completed, a device buffer
     only after its stream has passed the work that read it. During graph
-    capture, without pinned memory, or for a destination of another dtype,
-    size or layout, the values take a plain ``copy_(non_blocking=True)``.
+    capture, without pinned memory, off the uploader's device, or for a
+    destination of another dtype, size or layout, the values take a plain
+    ``copy_(non_blocking=True)``.
     """
 
     def __init__(self) -> None:
@@ -110,16 +118,23 @@ class HostUploader:
         self._rings: dict[str, tuple[_UploadSlot, _UploadSlot]] = {}
         self._next: dict[str, int] = {}
 
+    def synchronize(self) -> None:
+        """Finish uploads before the owner releases the pinned staging buffers."""
+        for ring in self._rings.values():
+            for slot in ring:
+                slot.uploaded.synchronize()
+
     def upload(
         self, key: str, value: torch.Tensor, destination: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Upload host ``value``; returns the device tensor holding it (``destination`` if given)."""
         if not self._can_stage(value, destination):
             if destination is None:
-                destination = torch.empty(value.shape, dtype=value.dtype, device="cuda")
+                device = "cuda" if self._stream is None else self._stream.device
+                destination = torch.empty(value.shape, dtype=value.dtype, device=device)
             destination.copy_(maybe_pin_memory(value), non_blocking=True)
             return destination
-        current = torch.cuda.current_stream(self._stream.device)
+        current = current_cuda_stream(self._stream.device_index)
         ring = self._rings.get(key)
         if ring is None:
             ring = self._rings[key] = (_UploadSlot(), _UploadSlot())
@@ -141,24 +156,36 @@ class HostUploader:
                 slot.staged = torch.empty(size, dtype=value.dtype, device=current.device)
             # A fresh device allocation is free from this point of the current stream on.
             slot.released.record(current)
-        host = slot.pinned[:count].view(value.shape)
-        host.copy_(value)
-        staged = slot.staged[:count].view(value.shape)
+        slot.pinned[:count].copy_(value.reshape(count))
         self._stream.wait_event(slot.released)
-        with torch.cuda.stream(self._stream):
-            staged.copy_(host, non_blocking=True)
+        # Invisible to the pinned allocator: a slot frees ``pinned`` only after ``uploaded``.
+        CUASSERT(
+            cudart.cudaMemcpyAsync(
+                slot.staged.data_ptr(),
+                slot.pinned.data_ptr(),
+                count * value.element_size(),
+                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                self._stream.cuda_stream,
+            )
+        )
         slot.uploaded.record(self._stream)
         current.wait_event(slot.uploaded)
         slot.reader = current
         if destination is None:
-            return staged
+            return slot.staged[:count].view(value.shape)
         _copy_kernel[(triton.cdiv(count, _COPY_BLOCK),)](
-            staged, destination, count, BLOCK=_COPY_BLOCK
+            slot.staged, destination, count, BLOCK=_COPY_BLOCK
         )
         return destination
 
     def _can_stage(self, value: torch.Tensor, destination: torch.Tensor | None) -> bool:
-        if self._stream is None or value.numel() == 0 or torch.cuda.is_current_stream_capturing():
+        if (
+            self._stream is None
+            or value.numel() == 0
+            # The raw copy runs in the calling thread's current context.
+            or torch._C._cuda_getDevice() != self._stream.device_index
+            or torch.cuda.is_current_stream_capturing()
+        ):
             return False
         return destination is None or (
             destination.device == self._stream.device

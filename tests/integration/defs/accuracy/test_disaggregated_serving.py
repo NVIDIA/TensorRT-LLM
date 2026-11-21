@@ -56,9 +56,9 @@ from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
                         skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
-                            LlmapiAccuracyTestHarness, LongBenchV2,
-                            acceptance_length_from_iteration_stats,
+from .accuracy_core import (GSM8K, MMLU, QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS,
+                            GSM8KInferenceX, LlmapiAccuracyTestHarness,
+                            LongBenchV2, acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
 from .sparse_offload_accuracy import (LONGBENCH_CASES, assert_concurrent_decode,
                                       assert_host_fetches, assert_token_parity,
@@ -214,7 +214,7 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 def run_accuracy_test(llm: "DuckLLM",
                       model_name: str,
                       test_sets: List[Union[str, type]] = ["MMLU", "GSM8K"],
-                      extra_evaluator_kwargs: Optional[Dict[Union[str, type],
+                      extra_evaluator_kwargs: Optional[Dict[type,
                                                             Dict[str,
                                                                  Any]]] = None,
                       extra_acc_spec: Optional[str] = None,
@@ -1175,7 +1175,10 @@ def run_parallel_test(model_name: str,
                       trust_remote_code: bool = False,
                       quant_algo: str = None,
                       kv_cache_quant_algo: str = None,
-                      max_batch_size: int = None):
+                      max_batch_size: int = None,
+                      extra_evaluator_kwargs: Optional[Dict[type,
+                                                            Dict[str,
+                                                                 Any]]] = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -1233,7 +1236,10 @@ def run_parallel_test(model_name: str,
             llm.args.quant_config.quant_algo = quant_algo
         if kv_cache_quant_algo is not None:
             llm.args.quant_config.kv_cache_quant_algo = kv_cache_quant_algo
-        run_accuracy_test(llm, model_name, test_sets)
+        run_accuracy_test(llm,
+                          model_name,
+                          test_sets,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
@@ -1309,10 +1315,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "max_tokens_in_buffer": 8192,
         }
         speculative_config = {"decoding_type": "MTP", "max_draft_len": 3}
+        # Each worker tunes the SM107 dense GEMM of the checkpoint's NVFP4
+        # linear layers at startup. Profile only the kernel configurations
+        # nvMatmulHeuristics ranks highest instead of the full tactic space.
+        autotuner_nvmmh_config = {"max_tactics": 5}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
+            "autotuner_nvmmh_config": autotuner_nvmmh_config,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
             "speculative_config": {
@@ -1323,6 +1334,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "enable_chunked_prefill": False,
+            "autotuner_nvmmh_config": autotuner_nvmmh_config,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
             "speculative_config": speculative_config,
@@ -1344,6 +1356,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 gen_server_config,
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                 assert_worker_log_contains=context_only_log,
+                assert_worker_log_excludes=(
+                    "nvMatmulHeuristics cannot be imported", ),
         ) as llm:
             # The DuckLLM args do not carry the served quantization, so set
             # the specs the accuracy reference lookup matches on.
@@ -2313,7 +2327,11 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # reference for this quant_algo differs from the unquantized one.
             llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
             llm.args.quant_config.kv_cache_quant_algo = "FP8"
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            run_accuracy_test(llm,
+                              self.MODEL_NAME, [GSM8K],
+                              extra_evaluator_kwargs={
+                                  GSM8K: QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS
+                              })
 
     @pytest.mark.skip_less_device(4)
     def test_ctx_pp_gen_tp_asymmetric(self, mocker):
@@ -2341,7 +2359,8 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # ctx_pp=2 overflows the KV cache quota.
             # Other Qwen3.5-4B tests cap this at 32
             # (see test_llm_api_pytorch.py).
-            max_batch_size=32)
+            max_batch_size=32,
+            extra_evaluator_kwargs={GSM8K: QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS})
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)

@@ -228,6 +228,9 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._capture_allowed = False
         runner._is_mixed_encoder_decoder_batch.return_value = False
         runner._can_run_cuda_graph_batch.return_value = True
+        runner._resolve_sample_type.return_value = SampleType.FULL
+        runner._kv_regime_for_batch.return_value = None
+        runner._packed_split_for_batch.return_value = None
 
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -247,7 +250,14 @@ class GraphKeyTestCase(unittest.TestCase):
 
         self.assertEqual(result, (None, None, None))
         runner.get_graph_key.assert_called_once_with(
-            batch, None, None, None, frozenset(), torch.float8_e4m3fn, False, None, None, None
+            batch,
+            None,
+            None,
+            None,
+            frozenset(),
+            torch.float8_e4m3fn,
+            False,
+            resolved_graph_shape=(SampleType.FULL, None, None),
         )
 
     def test_graph_key_includes_lora_variant(self) -> None:
@@ -294,6 +304,9 @@ class GraphKeyTestCase(unittest.TestCase):
             }
         }
         runner._is_mixed_encoder_decoder_batch.return_value = False
+        runner._resolve_sample_type.return_value = SampleType.FULL
+        runner._kv_regime_for_batch.return_value = None
+        runner._packed_split_for_batch.return_value = None
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -312,7 +325,14 @@ class GraphKeyTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(
-            batch, None, None, None, promoted_ids, None, False, None, None, None
+            batch,
+            None,
+            None,
+            None,
+            promoted_ids,
+            None,
+            False,
+            resolved_graph_shape=(SampleType.FULL, None, None),
         )
         self.assertEqual(result, (graph_attn_metadata, graph_spec_metadata, key))
 
@@ -904,6 +924,7 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         runner.config = SimpleNamespace(
             enable_in_graph_sampling=False,
             enable_attention_dp=True,
+            skip_adp_count_gather=False,
             mapping=SimpleNamespace(tp_size=2),
             dist=SimpleNamespace(tp_allgather_int64=allgather),
         )
@@ -1122,6 +1143,7 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
         runner.config = SimpleNamespace(
             enable_in_graph_sampling=False,
             enable_attention_dp=True,
+            skip_adp_count_gather=False,
             mapping=SimpleNamespace(tp_size=2),
             dist=SimpleNamespace(tp_allgather_int64=allgather),
         )
