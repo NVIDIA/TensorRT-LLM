@@ -981,8 +981,16 @@ def test_cutedsl_runner_identity_is_the_active_layout(
 
     with_spare_slots, without_spare_slots = build(6, 4), build(4)
     assert with_spare_slots.unique_id() == without_spare_slots.unique_id()
-    # The tuning profiles still cover the rows, and route to the slots, of each layout.
-    assert with_spare_slots.get_tuning_config() is not without_spare_slots.get_tuning_config()
+    # The finalize and gather runners give the tuner the inputs of the active slots, so they share
+    # the tuning config of a layer without spare slots. The grouped GEMM runner maps rows that pad
+    # every local slot, and the outer runner routes to this rank's slots.
+    shares_tuning_config = runner in (
+        "Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner",
+        "Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner",
+    )
+    assert (
+        with_spare_slots.get_tuning_config() is without_spare_slots.get_tuning_config()
+    ) == shares_tuning_config
 
 
 @pytest.mark.parametrize(
@@ -1081,6 +1089,108 @@ def test_cutedsl_runner_kernel_takes_the_l2_policy_of_the_active_slots(
         **without_spare_slots,
         "num_local_experts": num_slots,
     }
+
+
+@pytest.mark.parametrize("num_tokens", [18, 64])
+@pytest.mark.parametrize(
+    "op",
+    [
+        "cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
+    ],
+)
+def test_cutedsl_op_tunes_and_looks_up_the_row_buckets_of_the_active_slots(
+    monkeypatch: pytest.MonkeyPatch, op: str, num_tokens: int
+) -> None:
+    """With spare slots, the tuner profiles and looks up the permuted-row buckets that a layer
+    without them has for the same tokens, although the rows pad every local slot."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not torch.cuda.is_available():
+        pytest.skip("The CuteDSL NVFP4 grouped GEMM ops take CUDA tensors")
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL is not available")
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 100)
+    # Rank 1 of two with 16 active and 6 spare slots, top-8 routing.
+    ep_size, ep_rank, num_active, num_spare, top_k, tile_size, n, k = 2, 1, 16, 6, 8, 128, 256, 256
+    tuner = AutoTuner.get()
+
+    class _ChoseOne(Exception):
+        pass
+
+    class _StoppingTuner:
+        """Stop the op where it asks the tuner for a tactic, with what it gives the tuner."""
+
+        def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
+            raise _ChoseOne(tuning_config, inputs)
+
+    monkeypatch.setattr(cute_dsl_custom_ops.AutoTuner, "get", staticmethod(_StoppingTuner))
+
+    def tuner_view(slots: int, tuner_num_local_experts: int | None = None) -> tuple:
+        """Return the profiles the tuner generates and the profile it looks up for the op's call
+        on ``num_tokens`` tokens over ``slots`` local slots."""
+        layout = dict(
+            num_experts=ep_size * slots,
+            top_k=top_k,
+            num_local_experts=slots,
+            local_expert_offset=ep_rank * slots,
+            tile_size=tile_size,
+        )
+        # moe_sort pads the permuted rows for every local slot.
+        rows = cute_dsl_custom_ops.GroupedGemmInputsHelper(**layout).get_max_num_permuted_tokens(
+            num_tokens
+        )
+        scale_k = k // 16
+
+        def zeros(*shape: int, dtype: torch.dtype = torch.uint8) -> torch.Tensor:
+            return torch.zeros(shape, dtype=dtype, device="cuda")
+
+        tables = dict(
+            tile_idx_to_group_idx=zeros(rows // tile_size, dtype=torch.int32),
+            tile_idx_to_mn_limit=zeros(rows // tile_size, dtype=torch.int32),
+            permuted_idx_to_expanded_idx=zeros(rows, dtype=torch.int32),
+            num_non_exiting_tiles=zeros(1, dtype=torch.int32),
+        )
+        weights = dict(
+            weight=zeros(slots, n, k // 2),
+            weight_scale=zeros(slots, n, scale_k),
+            alpha=zeros(slots, dtype=torch.float32),
+        )
+        if "finalize" in op:
+            args = dict(
+                input=zeros(rows, k // 2),
+                input_scale=zeros(rows * scale_k),
+                output=zeros(num_tokens, n, dtype=torch.bfloat16),
+                token_final_scales=zeros(num_tokens, top_k, dtype=torch.float32),
+                output_dtype=torch.bfloat16,
+            )
+        else:
+            args = dict(
+                input=zeros(num_tokens, k // 2),
+                input_scale=zeros(num_tokens, scale_k),
+                global_sf=zeros(1, dtype=torch.float32),
+            )
+        with pytest.raises(_ChoseOne) as chose:
+            getattr(torch.ops.trtllm, op)(
+                **args,
+                **weights,
+                **tables,
+                **layout,
+                tuner_num_local_experts=tuner_num_local_experts,
+            )
+        config, inputs = chose.value.args
+        profiles = {p.get_opt_shapes() for p in tuner._optimization_profiles(config, inputs)}
+        lookup = tuner._find_nearest_profile(
+            tuple(t.size() for t in inputs),
+            config.dynamic_tensor_specs,
+            config.constraint_specs,
+            config.tune_max_num_tokens,
+        )
+        return profiles, lookup
+
+    assert tuner_view(num_active + num_spare, num_active) == tuner_view(num_active)
 
 
 @pytest.mark.cpu_only

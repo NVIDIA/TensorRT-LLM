@@ -3588,20 +3588,42 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return valid_tactics
 
+        def tuner_helper(self) -> GroupedGemmInputsHelper:
+            """The tuning helper of the active slots' layout, which ``tuner_inputs`` have."""
+            num_experts, num_local_experts, local_expert_offset = self.active_layout
+            return GroupedGemmInputsHelper(num_experts, self.top_k,
+                                           num_local_experts,
+                                           local_expert_offset, self.tile_size)
+
+        def tuner_inputs(self,
+                         inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+            """Return the ``inputs`` the autotuner gets.
+
+            With spare slots, these are the inputs of a layer without them for
+            the same tokens: the active slots' weights, and the permuted rows
+            and tiles that the active slots' layout pads those tokens to.
+            """
+            if self.tuner_num_local_experts is None:
+                return inputs
+            (a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx,
+             tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+             *others) = GroupedGemmInputsHelper.tuner_inputs(
+                 inputs, self.tuner_num_local_experts)
+            rows = self.tuner_helper().get_max_num_permuted_tokens(c.size(0))
+            tiles = rows // self.tile_size
+            scale_k = a.size(1) * 2 // self.scaling_vector_size
+            return [
+                a[:rows], b, a_sf[:rows * scale_k], b_sf, alpha, c,
+                tile_idx_to_group_idx[:tiles], tile_idx_to_mn_limit[:tiles],
+                permuted_idx_to_expanded_idx[:rows], *others
+            ]
+
         def get_tuning_config(self) -> TuningConfig:
             """The runner's TuningConfig; an evict-first runner with a token bound tunes up to the permuted rows of
-            that bound (``tune_max_num_tokens``), so its tactics cover every call it serves.
-            The helper maps the rows of every local slot."""
-            key = (self.unique_id(), self.num_local_experts,
-                   self.weights_evict_first_max_tokens)
+            that bound (``tune_max_num_tokens``), so its tactics cover every call it serves."""
+            key = (self.unique_id(), self.weights_evict_first_max_tokens)
             if key not in self.__class__.tuning_config_cache:
-                helper = GroupedGemmInputsHelper(
-                    self.num_experts,
-                    self.top_k,
-                    self.num_local_experts,
-                    self.local_expert_offset,
-                    self.tile_size,
-                    tuner_num_local_experts=self.tuner_num_local_experts)
+                helper = self.tuner_helper()
                 if self.use_expert_counts:
                     self.__class__.tuning_config_cache[key] = TuningConfig(
                         dynamic_tensor_specs=(DynamicTensorSpec(
@@ -3908,8 +3930,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
             [runner],
             runner.get_tuning_config(),
-            GroupedGemmInputsHelper.tuner_inputs(inputs,
-                                                 tuner_num_local_experts),
+            runner.tuner_inputs(inputs),
         )
         runner(inputs, tactic=best_tactic)
 
@@ -4521,9 +4542,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return valid_tactics
 
+        def tuner_helper(self) -> GatherGroupedGemmInputsHelper:
+            """The tuning helper of the active slots' layout, which ``tuner_inputs`` have."""
+            num_experts, num_local_experts, local_expert_offset = self.active_layout
+            return GatherGroupedGemmInputsHelper(num_experts, self.top_k,
+                                                 num_local_experts,
+                                                 local_expert_offset,
+                                                 self.tile_size)
+
+        def tuner_inputs(self, inputs: List) -> List:
+            """Return the ``inputs`` the autotuner gets.
+
+            With spare slots, these are the inputs of a layer without them for
+            the same tokens: the active slots' weights, and the permuted rows
+            and tiles that the active slots' layout pads those tokens to.
+            """
+            if self.tuner_num_local_experts is None:
+                return inputs
+            (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
+             tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+             *others) = GroupedGemmInputsHelper.tuner_inputs(
+                 inputs, self.tuner_num_local_experts)
+            rows = self.tuner_helper().get_max_num_permuted_tokens(a.size(0))
+            tiles = rows // self.tile_size
+            return [
+                a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx[:tiles],
+                tile_idx_to_mn_limit[:tiles],
+                permuted_idx_to_expanded_idx[:rows], *others
+            ]
+
         def get_tuning_config(self) -> TuningConfig:
-            # The helper maps the rows of every local slot.
-            key = (self.unique_id(), self.num_local_experts)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(
                     self.num_experts,
@@ -4542,14 +4591,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         use_cold_l2_cache=True,
                         share_jit_builds=True)
                     return self.__class__.tuning_config_cache[key]
-                helper = GatherGroupedGemmInputsHelper(
-                    self.num_experts,
-                    self.top_k,
-                    self.num_local_experts,
-                    self.local_expert_offset,
-                    self.tile_size,
-                    tuner_num_local_experts=self.tuner_num_local_experts,
-                )
+                helper = self.tuner_helper()
                 # Tuning uses layout:
                 # a, b, a_sf, b_sf, alpha, tile_idx, tile_mn_limit, permuted_idx, ...
                 self.__class__.tuning_config_cache[key] = TuningConfig(
@@ -4902,8 +4944,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
             [runner],
             runner.get_tuning_config(),
-            GroupedGemmInputsHelper.tuner_inputs(inputs,
-                                                 tuner_num_local_experts),
+            runner.tuner_inputs(inputs),
         )
         output = runner.forward(inputs, tactic=best_tactic)
         return output
@@ -4962,8 +5003,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
             [runner],
             runner.get_tuning_config(),
-            GroupedGemmInputsHelper.tuner_inputs(inputs,
-                                                 tuner_num_local_experts),
+            runner.tuner_inputs(inputs),
         )
         runner.zero_args = (zero_out.data_ptr(),
                             zero_out.numel() * zero_out.element_size())
