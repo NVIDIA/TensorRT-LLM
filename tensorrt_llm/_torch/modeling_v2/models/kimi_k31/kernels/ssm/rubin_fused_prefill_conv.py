@@ -1172,12 +1172,6 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
         or any(not t.is_contiguous() for t in (starts, slots, has_init))
     ):
         raise ValueError("Prepare contiguous int32 starts/slots and bool initial-state flags")
-    # The scalar fallback uses CuTe layout arithmetic with int32 extents.
-    # Reject overflowing layouts before launch rather than wrap an address.
-    if any(
-        sum((n - 1) * stride for n, stride in zip(t.shape, t.stride())) >= 2**31 for t in tensors
-    ):
-        raise ValueError("KDA convolution tensor offsets must fit int32")
     writable = (conv_state, q, k, v)
     for i, output in enumerate(writable):
         for other in (src, weight, starts, slots, has_init, *writable[:i]):
@@ -1204,6 +1198,19 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
     # a 16-byte-aligned base and a slot stride divisible by 8 elements.
     ss = conv_state.stride()
     st_vec = ss[1] == 3 and ss[2] == 1 and ss[0] % 8 == 0 and _align(conv_state) == 0
+    for tensor, vector_path in (
+        (src, src_vec),
+        (weight, w_vec),
+        (conv_state, st_vec),
+        (q, out_vec),
+        (k, out_vec),
+        (v, out_vec),
+    ):
+        if (
+            not vector_path
+            and sum((n - 1) * stride for n, stride in zip(tensor.shape, tensor.stride())) >= 2**31
+        ):
+            raise ValueError("Scalar KDA convolution tensor offsets must fit int32")
     stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
     # grid.y only sets parallelism (CTAs loop over the device-side run count): no
     # sequence is longer than T, so a looser bound only adds idle CTAs and an

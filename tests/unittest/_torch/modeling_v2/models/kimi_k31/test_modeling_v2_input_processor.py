@@ -47,6 +47,7 @@ def _media_proc_cfg(in_patch_limit=65536):
 def _processor(*, in_patch_limit=65536):
     """An input processor around a stub HF image processor."""
     processor = K31InputProcessor.__new__(K31InputProcessor)
+    processor._media_placeholder_token_id = 163605
     processor._config = SimpleNamespace(
         vision_config=SimpleNamespace(patch_size=_PATCH, merge_kernel_size=(2, 2))
     )
@@ -213,3 +214,10 @@ def test_text_prompt_truncates_encoded_ids(size):
     )
     assert result == ids[-128:]
     assert extra == {}
+
+
+def test_media_token_without_image_is_rejected():
+    processor = _processor()
+    processor._encode_prompt = lambda _: [processor._media_placeholder_token_id]
+    with pytest.raises(ValueError, match="requires a corresponding image"):
+        processor.call_with_text_prompt({"prompt": "<|media_pad|>"}, None)

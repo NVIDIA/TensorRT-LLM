@@ -59,6 +59,9 @@ from cutlass import dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kernels.comm.lamport_ar import (
+    mbarrier_test_wait_acquire_cluster,
+)
 
 from . import route_quant as _ag
 from . import route_quant as _rq
@@ -813,7 +816,12 @@ def moe_front_kernel(
                                 cutlass.Float32(acc[4 * h + 2]), cutlass.Float32(acc[4 * h + 3]), bar,
                             )  # fmt: skip
                     else:
-                        while not cute.arch.mbarrier_test_wait(mail_full.subview(rd).data_ptr(), 0):
+                        while (
+                            mbarrier_test_wait_acquire_cluster(
+                                mail_full.subview(rd).data_ptr().toint(), 0
+                            )
+                            == 0
+                        ):
                             pass
                         tot = [cutlass.Float32(0.0)] * mma_n
                         for t in cutlass.range_constexpr(mma_n):
@@ -1115,7 +1123,7 @@ def _runner_sort(
         if in_smem:
             if num_tokens > cutlass.Int32(1):
                 # test_wait spin: a warp suspended in try_wait is woken late by remote completions.
-                while not cute.arch.mbarrier_test_wait(ids_bar.data_ptr(), 0):
+                while mbarrier_test_wait_acquire_cluster(ids_bar.data_ptr().toint(), 0) == 0:
                     pass
         else:
             if cutlass.const_expr(cluster):

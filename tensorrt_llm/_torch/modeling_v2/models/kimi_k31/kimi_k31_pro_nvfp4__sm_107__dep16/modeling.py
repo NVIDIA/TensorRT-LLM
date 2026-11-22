@@ -133,6 +133,7 @@ from ..ops.spec.mla_norm_rope import dflash2_mla_block_rope, dflash2_mla_ctx_nor
 from ..ops.spec.rubin_dflash2_worker import (
     RubinDFlash2WorkerMixin,
     agree_draft_tokens,
+    agree_verified_tokens,
     rubin_draft_config_kwargs,
 )
 from ..ops.spec.strict_accept import strict_accept
@@ -1403,9 +1404,8 @@ def _build_runtime(core: Any) -> _Rt:
         )
         shared_gate_up_reserve = _shared_gate_up_reserve(core.role, megamoe_exchange_ctas(megamoe))
     if c["moe_backend"] == "cutedsl":
-        # The all-to-all's workspace over the EP group (collective): up to max_num_tokens rows per
-        # rank, the NVFP4 latent out and the BF16 latent back (FP8 on the wire, so
-        # every step takes the fence transport).
+        # The EP workspace holds up to max_num_tokens rows per rank. Dispatch sends NVFP4.
+        # Combine sends BF16 by default and FP8 when use_low_precision_moe_combine is enabled.
         a2a = rubin_moe_a2a_workspace(
             cfg.mapping,
             num_experts=_K31["num_experts"],
@@ -1413,6 +1413,7 @@ def _build_runtime(core: Any) -> _Rt:
             max_num_tokens_per_rank=int(cfg.max_num_tokens),
             hidden_size=d.latent,
             dtype=torch.bfloat16,
+            use_low_precision_combine=cfg.use_low_precision_moe_combine,
         )
     moe_comm = _MoeComm(
         latent_stream=s.latent,
@@ -3589,7 +3590,9 @@ class DFlashWorker(RubinDFlash2WorkerMixin, UnifiedDraftCacheWorkerMixin, _Engin
         )
         if fresh:
             draft_model.bind_runtime(
-                spec_metadata.max_num_requests * self._compute_block_size, self._ctx_page_size
+                (spec_metadata.num_seq_slots or spec_metadata.max_num_requests)
+                * self._compute_block_size,
+                self._ctx_page_size,
             )
 
     # -- target tokens and acceptance -----------------------------------------
@@ -3881,7 +3884,9 @@ class DFlashWorker(RubinDFlash2WorkerMixin, UnifiedDraftCacheWorkerMixin, _Engin
             num_accepted_tokens, num_contexts, K, spec_metadata=spec_metadata
         )
         return self._commit_occurrence_counts(
-            (accepted_tokens, num_accepted_tokens), batch_size, spec_metadata
+            agree_verified_tokens(self, accepted_tokens, num_accepted_tokens),
+            batch_size,
+            spec_metadata,
         )
 
     def _dflash2_global_top_k(self, gen_logits, spec_metadata, top_k: int, full_vocab: int):
@@ -4783,8 +4788,8 @@ class KimiK31ProNvfp4Sm107Dep16Core(DecoderModel):
         self.rope_positions = (
             int(model_config.pretrained_config.max_position_embeddings)
             if max_seq_len is None
-            else int(max_seq_len) + _ROPE_HEADROOM
-        )
+            else int(max_seq_len)
+        ) + _ROPE_HEADROOM
         self._layers: tuple | None = None
         self._head: _HeadW | None = None
         self._rt: _Rt | None = None

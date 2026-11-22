@@ -515,7 +515,7 @@ class _OneSidedTimeoutProxy:
 _TIMEOUT_PROXY = _OneSidedTimeoutProxy()
 
 
-def _one_sided_unavailable(mapping: Mapping) -> Optional[str]:
+def _local_one_sided_mismatch(mapping: Mapping) -> Optional[str]:
     """Why the one-sided all-to-all cannot serve this EP group, or None: the platform has no NVLink fabric with every
     link up (the engine strategy's ``is_platform_supported`` probe; a failing NVML query counts as none), or the group
     is not one its kernels take (pure EP, at most ``_MAX_RANKS`` ranks)."""
@@ -530,6 +530,12 @@ def _one_sided_unavailable(mapping: Mapping) -> Optional[str]:
     if mapping.moe_ep_size > _MAX_RANKS:
         return f"it serves at most {_MAX_RANKS} EP ranks"
     return None
+
+
+def _one_sided_unavailable(mapping: Mapping) -> Optional[str]:
+    """Agree on the exchange before any rank enters its setup collectives."""
+    reasons = MnnvlMemory.get_comm(mapping).allgather(_local_one_sided_mismatch(mapping))
+    return next((reason for reason in reasons if reason is not None), None)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -628,14 +634,16 @@ def workspace_layout(
 # ----------------------------------------------------------------------------------------------------------------
 
 
+def _cached_one_sided_mismatch(mapping: Mapping, workspace_cache: dict) -> Optional[str]:
+    key = ("availability", tuple(mapping.tp_group))
+    if key not in workspace_cache:
+        workspace_cache[key] = _one_sided_unavailable(mapping)
+    return workspace_cache[key]
+
+
 class K31EpAllToAll:
     """The one-sided NVLink all-to-all of one MoE layer; the workspace is shared by every layer with the same
     layout (one per process for K3.1)."""
-
-    #: layout key -> {"memory", "workspace", "metainfo", "sentinel_max_tokens"}.
-    _WORKSPACES: dict = {}
-    #: layout key -> the sentinel vote's (token limit, 0 when off; layout with its regions).
-    _SENTINEL_VOTES: dict = {}
 
     def __init__(
         self,
@@ -646,13 +654,16 @@ class K31EpAllToAll:
         hidden_size: int,
         dtype: torch.dtype,
         use_low_precision_combine: bool = False,
+        *,
+        workspace_cache: Optional[dict] = None,
     ) -> None:
         """The sentinel transport carries the small steps of the rows `dispatch` sends in
         :data:`SENTINEL_PAYLOAD_FORMAT`. Collective over the EP group on the first instance of a layout (the
         sentinel vote and the workspace allocation)."""
-        unavailable = _one_sided_unavailable(mapping)
-        if unavailable is not None:
-            raise RuntimeError(f"the one-sided all-to-all is not available here: {unavailable}")
+        if workspace_cache is None:
+            workspace_cache = {}
+        if (reason := _cached_one_sided_mismatch(mapping, workspace_cache)) is not None:
+            raise RuntimeError(f"the one-sided all-to-all is not available here: {reason}")
         self.mapping = mapping
         self.ep_rank = mapping.moe_ep_rank
         self.ep_size = mapping.moe_ep_size
@@ -675,35 +686,28 @@ class K31EpAllToAll:
             dtype,
         )
         shape += (use_low_precision_combine, tuple(metainfo.tolist()))
-        vote = K31EpAllToAll._SENTINEL_VOTES.get(shape)
-        if vote is None:
-            vote = self._vote_sentinel(
+        state = workspace_cache.get(shape)
+        if state is None:
+            limit, layout = self._vote_sentinel(
                 metainfo.clone(),
                 max_num_tokens_per_rank,
                 hidden_size,
                 dtype,
                 SENTINEL_PAYLOAD_FORMAT,
             )
-            K31EpAllToAll._SENTINEL_VOTES[shape] = vote
-        self.sentinel_max_tokens, layout = vote
-        metainfo = torch.tensor(layout, dtype=torch.int64, device="cpu")
+            metainfo = torch.tensor(layout, dtype=torch.int64, device="cpu")
+            MnnvlMemory.initialize()
+            memory = MnnvlMemory(mapping, int(metainfo[_WORKSPACE_SIZE_INDEX]))
+            workspace = memory.as_torch_strided_tensor(torch.uint8)
+            moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
+            state = workspace_cache[shape] = (memory, workspace, metainfo, limit)
+        self._memory, self.workspace, self.metainfo, self.sentinel_max_tokens = state
         self._sentinel_row = (
             sentinel_row(SENTINEL_PAYLOAD_FORMAT, hidden_size, top_k)
             if self.sentinel_max_tokens
             else None
         )
-        self.workspace_size_per_rank = int(metainfo[_WORKSPACE_SIZE_INDEX])
-        MnnvlMemory.initialize()
-        key = (self.workspace_size_per_rank, *shape[:-1], layout)
-        state = K31EpAllToAll._WORKSPACES.get(key)
-        if state is None:
-            memory = MnnvlMemory(mapping, self.workspace_size_per_rank)
-            workspace = memory.as_torch_strided_tensor(torch.uint8)
-            moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
-            state = dict(memory=memory, workspace=workspace, metainfo=metainfo)
-            K31EpAllToAll._WORKSPACES[key] = state
-        self.workspace = state["workspace"]
-        self.metainfo = state["metainfo"]
+        self.workspace_size_per_rank = int(self.metainfo[_WORKSPACE_SIZE_INDEX])
         self.invalid_token_expert_id = INVALID_EXPERT_ID
         # (local token count, runtime max tokens per rank, combine payload offset, sentinel step) of the pending
         # dispatch.
@@ -881,13 +885,6 @@ class K31EpAllToAll:
             use_sentinel,
         )
 
-    @classmethod
-    def release_workspaces(cls) -> None:
-        """Release every workspace (on every rank, after the last exchange); the memory goes once the last view of
-        it is gone."""
-        torch.cuda.synchronize()
-        cls._WORKSPACES.clear()
-
 
 class K31EpAllGather:
     """The AllGather + ReduceScatter exchange of one MoE layer over the attention-DP group (MPI session)."""
@@ -956,6 +953,8 @@ def create_ep_all_to_all(
     hidden_size: int,
     dtype: torch.dtype,
     use_low_precision_combine: bool = False,
+    *,
+    workspace_cache: Optional[dict] = None,
 ) -> Optional[K31EpAllToAll | K31EpAllGather]:
     """The token exchange of K3.1's routed MoE under attention DP, or ``None`` without attention DP.
 
@@ -982,11 +981,13 @@ def create_ep_all_to_all(
     forced = os.environ.get("TRTLLM_FORCE_COMM_METHOD", "").upper()
     if forced == "ALLGATHER":
         return K31EpAllGather(*args)
-    if forced == "NVLINK_ONE_SIDED":
-        return K31EpAllToAll(*args)
-    unavailable = _one_sided_unavailable(mapping)
+    if workspace_cache is None:
+        workspace_cache = {}
+    unavailable = _cached_one_sided_mismatch(mapping, workspace_cache)
     if unavailable is None:
-        return K31EpAllToAll(*args)
+        return K31EpAllToAll(*args, workspace_cache=workspace_cache)
+    if forced == "NVLINK_ONE_SIDED":
+        raise RuntimeError(f"the one-sided all-to-all is not available here: {unavailable}")
     logger.info_once(
         "Kimi K3.1 MoE exchange: all-gather + reduce-scatter (the one-sided all-to-all is not available here: "
         f"{unavailable})",

@@ -278,25 +278,11 @@ k31_w4a8_ep_moe_fused = K31W4A8EpMoeFused()
 MAX_ROWS = 4096
 
 _FUSED_WS: dict = {}
-_REAL_ROWS: dict = {}
 _PADDED_STEPS_LOGGED = 0
 
 
-def real_rows_buffer(device: torch.device) -> torch.Tensor:
-    """The device's int32 word holding this step's real (non-padding) row count of the attention-DP rank (the fused
-    path's dispatch leaves the tail rows past it out); ``2**31 - 1`` (no padding known) until a step publishes one.
-    Create it outside CUDA-graph capture."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    buf = _REAL_ROWS.get(index)
-    if buf is None:
-        buf = _REAL_ROWS[index] = torch.full(
-            (4,), 2**31 - 1, dtype=torch.int32, device=f"cuda:{index}"
-        )
-    return buf
-
-
 def publish_real_rows(num_tokens: int, num_generations: int, num_ctx_tokens: int, request_ids, dummy_id_floor: int,
-                      device: torch.device) -> None:  # fmt: skip
+                      real_rows: torch.Tensor) -> None:  # fmt: skip
     """Write this step's real row count before its forward (eager, capture or graph replay): the CUDA-graph padding
     requests (ids at or above ``dummy_id_floor``) are appended at the tail of the generation requests, each with the
     step's rows per generation request; the rows before them are real."""
@@ -310,7 +296,7 @@ def publish_real_rows(num_tokens: int, num_generations: int, num_ctx_tokens: int
     rows = num_tokens
     if pad and num_generations:
         rows = num_tokens - pad * ((num_tokens - num_ctx_tokens) // num_generations)
-    real_rows_buffer(device)[0].fill_(max(0, rows))
+    real_rows[0].fill_(max(0, rows))
     global _PADDED_STEPS_LOGGED
     if pad and _PADDED_STEPS_LOGGED < 16:
         _PADDED_STEPS_LOGGED += 1
@@ -373,11 +359,6 @@ def fused_moe_workspace(
     return ws
 
 
-def real_rows_of(device: torch.device) -> Optional[torch.Tensor]:
-    """The device's published real-row word (:func:`publish_real_rows`), or None before any step published one."""
-    return _REAL_ROWS.get(device.index if device.index is not None else torch.cuda.current_device())
-
-
 __all__ = [
     "MAX_ROWS",
     "N_TILE",
@@ -387,8 +368,6 @@ __all__ = [
     "fused_moe_decline",
     "fused_moe_workspace",
     "publish_real_rows",
-    "real_rows_buffer",
-    "real_rows_of",
     "slot_bytes",
 ]
 

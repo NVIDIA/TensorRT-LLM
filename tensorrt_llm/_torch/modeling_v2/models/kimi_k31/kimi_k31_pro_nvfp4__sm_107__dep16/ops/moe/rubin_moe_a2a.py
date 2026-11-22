@@ -8,7 +8,7 @@ engine's layout and initializes it; ``rubin_moe_a2a_dispatch`` and ``rubin_moe_a
 the two entries, each one engine op call with every argument explicit. They run the same ops,
 with the same arguments, as the engine ``NVLinkOneSided`` strategy, without its per-call state,
 environment reads, host watchdog or checkpoint hooks. Every step takes the fence transport: the
-combine goes over NVLink as FP8, which the sentinel transport does not carry, so the engine
+combine optionally goes over NVLink as FP8, which the sentinel transport does not carry, so the engine
 strategy takes the fence transport for it as well.
 """
 
@@ -37,6 +37,7 @@ class RubinA2aWorkspace(NamedTuple):
     max_num_tokens_per_rank: int
     hidden_size: int
     memory: Any  # the MNNVL allocation behind ``workspace``; kept alive here
+    use_low_precision_combine: bool = False
 
 
 def workspace_payload_bytes(
@@ -81,6 +82,7 @@ def rubin_moe_a2a_workspace(
     max_num_tokens_per_rank: int,
     hidden_size: int,
     dtype: torch.dtype,
+    use_low_precision_combine: bool = False,
 ) -> RubinA2aWorkspace:
     """Allocate and initialize this rank's all-to-all workspace (runtime-helper builder).
 
@@ -124,6 +126,7 @@ def rubin_moe_a2a_workspace(
         max_num_tokens_per_rank=max_num_tokens_per_rank,
         hidden_size=hidden_size,
         memory=memory,
+        use_low_precision_combine=use_low_precision_combine,
     )
 
 
@@ -288,8 +291,8 @@ class RubinMoeA2aCombine(OpWrapper):
 
     ``payload`` is ``[ep_size * runtime_max, H]`` or ``[ep_size, runtime_max, H]``: the dispatch's
     ``combine_payload`` in the workspace (nothing is copied). ``combine_payload_offset`` and
-    ``runtime_max_tokens_per_rank`` are the dispatch's. The combine sends FP8 over NVLink (the
-    output stays BF16).
+    ``runtime_max_tokens_per_rank`` are the dispatch's. The combine uses BF16 or FP8 on the wire.
+    The output is BF16.
     """
 
     ARCHS = frozenset({Arch.SM_107})
@@ -310,9 +313,8 @@ class RubinMoeA2aCombine(OpWrapper):
     )
 
     note = """
-    Collective, as the dispatch, and right after the dispatch whose offset it takes. The FP8 wire
-    format rounds each partial sum term to FP8 before the sum, so the combine is banded against
-    its FP32 reference (the test states the band).
+    All ranks call combine after the corresponding dispatch, using its payload offset.
+    With low-precision combine enabled, each contribution is rounded to FP8 before summation.
     """
 
     def __call__(
@@ -336,7 +338,7 @@ class RubinMoeA2aCombine(OpWrapper):
             ws.top_k,
             combine_payload_offset,
             True,  # payload_in_workspace
-            use_low_precision=True,
+            use_low_precision=ws.use_low_precision_combine,
             enable_rank_mask=False,
             active_rank_mask=None,
             use_sentinel=False,
@@ -354,7 +356,7 @@ class RubinMoeA2aCombine(OpWrapper):
         ``{(r, t): row}`` keyed by the source rank and token of each row it received, and
         ``local_num_tokens`` every rank's count, in rank order. Rank ``r``'s token ``t`` is the
         FP32 sum over ``q`` of ``payload[q][(r, t)]`` (a rank that did not receive it adds
-        nothing). The FP8 wire format is the test's band."""
+        nothing)."""
         out = []
         for r in range(ws.ep_size):
             rows = []

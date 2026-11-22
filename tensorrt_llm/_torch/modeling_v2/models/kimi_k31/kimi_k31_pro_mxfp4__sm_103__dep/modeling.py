@@ -418,7 +418,6 @@ from .ops.moe.w4a8_ep_moe_fused import (
     fused_moe_workspace,
     k31_w4a8_ep_moe_fused,
     publish_real_rows,
-    real_rows_of,
 )
 from .ops.norm.attn_res_moe_add_rmsnorm import k31_attn_res_moe_add_rmsnorm
 from .weights import PROJECTOR_PREFIX, VISION_TOWER_PREFIX, expert_ckpt_spec
@@ -1074,8 +1073,6 @@ class _K31KdaPair:
     and the step's row counts (``((context rows, generation rows) of pair rank 0, ... of pair rank 1)``), exchanged by
     the first KDA layer of every eager step."""
 
-    _BY_GROUP: dict = {}
-
     def __init__(self, group: Mapping):
         self.ws = group_workspace(group)
         self.rank = group.tp_rank
@@ -1087,15 +1084,6 @@ class _K31KdaPair:
             f"Kimi K3.1 pair-sharded KDA [q | k | v | g] projection: rank {group.rank} is pair rank {self.rank}, "
             f"Lamport buffer {self.ws.bytes_per_buffer} B"
         )
-
-    @classmethod
-    def of(cls, group: Mapping, layer_idx: int) -> "_K31KdaPair":
-        pair = cls._BY_GROUP.get(group)
-        if pair is None:
-            pair = cls._BY_GROUP[group] = cls(group)
-        if pair.first_layer is None or layer_idx < pair.first_layer:
-            pair.first_layer = layer_idx
-        return pair
 
     def half_weight(self, rows: int, like: torch.Tensor, num_layers: int):
         """A layer's half-weight buffer ``[rows, hidden]`` and its full-width view ``[2 * rows, hidden]`` (the half
@@ -1231,7 +1219,8 @@ class K31KDALinearAttention(K31KdaLayer):
         self._k31_low_m_plan = _k31_decode_plan(mapping)
         # Pair-sharded [q | k | v | g] projection, set up with the fused weights.
         self._k31_mapping = mapping
-        self._k31_kda_registry = extra_attrs.get(KDA_LAYERS) if extra_attrs is not None else None
+        self._k31_extra_attrs = extra_attrs if extra_attrs is not None else {}
+        self._k31_kda_registry = self._k31_extra_attrs.get(KDA_LAYERS)
         self._k31_pair: Optional[_K31KdaPair] = None
         self._k31_pair_wide: Optional[torch.Tensor] = None
         self._k31_pair_rows = None
@@ -1247,7 +1236,11 @@ class K31KDALinearAttention(K31KdaLayer):
         d = self.proj_size
         half = d // _K31_KDA_PAIR
         r = group.tp_rank
-        pair = _K31KdaPair.of(group, self.layer_idx)
+        pair = self._k31_extra_attrs.get("kimi_k31_kda_pair")
+        if pair is None:
+            pair = self._k31_extra_attrs["kimi_k31_kda_pair"] = _K31KdaPair(group)
+        if pair.first_layer is None or self.layer_idx < pair.first_layer:
+            pair.first_layer = self.layer_idx
         # Every KDA layer's half lives in one pool, so each half has a full-width view (``_k31_kda_pair_halves``).
         num_layers = len(self._k31_kda_registry) if self._k31_kda_registry else 1
         shard, wide = pair.half_weight(4 * half, w, num_layers)
@@ -2629,6 +2622,7 @@ class K31TargetRoutedExperts(K31RoutedExperts):
         all_rank_num_tokens: List[int],
         max_tokens: int,
         place: Optional[torch.Tensor] = None,
+        real_rows: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """The routed MoE of this rank's ``x`` ``[ntok, 3584]`` BF16 through the fused dispatch + experts + combine
         op, or ``None`` where the call keeps :meth:`forward` (a step row count above ``max_tokens``, a step the MoE
@@ -2673,7 +2667,7 @@ class K31TargetRoutedExperts(K31RoutedExperts):
             self.expert_size_per_partition,
             max(all_rank_num_tokens),
             *self.caps,
-            real_rows=real_rows_of(dev),
+            real_rows=real_rows,
             place=place,
         )
 
@@ -2741,6 +2735,7 @@ class K31MoE(nn.Module):
         # Attention-DP decode: the routed MoE as one fused op (dispatch, CTA-pair FC1, FC2 with the combine in
         # its epilogue, token-side reduce), bitwise to the separate path it replaces. The decision per call depends
         # only on group-wide values (the step's largest per-rank row count).
+        self._k31_extra_attrs = model_config.extra_attrs
         self._fused_moe_max_num_tokens = model_config.max_num_tokens
         # Resolved on the first forward (the weights exist by then); 0 = the separate path.
         self._fused_moe_max_tokens = None
@@ -2996,6 +2991,7 @@ class K31MoE(nn.Module):
                     all_rank_num_tokens,
                     self._fused_moe_max_tokens,
                     place=place,
+                    real_rows=self._k31_extra_attrs.get("kimi_k31_moe_real_rows"),
                 )
             if y is None and place is not None:
                 # The separate path routes by logical expert id, which no longer names the slot holding the weights.
@@ -4640,13 +4636,18 @@ class K31DFlashWorker(
         # The routed MoE's fused path skips this step's CUDA-graph padding rows (the tail requests).
         from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
+        attrs = draft_model.model_config.extra_attrs
+        if "kimi_k31_moe_real_rows" not in attrs:
+            attrs["kimi_k31_moe_real_rows"] = torch.full(
+                (4,), 2**31 - 1, dtype=torch.int32, device="cuda"
+            )
         publish_real_rows(
             attn_metadata.num_tokens,
             attn_metadata.num_generations,
             attn_metadata.num_ctx_tokens,
             spec_metadata.request_ids,
             CUDA_GRAPH_DUMMY_REQUEST_ID - spec_metadata.max_draft_len,
-            torch.device("cuda", torch.cuda.current_device()),
+            attrs["kimi_k31_moe_real_rows"],
         )
         super().prepare_managed_draft_cache(
             draft_model, spec_metadata, attn_metadata, resource_manager

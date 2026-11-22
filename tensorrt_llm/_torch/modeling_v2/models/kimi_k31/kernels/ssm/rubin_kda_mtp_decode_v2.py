@@ -1446,6 +1446,9 @@ def kda_decode_mtp_v2_kernel(
     # norm epilogue.
     if wg < 2:
         cute.arch.mbarrier_wait(mbar2, 0)
+        if cutlass.const_expr(SPLIT_V == 1):
+            # The unsplit state store also reuses the second MMA's input slab.
+            cute.arch.mbarrier_wait(mbar2b, 0)
     else:
         cute.arch.mbarrier_wait(mbar2b, 0)
     tcgen05_fence_after_thread_sync()

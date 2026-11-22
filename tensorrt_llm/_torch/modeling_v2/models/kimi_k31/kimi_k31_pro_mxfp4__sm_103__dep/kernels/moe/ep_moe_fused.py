@@ -83,7 +83,6 @@ from ..comm.moe_a2a import (
     add_f32,
     atom_add_acq_rel_gpu,
     fence_acq_rel_sys,
-    ld_acquire_sys_u32,
     ld_cg_v4,
     ld_nc_u64,
     ld_relaxed_u32,
@@ -92,6 +91,7 @@ from ..comm.moe_a2a import (
     st_relaxed_u32,
     st_v4,
     tree8_bf16x2,
+    wait_for_peer_epoch,
 )
 
 #: Flag words of the fused path in the workspace's flag area (uint32 words, each on its own 128-byte line, clear of
@@ -601,9 +601,7 @@ class EpCombineReduceKernel:
         epoch = ld_relaxed_u32(base + Int64(CALL_WORD * 4))
         if tid < W:
             wflag = base + Int64((DONE_FLAGS + tid * FLAG_STRIDE) * 4)
-            wgot = ld_acquire_sys_u32(wflag)
-            while wgot != epoch:
-                wgot = ld_acquire_sys_u32(wflag)
+            wait_for_peer_epoch(base, wflag, epoch)
         cute.arch.barrier()
         slots = base + slot_off
         wp = cute.make_rmem_tensor((K,), Float32)

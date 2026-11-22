@@ -710,6 +710,23 @@ def test_k31_mapping_rules(monkeypatch, mapping, missed, widened):
         assert reason is not None and missed in reason
 
 
+@pytest.mark.parametrize(
+    "setting, options",
+    [
+        ("enable_return_routed_experts", {"enable_return_routed_experts": True}),
+        ("TRTLLM_ENABLE_PDL", {"env_overrides": {"TRTLLM_ENABLE_PDL": "0"}}),
+        (
+            "TRTLLM_DISABLE_FUSED_DSA_METADATA",
+            {"env_overrides": {"TRTLLM_DISABLE_FUSED_DSA_METADATA": "1"}},
+        ),
+    ],
+)
+def test_routing_rejects_unsupported_execution_settings(setting, options):
+    config = _model_config(_k31_config(), **_TEP8)
+    with pytest.raises(ValueError, match=setting):
+        modeling_v2_resolve(config, _llm_args(**options))
+
+
 @pytest.mark.parametrize("reject", [False, True])
 def test_dflash2_watermark_rejected(reject):
     spec = _dflash2(fields={"use_rejection_sampling": reject})

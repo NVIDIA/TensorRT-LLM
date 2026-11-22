@@ -320,7 +320,7 @@ def _wait_peers_done(peers: Int64, rank: Int32, epoch: Int32, tid: Int32, world:
         if tid != rank:
             peer = ld_nc_u64(peers + Int64(tid) * 8)
             done = ld_acquire_sys_u32(peer + Int64(DONE * 4))
-            while done < epoch - 1:
+            while Int32(done - (epoch - 1)) < 0:
                 done = ld_acquire_sys_u32(peer + Int64(DONE * 4))
     cute.arch.barrier()
 
@@ -606,7 +606,7 @@ class SpAllGatherKernel:
                 if tid == 0:
                     flag = base + Int64((AG_FLAGS + s * MAX_CHUNKS) * 4) + Int64(c) * 4
                     got = ld_acquire_sys_u32(flag)
-                    while got < epoch:
+                    while Int32(got - epoch) < 0:
                         got = ld_acquire_sys_u32(flag)
                 cute.arch.barrier()
                 src = base + Int64(FLAGS_BYTES) + (Int64(s) * Int64(rows) + Int64(r0)) * rb

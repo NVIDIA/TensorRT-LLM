@@ -131,6 +131,7 @@ from ..ops.spec.mla_norm_rope import dflash2_mla_block_rope, dflash2_mla_ctx_nor
 from ..ops.spec.rubin_dflash2_worker import (
     RubinDFlash2WorkerMixin,
     agree_draft_tokens,
+    agree_verified_tokens,
     rubin_draft_config_kwargs,
 )
 from ..ops.spec.strict_accept import strict_accept
@@ -3307,7 +3308,9 @@ class DFlashWorker(RubinDFlash2WorkerMixin, UnifiedDraftCacheWorkerMixin, _Engin
         )
         if fresh:
             draft_model.bind_runtime(
-                spec_metadata.max_num_requests * self._compute_block_size, self._ctx_page_size
+                (spec_metadata.num_seq_slots or spec_metadata.max_num_requests)
+                * self._compute_block_size,
+                self._ctx_page_size,
             )
 
     def _issue_draft_projection(
@@ -3626,7 +3629,9 @@ class DFlashWorker(RubinDFlash2WorkerMixin, UnifiedDraftCacheWorkerMixin, _Engin
             num_accepted_tokens, num_contexts, K, spec_metadata=spec_metadata
         )
         return self._commit_occurrence_counts(
-            (accepted_tokens, num_accepted_tokens), batch_size, spec_metadata
+            agree_verified_tokens(self, accepted_tokens, num_accepted_tokens),
+            batch_size,
+            spec_metadata,
         )
 
     def _dflash2_global_top_k(self, gen_logits, spec_metadata, top_k: int, full_vocab: int):
@@ -4136,8 +4141,8 @@ class KimiK31ProNvfp4Sm107Helix8Core(DecoderModel):
         self.rope_positions = (
             int(model_config.pretrained_config.max_position_embeddings)
             if max_seq_len is None
-            else int(max_seq_len) + _ROPE_HEADROOM
-        )
+            else int(max_seq_len)
+        ) + _ROPE_HEADROOM
         self._layers: tuple | None = None
         self._head: _HeadW | None = None
         self._rt: _Rt | None = None

@@ -61,8 +61,8 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
         + kv_head_idx * BLOCK_SIZE
         + token_in_page
     """
-    kv_head_idx = tl.program_id(0)
-    token_id = tl.program_id(1)
+    token_id = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
     tile_id = tl.program_id(2)
 
     indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -175,7 +175,7 @@ def triton_convert_req_index_to_global_index(
         ti_stride0, ti_stride1, ti_stride2 = token_indices_c.stride()
     out_stride0, out_stride1, out_stride2, out_stride3 = out.stride()
 
-    grid = (num_kv_heads, num_tokens, tiles_per_row)
+    grid = (num_tokens, num_kv_heads, tiles_per_row)
 
     _convert_req_index_to_global_index_kernel_with_stride_factor[grid](
         req_id_c,

@@ -367,15 +367,6 @@ _NO_CI_STAGE = {
     ),
 }
 
-# Target accuracy gates no CI stage or QA platform can run, by test-db path, with what they
-# wait for. No list may run them.
-_NO_PLATFORM = {
-    "accuracy/modeling_v2/kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix8": (
-        "a DEP16 context server and a helix8 generation server on one host, 24 sm_107 GPUs; "
-        "no Rubin host has 24 GPUs, and the gate serves on localhost only"
-    ),
-}
-
 
 def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     """Every modeling_v2 test is in a list some job runs.
@@ -385,16 +376,12 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     deployments, run from the QA lists. Paths are in test-db form: unit tests relative
     to ``tests/``, accuracy tests relative to ``tests/integration/defs/``. Only paths
     are compared: the ``-m cpu_only`` and ``-m "not cpu_only"`` split between stages is
-    not checked. Unit tests under ``_NO_CI_STAGE`` and accuracy gates under
-    ``_NO_PLATFORM`` are exempt until a stage or platform can run them.
+    not checked. Unit tests under ``_NO_CI_STAGE`` are exempt until CI has a matching stage.
     """
     unit_root, accuracy_root = repo / "tests", repo / "tests/integration/defs"
     test_db = _test_db_entries(repo)
     any_list = test_db + _qa_entries(repo)
     unit_tests = [str(p.relative_to(unit_root)) for p in sorted((repo / _UNIT).rglob("test_*.py"))]
-    accuracy_tests = [
-        str(p.relative_to(accuracy_root)) for p in sorted((repo / _ACC).rglob("test_*.py"))
-    ]
     # An exemption outlives its reason once its tests move, vanish, or a list starts running them.
     stale = sorted(
         where
@@ -402,13 +389,7 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
         if not any(_at_or_under(t, where) for t in unit_tests)
         or any(_runs(e, t) for e in test_db for t in unit_tests if _at_or_under(t, where))
     )
-    stale += sorted(
-        where
-        for where in _NO_PLATFORM
-        if not any(_at_or_under(t, where) for t in accuracy_tests)
-        or any(_runs(e, t) for e in any_list for t in accuracy_tests if _at_or_under(t, where))
-    )
-    assert not stale, f"_NO_CI_STAGE / _NO_PLATFORM entries with no test or now listed: {stale}"
+    assert not stale, f"_NO_CI_STAGE entries with no test or now listed: {stale}"
     # Test-db path -> the test files that stand for it, and the entries that may run them.
     tests = {
         t: ([t], test_db)
@@ -419,7 +400,7 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
         for d in _targets(family_dir):
             accuracy = repo / _ACC / family_dir.name / d.name
             key = str(accuracy.relative_to(accuracy_root))
-            if accuracy.is_dir() and key not in _NO_PLATFORM:
+            if accuracy.is_dir():
                 files = [
                     str(p.relative_to(accuracy_root)) for p in sorted(accuracy.rglob("test_*.py"))
                 ]

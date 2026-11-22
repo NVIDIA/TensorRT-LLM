@@ -441,6 +441,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..input_processor import MEDIA_PLACEHOLDER_TOKEN_ID, moonvit_max_image_grid
+from ..ops.spec.rubin_dflash2_worker import agree_draft_tokens
 from . import weights as target_weights
 from .ops.attention.mla_query_e4m3 import k31_mla_query_e4m3
 from .ops.attention.sparse_mla_prims_ts import full_lengths, k31_sparse_mla_prims_ts
@@ -2151,8 +2152,8 @@ class K31MLA(nn.Module):
         recv = rows_alltoall([q_heads[bounds[j] : bounds[j + 1]] for j in range(tp)], rows, mapping)
         q_all = recv[:, :n].transpose(0, 1).reshape(n, tp * heads, qk_dim)
         out_rows = q.new_empty(n, tp * heads, v_dim)
+        w_uk, w_uv = self._shardq_all_head_weights()
         if n > 0:
-            w_uk, w_uv = self._shardq_all_head_weights()
             q_nope, q_pe = q_all.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             q_latent = q.new_empty(n, tp * heads, self.kv_lora_rank)
             self._bmm_bf16_out(
@@ -7442,7 +7443,7 @@ class K31DFlashWorker(
             self._restore_ctx_len_host()
         self._ctx_len_restore_pending = False
 
-        return {
+        outputs = {
             # The gathered float32 target logits, or this rank's vocab shard
             # when the target tokens were selected from it.
             "logits": raw_logits,
@@ -7452,6 +7453,8 @@ class K31DFlashWorker(
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        agree_draft_tokens(outputs, self.mapping)
+        return outputs
 
     def _k31_greedy_selector_tokens(
         self, draft_model, gen_hidden_states, inputs, spec_metadata, num_gens: int, K: int
@@ -8779,6 +8782,7 @@ class K31TepHybridCacheManager(KimiK3DSAHybridCacheManager):
     """
 
     def __init__(self, *args, cold_page_codec_provider=None, **kwargs) -> None:
+        self._shard_cold_page_provider = None
         if cold_page_codec_provider is None:
             from .ops.common.shard_cold_page_codec import create_shard_cold_page_provider
 
@@ -8790,7 +8794,15 @@ class K31TepHybridCacheManager(KimiK3DSAHybridCacheManager):
             cold_page_codec_provider = create_shard_cold_page_provider(
                 kwargs["mapping"], kv_cache_config
             )
+            self._shard_cold_page_provider = cold_page_codec_provider
         super().__init__(*args, cold_page_codec_provider=cold_page_codec_provider, **kwargs)
+
+    def shutdown(self):
+        try:
+            super().shutdown()
+        finally:
+            if self._shard_cold_page_provider is not None:
+                self._shard_cold_page_provider.close()
 
 
 class KimiK31ForConditionalGeneration(K31VLWrapper):

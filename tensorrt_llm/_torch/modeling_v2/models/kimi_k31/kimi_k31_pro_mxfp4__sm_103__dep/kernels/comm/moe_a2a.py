@@ -35,6 +35,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.distributed import ops as _dist_ops
+from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from tensorrt_llm.mapping import Mapping
 
 #: Largest EP group the flag layout holds.
@@ -57,6 +58,8 @@ DEPOCH, CEPOCH, COUNT, ITEMQ, DFLAGS, FEPOCH, DCOUNT, FCOUNT, FFLAGS, CFLAGS = (
     512,
     1024,
 )
+#: Aligned int64 in the control area, after the fused FC2 call and CTA counters.
+_TIMEOUT_WORD = 352
 #: Bytes reserved for the flags.
 FLAGS_BYTES = 256 * 1024
 #: Most distinct destination ranks per token the combine sums (the engine tree's two groups of eight).
@@ -335,6 +338,30 @@ def _arrive(
     return ticket
 
 
+@dsl_user_op
+def _globaltimer_ns(*, loc=None, ip=None):
+    return Int64(_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _timeout_trap(*, loc=None, ip=None):
+    _asm(None, [], "trap;", "", loc=loc, ip=ip)
+
+
+@cute.jit
+def wait_for_peer_epoch(base: Int64, flag: Int64, epoch: Int32):
+    if ld_acquire_sys_u32(flag) != epoch:
+        budget = ld_nc_u64(base + Int64(_TIMEOUT_WORD * 4))
+        start = _globaltimer_ns()
+        polls = Int32(0)
+        while ld_acquire_sys_u32(flag) != epoch:
+            polls += 1
+            if (polls & 255) == 0:
+                if _globaltimer_ns() - start >= budget:
+                    if ld_acquire_sys_u32(flag) != epoch:
+                        _timeout_trap()
+
+
 @cute.jit
 def _wait_flags(
     base: Int64, epoch: Int32, tid: Int32, flag_word: cutlass.Constexpr, world: cutlass.Constexpr
@@ -342,9 +369,7 @@ def _wait_flags(
     """Threads ``0 .. world - 1`` wait until every rank's flag reads ``epoch``; then the CTA syncs."""
     if tid < world:
         wflag = base + Int64(flag_word * 4) + Int64(tid) * 4
-        wgot = ld_acquire_sys_u32(wflag)
-        while wgot != epoch:
-            wgot = ld_acquire_sys_u32(wflag)
+        wait_for_peer_epoch(base, wflag, epoch)
     cute.arch.barrier()
 
 
@@ -439,11 +464,20 @@ class MoeA2AWorkspace:
         self.peers = torch.tensor(peers, dtype=torch.int64, device=device)
         self.offs = torch.tensor(self.offsets, dtype=torch.int64, device=device)
         self.local[:FLAGS_BYTES].zero_()
+        self._timeout_ns = self.local[_TIMEOUT_WORD * 4 : _TIMEOUT_WORD * 4 + 8].view(torch.int64)
+        register_moe_comm_timeout_proxy(self)
         torch.cuda.synchronize()
         if not _dist_ops._mnnvl_workspace_all_succeeded(comm, True):
             raise RuntimeError("all-to-all workspace setup failed on a rank")
         self._comm = comm
         self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+
+    name = "Kimi K3.1 fused EP"
+
+    @torch.inference_mode()
+    def set_timeout_seconds(self, seconds: int | None) -> None:
+        # Match the native MoE all-to-all's five-minute serving default.
+        self._timeout_ns.fill_((300 if seconds is None else seconds) * 1_000_000_000)
 
     def recv(self, i: int, tmax: int, dtype: torch.dtype, width: int) -> torch.Tensor:
         """Receive array ``i`` (0 activation, 1 scales, 2 ids, 3 weights) as ``[W * tmax, width]``."""

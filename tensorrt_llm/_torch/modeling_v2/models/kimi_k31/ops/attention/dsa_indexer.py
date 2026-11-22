@@ -1177,7 +1177,11 @@ class K31Indexer(nn.Module):
             assert metadata.gen_indexer_kv_lens_cuda_runtime is not None
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
-            if self.gvr_topk(logits_decode.device) and logits_decode.dtype == torch.float32:
+            if (
+                self.gvr_topk(logits_decode.device)
+                and logits_decode.dtype == torch.float32
+                and (logits_decode.shape[0] > 1 or logits_decode.shape[1] % 4 == 0)
+            ):
                 # Deterministic GVR Top-K for uniform next_n rows (the radix's set on tie-free
                 # rows, the smaller columns on ties). With the generation pool remap the caller
                 # armed (gen-only call, no shared Top-K), the rows come out as ordered pool rows.

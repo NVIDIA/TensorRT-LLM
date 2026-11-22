@@ -149,7 +149,7 @@ def _launch(
         t["unroll"],
         t["rs_slices"],
     )
-    ws.epoch += 1
+    ws.epoch = (ws.epoch + 1) & 0xFFFFFFFF
     kernel(
         _k.Int64(x.data_ptr()),
         _k.Int64(out.data_ptr()),
@@ -158,7 +158,7 @@ def _launch(
         _k.Int32(rows),
         _k.Int32(_row_bytes(x)),
         _k.Int32(ws.rank),
-        _k.Int32(ws.epoch),
+        _k.Int32(ws.epoch if ws.epoch < 2**31 else ws.epoch - 2**32),
         _stream(),
     )
     return out
@@ -180,7 +180,7 @@ def _row_bytes(x: torch.Tensor) -> int:
     return (x.numel() // x.shape[0]) * x.element_size() if x.dim() and x.shape[0] else 0
 
 
-def gather_serves(x: torch.Tensor, mapping: Mapping) -> bool:
+def _aligned_rows(x: torch.Tensor, mapping: Mapping) -> bool:
     rb = _row_bytes(x)
     return (
         2 <= mapping.tp_size <= MAX_RANKS
@@ -194,9 +194,14 @@ def gather_serves(x: torch.Tensor, mapping: Mapping) -> bool:
     )
 
 
+def gather_serves(x: torch.Tensor, mapping: Mapping) -> bool:
+    return _aligned_rows(x, mapping) and x.shape[0] <= TUNING["chunk_rows"] * _k.MAX_CHUNKS
+
+
 def reduce_scatter_serves(x: torch.Tensor, mapping: Mapping) -> bool:
     return (
-        gather_serves(x, mapping)
+        _aligned_rows(x, mapping)
+        and x.shape[0] <= mapping.tp_size * TUNING["chunk_rows"] * _k.MAX_CHUNKS
         and x.dtype == torch.bfloat16
         and x.shape[0] % mapping.tp_size == 0
     )

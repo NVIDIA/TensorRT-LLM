@@ -197,8 +197,9 @@ def _ks_wait_flags(i32_ptr, state_ptr, cell, rw, e, max_spin, W: tl.constexpr):
     while (tl.sum((v != e).to(tl.int32), axis=0) > 0) & (n < max_spin):
         v = tl.atomic_add(i32_ptr + 4 * rw + cell, zero, sem="acquire", scope="sys")
         n += 1
-    if n >= max_spin:
+    if tl.sum((v != e).to(tl.int32), axis=0) > 0:
         tl.atomic_add(state_ptr + 3, 1)
+        tl.inline_asm_elementwise("trap;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
     tl.debug_barrier()
 
 

@@ -568,7 +568,7 @@ class TwoShotAllReduceRMSNormReduceScatter:
             if arrived == Uint32(m) - Uint32(1):
                 store_u32_addr(ctrl_addr + 8, Uint32(0))
                 store_u32_addr(ctrl_addr + 4, Uint32(m))
-                store_u32_addr(ctrl_addr, epoch + Uint32(1))
+                store_u32_addr(ctrl_addr, (epoch + Uint32(1)) % Uint32(NUM_GENERATIONS))
 
 
 class TwoShotSharedPush:

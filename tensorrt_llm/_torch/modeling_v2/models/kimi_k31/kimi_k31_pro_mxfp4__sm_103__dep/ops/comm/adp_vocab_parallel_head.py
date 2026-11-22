@@ -28,11 +28,13 @@ from __future__ import annotations
 from typing import Dict, Optional, Sequence
 
 import cuda.bindings.driver as cuda
+import pynvml
 import torch
 import torch.nn.functional as F
 from cutlass import Int32, Int64
 
 from tensorrt_llm._torch.distributed import ops as _dist_ops
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce, allgather, alltoall_helix
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kernels.spec.dflash2_top32 import (
@@ -162,11 +164,15 @@ def _key(mapping: Mapping) -> tuple:
 def exchange_supported(mapping: Mapping) -> bool:
     """Whether the exchange kernels can run over this group: 2..32 ranks of SM100 / SM103 GPUs on one NVLink
     domain whose memory the ranks can map (the engine's MNNVL condition, single node included)."""
-    return (
-        2 <= mapping.tp_size <= _x.MAX_WORLD
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
-        and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=True)
-    )
+    try:
+        local = (
+            2 <= mapping.tp_size <= _x.MAX_WORLD
+            and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+            and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=True)
+        )
+    except pynvml.NVMLError:
+        local = False
+    return all(MnnvlMemory.get_comm(mapping).allgather(local))
 
 
 def reserve_exchange(

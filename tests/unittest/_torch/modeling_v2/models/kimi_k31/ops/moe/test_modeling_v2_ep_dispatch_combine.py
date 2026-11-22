@@ -147,6 +147,7 @@ def _rank_one_sided() -> dict:
     # Releases the engine's workspace before the family allocates its own.
     engine.destroy()
 
+    cache = {}
     with MetaInitMode():
         family = fam.K31EpAllToAll(
             mapping,
@@ -156,9 +157,10 @@ def _rank_one_sided() -> dict:
             hidden_size=HIDDEN,
             dtype=torch.bfloat16,
             use_low_precision_combine=False,
+            workspace_cache=cache,
         )
         picked = fam.create_ep_all_to_all(
-            mapping, NUM_SLOTS, TOP_K, MAX_TOKENS, HIDDEN, torch.bfloat16
+            mapping, NUM_SLOTS, TOP_K, MAX_TOKENS, HIDDEN, torch.bfloat16, workspace_cache=cache
         )
     if (
         not isinstance(picked, fam.K31EpAllToAll)
@@ -217,7 +219,7 @@ def _rank_one_sided() -> dict:
         torch.cuda.synchronize()
         if out.shape != eout.shape or not torch.equal(_bits(out), _bits(eout)):
             fails.append(("combine vs engine", cell.why))
-    fam.K31EpAllToAll.release_workspaces()
+    cache.clear()
     return dict(rank=rank, fails=fails)
 
 

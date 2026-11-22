@@ -398,7 +398,6 @@ class ShardColdPageProvider:
         self.stats = _Stats()
         self._stats_at = time.monotonic()
         self._stats_prev = _Stats()
-        atexit.register(self._log_stats_at_exit)
 
     # ---- KV-V2 manager side -------------------------------------------------------------------------------------
 
@@ -415,7 +414,9 @@ class ShardColdPageProvider:
         """A native codec owning the replicated attention layers; None (lossless default) for draft managers or
         when no layer qualifies. ``runtime_dtype`` and the per-layer geometry are not needed: the codec moves raw
         bytes of whatever dtype each buffer holds."""
-        if is_draft:
+        # A partially committed page may contain different unused bytes on each rank.
+        # Its full-page checksum cannot identify a replicated page.
+        if is_draft or cache_config.enable_partial_commit:
             return None
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
@@ -586,6 +587,7 @@ class ShardColdPageProvider:
         """Stop the watchdog thread; the provider must not be used afterwards."""
         if self._transport is not None:
             self._transport.close()
+            atexit.unregister(self._log_stats_at_exit)
 
     # ---- internals -----------------------------------------------------------------------------------------------
 
@@ -594,6 +596,7 @@ class ShardColdPageProvider:
             self._transport = _Transport(
                 self.mapping, self.timeout_s, self.nccl_timeout_s, self.abort_on_error
             )
+            atexit.register(self._log_stats_at_exit)
         return self._transport
 
     def _plan(self, lifecycle) -> _Plan:

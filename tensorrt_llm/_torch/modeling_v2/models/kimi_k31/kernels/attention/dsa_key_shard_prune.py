@@ -80,6 +80,11 @@ _lv = _lam._lv
 
 
 @dsl_user_op
+def _trap(*, loc=None, ip=None):
+    _asm(None, [], "trap;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _lds64(addr, *, loc=None, ip=None):
     return Int64(
         _asm(
@@ -510,9 +515,9 @@ def _poll_v4(addr: Int64, second: Int32, max_spin: Int32, state: Int64):
         w = _lam.ld_volatile_v4(addr)
         ok = _clean_pair(w[0], w[1], w[2], w[3], second)
         n = n + 1
-        if n >= max_spin:
+        if n >= max_spin and ok == 0:
             _lam.atom_add_relaxed_u32(state + Int64(12), Int32(1))
-            ok = Int32(1)
+            _trap()
     return w
 
 

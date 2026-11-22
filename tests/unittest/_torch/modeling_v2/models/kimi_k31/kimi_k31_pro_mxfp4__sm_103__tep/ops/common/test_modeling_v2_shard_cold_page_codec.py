@@ -27,6 +27,11 @@ def _single_rank_provider():
     )
 
 
+def test_partial_commits_use_native_page_storage() -> None:
+    _, provider = _single_rank_provider()
+    assert provider.create_cold_page_codec(SimpleNamespace(enable_partial_commit=True)) is None
+
+
 def test_watchdog_times_each_pending_decode(monkeypatch: pytest.MonkeyPatch) -> None:
     sc, provider = _single_rank_provider()
     transport = provider._get_transport()

@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+metadata:
+  model_name: kimi_k31_nvfp4
+  precision: fp4
+  model_dir_name: Kimi-K3.1-Pro-NVFP4
+  supported_gpus:
+  - VR200
+slurm:
+  timeout: 7200
+  numa_bind: false
+benchmark:
+  mode: e2e
+  concurrency_list: '64'
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  worker_env_var: TRTLLM_NIXL_NUM_THREADS=1 UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp
+worker_config:
+  ctx:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    modeling_v2: require
+    max_batch_size: 16
+    max_num_tokens: 8192
+    max_seq_len: 8192
+    trust_remote_code: true
+    disable_overlap_scheduler: true
+    cuda_graph_config: null
+    kv_cache_config:
+      use_kv_cache_manager_v2: true
+      dtype: fp8
+      tokens_per_block: 64
+      enable_block_reuse: false
+      mamba_ssm_cache_dtype: float32
+      free_gpu_memory_fraction: 0.5
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+    sparse_attention_config:
+      algorithm: dsa
+      indexer_k_dtype: fp8
+      enable_heuristic_topk: true
+      use_self_sampling_topk: true
+      gvr_deterministic_topk: true
+    speculative_config:
+      decoding_type: DFlash
+      max_draft_len: 5
+      speculative_model: Kimi-K3.1-Dflash2-Preview
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 60000
+  gen:
+    tensor_parallel_size: 1
+    context_parallel_size: 8
+    moe_tensor_parallel_size: 2
+    moe_expert_parallel_size: 4
+    cp_config:
+      cp_type: HELIX
+      tokens_per_block: 64
+      use_nccl_for_alltoall: false
+      fifo_version: 2
+    enable_attention_dp: false
+    modeling_v2: require
+    max_batch_size: 16
+    max_num_tokens: 96
+    max_seq_len: 8192
+    trust_remote_code: true
+    disable_overlap_scheduler: true
+    cuda_graph_config: null
+    kv_cache_config:
+      use_kv_cache_manager_v2: true
+      dtype: fp8
+      tokens_per_block: 64
+      enable_block_reuse: false
+      mamba_ssm_cache_dtype: float32
+      free_gpu_memory_fraction: 0.5
+    moe_config:
+      backend: CUTEDSL_FC12
+      use_low_precision_moe_combine: true
+    sparse_attention_config:
+      algorithm: dsa
+      indexer_k_dtype: fp8
+      enable_heuristic_topk: true
+      use_self_sampling_topk: true
+      gvr_deterministic_topk: true
+    speculative_config:
+      decoding_type: DFlash
+      max_draft_len: 5
+      speculative_model: Kimi-K3.1-Dflash2-Preview
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 60000

@@ -1002,6 +1002,11 @@ def _specialized_decision(
             f"moe_config.backend {llm_args.moe_config.backend}: a {layout} {role} server runs "
             f"{backend}"
         )
+    if layout in ("tep8", "helix8") and llm_args.allreduce_strategy not in (None, "AUTO", "MNNVL"):
+        return (
+            None,
+            f"{layout} requires MNNVL MoE collectives, got allreduce_strategy={llm_args.allreduce_strategy}",
+        )
     if (mismatch := _specialized_engine_mismatch(llm_args, spec_config)) is not None:
         return None, mismatch
     if mapping.enable_attention_dp and llm_args.enable_lm_head_tp_in_adp:
@@ -1180,6 +1185,14 @@ def route(
     if (mismatch := _dsa_indexer_mismatch(text)) is not None:
         raise NoTarget(mismatch)
     from .config import mxfp4_experts, routes_to_nvfp4_targets
+
+    if llm_args.enable_return_routed_experts:
+        raise NoTarget("Kimi K3.1 does not support enable_return_routed_experts")
+    overrides = llm_args.env_overrides or {}
+    for name, required in (("TRTLLM_ENABLE_PDL", "1"), ("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0")):
+        value = str(overrides.get(name, os.environ.get(name, required)))
+        if value != required:
+            raise NoTarget(f"Kimi K3.1 requires {name}={required}, got {value!r}")
 
     spec = model_config.spec_config or llm_args.speculative_config
     if (

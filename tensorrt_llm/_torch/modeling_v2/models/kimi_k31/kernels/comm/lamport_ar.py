@@ -96,6 +96,21 @@ def _lv(value, *, loc=None, ip=None):
     return Int64(value).ir_value(loc=loc, ip=ip)
 
 
+@dsl_user_op
+def mbarrier_test_wait_acquire_cluster(mbar, parity, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(mbar, loc=loc, ip=ip), _iv(parity, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nmbarrier.test_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n"
+            "selp.u32 $0, 1, 0, p;\n}",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def _fv(value, *, loc=None, ip=None):
     return cutlass.Float32(value).ir_value(loc=loc, ip=ip)
 

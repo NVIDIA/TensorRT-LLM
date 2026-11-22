@@ -406,6 +406,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..input_processor import MEDIA_PLACEHOLDER_TOKEN_ID, moonvit_max_image_grid
+from ..ops.spec.rubin_dflash2_worker import agree_draft_tokens
 from . import weights as target_weights
 from .ops.moe.noaux_tc_mxfp8_quant import fused_noaux_quant
 from .weights import PROJECTOR_PREFIX, VISION_TOWER_PREFIX, expert_ckpt_spec
@@ -5218,7 +5219,7 @@ class K31DFlashWorker(
             self._restore_ctx_len_host()
         self._ctx_len_restore_pending = False
 
-        return {
+        outputs = {
             # The gathered float32 target logits, or this rank's vocab shard
             # when the target tokens were selected from it.
             "logits": raw_logits,
@@ -5228,6 +5229,8 @@ class K31DFlashWorker(
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        agree_draft_tokens(outputs, self.mapping)
+        return outputs
 
     def _block_gather_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int, num_rows: int

@@ -294,6 +294,7 @@ class K31RoutedExperts(nn.Module):
                 hidden_size=hidden_size,
                 dtype=model_config.torch_dtype,
                 use_low_precision_combine=model_config.use_low_precision_moe_combine,
+                workspace_cache=model_config.extra_attrs.setdefault("kimi_k31_ep_workspaces", {}),
             )
             if self.use_dp and mapping.dp_size > 1
             else None

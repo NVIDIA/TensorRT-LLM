@@ -461,6 +461,8 @@ class K31InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsB
             ids = self._encode_prompt(text_prompt)
             if sampling_params is not None and sampling_params.truncate_prompt_tokens is not None:
                 ids = ids[-sampling_params.truncate_prompt_tokens :]
+            if self._media_placeholder_token_id in ids:
+                raise ValueError("Kimi media placeholder requires a corresponding image")
             return ids, {}
 
         # The HF processor takes either chat ``messages`` or ``medias`` and the formatted ``text``; the prompt is
@@ -476,31 +478,33 @@ class K31InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsB
         # placeholder, so the executor finds the image positions with the model's ``multimodal_token_ids``.
         placeholder_id = self._media_placeholder_token_id
         grid_thws = processed.get("grid_thws", processed.get("image_grid_thw"))
-        if grid_thws is not None:
-            merge_kh, merge_kw = self._merge_kernel_size()
-            tokens_per_media = [(h // merge_kh) * (w // merge_kw) for _, h, w in grid_thws.tolist()]
-            new_ids: List[int] = []
-            media_idx = 0
-            for tok in input_ids.tolist():
-                if tok == placeholder_id:
-                    if media_idx >= len(tokens_per_media):
-                        raise ValueError(
-                            f"More media placeholder tokens ({media_idx + 1}) in input_ids than images in "
-                            f"grid_thws ({len(tokens_per_media)}). Check that the prompt has the correct number "
-                            f"of <|media_pad|> tokens."
-                        )
-                    new_ids.extend([placeholder_id] * tokens_per_media[media_idx])
-                    media_idx += 1
-                else:
-                    new_ids.append(tok)
-            input_ids = torch.tensor(new_ids, dtype=torch.int32)
+        if grid_thws is None or len(grid_thws) != len(images):
+            raise ValueError("Kimi image processor must return one grid per input image")
+        merge_kh, merge_kw = self._merge_kernel_size()
+        tokens_per_media = [(h // merge_kh) * (w // merge_kw) for _, h, w in grid_thws.tolist()]
+        new_ids: List[int] = []
+        media_idx = 0
+        for tok in input_ids.tolist():
+            if tok == placeholder_id:
+                if media_idx >= len(tokens_per_media):
+                    raise ValueError(
+                        f"More media placeholder tokens ({media_idx + 1}) in input_ids than images in "
+                        f"grid_thws ({len(tokens_per_media)}). Check that the prompt has the correct number "
+                        f"of <|media_pad|> tokens."
+                    )
+                new_ids.extend([placeholder_id] * tokens_per_media[media_idx])
+                media_idx += 1
+            else:
+                new_ids.append(tok)
+        if media_idx != len(images):
+            raise ValueError(f"Found {media_idx} media placeholders for {len(images)} input images")
+        input_ids = torch.tensor(new_ids, dtype=torch.int32)
 
         multimodal_data: Dict[str, Any] = {}
         pixel_values = processed.get("pixel_values")
         if pixel_values is not None:
             image_entry: Dict[str, Any] = {"pixel_values": pixel_values}
-            if grid_thws is not None:
-                image_entry["image_grid_thw"] = grid_thws
+            image_entry["image_grid_thw"] = grid_thws
             multimodal_data["image"] = image_entry
 
         return input_ids.to(torch.int32).tolist(), {

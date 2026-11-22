@@ -104,6 +104,18 @@ class RubinDraftTokenAgreement(OpWrapper):
 rubin_draft_token_agreement = RubinDraftTokenAgreement()
 
 
+def agree_verified_tokens(worker, tokens, lengths):
+    """Use rank zero's verification result before updating the per-request state."""
+    group = draft_agreement_mapping(worker.mapping)
+    if group is None:
+        return tokens, lengths
+    packed = torch.cat((tokens, lengths[:, None]), dim=1).to(torch.int32)
+    agreed = rubin_draft_token_agreement(packed, group)
+    return agreed[:, :-1].contiguous().to(tokens.dtype), agreed[:, -1].contiguous().to(
+        lengths.dtype
+    )
+
+
 def agree_draft_tokens(outputs: Any, mapping: Any) -> None:
     """Give ``next_draft_tokens`` ``[rows, K]`` and the draft columns of ``next_new_tokens``
     ``[rows, 1 + K]`` the group rank 0's values (column 0, the last accepted token, already

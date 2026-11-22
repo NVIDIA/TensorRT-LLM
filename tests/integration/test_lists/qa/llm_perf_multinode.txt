@@ -64,6 +64,9 @@ accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8/test_accura
 accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4/test_accuracy.py::TestModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4::test_gsm8k[disagg-e2e-vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_helix8_bs20_dspark5]
 accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1/test_accuracy.py::TestModelingV2KimiK3Nvfp4Sm107Tp1::test_gsm8k[disagg-e2e-vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_dep16_bs16_dspark5]
 
+# VR200 Kimi K3.1 Pro NVFP4 GSM8K with DEP16 context and Helix8 generation
+accuracy/modeling_v2/kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix8/test_accuracy.py::TestModelingV2KimiK31ProNvfp4Sm107Helix8::test_gsm8k_helix8[disagg-e2e-vr200_kimi-k31-nvfp4-dflash2_gsm8k_ctx1_dep16_gen1_helix8_bs16]
+
 # VR200 MiniMax-M3
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep16_eplb0_eagle3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep8_eplb0_eagle3_ccb-NIXL]

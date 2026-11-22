@@ -68,6 +68,8 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATUR
 from tensorrt_llm._torch.speculative import interface as _spec_interface
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
+from .rubin_dflash2_worker import agree_verified_tokens
+
 
 def _sample_rows(
     weights: torch.Tensor, uniforms: torch.Tensor, fallback: torch.Tensor
@@ -394,7 +396,9 @@ def dflash2_sample_and_accept(worker, logits, attn_metadata, spec_metadata):
                 FORCE_SLOT_STRIDE,
             )
             return worker._commit_occurrence_counts(
-                (accepted_tokens, num_accepted_tokens), batch_size, spec_metadata
+                agree_verified_tokens(worker, accepted_tokens, num_accepted_tokens),
+                batch_size,
+                spec_metadata,
             )
         greedy = greedy_request_mask(temperatures)
         greedy_tau, greedy_bonus = greedy_verify_op(
@@ -412,5 +416,7 @@ def dflash2_sample_and_accept(worker, logits, attn_metadata, spec_metadata):
         num_accepted_tokens, num_contexts, K, spec_metadata=spec_metadata
     )
     return worker._commit_occurrence_counts(
-        (accepted_tokens, num_accepted_tokens), batch_size, spec_metadata
+        agree_verified_tokens(worker, accepted_tokens, num_accepted_tokens),
+        batch_size,
+        spec_metadata,
     )

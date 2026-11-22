@@ -49,6 +49,10 @@ from cutlass import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kernels.comm.lamport_ar import (
+    mbarrier_test_wait_acquire_cluster,
+)
+
 from .route_ptx import (
     NUM_EXPERTS,
     TOP_K,
@@ -318,21 +322,6 @@ def _st_async_b32(addr, rank, value, mbar, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _mbar_test_wait(mbar, parity, *, loc=None, ip=None):
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(mbar, loc=loc, ip=ip), _iv(parity, loc=loc, ip=ip)],
-            "{\n.reg .pred p;\nmbarrier.test_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n"
-            "selp.u32 $0, 1, 0, p;\n}",
-            "=r,r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
 def _min(a, b):
     return cutlass.select_(a < b, a, b)
 
@@ -581,9 +570,9 @@ class RunnerSortKernel:
             if eok:
                 for d in cutlass.range_constexpr(self.ctas):
                     _st_async_b32(cnt_s + (cta * lcap + e) * 4, Int32(d), cnt, flag_s)
-            done = _mbar_test_wait(flag_s, Int32(0))
+            done = mbarrier_test_wait_acquire_cluster(flag_s, Int32(0))
             while done == 0:
-                done = _mbar_test_wait(flag_s, Int32(0))
+                done = mbarrier_test_wait_acquire_cluster(flag_s, Int32(0))
             ok = Int32(cutlass.select_(eok, Int32(1), Int32(0)))
             tot = Int32(0)
             for c in cutlass.range_constexpr(self.ctas):
