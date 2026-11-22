@@ -53,7 +53,9 @@ def _make_executor() -> PyExecutor:
 def _phase_request(
     request_id: int, state: LlmRequestState, *, dummy: bool = False
 ) -> SimpleNamespace:
-    return SimpleNamespace(request_id=request_id, state=state, is_dummy=dummy)
+    return SimpleNamespace(
+        request_id=request_id, py_request_id=request_id, state=state, is_dummy=dummy
+    )
 
 
 def _make_generation_request(request_id: int) -> LlmRequest:
