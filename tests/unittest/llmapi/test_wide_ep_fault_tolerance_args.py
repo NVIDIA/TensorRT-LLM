@@ -167,6 +167,10 @@ def test_supported_configuration_is_accepted(fields):
             "(kv_cache_config.host_cache_bind_to_gpu_numa_node=False, not True)",
         ),
         (
+            {"kv_cache_config": KvCacheConfig(enable_kv_pool_rebalance=True)},
+            "no KV pool rebalance (kv_cache_config.enable_kv_pool_rebalance=False, not True)",
+        ),
+        (
             {"cache_transceiver_config": CacheTransceiverConfig(backend="DEFAULT")},
             "no disaggregated serving (no cache_transceiver_config.backend, not 'DEFAULT')",
         ),

@@ -126,7 +126,6 @@ class MoERunner(TunableRunner):
         activation_type: ActivationType,
         unpadded_hidden_size: Optional[int] = None,
         use_mxfp8_weight_scaling: bool = False,
-        tuner_num_local_experts: Optional[int] = None,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -149,7 +148,6 @@ class MoERunner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
-        self.tuner_num_local_experts = tuner_num_local_experts
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
@@ -180,7 +178,7 @@ class MoERunner(TunableRunner):
         return tactic
 
     def unique_id(self):
-        identity = (
+        return (
             self.x_dtype,
             self.weight_dtype,
             self.output_dtype,
@@ -199,9 +197,6 @@ class MoERunner(TunableRunner):
             self.unpadded_hidden_size,
             self.use_mxfp8_weight_scaling,
         )
-        if self.tuner_num_local_experts is not None:
-            identity += (self.tuner_num_local_experts, )
-        return identity
 
     def forward(
         self,
@@ -211,11 +206,6 @@ class MoERunner(TunableRunner):
         do_preparation: bool = False,
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
-        if self.tuner_num_local_experts is not None:
-            # The profiler routes tokens to every expert of the weights it gets.
-            fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = (
-                None if w is None else w[:self.tuner_num_local_experts]
-                for w in inputs[1:])
         tactic = self._resolve_fallback_tactic(tactic, gemm_idx)
         self.fused_moe_runner.run_gemm_profile(
             x,
@@ -316,6 +306,18 @@ def fused_moe(
         tuner_input = input
         tuner_top_k = token_selected_experts.size(1)
 
+    tuner_weights = [
+        fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+        fc2_expert_biases
+    ]
+    if tuner_num_local_experts is not None:
+        # The tuner gets only the active slots, so it profiles and caches the
+        # problem of a layer without spare slots.
+        tuner_weights = [
+            None if w is None else w[:tuner_num_local_experts]
+            for w in tuner_weights
+        ]
+
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,
@@ -337,7 +339,6 @@ def fused_moe(
         activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
         use_mxfp8_weight_scaling=use_mxfp8_weight_scaling,
-        tuner_num_local_experts=tuner_num_local_experts,
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
@@ -346,10 +347,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        [tuner_input, *tuner_weights],
         gemm_idx=1,
     )
 
@@ -357,10 +355,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        [tuner_input, *tuner_weights],
         gemm_idx=2,
     )
 

@@ -20,9 +20,10 @@ A leaf declares its kernel-selection flags once, as a frozen
 bottom are the ones more than one format binds.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from functools import cached_property, partial
+from typing import Any
 
 import torch
 
@@ -256,7 +257,7 @@ class CutlassFusedMoEBase(MoEImplBase):
             self._fused_moe_op = partial(torch.ops.trtllm.fused_moe, **self.tuner_layout_kwargs)
 
     @cached_property
-    def _fused_moe_op(self):
+    def _fused_moe_op(self) -> Callable[..., Any]:
         """``torch.ops.trtllm.fused_moe``. A module with spare slots binds the tuner layout of its
         active slots to it in :meth:`create_weights`."""
         return torch.ops.trtllm.fused_moe

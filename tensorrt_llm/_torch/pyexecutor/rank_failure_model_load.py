@@ -115,6 +115,15 @@ def prepare_model(model: torch.nn.Module) -> None:
     # A model may run its MoE layers over an EP group other than its mapping's MoE parallelism;
     # moe_comms checks that every layer runs over the same one.
     comms = moe_comms(model)
+    for name, layer in model.named_modules():
+        if isinstance(layer, MoE) and layer.layer_load_balancer is None:
+            raise ValueError(
+                f"MoE layer {name} ({type(layer).__name__}) has no EPLB load balancer, but Wide-EP "
+                "fault tolerance restores a failed rank's experts through it. EPLB serves only the "
+                "model architectures in moe_model_arch_list (tensorrt_llm/_torch/moe/fused_moe/"
+                "moe_load_balancer.py), which must include the first architecture in the "
+                f"checkpoint's config.json; {TURN_FAULT_TOLERANCE_OFF}."
+            )
     health = EPGroupHealth(comms[0].ep_size)
     ep_rank = comms[0].ep_rank
     if Distributed.startup_record.replacement:

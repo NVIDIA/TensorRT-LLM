@@ -24,8 +24,8 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Awaitable, Callable, Dict, List, Optional,
-                    Tuple, TypeVar, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple,
+                    TypeVar, Union)
 
 import msgspec
 import torch
@@ -318,25 +318,6 @@ def _configure_parser_special_token_decoding(
         sampling_params.spaces_between_special_tokens = False
 
 
-def _stream_error_events(error: Exception) -> List[str]:
-    """Return the SSE events that end a stream whose request failed.
-
-    The client receives an OpenAI error object with the exception's message,
-    then [DONE]. A streaming completion reports a failure the same way once
-    HTTP 200 has been sent.
-    """
-    message = str(error)
-    error_data = json.dumps({
-        "error": {
-            "message": message,
-            "type": "server_error",
-            "code": None,
-            "param": None,
-        }
-    })
-    return [f"data: {error_data}\n\n", "data: [DONE]\n\n"]
-
-
 def _record_generator_termination(generator) -> None:
     """Classify a fatal generator error without exposing exception details."""
     component = "llm"
@@ -624,10 +605,6 @@ _InputProcessingResult = TypeVar("_InputProcessingResult")
 
 class OpenAIServer(_VideoRoutesMixin):
 
-    # Class defaults, so a server built without __init__ serves alone.
-    _stop_attached_frontends: Optional[Callable[..., Awaitable]] = None
-    _attached_frontends_stopped: Optional[asyncio.Task] = None
-
     @staticmethod
     def _iteration_stats_buffer_maxlen(
             iter_stats_max_iterations: Optional[int]) -> Optional[int]:
@@ -658,8 +635,7 @@ class OpenAIServer(_VideoRoutesMixin):
             enable_runtime_control_endpoints: bool = False,
             runtime_control_api_key: Optional[str] = None,
             multi_frontend_serving: Optional[MultiFrontendServing] = None,
-            graceful_shutdown_timeout: Optional[int] = None,
-            stop_attached_frontends: Optional[Callable[..., Awaitable]] = None):
+            graceful_shutdown_timeout: Optional[int] = None):
         if graceful_shutdown_timeout is not None and graceful_shutdown_timeout <= 0:
             raise ValueError(
                 "graceful_shutdown_timeout must be a positive number of "
@@ -807,10 +783,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self._multi_frontend = multi_frontend_serving
         self._launcher_forwarder: Optional[LauncherForwarder] = None
         self._launcher_watchdog_task: Optional[asyncio.Task] = None
-        # The launcher of a multi-frontend server passes a coroutine function
-        # that stops its attached frontends. It returns once they exited and
-        # kills them once its argument returns True.
-        self._stop_attached_frontends = stop_attached_frontends
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
@@ -920,51 +892,41 @@ class OpenAIServer(_VideoRoutesMixin):
 
             yield
 
-            try:
-                if self._attached_frontends_stopped is not None:
-                    # The engine serves the attached frontends' requests until
-                    # they exit. A drain that raises still shuts the engine
-                    # down; the launcher terminates the frontends that remain.
-                    await self._attached_frontends_stopped
-            finally:
-                await self._perf_metrics_writer.close()
-                for task in (self._launcher_watchdog_task,
-                             self._clock_offset_task):
-                    if task is not None:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
-                if self._launcher_forwarder is not None:
-                    await self._launcher_forwarder.close()
-                if self._tokenization_owners is not None:
-                    await asyncio.to_thread(self._tokenization_owners.close)
-                if self.encode_batcher is not None:
-                    await self.encode_batcher.shutdown()
-                    logger.info("Stopped encode dynamic batcher")
-
-                # Stop background iteration stats collector
-                if self._iteration_stats_collector_task is not None:
-                    self._iteration_stats_collector_task.cancel()
+            await self._perf_metrics_writer.close()
+            for task in (self._launcher_watchdog_task, self._clock_offset_task):
+                if task is not None:
+                    task.cancel()
                     try:
-                        await self._iteration_stats_collector_task
+                        await task
                     except asyncio.CancelledError:
                         pass
-                    logger.info(
-                        "Stopped background iteration stats collector task")
+            if self._launcher_forwarder is not None:
+                await self._launcher_forwarder.close()
+            if self._tokenization_owners is not None:
+                await asyncio.to_thread(self._tokenization_owners.close)
+            if self.encode_batcher is not None:
+                await self.encode_batcher.shutdown()
+                logger.info("Stopped encode dynamic batcher")
 
-                await self._deregister_server()
-                if self.resource_governor is not None:
-                    self.resource_governor.close()
-                self.generator.shutdown()
-                # A stats read still in flight fails fast now that the executor
-                # is down; the /metrics handler already treats that as no stats.
-                self._metrics_stats_executor.shutdown(wait=False,
-                                                      cancel_futures=True)
-                BaseMediaIO.clear_executor(self._media_load_executor)
-                self._media_load_executor.shutdown(wait=False,
-                                                   cancel_futures=True)
+            # Stop background iteration stats collector
+            if self._iteration_stats_collector_task is not None:
+                self._iteration_stats_collector_task.cancel()
+                try:
+                    await self._iteration_stats_collector_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Stopped background iteration stats collector task")
+
+            await self._deregister_server()
+            if self.resource_governor is not None:
+                self.resource_governor.close()
+            self.generator.shutdown()
+            # A stats read still in flight fails fast now that the executor is
+            # down; the /metrics handler already treats that as no stats.
+            self._metrics_stats_executor.shutdown(wait=False,
+                                                  cancel_futures=True)
+            BaseMediaIO.clear_executor(self._media_load_executor)
+            self._media_load_executor.shutdown(wait=False, cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
@@ -2330,19 +2292,15 @@ class OpenAIServer(_VideoRoutesMixin):
                             res, args)
                     for pp_res in pp_results:
                         yield pp_res
-            except Exception as e:
-                # Only failures are handled here. A consumer that stops reading
-                # closes the stream with GeneratorExit and a client that
-                # disconnects cancels it. Neither is an Exception.
-                logger.error(traceback.format_exc())
-                # StreamingResponse commits HTTP 200 before the first chunk, so
-                # the error ends the stream as an SSE error event.
-                for event in _stream_error_events(e):
-                    yield event
-            else:
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
+            except Exception:
+                # Only failures are logged: a consumer that stops reading closes
+                # the stream with GeneratorExit, and a client that disconnects
+                # cancels it, and neither is an error of this stream.
+                logger.error(traceback.format_exc())
+                raise
 
         input_started = _start_input_processing()
         try:
@@ -3301,8 +3259,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
                 # instead of breaking the HTTP connection.
-                for event in _stream_error_events(e):
-                    yield event
+                error_data = json.dumps({
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": None,
+                        "param": None,
+                    }
+                })
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -3483,17 +3449,13 @@ class OpenAIServer(_VideoRoutesMixin):
                                   post_processor(res, args))
                     for pp_res in pp_results:
                         yield pp_res
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(traceback.format_exc())
-                # StreamingResponse commits HTTP 200 before the first chunk, so
-                # the error ends the stream as an SSE error event.
-                for event in _stream_error_events(e):
-                    yield event
-            else:
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(traceback.format_exc())
+                raise
 
         input_started = _start_input_processing()
         try:
@@ -4616,41 +4578,4 @@ class OpenAIServer(_VideoRoutesMixin):
                     server.should_exit = True
 
         asyncio.create_task(_register_after_serving())
-        if self._stop_attached_frontends is None:
-            await server.serve(sockets=sockets)
-            return
-        self._attached_frontends_stopped = asyncio.create_task(
-            self._stop_attached_frontends_on_shutdown(server))
-        # The attached frontends reach the launcher's /health and forwarded
-        # routes on its Unix socket. A server of its own keeps that socket open
-        # while they drain. It starts first, so the main server installs its
-        # signal handlers last and receives a shutdown signal first. Once a
-        # server stops, uvicorn passes the signal on to the handler it replaced.
-        launcher_uds = [s for s in sockets if s.family == socket.AF_UNIX]
-        sockets = [s for s in sockets if s.family != socket.AF_UNIX]
-        launcher_server = uvicorn.Server(
-            uvicorn.Config(self.app,
-                           lifespan="off",
-                           log_level="info",
-                           timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-                           **config_kwargs))
-
-        async def serve_http() -> None:
-            try:
-                await server.serve(sockets=sockets)
-            finally:
-                launcher_server.should_exit = True
-
-        await asyncio.gather(launcher_server.serve(sockets=launcher_uds),
-                             serve_http())
-
-    async def _stop_attached_frontends_on_shutdown(
-            self, server: uvicorn.Server) -> None:
-        """Stop the attached frontends once uvicorn begins its shutdown.
-
-        They drain their requests while this frontend drains its own. The
-        lifespan shutdown awaits this before it shuts the engine down.
-        """
-        while not server.should_exit:
-            await asyncio.sleep(0.1)
-        await self._stop_attached_frontends(lambda: server.force_exit)
+        await server.serve(sockets=sockets)

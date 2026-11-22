@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax-M3 KV pools start zeroed.
+"""MiniMax-M3 KV pools start zeroed, and so do the slots a pool resize adds.
 
 Readers that consume a whole block or page (the CSR sparse prefill's V dequant,
 the full-context decode on a last page's tail) also read bytes no request has
@@ -26,6 +26,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3KVCacheManagerV2,
 )
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import (
@@ -34,6 +35,10 @@ from tensorrt_llm.llmapi.llm_args import (
     MiniMaxM3SparseAttentionConfig,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PoolDesc
+
+# The smallest unit in which a GPU KV cache pool maps device memory.
+_MIN_ALLOCATION_UNIT = 2 << 20
 
 
 def _nonzero_bytes(view: torch.Tensor) -> int:
@@ -45,11 +50,20 @@ def _nonzero_bytes(view: torch.Tensor) -> int:
     return int(torch.count_nonzero(raw).item())
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
-@pytest.mark.parametrize("with_draft", [False, True], ids=["target_only", "shared_eagle3"])
-def test_every_pool_view_is_zero_after_construction(with_draft: bool) -> None:
+def _pool_bytes(pool: PoolDesc, slots: range) -> torch.Tensor:
+    """Return the bytes of ``slots`` in ``pool``."""
+    return convert_to_torch_tensor(
+        TensorWrapper(
+            pool.base_address + slots.start * pool.slot_bytes,
+            torch.uint8,
+            [len(slots) * pool.slot_bytes],
+        )
+    )
+
+
+def _make_manager(with_draft: bool) -> MiniMaxM3KVCacheManagerV2:
     torch.cuda.init()
-    manager = MiniMaxM3KVCacheManagerV2(
+    return MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
             host_cache_size=0,
@@ -76,6 +90,12 @@ def test_every_pool_view_is_zero_after_construction(with_draft: bool) -> None:
             implementation="msa", indexer_kv_dtype="fp8"
         ),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+@pytest.mark.parametrize("with_draft", [False, True], ids=["target_only", "shared_eagle3"])
+def test_every_pool_view_is_zero_after_construction(with_draft: bool) -> None:
+    manager = _make_manager(with_draft)
     try:
         views = {
             **{("kv",) + key: view for key, view in manager._kv_buffers.items()},
@@ -89,5 +109,45 @@ def test_every_pool_view_is_zero_after_construction(with_draft: bool) -> None:
         counts = {name: _nonzero_bytes(view) for name, view in views.items() if view is not None}
         nonzero = {name: count for name, count in counts.items() if count}
         assert not nonzero, f"pool views with nonzero bytes after construction: {nonzero}"
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_slots_added_by_a_resize_are_zero() -> None:
+    manager = _make_manager(with_draft=False)
+    try:
+        (pool_group,) = manager.impl.pool_group_descs
+        num_slots = pool_group.num_slots
+        # A pool that fits in one allocation unit keeps it mapped through a shrink, so the slots the
+        # shrink drops from it come back from the grow still holding the bytes written below.
+        assert any(num_slots * pool.slot_bytes <= _MIN_ALLOCATION_UNIT for pool in pool_group.pools)
+        for pool in pool_group.pools:
+            _pool_bytes(pool, range(num_slots)).fill_(0xFF)
+        quota = manager.gpu_quota
+        manager.resize_gpu_quota(quota // 2)
+        (pool_group,) = manager.impl.pool_group_descs
+        kept = pool_group.num_slots
+        manager.resize_gpu_quota(2 * quota)
+        (pool_group,) = manager.impl.pool_group_descs
+        assert kept < num_slots < pool_group.num_slots
+        torch.cuda.synchronize()
+
+        for pool in pool_group.pools:
+            assert _pool_bytes(pool, range(kept)).eq(0xFF).all()
+            assert _nonzero_bytes(_pool_bytes(pool, range(kept, pool_group.num_slots))) == 0
+        for view in (
+            *manager._kv_buffers.values(),
+            *manager._block_scale_buffers.values(),
+            *manager._index_k_buffers.values(),
+        ):
+            assert view.shape[0] == pool_group.num_slots
+            assert any(
+                pool.base_address
+                <= view.data_ptr()
+                < pool.base_address + pool_group.num_slots * pool.slot_bytes
+                for pool in pool_group.pools
+            )
+            assert _nonzero_bytes(view[kept:]) == 0
     finally:
         manager.shutdown()

@@ -250,10 +250,15 @@ def _executor(rank=0):
         rank_failure_recovery=None,
         _wait_for_model_engine_input_copy=MagicMock(),
         resource_manager=SimpleNamespace(resource_managers={}),
+        _staged_responses=[],
+        responses={},
+        response_cv=threading.Condition(),
     )
     for step in (
         "_accept_or_discard_previous_batch",
         "_discard_previous_batch",
+        "_flush_staged_responses",
+        "_publish_responses",
         "resume_at_iteration",
         "known_request_ids",
         "export_waiting_state",
@@ -876,6 +881,24 @@ def test_resume_recomputes_interrupted_fails_lost(monkeypatch):
     assert isinstance(error, RankFailureError)
 
 
+def test_staged_final_response_does_not_count_as_lost():
+    """Check that a request whose final response waits in staging is not failed at the resume."""
+    r = _resuming()
+    executor = r.executor
+    # With client I/O during the GPU wait, the last step's final response for request 16 is
+    # staged. The outstanding requests below model the worker as ending the request as soon as
+    # the response is published.
+    executor._staged_responses = [(16, Mock(), None)]
+    r.recovery.set_outstanding_requests(lambda: {} if 16 in executor.responses else {16: 116})
+
+    executor.iter_counter = 10
+    r.recovery.before_iteration()
+
+    assert executor._staged_responses == []
+    ((lost, _), _) = executor.fail_requests_by_id.call_args
+    assert lost == {}
+
+
 def test_rearm_synchronizes_before_record_lock(monkeypatch):
     """Check that the rank waits for the device before it takes the membership record's lock."""
     r = _resuming()
@@ -1278,7 +1301,7 @@ def test_release_never_charges_serving_memory(monkeypatch, allocate, quota):
     assert not r.recovery.pauses_forward()
 
 
-def _short_release(monkeypatch, fresh_rows=frozenset(range(WORLD))):
+def _short_release(monkeypatch, fresh_rows=frozenset(range(WORLD)), device=None):
     """Return rank 0 after a release that the remap of ``fresh_rows`` left 4 MiB short."""
     clock = SimpleNamespace(now_s=0.0)
     monkeypatch.setattr(
@@ -1287,7 +1310,7 @@ def _short_release(monkeypatch, fresh_rows=frozenset(range(WORLD))):
         SimpleNamespace(monotonic=lambda: clock.now_s, perf_counter=time.perf_counter),
     )
     r = _resuming()
-    _, _, device = _eplb(monkeypatch, r)
+    _, _, device = _eplb(monkeypatch, r, device=device)
     r.moe.workspace_rows_needing_fresh_pages.return_value = fresh_rows
     r.moe.remap_workspaces.side_effect = lambda gather, fresh_rows: device.take(4 * MIB)
     r.recovery.before_iteration()  # The install and the commit.
@@ -1348,23 +1371,100 @@ def test_unowed_shortfall_is_not_retried(monkeypatch):
     assert _retry_vote(r, device, clock) == 0
 
 
-def test_next_change_release_replaces_pending_retry(monkeypatch):
-    """Check that the release of the next change replaces the retry of the last one."""
-    r, device, clock = _short_release(monkeypatch)
+def _deliver_second_change(r):
+    """Deliver the INSTALL of a change that rank 1 fails in, answered by its commit."""
     second = _record(MembershipState.INSTALL, 2, 0b1001, ResumeState(iteration=12, epoch=10))
     _install(r, second)
     r.executor.iter_counter = 13
     committed = second.model_copy(update=dict(state=MembershipState.COMMITTED))
     r.client.answers[(Reply.INSTALLED, 2)] = [committed]
+
+
+def test_next_change_release_replaces_pending_retry(monkeypatch):
+    """Check that the release of the next change replaces the retry of the last one.
+
+    The next change's restore also takes the row that rank 2's process still holds from the pool,
+    so serving keeps its free memory until each excluded process ends.
+    """
+    r, device, clock = _short_release(monkeypatch)
+    _deliver_second_change(r)
+    r.recovery.before_iteration()  # The install and the commit.
+    assert device.gpu_quota == 44 * MIB
+    assert device.free == FREE_BYTES
+    _vote(r)
+    r.recovery.before_iteration()  # The release.
+    assert device.gpu_quota == 44 * MIB
+    assert _retry_vote(r, device, clock) == 1  # Rank 2 ended.
+    r.recovery.before_iteration()
+    assert device.gpu_quota == 48 * MIB
+    assert device.free == FREE_BYTES
+    assert _retry_vote(r, device, clock) == 1  # Rank 1 ended.
+    r.recovery.before_iteration()
+    assert device.gpu_quota == 52 * MIB
+    assert device.free == FREE_BYTES
+    assert _retry_vote(r, device, clock, freed=0) == 0
+
+
+def test_release_without_restore_keeps_owed_row_free(monkeypatch):
+    """Check that a change that restores nothing on this rank keeps the owed row's free memory.
+
+    The release stays 4 MiB short until rank 2's process ends, rather than taking the row from
+    serving's free memory.
+    """
+    r, device, clock = _short_release(monkeypatch)
+    expert_restore = r.executor.model_engine.moe_load_balancer.expert_restore
+    expert_restore.plan_expert_restore = lambda *args, **kwargs: SimpleNamespace(
+        device_bytes=0, placements=()
+    )
+    expert_restore.restore_lost_experts = lambda *args, **kwargs: 0
+    r.moe.workspace_rows_needing_fresh_pages.return_value = frozenset()
+    r.moe.remap_workspaces.side_effect = None
+    _deliver_second_change(r)
     r.recovery.before_iteration()  # The install and the commit.
     _vote(r)
     r.recovery.before_iteration()  # The release.
-    assert device.gpu_quota == 48 * MIB
+    assert device.gpu_quota == 54 * MIB
+    assert device.free == FREE_BYTES
     assert _retry_vote(r, device, clock) == 1  # Rank 2 ended.
     r.recovery.before_iteration()
-    assert device.gpu_quota == 52 * MIB
-    assert _retry_vote(r, device, clock) == 0  # Rank 1 ended.
+    assert device.gpu_quota == 58 * MIB
     assert device.free == FREE_BYTES
+
+
+def test_owed_row_given_up_as_far_as_the_pool_allows(monkeypatch):
+    """Check that the next restore gives up an owed row only as far as the pool's quota allows.
+
+    The 45 MiB of earlier spare slots and the 6 MiB restored since leave 13 MiB of the 64 MiB
+    startup quota. The next restore needs 10 MiB, so the pool gives up 3 MiB of the 4 MiB row that
+    rank 2's process still holds, and serving is 1 MiB short until that process ends.
+    """
+    r, device, _ = _short_release(monkeypatch, device=_Device(gpu_quota=19 * MIB, backed=45 * MIB))
+    assert device.gpu_quota == 9 * MIB
+    _deliver_second_change(r)
+    device.floor = 0  # The pool holds no pages, so it can give up its whole quota.
+    r.recovery.before_iteration()
+    assert _replies(r) == [Reply.INSTALLED, Reply.INSTALLED]
+    assert device.gpu_quota == 0
+    assert device.free == FREE_BYTES - MIB
+
+
+def test_owed_row_never_fails_the_restore(monkeypatch):
+    """Check that the pool keeps an owed row's quota when the pages in use need it.
+
+    It guards the fallback to the restore alone: it fails if the owed bytes could preempt a
+    request or fail the restore.
+    """
+    r, device, _ = _short_release(monkeypatch)
+    device.used = 46 * MIB
+    _deliver_second_change(r)
+    # A FAILED reply ends the test rather than waiting for the next record.
+    r.client.answers[(Reply.FAILED, 2)] = [
+        _record(MembershipState.PROPOSE, generation=3, active_mask=0b0001)
+    ]
+    r.recovery.before_iteration()
+    assert _replies(r) == [Reply.INSTALLED, Reply.INSTALLED]
+    assert _resizes(device)[-2:] == [44 * MIB, 48 * MIB]
+    assert device.free == FREE_BYTES - 4 * MIB
 
 
 def test_healthy_step_checks_no_device_memory(monkeypatch):

@@ -31,14 +31,16 @@ from .records import MAX_RANKS, REPORT_INTERVAL_S, rank_mask
 
 if TYPE_CHECKING:
     from mpi4py import MPI
-    from torch.distributed import Store
+
+    from .signed_store import SignedStore
 
 
 LIVENESS_KEY = "liveness"
 RECORD_KEY = "record"
 TRANSACTION_KEY = "last_transaction"
 # The Unix time in milliseconds since which the active ranks have waited on a rank that makes no
-# progress, or empty while no rank stalls them.
+# progress, or empty once no rank stalls them. It is unset until the first stall, so read it after
+# checking that it is set.
 STALLED_SINCE_KEY = "stalled_since"
 
 
@@ -65,11 +67,14 @@ def rendezvous_host_port(address: str) -> tuple[str, int]:
 
 
 def wait_for_keys(
-    store: "Store", keys: list[str], check_s: float, check: Callable[[], None]
+    store: "SignedStore", keys: list[str], check_s: float, check: Callable[[], None]
 ) -> list[bytes]:
     """Wait until ``keys`` are set and return their values.
 
-    Call ``check`` every ``check_s`` while waiting. ``check`` may raise to stop waiting.
+    Call ``check`` every ``check_s`` while waiting. ``check`` may raise to stop waiting. A store
+    server that stops responding holds the store call past ``check_s``, so only the end of the
+    process stops that wait: the owner of the membership client ends it once the authority is
+    silent.
     """
     from torch.distributed import DistStoreError
 
@@ -94,24 +99,25 @@ class StoreGroup(StoreComm):
 
     def __init__(
         self,
-        store: "Store",
+        store: "SignedStore",
         name: str,
         rank: int,
         ranks: Sequence[int],
         on_wait: Callable[[int], None] = lambda waiting: None,
         active: Optional[Sequence[int]] = None,
-        gpus_per_node: int = 1,
+        gpus_per_node: Optional[int] = None,
         startup: bool = False,
     ) -> None:
         """Build the group's communicator over ``store``.
 
         Args:
             store: The rendezvous store client that holds the group's values.
-            name: The key prefix of the group's calls, the same on every member.
+            name: The key prefix of the group's calls, the same on every member. No other group
+                on the store uses it, as the keys of a group's last calls can stay in the store.
             rank: This process's global rank, one of ``ranks``.
             ranks: The group's global ranks, in communicator rank order.
             on_wait: Called while a call waits, with a mask of the active members whose values
-                are missing, and with 0 once the call has them.
+                are missing, and with 0 once the call ends. The default waits without bound.
             active: The members that take part, by default every member.
             gpus_per_node: The ranks per node, which ``Split_type`` groups by.
             startup: Whether this is the world communicator of a rank's startup, on which a
@@ -278,7 +284,10 @@ class StoreGroup(StoreComm):
     ) -> "StoreGroup":
         """Return the members on this rank's node, supporting only the node split types.
 
-        The subgroup orders its members by global rank; ``key`` and ``info`` are ignored.
+        The subgroup keeps this group's member order; ``key`` and ``info`` are ignored.
+
+        Raises:
+            ValueError: The group was built without ``gpus_per_node``.
         """
         from mpi4py import MPI
 
@@ -286,6 +295,8 @@ class StoreGroup(StoreComm):
             raise NotImplementedError(
                 f"StoreGroup splits by node only, not by split type {split_type}"
             )
+        if self._gpus_per_node is None:
+            raise ValueError(f"StoreGroup {self._name} needs gpus_per_node to split by node")
         node = self.rank // self._gpus_per_node
         return self.subgroup(r for r in self.membership if r // self._gpus_per_node == node)
 

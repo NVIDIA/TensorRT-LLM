@@ -425,10 +425,6 @@ class PyResult:
         # rows); the worker builds the user-facing values from them.
         self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
         self.context_prompt_last_logprobs: torch.Tensor | None = None
-        # One past the last prompt position whose context row is stored. Only
-        # the rank that calls store_context_logits reads it, so PyResult.Diff
-        # does not sync it to other ranks.
-        self.context_rows_end = 0
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
             use_device_memory=use_device_memory,
@@ -1008,9 +1004,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # PyExecutor._handle_responses and LlmResult.spec_dec_totals.
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
-        # Set with the first cached_tokens of the request's first prefill;
-        # see reported_cached_tokens.
-        self._reported_cached_tokens: Optional[int] = None
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
@@ -1181,18 +1174,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if not self._cached_tokens_set:
             self._cached_tokens = value
             self._cached_tokens_set = True
-            if self._reported_cached_tokens is None:
-                self._reported_cached_tokens = value
-
-    @property
-    def reported_cached_tokens(self) -> int:
-        """Prompt tokens the request's first prefill found in the KV cache.
-
-        Reported as usage cached_tokens. Unlike cached_tokens, it is kept
-        across a recompute, whose prefill reuses blocks this request computed
-        itself.
-        """
-        return self._reported_cached_tokens or 0
 
     def _initialize_execution_state(self,
                                     *,
@@ -1386,7 +1367,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         )
         if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
             llm_result.remote_tail_start = self.py_csa2_remote_tail_start
-        llm_result.cached_tokens = self.reported_cached_tokens
+        llm_result.cached_tokens = self.cached_tokens
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,

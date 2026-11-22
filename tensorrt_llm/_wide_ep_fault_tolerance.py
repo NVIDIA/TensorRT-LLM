@@ -29,7 +29,7 @@ RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 # The hex secret that every deployment process holds. It derives the hello token.
 SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"  # nosec B105 - environment variable name, not a secret
 # The model architectures that Wide-EP fault tolerance supports, as named in config.json.
-SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM",)
+SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM")
 # The alternative that each error about an unmet fault tolerance requirement offers.
 TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
 
@@ -180,6 +180,13 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "and fail its startup check that the node holds every tier bound to it",
             ),
             (
+                not llm_args.kv_cache_config.enable_kv_pool_rebalance,
+                "no KV pool rebalance (kv_cache_config.enable_kv_pool_rebalance=False, not True), "
+                "because fault tolerance resizes the KV cache pool with fixed shares between its "
+                "pool groups, and a rebalance changes those shares without zeroing the slots it "
+                "adds",
+            ),
+            (
                 transceiver_backend is None,
                 "no disaggregated serving (no cache_transceiver_config.backend, not "
                 f"{transceiver_backend!r}), because the KV cache transfers between serving "
@@ -259,8 +266,8 @@ def check_model_architectures(architectures: Optional[Sequence[str]]) -> None:
             (
                 bool(architectures)
                 and all(name in SUPPORTED_ARCHITECTURES for name in architectures),
-                f"a model architecture in {list(SUPPORTED_ARCHITECTURES)} (DeepSeek-V3 and "
-                f"DeepSeek-R1), not {architectures}",
+                f"a model architecture in {list(SUPPORTED_ARCHITECTURES)} (DeepSeek-V3, "
+                f"DeepSeek-R1 and Qwen3-235B-A22B), not {architectures}",
             )
         ]
     )

@@ -27,7 +27,6 @@ import logging
 import os
 import pickle  # nosec B403
 import secrets
-import select
 import socket
 import subprocess  # nosec B404 - starts the membership authority with sys.executable and a fixed argv, no shell
 import sys
@@ -57,7 +56,7 @@ from ...pyexecutor.hang_detector import RANK_CRASH_KILL_GRACE_ENV
 from ..communicator import Distributed
 from ..host_exchange import MnnvlDistFactory
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart, StartupRecord
-from .liveness import MembershipClient, close_in_forked_child, rendezvous_store
+from .liveness import MembershipClient, _readable, close_in_forked_child, rendezvous_store
 from .records import (
     MAX_RANKS,
     RENDEZVOUS_TIMEOUT_S,
@@ -562,7 +561,7 @@ def _start_authority(world_size: int, gpus_per_node: int, timeout_s: float) -> s
         finally:
             os.close(write_fd)
         close_in_forked_child(process.stdin)
-        ready, _, _ = select.select([address_pipe], [], [], timeout_s)
+        ready = _readable([address_pipe], timeout_s)
         address = address_pipe.readline().strip() if ready else ""
     if not address:
         process.kill()

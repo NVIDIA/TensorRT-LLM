@@ -367,17 +367,16 @@ def test_raise_after_steps_ends_a_stream_with_the_scripted_error(serve_env):
         )
     )
     client = serve_env.client(server.app)
-    with client.stream(
-        "POST", "/v1/chat/completions", json={**_CHAT_BODY, "stream": True}
-    ) as response:
-        received = [line for line in response.iter_lines() if line.startswith("data: ")]
-    # The chat stream ends with an SSE error event, then [DONE].
-    *chunks, error_line, done_line = received
-    assert any("partial" in line for line in chunks), (
+    received = []
+    with pytest.raises(RuntimeError, match="stream exploded"):
+        with client.stream(
+            "POST", "/v1/chat/completions", json={**_CHAT_BODY, "stream": True}
+        ) as response:
+            for line in response.iter_lines():
+                received.append(line)
+    assert any("partial" in line for line in received), (
         "the first scripted chunk must reach the client before the scripted error"
     )
-    assert json.loads(error_line[len("data: ") :])["error"]["message"] == "stream exploded"
-    assert done_line == "data: [DONE]"
 
 
 def test_hold_after_steps_release_and_cancellation():

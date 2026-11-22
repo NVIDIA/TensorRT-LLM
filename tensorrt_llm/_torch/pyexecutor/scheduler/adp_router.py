@@ -390,7 +390,6 @@ class ADPRouter(ABC):
         include_kv_cache_load: bool = False,
         num_pending_new_requests: int = 0,
         iter_stats_enabled: bool = False,
-        has_pending_context_retirement: bool = False,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -420,8 +419,6 @@ class ADPRouter(ABC):
             iter_stats_enabled: Whether iteration stats are collected. It must be
                 identical on every rank (config-derived, not "a payload is
                 pending"), because it picks the collective.
-            has_pending_context_retirement: Whether a context request on this
-                rank awaits the retirement of its KV send.
         """
         local_state = self._build_local_rank_state(
             active_requests,
@@ -431,7 +428,6 @@ class ADPRouter(ABC):
             forward_work,
             num_connector_transfers,
             connector_poll_failed,
-            has_pending_context_retirement,
         )
         serialized = local_state.serialize(include_kv_cache_load)
         if iter_stats_enabled:
@@ -454,7 +450,6 @@ class ADPRouter(ABC):
         iter_stats_payload: RankIterStatsPayload | None = None,
         include_kv_cache_load: bool = False,
         num_pending_new_requests: int = 0,
-        has_pending_context_retirement: bool = False,
     ) -> tuple[list[RankState], list[list[int]]]:
         """``gather_all_rank_states`` with extra per-rank ints on the same allgather.
 
@@ -467,11 +462,7 @@ class ADPRouter(ABC):
         The router's own state construction and routing logic are untouched.
         """
         local_state = self._build_local_rank_state(
-            active_requests,
-            None,
-            iter_stats_payload,
-            num_pending_new_requests,
-            has_pending_context_retirement=has_pending_context_retirement,
+            active_requests, None, iter_stats_payload, num_pending_new_requests
         )
         state_ints = local_state.serialize(include_kv_cache_load)
         width = len(state_ints)
@@ -489,7 +480,6 @@ class ADPRouter(ABC):
         forward_work: tuple[int, int] | None = None,
         num_connector_transfers: int = 0,
         connector_poll_failed: bool = False,
-        has_pending_context_retirement: bool = False,
     ) -> RankState:
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -505,7 +495,6 @@ class ADPRouter(ABC):
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
         local_state.num_connector_transfers = num_connector_transfers
         local_state.connector_poll_failed = connector_poll_failed
-        local_state.has_pending_context_retirement = has_pending_context_retirement
         if self.dist.has_cp_helix:
             self._use_max_load_across_cp(local_state)
         return local_state
@@ -1003,7 +992,6 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         num_active_tokens = sum(_active_tokens(req) for req in active_requests)
         n_active_for_state = len(active_requests)
-        num_in_transfer_requests = 0
 
         # Fold in requests mid KV-transfer to GEN; they are removed from
         # active_requests but still counted as per-rank load. Gated behind
@@ -1013,14 +1001,12 @@ class KVCacheAwareADPRouter(ADPRouter):
         if self.account_for_in_transfer and self.async_transfer_manager is not None:
             in_transfer = self.async_transfer_manager.requests_in_transfer()
             num_active_tokens += sum(_active_tokens(r) for r in in_transfer.values())
-            num_in_transfer_requests = len(in_transfer)
-            n_active_for_state += num_in_transfer_requests
+            n_active_for_state += len(in_transfer)
 
         return RankState(
             rank=self.dist.tp_rank,
             num_active_requests=n_active_for_state,
             num_active_tokens=num_active_tokens,
-            num_in_transfer_requests=num_in_transfer_requests,
         )
 
     def gather_prefix_matches(

@@ -567,7 +567,10 @@ def test_layers_bound_to_one_execution_state(
     monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
     monkeypatch.setattr(StartupRecord, "replacement", replacement)
     comms = [Mock(spec=NVLinkOneSided, ep_size=4, ep_rank=1) for _ in range(2)]
-    model = torch.nn.ModuleList([_moe_layer(ConfigurableMoE, comm=comm) for comm in comms])
+    balancer = SimpleNamespace(host_tensor_sharer=None)
+    model = torch.nn.ModuleList(
+        [_moe_layer(ConfigurableMoE, comm=comm, layer_load_balancer=balancer) for comm in comms]
+    )
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
         mapping=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
@@ -583,10 +586,13 @@ def _target_with_drafter(
     target_comm: NVLinkOneSided, draft_comm: NVLinkOneSided
 ) -> torch.nn.Module:
     """Build a model with one MoE layer and a one-model drafter (``draft_model``) with another."""
+    balancer = SimpleNamespace(host_tensor_sharer=None)
     model = torch.nn.Module()
-    model.moe = _moe_layer(ConfigurableMoE, comm=target_comm)
+    model.moe = _moe_layer(ConfigurableMoE, comm=target_comm, layer_load_balancer=balancer)
     model.draft_model = torch.nn.Module()
-    model.draft_model.moe = _moe_layer(ConfigurableMoE, comm=draft_comm)
+    model.draft_model.moe = _moe_layer(
+        ConfigurableMoE, comm=draft_comm, layer_load_balancer=balancer
+    )
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
     )

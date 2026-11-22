@@ -23,8 +23,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.membership import HANG_TIMEOUT_S
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import SYNC_PROTOCOL_ENV
+from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+    SYNC_PROTOCOL_ENV,
+    NVLinkOneSided,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import SERVING_TIMEOUT_ENV
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor import rank_failure_model_load
@@ -68,8 +73,14 @@ _SERVING_TIMEOUT_S = int(2 * HANG_TIMEOUT_S)
         ({}, "kv_auto", "(kv_cache_config.use_kv_cache_manager_v2=True, not 'auto')"),
         # The executor creator turns it off after the arguments' validation in some modes.
         ({}, "overlap", "the overlap scheduler, which speculative decoding without overlap"),
-        ({}, "architecture", "a model architecture in ['DeepseekV3ForCausalLM']"),
+        (
+            {},
+            "architecture",
+            "a model architecture in ['DeepseekV3ForCausalLM', 'Qwen3MoeForCausalLM']",
+        ),
+        # A supported architecture passes the architecture check and fails on its missing MoE layers.
         ({}, "no_moe", "requires a model with MoE layers"),
+        ({}, "no_moe_qwen3_moe", "requires a model with MoE layers"),
     ],
 )
 def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix):
@@ -89,12 +100,43 @@ def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix)
         check()
         return
     model = torch.nn.Module()  # A model without MoE layers.
-    architecture = "Qwen3MoeForCausalLM" if lacks == "architecture" else "DeepseekV3ForCausalLM"
+    architecture = {
+        "architecture": "LlamaForCausalLM",
+        "no_moe_qwen3_moe": "Qwen3MoeForCausalLM",
+    }.get(lacks, "DeepseekV3ForCausalLM")
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=[architecture]),
     )
+    model_check = lacks in ("architecture", "no_moe", "no_moe_qwen3_moe")
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
-        (partial(prepare_model, model) if lacks in ("architecture", "no_moe") else check)()
+        (partial(prepare_model, model) if model_check else check)()
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+def test_moe_layer_without_load_balancer_refused(monkeypatch):
+    """Check that a MoE layer that EPLB left without a load balancer is refused by name."""
+    monkeypatch.setattr(
+        rank_failure_model_load,
+        "MoeExecutionState",
+        lambda health, ep_rank, device: SimpleNamespace(ep_group_health=health, ep_rank=ep_rank),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(Distributed, "startup_record", SimpleNamespace(replacement=False))
+    layers = []
+    for balancer in (SimpleNamespace(host_tensor_sharer=None), None):
+        layer = ConfigurableMoE.__new__(ConfigurableMoE)
+        torch.nn.Module.__init__(layer)
+        layer.comm = Mock(spec=NVLinkOneSided, ep_size=WORLD, ep_rank=0)
+        layer.layer_load_balancer = balancer
+        layers.append(layer)
+    model = torch.nn.ModuleList(layers)
+    model.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+    )
+    with pytest.raises(
+        ValueError, match=re.escape("MoE layer 1 (ConfigurableMoE) has no EPLB load balancer")
+    ) as error:
+        prepare_model(model)
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 

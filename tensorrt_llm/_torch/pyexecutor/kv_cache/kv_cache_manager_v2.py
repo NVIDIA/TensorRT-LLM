@@ -106,6 +106,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     OutOfPagesError,
     PageIndexMode,
     PlannedDropHandle,
+    PoolGroupDesc,
     PoolGroupPeakBlockStats,
     PoolRebalanceConfig,
     RemoteCacheTierConfig,
@@ -8910,9 +8911,43 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         unit = _gpu_alloc_granularity(self.impl.init_config.cache_tiers[GPU_LEVEL].quota)
         quota = max(0, quota) // unit * unit
-        if quota != self.gpu_quota and not self.impl.resize(GPU_LEVEL, quota):
+        if quota == self.gpu_quota:
+            return quota
+        num_slots = [pool_group.num_slots for pool_group in self.impl.pool_group_descs]
+        if not self.impl.resize(GPU_LEVEL, quota):
             raise OutOfPagesError(f"The GPU KV cache pool cannot be resized to {quota} bytes")
+        grown = [
+            (pool_group, range(old_num_slots, pool_group.num_slots))
+            for pool_group, old_num_slots in zip(self.impl.pool_group_descs, num_slots)
+            if pool_group.num_slots > old_num_slots
+        ]
+        if grown:
+            self._on_gpu_pool_grown(grown)
         return self.gpu_quota
+
+    def _on_gpu_pool_grown(self, grown: Sequence[Tuple[PoolGroupDesc, range]]) -> None:
+        """Zero the slots that :meth:`resize_gpu_quota` added to the GPU pool.
+
+        Runs once per resize, after the device has backed the new slots and while every KV cache
+        is still suspended, when at least one pool group gained slots. Pool base addresses do not
+        change; only the slot counts do. The new slots hold no page, and their bytes are whatever
+        the memory held before. Attention masks the unwritten tokens of a page by multiplying by
+        zero, which keeps a NaN or Inf, so the new slots are zeroed like the whole pool after
+        warmup. The zeroing runs on the execution stream, ahead of any later forward.
+
+        Args:
+            grown: Each pool group that gained slots, with the range of its new slot indices.
+        """
+        with torch.cuda.stream(self._stream):
+            for pool_group, slots in grown:
+                for pool in pool_group.pools:
+                    convert_to_torch_tensor(
+                        TensorWrapper(
+                            pool.base_address + slots.start * pool.slot_bytes,
+                            torch.uint8,
+                            [len(slots) * pool.slot_bytes],
+                        )
+                    ).zero_()
 
     def flush_iteration_events(self):
         event_manager = self.event_manager
