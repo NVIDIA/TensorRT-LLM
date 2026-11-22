@@ -859,6 +859,10 @@ def _test_sparse_offload_long_context(
         "FORCE_MHC_KERNEL_DETERMINISTIC": "1",
         "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
         "TRTLLM_DISAGG_NO_RETRY": "1",
+        # Servers that exchange an NVFP4 DSA cache must share its layout. The
+        # offloading generation worker keeps the residual layout, which `auto`
+        # would not pick on the resident context worker.
+        "TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT": "residual",
     }
     world_size = gen_server_config["tensor_parallel_size"]
     print(
