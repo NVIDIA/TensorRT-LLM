@@ -98,6 +98,16 @@ def _gate_up_fake(activation, packed_weight, input_scale, weight_scale, output_s
     )
 
 
+def _valid_bf16_unit(unit, device):
+    return (
+        unit.device == device
+        and unit.dtype == torch.float32
+        and unit.shape == (1,)
+        and unit.is_contiguous()
+        and unit.data_ptr() % 4 == 0
+    )
+
+
 @torch.library.custom_op("h3_fp8::gate_up_swiglu_bf16", mutates_args=(), device_types="cuda")
 def gate_up_bf16(
     activation: torch.Tensor,
@@ -108,30 +118,39 @@ def gate_up_bf16(
     swiglu_beta: float | None,
 ) -> torch.Tensor:
     """Fuse the original BF16 GateUp projection and plain SwiGLU."""
+    launch = gate_up_swiglu.precompiled_bf16(activation.device.index)
     if (
-        activation.dtype != torch.bfloat16
-        or weight.dtype != torch.bfloat16
-        or not activation.is_contiguous()
-        or not weight.is_contiguous()
-        or activation.data_ptr() % 256
-        or weight.data_ptr() % 256
+        launch is not None
+        and activation.ndim == 2
+        and activation.shape[0] > 0
+        and activation.shape[1] == gate_up_swiglu.K_DIM
+        and weight.shape == (gate_up_swiglu.N_TOT, gate_up_swiglu.K_DIM)
+        and activation.device == weight.device
+        and activation.dtype == weight.dtype == torch.bfloat16
+        and activation.is_contiguous()
+        and weight.is_contiguous()
+        and activation.data_ptr() % 256 == 0
+        and weight.data_ptr() % 256 == 0
+        and _valid_bf16_unit(unit_scale, activation.device)
+        and swiglu_limit in (None, float("inf"))
+        and swiglu_alpha in (None, 1.0)
+        and swiglu_beta in (None, 0.0)
     ):
-        return swiglu(
-            F.linear(activation, weight),
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        )
-    output = activation.new_empty((activation.shape[0], gate_up_swiglu.D_HALF))
-    gate_up_swiglu._get_compiled(activation.device.index, bf16=True)(
-        activation, weight, unit_scale, unit_scale, unit_scale, output
+        output = activation.new_empty((activation.shape[0], gate_up_swiglu.D_HALF))
+        if output.data_ptr() % 256 == 0:
+            launch(activation, weight, unit_scale, unit_scale, unit_scale, output)
+            return output
+    return swiglu(
+        F.linear(activation, weight),
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
-    return output
 
 
 @gate_up_bf16.register_fake
 def _gate_up_bf16_fake(activation, weight, unit_scale, swiglu_limit, swiglu_alpha, swiglu_beta):
-    return activation.new_empty((activation.shape[0], gate_up_swiglu.D_HALF))
+    return activation.new_empty((*activation.shape[:-1], weight.shape[0] // 2))
 
 
 @torch.library.custom_op("h3_fp8::down_gated_residual", mutates_args=(), device_types="cuda")
@@ -184,7 +203,9 @@ def bf16_down(
     indices: torch.Tensor,
 ) -> torch.Tensor:
     gate_column = projection_residual.DOWN_GATE
-    if projection_residual.supports(activation, weight, hidden, modulation, indices, gate_column):
+    if _valid_bf16_unit(unit, activation.device) and projection_residual.supports(
+        activation, weight, hidden, modulation, indices, gate_column
+    ):
         return projection_residual.run(
             activation, weight, unit, unit, hidden, modulation, indices, gate_column
         ).reshape_as(hidden)
@@ -298,9 +319,17 @@ def bf16_attention_projection(
     indices: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        raw.shape[-1:] != (7168,)
+        or hidden.shape[-1:] != (5376,)
+        or raw.shape[:-1] != hidden.shape[:-1]
+    ):
+        raise ValueError("Expected matching attention [*,7168] and hidden [*,5376] rows")
     activation = raw.reshape(-1, 7168)
     gate_column = projection_residual.ATTENTION_OUTPUT_GATE
-    if projection_residual.supports(activation, weight, hidden, modulation, indices, gate_column):
+    if _valid_bf16_unit(unit, activation.device) and projection_residual.supports(
+        activation, weight, hidden, modulation, indices, gate_column
+    ):
         residual = projection_residual.run(
             activation, weight, unit, unit, hidden, modulation, indices, gate_column
         ).reshape_as(hidden)

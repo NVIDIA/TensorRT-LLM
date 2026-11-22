@@ -1020,8 +1020,16 @@ def _smem_optin_bytes(device_index):
     return int(torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin)
 
 
+def _cache_key(device_index, bf16):
+    return device_index, bf16, repr(sorted(_CFG.items()))
+
+
+def precompiled_bf16(device_index):
+    return _compiled.get(_cache_key(device_index, True))
+
+
 def _get_compiled(device_index, smem_optin=None, *, bf16=False):
-    key = (device_index, bf16, repr(sorted(_CFG.items())))
+    key = _cache_key(device_index, bf16)
     fn = _compiled.get(key)
     if fn is None:
         cfg = dict(_CFG)

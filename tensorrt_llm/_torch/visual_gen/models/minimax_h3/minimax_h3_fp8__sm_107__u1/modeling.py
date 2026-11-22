@@ -116,6 +116,11 @@ class Fp8Attention(ScenarioAttention):
     """The scenario's QK-norm, RoPE and FP8 cast for every block: raw attention for a fused
     block's FP8 producer, projected attention for a BF16 block's family forward."""
 
+    def __init__(self, *, layer_idx: int, **kwargs) -> None:
+        super().__init__(layer_idx=layer_idx, **kwargs)
+        # Keep the index a CPU tensor so the compiled graph can be reused across blocks.
+        self._fp8_block_id = torch.tensor(layer_idx, device="cpu", dtype=torch.int64)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -517,6 +522,4 @@ class Fp8Transformer(ScenarioTransformer):
                 "_fp8_output_quant_factor", factors[index : index + 1], persistent=False
             )
         self.fp8_conditioning_cache = ConditioningCache(self)
-        for block in blocks:
-            block.attn._fp8_block_id = block.adaln_proj._h3_fp8_block_id
         torch.cuda.synchronize(device)
