@@ -190,7 +190,7 @@ def _parse_response_input(
     if not isinstance(input_msg, dict):
         input_msg = input_msg.model_dump()
 
-    _responses_debug_log(f"------- Parsing input -----------")
+    _responses_debug_log("------- Parsing input -----------")
     _responses_debug_log(input_msg)
     _responses_debug_log("")
 
@@ -286,8 +286,9 @@ class ConversationHistoryStore:
                              prev_resp_id: Optional[str] = None) -> None:
         """Store a response and its model-output messages.
 
-        If the previous response ID is provided, the messages are appended to
-        that conversation. Otherwise, a new conversation is created.
+        A response's pending input messages are extended with its output.
+        Otherwise, the previous response's history is copied before appending
+        the output, or a new conversation is created.
 
         Args:
             resp: ResponsesResponse
@@ -301,7 +302,7 @@ class ConversationHistoryStore:
         _responses_debug_log(
             f"ConversationHistoryStore storing resp: {resp_id}")
         if ENABLE_RESPONSES_DEBUG_MSG:
-            _responses_debug_log(f" -> resp_msgs:")
+            _responses_debug_log(" -> resp_msgs:")
             for msg in resp_msgs:
                 _responses_debug_log(f" -> {msg}")
 
@@ -321,8 +322,12 @@ class ConversationHistoryStore:
                         f"Previous response id {prev_resp_id} not found in conversation store"
                     )
 
-                conversation_id = self.response_to_conversation[prev_resp_id]
-                self.conversations[conversation_id].extend(resp_msgs)
+                previous_conversation_id = self.response_to_conversation[
+                    prev_resp_id]
+                conversation_id = _random_uuid()
+                self.conversations[conversation_id] = [
+                    *self.conversations[previous_conversation_id], *resp_msgs
+                ]
             else:
                 conversation_id = _random_uuid()
                 self.conversations[conversation_id] = resp_msgs
@@ -343,10 +348,11 @@ class ConversationHistoryStore:
                              msgs: Union[list[Message],
                                          list[ChatCompletionMessageParam]],
                              prev_resp_id: Optional[str]) -> None:
-        """
-        Store the messages in the conversation store.
+        """Store the messages in the conversation store.
 
-        `msgs` should always contains the whole conversation messages, including the previous messages and the new messages.
+        `msgs` should always contain the whole conversation messages, including
+        the previous messages and the new messages. Each response owns a
+        separate list so descendants cannot overwrite their predecessor.
 
         Args:
             resp_id: str
@@ -356,17 +362,14 @@ class ConversationHistoryStore:
         Returns:
             None
         """
-        _responses_debug_log(f"ConversationHistoryStore storing msg:")
+        _responses_debug_log("ConversationHistoryStore storing msg:")
         if ENABLE_RESPONSES_DEBUG_MSG:
             for msg in msgs:
                 _responses_debug_log(f" -> {msg}")
 
         async with self.conversations_lock:
             conversation_id: str
-            if prev_resp_id is not None and prev_resp_id in self.response_to_conversation:
-                conversation_id = self.response_to_conversation[prev_resp_id]
-            else:
-                conversation_id = _random_uuid()
+            conversation_id = _random_uuid()
 
             _responses_debug_log(
                 f" * storing at conversation: {conversation_id}")
@@ -382,7 +385,7 @@ class ConversationHistoryStore:
     async def get_conversation_history(
             self, resp_id: str
     ) -> Union[list[Message], list[ChatCompletionMessageParam]]:
-        _responses_debug_log(f"ConversationHistoryStore getting prev_msgs:")
+        _responses_debug_log("ConversationHistoryStore getting prev_msgs:")
         _responses_debug_log(f" -> prev_resp_id: {resp_id}")
         async with self.conversations_lock:
             if resp_id in self.response_to_conversation:
@@ -623,8 +626,7 @@ def _parse_output_tokens(tokens: list[int]) -> list[Message]:
 
 
 def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
-    """
-    Parse a Harmony message into a list of output response items.
+    """Parse a Harmony message into a list of output response items.
     """
     if message.author.role != "assistant":
         # This is a message from a tool to the assistant (e.g., search result).
@@ -1237,8 +1239,7 @@ def _stored_tool_name(call) -> str:
 
 def _create_output_messages(
         output_contents: dict[str, Any]) -> list[ChatCompletionMessageParam]:
-    """
-    Convert output contents to chat completion messages for conversation store.
+    """Convert output contents to chat completion messages for conversation store.
 
     Reasoning is stored and stripped on replay (_create_input_messages). Tool
     calls go on the reasoning message, else the text message, else a bare
@@ -1744,7 +1745,7 @@ async def request_preprocess(
         prev_msgs = await conversation_store.get_conversation_history(
             prev_response_id)
 
-        _responses_debug_log(f"Prev msgs:")
+        _responses_debug_log("Prev msgs:")
         for msg in prev_msgs:
             _responses_debug_log(f" -> {msg}")
 
@@ -3693,8 +3694,7 @@ async def keep_responses_stream_alive(
 
 
 class ServerArrivalTimeMiddleware:
-    """
-    Custom ASGI middleware to track server arrival time.
+    """Custom ASGI middleware to track server arrival time.
 
     We implement this as a pure ASGI middleware instead of using FastAPI's
     @app.middleware("http") decorator because the decorator internally uses
@@ -3757,8 +3757,7 @@ class PeriodicLatencyLogger:
 
 
 class ResponseHooks(ABC):
-    """
-    Hooks for response processing and (disagg) service perf observability.
+    """Hooks for response processing and (disagg) service perf observability.
     """
 
     @abstractmethod
