@@ -185,7 +185,8 @@ def open_node_supervisor_connection(
         node: The node that the supervisor runs on.
         ranks: The ranks that the supervisor starts on its node.
         host: The node's host name, which the authority logs.
-        timeout_s: How long to wait for the connection to the authority.
+        timeout_s: How long connecting to the authority may take once the store holds its
+            address. The store client's timeout bounds the wait for that address.
     """
     return _open_connection(store, f"node {node} {','.join(map(str, ranks))} {host}", timeout_s)
 
@@ -222,7 +223,8 @@ class MembershipClient:
 
     The thread ends once a record drops this process from the membership, and leaves the connection
     open: the authority admits a replacement for the rank only once it closes, when the owner calls
-    :meth:`stop` or exits.
+    :meth:`stop` or exits. The callbacks run on the thread and must not call :meth:`bind` or
+    :meth:`stop`.
     """
 
     def __init__(
@@ -250,6 +252,8 @@ class MembershipClient:
         self._replacement = replacement
         self._report = RankReport()
         self.record: Optional[MembershipRecord] = None
+        # The newest record handed to an on_record callback.
+        self._delivered: Optional[MembershipRecord] = None
         self.incarnation: Optional[int] = None
         self._lock = threading.Lock()
         self._delivery = threading.Lock()
@@ -268,7 +272,7 @@ class MembershipClient:
         """Connect, take the authority's first record and start the thread.
 
         The first record sets ``record`` and ``incarnation`` at once. The thread also delivers it
-        to ``on_record``.
+        to ``on_record``, unless :meth:`bind` did first.
         """
         connection = open_liveness_connection(self._store, self.rank, self._replacement)
         self._sock, self._lines = connection.sock, connection.lines
@@ -293,6 +297,7 @@ class MembershipClient:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the thread and close the liveness connection. A second call does nothing."""
         self._stop.set()
         self._wake()
         if self._thread.ident is not None:
@@ -301,6 +306,8 @@ class MembershipClient:
             self._sock.close()
         # A report() racing this stop must not write to a closed or reused descriptor.
         with self._lock:
+            if self._wake_write is None:
+                return
             os.close(self._wake_read)
             os.close(self._wake_write)
             self._wake_write = None
@@ -315,6 +322,7 @@ class MembershipClient:
         with self._delivery:
             self._on_record, self._on_tick, self._on_error = on_record, on_tick, on_error
             if self.record is not None:
+                self._delivered = self.record
                 on_record(self.record)
 
     def report(self, **changes) -> None:
@@ -370,14 +378,14 @@ class MembershipClient:
     def _serve(self) -> None:
         listed = False
         tick_s = heard_s = time.monotonic()
-        lines, self._received = self._received, []
+        records = [self.record, *_records(self._received[1:])]
         while not self._stop.is_set():
-            # A heartbeat line is empty.
-            for line in filter(None, lines):
-                record = MembershipRecord.model_validate_json(line)
+            for record in records:
                 with self._delivery:
                     self.record = record
-                    _call("record", self._on_record, record)
+                    if record is not self._delivered:
+                        self._delivered = record
+                        _call("record", self._on_record, record)
                 member = record.is_member(self.rank, self.incarnation)
                 if listed and not member:
                     return
@@ -396,7 +404,7 @@ class MembershipClient:
                         "the membership authority sent nothing for "
                         f"{AUTHORITY_SILENCE_TIMEOUT_S:g} s"
                     )
-            lines = []
+            records = []
             if self._sock in readable:
                 data = self._sock.recv(1 << 16)
                 if not data:
@@ -404,6 +412,7 @@ class MembershipClient:
                 lines = self._lines.decode(data)
                 if lines:
                     heard_s = time.monotonic()
+                records = _records(lines)
             due = time.monotonic() >= tick_s
             if due:
                 tick_s = time.monotonic() + REPORT_INTERVAL_S
@@ -415,6 +424,11 @@ class MembershipClient:
                 except BlockingIOError:
                     pass
                 self._send_report()
+
+
+def _records(lines: list[bytes]) -> list[MembershipRecord]:
+    """Parse the records of ``lines``, skipping the empty heartbeat lines."""
+    return [MembershipRecord.model_validate_json(line) for line in lines if line]
 
 
 class _CallbackError(Exception):

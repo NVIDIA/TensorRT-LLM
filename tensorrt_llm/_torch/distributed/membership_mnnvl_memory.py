@@ -25,7 +25,7 @@ members, whose gathers return None for an inactive member.
 
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -33,9 +33,11 @@ from tensorrt_llm.logger import logger
 
 from .mnnvl_memory import (
     MembershipComm,
+    MnnvlCheckpointCommunicator,
     MnnvlMappingError,
     MnnvlMemory,
     MnnvlPeerHandleError,
+    _MnnvlAllocationRecord,
     _MnnvlAllocationState,
 )
 
@@ -43,7 +45,7 @@ if TYPE_CHECKING:
     from .membership import StoreGroup
 
 
-def comm_members(comm: Any) -> tuple[int, ...]:
+def comm_members(comm: MembershipComm | MnnvlCheckpointCommunicator) -> tuple[int, ...]:
     """Return the global ranks of ``comm``'s members.
 
     A ``MembershipComm`` lists them. Any other communicator is taken as the ranks from 0 in order.
@@ -70,7 +72,9 @@ def _mapping_outcome(failure: Exception, rank: int) -> _MappingFailure | tuple[(
 
 
 def _raise_reported_failures(
-    what: str, outcomes: dict[int, Any], local_failure: Optional[Exception]
+    what: str,
+    outcomes: dict[int, Optional[_MappingFailure | tuple[()]]],
+    local_failure: Optional[Exception],
 ) -> None:
     """Raise the same error on every active rank for the failures the active ranks reported.
 
@@ -233,7 +237,7 @@ class MembershipMnnvlMemory(MnnvlMemory):
             f"{(time.perf_counter() - start_s) * 1e3:.1f} ms"
         )
 
-    def _record_of(self, comm: "StoreGroup") -> Any:
+    def _record_of(self, comm: "StoreGroup") -> _MnnvlAllocationRecord:
         """Return this allocation's record after checking that ``comm`` has its members.
 
         Raises:

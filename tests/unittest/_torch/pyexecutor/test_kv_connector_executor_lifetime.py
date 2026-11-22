@@ -75,7 +75,7 @@ def _request(request_id: int = 1) -> SimpleNamespace:
         is_dummy_request=False,
         is_finished=False,
         py_decoding_iter=0,
-        reported_cached_tokens=32,
+        cached_tokens=32,
         create_response=Mock(return_value=response),
     )
 
