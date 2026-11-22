@@ -287,6 +287,9 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_tunes_only_the_active_slots
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_grouped_gemm_tunes_only_the_active_slots
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_moe_computes_a_restored_expert_in_a_spare_slot
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_runner_kernel_takes_the_l2_policy_of_the_active_slots
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_op_tunes_and_looks_up_the_row_buckets_of_the_active_slots
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm

@@ -116,8 +116,9 @@ class Authority:
 
     Outside a change, a rank whose node supervisor reports its hang detector paused, in a report
     received within half the hang timeout, is never removed as hung, also once the rank's own
-    reports stop. The ranks that wait on such a rank stall until their own hang detector or
-    all-to-all timeout ends them.
+    reports stop. The ranks that wait on such a rank stall as they would without fault tolerance:
+    until their own hang detector or all-to-all timeout ends them, or without bound while their
+    hang detector is paused too.
 
     Call :meth:`tick` every report interval. ``record`` holds the current decision and
     ``last_transaction`` summarizes the last ended change. The authority process publishes
@@ -533,20 +534,19 @@ class Authority:
         while its reports advance. Outside a change, a rank in ``paused_s``, whose node supervisor
         recently reported its hang detector paused, is never hung, and once it leaves the pause its
         stall starts no earlier than the latest node report that counted it as paused. A joining
-        rank that waits on no peer is hung after at most the admission timeout, so the survivors do
-        not pause a full hang timeout for it.
+        rank that waits on no peer and has not given the phase's reply is hung after at most the
+        admission timeout, so the survivors do not pause a full hang timeout for it.
 
         Also record the failure causes and since when the active ranks stall.
         """
         state, active_mask = self.record.state, self.record.active_mask
         active = _ranks(active_mask)
         expected = {MembershipState.PROPOSE: Reply.READY, MembershipState.INSTALL: Reply.INSTALLED}
+        replied: set[int] = set()
         waited_on = 0
         if state in expected:
-            waited_on = rank_mask(
-                (r for r in active if not self._rank_replied(r, reports, expected[state])),
-                self.world_size,
-            )
+            replied = {r for r in active if self._rank_replied(r, reports, expected[state])}
+            waited_on = rank_mask(set(active) - replied, self.world_size)
         # During the startup a rank that started waits on every rank that has not.
         not_started = 0
         if state == MembershipState.STARTING:
@@ -598,8 +598,9 @@ class Authority:
                     self.stalled_since_s is None or since_s < self.stalled_since_s
                 ):
                     self.stalled_since_s = since_s
-                # A joiner that waits on a peer may be held up by it, so it gets the full timeout.
-                stalled_joiner = r in self._joining and not waits.get(r)
+                # A joiner that waits on a peer may be held up by it, and one that gave the phase's
+                # reply waits on the others, so either gets the full timeout.
+                stalled_joiner = r in self._joining and not waits.get(r) and r not in replied
                 limit_s = min(timeout_s, self.admission_timeout_s) if stalled_joiner else timeout_s
                 if now_s - since_s > limit_s:
                     failed |= 1 << r

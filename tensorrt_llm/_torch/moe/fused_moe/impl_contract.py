@@ -507,8 +507,8 @@ def spare_slots_rejection(cls: type, d: "MoEDeployment") -> Optional[MoEEligibil
     """Reject the unbacked spare EPLB slots on an impl without ``supports_spare_slots``, else None.
 
     The resolver applies it to every candidate that ``can_implement`` accepts; a
-    family whose leaves differ also composes it into ``can_implement``, which a
-    direct call reaches.
+    family whose leaves differ also composes it into ``can_implement`` after the
+    leaf's own gates, which a direct call reaches.
     """
     if d.spare_slots_enabled and not cls.capabilities.supports_spare_slots:
         return MoEEligibility.no(

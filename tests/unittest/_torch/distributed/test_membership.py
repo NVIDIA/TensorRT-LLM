@@ -509,16 +509,42 @@ def test_frozen_survivor_removed_before_joiner():
     assert record.active_mask == _without(2)
 
 
+def test_installed_joiner_kept_while_frozen_survivor_waits_on_it():
+    """Keep a joiner that replied INSTALLED, while a frozen survivor's last report waits on it.
+
+    The joiner idles after its reply and gets the full hang timeout, so the frozen survivor is
+    removed first and the joiner commits.
+    """
+    cluster = Cluster(hang_timeout_s=4.0, admission_timeout_s=1.0)
+    cluster.alive.discard(3)
+    cluster.run(1.0)
+    _join(cluster, 3)
+    cluster.run_until(MembershipState.INSTALL)
+    cluster.waiting_for[2] = 1 << 3
+    cluster.hung.add(2)
+    cluster.step()  # the joiner replies INSTALLED
+    cluster.hung.add(3)
+    cluster.stopped.add(2)
+    record = _first_change(cluster, 8.0)
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == _without(2)
+    _release(cluster)
+    record = cluster.run(1.0)
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == _without(2)
+
+
 def test_unconnected_replacement_join_request_dropped():
-    """Drop the join request of a replacement that never connects."""
+    """Drop the join request of a replacement that never connects, whatever the rank last reported."""
     cluster = Cluster()
     cluster.alive.discard(3)
     cluster.run(1.0)
-    cluster.reports[3] = RankReport()
+    # The last report the authority holds for rank 3 says that it is ready to join.
+    cluster.reports[3] = RankReport(joining_ready=True)
     cluster.authority.request_join(3)  # the replacement never connects
     record = cluster.run(1.0)
     assert record.state == MembershipState.COMMITTED
-    assert not record.is_active(3)
+    assert not any(published.is_active(3) for published in cluster.published)
 
 
 def _join(cluster, rank):
@@ -841,7 +867,10 @@ def _leave(clients):
 
 @pytest.mark.parametrize("end", [MembershipState.SHUTDOWN, MembershipState.ABORTED])
 def test_authority_ends_with_rank_connected(end):
-    """End the authority after rank 0 read SHUTDOWN, or a hang timeout after an abort."""
+    """End the authority a hang timeout after SHUTDOWN or an abort while rank 1 stays connected.
+
+    Rank 0's pipe stays open, as while rank 0 waits for the authority to exit.
+    """
     store = InMemoryStore()
     parent_read, parent_write = os.pipe()
     process = AuthorityProcess(2, 2, store, Authority(2, hang_timeout_s=5.0), parent=parent_read)
@@ -860,8 +889,6 @@ def test_authority_ends_with_rank_connected(end):
             clients[0].report(shutdown=True)
             _until(lambda: clients[0].record.state == MembershipState.SHUTDOWN)
         clients[0].stop()  # The deployment aborts unless it shuts down.
-        if end == MembershipState.SHUTDOWN:
-            os.close(parent_write)  # as when rank 0's process ends
         _until(lambda: clients[1].record.state == end)
         thread.join(TIMEOUT_S)
         assert not thread.is_alive()
@@ -871,8 +898,7 @@ def test_authority_ends_with_rank_connected(end):
     finally:
         _leave(clients)
         os.close(parent_read)
-        if end == MembershipState.ABORTED:
-            os.close(parent_write)
+        os.close(parent_write)
     assert [record.state for record in returned] == [end]
 
 
@@ -907,8 +933,8 @@ def test_authority_process_runs_until_rank_0_ends(end):
     """Run the authority process as rank 0 starts it, and end it as rank 0 does.
 
     The process writes the store's address to ``--address-fd`` once the store listens there, runs
-    on every CPU though started bound to one, ignores SIGINT and SIGTERM, and exits with 0 after a
-    shutdown, else with 1.
+    on every CPU though started bound to one, raises its open-file limit to the hard limit, ignores
+    SIGINT and SIGTERM, and exits with 0 after a shutdown, else with 1.
     """
     # Reserved with SO_REUSEADDR until the process ends, so that the authority can still bind it.
     reserved = socket.socket()
@@ -924,8 +950,10 @@ def test_authority_process_runs_until_rank_0_ends(end):
     }
     env.pop("TLLM_NUMA_AWARE_WORKER_AFFINITY", None)
     allowed = os.sched_getaffinity(0)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     read_fd, write_fd = os.pipe()
     os.sched_setaffinity(0, {min(allowed)})
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard // 2, hard))
     try:
         process = subprocess.Popen(
             [
@@ -942,15 +970,18 @@ def test_authority_process_runs_until_rank_0_ends(end):
         )
     finally:
         os.sched_setaffinity(0, allowed)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
         os.close(write_fd)
     clients = []
     try:
         with os.fdopen(read_fd) as address_pipe:
-            assert select.select([address_pipe], [], [], TIMEOUT_S)[0]
+            # The process imports TensorRT-LLM on one CPU first. Wait as long as rank 0 does.
+            assert select.select([address_pipe], [], [], membership.RENDEZVOUS_TIMEOUT_S)[0]
             assert address_pipe.readline() == f"{address}\n"
         store = open_store(address, timeout_s=TIMEOUT_S)
         store.wait([LIVENESS_KEY], timedelta(seconds=TIMEOUT_S))
         assert os.sched_getaffinity(process.pid) >= allowed
+        assert resource.prlimit(process.pid, resource.RLIMIT_NOFILE)[0] == hard
         for signum in (signal.SIGINT, signal.SIGTERM):
             process.send_signal(signum)
         clients.append(_member(store, 0, 1))
@@ -1123,7 +1154,7 @@ def test_waiting_for_the_authority_is_logged(monkeypatch, published):
 
 
 def test_unchanged_membership_sends_nothing():
-    """Send no record and write nothing to the store while the membership does not change."""
+    """Send and store no record while the membership does not change, besides a new incarnation."""
     with _deployment(2) as (store, clients):
         clients[1].stop()
         _until(lambda: clients[0].record.active_mask == 0b01)
@@ -1140,9 +1171,12 @@ def test_unchanged_membership_sends_nothing():
                     data = connection.sock.recv(1 << 16)
                     assert data, "the authority closed the connection"
                     received += data
-            # Only the record that gives it its incarnation arrives, besides empty heartbeat lines.
+            # Only the record that gives it its incarnation arrives, besides empty heartbeat lines,
+            # and the stored record takes that incarnation once.
             assert len([line for line in connection.lines.decode(received) if line]) == 1
-            writes.assert_not_called()  # until the connection closes
+            ((key, value),) = [call.args for call in writes.call_args_list]
+            assert key == RECORD_KEY
+            assert MembershipRecord.model_validate_json(value).incarnations == (0, 1)
 
 
 def test_foreign_or_second_replacement_refused(monkeypatch):
@@ -1361,6 +1395,23 @@ def test_node_view_names_connected_ranks(monkeypatch):
         view = node_0.until(lambda view: view.connected_mask == 0b0111)
         assert view.record.active_mask == 0b1111
         deciding.set()
+
+
+def test_node_view_names_connected_replacement():
+    """Name a replacement's incarnation in the view that first lists it connected.
+
+    The replacement has not reported that it is ready to join, so no membership change follows.
+    """
+    with _deployment(4) as (store, clients):
+        node_0 = _NodeSupervisor(store, 0, [0, 1])
+        clients[3].stop()
+        _until(lambda: _committed(clients[0], 0b0111))
+        node_0.until(lambda view: view.connected_mask == 0b0111)
+        joiner = MembershipClient(3, store, lambda record: None, replacement=True)
+        joiner.start()
+        clients.append(joiner)
+        view = node_0.until(lambda view: view.connected_mask == 0b1111)
+        assert view.record.incarnations == (0, 0, 0, 1)
 
 
 @pytest.mark.parametrize("connected_nodes", [[0], []], ids=["one", "none"])
@@ -1631,6 +1682,39 @@ def test_client_holds_first_record_after_start(monkeypatch):
     with _scripted_client([]) as client:
         assert client.record is not None
         assert client.record.incarnations[0] == client.incarnation
+
+
+def test_bind_before_first_delivery_delivers_record_once(monkeypatch):
+    """Deliver the first record once to a handler bound before the thread delivers it."""
+    serve = liveness.MembershipClient._serve
+    bound = threading.Event()
+
+    def serve_after_bind(self):
+        bound.wait(JOIN_TIMEOUT_S)
+        serve(self)
+
+    monkeypatch.setattr(liveness.MembershipClient, "_serve", serve_after_bind)
+    delivered, ticked = [], threading.Event()
+    with _scripted_client([]) as client:
+        client.bind(delivered.append, on_tick=ticked.set)
+        bound.set()
+        # The thread ticks after it handled the first record.
+        _until(ticked.is_set)
+        assert delivered == [client.record]
+
+
+def test_client_stop_twice_keeps_reused_descriptors():
+    """Close a client's descriptors on the first stop() only, so a second one closes nothing."""
+    with _scripted_client([]) as client:
+        client.stop()
+        reused = os.pipe()
+        try:
+            client.stop()
+            for fd in reused:
+                os.fstat(fd)
+        finally:
+            for fd in reused:
+                os.close(fd)
 
 
 def test_late_wakeup_keeps_live_authority(monkeypatch):

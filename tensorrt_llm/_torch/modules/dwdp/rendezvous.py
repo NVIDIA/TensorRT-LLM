@@ -102,51 +102,7 @@ class GroupComm(Protocol):
         ...
 
 
-class StoreComm:
-    """The ``allgather`` / ``Barrier`` subset of an mpi4py communicator, over a store.
-
-    Call ``n`` sets this rank's pickled object under ``<name>/<n>/<rank>`` and waits for the keys of
-    the other ranks, so every rank must issue the same sequence of collectives.
-    """
-
-    def __init__(self, store: Any, name: str, rank: int, size: int, timeout: timedelta) -> None:
-        self._store = store
-        self._name = name
-        self._rank = rank
-        self._size = size
-        self._timeout = timeout
-        self._seq = 0
-
-    def Get_rank(self) -> int:
-        return self._rank
-
-    def Get_size(self) -> int:
-        return self._size
-
-    def allgather(self, obj: Any) -> List[Any]:
-        """Gather one picklable object per rank, ordered by rank in the group."""
-        prefix = f"{self._name}/{self._seq}"
-        self._seq += 1
-        self._store.set(f"{prefix}/{self._rank}", pickle.dumps(obj))
-        # Trust boundary: only the processes of this launch write the store, whose port must stay
-        # on the trusted cluster network, as for the MPI communicator this replaces.
-        return [
-            None if payload is None else pickle.loads(payload)  # nosec B301
-            for payload in self._gather(prefix)
-        ]
-
-    def Barrier(self) -> None:
-        """Match ``MPI_Barrier``; waiting for every key is the synchronization."""
-        self.allgather(None)
-
-    def _gather(self, prefix: str) -> List[Optional[bytes]]:
-        """Return every rank's payload of the call with key prefix ``prefix``, by rank."""
-        keys = [f"{prefix}/{r}" for r in range(self._size)]
-        self._store.wait(keys, self._timeout)
-        return [self._store.get(key) for key in keys]
-
-
-class StoreDwdpGroup(StoreComm):
+class StoreDwdpGroup:
     """The ``allgather`` / ``Barrier`` / ``Free`` subset of an mpi4py communicator, over a TCPStore.
 
     Global DWDP rank 0 hosts the store for every group; keys are namespaced by group id, so
@@ -171,11 +127,14 @@ class StoreDwdpGroup(StoreComm):
         if global_rank < 0:
             raise ValueError(f"global_rank must be non-negative, got {global_rank}")
 
+        self._size = dwdp_size
         self._global_rank = global_rank
         self._num_workers = num_groups * dwdp_size
         self._setup_done = False
+        self._rank = global_rank % dwdp_size
         self._group_id = global_rank // dwdp_size
-        timeout = timedelta(seconds=timeout_s)
+        self._seq = 0
+        self._timeout = timedelta(seconds=timeout_s)
 
         if store is None:
             from torch.distributed import TCPStore
@@ -185,12 +144,10 @@ class StoreDwdpGroup(StoreComm):
                 host_name=master_addr,
                 port=master_port,
                 is_master=global_rank == 0,
-                timeout=timeout,
+                timeout=self._timeout,
                 wait_for_workers=False,
             )
-        super().__init__(
-            store, f"dwdp/{self._group_id}", global_rank % dwdp_size, dwdp_size, timeout
-        )
+        self._store = store
 
         # Two workers launched with the same TRTLLM_DWDP_RANK would overwrite each other's
         # payloads and silently pair the wrong expert slices; MPI rules this out by
@@ -227,11 +184,32 @@ class StoreDwdpGroup(StoreComm):
             num_groups=num_groups,
         )
 
+    def Get_rank(self) -> int:
+        return self._rank
+
+    def Get_size(self) -> int:
+        return self._size
+
     def allgather(self, obj: Any) -> List[Any]:
         """Gather one picklable object per rank, ordered by rank in the group."""
         if self._store is None:
             raise RuntimeError("allgather on a freed DWDP group")
-        return super().allgather(obj)
+
+        # Keys are unique per (group, call); every rank must issue the same sequence of collectives.
+        prefix = f"dwdp/{self._group_id}/{self._seq}/"
+        self._seq += 1
+        keys = [f"{prefix}{r}" for r in range(self._size)]
+
+        self._store.set(keys[self._rank], pickle.dumps(obj))
+        self._store.wait(keys, self._timeout)
+        # Trust boundary: the store is served by DWDP rank 0 and written only by the
+        # context workers of this launch; its port must stay on the trusted cluster
+        # network, as for the MPI communicator this replaces.
+        return [pickle.loads(self._store.get(key)) for key in keys]  # nosec B301
+
+    def Barrier(self) -> None:
+        """Match ``MPI_Barrier``; waiting for every key is the synchronization."""
+        self.allgather(None)
 
     def mark_setup_done(self) -> None:
         """Record that this worker no longer needs the store for setup. Idempotent."""
