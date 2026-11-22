@@ -14,7 +14,7 @@
 # limitations under the License.
 """The MNNVL memory transport of the host exchange, a ``HostExchangeGroup``.
 
-In a round, each rank writes its slot into every active rank's segment and polls its own segment.
+In a round, each rank writes its slot into every rank's segment and polls its own segment.
 Each rank owns one segment with two slot sets and one slot per sender::
 
     segment: | slot set 0: slot 0 | slot 1 | ... | slot set 1: slot 0 | slot 1 | ... |
@@ -68,30 +68,35 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
 
     @classmethod
     def uses_fabric_handles(cls, dev_id: int) -> bool:
-        """Return whether device ``dev_id`` shares memory through fabric handles.
+        """Return whether MNNVL memory on device ``dev_id`` is shared through fabric handles.
 
         ``MnnvlMemory.get_allocation_prop`` requests fabric handles on aarch64 hosts only, so this
-        tells the CPU architecture; it does not test that IMEX can export the handles.
+        tells the host's CPU architecture; it does not test that IMEX can export the handles.
         """
         handle_type = cls.get_allocation_prop(dev_id).requestedHandleTypes
         return handle_type == mnnvl_memory.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 
-    def __init__(self, comm: StoreGroup, nbytes: int):
+    def __init__(self, comm: StoreGroup, nbytes: int) -> None:
         """Reserve a row of ``nbytes`` per member of ``comm`` and map it among the active members.
 
         The rows are shared over ``comm`` rather than over the communicator of a ``Mapping``, so
         this replaces ``MnnvlMemory.__init__`` and the rows have no ``mapping``.
 
+        Args:
+            comm: The group of the rows' members, whose gathers return None for an inactive member.
+            nbytes: The bytes of each row before rounding up to the allocation granularity.
+
         Raises:
             MnnvlPeerHandleError: An active rank could not import a peer's handle.
             MnnvlMappingError: Mapping or zeroing failed on some active ranks.
-            RuntimeError: The device does not share memory through fabric handles.
+            RuntimeError: MNNVL memory on this host is not shared through fabric handles.
         """
         cls = type(self)
         dev_id = cls._init_device()
         if not cls.uses_fabric_handles(dev_id):
             raise RuntimeError(
-                "HostExchangeMnnvlMemory requires fabric memory handles, which this device lacks"
+                "HostExchangeMnnvlMemory requires fabric memory handles, which MNNVL memory uses "
+                "on aarch64 hosts only"
             )
         granularity = cls.get_allocation_granularity(dev_id)
         stride = granularity * ceil_div(nbytes, granularity)
@@ -146,7 +151,7 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
         self.closed = True
         type(self).close_mnnvl_memory(self.ptr)
 
-    def __del__(self):
+    def __del__(self) -> None:
         if not self.closed:
             super().__del__()
 
@@ -154,30 +159,40 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
 class MnnvlHostExchangeGroup:
     """``HostExchangeGroup`` over MNNVL memory, one ``HostExchangeMnnvlMemory`` row per rank.
 
-    A round runs the all-to-all kernels' LL protocol on the copy engines, so it takes no SMs. Round
-    ``epoch`` uses slot set ``epoch & 1``, so a rank never overwrites a slot that a slower rank
-    still reads. A rank completes a round that another rank finished from the peers' rows.
+    The copy engines move the slots, so a round takes no SMs, and the epoch in every packet stands
+    in for a ready flag. Round ``epoch`` uses slot set ``epoch & 1``, so a rank never overwrites a
+    slot that a slower rank still reads. A rank completes a round that another rank finished from
+    the peers' rows.
     """
 
     # The payload packets (1 KiB of payload) that the header poll copies with each header. A payload
     # that fits goes to every row, so it arrives with the header poll and needs no second poll.
-    _HEADER_POLL_PACKETS = 256
-    # A wait polls back to back for _SPIN_S, then sleeps between polls. _SPIN_S is longer than the
-    # normal prefill imbalance between ranks, so a healthy step's wait sees a late rank's packets as
-    # soon as they land, and a wait on a failed rank stops spinning soon after. An idle wait may last
-    # until the next request arrives, so it sleeps after _IDLE_SPIN_S.
+    _HEADER_POLL_PAYLOAD_PACKETS = 256
+    # A wait polls back to back for _SPIN_S, then sleeps between polls. When every header is in but
+    # a payload needs a second poll, it spins for _SPIN_S again on the payloads. _SPIN_S is longer
+    # than the normal prefill imbalance between ranks, so a healthy step's wait sees a late rank's
+    # packets as soon as they land, and a wait on a failed rank stops spinning soon after. An idle
+    # wait may last until the next request arrives, so it sleeps after _IDLE_SPIN_S.
     _SPIN_S = 150e-3
     _IDLE_SPIN_S = 20e-6
 
     def __init__(
         self, rank: int, nranks: int, rows: HostExchangeMnnvlMemory, slot_payload_bytes: int
-    ):
+    ) -> None:
+        """Create the transport of TP rank ``rank`` over ``rows``.
+
+        Args:
+            rank: This rank's TP rank.
+            nranks: The TP group's size.
+            rows: One row of ``buffer_bytes(nranks, slot_payload_bytes)`` bytes per rank.
+            slot_payload_bytes: The payload bytes of a slot, ``slot_payload_bytes // 4`` packets.
+        """
         self._cuda = mnnvl_memory.cuda
         self.rank = rank
         self.nranks = nranks
         self.rows = rows
         self.words = slot_payload_bytes // 4
-        self._header_poll_packets = 1 + min(self.words, self._HEADER_POLL_PACKETS)
+        self._header_poll_packets = 1 + min(self.words, self._HEADER_POLL_PAYLOAD_PACKETS)
         self._slot_bytes = 8 * (1 + self.words)
         # A round uses slot set epoch & 1, which starts at (epoch & 1) * _slot_set_bytes.
         self._slot_set_bytes = nranks * self._slot_bytes
@@ -228,14 +243,14 @@ class MnnvlHostExchangeGroup:
                 HostExchangeMnnvlMemory.uses_fabric_handles(torch.cuda.current_device()),
                 "an aarch64 host (such as a GB200 node), on which MNNVL memory is shared through "
                 "fabric handles, because fault tolerance remaps MNNVL memory and exchanges host "
-                "values through fabric handles; the fabric handles also need IMEX running and an "
-                "IMEX channel in the container, which this check does not test",
+                "values through fabric handles (the fabric handles also need IMEX running and an "
+                "IMEX channel in the container, which this check does not test)",
             ),
             (
                 get_sm_version() == 100,
-                "an SM 100 GPU (Blackwell B200/GB200), because the host exchange relies on the "
-                "copy engines writing each aligned 8-byte packet in one transaction, which a tear "
-                "test confirmed on GB200 only",
+                "an SM 100 GPU, as in a GB200, because the host exchange relies on the copy "
+                "engines writing each aligned 8-byte packet in one transaction, which a tear test "
+                "confirmed on GB200 only",
             ),
         ]
 
@@ -262,15 +277,15 @@ class MnnvlHostExchangeGroup:
         return runs
 
     def start_round(
-        self, epoch: int, words: np.ndarray, length: int, recipients: Optional[int]
+        self, epoch: int, payload: np.ndarray, length: int, recipients: Optional[int]
     ) -> None:
         # The header goes to every row, the payload to the recipients' rows.
-        packets = 1 + words.size
+        packets = 1 + payload.size
         halves = self._send_halves[: 2 * packets]
         halves[0] = length
         halves[1::2] = epoch
-        halves[2::2] = words
-        if recipients is None or words.size <= self._HEADER_POLL_PACKETS:
+        halves[2::2] = payload
+        if recipients is None or payload.size <= self._HEADER_POLL_PAYLOAD_PACKETS:
             # A payload that a header poll copies whole goes to every row.
             runs = self._send_runs_to_all
         else:
@@ -282,10 +297,10 @@ class MnnvlHostExchangeGroup:
                 self.rows.stride,
                 self._send_ptr,
                 0,
-                8 * (packets if payload else 1),
+                8 * (packets if with_payload else 1),
                 count,
             )
-            for first, count, payload in runs
+            for first, count, with_payload in runs
         ]
 
     def wait(

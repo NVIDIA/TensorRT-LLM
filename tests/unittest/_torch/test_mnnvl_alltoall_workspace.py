@@ -641,11 +641,12 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
 
 
 def _build_one_sided(
-    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool, **kwargs: object
-) -> tuple[Mock, _FakeComm]:
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+) -> tuple[NVLinkOneSided, Mock, _FakeComm]:
     """Build an EP-2 NVLinkOneSided on fake MNNVL memory, with or without Wide-EP fault tolerance.
 
-    Returns the mock of moe_a2a_initialize and the communicator of the fake memory.
+    ``MnnvlMemory`` and ``MembershipMnnvlMemory`` each get their own fake. Returns the
+    NVLinkOneSided, the mock of moe_a2a_initialize and the communicator of the fake memory.
     """
     comm = _FakeComm()
 
@@ -666,6 +667,9 @@ def _build_one_sided(
         def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
             return torch.zeros(2, 64, dtype=torch.uint8)
 
+    class _MembershipMemory(_Memory):
+        pass
+
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
@@ -679,8 +683,8 @@ def _build_one_sided(
         "WORKSPACE_SIZE_INDEX",
         int(_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX),
     )
-    for memory in ("MnnvlMemory", "MembershipMnnvlMemory"):
-        monkeypatch.setattr(one_sided_module, memory, _Memory)
+    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "MembershipMnnvlMemory", _MembershipMemory)
     monkeypatch.setattr(
         _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
     )
@@ -689,23 +693,28 @@ def _build_one_sided(
     mapping = SimpleNamespace(
         world_size=2, moe_ep_size=2, moe_ep_rank=0, has_cp_helix=Mock(return_value=False)
     )
-    NVLinkOneSided(
+    one_sided = NVLinkOneSided(
         mapping=mapping,
         num_slots=8,
         top_k=2,
         max_num_tokens_per_rank=1,
         enable_wide_ep_fault_tolerance=fault_tolerance,
-        **kwargs,
     )
-    return initialize, comm
+    return one_sided, initialize, comm
 
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])
 def test_rank_mask_workspace_barrier(
     monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
 ) -> None:
-    """Only Wide-EP fault tolerance replaces the workspace initialization's barrier with its own."""
-    initialize, comm = _build_one_sided(monkeypatch, fault_tolerance)
+    """Only Wide-EP fault tolerance allocates MembershipMnnvlMemory and brings its own barrier.
+
+    With fault tolerance, the workspace communicator's barrier replaces the one of the workspace
+    initialization.
+    """
+    one_sided, initialize, comm = _build_one_sided(monkeypatch, fault_tolerance)
+    memory_type = "MembershipMnnvlMemory" if fault_tolerance else "MnnvlMemory"
+    assert type(one_sided.mnnvl_mem) is getattr(one_sided_module, memory_type)
     assert initialize.call_args.kwargs == {"barrier": not fault_tolerance}
     assert comm.barrier_count == int(fault_tolerance)
 

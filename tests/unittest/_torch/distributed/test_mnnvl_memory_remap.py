@@ -389,7 +389,7 @@ def test_failed_import_reported_to_peers(memory, driver):
         memory.remap(_Comm(gather, membership=range(4, 8)), frozenset(range(4, 8)))
     assert reported[-1][1] == [4]
     assert raised.value.ranks == (4,)
-    assert reported[-1][0] == "MnnvlPeerHandleError: 2"
+    assert reported[-1][0] == "MnnvlPeerHandleError: Cannot import the MNNVL handle of rank 4: 2"
     assert driver.mapped == {}
     assert not memory.mapped
 
@@ -604,7 +604,10 @@ def test_failed_rows_leave_nothing_mapped(rows_driver, monkeypatch, failure):
             return (2, None) if len(imports) == 2 else (0, ("import", data))
 
         monkeypatch.setattr(rows_driver, "cuMemImportFromShareableHandle", import_handle)
-        expected = pytest.raises(MnnvlPeerHandleError, match="rank 1: MnnvlPeerHandleError: 2")
+        expected = pytest.raises(
+            MnnvlPeerHandleError,
+            match="rank 1: MnnvlPeerHandleError: Cannot import the MNNVL handle of rank 3: 2",
+        )
     else:
         monkeypatch.setattr(rows_driver, "cuMemsetD8", lambda address, value, size: 2)
         expected = pytest.raises(RuntimeError)

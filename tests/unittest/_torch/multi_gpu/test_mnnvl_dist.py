@@ -99,63 +99,98 @@ def _dists(tp):
     return MnnvlDist(mapping), MPIDist(mapping), rank
 
 
+def _same(a, b):
+    """Return whether ``a`` and ``b`` hold the same values, comparing arrays element by element."""
+    return np.array_equal(a, b) if isinstance(b, np.ndarray) else a == b
+
+
 def _collectives(tp):
-    """Check that every host collective returns what MPIDist returns."""
+    """Check that every host collective returns what MPIDist returns.
+
+    Every rank runs every collective before any rank asserts, so a mismatch does not leave the
+    other ranks waiting in the next collective.
+    """
     mnnvl, mpi, rank = _dists(tp)
     MnnvlDist.check_requirements(mnnvl.mapping)
     assert mnnvl.supports_single_round_broadcast
+    mismatches = []
+
+    def check(name, received, expected):
+        if not _same(received, expected):
+            mismatches.append((name, received, expected))
+
+    def compare(name, run):
+        check(name, run(mnnvl), run(mpi))
+
     small = {"rank": rank, "load": [rank, 2 * rank]}
     # Larger than one exchange slot, so it takes several rounds. Its length differs across ranks.
     large = bytes(range(256)) * (3000 + 500 * rank)
     for obj in (small, large, None, b""):
-        assert mnnvl.allgather(obj) == mpi.allgather(obj)
-        assert mnnvl.tp_allgather(obj) == mpi.tp_allgather(obj)
-        assert mnnvl.tp_gather(obj, root=1) == mpi.tp_gather(obj, root=1)
-        assert mnnvl.broadcast(obj, root=tp - 1) == mpi.broadcast(obj, root=tp - 1)
-        assert mnnvl.broadcast_or_none(obj if rank == 0 else None) == mpi.broadcast_or_none(
-            obj if rank == 0 else None
+        root_obj = obj if rank == 0 else None
+        compare("allgather", lambda dist: dist.allgather(obj))
+        compare("tp_allgather", lambda dist: dist.tp_allgather(obj))
+        compare("tp_gather", lambda dist: dist.tp_gather(obj, root=1))
+        compare("broadcast", lambda dist: dist.broadcast(obj, root=tp - 1))
+        compare("tp_broadcast", lambda dist: dist.tp_broadcast(obj, root=tp - 1))
+        compare("broadcast_or_none", lambda dist: dist.broadcast_or_none(root_obj))
+        compare(
+            "broadcast_or_none_with_header",
+            lambda dist: dist.broadcast_or_none_with_header(root_obj, [11, rank]),
         )
-    for op in (ReduceOp.SUM, ReduceOp.MAX, ReduceOp.MIN):
-        assert mnnvl.allreduce(rank + 1, op) == mpi.allreduce(rank + 1, op)
-    assert mnnvl.tp_allreduce([rank], ReduceOp.SUM) == mpi.tp_allreduce([rank], ReduceOp.SUM)
+    for op in ReduceOp:
+        compare(f"allreduce {op.name}", lambda dist: dist.allreduce(rank + 1, op))
+    compare("tp_allreduce", lambda dist: dist.tp_allreduce([rank], ReduceOp.SUM))
     values = [rank, -rank, 2**40 + rank]
-    assert np.array_equal(mnnvl.tp_allgather_int64(values), mpi.tp_allgather_int64(values))
+    compare("tp_allgather_int64", lambda dist: dist.tp_allgather_int64(values))
     # Rows that arrive with their headers, that need a second poll, and that take several rounds.
     slot_values = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES // 8
-    for n in (0, 1, MnnvlHostExchangeGroup._HEADER_POLL_PACKETS, slot_values, 2 * slot_values + 3):
+    header_poll_values = MnnvlHostExchangeGroup._HEADER_POLL_PAYLOAD_PACKETS
+    for n in (0, 1, header_poll_values, slot_values, 2 * slot_values + 3):
         row = np.arange(n, dtype=np.int64) * (rank + 1) - 2**40
-        assert np.array_equal(mnnvl.tp_allgather_int64(row), mpi.tp_allgather_int64(row)), n
-    assert np.array_equal(
-        mnnvl.broadcast_int64(values, root=1), mpi.broadcast_int64(values, root=1)
-    )
+        compare(f"tp_allgather_int64 of {n}", lambda dist: dist.tp_allgather_int64(row))
+    compare("broadcast_int64", lambda dist: dist.broadcast_int64(values, root=1))
     # With every rank active, a vote's gather has every row.
-    assert np.array_equal(
-        mnnvl.tp_allgather_int64(values, active_only=True), mpi.tp_allgather_int64(values)
+    check(
+        "tp_allgather_int64 active_only",
+        mnnvl.tp_allgather_int64(values, active_only=True),
+        mpi.tp_allgather_int64(values),
     )
+    mnnvl.tp_barrier()
     mnnvl.barrier()
+    assert not mismatches, mismatches
 
 
 def _stress(tp):
-    """Check many gathers of random sizes, up to three rounds each, byte for byte."""
+    """Check many gathers of random sizes, up to three rounds each, byte for byte.
+
+    Sizes up to three slots cover payloads that arrive with the header poll, that need a second
+    poll, and that span two or three rounds. The 2000 steps reuse each slot set at least 2000
+    times across those layouts, so a wait that took a packet left over from an earlier round would
+    fail the comparison. Every rank runs every step before any rank asserts.
+    """
     mnnvl, _, rank = _dists(tp)
     rng = np.random.default_rng(1234)
     slot = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
+    mismatches = []
     for step in range(2000):
         # Every rank draws the same sizes.
         sizes = rng.integers(0, 3 * slot, size=tp)
         mine = np.random.default_rng(step * tp + rank).bytes(int(sizes[rank]))
         gathered = mnnvl.allgather(mine)
-        for r, payload in enumerate(gathered):
-            assert payload == np.random.default_rng(step * tp + r).bytes(int(sizes[r])), (step, r)
+        expected = [np.random.default_rng(step * tp + r).bytes(int(sizes[r])) for r in range(tp)]
+        if gathered != expected:
+            mismatches.append(("allgather", step))
         # The int64 rows have one size per step and take up to three rounds.
         n = int(sizes[0]) // 8
         rows = mnnvl.tp_allgather_int64(
             np.random.default_rng(step * tp + rank).integers(-(2**62), 2**62, n)
         )
-        for r in range(tp):
-            assert np.array_equal(
-                rows[r], np.random.default_rng(step * tp + r).integers(-(2**62), 2**62, n)
-            ), (step, r)
+        expected = [
+            np.random.default_rng(step * tp + r).integers(-(2**62), 2**62, n) for r in range(tp)
+        ]
+        if not np.array_equal(rows, expected):
+            mismatches.append(("tp_allgather_int64", step))
+    assert not mismatches, mismatches
 
 
 def _epoch_wrap(tp):

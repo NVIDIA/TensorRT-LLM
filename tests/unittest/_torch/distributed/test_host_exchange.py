@@ -400,8 +400,8 @@ class _LocalGroup:
         self._waiting = 0
         self.installs = []
 
-    def start_round(self, epoch, words, length, recipients):
-        self._staged = (epoch, _slot(epoch, words.tobytes(), length, self.words))
+    def start_round(self, epoch, payload, length, recipients):
+        self._staged = (epoch, _slot(epoch, payload.tobytes(), length, self.words))
 
     def _rows(self, epoch):
         empty = np.zeros(1 + self.words, dtype=np.uint64)
@@ -603,7 +603,7 @@ def test_long_payloads_reach_only_recipients(monkeypatch, seed):
     for q in range(nranks):
         assert results[q] == [payloads[r] if r in readers[q] else None for r in range(nranks)]
     rows = exchanges[0].group.rows._memory.view(np.uint64).reshape(nranks, 2, nranks, -1)
-    header_poll = 1 + MnnvlHostExchangeGroup._HEADER_POLL_PACKETS
+    header_poll = 1 + MnnvlHostExchangeGroup._HEADER_POLL_PAYLOAD_PACKETS
     for r in range(nranks):
         others = [q for q in range(nranks) if q not in recipients[r]]
         assert not rows[others, :, r, header_poll:].any()
@@ -630,8 +630,8 @@ def test_payload_longer_than_header_length(monkeypatch):
     exchange = _host_exchange_group(monkeypatch, 1, _SLOT_BYTES)[0]
     start_round, lengths = exchange.group.start_round, []
 
-    def start_three_rounds(epoch, words, length, recipients):
-        start_round(epoch, words, length, recipients)
+    def start_three_rounds(epoch, payload, length, recipients):
+        start_round(epoch, payload, length, recipients)
         lengths.append(length)
         if len(lengths) == 3:
             raise _Replaced
@@ -652,20 +652,20 @@ def test_header_with_more_than_a_slot_left_runs_another_round(monkeypatch):
     exchange = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)[0]
     group, rows = exchange.group, exchange.group.rows
     start_round = group.start_round
-    payload = b"a" * _SLOT_BYTES + b"b" * _SLOT_BYTES + b"c" * _SLOT_BYTES
+    rank_1_data = b"a" * _SLOT_BYTES + b"b" * _SLOT_BYTES + b"c" * _SLOT_BYTES
     headers = iter([2 * _SLOT_BYTES, 2 * _SLOT_BYTES, _SLOT_BYTES])
 
-    def start_with_rank_1(epoch, words, length, recipients):
-        start_round(epoch, words, length, recipients)
+    def start_with_rank_1(epoch, payload, length, recipients):
+        start_round(epoch, payload, length, recipients)
         # Rank 1's slot of this round, written into rank 0's row.
         start = (epoch - 1) * _SLOT_BYTES
-        packets = _slot(epoch, payload[start : start + _SLOT_BYTES], length=next(headers))
+        packets = _slot(epoch, rank_1_data[start : start + _SLOT_BYTES], length=next(headers))
         slot = (epoch & 1) * group._slot_set_bytes + group._slot_bytes
         rows._memory[slot : slot + packets.nbytes] = packets.view(np.uint8)
 
     group.start_round = start_with_rank_1
     results = _run_ranks([exchange], [lambda e: e.exchange(b"x0")])
-    assert results[0] == [b"x0", payload]
+    assert results[0] == [b"x0", rank_1_data]
     assert exchange.epoch == 3
 
 
@@ -730,11 +730,10 @@ def test_node_ranks_follow_gpus_per_node(rank, local):
     "lacks, requirement",
     [
         (None, None),
-        ("tp", "tensor_parallel_size equal to the world size"),
         ("cp", "context_parallel_size=1"),
         ("mnnvl", "multi-node NVLink (MNNVL) domain"),
         ("fabric", "an aarch64 host (such as a GB200 node), on which MNNVL memory is shared"),
-        ("sm", "an SM 100 GPU (Blackwell B200/GB200), because the host exchange relies on the"),
+        ("sm", "an SM 100 GPU, as in a GB200, because the host exchange relies on the copy"),
         ("mpi", "the MPI orchestrator (TLLM_DISABLE_MPI unset)"),
     ],
 )
@@ -758,7 +757,7 @@ def test_requirements_name_what_is_missing(monkeypatch, lacks, requirement):
         enable_attention_dp=True,
         pp_size=1,
         cp_size=2 if lacks == "cp" else 1,
-        tp_size=WORLD // 2 if lacks in ("tp", "cp") else WORLD,
+        tp_size=WORLD // 2 if lacks == "cp" else WORLD,
     )
     if requirement is None:
         MnnvlDist.check_requirements(mapping)

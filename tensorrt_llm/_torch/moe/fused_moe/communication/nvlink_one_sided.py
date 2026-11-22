@@ -634,9 +634,8 @@ class NVLinkOneSided(Communication):
                 barrier=not enable_wide_ep_fault_tolerance,
             )
             if enable_wide_ep_fault_tolerance:
-                # The workspace's own communicator, which its membership changes also use,
-                # synchronizes the ranks: no rank may write into a peer's row before the peer has
-                # initialized it.
+                # The workspace's own communicator synchronizes the ranks: no rank may write into a
+                # peer's row before the peer has initialized it.
                 memory_cls.get_comm(mapping).barrier()
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,

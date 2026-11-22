@@ -810,7 +810,9 @@ class MnnvlMemory:
         try:
             return _check_cu_result(cuda.cuMemImportFromShareableHandle(handle_data, handle_type))
         except RuntimeError as error:
-            raise MnnvlPeerHandleError([member], str(error)) from error
+            raise MnnvlPeerHandleError(
+                [member], f"Cannot import the MNNVL handle of rank {member}: {error}"
+            ) from error
 
     @staticmethod
     def _init_device() -> int:
