@@ -52,7 +52,7 @@ import torch
 
 from tensorrt_llm._utils import current_cuda_stream, wait_event
 from tensorrt_llm.logger import logger
-from tensorrt_llm.metrics.logging import LoggerExposure
+from tensorrt_llm.metrics.logging import LoggerExposure, format_kv_pool_fields
 from tensorrt_llm.metrics.perf import PerfMetricsRecord
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_global_profiler
@@ -66,6 +66,22 @@ from .runtime_hooks import runtime_hooks_of
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+KV_POOL_LOG_INTERVAL_ENV_VAR_NAME = "TLLM_KV_POOL_LOG_INTERVAL"
+
+
+def load_kv_pool_log_interval(env_var: str = KV_POOL_LOG_INTERVAL_ENV_VAR_NAME) -> int:
+    """Parse the per-pool KV cache log interval; unset or empty means disabled (``0``)."""
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return 0
+    try:
+        interval = int(raw)
+    except ValueError as e:
+        raise ValueError(f"Cannot parse environment variable `{env_var}`: {e}") from e
+    if interval < 0:
+        raise ValueError(f"Environment variable `{env_var}` must be non-negative, got {interval}")
+    return interval
+
 
 # The iteration log refreshes kv_cache_util (a full KV cache stats build) once
 # per this many iterations and reuses the last value in between.
@@ -849,6 +865,11 @@ class PyExecutorProfileManager:
         self.metrics = executor._perf_metrics
         self.metrics_logger = LoggerExposure(logger.info)
         self._metrics_log_rank_enabled = False
+        # Parsed here so a malformed value fails at construction (like
+        # ``TLLM_PROFILE_START_STOP``) instead of on the executor thread.
+        self._kv_pool_log_interval = load_kv_pool_log_interval()
+        self._kv_pool_log_lines = 0
+        self._kv_pool_gib_logged = False
 
     @property
     def _executor(self) -> "PyExecutor":  # noqa: F821
@@ -864,7 +885,28 @@ class PyExecutorProfileManager:
     def expose_metrics(self, record: PerfMetricsRecord) -> None:
         """Select executor-loop logging after collection and rank filtering."""
         if self._executor.print_log and self._metrics_log_rank_enabled:
-            self.metrics_logger.emit(record)
+            kv_pool_text = self._kv_pool_log_text() if self._kv_pool_log_interval else ""
+            self.metrics_logger.emit(record, kv_pool_text=kv_pool_text)
+
+    def _kv_pool_log_text(self) -> str:
+        """Return per-pool KV cache fields for every ``TLLM_KV_POOL_LOG_INTERVAL``-th log line.
+
+        Sampling counts printed lines rather than ``iter_counter``, which stays at zero
+        while a gen-only benchmark fills its batch. Unsampled lines, warmup (a temporary
+        KV cache manager) and the V1 manager read nothing.
+        """
+        executor = self._executor
+        manager = executor.kv_cache_manager
+        if manager is None or not executor._is_kv_manager_v2 or executor.is_warmup:
+            return ""
+        self._kv_pool_log_lines += 1
+        if self._kv_pool_log_lines % self._kv_pool_log_interval:
+            return ""
+        gpu_pool_gib = None
+        if not self._kv_pool_gib_logged:
+            self._kv_pool_gib_logged = True
+            gpu_pool_gib = [size / 2**30 for size in manager.get_gpu_pool_bytes()]
+        return format_kv_pool_fields(manager.get_kv_cache_pool_utilization(), gpu_pool_gib)
 
     @contextmanager
     def profile_step(self):
@@ -908,6 +950,16 @@ class PyExecutorProfileManager:
             log_all_ranks = False
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
         self._metrics_log_rank_enabled = log_all_ranks or executor.dist.rank in log_ranks
+        if (
+            self._kv_pool_log_interval
+            and not executor.is_warmup
+            and not (executor._is_kv_manager_v2 and executor.print_log)
+        ):
+            logger.warning(
+                f"{KV_POOL_LOG_INTERVAL_ENV_VAR_NAME}={self._kv_pool_log_interval} has no "
+                "effect: per-pool KV cache logging requires KV Cache Manager V2 and "
+                "print_iter_log=True."
+            )
 
         def profile_step_fn():
             nonlocal it, start_time

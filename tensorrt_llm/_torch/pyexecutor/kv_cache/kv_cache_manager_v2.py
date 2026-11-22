@@ -4572,6 +4572,50 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def get_gpu_pool_bytes(self) -> list[int]:
+        """Return the bytes of each GPU pool group: slot count times bytes per slot, all roles."""
+        return [
+            int(stat.total) * int(sum(stat.slot_sizes))
+            for stat in self._get_storage_statistics(GPU_LEVEL)
+        ]
+
+    def _log_kv_cache_pool_sizes(self) -> None:
+        """Log each GPU pool group's size and share, plus the equivalent ``pool_ratio``.
+
+        ``pool_ratio`` is indexed by layer group while pool statistics are indexed by pool
+        group, so the equivalent ratio is printed in layer-group order, as the config takes it.
+        It is only printed when every pool group holds exactly one layer group.
+        """
+        layer_groups: Dict[int, set[int]] = defaultdict(set)
+        for pool_group in self.impl.pool_group_descs:
+            for variant in pool_group.slot_desc.variants:
+                layer_groups[int(pool_group.pool_group_index)].add(int(variant.layer_group_id))
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        sizes = self.get_gpu_pool_bytes()
+        total = sum(sizes)
+        if not total:
+            return
+        for pool_group_id, (stat, size) in enumerate(zip(stats, sizes)):
+            logger.info(
+                f"pool_group_id={pool_group_id}, "
+                f"layer_group_ids={sorted(layer_groups[pool_group_id])}, "
+                f"slots={int(stat.total)}, slot_bytes={int(sum(stat.slot_sizes))}, "
+                f"bytes={size} ({size / 2**30:.3f} GiB), share={size / total:.4f}"
+            )
+        share_by_layer_group = {
+            next(iter(layer_groups[pool_group_id])): size / total
+            for pool_group_id, size in enumerate(sizes)
+            if len(layer_groups[pool_group_id]) == 1
+        }
+        if len(share_by_layer_group) == len(sizes):
+            ratio = ", ".join(
+                f"{share_by_layer_group[g]:.4f}" for g in sorted(share_by_layer_group)
+            )
+            logger.info(
+                f"GPU KV pools total {total / 2**30:.3f} GiB; "
+                f"equivalent pool_ratio (layer_group order) = [{ratio}]"
+            )
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -4586,6 +4630,18 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"{type(self).__name__} role-to-pool/lifecycle mapping:")
         for entry in entries:
             logger.info(entry)
+        self._log_kv_cache_pool_sizes()
+        # Cold levels number their pool groups independently of the hot level, so log
+        # the shared cold mapping too; per-pool offload logs are indexed by these ids.
+        if len(self.impl.cache_tier_list) > 1:
+            cold_mapping = {
+                pool_group_id: sorted(layer_group_ids)
+                for pool_group_id, layer_group_ids in self._cold_pool_group_membership()
+            }
+            logger.info(
+                f"{self.impl.cache_tier_list[1].name} pool_group_id -> layer_group_ids = "
+                f"{cold_mapping}"
+            )
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         pool_ids = torch.empty(
@@ -8896,6 +8952,36 @@ class KVCacheManagerV2(BaseResourceManager):
     def take_page_table_stats(self) -> tuple[int, int, int, float]:
         """Return and reset the page-table conversions: reused, row updates, full builds, full ms."""
         return (0, 0, 0, 0.0)
+
+    @staticmethod
+    def _utilization(total: int, remaining: int) -> float | None:
+        """Return ``1 - remaining / total``, or ``None`` for a pool without capacity."""
+        return 1.0 - remaining / total if total else None
+
+    def get_kv_cache_pool_utilization(self) -> dict[str, list[float | None] | None]:
+        """Read per-pool-group utilization from CPU-side counters.
+
+        Returns:
+            ``"gpu"`` maps to ``1 - available / total`` per GPU pool group, where
+            ``available`` counts free and evictable slots. ``"host"`` maps to the occupancy
+            ``1 - free / total`` per host pool group, including evictable cached pages, or to
+            ``None`` when there is no host tier. List positions are tier-local pool group ids;
+            zero-capacity groups read ``None``. Disk tiers are not reported.
+        """
+        pool_utilization: dict[str, list[float | None] | None] = {
+            "gpu": [
+                self._utilization(stat.total, stat.available)
+                for stat in self._get_storage_statistics(GPU_LEVEL)
+            ],
+            "host": None,
+        }
+        for level, tier in enumerate(self.impl.cache_tier_list):
+            if tier == CacheTier.HOST_MEM:
+                pool_utilization["host"] = [
+                    self._utilization(stat.total, stat.free)
+                    for stat in self._get_storage_statistics(CacheLevel(level))
+                ]
+        return pool_utilization
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
