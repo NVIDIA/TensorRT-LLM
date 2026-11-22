@@ -319,6 +319,55 @@ def _misaligned(tensor):
     return view
 
 
+@pytest.mark.parametrize("case", ("other_shape", "custom_swiglu", "not_precompiled"))
+def test_bf16_gate_up_preserves_framework_fallback(scenario, monkeypatch, case):
+    ops, _, gate_up_swiglu, _ = scenario
+    if case == "other_shape":
+        activation = torch.ones((3, 16), dtype=BF16, device="cuda")
+        weight = torch.full((32, 16), 0.25, dtype=BF16, device="cuda")
+    else:
+        activation = torch.ones((1, D), dtype=BF16, device="cuda")
+        weight = torch.full((2 * UP, D), 0.002, dtype=BF16, device="cuda")
+    settings = (2.0, 1.5, 0.25) if case == "custom_swiglu" else (None, None, None)
+
+    def unexpected_launch(*_):
+        pytest.fail("A BF16 kernel was launched outside its contract")
+
+    def precompiled(_):
+        return None if case == "not_precompiled" else unexpected_launch
+
+    monkeypatch.setattr(gate_up_swiglu, "precompiled_bf16", precompiled)
+    monkeypatch.setattr(gate_up_swiglu, "_get_compiled", unexpected_launch)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    out = ops.gate_up_bf16(activation, weight, unit, *settings)
+    ref = ops.swiglu(
+        F.linear(activation, weight),
+        swiglu_limit=settings[0],
+        swiglu_alpha=settings[1],
+        swiglu_beta=settings[2],
+    )
+    assert torch.equal(out, ref)
+
+
+def test_bf16_attention_projection_rejects_a_reshape_that_changes_rows(scenario):
+    ops = scenario[0]
+    tensors = _inputs(2, rows=1)
+    raw = torch.empty((1, 4, QK // 2), device="cuda", dtype=BF16)
+    weight = torch.empty((D, QK), device="cuda", dtype=BF16)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="Expected matching attention"):
+        ops.bf16_attention_projection(
+            raw,
+            weight,
+            unit,
+            tensors["hidden"],
+            tensors["norm_weight"],
+            tensors["modulation"],
+            tensors["indices"],
+            EPS,
+        )
+
+
 @pytest.mark.parametrize("length", (300, 4097))
 @pytest.mark.parametrize("case", ("misaligned_hidden", "int32_indices", "fp32_modulation"))
 def test_down_outside_the_kernel_contract_takes_the_unfused_path(

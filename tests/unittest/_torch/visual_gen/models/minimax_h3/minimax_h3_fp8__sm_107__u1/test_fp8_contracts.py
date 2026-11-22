@@ -817,6 +817,10 @@ def _fused_dispatch_namespace():
     )
     torch = SimpleNamespace(
         Tensor=_LayoutTensor,
+        tensor=lambda value, *, device, dtype: SimpleNamespace(
+            device=device, dtype=dtype, item=lambda: value
+        ),
+        int64="I64",
         bfloat16="BF16",
         float8_e4m3fn="FP8",
         ops=SimpleNamespace(
@@ -843,7 +847,12 @@ def _fused_dispatch_namespace():
     namespace = dict(
         torch=torch,
         _DispatchModule=type(
-            "_DispatchModule", (), {"__call__": lambda self, *a, **kw: self.forward(*a, **kw)}
+            "_DispatchModule",
+            (),
+            {
+                "__init__": lambda self, **kwargs: vars(self).update(kwargs),
+                "__call__": lambda self, *a, **kw: self.forward(*a, **kw),
+            },
         ),
         Optional=Optional,
         Linear=SimpleNamespace,
@@ -928,7 +937,9 @@ class FusedDispatchContracts(unittest.TestCase):
                 calls.append("family_ffn")
                 return tensor(hidden.shape)
 
-        attention = namespace["Fp8Attention"]()
+        attention = namespace["Fp8Attention"](layer_idx=0)
+        assert attention._fp8_block_id.device == "cpu"
+        assert attention._fp8_block_id.item() == attention.layer_idx
         attention.qkv_proj = Projection((21504, 5376))
         attention.to_out = [Projection((5376, 7168))]
         attention.use_async_ulysses = False
@@ -937,7 +948,6 @@ class FusedDispatchContracts(unittest.TestCase):
         attention._use_fused_fp8_qk = lambda *args: True
         attention._use_packed_a2a = lambda *args: False
         attention.head_dim, attention.local_num_attention_heads, attention.layer_idx = 128, 56, 0
-        attention._fp8_block_id = SimpleNamespace(item=lambda: 0)
         attention.norm_q = attention.norm_k = SimpleNamespace(
             weight=tensor((128,)), variance_epsilon=1e-6
         )
