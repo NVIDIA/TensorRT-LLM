@@ -1702,6 +1702,84 @@ def test_legacy_routed_cancel_drains_admitted_writes_and_fences_late_writes(aux)
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("retired", [False, True])
+def test_routed_cancel_preserves_fence_during_ack_registration(retired) -> None:
+    rid = 111
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._context_first_ownership = True
+    if retired:
+        sender._retired_rids[rid] = time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1
+
+    def get_peer_rank_info(_name, _rank):
+        sender.sweep_stale_req_infos()
+        return SimpleNamespace(self_endpoint="receiver")
+
+    sender._registrar = SimpleNamespace(get_peer_rank_info=get_peer_rank_info)
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
+    sender._handle_cancel_session([MessageType.CANCEL_SESSION, b"111", b"gen", b"1"])
+    params = DisaggregatedParams(
+        disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+    )
+    session = transfer_mod.TxSession(rid, params, sender)
+
+    assert session.has_failed()
+    assert sender._send_session_quiesced(sender._send_task_queues[0].get_nowait())
+    dealer.send.assert_called_once_with([MessageType.SESSION_QUIESCED, b"0", b"111"])
+    assert not sender._pending_session_quiescence
+
+
+@pytest.mark.cpu_only
+def test_failed_legacy_bounce_receive_keeps_waiting_after_session_ack() -> None:
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    session = _make_rx_session(receiver, 112)
+    session.receive(_sole_piece())
+    _publish_report_tokens(session, ranks=(0, 1))
+    session.process_kv_agent_result(0, 0, True, AgentResult.FAILED, _KV_RESULT_REPORT_TOKEN)
+    session.notify_cancel()
+    session.process_session_quiesced(1)
+
+    assert session.failed_receive_awaits_writers()
+    assert KvCacheTransceiverV2._retirement_blocked(session)
+    dealer = Mock()
+    listener = SimpleNamespace(
+        _get_session=lambda _: session, _get_or_connect_dealer=lambda _: dealer
+    )
+    Receiver.send_cancel_to_senders(listener, 112, {"sender"})
+    dealer.send.assert_called_once_with([MessageType.CANCEL_SESSION, b"112"])
+
+
+@pytest.mark.cpu_only
+def test_shutdown_waits_for_routed_legacy_write_without_agent_recovery(monkeypatch) -> None:
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    params = DisaggregatedParams(disagg_request_id=113)
+    session = transfer_mod.TxSession(113, params, sender)
+    task = transfer_mod.SendTaskBase(params)
+    session.kv_tasks.append(task)
+    task._native_inflight = 1
+    session.cancel_local(by_peer=True, report_unsubmitted_aux=False, routed=True)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._agent_recovery = False
+    transceiver._transfer_worker = SimpleNamespace(_sender=sender)
+    transceiver.kv_transfer_timeout_ms = 1000
+
+    def complete_write(_delay):
+        assert sender._get_session(113) is session
+        task._native_inflight = 0
+
+    sleep = Mock(side_effect=complete_write)
+    monkeypatch.setattr(transceiver_mod.time, "sleep", sleep)
+    transceiver._close_session_or_raise(session, 113, "shutdown")
+
+    sleep.assert_called_once()
+    assert sender._get_session(113) is None
+
+
+@pytest.mark.cpu_only
 def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> None:
     rid = 98
     sender = object.__new__(transfer_mod.Sender)

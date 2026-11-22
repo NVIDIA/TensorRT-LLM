@@ -345,6 +345,7 @@ class _NodeShare:
         self.segments: dict[int, _broker.OwnedSegment] = {}
         self.fds: list[int] = []
         self.vmm: Optional[_VmmChunks] = None
+        self.vmm_owned_by_storage = False
 
     def close(self) -> None:
         for segment in self.segments.values():
@@ -353,9 +354,10 @@ class _NodeShare:
         for fd in self.fds:
             os.close(fd)
         self.fds.clear()
-        if self.vmm is not None:
+        if self.vmm is not None and not self.vmm_owned_by_storage:
             self.vmm.close()
-            self.vmm = None
+        self.vmm = None
+        self.vmm_owned_by_storage = False
 
 
 def _all_agree(ok: bool) -> bool:
@@ -514,7 +516,13 @@ class PleHostTable:
 
     def _fill_node(self, copy: Copy, read: Read) -> bool:
         vmm = self._node.vmm
-        self.table = vmm.view(self.rows, self.cols, self.dtype, self.device)
+        if self.table is None:
+            table = vmm.view(self.rows, self.cols, self.dtype, self.device)
+            # PyTorch preserves the storage wrapper across tensor aliases.
+            # Parameters and detached views can outlive this table object.
+            weakref.finalize(table.untyped_storage(), vmm.close).atexit = False
+            self._node.vmm_owned_by_storage = True
+            self.table = table
         try:
             for k in list(self._node.segments):
                 self._fill_and_publish(k, copy)

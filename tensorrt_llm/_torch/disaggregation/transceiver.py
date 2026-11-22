@@ -1425,21 +1425,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
         """Close one terminal session or fail-stop instead of diverging locally."""
+        recovery_enabled = getattr(self, "_agent_recovery", False)
         if (
             outcome == "shutdown"
-            and getattr(self, "_agent_recovery", False)
             and isinstance(session, (TxSession, RxSession))
             and not getattr(session, "_enforce_physical_ownership", False)
+            and (
+                recovery_enabled
+                or isinstance(session, TxSession)
+                and session._close_requires_drain()
+            )
         ):
             sender = self._transfer_worker._sender
-            deadline = time.monotonic() + sender._retirement_timeout_s
+            timeout_s = (
+                sender._retirement_timeout_s
+                if recovery_enabled
+                else self.kv_transfer_timeout_ms / 1000.0
+            )
+            started_at = time.monotonic()
+            deadline = started_at + timeout_s
             session.cancel()
             while self._retirement_blocked(session):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    sender._fail_agent_recovery(
-                        sender._agent_generation, rid, deadline - sender._retirement_timeout_s
-                    )
+                    if recovery_enabled:
+                        sender._fail_agent_recovery(sender._agent_generation, rid, started_at)
                     raise RuntimeError("NIXL shutdown retirement timed out")
                 time.sleep(min(0.01, remaining))
         if self._ownership_blocks_retirement(session):

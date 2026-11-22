@@ -967,11 +967,11 @@ class Sender(SenderBase):
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
             if owned and unique_rid in self._sessions:
                 raise RuntimeError("cannot replace an owned TxSession")
-            self._retired_rids.pop(unique_rid, None)
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 cancelled_by_peer = self._pre_cancelled_rids[unique_rid]
             if not pre_cancel:
+                self._retired_rids.pop(unique_rid, None)
                 self._sessions[unique_rid] = tx_session if owned else weakref.ref(tx_session)
         if pre_cancel:
             if owned:
@@ -987,6 +987,7 @@ class Sender(SenderBase):
                         raise RuntimeError("cannot replace an owned TxSession")
                     # Keep the fence for this immutable request ID after
                     # session cleanup, so delayed creation cannot reopen it.
+                    self._routed_cancels.discard(unique_rid)
                     with self._peer_requests_lock:
                         req_infos = list(self._peer_requests.get(unique_rid, {}).values())
                     self._sessions[unique_rid] = tx_session
@@ -2323,31 +2324,39 @@ class Sender(SenderBase):
     def _handle_cancel_session(self, message: list[bytes]):
         unique_rid = int(message[1])
         routed = len(message) == 4
+        marker = None
+        if routed:
+            rank = int(message[3])
+            peer = self._registrar.get_peer_rank_info(message[2].decode(), rank)
+            marker = _SessionQuiescence(unique_rid, rank, peer.self_endpoint)
         unsubmitted = []
         with self._sessions_lock:
             session = self._get_session(unique_rid)
             owned = (
                 session._enforce_physical_ownership
                 if session is not None
-                else self.ownership_enabled(context_first=routed)
+                else self.ownership_enabled(context_first=False)
             )
             if routed and not owned:
                 self._routed_cancels.add(unique_rid)
             if session is None or owned or routed:
                 self._pre_cancelled_rids.setdefault(unique_rid, True)
+            if marker is not None:
+                marker = self._reserve_session_quiescence_locked(marker)
             if session is None and not owned and not routed:
                 with self._peer_requests_lock:
                     unsubmitted = list(self._peer_requests.get(unique_rid, {}).values())
-        if session is not None:
-            if owned:
-                session.cancel_local(by_peer=True)
-            elif routed:
-                session.cancel_local(by_peer=True, report_unsubmitted_aux=False, routed=True)
-            else:
-                session.cancel(by_peer=True)
-        if routed:
-            # CANCEL carries the reply route even after REQUEST_DATA expires.
-            self._queue_session_quiescence(unique_rid, message[2].decode(), int(message[3]))
+        try:
+            if session is not None:
+                if owned:
+                    session.cancel_local(by_peer=True)
+                elif routed:
+                    session.cancel_local(by_peer=True, report_unsubmitted_aux=False, routed=True)
+                else:
+                    session.cancel(by_peer=True)
+        finally:
+            if marker is not None:
+                self._enqueue_session_quiescence(marker)
         for info in unsubmitted:
             self._send_failed_result_to_receiver(
                 info, include_aux=info.aux_slot is not None and info.slice_id == 0
@@ -2358,16 +2367,27 @@ class Sender(SenderBase):
     ) -> None:
         """Queue proof on the same worker/socket as this peer's piece results."""
         endpoint = self._registrar.get_peer_rank_info(instance_name, instance_rank).self_endpoint
-        key = (unique_rid, instance_rank)
         with self._sessions_lock:
-            if (
-                getattr(self, "_quiescence_closed", False)
-                or key in self._pending_session_quiescence
-            ):
+            if unique_rid not in self._pre_cancelled_rids:
                 return
-            marker = _SessionQuiescence(unique_rid, instance_rank, endpoint)
-            self._pending_session_quiescence[key] = marker
-            self._send_task_queues[hash(key) % self._num_threads].put(marker)
+            marker = self._reserve_session_quiescence_locked(
+                _SessionQuiescence(unique_rid, instance_rank, endpoint)
+            )
+            if marker is not None:
+                self._enqueue_session_quiescence(marker)
+
+    def _reserve_session_quiescence_locked(
+        self, marker: _SessionQuiescence
+    ) -> Optional[_SessionQuiescence]:
+        key = (marker.unique_rid, marker.peer_rank)
+        if getattr(self, "_quiescence_closed", False) or key in self._pending_session_quiescence:
+            return None
+        self._pending_session_quiescence[key] = marker
+        return marker
+
+    def _enqueue_session_quiescence(self, marker: _SessionQuiescence) -> None:
+        key = (marker.unique_rid, marker.peer_rank)
+        self._send_task_queues[hash(key) % self._num_threads].put(marker)
 
     def _send_session_quiesced(self, marker: _SessionQuiescence) -> bool:
         """Acknowledge a fenced, drained session; return False to retry later.
@@ -4038,7 +4058,7 @@ class Receiver(ReceiverBase):
             return set()
         message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
         session = self._get_session(unique_rid)
-        if session is not None:
+        if session is not None and getattr(session, "_uses_legacy_bounce", False) is not True:
             rank_info = self._registrar.self_rank_info
             message.extend(
                 [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
@@ -4250,6 +4270,10 @@ class RxSession(RxSessionBase):
         self._aux_expected_writers = 0
         self._aux_writer_reports: set[int] = set()
         self._legacy_quiesced_writers: set[int] = set()
+        self._uses_legacy_bounce = (
+            not self._enforce_physical_ownership
+            and getattr(getattr(receiver, "_agent", None), "bounce_enabled", False) is True
+        )
         self._recovery_failed = False
         self._aux_status: TaskStatus = TaskStatus.INIT
         self._publication_may_have_escaped = False
@@ -4967,7 +4991,10 @@ class RxSession(RxSessionBase):
             if self._closed or not self._cancel_notification_started or not self.has_failed():
                 return
             if not self._enforce_physical_ownership:
-                self._legacy_quiesced_writers.add(peer_rank)
+                # A bounce failure can resolve the sender before a receiver scatter finishes.
+                # Keep the legacy writer wait for this transport.
+                if not self._uses_legacy_bounce:
+                    self._legacy_quiesced_writers.add(peer_rank)
                 return
             owners = [task._get_physical_owner() for task in self._kv_tasks]
             if self._aux_physical_owner is not None:

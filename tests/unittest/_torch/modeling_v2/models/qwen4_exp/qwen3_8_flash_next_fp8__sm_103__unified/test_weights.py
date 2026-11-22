@@ -8,6 +8,7 @@ from __future__ import annotations
 import collections
 import gc
 import json
+import os
 import re
 import struct
 from collections.abc import Callable
@@ -605,7 +606,10 @@ def test_host_table_preserves_stored_dtype(dtype: torch.dtype) -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", (torch.float8_e4m3fn, torch.bfloat16))
-def test_host_table_node_allocates_dtype_bytes(dtype: torch.dtype, monkeypatch) -> None:
+@pytest.mark.parametrize("retain_storage_alias", [False, True])
+def test_host_table_node_allocates_dtype_bytes(
+    dtype: torch.dtype, monkeypatch, retain_storage_alias: bool
+) -> None:
     """Node allocations reserve every byte while retaining dtype-independent row chunks, and are
     released when the table is collected."""
     host_table = _host_table_module()
@@ -614,14 +618,25 @@ def test_host_table_node_allocates_dtype_bytes(dtype: torch.dtype, monkeypatch) 
 
     class Chunks:
         def __init__(self, device_index: int, chunk_bytes: int, count: int, node: int) -> None:
+            self.chunk_bytes = chunk_bytes
             allocations.append((device_index, chunk_bytes, count, node))
 
         def close(self) -> None:
             closed.append(True)
 
+        def view(self, rows, cols, dtype, device):
+            return torch.zeros(rows, cols, dtype=dtype)
+
+        def attach(self, chunk, fd):
+            pass
+
+        def complete(self) -> bool:
+            return True
+
     monkeypatch.setattr(host_table, "_VmmChunks", Chunks)
     monkeypatch.setattr(host_table, "device_numa_node", lambda device: 0)
     monkeypatch.setattr(host_table._broker, "try_own", lambda key: None)
+    monkeypatch.setattr(host_table, "CHUNKS", 1)
     table = host_table.PleHostTable(
         host_table.NODE,
         23,
@@ -641,8 +656,29 @@ def test_host_table_node_allocates_dtype_bytes(dtype: torch.dtype, monkeypatch) 
         )
         assert allocations == [(0, chunk_bytes, host_table.CHUNKS, 0)]
         assert table._node_error is None
+        if retain_storage_alias:
+            monkeypatch.setattr(host_table.PleHostTable, "_check_chunk", lambda *_: None)
+            monkeypatch.setattr(
+                host_table._broker,
+                "acquire",
+                lambda *_: (
+                    "attach",
+                    os.open(os.devnull, os.O_RDONLY),
+                    {"chunk_bytes": chunk_bytes},
+                ),
+            )
+            assert table._fill_node(None, None)
+            model = torch.nn.Module()
+            model.weight = torch.nn.Parameter(table.table, requires_grad=False)
+            alias = model.state_dict()["weight"][:, :1]
+            del model
     finally:
         del table
+        gc.collect()
+    if retain_storage_alias:
+        assert closed == []
+        assert alias.shape == (23, 1)
+        del alias
         gc.collect()
     assert closed == [True]
 
