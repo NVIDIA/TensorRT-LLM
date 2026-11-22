@@ -11,8 +11,13 @@ import torch
 import tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 as resource_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._manager import keyed_by_placeholders
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm.inputs.multimodal import MultimodalParams, request_cache_salt
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_NO_CONTENT_HASHES_KEY,
+    MultimodalParams,
+    request_cache_salt,
+)
 from tensorrt_llm.inputs.registry import create_input_processor_with_hash
 from tensorrt_llm.runtime.kv_cache_hash import hash_v1_block_key
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -518,3 +523,28 @@ def test_requests_without_content_hashes_do_not_share_block_keys(case: str) -> N
     if case != "hashing_off":
         assert len(v1_keys) == 2
         assert not set(v1_keys[0]) & set(v1_keys[1])
+
+
+@pytest.mark.parametrize(
+    "py_multimodal_data,expected",
+    [
+        ({"image": {}}, False),
+        ({"image": {}, MULTIMODAL_NO_CONTENT_HASHES_KEY: True}, True),
+    ],
+    ids=["content_hashes", "random_hashes"],
+)
+def test_kv_lender_treats_random_hashes_like_no_hashes(py_multimodal_data, expected) -> None:
+    """The KV lender does not lend blocks whose multimodal keys do not name the content."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    request = SimpleNamespace(
+        py_multimodal_data=py_multimodal_data,
+        multimodal_hashes=[list(_HASH_INTS)],
+        multimodal_positions=[1],
+        multimodal_lengths=[4],
+    )
+
+    assert keyed_by_placeholders(request) is expected
+    PyExecutor._release_multimodal_resources(None, request)
+    assert "image" not in request.py_multimodal_data
+    assert keyed_by_placeholders(request) is expected

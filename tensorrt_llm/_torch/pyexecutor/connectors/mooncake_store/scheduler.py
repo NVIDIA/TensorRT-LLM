@@ -27,6 +27,7 @@ do the moving. That needs two pieces of per-request bookkeeping:
 from typing import Dict, List, Optional, Tuple
 
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_NO_CONTENT_HASHES_KEY
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
@@ -49,8 +50,12 @@ def _multimodal_item_digests(request: LlmRequest) -> Optional[Tuple[bytes, ...]]
         multimodal one, and None when the request carries media the digests do
         not describe. The placeholder tokens of such a request say nothing
         about its content, so no key names its pages without naming someone
-        else's; the caller leaves it alone.
+        else's; the caller leaves it alone. Random digests, which the input
+        processor flags, name pages that no other request can look up.
     """
+    multimodal_data = getattr(request, "py_multimodal_data", None)
+    if isinstance(multimodal_data, dict) and multimodal_data.get(MULTIMODAL_NO_CONTENT_HASHES_KEY):
+        return None
     # The same three fields `KVCacheManagerV2` reads to decide whether a
     # request is multimodal, so local reuse and the store agree.
     hashes = request.multimodal_hashes
@@ -85,7 +90,7 @@ def _reuse_scope(request: LlmRequest) -> Optional[ReuseScope]:
     if digests is None:
         logger.warning_once(
             "mooncake-store is bypassing requests whose multimodal content "
-            "carries no hashes: their prompt tokens do not identify the media "
+            "carries no content hashes: their prompt tokens do not identify the media "
             "behind them, so a stored page could be served to a different "
             "request.",
             key="mooncake-store-unhashed-multimodal",

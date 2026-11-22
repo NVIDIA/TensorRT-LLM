@@ -609,7 +609,7 @@ def _validate_multimodal_runs(
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
-    """Clear `mm_data` in place, retaining only `mrope_config.mrope_position_deltas`.
+    """Release encoder data, keeping generation positions and cache identity.
 
     Shared primitive behind `MultimodalParams.strip_for_generation` (which applies
     it to a detached copy, preserving its caller's dict) and the post-prefill
@@ -622,7 +622,13 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     mrope_deltas = None
     if isinstance(mrope_config, dict):
         mrope_deltas = mrope_config.get('mrope_position_deltas')
+    no_content_hashes = mm_data.get(MULTIMODAL_NO_CONTENT_HASHES_KEY)
+    cache_salt = mm_data.get(MULTIMODAL_CACHE_SALT_KEY)
     mm_data.clear()
+    if no_content_hashes:
+        mm_data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
+    if cache_salt is not None:
+        mm_data[MULTIMODAL_CACHE_SALT_KEY] = cache_salt
     if mrope_deltas is not None:
         mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
 
@@ -1345,8 +1351,7 @@ class MultimodalParams:
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_position_deltas and removes all other multimodal data
-        (embeddings, images, etc.) as they're not needed during generation.
+        Keep position deltas and cache identity while releasing encoder payloads.
         """
         if not self.multimodal_data:
             return
