@@ -94,7 +94,10 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
     try:
         if not ffmpeg_available:
             try:
-                llm_venv.run_cmd(["-m", "pip", "install", "imageio-ffmpeg==0.8.1"])
+                llm_venv.run_cmd(
+                    ["-m", "pip", "install", "imageio-ffmpeg==0.8.1"],
+                    timeout=240,
+                )
                 exe = llm_venv.run_output(
                     "import imageio_ffmpeg\nprint(imageio_ffmpeg.get_ffmpeg_exe())"
                 ).strip()
@@ -105,7 +108,7 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
                         f"{bin_dir}{os.pathsep}{prev_path}" if prev_path else bin_dir
                     )
                     ffmpeg_available = shutil.which("ffmpeg") is not None
-            except (subprocess.SubprocessError, OSError) as err:
+            except (subprocess.SubprocessError, OSError, RuntimeError) as err:
                 print_warning(f"imageio-ffmpeg wheel setup failed, falling back to apt: {err}")
             if not ffmpeg_available:
                 install_ffmpeg_via_apt()

@@ -35,6 +35,7 @@ from cbts.command.report_decision import _stage_group
 from cbts.coverage.selection.touch_db import stage_family
 from cbts.coverage.tier import write_coverage_test_db
 from cbts.rules import test_list as test_list_mod
+from cbts.rules._helpers import lookup_paths_into_block_filters
 from cbts.rules.base import PRInputs
 from cbts.rules.waives import WAIVES_FILE, WaivesRule
 
@@ -162,7 +163,8 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
         "unittest/_torch/attention/sparse "
         "--ignore=unittest/_torch/attention/sparse/dsa "
         "--ignore unittest/_torch/attention/sparse/multi_gpu "
-        '--ignore-glob="unittest/_torch/attention/sparse/msa/*"'
+        '--ignore-glob="unittest/_torch/attention/sparse/msa/*" '
+        '--ignore-glob="*slow*"'
     )
     (test_db / "l0_b200.yml").write_text(
         yaml.safe_dump(
@@ -171,16 +173,20 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
         )
     )
     index = YAMLIndex.load(test_db)
-    matches = index.find_matches_for_waive(
-        "unittest/_torch/attention/sparse/csa2/test_backend.py::test_foo"
-    )
-    assert matches is not None and [(b.yaml_stem, lvl) for b, lvl in matches] == [
-        ("l0_b200", "unittest/_torch/attention/sparse")
-    ]
+    for retained in (
+        "unittest/_torch/attention/sparse/csa2/test_backend.py::test_foo",
+        "unittest/_torch/attention/sparse/csa2/test_backend.py::test_slow",
+    ):
+        matches = index.find_matches_for_waive(retained)
+        assert matches is not None and [(b.yaml_stem, lvl) for b, lvl in matches] == [
+            ("l0_b200", "unittest/_torch/attention/sparse")
+        ]
+        assert index.find_match_for_path(retained) is not None
     for excluded in (
         "unittest/_torch/attention/sparse/dsa/test_bar.py",
         "unittest/_torch/attention/sparse/multi_gpu/test_baz.py",
         "unittest/_torch/attention/sparse/msa/test_proxy.py",
+        "unittest/_torch/attention/sparse/csa2/test_slow_ops.py::test_x",
     ):
         assert index.find_matches_for_waive(excluded) is None
         assert index.find_match_for_path(excluded) is None
@@ -299,12 +305,58 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
     res_pen = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: penalties_diff}))
     assert res_pen is not None and res_pen.affected_stages == {"A10-PyTorch-1"}
 
+    sampler_diff = (
+        "@@ -1,1 +1,2 @@\n"
+        "+unittest/_torch/sampler/test_in_graph_sampling.py::test_x SKIP (https://nvbugs/3)\n"
+    )
+    res_sampler = rule.apply(
+        PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: sampler_diff})
+    )
+    assert res_sampler is not None and res_sampler.affected_stages == {
+        "A10-PyTorch-1",
+        "DGX_B200-PyTorch-1",
+    }
+
     non_fp4_diff = (
         "@@ -1,1 +1,2 @@\n"
         "+unittest/disaggregated/test_deepseek_v4_kv_transfer.py::test_transfer[bf16] SKIP (https://nvbugs/2)\n"
     )
     res_kv = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: non_fp4_diff}))
     assert res_kv is not None and res_kv.affected_stages == {"DGX_B200-PyTorch-1"}
+
+
+def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
+    tmp_path: Path,
+) -> None:
+    """A walked-up support-file match must survive alongside a direct test match in the same block."""
+    test_db = tmp_path / "test-db"
+    test_db.mkdir()
+    entries = [
+        "disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance",
+        "other_suite/test_unrelated.py::test_keep_when_touched",
+        "other_suite/test_untouched.py::test_drop",
+    ]
+    (test_db / "l0_a10.yml").write_text(
+        yaml.safe_dump(
+            {"version": "0.0.1", "l0_a10": [{"condition": _CONDITION, "tests": entries}]},
+            sort_keys=False,
+        )
+    )
+    index = YAMLIndex.load(test_db)
+    bf, unmatched = lookup_paths_into_block_filters(
+        index,
+        [
+            "disaggregated/test_configs/disagg_config_cache_aware_balance.yaml",
+            "other_suite/test_unrelated.py::test_keep_when_touched",
+        ],
+    )
+    assert unmatched == []
+    filtered = tmp_path / "filtered"
+    write_filtered_test_db(test_db, filtered, bf)
+    assert yaml.safe_load((filtered / "l0_a10.yml").read_text())["l0_a10"][0]["tests"] == [
+        "disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance",
+        "other_suite/test_unrelated.py::test_keep_when_touched",
+    ]
 
 
 def test_test_list_rule_b200_addition_with_cpu_deletion_leaves_cpu_unfiltered(

@@ -156,13 +156,22 @@ def _entry_excludes_waive(entry: str, waive_id: str) -> bool:
     if not waive_target:
         return False
     waive_file = waive_target.split("::", 1)[0]
+    waive_paths = [waive_file]
+    cur_path = waive_file
+    while "/" in cur_path:
+        cur_path = cur_path.rsplit("/", 1)[0]
+        waive_paths.append(cur_path)
     for m in _IGNORE_OPT_RE.finditer(norm_entry):
         ignored = _normalize_target_path(m.group(1).strip("\"'"))
         if ignored and _target_in_filter_subtree(waive_target, ignored):
             return True
     for m in _IGNORE_GLOB_OPT_RE.finditer(norm_entry):
         pat = m.group(1).strip("\"'")
-        if pat and (fnmatchcase(waive_file, pat) or fnmatchcase(waive_target, pat)):
+        if not pat:
+            continue
+        if any(fnmatchcase(p, pat) for p in waive_paths) or (
+            pat.endswith("/*") and fnmatchcase(f"{waive_file}/_", pat)
+        ):
             return True
     for m in _DESELECT_OPT_RE.finditer(norm_entry):
         deselected = _normalize_target_path(m.group(1).strip("\"'"))
@@ -391,6 +400,22 @@ class YAMLIndex:
             result.append((block, prefix))
         return result or None
 
+    def find_match_for_path_with_anchor(
+        self, path: str
+    ) -> Optional[tuple[str, list[tuple[Block, str]]]]:
+        """Like `find_match_for_path`, also returning the resolved lookup anchor."""
+        anchor = _path_lookup_anchor(path)
+        if not anchor:
+            return None
+        is_file_anchor = anchor == path
+        while True:
+            matches = self._lookup_at_anchor(anchor)
+            if matches is not None:
+                return anchor, matches
+            if is_file_anchor or "/" not in anchor:
+                return None
+            anchor = anchor.rsplit("/", 1)[0]
+
     def find_match_for_path(self, path: str) -> Optional[list[tuple[Block, str]]]:
         """Find YAML entries that share pytest-tree lineage with `path`.
 
@@ -406,17 +431,8 @@ class YAMLIndex:
         such ancestor. `test_*.py` paths anchor on the file itself
         without walking up.
         """
-        anchor = _path_lookup_anchor(path)
-        if not anchor:
-            return None
-        is_file_anchor = anchor == path
-        while True:
-            matches = self._lookup_at_anchor(anchor)
-            if matches is not None:
-                return matches
-            if is_file_anchor or "/" not in anchor:
-                return None
-            anchor = anchor.rsplit("/", 1)[0]
+        res = self.find_match_for_path_with_anchor(path)
+        return res[1] if res is not None else None
 
     def all_test_ids(self) -> Iterable[str]:
         return self._test_to_blocks.keys()

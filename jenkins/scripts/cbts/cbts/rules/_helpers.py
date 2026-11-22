@@ -23,7 +23,6 @@ from cbts.blocks import (
     YAMLIndex,
     _entry_excludes_waive,
     _entry_target,
-    _path_lookup_anchor,
     _target_in_filter_subtree,
     block_matches_stage,
 )
@@ -315,11 +314,11 @@ def lookup_paths_into_block_filters(
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
     unmatched: list[str] = []
     for path in paths:
-        matches = yaml_index.find_match_for_path(path)
-        if matches is None:
+        res = yaml_index.find_match_for_path_with_anchor(path)
+        if res is None:
             unmatched.append(path)
             continue
-        anchor = _path_lookup_anchor(path) or path
+        resolved_anchor, matches = res
         for block, prefix in matches:
             key = (block.yaml_stem, block.block_index)
             ids = block_filters.setdefault(key, {}).setdefault(prefix, set())
@@ -327,10 +326,10 @@ def lookup_paths_into_block_filters(
                 target = _entry_target(raw)
                 if (
                     _target_in_filter_subtree(target, prefix)
-                    and not _entry_excludes_waive(raw, anchor)
+                    and not _entry_excludes_waive(raw, resolved_anchor)
                     and (
-                        _target_in_filter_subtree(anchor, target)
-                        or _target_in_filter_subtree(target, anchor)
+                        _target_in_filter_subtree(resolved_anchor, target)
+                        or _target_in_filter_subtree(target, resolved_anchor)
                     )
                 ):
                     ids.add(raw)
