@@ -873,6 +873,40 @@ def test_a_window_prices_at_the_scale_of_the_bucket_its_busiest_rank_pads_to(mon
     assert update.moved == [] and not update.copy_items
 
 
+def test_a_window_whose_ranks_admit_a_request_at_every_call_still_decides(monkeypatch):
+    """Regression: a rank that admits a request at every call of a window ran only batches with
+    context requests, which recorded nothing; its zero forwards voided the window for every rank
+    (the decider's forwards.min() < 1), and under immediate refill at 128 requests per GPU almost
+    no window survived. Counting the generation rows of those batches keeps the window."""
+    from _torch.moe import adaptive_eplb_reference as reference
+
+    monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_route_into", reference.route_into, False)
+    monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_record", reference.record, False)
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    forwards = {}
+    for rows in (None, (1, 5)):  # without generation rows: the rule before the fix
+        balancer = manager()
+        layers = [balancer.add_layer(E, 2, LOCAL) for _ in range(L)]
+        for layer in layers:
+            layer.prepare_device_state(torch.int64, "cpu")
+        # 1 context token, then 4 generation tokens.
+        ids = torch.tensor([[7, 6]] + [[0, 1]] * 4, dtype=torch.int32)
+        for _ in range(FORWARDS):  # every call of the window admits one request on this rank
+            balancer.observe_scheduled_batch(4, False, False, lambda start, stop: (0, 0, 0), rows)
+            for layer in layers:
+                layer.update_statistic_with_local_ids(ids, True, True)
+                layer.route(ids)
+        forwards[rows] = [int(layer.statistics.forwards.item()) for layer in layers]
+    assert forwards == {None: [0] * L, (1, 5): [FORWARDS] * L}
+    moved = {}
+    for rows, counts in forwards.items():
+        decider = measured_decider(0.5)
+        window_stats(decider.stats)
+        decider.stats[0, L * E : L * (E + 1)] = counts  # rank 0 is the admitting rank
+        moved[rows] = decider.decide(0).moved
+    assert moved == {None: [], (1, 5): [0, 1]}
+
+
 @closes_runtimes
 def test_statistics_count_only_inside_the_windows_the_runtime_schedules(host_cuda, monkeypatch):
     """The recording flag is set from a window's open to its close and clear between windows, on the

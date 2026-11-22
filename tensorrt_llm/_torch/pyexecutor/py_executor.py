@@ -12513,10 +12513,18 @@ class PyExecutor:
             balancer = getattr(self, "_moe_load_balancer", None)
             if balancer is not None:
                 generation = scheduled_requests.generation_requests
+                # The forward lays out the context tokens first, then each
+                # generation request's token and draft tokens.
+                generation_tokens = sum(1 + get_draft_token_length(req)
+                                        for req in generation)
                 balancer.observe_scheduled_batch(
-                    len(generation), not scheduled_requests.context_requests,
-                    self.is_warmup, lambda start, stop: generation_progress(
-                        generation, start, stop))
+                    len(generation),
+                    not scheduled_requests.context_requests,
+                    self.is_warmup,
+                    lambda start, stop: generation_progress(
+                        generation, start, stop),
+                    generation_rows=(num_ctx_tokens,
+                                     num_ctx_tokens + generation_tokens))
 
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations. With the

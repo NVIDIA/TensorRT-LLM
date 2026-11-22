@@ -49,6 +49,43 @@ def _counts(*values: float) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.float32)
 
 
+def test_a_batch_with_context_requests_counts_only_its_generation_rows():
+    """The executor names the rows of the generation tokens of a batch that also runs context
+    requests (they follow the context tokens); the statistics count those rows and the forward,
+    also across a chunked forward, and the router path hands such a batch to the separate launches.
+    Without the rows a mixed batch records nothing, as before."""
+    balancer = _balancer()
+    layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
+    layer.prepare_device_state(torch.int64, "cpu")
+    context = torch.tensor([[7, 6]] * 3, dtype=torch.int32)  # 3 context tokens, all on experts 7, 6
+    generation = torch.tensor([[0, 1], [0, 2]], dtype=torch.int32)
+    ids = torch.cat([context, generation])
+    balancer.observe_scheduled_batch(2, False, False, lambda start, stop: (0, 0, 0), (3, 5))
+    assert balancer.recording and balancer.counted_rows == (3, 5)
+    assert layer.router_route(True) is None
+    layer.update_statistic_with_local_ids(ids, True, True)
+    assert layer.route(ids).shape == ids.shape  # the route still maps every row
+    assert torch.equal(layer.statistics.rows, _counts(2, 1, 1, 0, 0, 0, 0, 0))
+    assert layer.statistics.forwards.item() == 1
+    # A chunked forward: chunk 1 holds 2 context tokens, chunk 2 the third and the generation ones.
+    layer.update_statistic_with_local_ids(ids[:2], True, False)
+    layer.route(ids[:2])
+    layer.update_statistic_with_local_ids(ids[2:], False, True)
+    layer.route(ids[2:])
+    assert torch.equal(layer.statistics.rows, _counts(4, 2, 2, 0, 0, 0, 0, 0))
+    assert layer.statistics.forwards.item() == 2
+    # A generation-only batch counts every row again.
+    _observe(balancer, 2)
+    assert balancer.counted_rows is None and layer.router_route(True) is not None
+    layer.update_statistic_with_local_ids(generation, True, True)
+    layer.route(generation)
+    assert torch.equal(layer.statistics.rows, _counts(6, 3, 3, 0, 0, 0, 0, 0))
+    # A mixed batch without generation rows (or with none) records nothing.
+    for rows in (None, (3, 3)):
+        balancer.observe_scheduled_batch(2, False, False, lambda start, stop: (0, 0, 0), rows)
+        assert not balancer.recording and balancer.counted_rows is None
+
+
 def test_a_layer_built_outside_the_balancer_registers_nothing():
     """``unbalanced_layer`` hides the balancer while a layer outside it is built, drops that layer's
     repeat count and restores the balancer, also on error. A layer that does not fit is refused."""

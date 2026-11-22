@@ -256,6 +256,8 @@ class AdaptiveMoeLayerLoadBalancer:
         self._route_staging: Callable[[int, int, torch.device], object | None] | None = None
         self._pending: tuple[torch.Tensor, bool] | None = None
         self._route_into = None
+        # Local token rows of the forward the calls so far covered (a chunked forward's offset).
+        self._rows_seen = 0
 
     def get_repeat_count(self) -> int:
         return self.repeated_count
@@ -329,7 +331,21 @@ class AdaptiveMoeLayerLoadBalancer:
         if self.manager.recording or (
             statistics.rows.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
-            self._pending = (local_raw_expert_ids, is_first_stage)
+            self._pending = (self._counted(local_raw_expert_ids, is_first_stage), is_first_stage)
+
+    def _counted(self, ids: torch.Tensor, first: bool) -> torch.Tensor:
+        """The rows of ``ids`` (a call's ``[tokens, top_k]``) that count: all of them, or in a batch
+        with context requests those of the generation tokens (``manager.counted_rows``), placed
+        after the rows of the forward's earlier chunks. A slice, which :meth:`route` records apart.
+        """
+        rows = self.manager.counted_rows
+        if first:
+            self._rows_seen = 0
+        start, n = self._rows_seen, ids.shape[0]
+        self._rows_seen += n
+        if rows is None:
+            return ids
+        return ids[min(max(rows[0] - start, 0), n) : min(max(rows[1] - start, 0), n)]
 
     update_statistic_with_local_ids = update_local_statistic
 
@@ -340,11 +356,15 @@ class AdaptiveMoeLayerLoadBalancer:
             first: Whether this is the layer's first call in the forward, which counts the forward.
 
         Returns:
+            None in a batch with context requests (only its generation rows count, which the
+            separate launches record), else
             ``(table, rows, forwards, enabled, first)``: the layer's packed route table row, its
             statistics rows and forward count, the recording flag where :meth:`update_local_statistic`
             would keep the routes (recording, or under CUDA graph capture, where the flag gates every
             replay; else a flag that is never set), and ``first``.
         """
+        if self.manager.counted_rows is not None:
+            return None  # a batch with context requests counts part of its rows: separate launches
         pending, self._pending = self._pending, None
         if pending is not None:
             self.statistics.record(*pending)
@@ -456,6 +476,9 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         self.off_reason: str | None = None
         # Whether the forwards now running record their routes.
         self.recording = False
+        # The local token rows ``[start, stop)`` that count in a batch that also runs context
+        # requests (its generation tokens); None when every row counts.
+        self.counted_rows: tuple[int, int] | None = None
         # Whether a window is open: the device flag counts only while this and ``recording`` hold.
         # Without a runtime no window is scheduled and every recorded forward counts; the runtime
         # closes and opens windows on its own schedule (``on_window``).
@@ -741,16 +764,28 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         generation_only: bool,
         is_warmup: bool,
         generation_progress: Callable[[int, int], tuple[int, int, int]],
+        generation_rows: tuple[int, int] | None = None,
     ) -> None:
         """Record the statistics of generation steps outside warmup only, and pass the generation
-        requests' progress to the runtime when it asks for it."""
-        recording = num_generation_requests > 0 and generation_only and not is_warmup
+        requests' progress to the runtime when it asks for it.
+
+        A batch that also runs context requests records the rows of its generation tokens only,
+        ``generation_rows`` (``[start, stop)`` of the forward's local tokens); without them it
+        records nothing. Skipping such batches whole left a window without a single forward on a
+        rank that admits a request at every call, and the window's other ranks lost it too.
+        """
+        mixed = not generation_only
+        counted = generation_rows is not None and generation_rows[1] > generation_rows[0]
+        recording = num_generation_requests > 0 and not is_warmup and (counted or not mixed)
         if self._pending is not None and not is_warmup:  # serving began, no warmup calibrated it
             self._pending, self.off_reason = None, "no CUDA graph warmup calibrated its time model"
             logger.warning(f"adaptive EPLB is off: {self.off_reason}")
         if self.off_reason is not None or getattr(self.runtime, "failure", None) is not None:
             recording = False  # nothing reads the statistics of adaptive EPLB that is off
         self.recording = recording
+        self.counted_rows = None
+        if recording and mixed:
+            self.counted_rows = (int(generation_rows[0]), int(generation_rows[1]))
         self._sync_recording_flag()
         if self.runtime is not None and self.runtime.wants_request_progress:
             self.runtime.add_request_progress(num_generation_requests, generation_progress)

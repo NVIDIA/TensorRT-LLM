@@ -956,8 +956,12 @@ class BaseMoeLoadBalancer(ABC):
         """
 
     def observe_scheduled_batch(
-            self, num_generation_requests: int, generation_only: bool,
-            is_warmup: bool, generation_progress: GenerationProgress) -> None:
+            self,
+            num_generation_requests: int,
+            generation_only: bool,
+            is_warmup: bool,
+            generation_progress: GenerationProgress,
+            generation_rows: Optional[Tuple[int, int]] = None) -> None:
         """See the batch the executor is about to run. Nothing by default.
 
         Args:
@@ -968,6 +972,9 @@ class BaseMoeLoadBalancer(ABC):
                 the generation requests ``[start, stop)``, the tokens they
                 still have to produce, how many of them are requests and the
                 tokens they accept per step.
+            generation_rows: ``[start, stop)`` of the forward's local tokens
+                that the generation requests' tokens fill (after the context
+                tokens).
         """
 
     def iteration_stats(self) -> Optional[Dict[str, int]]:
