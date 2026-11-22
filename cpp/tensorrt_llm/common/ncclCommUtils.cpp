@@ -22,7 +22,9 @@
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#endif
 
 #include <iterator>
 #include <mutex>
