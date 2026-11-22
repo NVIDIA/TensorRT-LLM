@@ -21,7 +21,9 @@ from typing import Iterable, Iterator
 from cbts.blocks import (
     Stage,
     YAMLIndex,
+    _entry_excludes_waive,
     _entry_target,
+    _path_lookup_anchor,
     _target_in_filter_subtree,
     block_matches_stage,
 )
@@ -317,11 +319,20 @@ def lookup_paths_into_block_filters(
         if matches is None:
             unmatched.append(path)
             continue
+        anchor = _path_lookup_anchor(path) or path
         for block, prefix in matches:
             key = (block.yaml_stem, block.block_index)
             ids = block_filters.setdefault(key, {}).setdefault(prefix, set())
             for raw in block.tests:
-                if _target_in_filter_subtree(_entry_target(raw), prefix):
+                target = _entry_target(raw)
+                if (
+                    _target_in_filter_subtree(target, prefix)
+                    and not _entry_excludes_waive(raw, anchor)
+                    and (
+                        _target_in_filter_subtree(anchor, target)
+                        or _target_in_filter_subtree(target, anchor)
+                    )
+                ):
                     ids.add(raw)
     return block_filters, unmatched
 

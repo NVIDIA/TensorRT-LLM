@@ -115,9 +115,9 @@ def test_yaml_index_loads_every_context_of_a_file(tmp_path: Path) -> None:
         "l0_x_multi_nodes_perf_sanity_b": ["perf/test_b.py::test_one"],
         "l0_x": ["unit/test_c.py"],
     }
-    match = index.find_match_for_waive("perf/test_b.py::test_one")
-    assert match is not None and [b.yaml_stem for b in match[1]] == [
-        "l0_x_multi_nodes_perf_sanity_b"
+    matches = index.find_matches_for_waive("perf/test_b.py::test_one")
+    assert matches is not None and [(b.yaml_stem, lvl) for b, lvl in matches] == [
+        ("l0_x_multi_nodes_perf_sanity_b", "perf/test_b.py::test_one")
     ]
 
 
@@ -155,10 +155,15 @@ def test_narrowed_test_db_has_one_file_per_context(tmp_path: Path) -> None:
 
 
 def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path) -> None:
-    """Directory entries carrying `--ignore=...` still index under their directory target."""
+    """Directory entries carrying `--ignore` / `--ignore-glob` exclude ignored subtrees in waive and path lookups."""
     test_db = tmp_path / "test-db"
     test_db.mkdir()
-    entry = "unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa"
+    entry = (
+        "unittest/_torch/attention/sparse "
+        "--ignore=unittest/_torch/attention/sparse/dsa "
+        "--ignore unittest/_torch/attention/sparse/multi_gpu "
+        '--ignore-glob="unittest/_torch/attention/sparse/msa/*"'
+    )
     (test_db / "l0_b200.yml").write_text(
         yaml.safe_dump(
             {"version": "0.0.1", "l0_b200": [{"condition": _CONDITION, "tests": [entry]}]},
@@ -166,13 +171,19 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
         )
     )
     index = YAMLIndex.load(test_db)
-    match = index.find_match_for_waive(
+    matches = index.find_matches_for_waive(
         "unittest/_torch/attention/sparse/csa2/test_backend.py::test_foo"
     )
-    assert match is not None
-    assert match[0] == "unittest/_torch/attention/sparse"
-    assert [b.yaml_stem for b in match[1]] == ["l0_b200"]
-    assert index.find_match_for_waive("unittest/_torch/attention/sparse/dsa/test_bar.py") is None
+    assert matches is not None and [(b.yaml_stem, lvl) for b, lvl in matches] == [
+        ("l0_b200", "unittest/_torch/attention/sparse")
+    ]
+    for excluded in (
+        "unittest/_torch/attention/sparse/dsa/test_bar.py",
+        "unittest/_torch/attention/sparse/multi_gpu/test_baz.py",
+        "unittest/_torch/attention/sparse/msa/test_proxy.py",
+    ):
+        assert index.find_matches_for_waive(excluded) is None
+        assert index.find_match_for_path(excluded) is None
 
 
 def test_waives_rule_resolves_per_block_across_file_and_directory_registrations(
@@ -245,9 +256,55 @@ def test_deselect_preserves_parameter_boundaries(tmp_path: Path) -> None:
         )
     )
     index = YAMLIndex.load(test_db)
-    assert index.find_match_for_waive("unit/test_x.py::test_case[a]") is None
-    assert index.find_match_for_waive("unit/test_x.py::test_case[b]") is not None
-    assert index.find_match_for_waive("unit/test_x.py::test_case") is not None
+    assert index.find_matches_for_waive("unit/test_x.py::test_case[a]") is None
+    assert index.find_matches_for_waive("unit/test_x.py::test_case[b]") is not None
+    assert index.find_matches_for_waive("unit/test_x.py::test_case") is not None
+
+
+def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -> None:
+    """`-k "a.py or b.py"` rejects `c.py`, while `-k "not NVFP4"` over-includes non-NVFP4 waives."""
+    test_db = tmp_path / "test-db"
+    test_db.mkdir()
+    pre_cond = {"terms": {"stage": "pre_merge", "backend": "pytorch"}}
+    sampler_k = (
+        'unittest/_torch/sampler -k "test_in_graph_sampling.py or test_finish_reasons_fused.py"'
+    )
+    kv_not_k = 'unittest/disaggregated/test_deepseek_v4_kv_transfer.py -k "not NVFP4"'
+    (test_db / "l0_a10.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_a10": [{"condition": pre_cond, "tests": ["unittest/_torch/sampler"]}],
+            },
+            sort_keys=False,
+        )
+    )
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_b200": [{"condition": pre_cond, "tests": [sampler_k, kv_not_k]}],
+            },
+            sort_keys=False,
+        )
+    )
+    index = YAMLIndex.load(test_db)
+    stages = {
+        "A10-PyTorch-1": Stage("A10-PyTorch-1", "l0_a10", "x86_64", 1, 1, {}),
+        "DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1, {}),
+    }
+    rule = WaivesRule(index, stages)
+
+    penalties_diff = "@@ -1,1 +1,2 @@\n+unittest/_torch/sampler/test_penalties.py::test_x SKIP (https://nvbugs/1)\n"
+    res_pen = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: penalties_diff}))
+    assert res_pen is not None and res_pen.affected_stages == {"A10-PyTorch-1"}
+
+    non_fp4_diff = (
+        "@@ -1,1 +1,2 @@\n"
+        "+unittest/disaggregated/test_deepseek_v4_kv_transfer.py::test_transfer[bf16] SKIP (https://nvbugs/2)\n"
+    )
+    res_kv = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: non_fp4_diff}))
+    assert res_kv is not None and res_kv.affected_stages == {"DGX_B200-PyTorch-1"}
 
 
 def test_test_list_rule_b200_addition_with_cpu_deletion_leaves_cpu_unfiltered(

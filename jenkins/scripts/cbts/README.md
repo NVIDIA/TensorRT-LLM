@@ -149,11 +149,11 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 
 ## Lookup algorithms
 
-`YAMLIndex.find_match_for_waive` (waive ids): walks the pytest tree from
-the waive id toward the root; the first level whose YAML has a matching
-entry becomes the filter prefix for that block. Prefixes remember their
-originating waive id(s) so `write_filtered_test_db` can apply the `-k`
-keyword guard.
+`YAMLIndex.find_matches_for_waive` (waive ids): walks the pytest tree from
+the waive id toward the root across all blocks, resolving each block
+independently at its own narrowest matching level. Prefixes remember their
+originating waive id(s) so `write_filtered_test_db` can apply target-lineage,
+exclusion (`--ignore`/`--ignore-glob`/`--deselect`), and `-k` guards.
 
 ```
 waive id (raw)
@@ -167,9 +167,11 @@ target_lookup     (function/class/file/dir level)
 ```
 
 An entry matches a level when its canonical target (with `SKIP`/`TIMEOUT`/
-`full:gpu`/`-k`/`-m`/`[params]` stripped) equals the level AND any `-k`
-keyword filter on the entry contains an identifier from the waive id. `-m`
-markers always pass (unverifiable from string).
+`full:gpu`/`-k`/`-m`/`--ignore`/`--ignore-glob`/`--deselect`/`[params]`
+stripped) equals the level, does not exclude the target via `--ignore`/
+`--ignore-glob`/`--deselect`, AND any non-negated `-k` keyword filter on the
+entry case-insensitively matches the waive id (`-k` expressions containing
+`not` and `-m` markers over-include safely).
 
 The `-k` keyword guard runs twice: once at lookup, once when writing
 `cbts_test_db/` (drops sibling entries whose `-k` doesn't match the waived

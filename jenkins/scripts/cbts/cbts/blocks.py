@@ -130,10 +130,10 @@ def _iter_parent_ids(test_id: str):
             yield s
 
 
-# pytest's `-k` keyword expressions can be a single word like `"deepseek"` or
-# a boolean expression like `"a and not b"`. We tokenize on identifier chars
-# and strip the boolean operators, then check substring against the waive id.
-# Over-includes for complex expressions; never under-includes.
+# pytest's `-k` keyword expressions can be a single word like `"deepseek"`,
+# dotted file selectors like `"a.py or b.py"`, or boolean expressions with
+# `not`. Keep dots inside tokens, compare case-insensitively like pytest, and
+# treat expressions containing `not` as unconstrained (over-include safely).
 _K_VALUE_RE = re.compile(r'\s+-k\s+"([^"]*)"')
 _M_FLAG_RE = re.compile(r"\s+-m\b")
 _IGNORE_OPT_RE = re.compile(r"\s+--ignore(?:=|\s+)(\S+)")
@@ -193,11 +193,14 @@ def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
     kw = _extract_k_keyword(entry)
     if kw is None:
         return True  # no -k → unconstrained
-    tokens = re.findall(r"[A-Za-z_]\w*", kw)
+    tokens = re.findall(r"[A-Za-z_][\w.]*", kw)
+    if any(t.lower() == "not" for t in tokens):
+        return True  # negations match the complement; over-include safely
     real = [t for t in tokens if t.lower() not in _K_RESERVED_WORDS]
     if not real:
         return True  # all-reserved expression → can't decide; over-include
-    return any(t in waive_id for t in real)
+    waive_lower = waive_id.lower()
+    return any(t.lower() in waive_lower for t in real)
 
 
 def _strip_params(s: str) -> str:
@@ -217,7 +220,8 @@ def _normalize_target_path(target: str) -> str:
 def _entry_target(entry: str) -> str:
     """Canonical "target" key for indexing/lookup.
 
-    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m), and `[params]` suffix.
+    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m/--ignore/--ignore-glob/--deselect),
+    and `[params]` suffix.
 
     `file.py::TestC::test_m[a-b] TIMEOUT (90)` → `file.py::TestC::test_m`
     `file.py -k "kw"`                          → `file.py`
@@ -356,13 +360,6 @@ class YAMLIndex:
                     resolved[key] = (block, level)
         return list(resolved.values()) or None
 
-    def find_match_for_waive(self, waive_id: str) -> Optional[tuple[str, list[Block]]]:
-        """Return `(most_specific_level, all_matched_blocks)` for `waive_id`, or None."""
-        matches = self.find_matches_for_waive(waive_id)
-        if not matches:
-            return None
-        return matches[0][1], [block for block, _ in matches]
-
     def git_path_to_yaml_key(self, git_path: str) -> Optional[str]:
         """Translate a repo-relative git path to its YAML namespace form.
 
@@ -382,6 +379,8 @@ class YAMLIndex:
         for block in self.blocks:
             covering: list[str] = []
             for entry in block.tests:
+                if _entry_excludes_waive(entry, anchor):
+                    continue
                 t = _entry_target(entry)
                 if _target_in_filter_subtree(t, anchor) or _target_in_filter_subtree(anchor, t):
                     covering.append(t)
@@ -862,10 +861,8 @@ def write_filtered_test_db(
                         matched_waives |= waives
                 if not matched_waives:
                     continue
-                # -k keyword guard: drop entries whose `-k` filter
-                # excludes every matching waive. Entries without `-k`
-                # are always kept (`_entry_applies_to_waive` returns
-                # True when no keyword is present).
+                # Applicability guard: drop sibling entries and entries whose
+                # `--ignore`/`--deselect`/`-k` options exclude every matching id.
                 if any(_entry_applies_to_waive(t, w) for w in matched_waives):
                     kept.append(t)
             # Safety: empty filter result → fallback to original (prevents

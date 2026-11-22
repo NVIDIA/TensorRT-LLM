@@ -80,10 +80,12 @@ it does not infer a complete graph of runtime docstring consumers.
 ## WaivesRule
 
 Reads `+`/`-` lines from the diff, normalizes each to a test id, then for
-each id calls `YAMLIndex.find_match_for_waive` to walk the pytest parent
-chain (function → class → file → dir) until a YAML entry matches. The
-matched level becomes that block's Layer 3 filter prefix; stages whose
-`mako` matches the block's `condition` go into `affected_stages`.
+each id calls `YAMLIndex.find_matches_for_waive` to walk the pytest parent
+chain (function → class → file → dir) and resolve the narrowest matching
+level independently per YAML block (respecting `--ignore`/`--ignore-glob`/
+`--deselect`, target lineage, and `-k`). The matched level becomes that
+block's Layer 3 filter prefix; stages whose `mako` matches the block's
+`condition` go into `affected_stages`.
 
 Outcomes:
 
@@ -261,8 +263,11 @@ Per touched `test-db/*.yml`, classifies each `+`/`-` line:
 - Anything else (top-level `- condition:`, mako edits, structural shifts)
   → `structural` list.
 
-Only **added** entries drive narrowing; removals don't need verification
-(the test either still runs elsewhere or is fully retired).
+Only **added** entries drive narrowing, and each added YAML scalar (including
+wrapped multiline selectors) resolves only against its owning `(yaml_stem,
+block_index)` in the edited file rather than parent-walking into other blocks
+or contexts; removals don't need verification (the test either still runs
+elsewhere or is fully retired).
 
 Outcomes:
 
@@ -626,7 +631,7 @@ and `OUT_OF_SCOPE_DIRECTORY_FILENAMES` in `out_of_scope.py` list the policies.
 | `iter_diff_post_line_numbers(diff)` | testdef | Yields post-image line numbers for AST scope mapping; `-` lines anchor to the next surviving line. |
 | `iter_diff_added_post_line_numbers(diff)` | testdef | Same, but `+` lines only — for callers reading meaning off the post-image. |
 | `iter_diff_pre_image(diff)` | testdef | Yields `(sign, body)` reconstructing each hunk's pre-image (`-` + context); `("@", "")` marks a hunk boundary. |
-| `lookup_ids_into_block_filters` | waives, testlist | Runs `find_match_for_waive` over a set of test ids; returns block_filters and miss set. |
+| `lookup_ids_into_block_filters` | waives | Runs `find_matches_for_waive` over a set of test ids; returns per-block `block_filters` and miss set. |
 | `lookup_paths_into_block_filters` | testdef | Runs `find_match_for_path` over a set of anchors; returns block_filters and miss set. |
 | `resolve_affected_stages` | all narrowing rules | Maps `block_filters` keys to stage names via `stages_by_yaml_stem`. |
 | `stages_by_yaml_stem` | all rules | Builds `{yaml_stem: [Stage, ...]}` index from the parsed Groovy stages. |

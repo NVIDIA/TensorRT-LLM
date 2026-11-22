@@ -4050,7 +4050,6 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py -k \"test_kimi_k3_mla_context_bf16_page64 or test_kimi_k3_mla_generation_bf16_page64\"]": 42.08,
    "test_unittests.py::test_unittests_v2[unittest/_torch/models/test_minimax_m3.py -k \"test_minimax_m3_unfused_index_projection_tp_construction or test_horizontal_producer_explicit_caches_match_manager or test_horizontal_producer_plan_reuses_and_invalidates or test_horizontal_producer_plan_caches_unsupported_layout or test_horizontal_producer_checks_slot_capacity_after_plan_hit or test_horizontal_producer_plan_cache_is_bounded or test_nvfp4_reload_preserves_attention_scale_storage or test_registered_conditional_generation_text_forward or test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed or test_minimax_m3_gate_bf16_split_matches_fp32_router or test_packaged_nvfp4_experts_load_and_run_on_cutlass or test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank\"]": 21.1,
    "test_unittests.py::test_unittests_v2[unittest/_torch/models/test_minimax_m3_vl.py -k \"test_real_checkpoint_processor_input_ids_match_trt_build_helper or test_real_checkpoint_processor_video_input_ids_match_trt_build_helper or test_real_checkpoint_video_fast_path_matches_processor_input_ids or test_real_checkpoint_two_video_fast_path_matches_processor_input_ids or test_real_checkpoint_float_media_match_uint8_pixels\"]": 34.09,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/dwdp -k \"test_dwdp_prefetch_gpu.py or test_dense_attached_gpu.py or test_dwdp_moe_construction_gpu.py or test_page_pool_statistics.py\"]": 22.0,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modules/kimi_k3_attn_res]": 23.49,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modules/kimi_kda --ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py]": 416.52,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py]": 442.45,
@@ -4059,5 +4058,6 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/visual_gen/sparse_attention]": 118.24,
    "test_unittests.py::test_unittests_v2[unittest/disaggregated/test_deepseek_v4_kv_transfer.py -k \"NVFP4\"]": 29.75,
    "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests -k \"not RemoteInPlaceOfDisk and not TestTeardownWithoutCudaContext\"]": 447.22,
-   "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py -k \"TestTeardownWithoutCudaContext\"]": 18.77
+   "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py -k \"TestTeardownWithoutCudaContext\"]": 18.77,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/dwdp]": 22.0
 }

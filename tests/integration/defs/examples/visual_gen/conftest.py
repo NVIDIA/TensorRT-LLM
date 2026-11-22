@@ -94,7 +94,7 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
     try:
         if not ffmpeg_available:
             try:
-                llm_venv.run_cmd(["-m", "pip", "install", "imageio-ffmpeg"])
+                llm_venv.run_cmd(["-m", "pip", "install", "imageio-ffmpeg==0.8.1"])
                 exe = llm_venv.run_output(
                     "import imageio_ffmpeg\nprint(imageio_ffmpeg.get_ffmpeg_exe())"
                 ).strip()
