@@ -33,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
+from tensorrt_llm._torch.pyexecutor._util import create_torch_sampler_args
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     _NO_EXTRA_INPUTS,
     DecoderInputBuffers,
@@ -65,6 +66,7 @@ from tensorrt_llm.llmapi import (
 )
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
+    CudaGraphConfig,
     KvCacheConfig,
     PrefillCudaGraphBackend,
     TorchLlmArgs,
@@ -728,15 +730,16 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         self.assertEqual(kernel_path[0][:num_tokens].tolist(), expected_input_ids.tolist())
 
     def test_staged_speculative_inputs_warmup_respects_serving_role(self) -> None:
-        for is_disagg, role, expected_launches in (
-            (True, "context", 0),
-            (True, "ctx0", 0),
-            (True, "CONTEXT", 0),
-            (True, "generation", 1),
-            (False, "context", 1),
+        for is_disagg, role, speculative, expected_launches in (
+            (True, "context", True, 0),
+            (True, "ctx0", True, 0),
+            (True, "CONTEXT", True, 0),
+            (True, "generation", True, 1),
+            (False, "context", True, 1),
+            (False, "generation", False, 0),
         ):
             with (
-                self.subTest(is_disagg=is_disagg, role=role),
+                self.subTest(is_disagg=is_disagg, role=role, speculative=speculative),
                 patch.dict(os.environ, {"TRTLLM_DISAGG_ROLE": role}),
                 create_model_engine_and_kvcache(
                     llm_args=TorchLlmArgs(
@@ -748,7 +751,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                         if is_disagg
                         else None,
                     ),
-                    spec_config=SADecodingConfig(max_draft_len=3),
+                    spec_config=SADecodingConfig(max_draft_len=3) if speculative else None,
                     model=_StagedInputModel(torch.float16),
                 ) as (model_engine, kv_cache_manager),
                 patch.object(_stage_kernel, "run", wraps=_stage_kernel.run) as stage_launch,
@@ -768,6 +771,11 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                 torch.cuda.synchronize()
                 self.assertEqual(stage_launch.call_count, expected_launches)
                 upload.assert_not_called()
+                self.assertEqual(
+                    "speculative_input_staging"
+                    in model_engine._runner._warmup._warmup_timer.timings,
+                    bool(expected_launches),
+                )
 
     def test_staged_speculative_overlap_inputs_match_per_buffer_copies(self) -> None:
         self._check_staged_speculative_inputs(tokens_per_step=3)
@@ -781,6 +789,14 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         requests verifying in-flight drafts in permuted slots, and a dummy."""
         model_engine, kv_cache_manager = self.enterContext(
             create_model_engine_and_kvcache(
+                llm_args=TorchLlmArgs(
+                    model="dummy",
+                    max_batch_size=13,
+                    max_num_tokens=258,
+                    cuda_graph_config=CudaGraphConfig(
+                        enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]
+                    ),
+                ),
                 spec_config=SADecodingConfig(max_draft_len=tokens_per_step - 1),
                 model=_StagedInputModel(torch.float16),
             )
@@ -788,14 +804,19 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         preparer = model_engine._runner._inputs
         buffers = preparer._buffers
         resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
-        slots = model_engine.max_num_seq_slots
         generator = torch.Generator(device="cuda").manual_seed(0)
-        store = SpecSampler.Store.allocate(
-            num_slots=slots,
-            accepted_len=tokens_per_step,
-            draft_len=tokens_per_step - 1,
-            beam_width=1,
+        sampler = SpecSampler(
+            create_torch_sampler_args(
+                max_seq_len=model_engine.max_seq_len,
+                speculative_config=model_engine.spec_config,
+                max_beam_width=model_engine.max_beam_width,
+                disable_overlap_scheduler=model_engine.llm_args.disable_overlap_scheduler,
+                enable_async_worker=False,
+                enable_speculative_beam_history_d2h=model_engine.llm_args.enable_speculative_beam_history_d2h,
+                max_num_sequences=model_engine.max_num_seq_slots,
+            )
         )
+        store = sampler.store
         store.next_new_tokens.random_(0, 1000, generator=generator)
         store.new_tokens_lens.random_(1, tokens_per_step + 1, generator=generator)
         store.next_draft_tokens.random_(0, 1000, generator=generator)
