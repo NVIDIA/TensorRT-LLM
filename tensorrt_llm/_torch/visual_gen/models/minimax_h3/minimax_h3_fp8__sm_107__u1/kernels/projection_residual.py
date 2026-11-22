@@ -812,8 +812,11 @@ def compile_kernel(device_index, n, k, gate_column, modulation_dtype, index_dtyp
     input_dtype = torch.bfloat16 if bf16 else torch.float8_e4m3fn
     key = (device_index, n, k, gate_column, modulation_dtype, index_dtype, input_dtype)
     if key not in _compiled:
-        if bf16 and (n, k, gate_column) != (5376, 14336, DOWN_GATE):
-            raise ValueError("The BF16 configuration is qualified for H3 Down only")
+        if bf16 and (n, k, gate_column) not in (
+            (5376, 7168, ATTENTION_OUTPUT_GATE),
+            (5376, 14336, DOWN_GATE),
+        ):
+            raise ValueError("The BF16 configuration is qualified for H3 attention output and Down")
         config = BF16_DOWN_CONFIG if bf16 else CONFIG
         dsl_dtype = cutlass.BFloat16 if bf16 else cutlass.Float8E4M3FN
         kernel_class = Bf16ProjectionKernel if bf16 else ProjectionBreuseKernel

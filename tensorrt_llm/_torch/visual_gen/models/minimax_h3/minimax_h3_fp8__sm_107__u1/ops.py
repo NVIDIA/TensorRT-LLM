@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm.logger import logger
 
+from ..fused_adaln import h3_gate_res_norm_mod, h3_norm_mod
 from .kernels import gate_up_swiglu, projection_residual
 from .kernels.adaln import launch as adaln_launch
 from .kernels.conversion import BLOCKS, THREADS, modules_for_device
@@ -284,6 +285,37 @@ def _attention_projection_fake(
     eps,
 ):
     return torch.empty_like(hidden), torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
+
+
+@torch.library.custom_op("h3_fp8::bf16_attention_projection", mutates_args=(), device_types="cuda")
+def bf16_attention_projection(
+    raw: torch.Tensor,
+    weight: torch.Tensor,
+    unit: torch.Tensor,
+    hidden: torch.Tensor,
+    norm_weight: torch.Tensor,
+    modulation: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    activation = raw.reshape(-1, 7168)
+    gate_column = projection_residual.ATTENTION_OUTPUT_GATE
+    if projection_residual.supports(activation, weight, hidden, modulation, indices, gate_column):
+        residual = projection_residual.run(
+            activation, weight, unit, unit, hidden, modulation, indices, gate_column
+        ).reshape_as(hidden)
+        return residual, h3_norm_mod(residual, norm_weight, modulation, indices, eps, 4, 3)
+    projected = F.linear(raw, weight)
+    return h3_gate_res_norm_mod(
+        hidden, projected, norm_weight, modulation, indices, eps, gate_column, 4, 3
+    )
+
+
+@bf16_attention_projection.register_fake
+def _bf16_attention_projection_fake(
+    raw, weight, unit, hidden, norm_weight, modulation, indices, eps
+):
+    return torch.empty_like(hidden), torch.empty_like(hidden)
 
 
 @torch.library.custom_op("h3_fp8::shared_output_cast", mutates_args=(), device_types="cuda")
