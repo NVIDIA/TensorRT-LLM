@@ -639,7 +639,7 @@ class SingleLayerMoeLoadBalancer:
             if do_multi_stream():
                 self.event_dict[EventType.MoeBalancer].wait()
 
-    def abandon_forward(self):
+    def abandon_forward(self) -> None:
         """
         Reset the stage bookkeeping of a forward that did not complete, so
         that the next forward starts afresh.
