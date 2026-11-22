@@ -373,6 +373,15 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             if sum(levels) > 0 and levels[last] == sum(levels):
                 return levels
             self._prefill(self._prompt(256), stream)
+            _sync_device()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                levels = self._residency(prompt)
+                if sum(levels) > 0 and levels[last] == sum(levels):
+                    return levels
+                if sum(levels) == 0:
+                    break
+                time.sleep(0.02)
         self.fail(f"pages never reached level {last}: {self._residency(prompt)}")
 
     def _reuse_and_check(self, prompt, stream) -> list:

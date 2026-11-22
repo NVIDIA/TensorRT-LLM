@@ -17,6 +17,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 
 import pytest
@@ -79,6 +80,7 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
     av_available = importlib.util.find_spec("av") is not None
     ffmpeg_available = shutil.which("ffmpeg") is not None
     if av_available and ffmpeg_available:
+        yield
         return
     if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
         pytest.fail(
@@ -87,8 +89,34 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
         )
     if not av_available:
         llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    if not ffmpeg_available:
-        install_ffmpeg_via_apt()
+    bin_dir = None
+    prev_path = os.environ.get("PATH")
+    try:
+        if not ffmpeg_available:
+            try:
+                llm_venv.run_cmd(["-m", "pip", "install", "imageio-ffmpeg"])
+                exe = llm_venv.run_output(
+                    "import imageio_ffmpeg\nprint(imageio_ffmpeg.get_ffmpeg_exe())"
+                ).strip()
+                if exe and os.path.isfile(exe):
+                    bin_dir = tempfile.mkdtemp(prefix="trtllm_ffmpeg_bin_")
+                    os.symlink(exe, os.path.join(bin_dir, "ffmpeg"))
+                    os.environ["PATH"] = (
+                        f"{bin_dir}{os.pathsep}{prev_path}" if prev_path else bin_dir
+                    )
+                    ffmpeg_available = shutil.which("ffmpeg") is not None
+            except (subprocess.SubprocessError, OSError) as err:
+                print_warning(f"imageio-ffmpeg wheel setup failed, falling back to apt: {err}")
+            if not ffmpeg_available:
+                install_ffmpeg_via_apt()
+        yield
+    finally:
+        if bin_dir is not None:
+            if prev_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = prev_path
+            shutil.rmtree(bin_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")

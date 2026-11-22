@@ -6259,7 +6259,7 @@ class TestRetention(TestKVCacheManagerV2):
         for mode in (KvCacheTransferMode.GDS, KvCacheTransferMode.POSIX_DEBUG_FALLBACK):
             config = KvCacheRetentionConfig([], transfer_mode=mode, directory="/tmp")
             with (
-                self.subTest(mode=mode),
+                self.subTest(mode=mode.name),
                 self.assertRaisesRegex(ValueError, "per-request GDS/POSIX"),
             ):
                 self.manager.create_kv_cache(input_tokens=tokens, kv_cache_retention_config=config)

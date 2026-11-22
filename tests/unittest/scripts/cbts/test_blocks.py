@@ -142,3 +142,23 @@ def test_narrowed_test_db_has_one_file_per_context(tmp_path: Path) -> None:
             {"condition": _CONDITION, "tests": ["perf/test_a.py::test_one"]}
         ],
     }
+
+
+def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path) -> None:
+    """Directory entries carrying `--ignore=...` still index under their directory target."""
+    test_db = tmp_path / "test-db"
+    test_db.mkdir()
+    entry = "unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa"
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {"version": "0.0.1", "l0_b200": [{"condition": _CONDITION, "tests": [entry]}]},
+            sort_keys=False,
+        )
+    )
+    index = YAMLIndex.load(test_db)
+    match = index.find_match_for_waive(
+        "unittest/_torch/attention/sparse/csa2/test_backend.py::test_foo"
+    )
+    assert match is not None
+    assert match[0] == "unittest/_torch/attention/sparse"
+    assert [b.yaml_stem for b in match[1]] == ["l0_b200"]

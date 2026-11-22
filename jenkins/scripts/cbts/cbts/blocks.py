@@ -85,11 +85,11 @@ def normalize_test_id(test_id: str) -> str:
     return _TEST_ID_PREFIX_RE.sub("", s)
 
 
-# Detect a pytest-style option flag (e.g. ` -k`, ` -m`) inside a YAML target
-# spec. Used to peel `-k "..."` / `-m "..."` off so the bare path/node-id can
-# be indexed as an additional lookup key — that lets a fine-grained waive id
-# match a coarse YAML entry like `dir/x.py -k "deepseek"`.
-_PYTEST_OPTION_RE = re.compile(r"\s+-[a-zA-Z]\b")
+# Detect a pytest-style option flag (e.g. ` -k`, ` -m`, ` --ignore=...`) inside
+# a YAML target spec. Used to peel options off so the bare path/node-id can be
+# indexed as an additional lookup key — that lets a fine-grained waive or path
+# match a coarse YAML entry like `dir/x.py -k "deepseek"` or `dir --ignore=...`.
+_PYTEST_OPTION_RE = re.compile(r"\s+(?:-[a-zA-Z]\b|--(?:ignore(?:-glob)?|deselect)(?:=|\b))")
 
 
 def _strip_pytest_options(s: str) -> str:
