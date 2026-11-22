@@ -58,6 +58,7 @@ from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict,
                      prompt_logprobs_from_reduced, reduce_prompt_logprobs)
+from .sequence_limits import generation_capacity
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
@@ -499,7 +500,6 @@ class BaseWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
-            splited_prompt_len = int(prompt_len / cp_size)
             if not self.engine.is_generation_model:
                 # The prompt runs in one forward and nothing is generated, so
                 # it may fill max_seq_len; max_tokens=1 has the request
@@ -510,17 +510,8 @@ class BaseWorker(GenerationExecutor):
                             max_context_length=max_seq_len * cp_size,
                             num_prompt_tokens=prompt_len))
                 return 1
-            default_max_tokens = max_seq_len - splited_prompt_len
-            if default_max_tokens <= 0:
-                # Reject (never truncate): the prompt leaves no room for even
-                # one generated token. The message reports request-level
-                # totals, not per-CP-rank arithmetic: splited_prompt_len >=
-                # max_seq_len implies len(prompt_token_ids) >= max_seq_len *
-                # cp_size.
-                raise ValueError(
-                    context_length_exceeded_message(
-                        max_context_length=max_seq_len * cp_size,
-                        num_prompt_tokens=prompt_len))
+            default_max_tokens = generation_capacity(prompt_len, max_seq_len,
+                                                     cp_size)
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:

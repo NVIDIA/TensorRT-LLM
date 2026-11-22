@@ -1727,7 +1727,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         raw_logits = logits
-        K = self.max_draft_len
+        K = spec_metadata.runtime_draft_len
 
         self._lazy_init(draft_model, spec_metadata, attn_metadata)
         # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
@@ -1736,10 +1736,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         spec_metadata._dspark_worker = self
         self._prep_fork_model = (draft_model,)
 
-        # A draft length schedule only narrows how many of the block's tokens
-        # the target verifies: the block is always drafted K wide. At zero the
-        # target verifies nothing, so no block is proposed either.
-        if spec_metadata.runtime_draft_len == 0:
+        # The embedded draft model computes a fixed block. Publish only the
+        # prefix the target can verify, and skip the block for target-only steps.
+        if K == 0:
             return self._forward_without_drafting(
                 input_ids,
                 position_ids,
@@ -1777,7 +1776,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         prepare = (
             None
-            if spec_metadata.runtime_draft_len != K or captured is None
+            if K != self.max_draft_len or captured is None
             else (position_ids, captured.shape[0])
         )
         accepted = self._fused_accept(
@@ -1840,10 +1839,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 prepared=prepared,
             )
             if reuse_draft_tokens:
-                gen_draft_tokens = draft_output
+                gen_draft_tokens = draft_output[:, :K].contiguous()
                 gen_vocab = None
             elif draft_output is not None:
-                gen_logits = draft_output
+                gen_logits = draft_output[:, :K]
                 if self.guided_decoder is not None:
                     gen_draft_tokens = self._sample_draft_tokens_guided(
                         gen_logits,

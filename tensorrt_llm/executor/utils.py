@@ -34,6 +34,7 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.utils import logger_debug
 from ..logger import logger
+from .sequence_limits import context_length_exceeded_message
 
 
 class LlmLauncherEnvs(StrEnum):
@@ -138,20 +139,6 @@ class RequestError(RuntimeError):
 # Machine-readable error code the OpenAI-compatible server attaches to
 # over-length-prompt rejections (mirrors OpenAI's "context_length_exceeded").
 CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
-
-
-def context_length_exceeded_message(max_context_length: int,
-                                    num_prompt_tokens: int) -> str:
-    """Client-facing message for a prompt that exceeds the model context.
-
-    Mirrors OpenAI's wording so agent frameworks that pattern-match it (to
-    trigger context compaction) work unchanged. Keep in sync with
-    ``is_context_length_exceeded_message``.
-    """
-    return (
-        f"This model's maximum context length is {max_context_length} tokens. "
-        f"However, your messages resulted in {num_prompt_tokens} tokens. "
-        "Please reduce the length of the messages.")
 
 
 def check_prompt_capacity(num_prompt_tokens: int, max_prompt_len: int) -> None:

@@ -850,7 +850,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
             if draft_step == 0:
                 self.rollback_rejected_tokens()
             self.build()
-            if draft_step == self.max_num_draft_tokens - 1:
+            if draft_step == self.requests.max_num_draft_tokens - 1:
                 self.rollback_draft_tokens()
             # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
             self.copy_bitmask(num_bitmask_tokens=len(self.requests))

@@ -74,7 +74,7 @@ def test_dynamic_draft_len(enforce_single_worker):
     ]
     sampling_params = SamplingParams(max_tokens=50, temperature=0)
     with patch(
-        "tensorrt_llm._torch.speculative.utils.get_draft_len_for_batch_size",
+        "tensorrt_llm._torch.speculative.draft_budget.get_draft_len_for_batch_size",
         mock_get_draft_len_for_batch_size,
     ):
         results_spec = llm_spec.generate(prompts, sampling_params)

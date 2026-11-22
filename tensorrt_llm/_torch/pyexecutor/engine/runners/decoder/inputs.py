@@ -80,7 +80,6 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
-    DSparkDecodingConfig,
     PrefillCudaGraphBackend,
 )
 from tensorrt_llm.logger import logger
@@ -122,13 +121,6 @@ def resolve_runtime_draft_len(
     if spec_config is not None and not spec_config.is_linear_tree:
         return get_static_draft_len(spec_config)
     return runtime_draft_len
-
-
-def dspark_schedules_draft_len(spec_config: DecodingBaseConfig | None) -> bool:
-    """Whether a DSpark draft length schedule can shorten a step's uniform verify window."""
-    return (
-        isinstance(spec_config, DSparkDecodingConfig) and spec_config.draft_len_schedule is not None
-    )
 
 
 def uses_full_generation_page_table(
@@ -2695,6 +2687,7 @@ class DecoderInputPreparer:
             fold_rows = (
                 [request.py_seq_slot for request in extend_requests]
                 if scheduled_requests.num_context_requests == 0
+                and runtime_draft_len == self._config.max_draft_len
                 else None
             )
             if fold_rows is not None and any(slot is None for slot in fold_rows):
@@ -3007,10 +3000,8 @@ class DecoderInputPreparer:
                 ),
             )
 
-        # Attention sizes its generation rows by the static draft ceiling
-        # unless told the step's window, which both the confidence scheduler
-        # and a draft length schedule can shorten.
-        if self._dspark_trims_submitted_tokens or dspark_schedules_draft_len(spec_config):
+        # A request approaching its limit can shorten even a static draft schedule.
+        if spec_config is not None:
             self._publish_gen_token_layout(
                 attn_metadata,
                 scheduled_requests.generation_requests,

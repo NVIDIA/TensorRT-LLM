@@ -2215,6 +2215,17 @@ class SpecWorkerBase(nn.Module, ABC):
             outputs = self._forward_impl(*args, **kwargs)
         finally:
             self._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
+        if (attn_metadata is not None and spec_metadata is not None
+                and spec_metadata.use_rejection_sampling
+                and spec_metadata.runtime_draft_len < spec_metadata.max_draft_len
+                and spec_metadata.draft_probs is not None):
+            # The sampler zero-pads short proposal rows in its fixed-width
+            # store. A wider subsequent batch must see that same deterministic
+            # proposal in the probability store, including after a zero-width step.
+            slots = spec_metadata.batch_slot_ids[:attn_metadata.num_seqs]
+            width = spec_metadata.runtime_draft_len
+            spec_metadata.draft_probs[slots, width:, :] = 0
+            spec_metadata.draft_probs[slots, width:, 0] = 1
         if (spec_metadata is not None and spec_metadata.sharded_target_logits
                 and isinstance(outputs, dict)):
             # The step returns the shard target_logits produced; the engine

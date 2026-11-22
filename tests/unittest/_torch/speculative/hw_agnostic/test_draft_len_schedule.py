@@ -136,7 +136,7 @@ def test_correctness_across_batch_sizes(
                 top_k=1,
                 top_p=1.0,
             )
-            for max_tokens in [4] * 4 + [8] * 3 + [12]
+            for max_tokens in [4] * 4 + [8] * 3 + [24]
         ]
 
     # With dynamic draft_len_schedule
@@ -149,7 +149,15 @@ def test_correctness_across_batch_sizes(
 
         def instrumented_handle_dynamic_draft_len(scheduled_batch):
             original_handle_dynamic_draft_len(scheduled_batch)
-            runtime_schedule.append((scheduled_batch.batch_size, executor.runtime_draft_len))
+            remaining = min(
+                (
+                    min(executor.max_seq_len - req.get_num_tokens(0),
+                        req.py_max_new_tokens - (req.get_num_tokens(0) - req.py_orig_prompt_len))
+                    for req in scheduled_batch.all_requests() if not req.is_dummy
+                ),
+                default=max_draft_len + 1,
+            )
+            runtime_schedule.append((scheduled_batch.batch_size, executor.runtime_draft_len, remaining))
 
         monkeypatch.setattr(
             executor, "_handle_dynamic_draft_len", instrumented_handle_dynamic_draft_len
@@ -160,8 +168,9 @@ def test_correctness_across_batch_sizes(
     llm_with_schedule.shutdown()
 
     if drafter_type == "model_drafter":
-        for batch_size, runtime_draft_len in runtime_schedule:
-            expected_draft_len = get_draft_len_for_batch_size(schedule, batch_size, max_draft_len)
+        for batch_size, runtime_draft_len, remaining in runtime_schedule:
+            scheduled_len = get_draft_len_for_batch_size(schedule, batch_size, max_draft_len)
+            expected_draft_len = max(0, min(scheduled_len, remaining - 1))
             assert runtime_draft_len == expected_draft_len, (
                 f"DraftTarget resolved batch size {batch_size} to draft length "
                 f"{runtime_draft_len}, expected {expected_draft_len} from {schedule}"
@@ -174,7 +183,7 @@ def test_correctness_across_batch_sizes(
         ]
         # Request admission and completion may skip exact batch-size thresholds.
         expected_draft_lengths = set(schedule.values())
-        observed_draft_lengths = {draft_len for _, draft_len in runtime_schedule}
+        observed_draft_lengths = {draft_len for _, draft_len, _ in runtime_schedule}
         assert expected_draft_lengths.issubset(observed_draft_lengths), (
             f"DraftTarget runtime schedule did not exercise draft lengths {expected_draft_lengths}: "
             f"got {runtime_transitions}"

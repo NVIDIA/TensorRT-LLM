@@ -22,13 +22,12 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputPreparer,
-    dspark_schedules_draft_len,
 )
 from tensorrt_llm._torch.speculative import dspark as dspark_module
 from tensorrt_llm._torch.speculative.dspark import DSv4DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import update_draft_len
-from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -150,22 +149,10 @@ def test_max_concurrency_becomes_a_speculation_cutoff():
     assert config.draft_len_schedule == {8: BLOCK}
 
 
-def test_only_a_dspark_schedule_publishes_the_step_window_to_attention():
-    assert dspark_schedules_draft_len(
-        DSparkDecodingConfig(max_draft_len=BLOCK, draft_len_schedule={2: 3, 4: 2})
-    )
-    assert dspark_schedules_draft_len(DSparkDecodingConfig(max_draft_len=BLOCK, max_concurrency=8))
-    assert not dspark_schedules_draft_len(DSparkDecodingConfig(max_draft_len=BLOCK))
-    assert not dspark_schedules_draft_len(
-        MTPDecodingConfig(max_draft_len=BLOCK, draft_len_schedule={2: 3})
-    )
-    assert not dspark_schedules_draft_len(None)
-
-
 @pytest.mark.parametrize("runtime_draft_len", [0, 2, BLOCK])
 def test_schedule_publishes_a_uniform_window_of_the_step_draft_length(runtime_draft_len):
     """Sparse attention sizes its generation rows by the window the step submits."""
-    config = DSparkDecodingConfig(max_draft_len=BLOCK, draft_len_schedule={2: 3, 4: 2})
+    config = DSparkDecodingConfig(max_draft_len=BLOCK)
     preparer = object.__new__(DecoderInputPreparer)
     preparer._dspark_trims_submitted_tokens = False
     preparer._dspark_device_windows = False
