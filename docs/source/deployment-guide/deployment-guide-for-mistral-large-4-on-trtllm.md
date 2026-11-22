@@ -575,7 +575,7 @@ All 30 workloads passed with the existing accuracy references and tolerances unc
 
 | Symptom | Cause and fix |
 | :-- | :-- |
-| `... is a Mistral-Large-4 checkpoint in the Mistral-native format; load it with checkpoint_format='mistral'` | Set `checkpoint_format: mistral`. |
+| `Unrecognized model in ... Should have a model_type key in its config.json` | The checkpoint is in the Mistral-native format, without a `config.json`. Set `checkpoint_format: mistral`. |
 | `Mistral-Large-4 is served from the ModelOpt MIXED_PRECISION export, whose params.json states quantization_config; found quantization=...` | The checkpoint is not the NVFP4 checkpoint. Only the NVFP4 checkpoint is supported. |
 | `The tekken.json of ... declares reasoning efforts the installed mistral-common does not know` | Install mistral-common 1.13.0 or later from PyPI. |
 | `Unknown architecture for AutoModelForCausalLM: MistralLarge4ForCausalLM` | Set `modeling_v2: require`. |

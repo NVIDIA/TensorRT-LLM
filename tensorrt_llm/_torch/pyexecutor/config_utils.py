@@ -1097,20 +1097,6 @@ def build_minimax_dspark_draft_config(
     return config
 
 
-def _require_native_format_for_mistral_large_4(model_name_or_path: str) -> None:
-    """Name the format a Mistral-Large-4 checkpoint needs.
-
-    It ships Mistral-native files only (params.json, tekken.json, consolidated
-    safetensors), which checkpoint_format="mistral" reads.
-    """
-    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-        is_mistral_large4_checkpoint
-    if is_mistral_large4_checkpoint(model_name_or_path):
-        raise ValueError(
-            f"{model_name_or_path} is a Mistral-Large-4 checkpoint in the "
-            "Mistral-native format; load it with checkpoint_format='mistral'")
-
-
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: CheckpointFormat | str
@@ -1122,7 +1108,6 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         return MistralConfigLoader().load_pretrained_config(model_name_or_path)
 
-    _require_native_format_for_mistral_large_4(model_name_or_path)
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
