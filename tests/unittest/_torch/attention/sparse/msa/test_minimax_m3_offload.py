@@ -30,6 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import (
@@ -53,6 +54,13 @@ HEAD_DIM = 128
 TOPK = 16
 BATCH = 4
 SPARSE_LAYERS = (1, 3)
+
+
+@pytest.fixture(autouse=True)
+def _ample_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The manager rejects a host_history_size above this rank's share of the node's
+    # available memory, which a shared CI node cannot promise.
+    monkeypatch.setattr(rank_striped_read_ahead, "effective_available_host_memory", lambda: 1 << 40)
 
 
 def _manager(
