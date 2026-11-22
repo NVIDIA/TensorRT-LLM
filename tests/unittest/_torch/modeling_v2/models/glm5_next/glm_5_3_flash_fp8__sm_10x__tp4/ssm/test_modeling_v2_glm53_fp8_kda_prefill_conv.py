@@ -21,7 +21,9 @@ from tensorrt_llm._utils import get_sm_version
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 -- path above; fixture by name
 
-pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
+pytestmark = pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="certified on sm_100 and sm_103"
+)
 
 HEAD_DIM, WIDTH = 128, 4
 #: Elements past each slot's [3D, 3] window in its record (the other layers' windows in the real manager).

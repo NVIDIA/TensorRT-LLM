@@ -48,7 +48,7 @@ from _torch.moe.moe_test_utils import (
 )
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import check_accuracy, skip_pre_blackwell
+from utils.util import check_accuracy, getSMVersion, skip_pre_blackwell
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
@@ -860,10 +860,13 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("decode_tuning", [False, True])
-def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
+def test_fp4_block_scale_moe_decode_tuning(
+    monkeypatch: pytest.MonkeyPatch, decode_tuning: bool
+) -> None:
     """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
     rank; otherwise every rank tunes on its own over the power-of-2 ladder."""
     from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
 
     config = FP4BlockScaleMoERunner.get_tuning_config(4, decode_tuning=decode_tuning)
@@ -882,13 +885,16 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
         assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
 
     # Only the declaring model's tuning cache key carries the flag, and with it do_finalize (finalized and
-    # un-finalized calls run different kernels).
+    # un-finalized calls run different kernels); the routing the tactics are timed on follows.
+    monkeypatch.setattr(trtllm_gen_custom_ops, "_dummy_distribution", lambda: "random")
     for do_finalize in (False, True):
         runner = FP4BlockScaleMoERunner(
             512, 10, None, None, 512, 0, 64, None, 1, do_finalize, 0, decode_tuning=decode_tuning
         )
-        assert runner.unique_id() == (10, 512, 64, 0) + (
-            (True, do_finalize) if decode_tuning else ()
+        assert runner.unique_id() == (
+            (10, 512, 64, 0)
+            + ((True, do_finalize) if decode_tuning else ())
+            + (512, False, 1, None, None, "random")
         )
 
 
@@ -8111,3 +8117,122 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
         if bias:
             torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
             torch.testing.assert_close(restored.w2_bias, module.w2_bias)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "lean_intermediate,padded_intermediate,expected_valid_intermediate",
+    [
+        (352, 384, 352),
+        (192, 256, 192),
+        (128, 128, 128),
+        (None, 384, None),
+    ],
+    ids=["tp4_i1408_lean352", "tp16_i3072_lean192", "aligned_lean128", "unset_lean"],
+)
+def test_mxfp4_fp8_trtllm_gen_forwards_lean_intermediate_size(
+    monkeypatch: pytest.MonkeyPatch,
+    lean_intermediate: int | None,
+    padded_intermediate: int,
+    expected_valid_intermediate: int | None,
+) -> None:
+    """Keep physical padding separate from logical dimensions at the runner boundary."""
+    captured: dict[str, object] = {}
+
+    def fake_runner(*args: object, **kwargs: object) -> torch.Tensor:
+        # Op positions 19..21: physical intermediate, valid hidden, valid intermediate.
+        (
+            captured["intermediate_size"],
+            captured["valid_hidden_size"],
+            captured["valid_intermediate_size"],
+        ) = args[19:22]
+        return torch.zeros((2, 2048), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(torch.ops.trtllm, "e4m3_mxe2m1_block_scale_moe_runner", fake_runner)
+
+    leaf = TrtllmTrtllmGenW4a8Mxfp4Fp8Impl.__new__(TrtllmTrtllmGenW4a8Mxfp4Fp8Impl)
+    torch.nn.Module.__init__(leaf)
+    leaf.w3_w1_weight = torch.zeros((4, padded_intermediate * 2, 1024), dtype=torch.uint8)
+    leaf.w3_w1_weight_scale = torch.zeros((4, padded_intermediate * 2, 64), dtype=torch.uint8)
+    leaf.w3_w1_bias = torch.zeros((4, padded_intermediate * 2), dtype=torch.float32)
+    leaf.act_alpha = None
+    leaf.act_beta = None
+    leaf.act_clamp = None
+    leaf.w2_weight = torch.zeros((4, 2048, padded_intermediate // 2), dtype=torch.uint8)
+    leaf.w2_weight_scale = torch.zeros((4, 2048, padded_intermediate // 32), dtype=torch.uint8)
+    leaf.w2_bias = torch.zeros((4, 2048), dtype=torch.float32)
+    leaf.fc31_input_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.fc31_input_gate_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.fc2_input_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.num_slots = 4
+    leaf.hidden_size = 2048
+    leaf.quant_method = SimpleNamespace(intermediate_size_per_partition_lean=lean_intermediate)
+    leaf.slot_start = 0
+    leaf.expert_size_per_partition = 4
+    leaf.routing_method = RenormalizeMoeRoutingMethod(top_k=2)
+    leaf.max_num_tokens = 256
+    leaf.use_dp = False
+    leaf.parallel_size = 4
+
+    ctx = MoERunContext(
+        x=torch.zeros((2, 2048), dtype=torch.float8_e4m3fn),
+        x_sf=None,
+        router_logits=torch.zeros((2, 4), dtype=torch.bfloat16),
+        token_selected_experts=None,
+        token_final_scales=None,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=False,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+        do_finalize=True,
+    )
+    out = leaf.run_moe(ctx)
+
+    assert out.shape == (2, 2048)
+    assert captured["intermediate_size"] == padded_intermediate
+    assert captured["valid_hidden_size"] == 2048
+    assert captured["valid_intermediate_size"] == expected_valid_intermediate
+
+
+@pytest.mark.skipif(
+    not (100 <= getSMVersion() < 110),
+    reason="The kernel requires Blackwell.",
+)
+@pytest.mark.parametrize(
+    "valid_hidden_size,valid_intermediate_size",
+    [(512, 352), (352, 512), (2880, 2880)],
+    ids=["h512_i352", "h352_i512", "h2880_i2880"],
+)
+def test_moe_mxe2m1_weights_valid_dimensions(
+    valid_hidden_size: int, valid_intermediate_size: int
+) -> None:
+    """Exercise C++ TMA alignment with lean sizes and zero-padded weights."""
+    from _torch.moe.kernels.serial.test_moe import _run_moe_mxe2m1_weights as run_direct_case
+
+    from tensorrt_llm.quantization.utils.fp4_utils import pad_up
+
+    # Reuse the numerical reference without enabling the deprecated test matrix.
+    run_direct_case(
+        num_tokens=16,
+        hidden_size=pad_up(valid_hidden_size, 512),
+        intermediate_size=pad_up(valid_intermediate_size, 128),
+        routing_info={
+            "num_experts": 16,
+            "top_k": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RenormalizeMoeRoutingMethod(top_k=8).routing_method_type,
+        },
+        dtype_activation="fp8",
+        act_type_str="SwiGlu",
+        use_autotune=True,
+        use_topk_as_input=False,
+        valid_hidden_size=valid_hidden_size,
+        valid_intermediate_size=valid_intermediate_size,
+        skip_dynamic_tuning_buckets=True,
+        check_all_tactics=True,
+    )

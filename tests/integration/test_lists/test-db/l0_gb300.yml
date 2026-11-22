@@ -19,6 +19,7 @@ l0_gb300:
       backend: pytorch
   tests:
   # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_fixed_e8m0.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/embedding
@@ -42,6 +43,8 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_prebuild.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_rank_agreement.py
   # ------------- PyTorch tests ---------------
+  # EPLB host-accessible memory takes the GPU NUMA path on Grace Blackwell; checks its memory-monitor records.
+  - unittest/_torch/memory/test_memory_monitor_native.py::test_eplb_host_accessible_memory_is_recorded
   # MLA context head slices, including FP8 scale-block boundaries.
   - unittest/_torch/modules/test_linear_output_slice.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------

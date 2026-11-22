@@ -69,18 +69,23 @@ from .action import (
     resolve_domain_id,
 )
 from .defaults import (
-    COSMOS3_720P_PARAMS,
+    COSMOS3_ASPECT_RATIO_BUCKETS,
+    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DEFAULT_SYSTEM_PROMPT,
+    COSMOS3_DEFAULTS,
+    COSMOS3_DURATION_TEMPLATE,
     COSMOS3_ENVELOPES,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_GENERATION_DEFAULTS,
-    COSMOS3_V2V_DEFAULT_FLOW_SHIFT,
+    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
+    COSMOS3_T2I_SYSTEM_PROMPT,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
-    resolve_checkpoint_policy_defaults,
-    resolve_domain_action_config,
+    find_closest_target_size,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
+from .overrides import COSMOS3_OVERRIDES
+from .parameter_resolver import ParameterResolver, RequestParameters
 from .sampling import (
     DISTILLED_GUIDANCE_SCALE,
     Cosmos3SamplingPolicy,
@@ -91,13 +96,12 @@ from .sampling import (
 )
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
-    TRANSFER_DEFAULTS,
     Cosmos3TransferConfig,
     decode_media_to_uint8_cthw,
-    find_closest_target_size,
     load_or_compute_control_frames,
     pad_temporal_frames,
     resolve_transfer_config,
+    transfer_defaults,
     uint8_cthw_to_normalized_5d,
 )
 from .transformer_cosmos3 import NEMOTRON_DENSE_RECIPE, Cosmos3VFMTransformer, resolve_arch_recipe
@@ -128,23 +132,6 @@ def default_negative_prompt(output_type: str) -> str:
         if output_type == "image"
         else default_video_negative_prompt()
     )
-
-
-def _resolve_use_system_prompt(
-    requested: Optional[bool],
-    *,
-    checkpoint_default: bool,
-    is_v2v: bool,
-    is_transfer: bool,
-) -> bool:
-    """Resolve the request override against workflow and checkpoint defaults."""
-    if requested is not None:
-        return bool(requested)
-    # Transfer opts out for reference parity; vllm-omni's transfer path also
-    # defaults use_system_prompt to False.
-    if is_transfer:
-        return False
-    return is_v2v or checkpoint_default
 
 
 def _validate_request_compatibility(
@@ -230,22 +217,11 @@ def _validate_request_compatibility(
         )
 
 
-# NOTE: Intentional typo in "give" instead of "given" to match training setup.
-COSMOS3_DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful assistant who will generate videos from a give prompt."
-)
-COSMOS3_T2I_SYSTEM_PROMPT = (
-    "You are a helpful assistant who will generate images from a give prompt."
-)
-COSMOS3_V2V_FLOW_SHIFT = 10.0
 # Fraction of a transfer hint that may be mirror-padding before it is worth a
 # warning. A few frames of tail ping-pong is normal when clips differ slightly;
 # beyond this the control is mostly invented and the client likely sent clips of
 # different videos.
 CONTROL_LENGTH_MISMATCH_RATIO = 0.10
-COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
-COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
-COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
@@ -264,13 +240,6 @@ _COSMOS3_DEFAULT_OFFLOAD_STAGES = (
     (COSMOS3_REASONER_OFFLOAD_COMPONENT,),
     (COSMOS3_GENERATOR_OFFLOAD_COMPONENT,),
 )
-
-# ``W,H`` bucket names the reference builds requests from. A request there starts
-# as a (resolution, bucket) pair and the bucket string is carried into the prompt
-# verbatim; we only ever see the resolved height/width, so map back to the nearest
-# bucket. Emitting the exact reduced ratio instead would put a string the model
-# never saw in training into the caption (832x480 reduces to "15,26", not "16,9").
-COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
 
 
 def _aspect_ratio_bucket(height: int, width: int) -> str:
@@ -325,19 +294,6 @@ def _assert_anchor_matches(image_latent: torch.Tensor, latents: torch.Tensor) ->
             "Cosmos3 I2V conditioning latent must match the denoised latents: got "
             f"conditioning {image_latent.dtype} on {image_latent.device}, expected "
             f"{latents.dtype} on {latents.device}."
-        )
-
-
-def _validate_temporal_compression(transformer, vae_scale_factor_temporal: int) -> None:
-    """A config-declared temporal compression factor must match the VAE."""
-    if (
-        getattr(transformer, "temporal_compression_factor_declared", False)
-        and transformer.temporal_compression_factor != vae_scale_factor_temporal
-    ):
-        raise ValueError(
-            f"Transformer config declares temporal_compression_factor="
-            f"{transformer.temporal_compression_factor}, but the VAE reports "
-            f"scale_factor_temporal={vae_scale_factor_temporal}."
         )
 
 
@@ -405,13 +361,6 @@ class _ResolvedRequest:
     schedule: SamplingSchedule
 
 
-def _transfer_flow_shift(transfer_config: Cosmos3TransferConfig) -> float:
-    """The flow shift a transfer request runs with when it selects none itself."""
-    if transfer_config.flow_shift is not None:
-        return float(transfer_config.flow_shift)
-    return COSMOS3_V2V_DEFAULT_FLOW_SHIFT
-
-
 @dataclass
 class _PreparedLatents:
     """Video and optional action streams prepared for one denoise request."""
@@ -452,16 +401,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # only when the transformer config declares and loads its action heads.
         self.has_action_weights = False
         self.action_gen = False
-        self.checkpoint_policy_defaults: dict[str, Any] = {}
-        # Pre-load placeholder; load_standard_components derives the real
-        # policy from the checkpoint's scheduler via from_scheduler().
+        # Pre-load placeholder; load_standard_components derives the real policy
+        # from the checkpoint's scheduler.
         self.sampling = Cosmos3SamplingPolicy()
-        # Independent of the extra-param spec, whose default stays None so an
-        # omitted value survives the executor's default merge and reaches
-        # forward() as "unset".
-        self.default_use_system_prompt = False
         self.use_native_flow_schedule = False
         self.family = resolve_arch_recipe(primary_pretrained_config).name
+        self._resolver: Optional[ParameterResolver] = None
         # Schedulers are identified by their resolved (grid, flow_shift, stream) recipe
         self._scheduler_cache: dict = {}
         if getattr(
@@ -479,60 +424,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         super().__init__(pipeline_config)
 
-    def _mode_params(
-        self,
-        output_type: str,
-        *,
-        action_mode: Optional[str] = None,
-        checkpoint_policy_domain_matches: bool = True,
-    ) -> dict:
-        """Generation defaults selected from the request's output and action mode."""
-        normalized_action_mode = normalize_action_mode(action_mode)
-        request_mode = "action" if normalized_action_mode is not None else output_type
-        params = COSMOS3_GENERATION_DEFAULTS[(self.family, request_mode)]
-        checkpoint_policy_defaults = getattr(self, "checkpoint_policy_defaults", {})
-        if (
-            normalized_action_mode == ACTION_MODE_POLICY
-            and checkpoint_policy_domain_matches
-            and checkpoint_policy_defaults
-        ):
-            sampling_keys = {"num_inference_steps", "guidance_scale", "guidance_interval"}
-            return {
-                **params,
-                **{
-                    key: value
-                    for key, value in checkpoint_policy_defaults.items()
-                    if key in sampling_keys
-                },
-            }
-        return params
+    @property
+    def resolver(self) -> ParameterResolver:
+        """The checkpoint's settings; available once ``load_transformer_weights`` has
+        read them."""
+        if self._resolver is None:
+            raise RuntimeError("Cosmos3 pipeline: the checkpoint has not been loaded yet.")
+        return self._resolver
 
-    def _resolve_generation_params(
-        self,
-        output_type: str,
-        *,
-        action_mode: Optional[str] = None,
-        checkpoint_policy_domain_matches: bool = True,
-        **values,
-    ) -> dict:
-        """Fill None values: sampling-policy overrides win, then the mode
-        table, then the video table (for fields the image table omits)."""
-        mode_params = self._mode_params(
-            output_type,
-            action_mode=action_mode,
-            checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
-        )
-        video_params = self._mode_params("video")
-        sampling_overrides = self.sampling.generation_default_overrides()
-        resolved = {}
-        for key, value in values.items():
-            if value is None:
-                if key in sampling_overrides:
-                    value = sampling_overrides[key]
-                else:
-                    value = mode_params.get(key, video_params.get(key))
-            resolved[key] = value
-        return resolved
+    @resolver.setter
+    def resolver(self, resolver: ParameterResolver) -> None:
+        self._resolver = resolver
 
     def _log_envelope_advisory(
         self,
@@ -654,37 +556,27 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.transformer.load_weights(transformer_weights)
             self.transformer.eval()
 
+    def _read_checkpoint_settings(self, checkpoint_dir: str) -> None:
+        """Resolve the checkpoint's settings from its JSON files. Raises on a checkpoint
+        whose files omit a required setting or disagree on one."""
+        self.resolver = ParameterResolver.from_checkpoint(
+            checkpoint_dir, self.family, log=self.rank == 0
+        )
+        cfg = self.resolver.config()
+        if self.rank == 0:
+            logger.info(cfg.describe())
+        self.use_native_flow_schedule = cfg.sampling.native_flow_schedule
+
+    def load_transformer_weights(self, checkpoint_dir: str) -> dict[str, torch.Tensor]:
+        # Settings first: a checkpoint they reject fails before its weights are read.
+        self._read_checkpoint_settings(checkpoint_dir)
+        return super().load_transformer_weights(checkpoint_dir)
+
     def load_standard_components(
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
         skip_components = skip_components or []
-
-        # Prompting defaults are checkpoint-declared: distilled conversions
-        # carry ``default_use_system_prompt`` in model_index.json (diffusers'
-        # distilled blocks default it to True); older checkpoints omit it and
-        # keep the historical False.
-        model_index_path = os.path.join(checkpoint_dir, "model_index.json")
-        if os.path.exists(model_index_path):
-            with open(model_index_path) as f:
-                model_index = json.load(f)
-            self.default_use_system_prompt = bool(
-                model_index.get("default_use_system_prompt", self.default_use_system_prompt)
-            )
-            self.use_native_flow_schedule = bool(
-                model_index.get("use_native_flow_schedule", self.use_native_flow_schedule)
-            )
-
-        checkpoint_metadata_path = os.path.join(checkpoint_dir, "checkpoint.json")
-        if os.path.exists(checkpoint_metadata_path):
-            with open(checkpoint_metadata_path) as f:
-                checkpoint_metadata = json.load(f)
-            self.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
-                checkpoint_metadata.get("policy")
-            )
-            if self.checkpoint_policy_defaults:
-                logger.info(
-                    f"Loaded Cosmos3 checkpoint policy defaults: {self.checkpoint_policy_defaults}"
-                )
+        cfg = self.resolver.config()
 
         if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading audio tokenizer...")
@@ -705,11 +597,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder="text_tokenizer",
             )
 
-        # Cosmos3 canonical defaults — overwritten if VAE is loaded
-        self.vae_scale_factor_temporal = 4
-        self.vae_scale_factor_spatial = 16
+        self.vae_scale_factor_temporal = cfg.vae.temporal_compression
+        self.vae_scale_factor_spatial = cfg.vae.spatial_compression
 
         if PipelineComponent.VAE not in skip_components:
+            cfg.require_vae_compression(checkpoint_dir)
             logger.info("Loading VAE...")
             vae_device = (
                 torch.device("cpu")
@@ -722,13 +614,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 dtype=torch.bfloat16,
             )
 
-            self.vae_scale_factor_temporal = getattr(
-                self.vae.config, "scale_factor_temporal", self.vae_scale_factor_temporal
-            )
-            self.vae_scale_factor_spatial = getattr(
-                self.vae.config, "scale_factor_spatial", self.vae_scale_factor_spatial
-            )
-            _validate_temporal_compression(self.transformer, self.vae_scale_factor_temporal)
             self.transformer.temporal_compression_factor = self.vae_scale_factor_temporal
 
         if PipelineComponent.SCHEDULER not in skip_components:
@@ -738,7 +623,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # distilled ones. The policy holds the derived immutable facts.
             self.scheduler = load_scheduler(checkpoint_dir)
             self.sampling = Cosmos3SamplingPolicy.from_scheduler(
-                self.scheduler, native_flow_schedule=self.use_native_flow_schedule
+                self.scheduler,
+                native_flow_schedule=self.use_native_flow_schedule,
+                fixed_sigmas=cfg.sampling.fixed_sigmas,
             )
             _validate_sampling_recipe(self.family, self.use_native_flow_schedule, self.sampling)
             # Each stream's variants derive from that stream's own instance, so
@@ -783,16 +670,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 self.safety_checker = CosmosSafetyChecker()
                 self.safety_checker.to(device)
 
-        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+        if self.vae_scale_factor_spatial is not None:
+            self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
     @property
     def default_warmup_resolutions(self):
-        video = self._mode_params("video")
+        video = self.default_generation_params
         return [(video["height"], video["width"])]
 
     @property
     def default_warmup_num_frames(self):
-        return [self._mode_params("video")["num_frames"]]
+        return [self.default_generation_params["num_frames"]]
 
     @property
     def default_warmup_steps(self):
@@ -809,15 +697,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def default_generation_params(self):
         """Fields merged by the executor into every request.
 
-        These are the video-mode values — what an unmodified request runs.
-        A request that selects another mode re-resolves them in ``infer()``,
-        which tells a merged default from a caller-supplied value via
-        ``model_fields_set``. Key membership also declares these fields
-        supported during request validation. ``flow_shift`` is
-        pipeline-internal, not a request field.
+        These are the video-mode values by the request rules — what an unmodified
+        request runs, the distilled schedule included. A request that selects another
+        mode re-resolves them in ``infer()``, which tells a merged default from a
+        caller-supplied value via ``model_fields_set``. Key membership also declares
+        these fields supported during request validation.
         """
-        defaults = {k: v for k, v in self._mode_params("video").items() if k != "flow_shift"}
-        return {**defaults, **self.sampling.generation_default_overrides()}
+        params = self.resolver.request(RequestParameters(mode="video"))
+        return {k: getattr(params, k) for k in COSMOS3_DEFAULTS[self.family]["video"]}
 
     def classify_request_failure(self, exc: BaseException) -> Optional[str]:
         """Cosmos3 rejects unusable request content with ``ValueError`` and
@@ -830,10 +717,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # ``use_system_prompt`` keeps its None default here on purpose: the
         # executor materializes these into every request, so publishing the
         # checkpoint's boolean would destroy "unset" before forward() can
-        # resolve it by mode. The checkpoint value is exposed separately as
-        # ``default_use_system_prompt``.
+        # resolve it by mode. The checkpoint value lives in the resolver.
         specs = dict(COSMOS3_EXTRA_SPECS)
-        if getattr(self, "checkpoint_policy_defaults", {}):
+        if self.resolver.policy_defaults:
             specs["action_mode"] = specs["action_mode"].model_copy(
                 update={"default": ACTION_MODE_POLICY}
             )
@@ -853,12 +739,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         }
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
-        # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
-        # base defaults leave it None ("by mode") — warmup runs the video mode.
-        defaults = self.default_generation_params
+        defaults = self.default_generation_params  # the video mode, distilled schedule included
         guidance_scale = defaults["guidance_scale"]
-        if guidance_scale is None:
-            guidance_scale = self._mode_params("video")["guidance_scale"]
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
@@ -934,56 +816,68 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
         return schedule
 
+    def _schedule(
+        self,
+        *,
+        sigma_grid: Optional[SigmaGrid] = None,
+        flow_shift: Optional[float] = None,
+        mode: str = "video",
+        is_v2v: bool = False,
+        transfer_config: Optional[Cosmos3TransferConfig] = None,
+    ) -> SamplingSchedule:
+        """The schedule a request samples with.
+
+        The grid is the request's ``sigma_grid``, else the one this kind of request
+        or the checkpoint selects. The shift is the request's (``flow_shift``, or
+        ``transfer_config.flow_shift`` for a transfer request), else the resolver's:
+        an override, then the checkpoint scheduler's. A transfer request the resolver
+        has no shift for takes its control row's. ``mode`` is ``"video"``, ``"image"``
+        or ``"action"``.
+        """
+        is_transfer = transfer_config is not None
+        requested = transfer_config.flow_shift if is_transfer else flow_shift
+        kind = {"mode": mode, "is_v2v": is_v2v, "is_transfer": is_transfer}
+        resolved = self.resolver.flow_shift(requested, **kind)
+        if resolved is not None:
+            mode_shift = float(resolved.value)
+        elif is_transfer:
+            mode_shift = float(transfer_defaults(transfer_config.hints)["flow_shift"])
+        else:
+            mode_shift = self.sampling.checkpoint_flow_shift
+        return self._resolve_schedule(
+            sigma_grid=sigma_grid,
+            flow_shift=requested,
+            mode_flow_shift=mode_shift,
+            mode_use_karras_sigmas=self.resolver.use_karras_sigmas(**kind),
+        )
+
     def _transfer_schedule(
         self,
         transfer_config: Cosmos3TransferConfig,
         *,
         sigma_grid: Optional[SigmaGrid] = None,
     ) -> SamplingSchedule:
-        """The schedule a transfer request samples with.
-
-        The request's ``sigma_grid``, else the mode's non-Karras default. The shift
-        comes from ``transfer_config`` alone: the request's ``flow_shift`` when
-        ``flow_shift_explicit`` is set, else the hint preset's (see
-        :func:`_transfer_flow_shift`).
-        """
-        return self._resolve_schedule(
-            sigma_grid=sigma_grid,
-            flow_shift=transfer_config.flow_shift if transfer_config.flow_shift_explicit else None,
-            mode_flow_shift=_transfer_flow_shift(transfer_config),
-            mode_use_karras_sigmas=False,
-        )
+        """The schedule a transfer request samples with; see :meth:`_schedule`."""
+        return self._schedule(sigma_grid=sigma_grid, transfer_config=transfer_config)
 
     def _cacheable_flow_shifts(self) -> frozenset:
-        """Flow shifts reachable without a caller override, for this checkpoint.
-
-        Derived rather than fixed so a new family or mode table is picked up
-        automatically: the per-mode generation tables, the checkpoint's own
-        shift, V2V's stronger shift, and the per-hint transfer presets. Entries
-        are still created lazily, so a mode that is never served never builds
-        one.
-
-        Transfer's shifts are included even though every hint currently declares
-        the same value as V2V: tuning one off that value would otherwise drop it
-        out of the cache silently and rebuild a scheduler on every request for
-        that hint.
-        """
+        """Flow shifts reachable without the caller naming one, for this checkpoint:
+        the checkpoint's own shift, the overrides and the transfer defaults. Entries are
+        still created lazily, so a configuration that is never served never builds
+        one."""
         cached = getattr(self, "_cacheable_flow_shifts_cache", None)
         if cached is not None:
             return cached
-        shifts = {COSMOS3_V2V_FLOW_SHIFT, COSMOS3_V2V_DEFAULT_FLOW_SHIFT}
+        shifts: set[float] = set()
         checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
         if checkpoint_shift is not None:
             shifts.add(float(checkpoint_shift))
-        for mode in ("video", "image"):
-            table = COSMOS3_GENERATION_DEFAULTS.get((self.family, mode)) or {}
-            mode_shift = table.get("flow_shift")
-            if mode_shift is not None:
-                shifts.add(float(mode_shift))
-        for hint_defaults in TRANSFER_DEFAULTS.values():
-            hint_shift = hint_defaults.get("flow_shift")
-            if hint_shift is not None:
-                shifts.add(float(hint_shift))
+        rows = [*COSMOS3_DEFAULTS.get(self.family, {}).get("transfer", {}).values()]
+        for row in COSMOS3_OVERRIDES.get(self.family, {}).values():
+            rows.append({name: override.value for name, override in row.items()})
+        for row in rows:
+            if row.get("flow_shift") is not None:
+                shifts.add(float(row["flow_shift"]))
         cached = self._cacheable_flow_shifts_cache = frozenset(shifts)
         return cached
 
@@ -1037,7 +931,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         refs_v = req.params.video_reference
         video = refs_v[0].content if refs_v else None
         action_mode = extra_params.get("action_mode")
-        if action_mode is None and getattr(self, "checkpoint_policy_defaults", {}):
+        if action_mode is None and self.resolver.policy_defaults:
             # A checkpoint with a policy manifest has one supported action
             # workflow, so callers need not restate it on every request.
             action_mode = ACTION_MODE_POLICY
@@ -1056,7 +950,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             frame_rate = as_given("frame_rate")
         else:
             # Source-derived sizes go in as non-None, so they win over the mode
-            # table: _resolve_generation_params only fills what is still None.
+            # table: the resolver only fills what is still None.
             height, width = as_given("height"), as_given("width")
             frame_rate = req.params.frame_rate
             wants_source_size = "height" not in specified and "width" not in specified
@@ -1094,17 +988,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                             f"Cosmos3 following the source: "
                             f"{width}x{height} (WxH) @ {frame_rate} fps"
                         )
-            resolved = self._resolve_generation_params(
-                "image" if is_t2i else "video",
-                height=height,
-                width=width,
-                num_inference_steps=as_given("num_inference_steps"),
-                guidance_scale=as_given("guidance_scale"),
+            resolved = self.resolver.request(
+                RequestParameters(
+                    mode="image" if is_t2i else "video",
+                    height=height,
+                    width=width,
+                    num_inference_steps=as_given("num_inference_steps"),
+                    guidance_scale=as_given("guidance_scale"),
+                )
             )
-            height = resolved["height"]
-            width = resolved["width"]
-            num_inference_steps = resolved["num_inference_steps"]
-            guidance_scale = resolved["guidance_scale"]
+            height = resolved.height
+            width = resolved.width
+            num_inference_steps = resolved.num_inference_steps
+            guidance_scale = resolved.guidance_scale
 
         refs_i = req.params.image_reference
 
@@ -1780,60 +1676,42 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             transfer_config=transfer_config,
         )
 
-        action_cfg: dict[str, Any] = {}
-        checkpoint_policy_domain_matches = True
-        if do_action:
-            checkpoint_policy_defaults = (
-                getattr(self, "checkpoint_policy_defaults", {})
-                if normalized_action_mode == ACTION_MODE_POLICY
-                else {}
-            )
-            action_cfg = resolve_domain_action_config(
+        is_v2v = video is not None and not is_t2i and not do_action
+        params = self.resolver.request(
+            RequestParameters(
+                mode=output_type,
+                action_mode=normalized_action_mode,
+                is_v2v=is_v2v,
+                is_transfer=transfer_config is not None,
                 domain_name=domain_name,
                 domain_id=domain_id,
+                height=None if do_action else height,
+                width=None if do_action else width,
+                num_frames=None if do_action else num_frames,
+                frame_rate=frame_rate,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                flow_shift=flow_shift,
+                max_sequence_length=max_sequence_length,
+                use_system_prompt=use_system_prompt,
                 raw_action_dim=raw_action_dim,
                 action_chunk_size=action_chunk_size,
                 action_resolution=action_resolution,
-                frame_rate=frame_rate,
                 action_fps=action_fps,
                 use_state=use_state,
-                checkpoint_policy_defaults=checkpoint_policy_defaults,
             )
-            checkpoint_policy_domain_matches = action_cfg["checkpoint_policy_domain_matches"]
-
-        mode_params = self._mode_params(
-            output_type,
-            action_mode=normalized_action_mode,
-            checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
         )
-        values_to_resolve = {
-            "num_inference_steps": num_inference_steps,
-            "guidance_scale": guidance_scale,
-            "guidance_interval": None,
-            "max_sequence_length": max_sequence_length,
-        }
+        num_inference_steps = params.num_inference_steps
+        guidance_scale = params.guidance_scale
+        guidance_interval = params.guidance_interval
+        requested_flow_shift = flow_shift
+        max_sequence_length = params.max_sequence_length
+        use_system_prompt = params.use_system_prompt
         if not do_action:
-            values_to_resolve.update(
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-            )
-        resolved = self._resolve_generation_params(
-            output_type,
-            action_mode=normalized_action_mode,
-            checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
-            **values_to_resolve,
-        )
-        num_inference_steps = resolved["num_inference_steps"]
-        guidance_scale = resolved["guidance_scale"]
-        guidance_interval = resolved["guidance_interval"]
-        max_sequence_length = resolved["max_sequence_length"]
-        if not do_action:
-            height = resolved["height"]
-            width = resolved["width"]
-            num_frames = resolved["num_frames"]
-            frame_rate = resolved["frame_rate"]
+            height = params.height
+            width = params.width
+            num_frames = params.num_frames
+            frame_rate = params.frame_rate
 
         self.sampling.validate_request(num_inference_steps, guidance_scale)
         if not do_action:
@@ -1846,71 +1724,53 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 max_sequence_length=max_sequence_length,
             )
 
-        is_v2v = video is not None and not is_t2i and not do_action
-        use_system_prompt = _resolve_use_system_prompt(
-            use_system_prompt,
-            checkpoint_default=getattr(self, "default_use_system_prompt", False),
-            is_v2v=is_v2v,
-            is_transfer=transfer_config is not None,
-        )
-
         resolved_action_fps: Optional[float] = None
         if is_t2i:
             num_frames = 1
             enable_audio = False
 
         if do_action:
-            if self.rank == 0:
-                for warning in action_cfg["warnings"]:
-                    logger.warning(warning)
-                if action_cfg["preset_key"] is not None:
-                    logger.info(
-                        f"Cosmos3 action domain preset {action_cfg['preset_key']!r}: "
-                        f"raw_action_dim={action_cfg['raw_action_dim']}, "
-                        f"action_chunk_size={action_cfg['action_chunk_size']}, "
-                        f"action_resolution={action_cfg['action_resolution']}, "
-                        f"frame_rate={action_cfg['frame_rate']:.1f}, "
-                        f"action_fps={action_cfg['action_fps']:.1f}, "
-                        f"use_state={action_cfg['use_state']}, "
-                        f"num_frames={action_cfg['num_frames']}"
-                    )
-
-            domain_name = action_cfg["domain_name"]
-            raw_action_dim = action_cfg["raw_action_dim"]
-            action_chunk_size = action_cfg["action_chunk_size"]
-            action_resolution = action_cfg["action_resolution"]
-            num_frames = action_cfg["num_frames"]
-            frame_rate = action_cfg["frame_rate"]
-            resolved_action_fps = action_cfg["action_fps"]
-            use_state = action_cfg["use_state"]
+            if self.rank == 0 and params.preset_key is not None:
+                logger.info(
+                    f"Cosmos3 action domain preset {params.preset_key!r}: "
+                    f"raw_action_dim={params.raw_action_dim}, "
+                    f"action_chunk_size={params.action_chunk_size}, "
+                    f"action_resolution={params.action_resolution}, "
+                    f"frame_rate={params.frame_rate:.1f}, "
+                    f"action_fps={params.action_fps:.1f}, "
+                    f"use_state={params.use_state}, "
+                    f"num_frames={params.num_frames}"
+                )
+            domain_name = params.domain_name
+            raw_action_dim = params.raw_action_dim
+            action_chunk_size = params.action_chunk_size
+            action_resolution = params.action_resolution
+            num_frames = params.num_frames
+            frame_rate = params.frame_rate
+            resolved_action_fps = params.action_fps
+            use_state = params.use_state
             enable_audio = False
 
-        mode_shift = mode_params.get("flow_shift")
-        if mode_shift is None:
-            mode_shift = self.sampling.checkpoint_flow_shift
-        if is_v2v:
-            mode_shift = COSMOS3_V2V_FLOW_SHIFT
-        if transfer_config is None:
-            schedule = self._resolve_schedule(
-                sigma_grid=sigma_grid,
-                flow_shift=flow_shift,
-                mode_flow_shift=mode_shift,
-                mode_use_karras_sigmas=False if is_v2v else None,
+        if transfer_config is not None and requested_flow_shift is not None:
+            raise ValueError(
+                "A Cosmos3 transfer request takes its flow_shift from the transfer "
+                "config; set Cosmos3TransferConfig.flow_shift instead."
             )
+        # Resolved here so an unsupported selection is rejected before any input is
+        # decoded; _forward_transfer builds its scheduler from this schedule.
+        schedule = self._schedule(
+            sigma_grid=sigma_grid,
+            flow_shift=requested_flow_shift,
+            mode="action" if do_action else output_type,
+            is_v2v=is_v2v,
+            transfer_config=transfer_config,
+        )
+        if transfer_config is None:
             self.scheduler = self._scheduler_for(schedule)
             if getattr(self, "audio_scheduler", None) is not None:
                 self.audio_scheduler = self._scheduler_for(schedule, stream="audio")
             if getattr(self, "action_scheduler", None) is not None:
                 self.action_scheduler = self._scheduler_for(schedule, stream="action")
-        else:
-            # Resolved here so an unsupported selection is rejected before any control
-            # is decoded; _forward_transfer builds its scheduler from this schedule.
-            if flow_shift is not None:
-                raise ValueError(
-                    "A Cosmos3 transfer request takes its flow_shift from the transfer "
-                    "config; set Cosmos3TransferConfig.flow_shift instead."
-                )
-            schedule = self._transfer_schedule(transfer_config, sigma_grid=sigma_grid)
 
         if self.rank == 0:
             logger.info(
@@ -3066,11 +2926,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         frame_rate = (
             self._positive_float(transfer_config.fps) or self._positive_float(frame_rate) or 24.0
         )
-        num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
-        guidance_scale = (
-            float(transfer_config.guidance_scale)
+        defaults = transfer_defaults(transfer_config.hints)
+        guidance_scale = float(
+            transfer_config.guidance_scale
             if transfer_config.guidance_scale is not None
-            else COSMOS3_720P_PARAMS["guidance_scale"]
+            else defaults["guidance_scale"]
         )
         if self.sampling.is_distilled:
             # A distilled checkpoint runs one schedule and bakes guidance into
@@ -3084,7 +2944,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     f"{DISTILLED_GUIDANCE_SCALE}; per-hint guidance presets do not apply."
                 )
             guidance_scale = DISTILLED_GUIDANCE_SCALE
-        max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
         # forward() skips its own scheduler rebuild for transfer, so this is the

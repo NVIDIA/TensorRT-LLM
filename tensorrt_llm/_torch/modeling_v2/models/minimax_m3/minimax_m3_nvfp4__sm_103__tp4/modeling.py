@@ -106,6 +106,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm i
 )
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs,
     _draft_moe_selection,
@@ -4527,6 +4528,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp4(
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
+        # The fused all-reduces and the low-M MXFP8 GEMM run the family library's fixed copies: an installation
+        # without the library refuses here (NoTarget), and modeling_v2='auto' keeps the built-in model.
+        family_ops()
         # Under modeling_v2='require' a covered decode shape that cannot take its fast path raises.
         set_require(resolved_mode(type(self)) is ModelingV2Mode.REQUIRE)
         model_config = _text_model_config(model_config)
