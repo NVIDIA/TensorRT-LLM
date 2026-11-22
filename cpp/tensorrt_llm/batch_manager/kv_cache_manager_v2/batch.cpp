@@ -1967,7 +1967,6 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     TLLM_CHECK_WITH_INFO(selectionWidth == scratch.selectionWidth,
         "resolveSparseSelection: selectionWidth must match the configured numSelectedBlocks");
 
-    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
     auto const marks = watermarks();
 
     SparseResolveArgs resolve;
