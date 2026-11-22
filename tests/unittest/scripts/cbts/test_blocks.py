@@ -257,20 +257,27 @@ def test_test_list_rule_b200_addition_with_cpu_deletion_leaves_cpu_unfiltered(
     test_db = tmp_path / "tests/integration/test_lists/test-db"
     test_db.mkdir(parents=True)
     pre_cond = {"terms": {"stage": "pre_merge", "backend": "pytorch"}}
+    post_cond = {"terms": {"stage": "post_merge", "backend": "pytorch"}}
     added_test = "unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py"
     b200_rel = "tests/integration/test_lists/test-db/l0_b200.yml"
     cpu_rel = "tests/integration/test_lists/test-db/l0_cpu.yml"
     b200_pre = yaml.safe_dump(
         {
             "version": "0.0.1",
-            "l0_b200": [{"condition": pre_cond, "tests": ["unittest/test_keep.py"]}],
+            "l0_b200": [
+                {"condition": pre_cond, "tests": ["unittest/test_keep.py"]},
+                {"condition": post_cond, "tests": [added_test]},
+            ],
         },
         sort_keys=False,
     )
     b200_post = yaml.safe_dump(
         {
             "version": "0.0.1",
-            "l0_b200": [{"condition": pre_cond, "tests": ["unittest/test_keep.py", added_test]}],
+            "l0_b200": [
+                {"condition": pre_cond, "tests": ["unittest/test_keep.py", added_test]},
+                {"condition": post_cond, "tests": [added_test]},
+            ],
         },
         sort_keys=False,
     )
@@ -324,6 +331,48 @@ def test_test_list_rule_b200_addition_with_cpu_deletion_leaves_cpu_unfiltered(
     filtered = tmp_path / "filtered"
     write_filtered_test_db(test_db, filtered, res.block_filters)
     assert sorted(p.name for p in filtered.glob("*.yml")) == ["l0_b200.yml"]
+    assert yaml.safe_load((filtered / "l0_b200.yml").read_text())["l0_b200"] == [
+        {"condition": pre_cond, "tests": [added_test]}
+    ]
+
+
+def test_test_list_rule_multiline_wrapped_selector_schedules_stage(tmp_path: Path) -> None:
+    """Wrapped multiline YAML test additions resolve to the full folded selector."""
+    test_db = tmp_path / "tests/integration/test_lists/test-db"
+    test_db.mkdir(parents=True)
+    b200_rel = "tests/integration/test_lists/test-db/l0_b200.yml"
+    pre_text = (
+        "version: 0.0.1\n"
+        "l0_b200:\n"
+        "- condition:\n"
+        "    terms:\n"
+        "      stage: pre_merge\n"
+        "      backend: pytorch\n"
+        "  tests:\n"
+        "  - unittest/test_keep.py\n"
+    )
+    post_text = (
+        pre_text
+        + '  - unittest/_torch/moe/test_moe_backend.py -k "test_cutlass_moe_routing_round_trip or\n'
+        + '    test_cutlass_moe_public_activation_ids"\n'
+    )
+    (tmp_path / b200_rel).write_text(post_text)
+    index = YAMLIndex.load(test_db)
+    stages = {"DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1, {})}
+    rule = test_list_mod.TestListRule(index, stages, tmp_path)
+    diff = "".join(difflib.unified_diff(pre_text.splitlines(True), post_text.splitlines(True)))
+    res = rule.apply(PRInputs(changed_files={b200_rel}, diffs={b200_rel: diff}))
+    assert res is not None and res.scope == "testlistonly"
+    assert res.affected_stages == {"DGX_B200-PyTorch-1"}
+    filtered = tmp_path / "filtered_multiline"
+    write_filtered_test_db(test_db, filtered, res.block_filters)
+    expected = (
+        'unittest/_torch/moe/test_moe_backend.py -k "test_cutlass_moe_routing_round_trip or '
+        'test_cutlass_moe_public_activation_ids"'
+    )
+    assert yaml.safe_load((filtered / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
+        expected
+    ]
 
 
 def test_estimate_entries_seconds_reads_wrapped_unittest_batch_durations() -> None:

@@ -202,23 +202,12 @@ def _line_is_in_stage_select(lines: list[str], line_no: int) -> bool:
     return False
 
 
-def _scan_tests_entries(diff: str) -> tuple[set[str], set[str]]:
-    """Extract added / removed test IDs from a stage-select-clean diff.
-
-    The caller must have already confirmed the diff does not touch any
-    stage-select area; every `+/-` list item is then by construction
-    inside a `tests:` block.
-    """
-    added: set[str] = set()
+def _scan_removed_entries(diff: str) -> set[str]:
+    """Extract removed test IDs from a stage-select-clean diff."""
     removed: set[str] = set()
     for raw in diff.splitlines():
-        if not raw or raw.startswith(("+++", "---")):
+        if not raw.startswith("-") or raw.startswith("---"):
             continue
-        if _HUNK_HEADER_RE.match(raw):
-            continue
-        if raw[0] not in ("+", "-"):
-            continue
-        sign = raw[0]
         body = raw[1:]
         if not body.strip() or _COMMENT_RE.match(body):
             continue
@@ -227,61 +216,71 @@ def _scan_tests_entries(diff: str) -> tuple[set[str], set[str]]:
             continue
         tid = normalize_test_id(lm.group("body"))
         if tid:
-            (added if sign == "+" else removed).add(tid)
-    return added, removed
+            removed.add(tid)
+    return removed
 
 
 def _added_entries_by_block(
     post_text: str, post_lines: list[str], added_line_nums: set[int]
 ) -> tuple[dict[tuple[str, int], set[str]], set[str]]:
-    """Map `(yaml_stem, block_index)` to normalized test IDs added in that block."""
+    """Map `(yaml_stem, block_index)` to normalized test IDs touched by `+` lines.
+
+    Walks each block's `tests` sequence in the composed YAML tree so wrapped
+    multiline scalars resolve to their complete folded value (matching
+    `YAMLIndex`), including when a diff only adds/extends continuation lines.
+    """
     by_block: dict[tuple[str, int], set[str]] = {}
     unresolved: set[str] = set()
-    if not added_line_nums:
+    usable_lines = {
+        ln
+        for ln in added_line_nums
+        if 1 <= ln <= len(post_lines)
+        and post_lines[ln - 1].strip()
+        and not _COMMENT_RE.match(post_lines[ln - 1])
+    }
+    if not usable_lines:
         return by_block, unresolved
     try:
         root = yaml.compose(post_text)
     except yaml.YAMLError:
         root = None
-    spans: list[tuple[int, int, str, int]] = []
+
+    covered_lines: set[int] = set()
     if isinstance(root, yaml.MappingNode):
-        items = list(root.value)
-        for idx, (k_node, v_node) in enumerate(items):
+        for k_node, v_node in root.value:
             if k_node.value == "version" or not isinstance(v_node, yaml.SequenceNode):
                 continue
-            ctx_end = (
-                items[idx + 1][0].start_mark.line + 1
-                if idx + 1 < len(items)
-                else len(post_lines) + 1
-            )
-            blocks = list(v_node.value)
-            for b_idx, b_node in enumerate(blocks):
-                b_start = b_node.start_mark.line + 1
-                b_end = (
-                    blocks[b_idx + 1].start_mark.line + 1 if b_idx + 1 < len(blocks) else ctx_end
-                )
-                spans.append((b_start, b_end, str(k_node.value), b_idx))
+            stem = str(k_node.value)
+            for b_idx, b_node in enumerate(v_node.value):
+                if not isinstance(b_node, yaml.MappingNode):
+                    continue
+                for bk_node, bv_node in b_node.value:
+                    if bk_node.value != "tests" or not isinstance(bv_node, yaml.SequenceNode):
+                        continue
+                    for t_node in bv_node.value:
+                        if not isinstance(t_node, yaml.ScalarNode):
+                            continue
+                        t_start = t_node.start_mark.line + 1
+                        t_end = (
+                            t_node.end_mark.line
+                            if t_node.end_mark.column == 0
+                            and t_node.end_mark.line > t_node.start_mark.line
+                            else t_node.end_mark.line + 1
+                        )
+                        hit = {ln for ln in usable_lines if t_start <= ln <= t_end}
+                        if not hit:
+                            continue
+                        covered_lines |= hit
+                        tid = normalize_test_id(str(t_node.value))
+                        if tid:
+                            by_block.setdefault((stem, b_idx), set()).add(tid)
 
-    for ln in sorted(added_line_nums):
-        if not (1 <= ln <= len(post_lines)):
-            continue
-        raw = post_lines[ln - 1]
-        if not raw.strip() or _COMMENT_RE.match(raw):
-            continue
-        lm = _LIST_ITEM_RE.match(raw)
-        if not lm:
-            continue
-        tid = normalize_test_id(lm.group("body"))
-        if not tid:
-            continue
-        placed = False
-        for b_start, b_end, stem, b_idx in spans:
-            if b_start <= ln < b_end:
-                by_block.setdefault((stem, b_idx), set()).add(tid)
-                placed = True
-                break
-        if not placed:
-            unresolved.add(tid)
+    for ln in sorted(usable_lines - covered_lines):
+        lm = _LIST_ITEM_RE.match(post_lines[ln - 1])
+        if lm:
+            tid = normalize_test_id(lm.group("body"))
+            if tid:
+                unresolved.add(tid)
     return by_block, unresolved
 
 
@@ -345,15 +344,15 @@ class TestListRule(Rule):
                 stage_select_files.append(path)
                 continue
 
-            a, r = _scan_tests_entries(diff)
-            added |= a
-            removed |= r
+            removed |= _scan_removed_entries(diff)
             file_by_block, file_unresolved = _added_entries_by_block(
                 post_text, post_lines, added_line_nums
             )
             for b_key, tids in file_by_block.items():
                 added_by_block.setdefault(b_key, set()).update(tids)
+                added |= tids
             unresolved_added |= file_unresolved
+            added |= file_unresolved
 
         if stage_select_files:
             preview = ", ".join(stage_select_files[:3])
