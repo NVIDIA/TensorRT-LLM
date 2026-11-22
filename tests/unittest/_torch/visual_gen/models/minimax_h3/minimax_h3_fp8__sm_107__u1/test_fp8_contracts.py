@@ -870,7 +870,7 @@ def _fused_dispatch_namespace():
         ),
         (
             MODEL / "transformer_minimax_h3.py",
-            {"MiniMaxH3TransformerBlock": {"_forward_fused_adaln"}},
+            {"MiniMaxH3TransformerBlock": {"_forward_fused_adaln", "_forward_mlp_residual"}},
         ),
         (
             MODEL / "minimax_h3_nvfp4__sm_107__u1_u4/modeling.py",
@@ -1181,6 +1181,7 @@ class LifecycleContracts(unittest.TestCase):
                     ),
                     namespace,
                 )
+
                 transformer = SimpleNamespace(
                     proj_out=SimpleNamespace(weight=SimpleNamespace(device=target)),
                     _initialize_fp8=inner,

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 projection GEMM with a gated residual epilogue, for the two projections back to the hidden width.
+"""Projection GEMM with a gated residual epilogue, for projections back to the hidden width.
 
 ``out = bf16(hidden + gate * bf16(scale_a * scale_w * (activation @ weight.T)))`` in one kernel: FP32
 accumulation, the GEMM result rounded to BF16, then the gated residual as one FP32 FMA rounded to
@@ -777,6 +777,7 @@ CONFIG = dict(
     fallback_cluster_shape_mn=(2, 1),
     mma_tile_k=128,
 )
+BF16_DOWN_CONFIG = {**CONFIG, "cluster_shape_mn": (2, 1), "mma_tile_k": 64}
 ATTENTION_OUTPUT_GATE, DOWN_GATE = 2, 5
 _DTYPES = {
     torch.bfloat16: cutlass.BFloat16,
@@ -787,6 +788,16 @@ _DTYPES = {
 _compiled = {}
 
 
+class Bf16ProjectionKernel(ProjectionBreuseKernel):
+    def __init__(self, n, k, gate_column, **config):
+        super().__init__(n, k, gate_column=gate_column, **config)
+        self.mma_inst_shape = (256, config["tile_n"], 16)
+
+    def _make_tiled_mma(self, _collector=None):
+        # BF16 uses ordinary two-CTA MMA with both operands from shared memory.
+        return super()._make_tiled_mma()
+
+
 def block_shared_memory_bytes(device_index):
     """Shared memory one block of this device may opt in to, 0 when the driver does not report it."""
     status, capacity = cuda.cuDeviceGetAttribute(
@@ -795,31 +806,39 @@ def block_shared_memory_bytes(device_index):
     return int(capacity) if int(status) == 0 else 0
 
 
-def compile_kernel(device_index, n, k, gate_column, modulation_dtype, index_dtype):
+def compile_kernel(device_index, n, k, gate_column, modulation_dtype, index_dtype, *, bf16=False):
     """The compiled kernel for one projection shape; row counts are symbolic, so one build serves
     every sequence length and every number of modulation rows."""
-    key = (device_index, n, k, gate_column, modulation_dtype, index_dtype)
+    input_dtype = torch.bfloat16 if bf16 else torch.float8_e4m3fn
+    key = (device_index, n, k, gate_column, modulation_dtype, index_dtype, input_dtype)
     if key not in _compiled:
-        tile_n = CONFIG["tile_n"]
-        cn = CONFIG["cluster_shape_mn"][1]
+        if bf16 and (n, k, gate_column) != (5376, 14336, DOWN_GATE):
+            raise ValueError("The BF16 configuration is qualified for H3 Down only")
+        config = BF16_DOWN_CONFIG if bf16 else CONFIG
+        dsl_dtype = cutlass.BFloat16 if bf16 else cutlass.Float8E4M3FN
+        kernel_class = Bf16ProjectionKernel if bf16 else ProjectionBreuseKernel
+        precision = "BF16" if bf16 else "FP8"
+        tile_n = config["tile_n"]
+        cn = config["cluster_shape_mn"][1]
         tiles = n // tile_n
-        if n % tile_n or k % 128 or tiles % cn or (tiles // cn) % CONFIG["swizzle_size"]:
-            raise ValueError(f"the FP8 projection kernel does not tile a [{n}, {k}] weight")
+        if n % tile_n or k % 128 or tiles % cn or (tiles // cn) % config["swizzle_size"]:
+            raise ValueError(f"the {precision} projection kernel does not tile a [{n}, {k}] weight")
         capacity = block_shared_memory_bytes(device_index)
-        needed = (256 + tile_n // 2) * CONFIG["mma_tile_k"] * CONFIG["num_ab_stage"] + 4096
+        input_bytes = 2 if bf16 else 1
+        needed = (256 + tile_n // 2) * config["mma_tile_k"] * config[
+            "num_ab_stage"
+        ] * input_bytes + 4096
         if capacity < needed:
             raise RuntimeError(
-                f"the FP8 projection kernel needs {needed} bytes of shared memory per block, "
+                f"the {precision} projection kernel needs {needed} bytes of shared memory per block, "
                 f"the device offers {capacity}"
             )
-        kern = ProjectionBreuseKernel(n, k, gate_column=gate_column, **CONFIG)
+        kern = kernel_class(n, k, gate_column=gate_column, **config)
         m_sym = cute.sym_int32()
         act = make_fake_compact_tensor(
-            cutlass.Float8E4M3FN, (m_sym, k), stride_order=(1, 0), assumed_align=256
+            dsl_dtype, (m_sym, k), stride_order=(1, 0), assumed_align=256
         )
-        wgt = make_fake_compact_tensor(
-            cutlass.Float8E4M3FN, (n, k), stride_order=(1, 0), assumed_align=256
-        )
+        wgt = make_fake_compact_tensor(dsl_dtype, (n, k), stride_order=(1, 0), assumed_align=256)
         scale = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         out = make_fake_compact_tensor(
             cutlass.BFloat16, (m_sym, n), stride_order=(1, 0), assumed_align=256
@@ -857,12 +876,12 @@ def supports(a, w, x, mod, idx, gate_column):
     if not (a.is_cuda and a.ndim == w.ndim == mod.ndim == 2 and idx.ndim == 1):
         return False
     m, n = a.shape[0], w.shape[0]
-    key = (a.device.index, n, a.shape[1], gate_column, mod.dtype, idx.dtype)
+    key = (a.device.index, n, a.shape[1], gate_column, mod.dtype, idx.dtype, a.dtype)
     return (
         key in _compiled
         and m > 0
         and a.shape[1] == w.shape[1]
-        and a.dtype == w.dtype == torch.float8_e4m3fn
+        and a.dtype == w.dtype
         and x.dtype == torch.bfloat16
         and x.numel() == m * n
         and mod.shape[1] == 6 * n
@@ -881,7 +900,7 @@ def run(a, w, sa, sw, x, mod, idx, gate_column):
     m, k = a.shape
     n = w.shape[0]
     out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
-    _compiled[(a.device.index, n, k, gate_column, mod.dtype, idx.dtype)](
+    _compiled[(a.device.index, n, k, gate_column, mod.dtype, idx.dtype, a.dtype)](
         a, w, sa.reshape(1), sw.reshape(1), (x.view(m, n), mod, idx), out
     )
     return out

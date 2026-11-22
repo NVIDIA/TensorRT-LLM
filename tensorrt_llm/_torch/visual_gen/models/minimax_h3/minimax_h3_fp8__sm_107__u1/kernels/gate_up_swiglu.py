@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# H3 static FP8 gate-up GEMM -> BF16 rounding -> strict SwiGLU / sg_scale -> E4M3, fused.
+# H3 GateUp GEMM and SwiGLU on SM107, with a BF16 projection boundary.
 #
 # Native SM107 (Rubin) CuTe DSL kernel:
 #   * persistent, warp-specialized tcgen05 2-CTA FP8 GEMM, 256x256x64 instructions with the SM107
@@ -15,6 +15,8 @@
 #     BF16 (bf16_rn(acc*(sa*sw)), the mandatory rounding), release it to the MMA warp, then run
 #     the strict SG (same PTX ops as the reference SG kernel) -> saturating E4M3 from registers
 #     while the next tile's MMAs execute; packed 32B global stores
+#   * BF16 mode uses ordinary 2-CTA MMA, reads the original [gate; up] weights via a
+#     strided tensor map and returns BF16 SwiGLU activations
 from typing import Tuple
 
 import cuda.bindings.driver as cuda
@@ -193,6 +195,47 @@ def _swiglu4_bf16(g01, g23, u01, u23, f_sg, r_sg, zero, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _swiglu_bf16x2(gate, up, zero, *, loc=None, ip=None):
+    """Evaluate plain SwiGLU in FP32 on rounded BF16 inputs and return packed BF16."""
+    args = [cutlass.Uint32(v).ir_value(loc=loc, ip=ip) for v in (gate, up, zero)]
+    asm = """{
+.reg .b32 g, u;
+.reg .b16 g_lo, g_hi, u_lo, u_hi;
+.reg .f32 a<2>, b<2>, r<2>, t;
+or.b32 g, $1, $3;
+or.b32 u, $2, $3;
+mov.b32 {g_lo, g_hi}, g;
+mov.b32 {u_lo, u_hi}, u;
+cvt.f32.bf16 a0, g_lo;
+cvt.f32.bf16 a1, g_hi;
+cvt.f32.bf16 b0, u_lo;
+cvt.f32.bf16 b1, u_hi;
+"""
+    for i in range(2):
+        asm += (
+            f"mul.rn.f32 t, a{i}, 0fBFB8AA3B;\n"
+            "ex2.approx.ftz.f32 t, t;\n"
+            "add.rn.f32 t, t, 0f3F800000;\n"
+            "div.full.f32 t, 0f3F800000, t;\n"
+            f"mul.rn.f32 t, a{i}, t;\n"
+            f"add.rn.f32 b{i}, b{i}, 0f00000000;\n"
+            f"mul.rn.f32 r{i}, t, b{i};\n"
+        )
+    asm += "cvt.rn.bf16x2.f32 $0, r1, r0;\n}"
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            args,
+            asm,
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 class GateUpSwiGLUBreuseKernel:
     def __init__(
         self,
@@ -202,10 +245,12 @@ class GateUpSwiGLUBreuseKernel:
         fallback_cluster_shape_mn=(2, 1),
         mma_tile_k=128,
         skew_kb=2,
+        bf16=False,
     ):
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.TWO
-        self.mma_inst_shape = (256, 256, 64)
+        self.bf16 = bf16
+        self.mma_inst_shape = (256, 256, 16 if bf16 else 64)
         self.mma_tiler = (512, 256, mma_tile_k)  # 2 x inst M -> Bkeep/Breuse
         self.cluster_shape_mn = cluster_shape_mn
         self.fallback_cluster_shape_mn = fallback_cluster_shape_mn
@@ -257,8 +302,18 @@ class GateUpSwiGLUBreuseKernel:
         self.b_dtype = wgt.element_type
 
         tiled_mma = self._make_tiled_mma()
-        tiled_mma_bkeep = self._make_tiled_mma(CollectorOp.FILL)
-        tiled_mma_breuse = self._make_tiled_mma(CollectorOp.LASTUSE)
+        if cutlass.const_expr(self.bf16):
+            # Each CTA loads one 128-row half of the paired gate/up tile.
+            logical_weight_layout = cute.make_layout(
+                ((HALF_TILE_N, 2, D_HALF // HALF_TILE_N), K_DIM),
+                stride=((K_DIM, D_HALF * K_DIM, HALF_TILE_N * K_DIM), 1),
+            )
+            wgt = cute.make_tensor(wgt.iterator, logical_weight_layout)
+            tiled_mma_bkeep = self._make_tiled_mma()
+            tiled_mma_breuse = self._make_tiled_mma()
+        else:
+            tiled_mma_bkeep = self._make_tiled_mma(CollectorOp.FILL)
+            tiled_mma_breuse = self._make_tiled_mma(CollectorOp.LASTUSE)
 
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
@@ -842,14 +897,17 @@ class GateUpSwiGLUBreuseKernel:
             num_sub = HALF_TILE_N // self.epi_tile[1]  # 4 gate subtiles (+4 up subtiles)
             # BF16 staging: [gate subtiles 0..3 | up subtiles 0..3] x 16 packed bf16x2
             rStage = cute.make_rmem_tensor((2 * num_sub * n_val // 2,), cutlass.Uint32)
-            tTR_rO = cute.make_rmem_tensor((n_val,), cutlass.Float8E4M3FN)
+            tTR_rO = cute.make_rmem_tensor((n_val,), mOut.element_type)
             tTR_rO32 = cute.recast_tensor(tTR_rO, cutlass.Uint32)
             store_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=256
+                cute.nvgpu.CopyUniversalOp(), mOut.element_type, num_bits_per_copy=256
             )
 
-            s_ab = s_in[0] * s_w[0]
-            r_sg, f_sg = _sg_recip(s_g[0])
+            if cutlass.const_expr(self.bf16):
+                s_ab = cutlass.Float32(1.0)
+            else:
+                s_ab = s_in[0] * s_w[0]
+                r_sg, f_sg = _sg_recip(s_g[0])
             m_total = mOut.shape[0]
 
             acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
@@ -903,22 +961,28 @@ class GateUpSwiGLUBreuseKernel:
                 acc2_consumer_state.advance()
                 zero = _ld_shared_volatile(zero_ptr)
 
-                # ---- strict SG + E4M3 from registers (overlaps the next tile's MMAs) ----
+                # ---- SwiGLU from registers (overlaps the next tile's MMAs) ----
                 for c in cutlass.range_constexpr(2):
                     gRow = cute.local_tile(mOut[(row + c * 256, None)], (n_val,), (None,))
                     for s in cutlass.range_constexpr(2):
-                        for i in cutlass.range_constexpr(n_val // 4):
-                            g = (c * num_sub + s) * (n_val // 2) + 2 * i
-                            u = (c * num_sub + 2 + s) * (n_val // 2) + 2 * i
-                            tTR_rO32[i] = _swiglu4_bf16(
-                                rStage[g],
-                                rStage[g + 1],
-                                rStage[u],
-                                rStage[u + 1],
-                                f_sg,
-                                r_sg,
-                                zero,
-                            )
+                        if cutlass.const_expr(self.bf16):
+                            for i in cutlass.range_constexpr(n_val // 2):
+                                g = (c * num_sub + s) * (n_val // 2) + i
+                                u = (c * num_sub + 2 + s) * (n_val // 2) + i
+                                tTR_rO32[i] = _swiglu_bf16x2(rStage[g], rStage[u], zero)
+                        else:
+                            for i in cutlass.range_constexpr(n_val // 4):
+                                g = (c * num_sub + s) * (n_val // 2) + 2 * i
+                                u = (c * num_sub + 2 + s) * (n_val // 2) + 2 * i
+                                tTR_rO32[i] = _swiglu4_bf16(
+                                    rStage[g],
+                                    rStage[g + 1],
+                                    rStage[u],
+                                    rStage[u + 1],
+                                    f_sg,
+                                    r_sg,
+                                    zero,
+                                )
                         if row + c * 256 < m_total:
                             cute.copy(store_atom, tTR_rO, gRow[(None, out_col // n_val + s)])
                         cute.arch.sync_warp()
@@ -956,31 +1020,35 @@ def _smem_optin_bytes(device_index):
     return int(torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin)
 
 
-def _get_compiled(device_index, smem_optin=None):
-    key = (device_index, repr(sorted(_CFG.items())))
+def _get_compiled(device_index, smem_optin=None, *, bf16=False):
+    key = (device_index, bf16, repr(sorted(_CFG.items())))
     fn = _compiled.get(key)
     if fn is None:
         cfg = dict(_CFG)
+        element_type = cutlass.BFloat16 if bf16 else cutlass.Float8E4M3FN
+        element_bytes = 2 if bf16 else 1
+        if bf16:
+            cfg["mma_tile_k"] = 64
         if smem_optin is None:
             smem_optin = _smem_optin_bytes(device_index)
         if cfg.get("num_ab_stage") is None:
-            # A (2x128 rows) + B (128 rows) x K FP8 per stage; 4 KiB for barriers/alignment.
+            # A (2x128 rows) + B (128 rows) per stage; 4 KiB for barriers/alignment.
             cfg["num_ab_stage"] = max(
-                2, min(16, (smem_optin - 4096) // (3 * 128 * cfg.get("mma_tile_k", 128)))
+                2, min(16, (smem_optin - 4096) // (3 * 128 * cfg["mma_tile_k"] * element_bytes))
             )
-        kern = GateUpSwiGLUBreuseKernel(**cfg)
+        kern = GateUpSwiGLUBreuseKernel(**cfg, bf16=bf16)
         m_sym = cute.sym_int32()
         act = make_fake_compact_tensor(
-            cutlass.Float8E4M3FN, (m_sym, K_DIM), stride_order=(1, 0), assumed_align=256
+            element_type, (m_sym, K_DIM), stride_order=(1, 0), assumed_align=256
         )
         wgt = make_fake_compact_tensor(
-            cutlass.Float8E4M3FN, (N_TOT, K_DIM), stride_order=(1, 0), assumed_align=256
+            element_type, (N_TOT, K_DIM), stride_order=(1, 0), assumed_align=256
         )
         s_in = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         s_w = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         s_g = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         out = make_fake_compact_tensor(
-            cutlass.Float8E4M3FN, (m_sym, D_HALF), stride_order=(1, 0), assumed_align=256
+            element_type, (m_sym, D_HALF), stride_order=(1, 0), assumed_align=256
         )
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
         fn = cute.compile(kern, act, wgt, s_in, s_w, s_g, out, stream, options="--enable-tvm-ffi")
