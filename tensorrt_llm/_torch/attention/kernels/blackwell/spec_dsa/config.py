@@ -16,8 +16,9 @@
 
 A ``SpecDsaConfig`` holds what a specDSA kernel is specialized for: the indexer (heads, head dim, K-cache dtype and
 page size, compression ratio), the selection (top-K, longest row), the attention (heads, KV row layout, sliding window,
-attention sink) and the limits of the two implementations (batch sizes). It is frozen and hashable, validated when it
-is built, and independent of torch and CuTe DSL, so it can be imported anywhere.
+attention sink) and the batch-size limits of the implementations. The limits are host-side dispatch data and not part
+of ``kernel_key``. A ``SpecDsaConfig`` is frozen and hashable, validated when it is built, and independent of torch and
+CuTe DSL, so it can be imported anywhere.
 
 The kernels of this package are specialized for one spec, ``DS_V4_FLASH``. ``SUPPORTED_SPECS`` lists the specs they were
 built and validated for; their structural constants are defined from it and their constructors reject a config that
@@ -75,9 +76,13 @@ class SpecDsaConfig:
         window: rows of the sliding window.
         swa_page_rows: sliding-window rows per page.
         has_sink: whether the attention has a per-head sink.
-        megakernel_max_batch: largest batch size of the megakernel (0: no megakernel).
+        megakernel_max_batch: largest batch size the megakernel can serve (0: no megakernel).
         large_batch: whether the large-batch kernels serve the batch sizes above the megakernel's.
         max_batch: largest batch size.
+        tail_hybrid_range: first and last batch size of the tail-attention hybrid (the production indexer logits kernel,
+            the multi-CTA top-K and the tail attention), or None for no hybrid. Dispatch data only
+            (``op.implementation_for``): the hybrid's kernels do not depend on the spec, so it is not part of
+            ``kernel_key``.
     """
 
     name: str
@@ -98,6 +103,7 @@ class SpecDsaConfig:
     megakernel_max_batch: int
     large_batch: bool
     max_batch: int
+    tail_hybrid_range: tuple[int, int] | None = None
 
     def __post_init__(self):
         def bad(msg):
@@ -143,6 +149,19 @@ class SpecDsaConfig:
             bad("megakernel_max_batch exceeds max_batch")
         if not self.large_batch and self.max_batch > self.megakernel_max_batch:
             bad("batch sizes above megakernel_max_batch need the large-batch kernels")
+        rng = self.tail_hybrid_range
+        if rng is not None:
+            if (
+                not isinstance(rng, tuple)
+                or len(rng) != 2
+                or not all(isinstance(n, int) for n in rng)
+            ):
+                bad(f"tail_hybrid_range must be None or a tuple (first, last) of ints, got {rng!r}")
+            if not 1 <= rng[0] <= rng[1] <= self.max_batch:
+                bad(
+                    f"tail_hybrid_range {rng} must satisfy 1 <= first <= last <= max_batch "
+                    f"({self.max_batch})"
+                )
 
     @property
     def shape_key(self) -> tuple[int, int, int, int]:
@@ -223,9 +242,14 @@ DS_V4_FLASH = SpecDsaConfig(
 # The same model with the MXFP4 indexer K cache of the cache manager (E2M1 data and a UE8M0 scale per 32 elements,
 # 68 bytes per position) and an FP4 indexer query with a scale per 32 elements.
 # The FP4 K stream is twice as fast per byte, but the megakernel row cost (the epilogue warps' hand-over of every
-# row, the teams' selection and attention) does not shrink with it: from 21 rows the large-batch kernels are faster.
+# row, the teams' selection and attention) does not shrink with it: the megakernel can serve up to 20 rows but is the
+# default for 1 to 4, the tail-attention hybrid for 5 to 26 rows, the large-batch kernels from 27 rows.
 DS_V4_FLASH_FP4 = replace(
-    DS_V4_FLASH, name="DS-V4-Flash-FP4", index_k_dtype="fp4", megakernel_max_batch=20
+    DS_V4_FLASH,
+    name="DS-V4-Flash-FP4",
+    index_k_dtype="fp4",
+    megakernel_max_batch=20,
+    tail_hybrid_range=(5, 26),
 )
 
 # The specs the kernels were built and validated for.
@@ -243,6 +267,13 @@ KNOWN_SHAPES = {
 def _not_supported(what: str) -> NotImplementedError:
     supported = ", ".join(f"{s.name} {s.shape_key}" for s in SUPPORTED_SPECS.values())
     return NotImplementedError(f"specDSA has no kernels for {what}; supported: {supported}")
+
+
+def _range_within(inner: tuple[int, int] | None, outer: tuple[int, int] | None) -> bool:
+    """Whether the batch-size range ``inner`` lies inside ``outer`` (None is the empty range)."""
+    if inner is None:
+        return True
+    return outer is not None and outer[0] <= inner[0] and inner[1] <= outer[1]
 
 
 def resolve_spec(
@@ -278,8 +309,9 @@ def supported_spec(config: SpecDsaConfig | None = None) -> SpecDsaConfig:
     """``config`` (default: ``DS_V4_FLASH``) if the kernels serve it, else ``NotImplementedError``.
 
     The kernels serve a config whose ``kernel_key`` is one of ``SUPPORTED_SPECS`` and whose batch-size limits are not
-    above that spec's; a config with lower limits is accepted (it routes more batch sizes to the large-batch kernels or
-    rejects them).
+    above that spec's, and whose tail-hybrid range lies inside that spec's (none if the spec has none); a config with
+    lower limits or a narrower range is accepted (it routes more batch sizes to the other implementations or rejects
+    them).
     """
     if config is None:
         return DS_V4_FLASH
@@ -292,6 +324,11 @@ def supported_spec(config: SpecDsaConfig | None = None) -> SpecDsaConfig:
             ):
                 raise _not_supported(
                     f"{config.name!r} with batch-size limits above those of {spec.name}"
+                )
+            if not _range_within(config.tail_hybrid_range, spec.tail_hybrid_range):
+                raise _not_supported(
+                    f"{config.name!r} with a tail-hybrid range {config.tail_hybrid_range} outside "
+                    f"the one of {spec.name} {spec.tail_hybrid_range}"
                 )
             return config
     raise _not_supported(f"{config.name!r} {config.shape_key}")

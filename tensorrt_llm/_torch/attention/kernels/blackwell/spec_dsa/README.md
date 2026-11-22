@@ -9,8 +9,10 @@ megakernel (few rows) guesses the top-K threshold from a sample of the row's own
 sampling ladder of the GVR V2 top-K (a copy in this package, nothing is imported), and checks the guess with a count
 certificate; a row where the guess does not hold takes an exact fallback. The large-batch kernels (many rows) take no
 sample: each CTA keeps the candidates of its row segment above a floor that it raises from the candidates it has
-admitted so far, and selects the exact top-K from the ones kept. "spec" here is this speculation on the selection
-threshold, not speculative decoding (MTP).
+admitted so far, and selects the exact top-K from the ones kept. The tail-attention hybrid (a middle range of rows of
+the FP4 spec) keeps the production indexer logits kernel and replaces the rest of the chain with a multi-CTA exact
+top-K and a fused attention kernel. "spec" here is this speculation on the selection threshold, not speculative
+decoding (MTP).
 
 The kernels of this package are specialized for the specs of one model, DS-V4-Flash with an FP8 or an MXFP4 indexer K
 cache. `config.py` defines what a spec is and which specs have kernels; the rest of this file says where the parts that
@@ -21,8 +23,9 @@ differ between models live and how to add a model.
 | File | Role |
 | --- | --- |
 | `config.py` | `SpecDsaConfig` (the compile-time shape of a model), the specs, the support check |
-| `op.py` | the interface (`prepare`, `run`, `precompile`, `error_bits`, `implementation_for`, `is_supported`); picks the implementation of a batch size |
+| `op.py` | the interface (`prepare`, `run`, `precompile`, `error_bits`, `implementation_for`, `is_supported`); picks the implementation of a batch size (`implementation=` forces another one that can serve it) |
 | `megakernel_op.py`, `large_batch_op.py` | host side of each implementation (state, argument checks, engine cache); import-safe without CuTe DSL |
+| `hybrid_op.py` | host side of the tail-attention hybrid behind the same interface (FP4 spec, 5 to 26 rows): the state holds the compressed lengths, the scheduler metadata of the production logits kernel and the sinks; `run` is the production logits op, the multi-CTA top-K and the tail attention; `precompile` also warms the production logits op; import-safe without CuTe DSL |
 | `megakernel.py`, `megakernel_attention.py`, `megakernel_lib.py` | megakernel: kernel and row descriptors, attention (KV gather, MMA, softmax), PTX helpers and selection primitives |
 | `large_batch.py`, `large_batch_lib.py` | large-batch kernels: indexer kernel and attention tail, selection routines and the ready queue |
 | `tail_attention.py`, `tail_op.py` | tail attention: the decode sparse MLA of up to 26 rows behind any exact top-K kernel, the KV tiles of a row split over a cluster of 5 CTAs with the combine inside the cluster (host side: `run_attention`, `run_hybrid`) |
@@ -58,16 +61,49 @@ differ between models live and how to add a model.
   slowest row of the batch is. The two flags go together (`topk_multicta_op.run(trigger=True, arm=True)`,
   `run_attention(pdl=True, poll=True)` behind it on the same `topk` tensor); `run_hybrid` sets both.
 
-| Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
-| --- | --- | --- | --- | --- | --- | --- |
-| DS-V4-Flash | 64 x 128, fp8 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 47 rows | 48 to 1,024 rows |
-| DS-V4-Flash-FP4 | 64 x 128, fp4 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 20 rows | 21 to 1,024 rows |
+### Dispatch
+
+`op.implementation_for(batch_size, config)` picks the implementation: the tail hybrid inside the spec's
+`tail_hybrid_range`, else the megakernel up to `megakernel_max_batch`, else the large-batch kernels. The range is
+host-side dispatch data, not part of `kernel_key`. The last three columns of the table below are the default ranges.
+
+For the FP4 spec `op.run` runs the hybrid at 5 to 26 rows (`hybrid_op.py`): the indexer logits op of the production
+MXFP4 chain (`torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits`, into a logits buffer of `max_index_len` columns so that
+a captured launch has fixed shapes; the kernel writes each row's valid length), the multi-CTA top-K and the tail
+attention, with the `pdl` / `poll` defaults of `tail_op.run_hybrid`. `prepare` keeps the compressed lengths on the
+device and builds the scheduler metadata of the logits op (`tensorrt_llm.deep_gemm.get_paged_mqa_logits_metadata`) from
+them, both in persistent buffers that it refreshes in place, so a captured graph replays over them. The logits op and
+the top-K read that copy of the lengths, never the `ctx_lens` argument of `run`. `precompile` compiles the two kernels
+in the variant `run` launches and launches the logits op once on dummy data (its first call compiles it, which must not
+happen inside a capture).
+
+The hybrid is the one implementation that is not self-contained: the production logits op has to be registered (CuTe
+DSL installed) together with its scheduler metadata function. Both are resolved when first used; a missing one is a
+`RuntimeError` that names it (`hybrid_op.is_supported`, or `op.is_supported(..., batch_size=)`, tells beforehand), there
+is no fallback. It has no device-side error flag: `error_bits` is a zero view, and a state that was not refreshed for
+the step is not detected (the launch computes for the lengths of the last `prepare`). It takes contiguous
+`idx_block_table`, `bt_swa` and `bt_c` and an int32 [B] `kv_lens` only (the megakernel also takes strided block tables).
+The logits buffer belongs to the production op, so hybrid launches, and that op's other users, must be stream-ordered
+with respect to each other, also across states.
+
+The hybrid is tuned for rows of 1M tokens. Its top-K is exact for every row length, but the faster top-K stage only for
+rows of 16,384 positions or more (`topk_multicta_op.is_profitable`). The megakernel can serve up to 20 rows of the FP4
+spec (`megakernel_max_batch`) and stays selectable there: `prepare(..., implementation="megakernel")` and
+`precompile(..., implementation="megakernel")` force an implementation that can serve the batch size (the large-batch
+kernels any batch size, the hybrid its range). A state remembers its implementation.
+
+| Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Tail hybrid | Large batch |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DS-V4-Flash | 64 x 128, fp8 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 47 rows | none | 48 to 1,024 rows |
+| DS-V4-Flash-FP4 | 64 x 128, fp4 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 4 rows | 5 to 26 rows | 27 to 1,024 rows |
 
 `is_supported(device, config)` and `implementation_for(batch_size, config)` answer from this table. For a config that is
 not in it `is_supported` returns `(False, reason)` and `precompile`, `prepare` and `implementation_for` raise
 `NotImplementedError` (a state carries the spec it was prepared for, so `run` needs no config); the caller keeps the
-existing kernels for it. Indexer shapes of other DeepSeek models are in `config.KNOWN_SHAPES` (V3.2: 64 x 128,
-top-2048, no compression; V4-Pro: top-1024, 4x compression); they have no spec yet.
+existing kernels for it. A config with lower batch-size limits or a narrower `tail_hybrid_range` is served (the other
+batch sizes go to the other implementations); one with a range the spec does not have is refused. Indexer shapes of
+other DeepSeek models are in `config.KNOWN_SHAPES` (V3.2: 64 x 128, top-2048, no compression; V4-Pro: top-1024, 4x
+compression); they have no spec yet.
 
 ## What differs between models, and where it goes
 
@@ -77,7 +113,7 @@ top-2048, no compression; V4-Pro: top-1024, 4x compression); they have no spec y
 | Indexer K cache | fp8 or fp4 | `index_k_dtype`; a logits front end per dtype in the megakernel's stream CTAs and in the indexer kernel (fp4: block-scaled MXF4 MMA, the scale factors go to tensor memory with UTCCP; `run` takes the query scales as `q_scale`) |
 | Selection | K sets the candidate buffers, the certificate bounds and the ladder of the megakernel's threshold guess | the selection primitives (`*_lib.py`); tuning that depends on K lives with them |
 | KV format and dense attention | MLA latent KV (V3.2), E4M3 rows with a footer scale, window and sink (V4), the CSA2 cache (V4.1) | `kv_format`; one attention module per format (today `megakernel_attention.py` and the attention part of `large_batch.py`) |
-| Schedule | teams, ring depth, batch-size ranges per implementation | the knob tables of the host modules, keyed by `kernel_key`; `megakernel_max_batch` and `large_batch` of the spec |
+| Schedule | teams, ring depth, batch-size ranges per implementation | the knob tables of the host modules, keyed by `kernel_key`; `megakernel_max_batch`, `large_batch` and `tail_hybrid_range` of the spec |
 
 Model names appear in `config.py` only. The code that builds a config from a model's configuration and decides when to
 use these kernels belongs with the model's attention backend (`attention/backends/sparse/<family>`), not here.

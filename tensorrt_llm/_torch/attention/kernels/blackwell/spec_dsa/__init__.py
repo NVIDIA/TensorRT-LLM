@@ -15,10 +15,12 @@
 """specDSA (speculative DSA): fused decode sparse attention of the DeepSeek DSA models for Blackwell.
 
 The indexer logits, the exact top-K selection, the mapping to compressed-KV rows and the sparse attention over the
-selected rows run in one megakernel (few rows) or in two kernels (many rows). The megakernel guesses the top-K threshold
-from a sample of the row's own logits (the sampling ladder of the GVR V2 top-K) and checks it with a count certificate;
-a row where the guess does not hold takes an exact fallback. The two-kernel path takes no sample: it learns a floor from
-the candidates it has already admitted in the row and selects the exact top-K from the ones kept.
+selected rows run in one megakernel (few rows), in two kernels (many rows) or, for a middle range of rows of the MXFP4
+spec, in the tail-attention hybrid (the production indexer logits kernel, a multi-CTA top-K and a tail attention). The
+megakernel guesses the top-K threshold from a sample of the row's own logits (the sampling ladder of the GVR V2 top-K)
+and checks it with a count certificate; a row where the guess does not hold takes an exact fallback. The two-kernel path
+takes no sample: it learns a floor from the candidates it has already admitted in the row and selects the exact top-K
+from the ones kept. The selection is exact in all three.
 
 The kernels are specialized for a spec (:mod:`.config`); DeepSeek-V4-Flash is the one with kernels today (``README.md``
 lists the specs and how to add one). Import :mod:`.op` for the host side and :mod:`.config` for the specs; nothing is
