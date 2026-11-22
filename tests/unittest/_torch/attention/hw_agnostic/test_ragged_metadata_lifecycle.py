@@ -28,6 +28,7 @@ def _metadata(seq_lens: list[int], num_contexts: int = 0) -> DSAtrtllmAttentionM
     metadata._num_ctx_tokens = sum(seq_lens[:num_contexts])
     metadata._num_tokens = sum(seq_lens)
     metadata.max_draft_tokens = 5
+    metadata.sparse_metadata_params = SimpleNamespace(use_cute_dsl_paged_mqa_logits=False)
     metadata.runtime_tokens_per_gen_step = 0
     metadata._indexer_compress_ratio = 1
     metadata.kv_cache_manager = None

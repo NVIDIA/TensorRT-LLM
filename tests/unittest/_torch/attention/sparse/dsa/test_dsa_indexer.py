@@ -2314,6 +2314,9 @@ def _create_mock_metadata(
             self._num_seqs = num_contexts + num_generations
             self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
+            self.sparse_metadata_params = SimpleNamespace(
+                use_cute_dsl_paged_mqa_logits=use_cute_dsl_paged_mqa_logits
+            )
             self.num_sparse_topk = index_topk
             self._radix_rows_per_sequence = 1 + self.max_draft_tokens
             self._create_radix_aux_buffers(capture_graph=False)
