@@ -186,7 +186,8 @@ def prepare(
 ) -> tuple[ModuleType | None, ModuleType | None, torch.Tensor, dict]:
     """Qualify fresh binaries against installed GPU operators, including all BF16 bit patterns.
 
-    ``scales`` is the frozen model's contiguous CUDA FP32 tensor of shape [50].
+    ``scales`` is the frozen model's contiguous CUDA FP32 vector, one attention-output input scale
+    per fused block (1 to 50).
     This preparation runs before request timing and is repeated for each new process.
 
     Returns ``(quant, cast, factors, proof)``. ``quant`` and ``cast`` are None when the kernels
@@ -244,7 +245,8 @@ def _prepare(
         torch.cuda.get_device_capability(scales.device) == (10, 7)
         and properties.multi_processor_count == 212
     )
-    assert scales.is_cuda and scales.dtype == torch.float32 and scales.shape == (50,)
+    assert scales.is_cuda and scales.dtype == torch.float32 and scales.ndim == 1
+    assert 1 <= scales.numel() <= 50
     assert scales.is_contiguous() and bool(scales.isfinite().all()) and bool((scales > 0).all())
     pdl = os.environ.get("TRTLLM_ENABLE_PDL") != "0"
     factors = quant.factors(scales, True, pdl)
@@ -271,7 +273,7 @@ def _prepare(
     assert all(torch.unique(bits[:, j]).numel() == 65536 for j in range(8))
     raw = bits.view(torch.bfloat16).cuda()
     owner, out = guarded(tuple(raw.shape), torch.float8_e4m3fn)
-    for index in range(50):
+    for index in range(scales.numel()):
         scale, factor = scales[index : index + 1], factors[index : index + 1]
         native = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(raw, scale)[0]
         quant.out_config(raw, scale, factor, out, 0, pdl, BLOCKS, THREADS)
@@ -296,7 +298,7 @@ def _prepare(
     torch.cuda.synchronize()
     proof = dict(
         unary_qualified=True,
-        scales=50,
+        scales=scales.numel(),
         BF16_patterns_each_position=65536,
         positions=8,
         tails=list(TAILS),

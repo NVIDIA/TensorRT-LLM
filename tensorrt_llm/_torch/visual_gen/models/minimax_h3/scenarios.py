@@ -163,9 +163,11 @@ def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePip
 
 
 def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
-    """Uniform static per-tensor FP8, 212-SM Rubin, Ulysses=TP=1 and compile on.
+    """Static per-tensor FP8, 212-SM Rubin, Ulysses=TP=1 and compile on.
 
-    Mixed checkpoints, asynchronous exchange, weight mutation/offload, cache
+    A checkpoint may keep whole transformer blocks in BF16: such a block runs the family block
+    with FP8 attention, the others the fused FP8 block. Blocks that quantize only part of their
+    main Linears, per-layer quantization, asynchronous exchange, weight mutation/offload, cache
     approximations and whole-model CUDA Graphs are outside this fixed scenario.
     """
     if _device_capability() != (10, 7) or _device_multiprocessors() != 212:
@@ -178,7 +180,7 @@ def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline
         or config.dynamic_weight_quant
         or config.force_dynamic_quantization
     ):
-        raise NoScenario("the static-FP8 fusion needs a uniform pre-quantized FP8 checkpoint")
+        raise NoScenario("the static-FP8 fusion needs a pre-quantized FP8 checkpoint")
     model_config = config.model_configs["transformer"]
     if model_config.torch_dtype != torch.bfloat16:
         raise NoScenario("the static-FP8 fusion needs BF16 transformer activations")
@@ -188,24 +190,42 @@ def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline
     if any(name.startswith("transformer_blocks.") for name in attention_precision):
         raise NoScenario("the static-FP8 fusion needs FP8 Attention in all main transformer blocks")
     quant_config = _transformer_quant_config(config)
+    # One block's four main Linears: module name -> the checkpoint names behind it.
+    main_linears = {
+        "attn.qkv_proj": ("attn.to_q", "attn.to_k", "attn.to_v"),
+        "attn.to_out.0": ("attn.to_out.0",),
+        "ff.gate_up_proj": ("ff.net.0.proj",),
+        "ff.down_proj": ("ff.net.2",),
+    }
+    fused_blocks = 0
     for block_index in range(50):
-        for projection in (
-            "attn.qkv_proj",
-            "attn.to_q",
-            "attn.to_k",
-            "attn.to_v",
-            "attn.to_out.0",
-            "ff.gate_up_proj",
-            "ff.net.0.proj",
-            "ff.down_proj",
-            "ff.net.2",
-        ):
-            name = f"transformer_blocks.{block_index}.{projection}"
-            if quant_config.is_module_excluded_from_quantization(name):
+        prefix = f"transformer_blocks.{block_index}."
+        # The loader's rule: a Linear stays unquantized when its own name is excluded or all of
+        # its checkpoint names are; a fused Linear excluded only in part is a load error.
+        excluded = []
+        for linear, members in main_linears.items():
+            member_excluded = [
+                quant_config.is_module_excluded_from_quantization(prefix + member)
+                for member in members
+            ]
+            if quant_config.is_module_excluded_from_quantization(prefix + linear) or all(
+                member_excluded
+            ):
+                excluded.append(linear)
+            elif any(member_excluded):
                 raise NoScenario(
-                    "the static-FP8 fusion needs all 200 main Linears quantized; "
-                    f"{name} is excluded from quantization"
+                    f"the static-FP8 fusion needs each main Linear wholly quantized or wholly "
+                    f"excluded; {prefix}{linear} is excluded from quantization only in part"
                 )
+        if excluded and len(excluded) != len(main_linears):
+            raise NoScenario(
+                "the static-FP8 fusion needs each block's four main Linears all quantized or all "
+                f"excluded; block {block_index} has only {', '.join(excluded)} excluded from "
+                "quantization"
+            )
+        fused_blocks += not excluded
+    if not fused_blocks:
+        raise NoScenario("the static-FP8 fusion needs at least one block with FP8 main Linears")
     qac = getattr(config.attention, "quant_attention_config", None)
     if (
         str(config.attention.backend).upper() != "CUDNN"

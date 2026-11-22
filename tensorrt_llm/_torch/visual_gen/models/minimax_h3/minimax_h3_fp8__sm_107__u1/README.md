@@ -3,8 +3,9 @@
 
 # MiniMax-H3 static FP8 on Rubin
 
-This scenario implements the uniform static ModelOpt FP8 DiT on one SM107 GPU
-with 212 SMs. It keeps BF16 residuals and the original FP32 media heads, and
+This scenario implements the static ModelOpt FP8 DiT on one SM107 GPU with 212
+SMs, including checkpoints that keep whole blocks in BF16. It keeps BF16
+residuals and the original FP32 media heads, and
 runs FP8 Q/K/V through the trtllm-gen attention kernel with FP16 softmax
 (`skip_corr_threshold=0`). The `CUDNN` backend with `qk_dtype=v_dtype="fp8"` in
 the example below is how the FP8 attention recipe is requested; the scenario
@@ -42,8 +43,11 @@ No new public argument or separate benchmark command is introduced.
 
 ## Scope
 
-- All 200 main DiT Linears must be static per-tensor FP8 with the original H3
-  shapes. BF16 or mixed checkpoints are not admitted.
+- In each block the four main DiT Linears must be all static per-tensor FP8 or
+  all BF16, with the original H3 shapes. A block the checkpoint keeps in BF16
+  runs the family block with the same FP8 attention; the others run the fused
+  FP8 block. A BF16 checkpoint, or a block that quantizes only some of its main
+  Linears, is not admitted.
 - Batch one, any packed sequence length. The fused kernels take the row count at
   run time, so one build of each serves every request shape. The blocks raise on
   another batch size or layout rather than falling back.
