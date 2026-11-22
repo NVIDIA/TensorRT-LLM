@@ -3550,7 +3550,7 @@ def test_minimax_m3_dense_backend_library_order(
         bound=True,
     )(lambda required_max_positions: None)
 
-    attn_metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    attn_metadata = object.__new__(TrtllmAttentionMetadata)
     lengths = torch.tensor([2], dtype=torch.int32)
     attn_metadata._seq_lens = attn_metadata._seq_lens_kv = lengths
     attn_metadata.kv_lens_runtime = attn_metadata.kv_lens_cuda_runtime = lengths

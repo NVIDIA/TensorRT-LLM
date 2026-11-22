@@ -138,9 +138,10 @@ def test_client():
     # Test operations follow the checkpoint.
 ```
 
-`Client.__new__(Client)` is also recognized when the class has no custom
-allocator. Required fields come from class annotations and direct `self.field`
-assignments in the class and its single-inheritance chain. An optional type does
+`Client.__new__(Client)` is also recognized when the checker can establish
+that the class inherits the default allocator. Required fields come from
+class annotations and direct `self.field` assignments in the class and its
+single-inheritance chain. An optional type does
 not make initialization optional: `field: str | None` still needs a value.
 Existing class defaults are available to an instance. A bare annotation in the
 test (`client.endpoint: str`) does not initialize the field.
@@ -149,8 +150,9 @@ The checker follows direct assignments, simple aliases, literal `setattr`, field
 deletions and `if`/`else` joins. A field written on only one branch is not definitely
 initialized after the join. An unresolved mutation helper prevents a
 successful verification; it is not assumed to initialize or preserve fields.
-This includes calls that capture the instance and mutations through an alias
-whose identity depends on a container or a branch.
+This covers objects reachable through nested fields and containers, including
+callbacks that capture those objects. A conditional alias can also leave the
+affected objects unverified after a mutation.
 The checkpoint describes that program point only, not later mutations.
 An instance checkpoint can also be used inline, for example
 `consume(verify_instance(state, "production.client:Client"))`; the checker

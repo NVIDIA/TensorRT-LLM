@@ -30,7 +30,7 @@ import os
 import re
 import sys
 import sysconfig
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +38,16 @@ BINDINGS_MODULE = "tensorrt_llm.bindings"
 MARKERS = "test_common.interface_checks"
 UNKNOWN = "?"
 DEFINITIONS = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+UNSUPPORTED_BLOCKS = (
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.Try,
+    getattr(ast, "TryStar", ast.Try),
+    ast.With,
+    ast.AsyncWith,
+    ast.Match,
+)
 TARGET = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 
 
@@ -188,6 +198,7 @@ class Shape:
     skipped_bases: list[str] = field(default_factory=list)
     initializer_fields: dict[str, Member] = field(default_factory=dict)
     initializer_unknown: list[str] = field(default_factory=list)
+    allocator_unknown: bool = False
 
 
 @dataclass
@@ -205,6 +216,31 @@ class State:
     possible: set[str] = field(default_factory=set)
     unknown: list[str] = field(default_factory=list)
     definition: Definition | None = None
+
+
+def reachable_values(
+    roots: Iterable[Value],
+    env: dict[str, Value] | None = None,
+    aliases: dict[int, list[Value]] | None = None,
+) -> Iterator[Value]:
+    """Follow tracked fields, captured names, and possible aliases."""
+    pending = list(roots)
+    seen: set[int] = set()
+    seen_origins: set[int] = set()
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        yield value
+        if value.state is not None:
+            pending.extend(value.state.fields.values())
+        if env is not None:
+            pending.extend(env[name] for name in value.captures if name in env)
+        if aliases is not None:
+            for origin in value.origins - seen_origins:
+                pending.extend(aliases.get(origin, ()))
+            seen_origins.update(value.origins)
 
 
 DYNAMIC_MOCK_MEMBERS = "Dynamic mock/module members cannot establish exact equality"
@@ -854,8 +890,10 @@ def _extend_class_shape(
             )
         ):
             shape.unknown.append("Generated/decorated class interface: " + ast.unparse(dec))
+            shape.allocator_unknown = True
     if node.keywords:
         shape.unknown.append("Metaclass/class keywords can generate members")
+        shape.allocator_unknown = True
     runtime_body = []
     type_checking_properties = {}
     for item in node.body:
@@ -1048,6 +1086,7 @@ def _extend_class_shape(
                 unknown.append("Initializer has early exit or deleted fields")
         elif not (isinstance(item, (ast.Pass, ast.Expr))):
             shape.unknown.append("Conditional/dynamic class body")
+            shape.allocator_unknown = True
     # A guarded property may describe an inherited native descriptor.
     for name, member in type_checking_properties.items():
         shape.members.setdefault(name, member)
@@ -1272,18 +1311,11 @@ class Analyzer:
         return Value(captures=frozenset(captures))
 
     def referenced_origins(self, node: ast.AST, env: dict[str, Value]) -> frozenset[int]:
-        """Resolve captured names at the point where a function may run."""
-        names = loaded_names(node)
-        seen: set[str] = set()
-        origins: set[int] = set()
-        while names:
-            name = names.pop()
-            seen.add(name)
-            value = env.get(name)
-            if value is not None:
-                origins.update(value.origins)
-                names.update(value.captures - seen)
-        return frozenset(origins)
+        """Find tracked objects reachable from the referenced values."""
+        roots = (env[name] for name in loaded_names(node) if name in env)
+        return frozenset(
+            origin for value in reachable_values(roots, env) for origin in value.origins
+        )
 
     @staticmethod
     def invalidate_origins(
@@ -1295,18 +1327,19 @@ class Analyzer:
     ) -> None:
         if not origins:
             return
-        seen: set[int] = set()
-        values = list(env.values())
-        while values:
-            value = values.pop()
+        aliases: dict[int, list[Value]] = {}
+        for value in reachable_values(env.values()):
+            if value.state is not None:
+                for origin in value.origins:
+                    aliases.setdefault(origin, []).append(value)
+        roots = (value for origin in origins for value in aliases.get(origin, ()))
+        # Unknown effects may reach an object's fields and stored callbacks.
+        # A modeled field write only needs to invalidate possible alternate owners.
+        values = reachable_values(roots, env, aliases) if except_state is None else roots
+        for value in values:
             state = value.state
-            if state is None or id(state) in seen:
-                continue
-            seen.add(id(state))
-            values.extend(state.fields.values())
-            if state is not except_state and not value.origins.isdisjoint(origins):
-                if reason not in state.unknown:
-                    state.unknown.append(reason)
+            if state is not None and state is not except_state and reason not in state.unknown:
+                state.unknown.append(reason)
 
     def mutation_owner(self, value: Value, env: dict[str, Value], line: int) -> State | None:
         self.invalidate_origins(
@@ -1316,6 +1349,27 @@ class Analyzer:
             except_state=value.state,
         )
         return value.state
+
+    def is_namespace_read(self, call: ast.Call, env: dict[str, Value]) -> bool:
+        name = self.source.qualified(call.func).removeprefix("builtins.")
+        if (
+            name not in {"getattr", "vars"}
+            or len(call.args) != (2 if name == "getattr" else 1)
+            or call.keywords
+            or self.uses_rebound_names(call, [call.func])
+        ):
+            return False
+        owner = self.expression(call.args[0], env)
+        if owner.kind != "types.SimpleNamespace" or owner.state is None or owner.state.unknown:
+            return False
+        if name == "vars":
+            return True
+        key = call.args[1]
+        return (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and key.value in owner.state.fields
+        )
 
     def expression(self, node: ast.AST | None, env: dict[str, Value]) -> Value:
         if isinstance(node, ast.Name):
@@ -1327,7 +1381,10 @@ class Analyzer:
             return Value(origins=owner.origins)
         if isinstance(node, ast.Lambda):
             return self.deferred_function(node)
-        if isinstance(node, (ast.IfExp, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Subscript)):
+        if isinstance(
+            node,
+            (ast.IfExp, ast.BoolOp, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Subscript),
+        ):
             # These expressions can carry an instance without defining its exact identity.
             return Value(origins=self.referenced_origins(node, env))
         if isinstance(node, ast.Call):
@@ -1368,8 +1425,15 @@ class Analyzer:
                     if owner != "object":
                         shape = class_shape(definition, self.sources, members_only=True)
                         allocator = shape.members.get("__new__")
-                        if allocator is not None and (
-                            allocator.kind in {"callable", "property"} or allocator.default
+                        if (
+                            shape.allocator_unknown
+                            or shape.skipped_bases
+                            or (
+                                allocator is not None
+                                and (
+                                    allocator.kind in {"callable", "property"} or allocator.default
+                                )
+                            )
                         ):
                             raise Incomplete(f"Cannot establish the return type of {owner}.__new__")
                     return Value(
@@ -1385,6 +1449,8 @@ class Analyzer:
                     name,
                     origin,
                 )
+            # An unresolved result may alias a value reachable from the call.
+            return Value(origins=self.referenced_origins(node, env))
         return Value()
 
     def instance_registration(self, call: ast.Call, env: dict[str, Value]) -> None:
@@ -1748,9 +1814,22 @@ class Analyzer:
             or (isinstance(node, ast.Compare) and len(node.comparators) > 1)
             for node in nodes
         )
+        possible_origins = (
+            self.referenced_origins(expression, env)
+            if assignments and not track_alias
+            else frozenset()
+        )
         for node in nodes:
             if isinstance(node, ast.NamedExpr):
-                value = self.expression(node.value, env) if track_alias else Value()
+                if track_alias:
+                    value = self.expression(node.value, env)
+                else:
+                    # Short-circuiting or a comprehension can leave the old
+                    # binding in place or take an alias from an enclosing iterable.
+                    previous = env.get(node.target.id, Value())
+                    value = Value(
+                        origins=possible_origins | previous.origins, captures=previous.captures
+                    )
                 self.assignment(node.target, value, env)
             if not isinstance(node, ast.Call):
                 continue
@@ -1758,8 +1837,13 @@ class Analyzer:
             if name == MARKERS + ".verify_instance":
                 if id(node) not in self.handled:
                     self.instance_registration(node, env)
-            elif name == MARKERS + ".mock_target" or (
-                name == "types.SimpleNamespace" and not self.uses_rebound_names(node, [node.func])
+            elif (
+                name == MARKERS + ".mock_target"
+                or (
+                    name == "types.SimpleNamespace"
+                    and not self.uses_rebound_names(node, [node.func])
+                )
+                or self.is_namespace_read(node, env)
             ):
                 continue
             elif (
@@ -1785,6 +1869,7 @@ class Analyzer:
         for statement in body:
             if isinstance(statement, DEFINITIONS):
                 for decorator in statement.decorator_list:
+                    self.effects(decorator, env)
                     if (
                         isinstance(decorator, ast.Call)
                         and self.source.qualified(decorator.func) == MARKERS + ".mock_target"
@@ -1843,11 +1928,18 @@ class Analyzer:
                         f"Unresolved class-body effects at line {statement.lineno}",
                     )
                     self.block(statement.body, copy.deepcopy(env))
-                    env[statement.name] = Value()
+                    value = Value()
                 else:
                     # A deferred body cannot use instance state from definition time.
                     self.block(statement.body, {})
-                    env[statement.name] = self.deferred_function(statement)
+                    value = self.deferred_function(statement)
+                for decorator in reversed(statement.decorator_list):
+                    self.invalidate_origins(
+                        self.referenced_origins(decorator, env),
+                        env,
+                        f"Unresolved decorator effects at line {decorator.lineno}",
+                    )
+                env[statement.name] = value
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 if isinstance(statement, ast.AnnAssign) and statement.value is None:
                     continue
@@ -1933,17 +2025,13 @@ class Analyzer:
                             env,
                             f"Unresolved subscript deletion at line {statement.lineno}",
                         )
-            elif isinstance(
-                statement,
-                (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith, ast.Match),
-            ):
-                for value in env.values():
-                    if value.state:
-                        value.state.unknown.append(
-                            f"Unsupported control flow at line {statement.lineno}"
-                        )
+            elif isinstance(statement, UNSUPPORTED_BLOCKS):
+                reason = f"Unsupported control flow at line {statement.lineno}"
+                for value in reachable_values(env.values()):
+                    if value.state is not None and reason not in value.state.unknown:
+                        value.state.unknown.append(reason)
                 # Discovery still visits markers inside unsupported regions.
-                self.context.append(f"Unsupported control flow at line {statement.lineno}")
+                self.context.append(reason)
                 for field_name in ("body", "orelse", "finalbody"):
                     self.block(getattr(statement, field_name, []), copy.deepcopy(env))
                 for handler in getattr(statement, "handlers", []):
