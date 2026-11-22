@@ -1717,6 +1717,18 @@ def warmup_time_fields(
     return fields
 
 
+def is_multi_node_case(runtime: str, server_config: "ServerConfig") -> bool:
+    """Whether the case runs on more than one node, which CI does alone in a stage.
+
+    A disaggregated case gives each worker nodes of its own; any other case spans
+    nodes when its server has more GPUs than a node. Only such a case uploads
+    warmup time from test_e2e: a single-node stage runs several cases in one
+    process, and each reuses the caches of the cases before it, so test_warmup
+    measures single-node servers instead.
+    """
+    return runtime == "multi_node_disagg_server" or server_config.gpus > server_config.gpus_per_node
+
+
 def _server_reports_healthy(addr_path: str) -> bool:
     """Return whether the server whose address is in addr_path answers /health with 200."""
     try:
@@ -5775,7 +5787,7 @@ class PerfSanityTestConfig:
                 server_config = self.server_configs[server_idx]
                 server_env = server_config.to_env()
                 server_name = AGGREGATE_SERVER_NAME
-            if server_config.gpus > server_config.gpus_per_node:
+            if is_multi_node_case(self.runtime, server_config):
                 raise ValueError(
                     f"test_warmup runs single-node servers only; {server_config.name} uses "
                     f"{server_config.gpus} GPUs at {server_config.gpus_per_node} per node."
@@ -6043,8 +6055,10 @@ class PerfSanityTestConfig:
                 server_config_dict = server_config.to_db_data()
                 server_perf_results = self._perf_results.get(server_idx, [])
                 startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
-                warmup_times = warmup_time_fields(
-                    self.test_output_dir, server_idx, [AGGREGATE_SERVER_NAME]
+                warmup_times = (
+                    warmup_time_fields(self.test_output_dir, server_idx, [AGGREGATE_SERVER_NAME])
+                    if is_multi_node_case(self.runtime, server_config)
+                    else {}
                 )
                 startup_primary_row_pending = True
                 # Skip if server failed
@@ -6124,11 +6138,15 @@ class PerfSanityTestConfig:
                 client_configs = self.server_client_configs[server_idx]
                 server_perf_results = self._perf_results.get(server_idx, [])
                 startup_bundle = read_startup_observations(self.test_output_dir, server_idx)
-                warmup_times = warmup_time_fields(
-                    self.test_output_dir,
-                    server_idx,
-                    [f"CTX_{i}" for i in range(disagg_config.num_ctx_servers)]
-                    + [f"GEN_{i}" for i in range(disagg_config.num_gen_servers)],
+                warmup_times = (
+                    warmup_time_fields(
+                        self.test_output_dir,
+                        server_idx,
+                        [f"CTX_{i}" for i in range(disagg_config.num_ctx_servers)]
+                        + [f"GEN_{i}" for i in range(disagg_config.num_gen_servers)],
+                    )
+                    if is_multi_node_case(self.runtime, gen_config)
+                    else {}
                 )
                 startup_primary_row_pending = True
                 # Skip if server failed
@@ -6418,10 +6436,10 @@ WARMUP_TEST_CASES = [
 
 @pytest.mark.parametrize("perf_sanity_test_case", WARMUP_TEST_CASES)
 def test_warmup(output_dir, perf_sanity_test_case):
-    """Upload each server's cold-start warmup time; no benchmark client runs.
+    """Upload each single-node server's cold-start warmup time; no benchmark client runs.
 
-    test_e2e's warmup time reuses the caches of the cases before it in the same
-    stage; this one does not depend on them.
+    test_e2e uploads warmup time for multi-node cases only (is_multi_node_case):
+    in a single-node stage it would reuse the caches of the cases before it.
     """
     config = PerfSanityTestConfig(perf_sanity_test_case, output_dir)
     config.parse_config_file()
