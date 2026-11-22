@@ -71,7 +71,6 @@ l0_cpu:
   - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_setup_external_cluster_rejects_an_unhealthy_orchestrator[timeout]
   - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_external_cluster_log_scanner_trips_on_pattern
   - stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_log_only_thread_sends_probe_and_stops
-  - examples/visual_gen/test_media_deps_install.py::test_install_ffmpeg_via_apt_installs_ffmpeg
   # ModelExpress accuracy-canary guard (reference entries and worker argv, no GPUs):
   # catches a pruned reference before the post-merge canary does.
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references

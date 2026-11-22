@@ -23,10 +23,12 @@ import pytest
 import yaml
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import YAMLIndex, parse_stages_from_groovy, write_filtered_test_db
+from cbts.blocks import Stage, YAMLIndex, parse_stages_from_groovy, write_filtered_test_db
 from cbts.command.report_decision import _stage_group
 from cbts.coverage.selection.touch_db import stage_family
 from cbts.coverage.tier import write_coverage_test_db
+from cbts.rules.base import PRInputs
+from cbts.rules.waives import WAIVES_FILE, WaivesRule
 
 pytestmark = pytest.mark.cpu_only
 
@@ -162,3 +164,62 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
     assert match is not None
     assert match[0] == "unittest/_torch/attention/sparse"
     assert [b.yaml_stem for b in match[1]] == ["l0_b200"]
+    assert index.find_match_for_waive("unittest/_torch/attention/sparse/dsa/test_bar.py") is None
+
+
+def test_waives_rule_resolves_per_block_across_file_and_directory_registrations(
+    tmp_path: Path,
+) -> None:
+    """A file registration on one platform must not shadow a directory batch on another."""
+    test_db = tmp_path / "test-db"
+    test_db.mkdir()
+    pre_cond = {"terms": {"stage": "pre_merge", "backend": "pytorch"}}
+    dir_batch = (
+        "unittest/_torch/modules/kimi_kda "
+        "--ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py"
+    )
+    prefill_file = "unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py"
+    verify_file = "unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py"
+    (test_db / "l0_gb300.yml").write_text(
+        yaml.safe_dump(
+            {"version": "0.0.1", "l0_gb300": [{"condition": pre_cond, "tests": [verify_file]}]},
+            sort_keys=False,
+        )
+    )
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_b200": [{"condition": pre_cond, "tests": [prefill_file, dir_batch]}],
+            },
+            sort_keys=False,
+        )
+    )
+    index = YAMLIndex.load(test_db)
+    stages = {
+        "GB300-4_GPUs-PyTorch-1": Stage("GB300-4_GPUs-PyTorch-1", "l0_gb300", "sbsa", 1, 1, {}),
+        "DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1, {}),
+    }
+    rule = WaivesRule(index, stages)
+
+    waive_diff = f"@@ -1,1 +1,2 @@\n+{verify_file}::test_two_cta SKIP (https://nvbugs/1)\n"
+    res = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: waive_diff}))
+    assert res is not None and res.scope == "waiveonly"
+    assert res.affected_stages == {"GB300-4_GPUs-PyTorch-1", "DGX_B200-PyTorch-1"}
+    filtered = tmp_path / "filtered_verify"
+    write_filtered_test_db(test_db, filtered, res.block_filters)
+    assert yaml.safe_load((filtered / "l0_gb300.yml").read_text())["l0_gb300"][0]["tests"] == [
+        verify_file
+    ]
+    assert yaml.safe_load((filtered / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
+        dir_batch
+    ]
+
+    ignore_diff = f"@@ -1,1 +1,2 @@\n+{prefill_file}::test_prefill SKIP (https://nvbugs/2)\n"
+    res2 = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: ignore_diff}))
+    assert res2 is not None and res2.affected_stages == {"DGX_B200-PyTorch-1"}
+    filtered2 = tmp_path / "filtered_prefill"
+    write_filtered_test_db(test_db, filtered2, res2.block_filters)
+    assert yaml.safe_load((filtered2 / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
+        prefill_file
+    ]

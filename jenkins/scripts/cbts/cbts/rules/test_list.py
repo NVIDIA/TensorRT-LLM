@@ -33,6 +33,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
 from cbts.blocks import Stage, YAMLIndex, normalize_test_id
 
 from ._helpers import (
@@ -255,6 +257,7 @@ class TestListRule(Rule):
 
         added: set[str] = set()
         removed: set[str] = set()
+        touched_stems: set[str] = set()
         stage_select_files: list[str] = []
         unverifiable_files: list[str] = []
 
@@ -281,7 +284,8 @@ class TestListRule(Rule):
             # line anchors are intentionally excluded — they can land
             # on neighboring blocks and trigger false positives.
             try:
-                post_lines = (self._repo_root / path).read_text(encoding="utf-8").splitlines()
+                post_text = (self._repo_root / path).read_text(encoding="utf-8")
+                post_lines = post_text.splitlines()
             except (OSError, UnicodeDecodeError):
                 unverifiable_files.append(path)
                 continue
@@ -290,6 +294,15 @@ class TestListRule(Rule):
             if any(_line_is_in_stage_select(post_lines, ln) for ln in added_line_nums):
                 stage_select_files.append(path)
                 continue
+
+            try:
+                with_stems = yaml.safe_load(post_text) if post_text else None
+            except yaml.YAMLError:
+                with_stems = None
+            if isinstance(with_stems, dict):
+                touched_stems.update(
+                    k for k, v in with_stems.items() if k != "version" and isinstance(v, list)
+                )
 
             a, r = _scan_tests_entries(diff)
             added |= a
@@ -333,7 +346,9 @@ class TestListRule(Rule):
                 reason=f"testlist: no additions across {len(touched)} file(s){note}",
             )
 
-        block_filters, misses = lookup_ids_into_block_filters(self.yaml_index, added)
+        block_filters, misses = lookup_ids_into_block_filters(
+            self.yaml_index, added, allowed_stems=touched_stems or None
+        )
         if not block_filters:
             preview = ", ".join(sorted(misses)[:3])
             more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
