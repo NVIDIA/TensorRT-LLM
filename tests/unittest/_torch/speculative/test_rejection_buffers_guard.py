@@ -271,6 +271,7 @@ def _dispatch_meta(**over):
         is_ragged_verify=False,
         # The default mode, which the fused rejection-sampling kernels do not cover.
         advanced_sampling_mode=AdvancedSamplingMode.FULL,
+        rejection_sample_method="standard",
         use_rejection_sampling=True,
         is_all_greedy_sample=False,
         draft_probs_vocab_size=V,
