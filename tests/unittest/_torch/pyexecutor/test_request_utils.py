@@ -2348,6 +2348,12 @@ def test_response_bounds_additional_outputs(output_kind: str, serializer: Module
     append("hidden", first * 3)
     append("single", first * 4)
     append("empty", first * 5)
+    if output_kind == "context":
+        live_outputs = request.py_result._additional_context_outputs
+    else:
+        live_outputs = request.py_result._additional_generation_outputs
+    live_outputs.setdefault("routed_experts", [])
+    append("routed_experts", first * 6)
     restored = serializer.loads(serializer.dumps(response))
     diff = request.py_result.get_diff()
     chunks = (
@@ -2355,7 +2361,7 @@ def test_response_bounds_additional_outputs(output_kind: str, serializer: Module
         if output_kind == "context"
         else diff.additional_generation_outputs_list
     )
-    assert len(chunks) == 6
+    assert len(chunks) == 7
     for result in (response.result, restored.result):
         if output_kind == "context":
             outputs = result.additional_context_outputs

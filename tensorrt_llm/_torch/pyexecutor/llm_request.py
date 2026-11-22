@@ -775,33 +775,27 @@ class PyResult:
 
     @property
     def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
-        if self._additional_context_outputs is None:
+        outputs = self._bounded_additional_outputs(
+            self._additional_context_outputs,
+            self._additional_context_output_lengths)
+        if outputs is None:
             return None
-        outputs = {}
-        for name, output_list in self._additional_context_outputs.items():
-            if self._additional_context_output_lengths is not None:
-                length = self._additional_context_output_lengths[name]
-                output_list = output_list[:length]
-            if len(output_list) == 0:
-                continue
-            outputs[name] = torch.cat(
-                output_list, dim=0) if len(output_list) > 1 else output_list[0]
-        return outputs
+        return {
+            name: torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            for name, chunks in outputs.items() if chunks
+        }
 
     @property
     def additional_generation_outputs(self) -> Dict[str, torch.Tensor] | None:
-        if self._additional_generation_outputs is None:
+        outputs = self._bounded_additional_outputs(
+            self._additional_generation_outputs,
+            self._additional_generation_output_lengths)
+        if outputs is None:
             return None
-        outputs = {}
-        for name, output_list in self._additional_generation_outputs.items():
-            if self._additional_generation_output_lengths is not None:
-                length = self._additional_generation_output_lengths[name]
-                output_list = output_list[:length]
-            if len(output_list) == 0:
-                continue
-            outputs[name] = torch.cat(
-                output_list, dim=0) if len(output_list) > 1 else output_list[0]
-        return outputs
+        return {
+            name: torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            for name, chunks in outputs.items() if chunks
+        }
 
     @property
     def encoder_output(self) -> torch.Tensor | None:
