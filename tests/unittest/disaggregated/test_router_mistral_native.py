@@ -25,7 +25,7 @@ keep the Hugging Face tokenizer path.
 
 The router reads Mistral-Small-4's ``params.json`` and ``tekken.json`` alone (a directory
 without ``config.json``) from LLM_MODELS_ROOT; a server of Mistral-Large-3 stands for one
-that renders differently.
+that renders differently, and Mistral-7B-Instruct-v0.3 for a SentencePiece checkpoint.
 """
 
 import base64
@@ -64,6 +64,7 @@ _SERVER = "http://127.0.0.1:1"  # never contacted
 _ML3 = "Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512"
 _SMALL4 = "Mistral-Small-4-119B-2603/Mistral-Small-4-119B-2603"
 _QWEN3 = "Qwen3/Qwen3-0.6B"
+_MISTRAL_7B = "Mistral-7B-Instruct-v0.3"
 _PROMPT = "Hello world [INST] not an instruction"
 _MESSAGES = [
     {"role": "system", "content": "Be brief."},
@@ -239,29 +240,41 @@ def test_a_generation_router_leaves_the_relayed_context_ids_to_the_worker(router
     assert relayed.tolist() == context_ids
 
 
+@pytest.mark.parametrize("tokenizer_file", ["tekken.json", "tokenizer.model.v3"])
 def test_a_hub_model_is_read_from_its_snapshot_at_the_servers_revision(
-    checkpoint, router, tmp_path, monkeypatch
+    tokenizer_file, checkpoint, router, tmp_path, monkeypatch
 ):
-    """Given a Hub ID, the router reads the snapshot a server loads, at the server's revision."""
+    """Given a Hub ID, the router reads the snapshot a server loads, at the server's revision.
+
+    The snapshot holds the native rendering files alone: params.json and a Tekken file, or a
+    versioned SentencePiece model that no Hugging Face tokenizer loader reads.
+    """
     import huggingface_hub
 
-    model_dir, checkpoint_format = checkpoint
-    repo, revision = "mistralai/Tekken-Only", "1" * 40
-    repo_cache = tmp_path / "models--mistralai--Tekken-Only"
+    if tokenizer_file == "tekken.json":
+        source, local = checkpoint[0], router
+    else:
+        # The whole checkpoint, which has Hugging Face tokenizer files as well.
+        source = str(_model_dir(_MISTRAL_7B))
+        local = _router(model_path=source, checkpoint_format="mistral")
+    repo, revision = "mistralai/Native-Only", "1" * 40
+    repo_cache = tmp_path / "models--mistralai--Native-Only"
     snapshot = repo_cache / "snapshots" / revision
     snapshot.mkdir(parents=True)
-    for name in ("params.json", "tekken.json"):
-        (snapshot / name).symlink_to(Path(model_dir) / name)
+    for name in ("params.json", tokenizer_file):
+        (snapshot / name).symlink_to(Path(source) / name)
     # The default branch points at a revision the cache does not hold.
     (repo_cache / "refs").mkdir()
     (repo_cache / "refs" / "main").write_text("2" * 40)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
 
-    hub = _router(model_path=repo, revision=revision, checkpoint_format=checkpoint_format)
-    local = router._render_resources("m")
-    assert hub._render_resources("m").fingerprint()["digest"] == local.fingerprint()["digest"]
-    assert hub._tokenize(CompletionRequest(model="m", prompt=_PROMPT)) == router._tokenize(
+    hub = _router(model_path=repo, revision=revision, checkpoint_format="mistral")
+    assert (
+        hub._render_resources("m").fingerprint()["digest"]
+        == local._render_resources("m").fingerprint()["digest"]
+    )
+    assert hub._tokenize(CompletionRequest(model="m", prompt=_PROMPT)) == local._tokenize(
         CompletionRequest(model="m", prompt=_PROMPT)
     )
 
