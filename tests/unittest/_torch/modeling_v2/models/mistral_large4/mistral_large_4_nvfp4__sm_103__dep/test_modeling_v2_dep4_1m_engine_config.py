@@ -75,7 +75,6 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
     _MAX_RADIX_BLOCKS_PER_ROW,
     DSAtrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.modeling_v2 import _router_index
@@ -83,6 +82,9 @@ from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import routing
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__dep import (  # noqa: E501
     modeling as M,
+)
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    MistralLarge4CacheManager,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor import model_loader, py_executor_creator
@@ -95,6 +97,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     get_attention_workspace_is_chunked_prefill_bounded,
     get_kv_cache_manager_cls,
     get_mla_context_workspace_kv_len_cap,
+    model_declared_kv_cache_manager_cls,
     should_enable_adp_dummy_fixes,
     should_enable_non_overlap_adp_forward_intent,
     should_enable_scheduler_aware_adp_dummy,
@@ -253,6 +256,16 @@ def _route(pretrained_config, mapping):
     return routing.route(model_config, None, _SM103)
 
 
+def _engine_kv_cache_manager_cls(model_config, kv_cache_config):
+    """The KV cache manager class the engine builds: the class it resolves for this
+    configuration, or the subclass the routed target declares in its place
+    (RuntimeHooks.kv_cache_manager_cls)."""
+    return model_declared_kv_cache_manager_cls(
+        _route(model_config.pretrained_config, model_config.mapping),
+        get_kv_cache_manager_cls(model_config, kv_cache_config),
+    )
+
+
 def _resolve(checkpoint_dir: Path, options: dict) -> SimpleNamespace:
     """The configuration a served engine reaches for this checkpoint, front end then rank."""
     model = str(checkpoint_dir)
@@ -398,7 +411,7 @@ def _kv_cost(resolved, rank: int) -> CacheCost:
     """The engine's affine KV cost on ``rank``, as the KV-cache creator sizes the pool with it."""
     model_config, llm_args = resolved.model_config, resolved.llm_args
     kv_cache_config = llm_args.kv_cache_config
-    manager = get_kv_cache_manager_cls(model_config, kv_cache_config)
+    manager = _engine_kv_cache_manager_cls(model_config, kv_cache_config)
     return CacheCost.from_raw(
         manager.get_cache_size_per_token(
             model_config,
@@ -657,7 +670,8 @@ def _estimation_creator(resolved) -> KvCacheCreator:
     creator._tokens_per_block = resolved.llm_args.kv_cache_config.tokens_per_block
     creator._kv_cache_config = resolved.llm_args.kv_cache_config
     creator._is_kv_cache_manager_v2 = issubclass(
-        get_kv_cache_manager_cls(resolved.model_config, creator._kv_cache_config), KVCacheManagerV2
+        _engine_kv_cache_manager_cls(resolved.model_config, creator._kv_cache_config),
+        KVCacheManagerV2,
     )
     return creator
 
@@ -810,13 +824,13 @@ def test_core_yaml_and_quickstart_build_the_same_engine(dep4, dep4_quickstart):
     assert quick_adp.enable_kv_cache_aware_routing is False
     for resolved in (dep4, dep4_quickstart):
         kv_cache_config = resolved.llm_args.kv_cache_config
-        manager = get_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
         assert manager is MistralLarge4CacheManager
 
 
 def _manager_arguments(resolved, dtype) -> dict:
-    """What ``MistralLarge4CacheManager.__init__`` (attention/backends/sparse/mistral_large4/
-    cache_manager.py) hands the DSA V2 manager it builds on, given what ``_create_kv_cache_manager``
+    """What ``MistralLarge4CacheManager.__init__`` (the family's ops/cache/cache_manager.py)
+    hands the DSA V2 manager it builds on, given what ``_create_kv_cache_manager``
     (pyexecutor/_util.py) passes it for rank 0 of this engine: the LLM API's kv_cache_config, one
     576-wide MLA head on each of the 72 layers, the latent ``dtype``. The base is not built (it
     allocates the pool on the device): its constructor records its arguments and stops."""
@@ -859,8 +873,8 @@ def test_kv_cache_dtype_auto_and_fp8_build_the_fp8_ds_mla_pool(dep4, dep4_quicks
     """kv_cache_config.dtype fp8 (the gates: core.yaml's and the quickstart's --kv_cache_dtype=fp8)
     and auto (the CI class: the checkpoint's fp8_kv_cache) build the same cache. Each resolves the
     latent to FP8 (``kv_cache_quant_algo``, so ``_create_kv_cache_manager`` hands the manager
-    ``DataType.FP8``, ``quant_mode.has_fp8_kv_cache()``) on the same GSM8K anchor row; the sparse
-    registry picks ``MistralLarge4CacheManager``, whose ``latent_layout`` is fp8_ds_mla, at 47136
+    ``DataType.FP8``, ``quant_mode.has_fp8_kv_cache()``) on the same GSM8K anchor row; the target
+    declares ``MistralLarge4CacheManager``, whose ``latent_layout`` is fp8_ds_mla, at 47136
     bytes a token on every rank; and the manager builds its base over all 72 layers, a 656-byte
     head on the 63 KV owners only, as FP8, with the dtype it was asked for. A latent dtype the
     layout cannot hold, bf16, is refused at construction. The CI class's engine is the gates'
@@ -875,7 +889,7 @@ def test_kv_cache_dtype_auto_and_fp8_build_the_fp8_ds_mla_pool(dep4, dep4_quicks
             assert quant.kv_cache_quant_algo == QuantAlgo.FP8
         assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
         assert _anchor(llm_args) == 91.926
-        manager = get_kv_cache_manager_cls(model_config, llm_args.kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(model_config, llm_args.kv_cache_config)
         assert manager is MistralLarge4CacheManager and manager.latent_layout == "fp8_ds_mla"
         assert issubclass(manager, KVCacheManagerV2)
         for rank in range(_RANKS):
@@ -1167,7 +1181,7 @@ def test_dsa_kv_tables_at_1m(dep4, dep4_32k):
     for the short-sequence indexer skip, is [32768, 2048]: neither grows with max_seq_len."""
     for resolved in (dep4, dep4_32k):
         kv_cache_config = resolved.llm_args.kv_cache_config
-        manager = get_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
         assert manager is MistralLarge4CacheManager and issubclass(manager, KVCacheManagerV2)
         assert kv_cache_config.tokens_per_block == _TOKENS_PER_BLOCK
     assert _get_generation_kv_capacity(None, is_draft=False) == (0, BASE_GENERATION_TOKEN_COUNT)
@@ -1198,9 +1212,9 @@ def test_kv_pool_has_no_rank_factor(dep4, dep4_32k, tep4):
     which no rank holds, so the pool and not max_batch_size bounds how many 1M requests a rank
     holds at once; at 32K the same 16 requests of max_seq_len are 23.016 GiB."""
     model_config, kv_cache_config = dep4.model_config, dep4.llm_args.kv_cache_config
-    manager = get_kv_cache_manager_cls(model_config, kv_cache_config)
+    manager = _engine_kv_cache_manager_cls(model_config, kv_cache_config)
     assert manager is MistralLarge4CacheManager
-    assert manager is get_kv_cache_manager_cls(tep4.model_config, tep4.llm_args.kv_cache_config)
+    assert manager is _engine_kv_cache_manager_cls(tep4.model_config, tep4.llm_args.kv_cache_config)
     assert kv_cache_config.tokens_per_block == _TOKENS_PER_BLOCK
 
     cfg, sparse = model_config.pretrained_config, model_config.sparse_attention_config
@@ -1729,7 +1743,9 @@ def test_tep4_and_tp4_route_as_before(tep4, tp4):
         assert resolved.llm_args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
         assert resolved.llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
         assert _anchor(resolved.llm_args) == 91.926
-        manager = get_kv_cache_manager_cls(resolved.model_config, resolved.llm_args.kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(
+            resolved.model_config, resolved.llm_args.kv_cache_config
+        )
         assert manager is MistralLarge4CacheManager
         assert (_kv_cost(resolved, 0).slope, _kv_cost(resolved, 0).intercept) == (47136, 0)
         assert resolved.llm_args.enable_chunked_prefill is False

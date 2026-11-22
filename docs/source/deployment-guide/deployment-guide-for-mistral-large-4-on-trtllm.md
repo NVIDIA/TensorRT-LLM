@@ -582,7 +582,7 @@ All 30 workloads passed with the existing accuracy references and tolerances unc
 | `modeling_v2='require', but no target fits 'MistralLarge4ForCausalLM': ...` | The deployment is not supported. The message lists what was checked; compare the GPU, the parallel settings, the speculative-decoding configuration and the checkpoint with [Supported Configurations](#supported-configurations). |
 | `Cannot auto-detect tool parser ...` or `Cannot auto-detect reasoning parser ...` | Pass `--tool_parser mistral_large_4` and `--reasoning_parser mistral_large_4` by name. |
 | `the Mistral-Large-4 latent cache is fp8_ds_mla ...` | Leave `kv_cache_config.dtype` unset, or set it to `fp8` or `fp8_ds_mla`. |
-| `DSA for Mistral-Large-4 requires KV cache manager V2` | Leave `use_kv_cache_manager_v2` unset, or set it to `true`. |
+| `... declares the KV cache manager class MistralLarge4CacheManager ..., which is not a subclass of DSACacheManager` | Leave `use_kv_cache_manager_v2` unset, or set it to `true`. |
 | `Mistral DSpark max_draft_len must equal the trained block depth 3` or `Native Mistral DSpark must use the target checkpoint` | Set `max_draft_len: 3`, and set `speculative_model` to the checkpoint directory or leave it unset. |
 | Warning `max_seq_len ... is greater than max_num_tokens ... that can be allocated in kv cache manager, setting max_seq_len to ...` | Set `max_seq_len` explicitly; unset, it defaults to 1,048,576. |
 | Image requests fail with an error about OpenCV (`cv2`) | Install `mistral-common[opencv]`, or `opencv-python-headless`. |

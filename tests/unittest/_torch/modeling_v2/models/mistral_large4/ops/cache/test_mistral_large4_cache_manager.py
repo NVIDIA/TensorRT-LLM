@@ -1,17 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The Mistral-Large-4 latent cache's sizing and selection, from the checkpoint's own layer
-structure. No device: the per-token bytes the engine budgets with and the registry branch."""
+structure. No device: the per-token bytes the engine budgets with and the class it builds."""
 
+import importlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm._torch.attention.backends.sparse import get_sparse_attn_kv_cache_manager
-from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4.cache_manager import TOKEN_BYTES
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager, DSACacheManagerV2
 from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
+from tensorrt_llm._torch.modeling_v2.models import mistral_large4
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    TOKEN_BYTES,
+    MistralLarge4CacheManager,
+)
+from tensorrt_llm._torch.pyexecutor._util import model_declared_kv_cache_manager_cls
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -53,15 +59,28 @@ def test_bytes_per_token_are_owners_times_656_plus_full_indexers_times_132():
     assert MistralLarge4CacheManager.get_cache_size_per_token(mc, mapping) == 63 * 656 + 44 * 132
 
 
-def test_registry_selects_the_manager_from_the_config_class():
-    """The DSA branch hands a MistralLarge4Config checkpoint to this manager (V2 only) and
-    every other DSA checkpoint to the generic one, whatever attributes it carries."""
-    mc = _model_config()
-    sparse, cfg = mc.sparse_attention_config, mc.pretrained_config
-    assert get_sparse_attn_kv_cache_manager(sparse, True, cfg) is MistralLarge4CacheManager
-    assert get_sparse_attn_kv_cache_manager(sparse, True, SimpleNamespace()) is DSACacheManagerV2
-    other = SimpleNamespace(kv_source_layers=_SOURCES)
-    assert get_sparse_attn_kv_cache_manager(sparse, True, other) is DSACacheManagerV2
-    assert get_sparse_attn_kv_cache_manager(sparse, True) is DSACacheManagerV2
-    with pytest.raises(ValueError, match="V2"):
-        get_sparse_attn_kv_cache_manager(sparse, False, cfg)
+_TARGETS = sorted(
+    p.name for p in Path(mistral_large4.__file__).parent.glob("mistral_large_4_*") if p.is_dir()
+)
+
+
+@pytest.mark.parametrize("target", _TARGETS)
+def test_every_target_declares_the_manager_over_the_dsa_v2_one(target):
+    """The engine resolves the DSA manager for the checkpoint's sparse config, and builds the
+    subclass a target declares (RuntimeHooks.kv_cache_manager_cls) in its place. Every target
+    declares this manager, a DSACacheManagerV2; without KV cache manager V2 the engine resolves
+    the V1 DSA manager and refuses it."""
+    module = importlib.import_module(f"{mistral_large4.__name__}.{target}.modeling")
+    (target_cls,) = [
+        cls
+        for name, cls in vars(module).items()
+        if name.startswith("ModelingV2MistralLarge4") and isinstance(cls, type)
+    ]
+    sparse = _model_config().sparse_attention_config
+    resolved = get_sparse_attn_kv_cache_manager(sparse, True)
+    assert resolved is DSACacheManagerV2
+    assert model_declared_kv_cache_manager_cls(target_cls, resolved) is MistralLarge4CacheManager
+    resolved = get_sparse_attn_kv_cache_manager(sparse, False)
+    assert resolved is DSACacheManager
+    with pytest.raises(ValueError, match="not a subclass of DSACacheManager"):
+        model_declared_kv_cache_manager_cls(target_cls, resolved)

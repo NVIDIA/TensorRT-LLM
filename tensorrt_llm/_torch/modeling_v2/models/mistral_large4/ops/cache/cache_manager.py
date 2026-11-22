@@ -16,8 +16,9 @@ on every ``index_sharing == 'full'`` layer, owners and sharers alike. Indexer
 pages belong to their logical layers independently of latent ownership.
 
 Bytes per token = owners x 656 + full-indexer layers x 132.
-The manager is selected by ``sparse.registry`` for a ``MistralLarge4Config``
-checkpoint and requires KV cache manager V2.
+The targets declare this manager (``RuntimeHooks.kv_cache_manager_cls``) in place of the
+``DSACacheManagerV2`` the engine resolves for their DSA config, so it requires KV cache
+manager V2.
 """
 
 from __future__ import annotations
@@ -26,6 +27,12 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
+    DSACacheManagerV2,
+    _get_indexer_k_cache_bytes_per_token,
+    derive_indexer_k_cache_layer_mask,
+)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
@@ -34,13 +41,6 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeC
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId
-
-from ..dsa.cache_manager import (
-    DSACacheManagerV2,
-    _get_indexer_k_cache_bytes_per_token,
-    derive_indexer_k_cache_layer_mask,
-)
-from ..dsa.params import DSAParams
 
 if TYPE_CHECKING:
     import tensorrt_llm.bindings

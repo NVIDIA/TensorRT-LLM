@@ -8,8 +8,10 @@ import pytest
 import torch
 from kv_transfer_harness import run_kv_transfer_test
 
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
 from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    MistralLarge4CacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType

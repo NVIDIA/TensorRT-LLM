@@ -9,7 +9,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    MistralLarge4CacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as wrapper
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm.bindings import DataType

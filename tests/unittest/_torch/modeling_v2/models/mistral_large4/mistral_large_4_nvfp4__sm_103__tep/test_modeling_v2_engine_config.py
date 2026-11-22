@@ -105,7 +105,6 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     split_prefill_chunks,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
 from tensorrt_llm._torch.autotuner import AutoTuner, DistributedTuningStrategy
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
 from tensorrt_llm._torch.distributed import ops as distributed_ops
@@ -116,6 +115,9 @@ from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import routing
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep import (  # noqa: E501
     modeling as tep4_modeling,
+)
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    MistralLarge4CacheManager,
 )
 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
@@ -130,6 +132,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     get_attention_workspace_is_chunked_prefill_bounded,
     get_kv_cache_manager_cls,
     get_mla_context_workspace_kv_len_cap,
+    model_declared_kv_cache_manager_cls,
 )
 from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import (
     filter_cuda_graph_batch_sizes,
@@ -316,6 +319,16 @@ def _route(pretrained_config, mapping):
     return routing.route(model_config, None, _SM103)
 
 
+def _engine_kv_cache_manager_cls(model_config, kv_cache_config):
+    """The KV cache manager class the engine builds: the class it resolves for this
+    configuration, or the subclass the routed target declares in its place
+    (RuntimeHooks.kv_cache_manager_cls)."""
+    return model_declared_kv_cache_manager_cls(
+        _route(model_config.pretrained_config, model_config.mapping),
+        get_kv_cache_manager_cls(model_config, kv_cache_config),
+    )
+
+
 def _resolve(checkpoint_dir: Path, options: dict) -> SimpleNamespace:
     """The configuration a served engine reaches for this checkpoint under ``options``."""
     llm_args = TorchLlmArgs(model=str(checkpoint_dir), modeling_v2="require", **options)
@@ -436,7 +449,7 @@ def _kv_cost(resolved, rank: int = 0) -> CacheCost:
     """The engine's affine KV cost on ``rank``, as the KV-cache creator sizes the pool with it."""
     model_config, llm_args = resolved.model_config, resolved.llm_args
     kv_cache_config = llm_args.kv_cache_config
-    manager = get_kv_cache_manager_cls(model_config, kv_cache_config)
+    manager = _engine_kv_cache_manager_cls(model_config, kv_cache_config)
     return CacheCost.from_raw(
         manager.get_cache_size_per_token(
             model_config,
@@ -552,8 +565,8 @@ def test_envelope_resolves_as_configured(envelope, delivered):
     4, moe_ep 4, attention DP off; max_seq_len 1048576, max_num_tokens 32768 (the chunk),
     max_batch_size 16; chunked prefill accepted with the DSA sparse attention the checkpoint
     configures, the latent KV cache at its default dtype and block reuse off, on the V2 KV manager
-    the sparse registry picks for a MistralLarge4Config, `MistralLarge4CacheManager`
-    (attention/backends/sparse/registry.py, the fp8_ds_mla pool). The DSA config is the
+    the target declares, `MistralLarge4CacheManager` (RuntimeHooks.kv_cache_manager_cls, the
+    fp8_ds_mla pool). The DSA config is the
     checkpoint's, with its q_split_threshold default. `_create_py_executor` (py_executor_creator.py)
     keeps chunked prefill for MLA on sm_103 (`_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS`). Beside
     it the delivered config: 32768 tokens, one step per prompt."""
@@ -590,7 +603,7 @@ def test_envelope_resolves_as_configured(envelope, delivered):
         assert kv_cache_config.tokens_per_block == _TOKENS_PER_BLOCK
         assert kv_cache_config.use_kv_cache_manager_v2 is True
         assert kv_cache_config.max_attention_window is None
-        manager = get_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
         assert manager is MistralLarge4CacheManager and issubclass(manager, KVCacheManagerV2)
 
         graphs = llm_args.cuda_graph_config
@@ -609,8 +622,8 @@ def test_envelope_resolves_as_configured(envelope, delivered):
 
 
 def _manager_arguments(resolved, dtype) -> dict:
-    """What `MistralLarge4CacheManager.__init__` (attention/backends/sparse/mistral_large4/
-    cache_manager.py) hands the DSA V2 manager it builds on, given what `_create_kv_cache_manager`
+    """What `MistralLarge4CacheManager.__init__` (the family's ops/cache/cache_manager.py)
+    hands the DSA V2 manager it builds on, given what `_create_kv_cache_manager`
     (pyexecutor/_util.py) passes it for this engine: the LLM API's kv_cache_config, one 576-wide
     MLA head on each of the 72 layers, the latent ``dtype``. The base is not built (it allocates
     the pool on the device): its constructor records its arguments and stops."""
@@ -653,8 +666,8 @@ def test_kv_cache_dtype_auto_and_fp8_build_the_fp8_ds_mla_pool(envelope, gate):
     """kv_cache_config.dtype auto (the CI class: the checkpoint's fp8_kv_cache) and fp8 (the
     gates: spec-1m-kvds-tep4/options/core.yaml, the runtime's --kv_cache_dtype=fp8) build the
     same cache. Both resolve the latent to FP8 (`kv_cache_quant_algo`, so `_create_kv_cache_
-    manager` hands the manager `DataType.FP8`, `quant_mode.has_fp8_kv_cache()`); the sparse
-    registry picks `MistralLarge4CacheManager`, whose `latent_layout` is fp8_ds_mla, at 47136
+    manager` hands the manager `DataType.FP8`, `quant_mode.has_fp8_kv_cache()`); the target
+    declares `MistralLarge4CacheManager`, whose `latent_layout` is fp8_ds_mla, at 47136
     bytes a token; and the manager builds its base over all 72 layers, one 656-byte head on each
     of the 63 KV owners and none on the nine sharers, as FP8, with the dtype it was asked for. A
     latent dtype the layout cannot hold, bf16, is refused at construction."""
@@ -663,7 +676,7 @@ def test_kv_cache_dtype_auto_and_fp8_build_the_fp8_ds_mla_pool(envelope, gate):
         assert llm_args.kv_cache_config.dtype == requested
         assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
         assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
-        manager = get_kv_cache_manager_cls(model_config, llm_args.kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(model_config, llm_args.kv_cache_config)
         assert manager is MistralLarge4CacheManager and manager.latent_layout == "fp8_ds_mla"
         assert (_kv_cost(resolved).slope, _kv_cost(resolved).intercept) == (47136, 0)
 
@@ -1388,15 +1401,15 @@ def test_scheduler_admits_the_envelope_prompt_in_chunks(envelope):
 
 
 def test_kv_cache_sizing(resolved):
-    """The DSA pool per rank (`MistralLarge4CacheManager.get_cache_size_per_token`, attention/
-    backends/sparse/mistral_large4/cache_manager.py): the 63 KV owners keep an fp8_ds_mla latent
+    """The DSA pool per rank (`MistralLarge4CacheManager.get_cache_size_per_token`, the
+    family's ops/cache/cache_manager.py): the 63 KV owners keep an fp8_ds_mla latent
     of 656 bytes (512 e4m3, four fp32 tile scales, 64 bf16 rope), the 44 full-indexer layers an
     indexer key of 128 fp8 bytes and one fp32 scale, pages of 32; the nine sharers keep no
     latent. 47136 bytes a token on every rank, whatever max_seq_len; 16 requests at the
     engine's sequence length need that per token times their tokens."""
     model_config, llm_args = resolved.model_config, resolved.llm_args
     kv_cache_config = llm_args.kv_cache_config
-    manager = get_kv_cache_manager_cls(model_config, kv_cache_config)
+    manager = _engine_kv_cache_manager_cls(model_config, kv_cache_config)
     assert manager is MistralLarge4CacheManager
     assert kv_cache_config.tokens_per_block == _TOKENS_PER_BLOCK
 
@@ -1920,7 +1933,9 @@ def test_other_members_resolve_and_route_as_at_base():
             16,
         )
         assert resolved.llm_args.enable_chunked_prefill is False
-        manager = get_kv_cache_manager_cls(resolved.model_config, resolved.llm_args.kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(
+            resolved.model_config, resolved.llm_args.kv_cache_config
+        )
         assert manager is MistralLarge4CacheManager
         assert (_kv_cost(resolved).slope, _kv_cost(resolved).intercept) == (47136, 0)
         sparse = resolved.model_config.sparse_attention_config
@@ -2568,8 +2583,8 @@ def test_tep8_envelope_resolves_as_configured(tep8, tep8_gate, tep8_32k):
     """`TorchLlmArgs` (llmapi/llm_args.py) keeps the 1M config as given at tep8: max_seq_len
     1048576, max_num_tokens 32768 (the chunk), max_batch_size 16; chunked prefill accepted with the
     DSA sparse attention the checkpoint configures, the latent KV cache spelled fp8 and block reuse
-    off, on MistralLarge4CacheManager, the V2 KV manager the sparse registry picks for a
-    MistralLarge4Config (`get_kv_cache_manager_cls`, pyexecutor/_util.py). The DSA config is the
+    off, on MistralLarge4CacheManager, the V2 KV manager the target declares in place of
+    the DSA V2 one (`model_declared_kv_cache_manager_cls`, pyexecutor/_util.py). The DSA config is the
     checkpoint's, with its `q_split_threshold` default. `_create_py_executor`
     (py_executor_creator.py) keeps chunked prefill for MLA on sm_103
     (`_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS`). Beside it the delivered config: 32768 tokens,
@@ -2589,7 +2604,7 @@ def test_tep8_envelope_resolves_as_configured(tep8, tep8_gate, tep8_32k):
         assert kv_cache_config.tokens_per_block == _TOKENS_PER_BLOCK
         assert kv_cache_config.use_kv_cache_manager_v2 is True
         assert kv_cache_config.max_attention_window is None
-        manager = get_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
         assert manager is MistralLarge4CacheManager and issubclass(manager, KVCacheManagerV2)
 
         assert llm_args.prefill_capture_num_tokens is None
@@ -2696,8 +2711,8 @@ def test_tep8_kv_dtype_fp8_and_auto_build_the_fp8_ds_mla_pool(tep8, tep8_gate, t
     --kv_cache_dtype=fp8); the CI class leaves it at its default, auto. Both reach the same pool:
     `validate_and_set_kv_cache_quant` (pyexecutor/model_loader.py) sets the KV quant algo FP8 under
     fp8 and keeps the checkpoint's, FP8, under auto, so `_create_kv_cache_manager` hands the
-    manager the FP8 element type; the sparse registry picks MistralLarge4CacheManager for the
-    MistralLarge4Config whatever the dtype (`get_kv_cache_manager_cls`), and it accepts either
+    manager the FP8 element type; the target declares MistralLarge4CacheManager whatever the
+    dtype (`model_declared_kv_cache_manager_cls`), and it accepts either
     spelling over FP8 and builds the fp8_ds_mla layout -- its base over all 72 layers, one
     656-byte head on each of the 63 KV owners and none on the nine sharers, as FP8 -- 47136 bytes
     a token on every rank, the same anchor row. Any other element type is refused at
@@ -2711,7 +2726,7 @@ def test_tep8_kv_dtype_fp8_and_auto_build_the_fp8_ds_mla_pool(tep8, tep8_gate, t
         model_config, kv_cache_config = resolved.model_config, resolved.llm_args.kv_cache_config
         assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
         assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
-        manager = get_kv_cache_manager_cls(model_config, kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(model_config, kv_cache_config)
         assert manager is MistralLarge4CacheManager and manager.latent_layout == "fp8_ds_mla"
         base = _manager_arguments(resolved, tensorrt_llm.bindings.DataType.FP8)
         assert base["kv_cache_config"].dtype == kv_cache_config.dtype
@@ -3223,17 +3238,16 @@ def test_tep8_scheduler_admits_the_envelope_prompt_in_chunks(tep8):
 def test_kv_pool_as_at_tep4(tep8, tep8_gate, tep8_32k, tep8_32k_gate, tep4):
     """MLA's latent and the indexer keys are not head-sharded, and every rank holds all 16
     requests: a token costs the same on each of the eight ranks as on each tep4 rank, at the 1M
-    config as delivered (`MistralLarge4CacheManager.get_cache_size_per_token`,
-    attention/backends/sparse/mistral_large4/cache_manager.py) -- an fp8_ds_mla latent of 656
-    bytes (512 e4m3, four fp32 tile scales, 64 bf16 rope) on each of the 63 KV owners (the nine
-    sharers keep no latent) plus a 128-byte fp8 indexer key and its fp32 scale on each of the 44
-    full-indexer layers, in pages of 32, in the manager the sparse registry picks for a
-    MistralLarge4Config, with no per-request intercept. The delivered pool is that
-    times 16 x 32768 tokens; at 1M the pool is sized by free memory, not by 16 x
+    config as delivered (`MistralLarge4CacheManager.get_cache_size_per_token`, the family's
+    ops/cache/cache_manager.py) -- an fp8_ds_mla latent of 656 bytes (512 e4m3, four fp32 tile
+    scales, 64 bf16 rope) on each of the 63 KV owners (the nine sharers keep no latent) plus a
+    128-byte fp8 indexer key and its fp32 scale on each of the 44 full-indexer layers, in pages
+    of 32, in the manager the target declares, with no per-request intercept. The delivered pool
+    is that times 16 x 32768 tokens; at 1M the pool is sized by free memory, not by 16 x
     max_seq_len."""
     for resolved in (tep8, tep8_gate, tep8_32k, tep8_32k_gate, tep4):
         model_config, kv_cache_config = resolved.model_config, resolved.llm_args.kv_cache_config
-        assert get_kv_cache_manager_cls(model_config, kv_cache_config) is (
+        assert _engine_kv_cache_manager_cls(model_config, kv_cache_config) is (
             MistralLarge4CacheManager
         )
         assert kv_cache_config.tokens_per_block == 32

@@ -215,7 +215,7 @@ def _manager(pretrained_config):
     """The engine's KV cache manager for this checkpoint, from its own config: the fp8_ds_mla
     latent pool (656 B per token on each of the 63 KV owners), page 32, and the 44-layer indexer
     key pool."""
-    from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import (
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
         MistralLarge4CacheManager,
     )
     from tensorrt_llm.bindings import DataType

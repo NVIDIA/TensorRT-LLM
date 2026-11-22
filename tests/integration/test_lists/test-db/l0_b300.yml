@@ -163,6 +163,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/mistral_large4/test_multimodal_vision.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/mistral_large4/ops/activation TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/mistral_large4/ops/attention TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/cache TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/mistral_large4/ops/gemm TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/mistral_large4/ops/moe TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/mistral_large4/ops/norm TIMEOUT (30)

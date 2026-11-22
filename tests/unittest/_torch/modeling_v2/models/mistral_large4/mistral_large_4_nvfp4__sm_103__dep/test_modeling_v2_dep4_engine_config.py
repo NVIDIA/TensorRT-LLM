@@ -70,7 +70,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.autotuner import AutoTuner, DistributedTuningStrategy
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
@@ -83,6 +82,9 @@ from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import routing
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__dep import (  # noqa: E501
     modeling as M,
 )
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    MistralLarge4CacheManager,
+)
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import maybe_create_moe_load_balancer
 from tensorrt_llm._torch.pyexecutor import model_loader, py_executor_creator
@@ -90,6 +92,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
     KvCacheCreator,
     get_kv_cache_manager_cls,
+    model_declared_kv_cache_manager_cls,
     should_enable_adp_dummy_fixes,
     should_enable_non_overlap_adp_forward_intent,
     should_enable_scheduler_aware_adp_dummy,
@@ -260,6 +263,16 @@ def _route(pretrained_config, mapping):
     return routing.route(model_config, None, _SM103)
 
 
+def _engine_kv_cache_manager_cls(model_config, kv_cache_config):
+    """The KV cache manager class the engine builds: the class it resolves for this
+    configuration, or the subclass the routed target declares in its place
+    (RuntimeHooks.kv_cache_manager_cls)."""
+    return model_declared_kv_cache_manager_cls(
+        _route(model_config.pretrained_config, model_config.mapping),
+        get_kv_cache_manager_cls(model_config, kv_cache_config),
+    )
+
+
 def _resolve(checkpoint_dir: Path, llm_args: TorchLlmArgs) -> SimpleNamespace:
     """The configuration a served engine reaches for this checkpoint, front end then rank."""
     model = str(checkpoint_dir)
@@ -386,7 +399,7 @@ def _kv_cost(resolved, rank: int) -> CacheCost:
     """The engine's affine KV cost on ``rank``, as the KV-cache creator sizes the pool with it."""
     model_config, llm_args = resolved.model_config, resolved.llm_args
     kv_cache_config = llm_args.kv_cache_config
-    manager = get_kv_cache_manager_cls(model_config, kv_cache_config)
+    manager = _engine_kv_cache_manager_cls(model_config, kv_cache_config)
     return CacheCost.from_raw(
         manager.get_cache_size_per_token(
             model_config,
@@ -826,7 +839,9 @@ def test_kv_pool_has_no_rank_factor(world, engines, dep4, tep4):
     need that times their tokens."""
     for resolved in (*engines, dep4, tep4):
         model_config, kv_cache_config = resolved.model_config, resolved.llm_args.kv_cache_config
-        assert get_kv_cache_manager_cls(model_config, kv_cache_config) is MistralLarge4CacheManager
+        assert (
+            _engine_kv_cache_manager_cls(model_config, kv_cache_config) is MistralLarge4CacheManager
+        )
         assert kv_cache_config.tokens_per_block == 32
 
     dep = engines[0]

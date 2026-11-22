@@ -1052,10 +1052,8 @@ def test_mistral_large4_native_pretrained_config(tmp_path):
 
 def test_mistral_large4_derives_dsa_with_shared_indexers(tmp_path):
     from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
+        DSACacheManagerV2,
         derive_indexer_k_cache_layer_mask,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.mistral_large4.cache_manager import (
-        MistralLarge4CacheManager,
     )
     from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
     from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, KvCacheConfig
@@ -1080,12 +1078,9 @@ def test_mistral_large4_derives_dsa_with_shared_indexers(tmp_path):
     assert indexer_layers == [role == "full" for role in index_sharing]
     assert sum(indexer_layers) == 44
 
-    assert get_kv_cache_manager_cls(model_config, KvCacheConfig()) is MistralLarge4CacheManager
-    owners = sum(i == source for i, source in enumerate(pretrained_config.kv_source_layers))
-    bytes_per_token = MistralLarge4CacheManager.get_cache_size_per_token(
-        model_config, model_config.mapping
-    )
-    assert bytes_per_token == owners * 656 + 44 * 132
+    # The engine resolves the DSA V2 manager; the modeling_v2 targets build their own
+    # subclass of it in its place.
+    assert get_kv_cache_manager_cls(model_config, KvCacheConfig()) is DSACacheManagerV2
 
 
 def test_mistral_large4_quantization(tmp_path):

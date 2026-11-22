@@ -376,11 +376,11 @@ def _sparse_config():
 
 
 def _manager(pretrained_config, world: int):
-    """The engine's KV cache manager for this checkpoint (the sparse registry's pick for a
-    MistralLarge4Config): fp8_ds_mla latent pages on the 63 KV owners, the indexer keys on the
+    """The engine's KV cache manager for this checkpoint (the manager the targets declare
+    in place of the DSA V2 one): fp8_ds_mla latent pages on the 63 KV owners, the indexer keys on the
     44 full-indexer layers; this rank's own pool (the latent and the indexer keys are
     replicated over the ranks), at the world's max_seq_len."""
-    from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import (
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
         MistralLarge4CacheManager,
     )
     from tensorrt_llm.bindings import DataType

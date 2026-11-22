@@ -58,7 +58,6 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import indexer as dsa_ind
 from tensorrt_llm._torch.attention.backends.sparse.dsa import metadata as dsa_metadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
-from tensorrt_llm._torch.attention.backends.sparse.mistral_large4 import MistralLarge4CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     get_indexer_mqa_logits_workspace_bytes,
 )
@@ -66,6 +65,9 @@ from tensorrt_llm._torch.modeling_v2 import _router_index
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import routing
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp import (  # noqa: E501
     modeling as tp4_modeling,
+)
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    MistralLarge4CacheManager,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor import _util, model_loader, py_executor_creator
@@ -183,6 +185,16 @@ def _route(pretrained_config, mapping):
         pretrained_config=pretrained_config, mapping=mapping, spec_config=None
     )
     return routing.route(model_config, None, _SM103)
+
+
+def _engine_kv_cache_manager_cls(model_config, kv_cache_config):
+    """The KV cache manager class the engine builds: the class it resolves for this
+    configuration, or the subclass the routed target declares in its place
+    (RuntimeHooks.kv_cache_manager_cls)."""
+    return _util.model_declared_kv_cache_manager_cls(
+        _route(model_config.pretrained_config, model_config.mapping),
+        _util.get_kv_cache_manager_cls(model_config, kv_cache_config),
+    )
 
 
 def _resolve(checkpoint_dir: Path, options: dict) -> SimpleNamespace:
@@ -738,7 +750,7 @@ def test_kv_cache_is_fp8_ds_mla(tp4, tp4_fp8, tp4_quickstart):
     """Every spelling builds the fp8_ds_mla latent cache: the CI class's default dtype (auto, the
     checkpoint's fp8_kv_cache), the gates' options file's fp8 and the quickstart gates' fp8 each
     select
-    ``MistralLarge4CacheManager`` (the sparse registry picks it by the MistralLarge4Config), and
+    ``MistralLarge4CacheManager`` (the target declares it in place of the DSA V2 manager), and
     the engine hands it the FP8 element type. Per token on every rank: a 656-byte row on each of
     the 63 KV owners and the 132-byte indexer key on each of the 44 full-indexer layers, 47136 B,
     in pages of 32. The target refuses any other latent layout on its first step."""
@@ -753,7 +765,7 @@ def test_kv_cache_is_fp8_ds_mla(tp4, tp4_fp8, tp4_quickstart):
         assert kv_cache_config.dtype == dtype
         assert kv_cache_config.tokens_per_block == _PAGE
         assert resolved.model_config.quant_config.quant_mode.has_fp8_kv_cache()
-        manager = _util.get_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
+        manager = _engine_kv_cache_manager_cls(resolved.model_config, kv_cache_config)
         assert manager is MistralLarge4CacheManager
         assert manager.latent_layout == "fp8_ds_mla"
         assert manager.latent_token_bytes == _LATENT_ROW_BYTES
@@ -1100,8 +1112,11 @@ def test_chunks_within_max_seq_len_stay_whole_under_the_split(tp4):
 def _model_engine(resolved) -> SimpleNamespace:
     """The fields of ``ModelEngine`` the KV-cache creator reads, for this engine."""
     graphs = resolved.llm_args.cuda_graph_config
+    target = _route(resolved.model_config.pretrained_config, resolved.model_config.mapping)
     return SimpleNamespace(
-        model=SimpleNamespace(model_config=resolved.model_config),
+        model=SimpleNamespace(
+            model_config=resolved.model_config, runtime_hooks=target.runtime_hooks
+        ),
         attn_runtime_features=_runtime_features(resolved),
         batch_size=resolved.max_batch_size,
         max_cuda_graph_batch_size=max(graphs.batch_sizes),

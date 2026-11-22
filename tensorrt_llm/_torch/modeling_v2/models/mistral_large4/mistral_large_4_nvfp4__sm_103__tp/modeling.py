@@ -167,6 +167,9 @@ from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.attention.ssmax_s
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.attention.ssmax_scaling_fused_q import (
     ssmax_scaling_fused_q,
 )
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.cache.cache_manager import (
+    MistralLarge4CacheManager,
+)
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.comm.cute_dsl_allreduce_add_rmsnorm import (  # noqa: E501
     build_workspace as build_lamport_workspace,
 )
@@ -192,6 +195,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.flash_mla import get_mla_metadata
@@ -2361,6 +2365,10 @@ def _splice_image_rows(
 class ModelingV2MistralLarge4Nvfp4Sm103Tp(
     DecoderModelForCausalLM[MistralLarge4TpModelingV2, PretrainedConfig]
 ):
+    # The engine builds this owner-only fp8_ds_mla latent pool in place of the DSA V2 manager
+    # it resolves for the checkpoint's sparse attention config.
+    runtime_hooks = RuntimeHooks(kv_cache_manager_cls=MistralLarge4CacheManager)
+
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         super().__init__(
