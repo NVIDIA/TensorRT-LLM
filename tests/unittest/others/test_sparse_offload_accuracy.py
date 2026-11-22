@@ -113,7 +113,7 @@ def test_concurrency_gate_requires_retirement_after_overlap() -> None:
 
 def test_concurrency_gate_rejects_an_incomplete_first_batch() -> None:
     stats = [{"inflightBatchingStats": {"numGenRequests": count}} for count in [0, 1] + [2] * 128]
-    with pytest.raises(AssertionError, match="incomplete batch"):
+    with pytest.raises(AssertionError, match="Parity wave started with 1 of 2 requests"):
         assert_concurrent_decode(stats, min_batched_steps=128, expected_initial_batch_size=2)
 
 
