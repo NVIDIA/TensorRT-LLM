@@ -91,6 +91,13 @@ def test_split_type_groups_ranks_by_node():
         group.Split_type(MPI.COMM_TYPE_SHARED + 1000)
 
 
+def test_split_type_needs_gpus_per_node():
+    """Refuse a node split of a group built without the ranks per node."""
+    group = _group(InMemoryStore(), 3, range(6))
+    with pytest.raises(ValueError, match="gpus_per_node"):
+        group.Split_type(MPI.COMM_TYPE_SHARED)
+
+
 @pytest.mark.parametrize("op, expected", [("SUM", 6), ("MIN", 1), ("MAX", 3)])
 def test_allreduce_over_active_members(op, expected):
     """Reduce over the active members' values only."""
