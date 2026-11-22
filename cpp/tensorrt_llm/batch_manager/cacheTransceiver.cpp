@@ -1383,6 +1383,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             continue;
         }
+        if (mTimedOutSenderIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
+        }
         requestsStatus.completedRequestIds.insert(requestId);
         if (markComplete)
         {

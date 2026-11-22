@@ -180,6 +180,23 @@ def test_settled_send_releases_blocks_and_terminates_a_departed_request(outcome)
     assert h.effects.staged_responses == []
 
 
+@pytest.mark.parametrize("polled_before_completion", [False, True])
+def test_native_send_completion_preserves_observed_deadline(polled_before_completion) -> None:
+    h = _Harness()
+    req = _Request(1)
+    h.send(req)
+    req.py_kv_transfer_start_time = 0.0
+    if polled_before_completion:
+        h.coordinator._flag_transfer_timeout(req, "context", 10, current_time=0.011)
+    req.kv_cache_transfer_timed_out = True
+    h.transceiver.finish_send(req)
+    h.coordinator.reap_context_sends()
+
+    assert h.coordinator.transfer_outcomes == (0, 0, 1)
+    assert not h.in_transfer(req)
+    assert h.effects.terminated == [req]
+
+
 def test_fast_completion_of_an_active_request_stages_its_response_first() -> None:
     """A send that completes before the response pass ran: the response is
     created while the request is still TRANS_IN_PROGRESS (C++ createResult
