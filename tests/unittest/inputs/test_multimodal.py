@@ -922,6 +922,37 @@ def test_phi4mm_has_no_audio_token_count() -> None:
     assert modalities_without_token_count(image_and_audio, Phi4MMInputProcessor) == ["audio"]
 
 
+class _PilOnlyKimiImageProcessor:
+    """Counts tokens as the Kimi K3 checkpoint does: PIL images only, else ValueError."""
+
+    media_proc_cfg = {"temporal_merge_kernel_size": 2}
+
+    def media_tokens_calculator(self, media: dict) -> int:
+        from PIL import Image
+
+        items = [media["image"]] if media["type"] == "image" else media["video_chunk"]
+        if not all(isinstance(item, Image.Image) for item in items):
+            raise ValueError(f"Unsupported data type: {type(items[0])}")
+        width, height = items[0].size
+        return (width // 28) * (height // 28)
+
+
+def test_kimi_counts_the_tokens_of_tensor_images_and_frames() -> None:
+    """trtllm-serve passes images and video frames as tensors (format="pt").
+
+    A count that rejects them leaves every such request without item spans, so it would reuse
+    no KV cache at all.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_k25 import KimiK25InputProcessor
+
+    processor = object.__new__(KimiK25InputProcessor)
+    processor._processor = SimpleNamespace(image_processor=_PilOnlyKimiImageProcessor())
+    frame = torch.zeros(3, 56, 84, dtype=torch.uint8)
+
+    assert processor.get_num_tokens_per_image(image=frame) == 6
+    assert processor.get_num_tokens_per_video(video=[frame] * 3) == 12
+
+
 @pytest.mark.parametrize("hashing_off", [True, False], ids=["hashing_off", "hashing_failed"])
 def test_request_without_content_hashes_gets_random_hashes(monkeypatch, hashing_off) -> None:
     """Hashing off, or hashing failed for this request: the items get random hashes.
