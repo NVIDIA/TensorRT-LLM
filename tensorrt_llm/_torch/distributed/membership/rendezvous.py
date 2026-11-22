@@ -158,11 +158,6 @@ class StoreGroup(StoreComm):
             self.exchange_failed = True
             raise
 
-    def barrier(self) -> None:
-        self._gather_values(None)
-
-    Barrier = barrier
-
     def bcast(self, obj: Any, root: int = 0) -> Any:
         """Return ``obj`` from communicator rank ``root``, or None if that rank is not active."""
         return self._gather_values(obj if self.Get_rank() == root else None)[root]
