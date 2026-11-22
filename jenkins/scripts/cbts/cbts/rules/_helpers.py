@@ -279,21 +279,16 @@ def iter_diff_pre_image(diff: str) -> Iterator[tuple[str, str]]:
 def lookup_ids_into_block_filters(
     yaml_index: YAMLIndex,
     test_ids: Iterable[str],
-    allowed_stems: set[str] | None = None,
 ) -> tuple[dict[tuple[str, int], dict[str, set[str]]], list[str]]:
     """Resolve test ids via `find_matches_for_waive`; return (block_filters, misses).
 
     Each block receives its own most-specific matching level so cross-platform
-    file-vs-directory registrations all participate in narrowing. When
-    `allowed_stems` is given (e.g. `TestListRule` scoped to edited YAML files),
-    matches in untouched contexts are ignored.
+    file-vs-directory registrations all participate in narrowing.
     """
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
     misses: list[str] = []
     for tid in test_ids:
         matches = yaml_index.find_matches_for_waive(tid)
-        if matches is not None and allowed_stems is not None:
-            matches = [(b, lvl) for b, lvl in matches if b.yaml_stem in allowed_stems] or None
         if matches is None:
             misses.append(tid)
             continue

@@ -151,7 +151,8 @@ def _extract_k_keyword(entry: str) -> Optional[str]:
 def _entry_excludes_waive(entry: str, waive_id: str) -> bool:
     """True when `entry`'s `--ignore` / `--ignore-glob` / `--deselect` drops `waive_id`."""
     norm_entry = normalize_test_id(entry)
-    waive_target = _entry_target(waive_id)
+    norm_waive = _normalize_target_path(_strip_pytest_options(normalize_test_id(waive_id)))
+    waive_target = _normalize_target_path(_strip_params(norm_waive))
     if not waive_target:
         return False
     waive_file = waive_target.split("::", 1)[0]
@@ -164,8 +165,8 @@ def _entry_excludes_waive(entry: str, waive_id: str) -> bool:
         if pat and (fnmatchcase(waive_file, pat) or fnmatchcase(waive_target, pat)):
             return True
     for m in _DESELECT_OPT_RE.finditer(norm_entry):
-        deselected = _normalize_target_path(_strip_params(m.group(1).strip("\"'")))
-        if deselected and _target_in_filter_subtree(waive_target, deselected):
+        deselected = _normalize_target_path(m.group(1).strip("\"'"))
+        if deselected and _target_in_filter_subtree(norm_waive, deselected):
             return True
     return False
 
@@ -737,11 +738,19 @@ def _avg_duration(durations: dict[str, float]) -> float:
 
 
 def _estimate_entries_seconds(entries: list[str], durations: dict[str, float], avg: float) -> float:
-    """Sum entries' wall-time: exact node-id, else subtree-sum (deduped), else avg."""
+    """Sum entries' wall-time: wrapped/exact node-id, else bare, else subtree-sum, else avg."""
     matched: set[str] = set()
     unknown = 0
     for entry in entries:
-        bare = _strip_pytest_options(normalize_test_id(entry))
+        norm = normalize_test_id(entry)
+        wrapped = f"test_unittests.py::test_unittests_v2[{norm}]"
+        if wrapped in durations:
+            matched.add(wrapped)
+            continue
+        if norm in durations:
+            matched.add(norm)
+            continue
+        bare = _strip_pytest_options(norm)
         if bare in durations:
             matched.add(bare)
             continue

@@ -35,14 +35,9 @@ from typing import Optional
 
 import yaml
 
-from cbts.blocks import Stage, YAMLIndex, normalize_test_id
+from cbts.blocks import Stage, YAMLIndex, _entry_target, normalize_test_id
 
-from ._helpers import (
-    is_perf_stem,
-    lookup_ids_into_block_filters,
-    resolve_affected_stages,
-    stages_by_yaml_stem,
-)
+from ._helpers import is_perf_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 TEST_DB_DIR = "tests/integration/test_lists/test-db/"
@@ -236,6 +231,60 @@ def _scan_tests_entries(diff: str) -> tuple[set[str], set[str]]:
     return added, removed
 
 
+def _added_entries_by_block(
+    post_text: str, post_lines: list[str], added_line_nums: set[int]
+) -> tuple[dict[tuple[str, int], set[str]], set[str]]:
+    """Map `(yaml_stem, block_index)` to normalized test IDs added in that block."""
+    by_block: dict[tuple[str, int], set[str]] = {}
+    unresolved: set[str] = set()
+    if not added_line_nums:
+        return by_block, unresolved
+    try:
+        root = yaml.compose(post_text)
+    except yaml.YAMLError:
+        root = None
+    spans: list[tuple[int, int, str, int]] = []
+    if isinstance(root, yaml.MappingNode):
+        items = list(root.value)
+        for idx, (k_node, v_node) in enumerate(items):
+            if k_node.value == "version" or not isinstance(v_node, yaml.SequenceNode):
+                continue
+            ctx_end = (
+                items[idx + 1][0].start_mark.line + 1
+                if idx + 1 < len(items)
+                else len(post_lines) + 1
+            )
+            blocks = list(v_node.value)
+            for b_idx, b_node in enumerate(blocks):
+                b_start = b_node.start_mark.line + 1
+                b_end = (
+                    blocks[b_idx + 1].start_mark.line + 1 if b_idx + 1 < len(blocks) else ctx_end
+                )
+                spans.append((b_start, b_end, str(k_node.value), b_idx))
+
+    for ln in sorted(added_line_nums):
+        if not (1 <= ln <= len(post_lines)):
+            continue
+        raw = post_lines[ln - 1]
+        if not raw.strip() or _COMMENT_RE.match(raw):
+            continue
+        lm = _LIST_ITEM_RE.match(raw)
+        if not lm:
+            continue
+        tid = normalize_test_id(lm.group("body"))
+        if not tid:
+            continue
+        placed = False
+        for b_start, b_end, stem, b_idx in spans:
+            if b_start <= ln < b_end:
+                by_block.setdefault((stem, b_idx), set()).add(tid)
+                placed = True
+                break
+        if not placed:
+            unresolved.add(tid)
+    return by_block, unresolved
+
+
 class TestListRule(Rule):
     name = "testlist"
     needs_diff_for: tuple[str, ...] = ("tests/integration/test_lists/test-db/*.yml",)
@@ -257,7 +306,8 @@ class TestListRule(Rule):
 
         added: set[str] = set()
         removed: set[str] = set()
-        touched_stems: set[str] = set()
+        added_by_block: dict[tuple[str, int], set[str]] = {}
+        unresolved_added: set[str] = set()
         stage_select_files: list[str] = []
         unverifiable_files: list[str] = []
 
@@ -295,18 +345,15 @@ class TestListRule(Rule):
                 stage_select_files.append(path)
                 continue
 
-            try:
-                with_stems = yaml.safe_load(post_text) if post_text else None
-            except yaml.YAMLError:
-                with_stems = None
-            if isinstance(with_stems, dict):
-                touched_stems.update(
-                    k for k, v in with_stems.items() if k != "version" and isinstance(v, list)
-                )
-
             a, r = _scan_tests_entries(diff)
             added |= a
             removed |= r
+            file_by_block, file_unresolved = _added_entries_by_block(
+                post_text, post_lines, added_line_nums
+            )
+            for b_key, tids in file_by_block.items():
+                added_by_block.setdefault(b_key, set()).update(tids)
+            unresolved_added |= file_unresolved
 
         if stage_select_files:
             preview = ", ".join(stage_select_files[:3])
@@ -346,9 +393,26 @@ class TestListRule(Rule):
                 reason=f"testlist: no additions across {len(touched)} file(s){note}",
             )
 
-        block_filters, misses = lookup_ids_into_block_filters(
-            self.yaml_index, added, allowed_stems=touched_stems or None
-        )
+        block_by_key = {(b.yaml_stem, b.block_index): b for b in self.yaml_index.blocks}
+        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+        misses = sorted(unresolved_added)
+        for b_key, tids in added_by_block.items():
+            block = block_by_key.get(b_key)
+            if block is None:
+                misses.extend(sorted(tids))
+                continue
+            raw_by_norm: dict[str, list[str]] = {}
+            for raw in block.tests:
+                raw_by_norm.setdefault(normalize_test_id(raw), []).append(raw)
+            for tid in sorted(tids):
+                matched_raws = raw_by_norm.get(tid)
+                if not matched_raws:
+                    misses.append(tid)
+                    continue
+                for raw in matched_raws:
+                    target = _entry_target(raw)
+                    if target:
+                        block_filters.setdefault(b_key, {}).setdefault(target, set()).add(tid)
         if not block_filters:
             preview = ", ".join(sorted(misses)[:3])
             more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""

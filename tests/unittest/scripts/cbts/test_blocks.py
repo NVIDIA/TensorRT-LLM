@@ -17,16 +17,24 @@
 
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 
 import pytest
 import yaml
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Stage, YAMLIndex, parse_stages_from_groovy, write_filtered_test_db
+from cbts.blocks import (
+    Stage,
+    YAMLIndex,
+    _estimate_entries_seconds,
+    parse_stages_from_groovy,
+    write_filtered_test_db,
+)
 from cbts.command.report_decision import _stage_group
 from cbts.coverage.selection.touch_db import stage_family
 from cbts.coverage.tier import write_coverage_test_db
+from cbts.rules import test_list as test_list_mod
 from cbts.rules.base import PRInputs
 from cbts.rules.waives import WAIVES_FILE, WaivesRule
 
@@ -223,3 +231,106 @@ def test_waives_rule_resolves_per_block_across_file_and_directory_registrations(
     assert yaml.safe_load((filtered2 / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
         prefill_file
     ]
+
+
+def test_deselect_preserves_parameter_boundaries(tmp_path: Path) -> None:
+    """`--deselect=file::test[a]` excludes `[a]` while retaining `[b]` and unparameterized waives."""
+    test_db = tmp_path / "test-db"
+    test_db.mkdir()
+    entry = 'unit/test_x.py -k "test_case" --deselect=unit/test_x.py::test_case[a]'
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {"version": "0.0.1", "l0_b200": [{"condition": _CONDITION, "tests": [entry]}]},
+            sort_keys=False,
+        )
+    )
+    index = YAMLIndex.load(test_db)
+    assert index.find_match_for_waive("unit/test_x.py::test_case[a]") is None
+    assert index.find_match_for_waive("unit/test_x.py::test_case[b]") is not None
+    assert index.find_match_for_waive("unit/test_x.py::test_case") is not None
+
+
+def test_test_list_rule_b200_addition_with_cpu_deletion_leaves_cpu_unfiltered(
+    tmp_path: Path,
+) -> None:
+    """Adding a B200 test while only deleting from l0_cpu.yml must not narrow l0_cpu."""
+    test_db = tmp_path / "tests/integration/test_lists/test-db"
+    test_db.mkdir(parents=True)
+    pre_cond = {"terms": {"stage": "pre_merge", "backend": "pytorch"}}
+    added_test = "unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py"
+    b200_rel = "tests/integration/test_lists/test-db/l0_b200.yml"
+    cpu_rel = "tests/integration/test_lists/test-db/l0_cpu.yml"
+    b200_pre = yaml.safe_dump(
+        {
+            "version": "0.0.1",
+            "l0_b200": [{"condition": pre_cond, "tests": ["unittest/test_keep.py"]}],
+        },
+        sort_keys=False,
+    )
+    b200_post = yaml.safe_dump(
+        {
+            "version": "0.0.1",
+            "l0_b200": [{"condition": pre_cond, "tests": ["unittest/test_keep.py", added_test]}],
+        },
+        sort_keys=False,
+    )
+    cpu_pre = yaml.safe_dump(
+        {
+            "version": "0.0.1",
+            "l0_cpu": [
+                {
+                    "condition": pre_cond,
+                    "tests": [
+                        "unittest/_torch/modeling",
+                        "examples/test_removed.py::test_old",
+                        "unittest/scripts",
+                    ],
+                }
+            ],
+        },
+        sort_keys=False,
+    )
+    cpu_post = yaml.safe_dump(
+        {
+            "version": "0.0.1",
+            "l0_cpu": [
+                {
+                    "condition": pre_cond,
+                    "tests": ["unittest/_torch/modeling", "unittest/scripts"],
+                }
+            ],
+        },
+        sort_keys=False,
+    )
+    (tmp_path / b200_rel).write_text(b200_post)
+    (tmp_path / cpu_rel).write_text(cpu_post)
+    index = YAMLIndex.load(test_db)
+    stages = {
+        "DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1, {}),
+        "CPU-Generic-1": Stage("CPU-Generic-1", "l0_cpu", "x86_64", 1, 1, {}),
+    }
+    rule = test_list_mod.TestListRule(index, stages, tmp_path)
+    b200_diff = "".join(difflib.unified_diff(b200_pre.splitlines(True), b200_post.splitlines(True)))
+    cpu_diff = "".join(difflib.unified_diff(cpu_pre.splitlines(True), cpu_post.splitlines(True)))
+    res = rule.apply(
+        PRInputs(
+            changed_files={b200_rel, cpu_rel},
+            diffs={b200_rel: b200_diff, cpu_rel: cpu_diff},
+        )
+    )
+    assert res is not None and res.scope == "testlistonly"
+    assert res.affected_stages == {"DGX_B200-PyTorch-1"}
+    assert set(res.block_filters) == {("l0_b200", 0)}
+    filtered = tmp_path / "filtered"
+    write_filtered_test_db(test_db, filtered, res.block_filters)
+    assert sorted(p.name for p in filtered.glob("*.yml")) == ["l0_b200.yml"]
+
+
+def test_estimate_entries_seconds_reads_wrapped_unittest_batch_durations() -> None:
+    """`_estimate_entries_seconds` hits `test_unittests_v2[...]` keys before subtree fallback."""
+    batch = "unittest/_torch/modules/kimi_kda --ignore=unittest/_torch/modules/kimi_kda/test_a.py"
+    durations = {
+        f"test_unittests.py::test_unittests_v2[{batch}]": 416.52,
+        "unittest/_torch/modules/kimi_kda/test_b.py::test_slow": 1700.0,
+    }
+    assert _estimate_entries_seconds([batch], durations, avg=100.0) == pytest.approx(416.52)
