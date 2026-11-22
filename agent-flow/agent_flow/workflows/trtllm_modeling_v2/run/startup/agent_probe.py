@@ -160,7 +160,7 @@ def probe_inputs(
 
 
 def part_digests(parts: Mapping[str, Any]) -> dict[str, str]:
-    """One short digest per part of what a recorded pass stands for (this probe's, the substrate gate's)."""
+    """One short digest per part of what a recorded pass of this probe stands for."""
     return {
         name: hashlib.sha1(
             json.dumps(value, sort_keys=True, default=str).encode("utf-8")

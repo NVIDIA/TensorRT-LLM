@@ -9,12 +9,9 @@ from typing import TYPE_CHECKING
 
 from torch import nn
 
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
 from .decoder import DecoderRunner
 from .encoder import EncoderRunner
 from .encoder_decoder import EncoderDecoderRunner
-from .mm_encoder import MultimodalEncoderRunner
 
 if TYPE_CHECKING:
     from .interface import ModelRunner
@@ -27,17 +24,8 @@ __all__ = [
 ]
 
 
-def resolve_runner_type(
-    model: nn.Module,
-    llm_args: TorchLlmArgs,
-) -> type[ModelRunner]:
+def resolve_runner_type(model: nn.Module) -> type[ModelRunner]:
     """Resolve the startup runner class without constructing its dependencies."""
-    if llm_args.mm_encoder_only:
-        return MultimodalEncoderRunner
-
-    if llm_args.encode_only or not model.model_config.is_generation:
-        return EncoderRunner
-
     if model.model_config.is_encoder_decoder:
         return EncoderDecoderRunner
 

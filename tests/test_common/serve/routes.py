@@ -166,6 +166,7 @@ CONFIGS: Tuple[SnapshotConfig, ...] = (
     SnapshotConfig("llm_governor", "openai_server", AggConfig(governor_queue=True)),
     SnapshotConfig("llm_rl_control", "openai_server", AggConfig(rl_control=True)),
     SnapshotConfig("llm_runtime_control", "openai_server", AggConfig(runtime_control=True)),
+    SnapshotConfig("llm_memory_report", "openai_server", AggConfig(memory_report=True)),
     SnapshotConfig(
         "llm_rl_and_runtime_control",
         "openai_server",

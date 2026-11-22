@@ -70,6 +70,8 @@ _DROPPED_VARIABLES = {
     "POST_TAG",
     "FINAL_SNAPSHOT",
     "TIMEOUT_XML_SCRIPT",
+    "TIMEOUT_EVIDENCE_FILE",
+    "TIMEOUT_INPUT_FINAL",
     "ART_USER",
     "ART_PASS",
     "BASH_ENV",
@@ -362,7 +364,6 @@ def test_snapshot_post_tag_renames_results_in_the_tarball_only(runner: Runner) -
     assert result.returncode == 0, result.output
     assert set(_read_tarball(runner.tarball)) == {
         f"{STAGE}/results{POST_TAG}.xml",
-        f"{STAGE}/results-timeout{POST_TAG}.xml",
         f"{STAGE}/aggr-1/results.xml",
         f"{STAGE}/unfinished_test.txt",
     }

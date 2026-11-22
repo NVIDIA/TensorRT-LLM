@@ -14,7 +14,7 @@
 """ModelingV2Rule — narrows CI when the modeling_v2 subtree changes.
 
 modeling_v2 is a second modeling path living entirely under
-`tensorrt_llm/_torch/_experimental/modeling_v2/`: one self-contained forward per
+`tensorrt_llm/_torch/modeling_v2/`: one self-contained forward per
 (checkpoint, GPU arch, parallel topology), assembled from a catalog of
 op wrappers. Native code lives beside each model in `csrc/`; shared build
 infrastructure lives under `cpp/tensorrt_llm/modeling_v2/` and
@@ -34,15 +34,14 @@ binds with `from .<target>... import <Class>`. Everything else under
 `models/<family>/` is family code. If `routing.py` is missing, does not parse,
 or has a return whose directory it does not name, every path of the family is
 family code, and the whole family's tests stand in for those of its targets.
-A target's tests are its unit tests
+A target's tests include its unit tests
 (`unittest/_torch/modeling_v2/models/<family>/<target>`) and its accuracy
-tests (`accuracy/modeling_v2/<family>/<target>`); a family's tests are the
+tests (`accuracy/modeling_v2/<family>/<target>`). A family's tests are the
 same two paths one level up. The CPU check
 `unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py` requires every
 target to have accuracy tests, and every accuracy directory to name a target.
 
-- Any file in a target, native code included, selects only that target's
-  tests.
+- Any file in a target, native code included, selects that target's tests.
 - A Python file of family code in a subdirectory selects its mirror unit
   directory (`unittest/_torch/modeling_v2/models/<family>/<its directory>`).
   When there is none, or the file sits directly in the family directory, it
@@ -50,7 +49,8 @@ target to have accuracy tests, and every accuracy directory to name a target.
   the family's unit directory and its subdirectories that are not targets.
   Either way it adds the tests of every target that imports it. A file no
   target imports, such as `routing.py`, selects the whole family, as does
-  any non-Python family file.
+  any non-Python family file. Exact source-to-test associations also retain
+  named companion tests outside those prefixes.
 - A Python file under `catalog/<category>/` selects
   `unittest/_torch/modeling_v2/<category>` plus the tests of every target
   that imports it, or every modeling_v2 entry if that directory is missing.
@@ -81,7 +81,9 @@ A file that does not parse widens the selection to the whole family or
 every entry.
 
 The tests directly under `unittest/_torch/modeling_v2/` check the tree as a
-whole (routing, native loading, contracts), so any change keeps them.
+whole (routing, native loading, contracts), so any change keeps them. The
+CPU guard for shared FP4 test helpers, `moe/test_modeling_v2_fp4_test_helpers.py`,
+is also kept for every modeling_v2 change.
 
 A unit test prefix that no entry of a block sits at or under keeps the
 longest entry of that block that covers it instead, such as a directory
@@ -133,7 +135,7 @@ from .modeling_v2_source import PACKAGE, imported_names, package_names, routed_t
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
 _MV2_SRC_PREFIXES: tuple[str, ...] = (
-    "tensorrt_llm/_torch/_experimental/modeling_v2/",
+    "tensorrt_llm/_torch/modeling_v2/",
     "cpp/tensorrt_llm/modeling_v2/",
 )
 _CPP_BUILD_FILES = frozenset({"cpp/cmake/modules/modeling_v2.cmake"})
@@ -142,6 +144,57 @@ _IGNORE = re.compile(r"--ignore=(\S+)")
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
 _PKG_MODULE = PACKAGE
+_M3_UNIT_ROOT = f"{_UNIT_ROOT}/models/minimax_m3"
+_M3_OPS_SOURCE_ROOT = f"{_MV2_SRC_PREFIXES[0]}models/minimax_m3/ops"
+_M3_SM103_MOE_TESTS = {
+    f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp{tp}/ops/moe/test_modeling_v2_m3_{name}.py"
+    for tp in (4, 8)
+    for name in ("moe_engine", "router_gemv", "router_gemv_fp4", "router_tc")
+} | {f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp4/ops/moe/test_modeling_v2_m3_moe16_engine.py"}
+_EXTRA_SOURCE_UNIT_TESTS = {
+    # Target multicast tests share the family allreduce contract.
+    f"{_M3_OPS_SOURCE_ROOT}/comm/m3_allreduce.py": {
+        f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp{tp}/ops/comm/test_modeling_v2_m3_{name}.py"
+        for tp in (4, 8)
+        for name in ("mc_allreduce_norm_op_matrix", "mc_finalize_allreduce_norm")
+    },
+    # FP4 routing also protects the target engine checks that consume its operands.
+    f"{_M3_OPS_SOURCE_ROOT}/moe/m3_router_gemv_fp4.py": _M3_SM103_MOE_TESTS
+    | {
+        f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_107__tp4/{directory}/test_modeling_v2_m3_{name}.py"
+        for directory, name in (
+            ("ops/m3_moe", "moe_flat_gate_tp4"),
+            ("ops/moe", "moe16_engine"),
+            ("ops/moe", "moe_engine"),
+        )
+    },
+}
+# Include SM103 allreduce checks outside the mirrored ops/comm prefix.
+_EXTRA_SOURCE_UNIT_TESTS.update(
+    {
+        f"{_M3_OPS_SOURCE_ROOT}/{relative}": {
+            f"{_M3_UNIT_ROOT}/minimax_m3_nvfp4__sm_103__tp{tp}/comm/test_modeling_v2_m3_allreduce.py"
+            for tp in (4, 8)
+        }
+        for relative in (
+            "comm/mc_workspace.py",
+            "comm/reference.py",
+            "gemm/__init__.py",
+            "gemm/prequant.py",
+        )
+    }
+)
+# The MiniMax-M3 family-root CPU checks guard every family op, including ops whose
+# mirror unit directory would otherwise select only itself.
+_M3_FAMILY_ROOT_CHECKS = {
+    f"{_M3_UNIT_ROOT}/{relative}"
+    for relative in (
+        "test_collective_launcher_cleanup.py",
+        "test_modeling_v2_eagle3_worker_api.py",
+        "test_shared_kernel_contracts.py",
+        "ops/spec/test_modeling_v2_spec_tail_contracts.py",
+    )
+}
 
 # Substrings that mark a test entry as modeling_v2. All are unambiguous:
 #   - "unittest/_torch/modeling_v2/" → the op and target unit tests
@@ -182,8 +235,11 @@ def _mv2_entries(block) -> list[str]:
 
 
 def _is_whole_tree_test(target: str) -> bool:
-    """A test directly under the unit root, which checks the tree as a whole."""
-    rest = target.removeprefix(f"{_UNIT_ROOT}/").split("::")[0]
+    """A root-level tree check or the shared FP4 test-helper CPU guard."""
+    target = target.split("::")[0]
+    if target == f"{_UNIT_ROOT}/moe/test_modeling_v2_fp4_test_helpers.py":
+        return True
+    rest = target.removeprefix(f"{_UNIT_ROOT}/")
     return target.startswith(f"{_UNIT_ROOT}/") and "/" not in rest and rest.endswith(".py")
 
 
@@ -472,7 +528,11 @@ class ModelingV2Rule(Rule):
         if not targets or self._targets(family) is None:
             return _outermost(whole_family | tests)
         return _outermost(
-            self._family_unit_tests(family, PurePosixPath(*parts[2:-1])) | targets | tests
+            self._family_unit_tests(family, PurePosixPath(*parts[2:-1]))
+            | targets
+            | tests
+            | _EXTRA_SOURCE_UNIT_TESTS.get(path, set())
+            | (_M3_FAMILY_ROOT_CHECKS if path.startswith(f"{_M3_OPS_SOURCE_ROOT}/") else set())
         )
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:

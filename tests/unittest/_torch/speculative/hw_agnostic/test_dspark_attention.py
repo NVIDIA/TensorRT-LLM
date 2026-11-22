@@ -40,6 +40,8 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 )
 from tensorrt_llm._torch.modules.linear import Linear
 
+pytestmark = pytest.mark.cpu_only
+
 dspark_attention = modeling_dspark
 
 
@@ -69,7 +71,7 @@ def test_rmsnorm_rope_fallback_applies_weight_without_rmsnorm(monkeypatch):
 
 def test_rmsnorm_rope_skips_frequency_view_on_unsupported_arch(monkeypatch):
     monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_AVAILABLE", True)
-    monkeypatch.setattr(dspark_attention, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(dspark_attention, "_get_dspark_arch_str", lambda: None, raising=False)
     view_as_real = Mock(side_effect=AssertionError("frequency view should be skipped"))
     monkeypatch.setattr(torch, "view_as_real", view_as_real)
     x = torch.randn(2, 3, 64, dtype=torch.bfloat16)
@@ -952,7 +954,6 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
         DSv4DSparkDraftModel._bind_attn_projections(model)
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sm,tp_size,enable_attention_dp,use_bf16",
     [
@@ -1002,7 +1003,6 @@ def test_post_load_weights_selects_dspark_linear_backend(
         bf16_bind.assert_not_called()
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("use_cute_backend", [False, True])
 def test_post_load_weights_preserves_linear_backend_before_transform(
     monkeypatch: pytest.MonkeyPatch, use_cute_backend: bool
@@ -1171,7 +1171,6 @@ def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
     assert len(quant_calls) == len(gemm_calls) == 1
 
 
-@pytest.mark.cpu_only
 def test_zero_argument_post_load_transforms_non_attention_linears(monkeypatch):
     from tensorrt_llm._torch.models import modeling_dspark
 
@@ -1362,7 +1361,7 @@ def test_batched_fused_preparation_compacts_qkv_views(monkeypatch, batch, block)
         return draft.new_zeros(batch, 8, head_dim)
 
     monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_AVAILABLE", True)
-    monkeypatch.setattr(modeling_dspark, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(modeling_dspark, "_get_dspark_arch_str", lambda: None)
     monkeypatch.setattr(
         modeling_dspark, "is_fused_dspark_rmsnorm_rope_supported", lambda *args, **kwargs: False
     )
@@ -1429,9 +1428,12 @@ def test_forward_batched_reuses_ring_attention_metadata(monkeypatch, with_valid_
     stage_call = Mock(side_effect=lambda stage, h, *args, **kwargs: h)
     model = types.SimpleNamespace(
         mtp_layers=stages,
+        block_size=5,
         _attn_params={"window_size": 128},
         forward_embed=Mock(return_value=(hidden, torch.randn(2, 8), torch.zeros(2, 5))),
-        _dspark_freqs_table=Mock(return_value=torch.empty(0)),
+        _dspark_freqs_table=Mock(return_value=precompute_dspark_freqs_cis(2, 256)),
+        _tp_attention_ready=False,
+        _fuses_moe_boundary=Mock(return_value=False),
         _initial_pre_mix=Mock(return_value=None),
         _forward_stage=stage_call,
         uses_lagged_pre=False,

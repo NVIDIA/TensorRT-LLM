@@ -3498,6 +3498,10 @@ async def guard_responses_stream(
         for frame in frames:
             yield frame
         raise
+    finally:
+        # Close the source here: a guard closed before it ever iterates would
+        # otherwise leave it suspended until garbage collection.
+        await stream.aclose()
 
 
 # --------------------------------------------------------------------------

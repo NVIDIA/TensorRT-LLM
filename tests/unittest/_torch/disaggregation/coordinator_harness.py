@@ -45,8 +45,13 @@ class TransferRequest(SimpleNamespace):
             is_disagg_context_transmission_state=False,
             py_kv_transfer_start_time=None,
             py_kv_transfer_timed_out=False,
+            py_multimodal_params=None,
             py_disaggregated_params=None,
             cached_tokens=0,
+            py_per_pos_drafted=[],
+            py_per_pos_accepted=[],
+            py_total_draft_tokens=0,
+            py_total_accepted_draft_tokens=0,
             response=None,
         )
         defaults.update(overrides)

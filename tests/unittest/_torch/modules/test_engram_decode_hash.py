@@ -11,6 +11,7 @@ from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
 from tensorrt_llm._torch.modules.engram import engram as engram_module
+from tensorrt_llm._utils import is_blackwell_datacenter
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
@@ -222,7 +223,7 @@ def test_engram_decode_row_maps_are_immutable_and_stream_local(providers):
 @pytest.mark.parametrize(
     "case",
     [
-        "packed",
+        "empty_request",
         "missing_positions",
         "missing_ids",
         "missing_lengths",
@@ -241,7 +242,7 @@ def test_engram_decode_row_maps_are_immutable_and_stream_local(providers):
 def test_engram_decode_hash_rejects_unsupported_geometry(providers, case):
     provider, _ = providers()
     kwargs = _arguments([10, 20], [0, 0], [1, 2])
-    if case == "packed":
+    if case == "empty_request":
         kwargs["seq_lens_host"] = torch.tensor([2, 0], dtype=torch.int32)
     elif case == "missing_positions":
         kwargs["position_ids"] = None
@@ -294,16 +295,19 @@ def test_engram_decode_hash_preserves_validation(providers, case):
         provider.compute_hashes(**kwargs)
 
 
-def test_engram_decode_hash_keeps_packed_prefill_path(providers, monkeypatch):
+@pytest.mark.parametrize("masked", [False, True])
+def test_engram_decode_hash_fuses_multi_token_requests(providers, monkeypatch, masked):
     candidate, reference = providers()
-    kwargs = _arguments([10, 11, 20, 21], [0, 1, 0, 1], [1, 2], padded=8)
-    kwargs["seq_lens_host"] = torch.tensor([2, 2], dtype=torch.int32)
-    original = candidate._lookback_from_history
-    spy = Mock(wraps=original)
-    monkeypatch.setattr(candidate, "_lookback_from_history", spy)
-    _assert_hashes(candidate.compute_hashes(**kwargs), reference.compute_hashes(**kwargs))
-    assert spy.call_count == 1
-    assert candidate._decode_row_map is None
+    monkeypatch.setattr(candidate, "_lookback_from_history", Mock(side_effect=AssertionError))
+    mask = [True, True, False, True] if masked else None
+    # Speculative steps carry several tokens per request, each reading the ones before it.
+    for step in range(2):
+        ids = [10 + 8 * step, 20 + 8 * step, 22 + 8 * step, 24 + 8 * step]
+        positions = [step, 3 * step, 3 * step + 1, 3 * step + 2]
+        kwargs = _arguments(ids, positions, [1, 2], padded=8, mask=mask)
+        kwargs["seq_lens_host"] = torch.tensor([1, 3], dtype=torch.int32)
+        _assert_hashes(candidate.compute_hashes(**kwargs), reference.compute_hashes(**kwargs))
+    torch.testing.assert_close(candidate._history, reference._history, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("position", [-64, -1, 0, 1, 63])
@@ -453,19 +457,12 @@ def test_engram_decode_alias_hashes_read_resolved_scatter(providers, monkeypatch
     positions = positions[:16]
     tokens = list(range(70, 70 + real_requests)) + [11 + 17 * index for index in range(aliases)]
     masks = [index % 3 != 1 for index in range(16)]
-    launch = Mock(wraps=engram_module._decode_hash_kernel.run)
-    monkeypatch.setattr(engram_module._decode_hash_kernel, "run", launch)
     actual = provider.compute_hashes(
         **_arguments(tokens, positions, request_ids, padded=32, mask=masks)
     )
     expected = _hashes_from_shared_history(provider, request_ids, positions, 32)
     for layer, hashes in actual.items():
         torch.testing.assert_close(hashes.cpu(), expected[layer], atol=0, rtol=0)
-    assert len(launch.call_args_list) == len(provider.config.layer_ids)
-    assert all(
-        call.kwargs["READ_CURRENT_HISTORY"] and not call.kwargs["WRITE_HISTORY"]
-        for call in launch.call_args_list
-    )
 
 
 def test_engram_decode_aliases_refresh_all_dummy_capture(providers, monkeypatch):
@@ -517,3 +514,96 @@ def test_engram_decode_aliases_refresh_all_dummy_capture(providers, monkeypatch)
     for actual, expected in observed:
         _assert_hashes(actual, expected)
     torch.testing.assert_close(candidate._history, reference._history, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell_datacenter(), reason="Fused refresh on SM100/SM103")
+@pytest.mark.parametrize(
+    "tokens_per_request,real_requests,padding",
+    [(4, 9, 7), (4, 300, 20)],
+    ids=["one_launch", "scatter_then_hash"],
+)
+@pytest.mark.parametrize("use_graph", [True], ids=["graph"])
+def test_engram_decode_padded_batches_take_the_fused_path(
+    providers, monkeypatch, tokens_per_request, real_requests, padding, use_graph
+):
+    """A batch padded with a repeated dummy request takes the fused launches; every real request's
+    history and hashes match the Torch path bit for bit."""
+    candidate, reference = providers(pad=-7)
+    monkeypatch.setattr(candidate, "_lookback_from_history", Mock(side_effect=AssertionError))
+    scatter = Mock(wraps=engram_module.engram_history_scatter)
+    refresh = Mock(wraps=engram_module.compile_engram_decode_refresh)
+    monkeypatch.setattr(engram_module, "engram_history_scatter", scatter)
+    monkeypatch.setattr(engram_module, "compile_engram_decode_refresh", refresh)
+    dummy_id = (1 << 64) - 1
+    real_ids = list(range(1, real_requests + 1))
+    request_ids = real_ids + [dummy_id] * padding
+    num_tokens = len(request_ids) * tokens_per_request
+    real_tokens = real_requests * tokens_per_request
+    for provider in (candidate, reference):
+        for request_id in real_ids:
+            provider.queue_history_seed(
+                request_id, 0, [10, 20, 30], [True, request_id % 2 == 0, True]
+            )
+
+    def inputs(step):
+        ids = [
+            (37 * request + 11 * step + j) % 300
+            for request in real_ids
+            for j in range(tokens_per_request)
+        ]
+        positions = [
+            3 + step * tokens_per_request + j for _ in real_ids for j in range(tokens_per_request)
+        ]
+        # Padding repeats one request at fixed positions with different tokens: colliding writes.
+        ids += [11 + 17 * k + j for k in range(padding) for j in range(tokens_per_request)]
+        positions += [j for _ in range(padding) for j in range(tokens_per_request)]
+        kwargs = _arguments(ids, positions, request_ids, padded=num_tokens)
+        kwargs["seq_lens_host"] = torch.full(
+            (len(request_ids),), tokens_per_request, dtype=torch.int32
+        )
+        return kwargs
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    observed = []
+    with torch.cuda.stream(stream):
+        if use_graph:
+            warmup = inputs(0)
+            cached = candidate.compute_hashes(**warmup)
+            reference.compute_hashes(**warmup)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = {
+                    layer: hashes.clone()
+                    for layer, hashes in candidate.compute_hashes(**warmup).items()
+                }
+        for step in range(1, 5):
+            kwargs = inputs(step)
+            if use_graph:
+                actual = candidate.refresh_captured_hashes(**kwargs)
+                assert all(actual[layer].data_ptr() == cached[layer].data_ptr() for layer in actual)
+                graph.replay()
+                actual = captured
+            else:
+                actual = candidate.compute_hashes(**kwargs)
+            expected = reference.compute_hashes(**kwargs)
+            observed.append(
+                (
+                    {layer: value[:real_tokens].clone() for layer, value in actual.items()},
+                    {layer: value[:real_tokens].clone() for layer, value in expected.items()},
+                )
+            )
+    stream.synchronize()
+    for actual, expected in observed:
+        _assert_hashes(actual, expected)
+    for request_id in real_ids:
+        torch.testing.assert_close(
+            candidate._history[candidate._history_row_of[request_id]],
+            reference._history[reference._history_row_of[request_id]],
+            atol=0,
+            rtol=0,
+        )
+    # The fused refresh runs up to its row limit, the one-launch scatter beyond it.
+    fused = refresh if num_tokens <= engram_module._DECODE_REFRESH_MAX_ROWS else scatter
+    assert fused.call_count >= 4, (refresh.call_count, scatter.call_count)

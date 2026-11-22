@@ -39,7 +39,9 @@ from tensorrt_llm._startup_errors import (StartupErrorInfo,
                                           wrap_worker_startup_error)
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.llm_request import release_undelivered_response
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient,
                                   validate_session_world_size)
@@ -49,6 +51,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .prompt_tail import PromptTailPolicy
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
 from .result import GenerationResult, IterationResult
@@ -72,8 +75,10 @@ __all__ = [
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
+# get_memory_report() is answered by rank-0, which in the memory monitor's
+# full mode gathers the other ranks' reports over its own communicator.
 _MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
-    {"get_memory_status", "sleep", "wakeup"})
+    {"get_memory_report", "get_memory_status", "sleep", "wakeup"})
 
 
 def _check_collective_rpc_guard(
@@ -237,6 +242,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     # Total wait for the worker futures in an orderly shutdown. Generous
     # enough for the teardown of a large engine.
     _WORKER_SHUTDOWN_TIMEOUT_S = 180.0
+    # Set from gen_prompt_tail_tokens; None sends full prompts.
+    _prompt_tail: Optional[PromptTailPolicy] = None
 
     def __init__(
         self,
@@ -305,6 +312,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
+        prompt_tail = (_llm_args.gen_prompt_tail_tokens if isinstance(
+            _llm_args, TorchLlmArgs) else None)
+        if prompt_tail:
+            self._prompt_tail = PromptTailPolicy(prompt_tail)
+            logger.info(f"prompt tail trimming on, tail={prompt_tail}")
 
         # Multi-frontend serving: this launcher proxy owns the shared ipc
         # dir + HMAC key for the per-frontend endpoints (_setup_queues);
@@ -707,6 +719,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.rpc_addr,
             "rpc_hmac_key":
             self.hmac_key.hex(),
+            "prompt_tail_tokens":
+            self._prompt_tail.tail if self._prompt_tail is not None else 0,
         }
 
     @property
@@ -898,6 +912,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             # late responses instead of crashing with a KeyError.
             result = self._results.get(client_id)
             if result is None:
+                release_undelivered_response(res)
                 return
             queue = result.queue
             if isinstance(queue, _SyncQueue):
@@ -1392,6 +1407,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._results.pop(request.id, None)
             raise EngineDeadError(self._fatal_error)
 
+        # Requests that read their full prompt keep it (see prompt_tail.py).
+        if self._prompt_tail is not None:
+            tail = self._prompt_tail(request)
+            if tail:
+                request._prompt_tail_tokens = tail
+
         with nvtx_range_debug("request_queue.put"):
             self._send_request(request)
 
@@ -1699,6 +1720,12 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
 
         self._frontend_id = frontend_id
         self._num_frontends = num_lanes
+        # The launcher's validated prompt-tail setting.
+        prompt_tail = attach_info.get("prompt_tail_tokens", 0)
+        if prompt_tail:
+            self._prompt_tail = PromptTailPolicy(prompt_tail)
+            logger.info(f"prompt tail trimming on, tail={prompt_tail} "
+                        f"(frontend {frontend_id})")
         self._results: Dict[int, GenerationResult] = {}
         self.garbage_collection_gen0_threshold = None
         self.workers_started = False

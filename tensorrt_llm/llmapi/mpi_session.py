@@ -699,9 +699,10 @@ class MpiPoolSession(MpiSession):
                                           "flashinfer")
             workspace_managed |= env.get(
                 _FLASHINFER_WORKSPACE_ENV) == workspace_root
+        # Every pool is isolated, a single-worker one included, so concurrent
+        # instances on one node never share a FlashInfer workspace.
         isolate_workspace = (
-            (self.n_workers > 1 or workspace_managed)
-            and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+            env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
             and (_FLASHINFER_WORKSPACE_ENV not in env or
                  (workspace_managed and not explicit_workspace_override)))
         python_args = ["-c", _WORKER_ENV_BOOTSTRAP + _WORKER_SERVER_MAIN]
@@ -970,8 +971,13 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
+        # Resolve relative entries (including "" for the cwd) against this
+        # client's working directory; the ranks only adopt absolute entries.
+        client_sys_path = tuple(
+            path if os.path.isabs(path) else os.path.abspath(path)
+            for path in sys.path)
         self.queue.put(
-            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=client_sys_path))
         return []
 
     def submit_sync(self, task, *args, **kwargs) -> List[T]:

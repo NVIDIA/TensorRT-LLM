@@ -180,29 +180,85 @@ With `attention_backend="TRTLLM"`, TRTLLM target attention, and the default
 manager. Target and draft layers share one page table, so one KV budget covers
 both and each request's draft pages are allocated, padded and freed with its
 target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
-cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
+cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache, unless
+the drafter declares another pool dtype (`draft_kv_dtype`, for example FP8 E4M3
+latents for an MLA drafter).
 
 In disaggregated serving, direct worker launches require
-`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` on both the context and generation workers
-to enable shared draft-KV transfer. The `disaggregated_mpi_worker` launcher
-enables this setting automatically when both servers enable compatible
-speculation and use the same `tensor_parallel_size` and
-`enable_attention_dp`.
+`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` (or `auto`, which shares wherever the layout
+allows it) on both the context and generation workers to enable shared
+draft-KV transfer. The `disaggregated_mpi_worker` launcher enables this setting
+automatically when its config lists both context and generation servers, both
+enable compatible speculation, and they shard attention alike: the same
+`tensor_parallel_size`, where `enable_attention_dp` counts as 1 because every
+rank keeps all KV heads. A config that lists only one side (for example, a
+context-only MPI world) leaves sharing off unless the variable is `1`. A
+two-sided config with attention DP on both sides and different
+`tensor_parallel_size` values shards attention alike too, so it also shares;
+set `TRTLLM_DISAGG_SHARED_DRAFT_KV=0` to keep separate draft KV caches.
 
 When sharing is enabled, the context server's draft pages are transferred to
 the generation server with the target pages, so the drafter starts generation
 with the prompt context instead of an empty one. This requires the draft layers
 to have the target's rank-local KV-head count; the draft dtype and head
 dimension may differ, except that an NVFP4 target KV cache requires an
-identical draft layout. Both servers must use the same layout.
+identical draft layout unless both caches are K-only (MLA). Both servers must
+use the same layout.
+
+Hybrid recurrent/attention targets whose cache manager opts in (Kimi K3) also
+hold a standalone DSpark drafter's layers, after their own. In every case the
+drafter decides whether it shares: it declares whether its block attention reads
+the manager's pages at the run's `tokens_per_block`
+(`DFlashForCausalLM.reads_managed_ctx_pages`). By default only
+`attention_backend="TRTLLM"` does, at the page sizes its trtllm-gen kernels
+support; a drafter whose other backends read paged context declares that itself.
 
 The drafter keeps a separate draft KV cache manager instead when any of the
-following applies: context parallelism larger than 1, a per-layer KV-head count
-on the target or drafter, a specialized KV cache manager (for example, hybrid Mamba
-models), Gemma 4 hybrid attention, or, in disaggregated serving, a draft layout
+following applies: context parallelism larger than 1 (helix context parallelism
+is shared only with a drafter that reads a helix-sharded context), a per-layer
+KV-head count on the target or drafter, a specialized KV cache manager that does
+not opt in (for example, most hybrid Mamba models), Gemma 4 hybrid attention, or,
+in disaggregated serving, a draft layout
 that cannot be transferred with the target's. When the layers are shared, the
 worker log reports `target and draft KV layers share one KV cache manager` at
 startup.
+
+#### Prefix-cache hits (`context_recompute_tail`)
+
+DFlash and standalone DSpark drafters attend to K/V projected from target hidden states, and
+the target only produces hidden states for tokens it runs a forward on. With KV-cache block
+reuse on, a request that hits a cached prefix skips those tokens, so the drafter sees only the
+uncached tail of its prompt and the acceptance length drops on every hit. A draft KV pool paired
+with the target's block reuse, separate or sharing the target's KV cache manager (above), hands
+the reused prefix's draft K/V back with the target's pages, but acceptance still drops on hits:
+on MiniMax-M3.1-Flash with 8000-token prompts, cold AL 4.56 fell to 4.10 on repeats at tail `0`
+and to 4.35 at the drafter's window, the same for both pool layouts. The tail trades TTFT for
+acceptance in either layout.
+
+`context_recompute_tail` (on `DFlashDecodingConfig` and `DSparkDecodingConfig`) caps the reuse
+claim so the target recomputes the last tokens of the prompt:
+
+* `0` (default): no recompute; the full cached prefix is reused.
+* a positive `N`: the last `N` prompt tokens are recomputed, rounded so the reused prefix ends on
+  a block boundary. A tail of the drafter's attention window gives the drafter the inputs it
+  would see without reuse; the recomputed target K/V can still differ numerically from a cold
+  prefill, so the output need not match it token for token.
+* `-1`: a prefix hit re-prefills the whole prompt.
+* `null`: resolved from the drafter config, differently per drafter:
+  * DSpark checks each layer: the tail is the widest attention window over the layers, or `-1`
+    when any layer uses full attention or the drafter is MLA-shaped (`0` for the embedded
+    DeepSeek-V4 drafter).
+  * DFlash reads only the drafter-wide `dflash_config.use_swa` and `swa_window_size`: the tail is
+    `swa_window_size` when `use_swa` is set, else `-1`. Per-layer `layer_types` are not
+    consulted, so a DFlash drafter that mixes sliding-window and full-attention layers resolves to
+    the window; set `-1` explicitly for it.
+
+The recomputed tokens cost TTFT and prefill throughput on every hit and are not loaded from a
+KV connector. A disaggregated context server recomputes only when the draft layers share the
+target's KV cache manager, since only then do its draft pages reach the generation server. The
+`KVCacheManagerV2` requires the `all_reusable` block-reuse policy; the V1 manager requires
+chunked prefill and no sliding-window target layers. Otherwise the managers disable the tail with
+a warning.
 
 [DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 
@@ -416,6 +472,38 @@ The field name `speculative_model_dir` can also be used as an alias for `specula
       speculative_model_dir: /path/to/draft/model
 ```
 
+### CUDA graph sampling variants
+
+One-engine speculative decoding captures its decode CUDA graphs once per sampling variant: `greedy` for
+batches whose requests all decode greedily, `advanced` for batches with a sampled request (one whose
+temperature, top-k, top-p or min-p does not resolve to greedy decoding; a seed or a penalty alone does not),
+and `temperature_only` for sampled batches whose sampled requests set only a temperature. `temperature_only`
+needs target tokens sampled from vocabulary-sharded logits: MTP-Eagle one-model decode on a model with the
+spec-decode fast paths (today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) with tensor parallelism and without
+attention DP, relaxed acceptance or `watermark_config`, or a DSpark draft embedded in the target checkpoint (the
+DeepSeek-V4 family) with tensor parallelism or with attention DP and `enable_lm_head_tp_in_adp`. Neither works with
+rejection sampling or penalties; elsewhere the first CUDA graph capture rejects it.
+`cuda_graph_config.sampling_variants` (prototype) captures only the listed variants, which shortens startup
+and saves graph memory:
+
+```yaml
+cuda_graph_config:
+  enable_padding: true
+  sampling_variants: [advanced]
+```
+
+- Without `temperature_only`, temperature-only batches replay the `advanced` graphs.
+- Without `greedy`, greedy batches replay the sampled graphs (`temperature_only` if listed, else `advanced`)
+  and still decode greedily, at a cost: they add sampling-parameter and RNG-state uploads, take the sampled
+  path in eager steps too, and on the `advanced` graphs exact ties can break differently than on the `greedy`
+  graphs. They also lose the argmax fast paths: with rejection sampling, argmax drafting and its LM-head-TP
+  path; and the vocabulary-sharded target argmax where the model has one. Models with the spec-decode fast
+  paths, and embedded DSpark drafts, keep that argmax by listing `temperature_only`, unless they use rejection
+  sampling; DFlash with tensor parallelism keeps its shard selection when it runs without rejection sampling
+  and with `advanced_sampling_mode: no_topk_no_topp`.
+- Without `advanced`, a sampled batch that `temperature_only` does not serve runs eagerly, and the first one
+  logs a warning. Under attention DP, every rank then runs that step eagerly.
+
 ### DSpark attention projection precision
 
 `TRTLLM_DSPARK_LINEAR_BACKEND=bf16|fp8` selects the attention projection
@@ -434,3 +522,17 @@ rejects fp8.
 planner for packed FP4 MLA decode. The default is disabled (0); the
 rule-based split plan remains active. Validate end-to-end latency on the
 serving workload before enabling wave simulation.
+
+### Draft layer row picking
+
+On the first draft step of MTP-Eagle and single-layer EAGLE 3 one-model
+drafting, and on every MTP layer of vanilla MTP, a draft layer that supports it
+runs its attention on every input row (writing the draft KV cache of each) but
+the rest of the layer (norms, MLP or MoE) only on the one row per request the
+drafter reads: the last prompt row of a context request, the last accepted row
+of a generation request. Vanilla MTP does not pick rows under attention data
+parallelism, and MTP-Eagle does not pick them on the spec-decode fast paths.
+`TLLM_SPEC_DISABLE_DRAFT_ROW_PICK=1` turns this off. The picked rows
+are numerically equivalent to the full layer's but not bitwise identical for
+MoE draft layers, whose kernels may round differently at another row count, so
+an occasional draft token can differ.

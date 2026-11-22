@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the moe/k3_route_quant catalog entry: trtllm::k3_route_quant on one GPU (sm_100).
+"""GPU test for the moe/k3_route_quant op: trtllm::k3_route_quant on one GPU (sm_100).
 
-The bitwise comparator is the stock op it replaces, trtllm::kimi_k3_noaux_tc_mxfp8_quant: the four outputs (top-16 ids,
+The bitwise comparator is the stock op trtllm::kimi_k3_noaux_tc_mxfp8_quant: the four outputs (top-16 ids,
 routing weights, MXFP8 codes, UE8M0 scales) must be its bits. Checks, in file order:
 - single calls at M 1-8, 16, 33 and 64 with random logits, with and without the early trigger: the stock op's bits,
   run-to-run identical, and each M's rows the bits of the same rows of the 64-token call;
@@ -26,9 +26,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import (
-    k3_route_quant,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import k3_route_quant
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating
@@ -124,9 +122,7 @@ def _edge_case(case: str, seed: int):
 @contextlib.contextmanager
 def _cold_compile_cache():
     """The op's compile cache emptied for the duration (and restored after), so that the next call is a first call."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import op
 
     saved = dict(op._compiled)
     op._compiled.clear()

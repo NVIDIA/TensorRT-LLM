@@ -19,6 +19,7 @@ arguments and stops construction before any model is built.
 """
 
 import pytest
+import torch
 
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
@@ -114,3 +115,41 @@ def test_runner_rejects_load_balancers_a_layer_slice_cannot_run(
 )
 def test_runner_accepts_load_balancers_a_layer_slice_can_run(load_balancer, use_cuda_graph):
     runner_module._check_load_balancer_support(load_balancer, use_cuda_graph)
+
+
+def test_balanced_routing_routes_logits_routed_backends_on_the_host():
+    """Balanced routing reaches the TRTLLM-Gen BF16 leaf, which routes inside its op from the logits.
+
+    The leaf never calls routing_method.apply; while the balanced replacement is active it routes on the host, and
+    afterwards in the op again.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_bf16 import TrtllmTrtllmGenBf16Impl
+    from tensorrt_llm.tools.layer_wise_benchmarks.runner import BalanceMethod, Runner
+
+    routing = SimpleNamespace(
+        apply=lambda logits, input_ids=None: (None, None),
+        apply_with_sort=lambda *args, **kwargs: None,
+        top_k=2,
+    )
+    # A stand-in built without the leaf's __init__ (no weights): only the routing decision is exercised.
+    backend = TrtllmTrtllmGenBf16Impl.__new__(TrtllmTrtllmGenBf16Impl)
+    torch.nn.Module.__init__(backend)
+    moe = SimpleNamespace(
+        routing_method=routing, num_experts=8, forward_impl=lambda *a, **k: None, backend=backend
+    )
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            moe_backend="TRTLLM",
+            mapping=SimpleNamespace(enable_attention_dp=False, tp_rank=0, dp_size=1, moe_ep_size=1),
+        ),
+        layer_indices=[0],
+        model=SimpleNamespace(
+            model=SimpleNamespace(layers=[SimpleNamespace(mlp=SimpleNamespace(experts=moe))])
+        ),
+    )
+    assert backend._requires_separated_routing() is False
+    with Runner.replace_routing_method_ctx(runner, BalanceMethod.Balanced, 1.0):
+        assert backend._requires_separated_routing() is True
+    assert backend._requires_separated_routing() is False

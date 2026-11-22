@@ -30,6 +30,11 @@ except ImportError:
     from cuda import cuda
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    SwigluActivation,
+    SwigluBiasActivation,
+    activation_constant_names,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
@@ -104,12 +109,16 @@ def _check_backend_can_implement(
     dtype_activation: torch.dtype,
     swiglu_gptoss_style: bool,
     activation_type: ActivationType,
+    expert_bias: Optional[bool] = None,
+    activation_constants: frozenset[str] = frozenset(),
 ) -> Tuple[bool, Optional[str]]:
     """Resolve backend_str to its MoE class and ask whether it can serve this.
 
     The topology-dependent gates are deliberately not exercised here: this runs
     before ``_resolve_mapping_layout``, and the EP / comm constraints get their
     own explicit checks in :func:`is_candidate_valid` with better messages.
+    ``ConfigurableMoE.validate_backend`` checks unfinalized-output support on
+    the constructed backend and the actual communication strategy.
     """
     try:
         backend_type = MoeBackendType(backend_str.upper())
@@ -132,6 +141,8 @@ def _check_backend_can_implement(
         quant=canonical_quant(quant_algo),
         dtype_act=dtype_activation,
         swiglu_gptoss_style=swiglu_gptoss_style,
+        bias=expert_bias,
+        activation_constants=activation_constants,
         # Defaults to SwiGLU when unset, which would make every upstream
         # activation gate evaluate the wrong activation.
         activation=canonical_activation(activation_type),
@@ -243,6 +254,20 @@ def is_candidate_valid(
         act_dtype,
         model.swiglu_gptoss_style,
         model.activation_type_enum,
+        expert_bias=model.swiglu_gptoss_style if model.expert_bias is None else model.expert_bias,
+        activation_constants=(
+            activation_constant_names(SwigluActivation(clamp=model.swiglu_clamp))
+            if model.swiglu_clamp is not None
+            else activation_constant_names(
+                SwigluBiasActivation(
+                    gate_sigmoid_scale=model.swiglu_alpha,
+                    linear_offset=model.swiglu_beta,
+                    clamp=model.swiglu_limit,
+                )
+            )
+            if model.swiglu_gptoss_style and model.expert_bias is False
+            else frozenset()
+        ),
     )
     if not ok:
         return False, reason
@@ -252,6 +277,12 @@ def is_candidate_valid(
         moe_ep, moe_tp, enable_dp = _resolve_mapping_layout(config, world_size)
     except ValueError as exc:
         return False, str(exc)
+
+    if model.post_expert_norm_eps is not None:
+        pure_ep = moe_tp == 1 and moe_ep == world_size
+        pure_tp = moe_ep == 1 and moe_tp == world_size and not enable_dp
+        if not (pure_ep or pure_tp):
+            return False, "MuseSparkOpen requires pure MoE EP or pure MoE TP without attention DP"
 
     # DenseGEMM only supports TP; any EP configuration (TEP, DEP, custom ep>1) is unsupported.
     if config.backend.upper() == "DENSEGEMM" and moe_ep > 1:

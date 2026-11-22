@@ -13,21 +13,19 @@
 # limitations under the License.
 """Sampler orchestration: the entry points the executor drives each step.
 
-Holds the :class:`Sampler` ABC and its ``SampleState`` types, the trivial
-early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
-:class:`EarlyStopWithMMResult` for the multimodal-encoder-only engine), and
-:class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
-sampling logic of its own beyond batching and orchestration: each feature
-(beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-seeds) lives in its own module and is held here as a handler, driven through
-``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
+Holds the :class:`Sampler` ABC and its ``SampleState`` types, and
+:class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no sampling logic of its own beyond
+batching and orchestration: each feature (beam search, penalties, token bans,
+top-p decay, finish reasons, log-probs, seeds) lives in its own module and is
+held here as a handler, driven through ``setup_sampler_step`` /
+``sample_async`` / ``update_requests``.
 """
 
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 
 import torch
 
@@ -36,7 +34,6 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
-from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.logger import logger
 
 from ...utils import torch_multi_arange
@@ -198,6 +195,27 @@ class _FusedRowParamsBuffers:
         return self.floats[2]
 
 
+@dataclass(frozen=True, kw_only=True)
+class _StagedBatch:
+    """What ``stage_in_graph_sampling`` staged for a batch.
+
+    Kept after the step so that the same batch on the next step costs neither
+    restaging nor re-deriving what ``_process_requests`` needs to read the
+    in-graph samples back.
+    """
+
+    # (tier, request ids, slots) of every staged row, padding included.
+    key: tuple[Any, ...]
+    # The staged rows, padding included, and their live (non-dummy) prefix.
+    requests: list[LlmRequest]
+    live_requests: list[LlmRequest]
+    live_request_ids: list[int]
+    # No live request needs the finish-reason kernel, so stopping reduces to the
+    # host-side per-token checks of _update_requests_single_beam_single_step.
+    single_step_greedy: bool
+    live_seq_slots_host: torch.Tensor
+
+
 @dataclass(kw_only=True)
 class _SamplingGroup:
     """Requests of one batch sampled together, by ``TorchSampler._group_requests``."""
@@ -267,10 +285,6 @@ class Sampler(ABC, Generic[GenericSampleState]):
             return req.py_beam_width
         return 0
 
-    @abstractmethod
-    def is_generation_model(self) -> bool:
-        raise NotImplementedError
-
     def validate_request(self, request: LlmRequest) -> None:
         """Validate that the request can be processed by the sampler.
 
@@ -286,228 +300,6 @@ class Sampler(ABC, Generic[GenericSampleState]):
         Raises:
             Appropriate exception if request is not supported by sampler.
         """
-
-
-def _validate_single_forward_request(request: LlmRequest, max_num_tokens: Optional[int]) -> None:
-    """Reject a prompt that does not fit the one forward a non-generation request runs in."""
-    if max_num_tokens is not None and request.prompt_len > max_num_tokens:
-        raise ValueError(
-            context_length_exceeded_message(
-                max_context_length=max_num_tokens, num_prompt_tokens=request.prompt_len
-            )
-        )
-
-
-class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensors]]):
-    """
-    Use for skipping decoding step for non generation model,
-    such as encoder-only model (e.g., BERT) or reward models that only need context phase.
-
-    Args:
-        max_num_tokens: The engine's token budget. A request runs whole in one
-            forward, so a prompt longer than this is rejected; None skips the check.
-    """
-
-    SampleState: TypeAlias = SampleState[SampleStateTensors, SampleStateTensors]
-
-    def __init__(self, max_num_tokens: Optional[int] = None) -> None:
-        self.max_num_tokens = max_num_tokens
-
-    @override
-    def validate_request(self, request: LlmRequest) -> None:
-        _validate_single_forward_request(request, self.max_num_tokens)
-
-    @override
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, Any],
-        num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> SampleState:
-        host = SampleStateTensors(new_tokens=torch.empty(0))
-        assert not scheduled_requests.generation_requests
-        return self.SampleState(requests=scheduled_requests.context_requests, host=host)
-
-    @override
-    def update_requests(
-        self,
-        state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        assert isinstance(state, SampleState)
-        requests = state.requests
-        for idx, request in enumerate(requests):
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            # NOTE: This is a hack: set finish reason manually and set the beam 0
-            request.set_finished_reason(FinishReason.LENGTH, 0)
-
-    @override
-    def is_generation_model(self) -> bool:
-        return False
-
-
-@dataclass(kw_only=True)
-class MultimodalResult:
-    mm_embeddings: List[torch.Tensor]
-    # needed to torch.split the mm_embeddings into item-wise chunks
-    mm_embedding_lengths: List[List[int]]
-    # needed when requests mix text-only and multimodal ones
-    mm_embedding_request_indices: List[int]
-    # number of context requests in the batch
-    num_context_requests: int
-    # Can be used to include e.g. `mrope_position_ids`, etc.
-    extra_data: Optional[Dict[str, Any]] = None
-
-    def __post_init__(self) -> None:
-        num_embeddings = len(self.mm_embeddings)
-        metadata = (self.extra_data or {}).get("mm_embedding_metadata")
-        if metadata is not None and len(metadata) != num_embeddings:
-            raise ValueError("mm_embedding_metadata batch size does not match mm_embeddings")
-        num_lengths = len(self.mm_embedding_lengths)
-        if num_lengths != num_embeddings:
-            raise ValueError(
-                "mm_embedding_lengths batch size does not match mm_embeddings: "
-                f"{num_lengths} != {num_embeddings}"
-            )
-        num_request_indices = len(self.mm_embedding_request_indices)
-        if num_request_indices != num_embeddings:
-            raise ValueError(
-                "mm_embedding_request_indices batch size does not match "
-                f"mm_embeddings: {num_request_indices} != {num_embeddings}"
-            )
-        for result_index, (mm_embedding, mm_embedding_lengths) in enumerate(
-            zip(self.mm_embeddings, self.mm_embedding_lengths, strict=True)
-        ):
-            actual_rows = len(mm_embedding)
-            expected_rows = sum(mm_embedding_lengths)
-            if actual_rows != expected_rows:
-                raise ValueError(
-                    f"mm_embedding shape mismatch for result {result_index}: "
-                    f"{actual_rows} != {expected_rows}"
-                )
-        for request_index in self.mm_embedding_request_indices:
-            if request_index < 0 or request_index >= self.num_context_requests:
-                raise ValueError(
-                    "mm_embedding_request_indices contains an invalid request "
-                    f"index: {request_index} not in [0, {self.num_context_requests})"
-                )
-
-    @classmethod
-    def from_model_outputs(
-        cls, model_outputs: Dict[str, Any], num_context_requests: int
-    ) -> "MultimodalResult":
-        result_keys = {
-            "mm_embeddings",
-            "mm_embedding_lengths",
-            "mm_embedding_request_indices",
-        }
-        return cls(
-            mm_embeddings=model_outputs["mm_embeddings"],
-            mm_embedding_lengths=model_outputs["mm_embedding_lengths"],
-            mm_embedding_request_indices=model_outputs["mm_embedding_request_indices"],
-            num_context_requests=num_context_requests,
-            extra_data={
-                key: value for key, value in model_outputs.items() if key not in result_keys
-            },
-        )
-
-
-@dataclass(kw_only=True)
-class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors]):
-    data: MultimodalResult
-
-
-class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
-    """
-    Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
-
-    Args:
-        return_mm_results: Whether to attach the multimodal outputs to the
-            requests' results. Disable it on ranks whose responses never reach
-            the frontend: the results are exported as CUDA IPC handles, and
-            PyTorch keeps an exported allocation alive until a consumer opens
-            and releases its handle.
-        max_num_tokens: The engine's token budget. A request runs whole in one
-            forward, so a prompt longer than this is rejected; None skips the check.
-    """
-
-    SampleState: TypeAlias = SampleStateWithMMResult
-
-    def __init__(
-        self, return_mm_results: bool = True, max_num_tokens: Optional[int] = None
-    ) -> None:
-        self.return_mm_results = return_mm_results
-        self.max_num_tokens = max_num_tokens
-
-    @override
-    def validate_request(self, request: LlmRequest) -> None:
-        _validate_single_forward_request(request, self.max_num_tokens)
-
-    @override
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, Any],
-        num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> SampleState:
-        # from model_outputs to MultimodalResult
-        assert not scheduled_requests.generation_requests
-        data = MultimodalResult.from_model_outputs(
-            model_outputs, scheduled_requests.num_context_requests
-        )
-        return self.SampleState(requests=scheduled_requests.context_requests, data=data)
-
-    @override
-    def update_requests(
-        self,
-        state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        # resource_manager will not be used in this function, just for interface consistency.
-        assert isinstance(state, SampleState)
-        requests = state.requests
-        mm_embeddings = state.data.mm_embeddings
-        extra_data = state.data.extra_data or {}
-        mrope_position_ids = extra_data.get("mrope_position_ids", None)
-        mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
-        for request in requests:
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            # NOTE: This is a hack: set finish reason manually and set the beam 0
-            request.set_finished_reason(FinishReason.LENGTH, 0)
-
-        if not self.return_mm_results:
-            return
-
-        request_indices = state.data.mm_embedding_request_indices
-        for result_index, (request_index, mm_embedding) in enumerate(
-            zip(request_indices, mm_embeddings, strict=True)
-        ):
-            request = requests[request_index]
-            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
-
-            embedding_metadata = extra_data.get("mm_embedding_metadata")
-            if embedding_metadata is None:
-                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
-            else:
-                request.py_result.append_mm_embeddings(
-                    mm_embedding, mm_embedding_lengths, embedding_metadata[result_index]
-                )
-
-            # Store mrope data if available
-            if mrope_position_ids is not None and mrope_position_deltas is not None:
-                mrope_index = (
-                    request_index if len(mrope_position_ids) == len(requests) else result_index
-                )
-                request.py_result.set_mrope_position(
-                    mrope_position_ids[mrope_index],
-                    mrope_position_deltas[mrope_index],
-                )
-
-    @override
-    def is_generation_model(self) -> bool:
-        return False
 
 
 @dataclass(kw_only=True)
@@ -582,10 +374,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         to give logits post-processors each beam's real hypothesis.
         """
         return self._beam_search.start_beam_histories(requests)
-
-    @override
-    def is_generation_model(self) -> bool:
-        return True
 
     @dataclass(kw_only=True)
     @dataclass(kw_only=True)
@@ -737,6 +525,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Per-row "carries a watermark" flags the fast tier reads (see _fast_sample_in_graph).
         self._fast_watermark_enabled: torch.Tensor | None = None
         self._fast_watermark_flags: tuple[bool, ...] | None = None
+        # What was staged for the batch the buffers above hold, so a repeated
+        # batch is not restaged; see stage_in_graph_sampling.
+        self._staged_batch: _StagedBatch | None = None
 
         # The sampler can be created in inference mode, which disallows
         # in-place mutation of new_tokens. Temporarily exit inference mode.
@@ -881,6 +672,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             request.py_watermark_neutral = neutral
         return neutral
 
+    def _request_fast_path_ok(self, req: LlmRequest) -> bool:
+        """Whether one request is plain temperature / top_k / top_p / min_p sampling."""
+        slot = req.py_seq_slot
+        assert slot is not None
+        self._slot_params.assert_admitted(req, slot)
+        # Greedy is left out on purpose: greedy batches stay on the eager
+        # path. Capturing argmax saves about as much launch overhead as
+        # staging for it costs (on Qwen2-0.5B the two cancelled out), the
+        # eager stable-greedy path already handles them, and expressing
+        # greedy rows as top_k=1 would drag them onto the seeded sampling
+        # path for no gain.
+        if self._slot_params.modes[slot] is not SamplingMode.SAMPLING:
+            return False
+        if self._top_p_decay.uses_decay(slot):
+            return False
+        # The fast tier emits tokens only and samples the raw logits, so
+        # anything that rewrites them first is excluded. Stop words are
+        # allowed: they only decide when a request finishes, which still
+        # runs after the forward.
+        return not (req.py_return_log_probs or self._request_rewrites_logits(req))
+
     def _can_use_fast_path(self, requests: list[LlmRequest]) -> bool:
         """Whether every request is plain temperature / top_k / top_p / min_p sampling.
 
@@ -889,29 +701,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         and the feature handlers that rewrite logits or need extra outputs --
         penalties, token bans, embedding bias, logprobs and speculation, none of
         which the fast path runs.
+
+        The answer is fixed for a request's lifetime (its sampling parameters, slot
+        and features do not change), so it is computed once per request and kept on
+        it; a batch then costs one attribute read per request.
         """
         if self._use_beam_search:
             return False
-        modes = self._slot_params.modes
         for req in requests:
-            slot = req.py_seq_slot
-            assert slot is not None
-            self._slot_params.assert_admitted(req, slot)
-            # Greedy is left out on purpose: greedy batches stay on the eager
-            # path. Capturing argmax saves about as much launch overhead as
-            # staging for it costs (on Qwen2-0.5B the two cancelled out), the
-            # eager stable-greedy path already handles them, and expressing
-            # greedy rows as top_k=1 would drag them onto the seeded sampling
-            # path for no gain.
-            if modes[slot] is not SamplingMode.SAMPLING:
-                return False
-            if self._top_p_decay.uses_decay(slot):
-                return False
-            # The fast tier emits tokens only and samples the raw logits, so
-            # anything that rewrites them first is excluded. Stop words are
-            # allowed: they only decide when a request finishes, which still
-            # runs after the forward.
-            if req.py_return_log_probs or self._request_rewrites_logits(req):
+            ok = getattr(req, "py_fast_path_ok", None)
+            if ok is None:
+                ok = req.py_fast_path_ok = self._request_fast_path_ok(req)
+            if not ok:
                 return False
             # In-graph the keyed draw runs on the raw logits, which only a row that filters
             # nothing but its temperature can do.
@@ -993,18 +794,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         requests = scheduled_requests.generation_requests
         if not requests:
             return SampleType.FULL
-        if any(get_draft_token_length(request) != 0 for request in requests):
-            return SampleType.FULL
-
-        live_requests = [request for request in requests if not request.is_dummy]
+        live_requests = []
+        dummy_seen = False
+        for request in requests:
+            if get_draft_token_length(request) != 0:
+                return SampleType.FULL
+            if request.is_dummy:
+                dummy_seen = True
+            elif dummy_seen:
+                # Dummies are expected to be a trailing run; the live rows are taken
+                # to be the leading prefix when the results are read back.
+                return SampleType.FULL
+            else:
+                live_requests.append(request)
         if not live_requests:
             # An all-dummy batch is a capture pass: the pinned tier decides,
             # since the warmup requests carry no sampling params of their own.
             return pinned_sample_type or SampleType.FULL
-        if any(request.is_dummy for request in requests[: len(live_requests)]):
-            # Dummies are expected to be a trailing run; the live rows are taken
-            # to be the leading prefix when the results are read back.
-            return SampleType.FULL
         return pinned_sample_type or self.get_sample_type(live_requests)
 
     def stage_in_graph_sampling(
@@ -1030,7 +836,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         requests = scheduled_requests.generation_requests
         if not requests:
             return
-        live_requests = [request for request in requests if not request.is_dummy]
 
         # The graph samples and scatters every padded row on every replay, so
         # stage the whole padded batch to keep the staged width equal to the
@@ -1042,29 +847,64 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else self.dummy_slot_row
             for request in requests
         ]
-
-        # Write through the persistent buffer: a captured graph scatters through
-        # a fixed address, so this is sized once for the widest batch and only
-        # its leading rows are used.
+        request_ids = [request.py_request_id for request in requests]
         num_rows = len(seq_slots)
-        device = self.store.new_tokens.device
-        if self._in_graph_dest_indices is None or self._in_graph_dest_indices.numel() < num_rows:
-            self._in_graph_dest_indices = torch.zeros(
-                max(num_rows, self.max_num_sequences), dtype=torch.int64, device=device
-            )
-        seq_slots_host = torch.tensor(seq_slots, dtype=torch.int64, pin_memory=prefer_pinned())
-        self._in_graph_dest_indices[:num_rows].copy_(seq_slots_host, non_blocking=True)
 
-        if sample_type is SampleType.FAST:
-            self.stage_fast_sampling_params(
-                requests,
-                slots_per_row=seq_slots,
-                live_rows=len(live_requests),
+        # In a steady decode batch every step restages the same requests on the
+        # same slots. Their destinations and sampling params cannot have
+        # changed (a slot gets new params only when a new request is admitted
+        # to it, which changes the ids), and the buffers still hold them
+        # because only the staging calls below write the buffers. Only the
+        # seeds, which advance every step, need to be written again.
+        batch_key = (sample_type, request_ids, seq_slots)
+        staged = self._staged_batch
+        if staged is not None and staged.key == batch_key:
+            if sample_type is SampleType.FAST:
+                self._stage_fast_sampling_seeds(seq_slots[: len(staged.live_requests)])
+        else:
+            self._staged_batch = None
+            live_requests = [request for request in requests if not request.is_dummy]
+            live_rows = len(live_requests)
+
+            # Write through the persistent buffer: a captured graph scatters
+            # through a fixed address, so this is sized once for the widest
+            # batch and only its leading rows are used.
+            device = self.store.new_tokens.device
+            if (
+                self._in_graph_dest_indices is None
+                or self._in_graph_dest_indices.numel() < num_rows
+            ):
+                self._in_graph_dest_indices = torch.zeros(
+                    max(num_rows, self.max_num_sequences), dtype=torch.int64, device=device
+                )
+            seq_slots_host = torch.tensor(seq_slots, dtype=torch.int64, pin_memory=prefer_pinned())
+            self._in_graph_dest_indices[:num_rows].copy_(seq_slots_host, non_blocking=True)
+
+            if sample_type is SampleType.FAST:
+                self.stage_fast_sampling_params(
+                    requests,
+                    slots_per_row=seq_slots,
+                    live_rows=live_rows,
+                )
+            staged = self._staged_batch = _StagedBatch(
+                key=batch_key,
+                requests=list(requests),
+                live_requests=live_requests,
+                live_request_ids=[request.py_request_id for request in live_requests],
+                single_step_greedy=not any(
+                    self._request_needs_finish_reason_kernel(request) for request in live_requests
+                ),
+                live_seq_slots_host=torch.tensor(
+                    [cast(int, request.py_seq_slot) for request in live_requests],
+                    dtype=torch.int32,
+                    pin_memory=prefer_pinned(),
+                ),
             )
 
-        self._in_graph_live_rows = len(live_requests)
+        live_rows = len(staged.live_requests)
+        self._in_graph_live_rows = live_rows
         self._in_graph_rows = num_rows
-        self._in_graph_request_ids = [request.py_request_id for request in live_requests]
+        self._in_graph_request_ids = staged.live_request_ids
         self._in_graph_staged = True
         self._current_sample_type = sample_type
 
@@ -1095,6 +935,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         each row; the first ``live_rows`` rows are live, the rest padding.
         """
         num_rows = len(slots_per_row)
+        # The buffers are about to hold a batch that stage_in_graph_sampling
+        # may not know about.
+        self._staged_batch = None
         params = self._ensure_fast_buffers(num_rows)
 
         # Live rows read their slot's params. Padding rows are sampled only to
@@ -1110,18 +953,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Philox (seed, offset) per row, from the sampler's own seed manager so
         # a request's stream stays tied to how far it has decoded.
         self._seed_manager.observe(requests)
-        # _SeedManager is indexed by sequence slot and has no entry for the
-        # scratch row, so ask it only about the live rows. The padded rows keep
-        # whatever the buffers already hold; their tokens are discarded.
-        # Only the live rows consume RNG stream. Padding rows borrow a slot that
-        # may belong to an active request this batch simply did not schedule;
-        # advancing it would move that request's Philox offset by an amount that
-        # depends on concurrent load, breaking the guarantee _SeedManager exists
-        # for -- that a seeded request's stream depends only on its own draws.
-        live_slots_per_row = slots_per_row[:live_rows]
-        row_seeds = self._seed_manager.take_row_seeds(live_slots_per_row, device=params.seed.device)
-        params.seed[:live_rows].copy_(row_seeds.seed, non_blocking=True)
-        params.offset[:live_rows].copy_(row_seeds.offset, non_blocking=True)
+        self._stage_fast_sampling_seeds(slots_per_row[:live_rows])
 
         watermark = self._watermark
         if watermark is not None:
@@ -1129,7 +961,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 [request for request in requests if not request.is_dummy],
                 is_neutral=self._watermark_row_is_neutral,
             )
-            flags = [watermark.is_enabled(slot) for slot in live_slots_per_row]
+            flags = [watermark.is_enabled(slot) for slot in slots_per_row[:live_rows]]
             flags += [False] * (num_rows - live_rows)
             if (
                 self._fast_watermark_enabled is None
@@ -1149,6 +981,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     torch.tensor(flags, dtype=torch.bool, pin_memory=prefer_pinned()),
                     non_blocking=True,
                 )
+
+    def _stage_fast_sampling_seeds(self, live_slots_per_row: list[int]) -> None:
+        """Write the live rows' next Philox (seed, offset) into the staged buffers.
+
+        _SeedManager is indexed by sequence slot and has no entry for the
+        scratch row, so only the live rows are staged. The padded rows keep
+        whatever the buffers already hold; their tokens are discarded.
+        Only the live rows consume RNG stream. Padding rows borrow a slot that
+        may belong to an active request this batch simply did not schedule;
+        advancing it would move that request's Philox offset by an amount that
+        depends on concurrent load, breaking the guarantee _SeedManager exists
+        for -- that a seeded request's stream depends only on its own draws.
+        """
+        params = self._fast_params
+        assert params is not None
+        row_seeds = self._seed_manager.take_row_seeds(live_slots_per_row, device=params.seed.device)
+        live_rows = len(live_slots_per_row)
+        params.seed[:live_rows].copy_(row_seeds.seed, non_blocking=True)
+        params.offset[:live_rows].copy_(row_seeds.offset, non_blocking=True)
 
     @override
     def sample_in_graph(
@@ -1426,6 +1277,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @override
     def release_request(self, request: LlmRequest) -> None:
         self._finish_reasons_handler.release_request(request)
+        # The staged batch is reused only by the same requests on a later step, which a released
+        # request never joins again; dropping it keeps it from holding the request (and the
+        # outputs it owns, such as generation logits) after its output was returned.
+        staged = self._staged_batch
+        if staged is not None and request.py_request_id in staged.live_request_ids:
+            self._staged_batch = None
 
     @override
     @nvtx_range("setup_sampler_step")
@@ -2588,36 +2445,55 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # replaced (context-only steps, eager fallbacks) would
         # otherwise be sampled against another batch's destinations.
         if self._current_sample_type is not SampleType.FULL:
-            live_requests = [request for request in generation_requests if not request.is_dummy]
-            staged_matches_batch = (
-                self._in_graph_staged
+            staged = self._staged_batch
+            if (
+                staged is not None
+                and self._in_graph_staged
                 # A forward that sampled greedily in place of its LM head skipped the
                 # in-graph sampling, so the staged buffers were never written.
                 and greedy_tokens is None
                 and self._in_graph_dest_indices is not None
-                and [request.py_request_id for request in live_requests]
-                == self._in_graph_request_ids
-            )
+                and (
+                    generation_requests == staged.requests
+                    or generation_requests == staged.live_requests
+                )
+            ):
+                # Exactly the rows staging saw: what it derived for them holds.
+                live_requests = list(staged.live_requests)
+                staged_matches_batch = True
+                seq_slots_host = staged.live_seq_slots_host
+                single_step_greedy = staged.single_step_greedy
+            else:
+                live_requests = [request for request in generation_requests if not request.is_dummy]
+                staged_matches_batch = bool(
+                    self._in_graph_staged
+                    and greedy_tokens is None
+                    and self._in_graph_dest_indices is not None
+                    and [request.py_request_id for request in live_requests]
+                    == self._in_graph_request_ids
+                )
+                if staged_matches_batch:
+                    seq_slots_host = torch.tensor(
+                        [cast(int, request.py_seq_slot) for request in live_requests],
+                        dtype=torch.int32,
+                        pin_memory=prefer_pinned(),
+                    )
+                    single_step_greedy = not any(
+                        self._request_needs_finish_reason_kernel(request)
+                        for request in live_requests
+                    )
             if staged_matches_batch:
                 # The staged destinations span the padded batch the graph runs
                 # at; only the leading live rows are reported back, the padded
                 # ones scattered into the scratch row and are dropped here.
                 assert self._in_graph_dest_indices is not None
                 seq_slots_cuda = self._in_graph_dest_indices[: self._in_graph_live_rows]
-                seq_slots_host = torch.tensor(
-                    [cast(int, request.py_seq_slot) for request in live_requests],
-                    dtype=torch.int32,
-                    pin_memory=prefer_pinned(),
-                )
                 # Stopping still has to be decided after the forward. It reduces
                 # to the per-token EOS and length checks
                 # _update_requests_single_beam_single_step runs on the host only
                 # when no request needs the finish-reason kernel; otherwise the
                 # caller must take the regular path and compute finish reasons,
                 # or a stop word would never be detected.
-                single_step_greedy = not any(
-                    self._request_needs_finish_reason_kernel(request) for request in live_requests
-                )
                 if not single_step_greedy:
                     # write_finish_reasons shifts stop-word history by the
                     # accepted-draft count, which update_requests only refreshes
@@ -2723,6 +2599,32 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return_log_probs = self._log_probs._return_log_probs(sampling_requests)
         if return_log_probs:
             self._log_probs._prepare_log_probs(sampling_requests)
+        # Raw logprobs come from the model's logits, but the embedding bias,
+        # penalties and token bans below rewrite logits_cuda in place. Keep a
+        # copy of the rows of the requests that ask for raw logprobs and use one
+        # of them, and put those rows back before the logprobs are read.
+        # Multi-beam requests are skipped, as in the raw-logit extraction of
+        # _sample_batched_by_strategy: their logprobs come from the beam history.
+        raw_rows_index_cuda: Optional[torch.Tensor] = None
+        raw_rows_cuda: Optional[torch.Tensor] = None
+        if return_log_probs:
+            raw_rows = [
+                row
+                for request, offset, num_tokens in zip(
+                    sampling_requests,
+                    sampling_requests_metadata.req_offsets.tolist(),
+                    sampling_requests_metadata.req_num_generated_tokens.tolist(),
+                )
+                if self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)]
+                and not (self._use_beam_search and request.py_beam_width != 1)
+                and self._request_rewrites_logits(request)
+                for row in range(offset, offset + num_tokens)
+            ]
+            if raw_rows:
+                raw_rows_index_cuda = torch.tensor(
+                    raw_rows, dtype=torch.int64, pin_memory=prefer_pinned()
+                ).to(logits_cuda.device, non_blocking=True)
+                raw_rows_cuda = logits_cuda.index_select(0, raw_rows_index_cuda)
 
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
@@ -2874,6 +2776,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         if return_log_probs:
+            if raw_rows_cuda is not None:
+                logits_cuda.index_copy_(0, raw_rows_index_cuda, raw_rows_cuda)
             self._log_probs._process_logprobs(
                 batched_sampling_result,
                 logits_cuda=logits_cuda,

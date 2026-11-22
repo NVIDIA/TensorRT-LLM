@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,11 +33,13 @@ struct HelixPostProcParams
 {
     T* output;
     T const* gathered_o;
-    float2 const* gathered_stats;
+    void const* gathered_stats;
     int cp_size;
     int num_tokens;
     int num_heads;
     int kv_lora_rank;
+    // Compact base-2 LSE instead of the default natural-log anchor/sum pairs.
+    bool isLse = false;
 };
 
 template <typename T>
@@ -45,13 +47,13 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
 
 // Version 1: cp_dim=2 layout.
 // gathered_o: [num_tokens, num_heads, cp_size, kv_lora_rank].
-// gathered_stats: [num_tokens, num_heads, cp_size, 2].
+// gathered_stats: [num_tokens, num_heads, cp_size, isLse ? 1 : 2].
 template <typename T>
 void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t stream);
 
 // Version 2: cp_dim=1 layout.
 // gathered_o: [num_tokens, cp_size, num_heads, kv_lora_rank].
-// gathered_stats: [num_tokens, cp_size, num_heads, 2].
+// gathered_stats: [num_tokens, cp_size, num_heads, isLse ? 1 : 2].
 template <typename T>
 void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t stream);
 

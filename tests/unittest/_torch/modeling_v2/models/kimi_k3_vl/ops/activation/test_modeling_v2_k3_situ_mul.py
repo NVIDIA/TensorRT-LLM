@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_situ_mul catalog entry.
+"""GPU test for the k3_situ_mul op.
 
 The Kimi K3 dense MLP's SiTU-and-mul at TP16 (gate_up [M, 4224] -> [M, 2112]) with the checkpoint's and the default
 (beta, linear_beta), at every M in 1..8: error against SituAndMul's formula evaluated in fp32, identical bits on a
@@ -13,15 +13,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_mul import (
-    k3_situ_mul,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_mul import k3_situ_mul
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating
 
 assert torch.cuda.is_available(), "k3_situ_mul requires a CUDA device"
-# The receipts are sm_100 ones; CI's other architectures skip this file.
+# Runs on sm_100 and sm_103 (the architectures the op is certified on); other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="certified on sm_100 and sm_103",

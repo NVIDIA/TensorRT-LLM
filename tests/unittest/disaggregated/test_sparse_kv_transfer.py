@@ -110,6 +110,7 @@ def _manager(offload: bool) -> Mock:
         mixed_precision_high_layers={},
         get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.REPLICATED},
         get_disagg_role_layouts=lambda: {},
+        num_locality_domains=1,
     )
 
 
