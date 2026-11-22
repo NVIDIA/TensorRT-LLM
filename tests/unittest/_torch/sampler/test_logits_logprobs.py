@@ -254,6 +254,7 @@ def test_generation_logits_of_request_stopped_by_end_id(llm, end_index: int, str
 
     if streaming:
         sequence = None
+        rows = 0
         # The streamed output is updated in place, so check each chunk as it arrives.
         for output in llm.generate_async(
             prompts[0], sampling_params=sampling_params, streaming=True
@@ -264,7 +265,10 @@ def test_generation_logits_of_request_stopped_by_end_id(llm, end_index: int, str
             assert torch.argmax(sequence.generation_logits, dim=1).tolist() == [
                 sequence.token_ids[-1]
             ]
+            rows += sequence.generation_logits.shape[0]
         assert sequence is not None
+        # One row per output token across the chunks, not only one for the last token.
+        assert rows == len(sequence.token_ids)
     else:
         sequence = llm.generate(prompts[0], sampling_params=sampling_params).outputs[0]
         assert sequence.generation_logits is not None
