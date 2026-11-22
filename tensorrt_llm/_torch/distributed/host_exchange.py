@@ -299,9 +299,10 @@ class HostExchange:
         ranks = self._ranks_of(readers)[1]
         out = np.zeros((self.nranks, data.size), dtype=np.uint8)
         step = 4 * self._words
-        expected = min(data.size, self._MAX_HEADER_LENGTH)
-        for k, (lengths, rows) in enumerate(self._rounds(data.tobytes(), readers)):
-            if k == 0 and (lengths[self._ranks_of(readers & ~self._failed)[0]] != expected).any():
+        for k, (lengths, rows) in enumerate(self._rounds(data, readers)):
+            # Rows of one size give every rank the same header in every round.
+            expected = min(max(data.size - step * k, 0), self._MAX_HEADER_LENGTH)
+            if (lengths[self._ranks_of(readers & ~self._failed)[0]] != expected).any():
                 raise ValueError(
                     f"allgather_array rows differ in size across ranks: {lengths.tolist()}"
                 )
@@ -331,12 +332,18 @@ class HostExchange:
         return unpack_payloads(rows, lengths, ranks)
 
     def _rounds(
-        self, data: bytes, readers: int, recipients: Optional[int] = None, idle: bool = False
+        self,
+        data: bytes | np.ndarray,
+        readers: int,
+        recipients: Optional[int] = None,
+        idle: bool = False,
     ) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
         """Yield header lengths and packets per round, sending one slot of ``data`` per round.
 
-        Each header carries the bytes its sender has left from that round on, up to the largest
-        32-bit length. Another round follows while some header carries more than a slot.
+        ``data`` is the payload as bytes or as a uint8 array, which the rounds send without
+        copying it whole. Each header carries the bytes its sender has left from that round on, up
+        to the largest 32-bit length. Another round follows while some header carries more than a
+        slot.
         """
         self._round_readers = readers
         self._failed = 0
@@ -350,7 +357,7 @@ class HostExchange:
 
     def _round(
         self,
-        chunk: bytes,
+        chunk: bytes | np.ndarray,
         length: int,
         readers: int,
         recipients: Optional[int] = None,
@@ -363,7 +370,12 @@ class HostExchange:
         return result
 
     def _try_round(
-        self, chunk: bytes, length: int, readers: int, recipients: Optional[int], idle: bool
+        self,
+        chunk: bytes | np.ndarray,
+        length: int,
+        readers: int,
+        recipients: Optional[int],
+        idle: bool,
     ) -> Optional[tuple[np.ndarray, Optional[np.ndarray]]]:
         """Return every rank's header length and the packets received, or None to run it again.
 
@@ -373,7 +385,7 @@ class HostExchange:
             self._stop(next_epoch(self._epoch))
         self._epoch = next_epoch(self._epoch)
         self._missing = 0
-        payload = np.frombuffer(chunk + b"\0" * (-len(chunk) % 4), dtype=np.uint32)
+        payload = np.frombuffer(bytes(chunk) + b"\0" * (-len(chunk) % 4), dtype=np.uint32)
         self.group.start_round(self._epoch, payload, length, recipients)
         round_mask = self.active_mask
         rows = self._wait(round_mask, readers & round_mask, idle)

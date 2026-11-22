@@ -643,6 +643,36 @@ def test_payload_longer_than_header_length(monkeypatch):
 
 
 @pytest.mark.timeout(60)
+def test_rows_of_different_sizes_over_header_length_raise(monkeypatch):
+    """Check that rows of 4 GiB or more of different sizes raise on every rank.
+
+    The first headers of both rows hold the capped length 0xFFFFFFFF, so only the second round's
+    headers tell the sizes apart. The exchange reads the zero rows one slot at a time, so their
+    pages are never written. A third round stops the exchange.
+    """
+    exchanges = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
+    for exchange in exchanges:
+        start_round, started = exchange.group.start_round, []
+
+        def start_two_rounds(
+            epoch, payload, length, recipients, start_round=start_round, started=started
+        ):
+            if len(started) == 2:
+                raise _Replaced
+            started.append(epoch)
+            start_round(epoch, payload, length, recipients)
+
+        exchange.group.start_round = start_two_rounds
+
+    def gather(exchange):
+        row = np.zeros((1 << 32) + 8 * exchange.rank, dtype=np.uint8)
+        with pytest.raises(ValueError, match="rows differ in size across ranks"):
+            exchange.allgather_array(row)
+
+    _run_ranks(exchanges, [gather, gather])
+
+
+@pytest.mark.timeout(60)
 def test_header_with_more_than_a_slot_left_runs_another_round(monkeypatch):
     """Check that a rank runs another round while a peer's header says more than a slot is left.
 
