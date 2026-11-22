@@ -36,7 +36,8 @@ LIVENESS_KEY = "liveness"
 RECORD_KEY = "record"
 TRANSACTION_KEY = "last_transaction"
 # The Unix time in milliseconds since which the active ranks have waited on a rank that makes no
-# progress, or empty while no rank stalls them.
+# progress, or empty once no rank stalls them. It is unset until the first stall, so read it after
+# checking that it is set.
 STALLED_SINCE_KEY = "stalled_since"
 
 

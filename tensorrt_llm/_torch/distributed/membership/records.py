@@ -169,7 +169,8 @@ class MembershipRecord(_Message):
         joining_mask: The active ranks that are replacements being added by this change.
         given_up_mask: The ranks that no replacement is started for, as their node supervisor gave
             them up or left.
-        reason: Why a change left a rank out, or why the deployment aborted.
+        reason: Why the deployment aborted, or why a change leaves out a replacement that could
+            not install it.
     """
 
     generation: int
@@ -241,7 +242,9 @@ class RankReport(_Message):
         joining_ready: A replacement is ready to join. It counts as its READY to the change that
             adds it.
         started: The rank finished its startup.
-        shutdown: Rank 0 shuts the deployment down.
+        shutdown: Rank 0 shuts the deployment down. Rank 0 keeps its membership client and its
+            process running until it receives the SHUTDOWN record, since the deployment aborts once
+            either ends first.
     """
 
     progress: int = 0
