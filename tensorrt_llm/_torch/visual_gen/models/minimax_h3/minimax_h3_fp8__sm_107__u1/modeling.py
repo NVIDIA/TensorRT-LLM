@@ -5,6 +5,9 @@
 ``Fp8Transformer.initialize_fp8`` prepares one loaded model for the fused path: it compiles the
 kernels, stores the GateUp weights in the kernel's tile order, installs the QKV and GateUp Linear
 methods and the conditioning cache. Compiled kernels are cached per device at module level.
+
+A block whose four main Linears the checkpoint keeps in BF16 runs the family block instead, with
+the same FP8 attention; its residual stream is BF16 on both sides, as the fused block's is.
 """
 
 from pathlib import Path
@@ -155,9 +158,13 @@ class Fp8Attention(ScenarioAttention):
 
 
 class Fp8Block(MiniMaxH3TransformerBlock):
-    """Static-FP8 producers and fused GateUp, attention-output and Down GEMMs."""
+    """Static-FP8 producers and fused GateUp, attention-output and Down GEMMs.
+
+    ``fp8_fused`` is False for a block whose main Linears the checkpoint keeps in BF16; that
+    block runs the family forward."""
 
     attention_cls = Fp8Attention
+    fp8_fused: bool = True
 
     def _forward_fused_adaln(
         self,
@@ -169,6 +176,16 @@ class Fp8Block(MiniMaxH3TransformerBlock):
         timestep,
         valid_seq_len,
     ) -> torch.Tensor:
+        if not self.fp8_fused:
+            return super()._forward_fused_adaln(
+                hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len,
+            )
         if (
             hidden_states.ndim != 3
             or hidden_states.shape[0] != 1
@@ -219,8 +236,21 @@ class Fp8Block(MiniMaxH3TransformerBlock):
         )
 
 
+def _main_linears(block) -> tuple:
+    return (block.attn.qkv_proj, block.attn.to_out[0], block.ff.gate_up_proj, block.ff.down_proj)
+
+
+def _is_bf16_block(block) -> bool:
+    """Whether the checkpoint keeps all four main Linears of *block* unquantized in BF16."""
+    return all(
+        not linear.has_any_quant and linear.weight.dtype == torch.bfloat16
+        for linear in _main_linears(block)
+    )
+
+
 class Fp8Transformer(ScenarioTransformer):
-    """The H3 transformer with FP8-only blocks and one shared final FP32 cast."""
+    """The H3 transformer with fused FP8 blocks, family blocks where the checkpoint keeps a
+    block in BF16, and one shared final FP32 cast."""
 
     block_cls = Fp8Block
 
@@ -244,13 +274,14 @@ class Fp8Transformer(ScenarioTransformer):
             raise ValueError("The fused FP8 scenario requires all 50 blocks on one GPU")
         expected_shapes = ((21504, 5376), (5376, 7168), (28672, 5376), (5376, 14336))
         for block in blocks:
-            group = (
-                block.attn.qkv_proj,
-                block.attn.to_out[0],
-                block.ff.gate_up_proj,
-                block.ff.down_proj,
-            )
-            for linear, shape in zip(group, expected_shapes):
+            block.fp8_fused = not _is_bf16_block(block)
+            for linear, shape in zip(_main_linears(block), expected_shapes):
+                if not block.fp8_fused:
+                    if tuple(linear.weight.shape) != shape or linear.bias is not None:
+                        raise ValueError(
+                            "The fused FP8 scenario requires the original main Linear shapes"
+                        )
+                    continue
                 if (
                     not linear.has_fp8_qdq
                     or linear.weight.dtype != torch.float8_e4m3fn
@@ -263,7 +294,8 @@ class Fp8Transformer(ScenarioTransformer):
                     or not linear.input_scale.is_contiguous()
                 ):
                     raise ValueError(
-                        "The fused FP8 scenario requires all 200 main Linears to be static FP8"
+                        "The fused FP8 scenario requires each block's four main Linears to be "
+                        "all static FP8 or all BF16"
                     )
                 for scale in (linear.input_scale, linear.weight_scale):
                     if (
@@ -302,19 +334,22 @@ class Fp8Transformer(ScenarioTransformer):
         for projection in (self.proj_out, self.audio_proj_out):
             if projection.has_any_quant or projection.weight.dtype != torch.float32:
                 raise ValueError("The shared output cast requires the original FP32 media heads")
+        fused = [block for block in blocks if block.fp8_fused]
+        if not fused:
+            raise ValueError("The fused FP8 scenario requires at least one static-FP8 block")
         device = self.proj_out.weight.device
         settings = gate_up_swiglu._CFG
         required = 3 * 128 * settings["mma_tile_k"] * settings["num_ab_stage"] + 4096
         if projection_residual.block_shared_memory_bytes(device.index) < required:
             raise RuntimeError("The fused GateUp oversized shared-memory capacity is unavailable")
         scales = torch.cat(
-            [block.attn.to_out[0].input_scale.detach().reshape(1) for block in blocks]
+            [block.attn.to_out[0].input_scale.detach().reshape(1) for block in fused]
         )
         _, _, factors, self.fp8_kernel_qualification = prepare(scales, kernel_cache)
         # The kernels are built before any weight changes, so a failed build leaves the checkpoint
         # layout in place; the packing below can be repeated after a failure part-way through.
         gate_up_swiglu._get_compiled(device.index)
-        table_dtype = blocks[0].adaln_proj.linear.dtype
+        table_dtype = fused[0].adaln_proj.linear.dtype
         for width, gate in (
             (7168, projection_residual.ATTENTION_OUTPUT_GATE),
             (14336, projection_residual.DOWN_GATE),
@@ -323,7 +358,7 @@ class Fp8Transformer(ScenarioTransformer):
             projection_residual.compile_kernel(
                 device.index, 5376, width, gate, table_dtype, torch.int64
             )
-        for index, block in enumerate(blocks):
+        for index, block in enumerate(fused):
             block.attn.qkv_proj.quant_method = Fp8QkvMethod()
             gate_up = block.ff.gate_up_proj
             if not isinstance(gate_up.quant_method, PackedGateUpMethod):

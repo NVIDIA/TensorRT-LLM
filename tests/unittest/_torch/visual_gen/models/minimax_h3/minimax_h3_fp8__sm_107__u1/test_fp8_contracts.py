@@ -362,7 +362,18 @@ class RoutingContracts(unittest.TestCase):
         with patch.dict(sys.modules, {module + ".config": config, module + ".pipeline": pipeline}):
             self.assertIs(namespace["resolve_scenario"](object, cfg), expected)
 
-    def test_ignore_based_earlytop8_rejects_before_selection(self):
+    def _select_with_stub_pipeline(self, cfg):
+        namespace = _routing_namespace()
+        module = "_h3_fp8_cpu_contracts.minimax_h3_fp8__sm_107__u1"
+        config = ModuleType(module + ".config")
+        config.select = lambda: None
+        pipeline = ModuleType(module + ".pipeline")
+        expected = type("Pipeline", (), {})
+        pipeline.MiniMaxH3Fp8Sm107U1Pipeline = expected
+        with patch.dict(sys.modules, {module + ".config": config, module + ".pipeline": pipeline}):
+            self.assertIs(namespace["resolve_scenario"](object, cfg), expected)
+
+    def test_whole_bf16_blocks_still_select_fp8(self):
         cfg = _config()
         quant = cfg.model_configs["transformer"].quant_config
         quant.exclude_modules = _earlytop8_ignore_patterns()
@@ -375,15 +386,26 @@ class RoutingContracts(unittest.TestCase):
         ]
         self.assertEqual(len(excluded), 32)
         self.assertIsNone(cfg.model_configs["transformer"].quant_config_dict)
-        namespace = _routing_namespace()
-        with self.assertRaisesRegex(namespace["NoScenario"], "excluded"):
-            namespace["route_fp8_sm_107_u1"](cfg)
-        with self.assertRaisesRegex(RuntimeError, "excluded"):
-            namespace["resolve_scenario"](object, cfg)
+        self._select_with_stub_pipeline(cfg)
+
+    def test_partly_excluded_block_and_all_bf16_blocks_are_rejected(self):
+        for ignored, reason in [
+            (_earlytop8_ignore_patterns() + ["transformer_blocks.3.attn.to_out.0"], "excluded"),
+            (["transformer_blocks.7.ff*"], "excluded"),
+            (["transformer_blocks.*"], "at least one block"),
+        ]:
+            with self.subTest(ignored=ignored[-1]):
+                cfg = _config()
+                cfg.model_configs["transformer"].quant_config.exclude_modules = ignored
+                namespace = _routing_namespace()
+                with self.assertRaisesRegex(namespace["NoScenario"], reason):
+                    namespace["route_fp8_sm_107_u1"](cfg)
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    namespace["resolve_scenario"](object, cfg)
 
     def test_auto_and_off_keep_family_for_unsupported_cases(self):
         cases = [
-            (_earlytop8_ignore_patterns(), (10, 7), 212, 1),
+            ([*_earlytop8_ignore_patterns(), "transformer_blocks.3.ff*"], (10, 7), 212, 1),
             (_earlytop8_ignore_patterns(), (10, 3), 152, 1),
             (_earlytop8_ignore_patterns(), (10, 7), 212, 4),
             (_uniform_ignore_patterns(), (10, 3), 152, 1),
@@ -403,11 +425,11 @@ class RoutingContracts(unittest.TestCase):
 
     def test_parent_glob_regex_and_global_exclusions_are_honored(self):
         patterns = [
-            "transformer_blocks.1",
-            "transformer_blocks.1.*",
-            "transformer_blocks.1*",
-            r"re:transformer_blocks\.1\..*",
-            r"re:transformer_blocks\.1",
+            "transformer_blocks.1.attn",
+            "transformer_blocks.1.attn.*",
+            "transformer_blocks.1.attn*",
+            r"re:transformer_blocks\.1\.attn\..*",
+            r"re:transformer_blocks\.1\.attn",
             "transformer_blocks.*.ff.down_proj",
         ]
         for pattern in patterns:
@@ -478,15 +500,15 @@ class RoutingContracts(unittest.TestCase):
         projections = next(
             n
             for n in ast.walk(route)
-            if isinstance(n, ast.For)
-            and isinstance(n.target, ast.Name)
-            and n.target.id == "projection"
+            if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == "main_projections"
         )
         expected = set()
         for projection in ["attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj"]:
             expected.add(projection)
             expected.update(namespace["_checkpoint_linear_names"](model, projection))
-        self.assertEqual(set(ast.literal_eval(projections.iter)), expected)
+        self.assertEqual(set(ast.literal_eval(projections.value)), expected)
 
     def test_non_bf16_model_dtype_declines_before_selection(self):
         config = _config()
@@ -908,6 +930,44 @@ class FusedDispatchContracts(unittest.TestCase):
                     calls,
                     ["norm", "qkv_gemm", "qk_norm_rope", "attention_projection", "gate_up", "down"],
                 )
+
+    def test_bf16_block_takes_the_family_block_with_fp8_attention(self):
+        namespace, calls = _fused_dispatch_namespace()
+        block = self._block(namespace, calls)
+        tensor = _LayoutTensor
+
+        def bf16_projection(name, width):
+            def project(hidden):
+                calls.append(name)
+                return tensor((*hidden.shape[:-1], width))
+
+            return project
+
+        block.fp8_fused = False
+        block.attn.qkv_proj = bf16_projection("bf16_qkv", 21504)
+        block.attn.to_out = [bf16_projection("bf16_out", 5376)]
+        rows = 37712
+        output = block._forward_fused_adaln(
+            tensor((1, rows, 5376)),
+            tensor((1, 5376)),
+            tensor((rows,), "INT64"),
+            (tensor((rows, 64)), tensor((rows, 64))),
+            None,
+            None,
+            None,
+        )
+        self.assertEqual(output.shape, (1, rows, 5376))
+        self.assertEqual(
+            calls,
+            [
+                "family_norm",
+                "bf16_qkv",
+                "family_qk_norm",
+                "bf16_out",
+                "family_gate_res_norm",
+                "family_ffn",
+            ],
+        )
 
     def test_invalid_batch_width_rank_and_dtype_still_fail_before_dispatch(self):
         for shape, dtype in [

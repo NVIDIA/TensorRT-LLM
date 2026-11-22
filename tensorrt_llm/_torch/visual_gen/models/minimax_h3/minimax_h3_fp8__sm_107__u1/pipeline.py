@@ -13,7 +13,7 @@ from .modeling import Fp8Transformer
 
 
 class MiniMaxH3Fp8Sm107U1Pipeline(MiniMaxH3Nvfp4Sm107U1U4Pipeline):
-    """Uniform static-FP8 DiT, BF16 residuals and FP32 media heads on SM107.
+    """Static-FP8 DiT, BF16 residuals and FP32 media heads on SM107.
 
     The base contributes the FP8 Video VAE, component graphs and preloop
     scheduling. All DiT fusion and conditioning state belong to this instance.

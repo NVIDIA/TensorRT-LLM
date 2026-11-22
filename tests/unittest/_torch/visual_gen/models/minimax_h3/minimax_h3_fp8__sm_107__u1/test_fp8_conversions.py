@@ -23,6 +23,32 @@ def conversion_modules(tmp_path_factory):
     return modules
 
 
+def test_fewer_scales_than_blocks_build_the_same_kernels(tmp_path):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("The conversion kernels require an SM107 GPU")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 212:
+        pytest.skip("The fixed conversion grid requires the qualified 212-SM GPU")
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_fp8__sm_107__u1.kernels.conversion import (
+        prepare,
+    )
+
+    scales = torch.tensor([0.01, 0.1, 1.0, 10.0, 100.0] * 8 + [0.5, 2.0], device="cuda")
+    quant, _, factors, proof = prepare(scales, tmp_path)
+    if quant is None:
+        pytest.skip(f"The conversion kernels were not built: {proof['reason']}")
+    assert proof["unary_qualified"] and proof["scales"] == 42 and len(factors) == 42
+    raw = torch.linspace(-450, 450, 2049, device="cuda", dtype=torch.bfloat16).reshape(1, 2049)
+    for index in (0, 41):
+        scale = scales[index : index + 1]
+        expected = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(raw, scale)[0]
+        assert torch.equal(
+            quant.quantize_config(
+                raw, scale, factors[index : index + 1], 0, quant.pdl, 848, 256
+            ).view(torch.uint8),
+            expected.view(torch.uint8),
+        )
+
+
 @pytest.mark.parametrize("length", [1, 7, 8, 9, 255, 256, 257, 2049])
 def test_exact_conversion_and_odd_tails(conversion_modules, length):
     quant, cast, _, proof = conversion_modules
