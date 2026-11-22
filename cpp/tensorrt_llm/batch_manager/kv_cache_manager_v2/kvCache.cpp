@@ -141,6 +141,14 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
 KvCache::~KvCache()
 {
+    // A closed cache that no Batch holds has nothing left to release, so it skips close() and the
+    // API lock it takes. Finalizing it then cannot wait on a lock holder, such as a lossless
+    // host-drop eviction that is itself waiting for the thread running this destructor. The status
+    // is read without the lock: only this cache's own methods change it, and CLOSED is final.
+    if (mStatus == Status::CLOSED && mBatch == nullptr)
+    {
+        return;
+    }
     KVCM2_POISON_ON_EXCEPT(
         [this]()
         {

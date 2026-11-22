@@ -39,12 +39,14 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -1029,8 +1031,6 @@ constexpr size_t kHostDropMinRingSlots = 16;
 constexpr size_t kHostDropSlotAlignment = 4096;
 //! Page-index pairs one launch of the copy kernel takes.
 constexpr size_t kHostDropMaxPairsPerLaunch = 16384;
-//! Longest teardown wait for ring slots a consumer still holds.
-constexpr std::chrono::seconds kHostDropTeardownMaxWait{5};
 
 void logHostDropError(char const* where, int64_t count, char const* what)
 {
@@ -1068,10 +1068,10 @@ bool sameLosslessConfig(HostDropLosslessConfig const& a, HostDropLosslessConfig 
 
 void StorageManager::_handOffDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
 {
-    std::vector<HostDropRecord> records;
-    records.reserve(pages.size());
     try
     {
+        std::vector<HostDropRecord> records;
+        records.reserve(pages.size());
         for (auto const& page : pages)
         {
             auto const* committed = asCommitted(*page);
@@ -1104,17 +1104,52 @@ void StorageManager::_handOffDroppedPages(std::vector<SharedPtr<Page>> const& pa
 
 void StorageManager::_handOffEvictedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level, bool mayWait)
 {
+    _handOffPages(pages, level, mayWait);
+    if (!hostDropAsync() && !mHostDropHook)
+    {
+        return;
+    }
+    // The pages the drop prunes with it leave the cache too; hand them off in the same eviction, by level.
+    std::map<CacheLevel, std::vector<SharedPtr<Page>>> prunedByLevel;
+    try
+    {
+        for (auto& page : _pagesPrunedWith(pages))
+        {
+            CacheLevel const pageLevel = page->cacheLevel;
+            prunedByLevel[pageLevel].push_back(std::move(page));
+        }
+    }
+    catch (std::exception const& error)
+    {
+        logHostDropError("eviction", ++mHostDropStats.errors, error.what());
+        return;
+    }
+    for (auto const& [prunedLevel, pruned] : prunedByLevel)
+    {
+        _handOffPages(pruned, prunedLevel, mayWait);
+    }
+}
+
+void StorageManager::_handOffPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level, bool mayWait)
+{
     if (cacheTier(level) == CacheTier::HOST_MEM)
     {
         if (hostDropAsync())
         {
-            std::vector<Page*> rawPages;
-            rawPages.reserve(pages.size());
-            for (auto const& page : pages)
+            try
             {
-                rawPages.push_back(page.get());
+                std::vector<Page*> rawPages;
+                rawPages.reserve(pages.size());
+                for (auto const& page : pages)
+                {
+                    rawPages.push_back(page.get());
+                }
+                _queueHostDrops(rawPages, level, mayWait);
             }
-            _queueHostDrops(rawPages, level, mayWait);
+            catch (std::exception const& error)
+            {
+                logHostDropError("eviction", ++mHostDropStats.errors, error.what());
+            }
         }
         else if (mHostDropHook)
         {
@@ -1125,6 +1160,48 @@ void StorageManager::_handOffEvictedPages(std::vector<SharedPtr<Page>> const& pa
     {
         page->hostDropHandled = true;
     }
+}
+
+std::vector<SharedPtr<Page>> StorageManager::_pagesPrunedWith(std::vector<SharedPtr<Page>> const& pages) const
+{
+    // Mirrors what destroying `pages` does: ~CommittedPage unlinks the page and, if Block::unlinkRemovesSubtree(),
+    // detaches its block's subtree, whose blocks then free their droppable pages unlinked (Block::releasePages()).
+    std::vector<SharedPtr<Page>> pruned;
+    std::vector<Block const*> pending;
+    for (auto const& page : pages)
+    {
+        auto const* committed = asCommitted(*page);
+        if (committed == nullptr || committed->block == nullptr || committed->block->isOrphan()
+            || !Block::unlinkRemovesSubtree(*committed->block, mLifeCycles.getLifeCycle(page->lifeCycle)))
+        {
+            continue;
+        }
+        pending.push_back(committed->block);
+    }
+    std::unordered_set<Block const*> visited;
+    while (!pending.empty())
+    {
+        Block const* block = pending.back();
+        pending.pop_back();
+        if (!visited.insert(block).second)
+        {
+            continue;
+        }
+        for (Page* const page : block->storage)
+        {
+            if (page != nullptr && page->isCommitted() && !page->hostDropHandled && page->cacheLevel != kHotLevel
+                && page->hasValidSlot() && page->status() == PageStatus::DROPPABLE && page->scheduledForEviction()
+                && cacheTier(page->cacheLevel) == CacheTier::HOST_MEM)
+            {
+                pruned.push_back(page->sharedFromThis());
+            }
+        }
+        for (auto const& [key, child] : block->next)
+        {
+            pending.push_back(child.get());
+        }
+    }
+    return pruned;
 }
 
 HostDropRingInfo StorageManager::setUpHostDropRing(
@@ -1168,7 +1245,15 @@ HostDropRingInfo StorageManager::setUpHostDropRing(
             = preferKernel && copier->kernelEnabled() && copier->pageIndexLocation() == PageIndexLocation::kDevice;
         auto pairs
             = kernel ? allocateDeviceMemory<PageIndexPair>(kHostDropMaxPairsPerLaunch) : CudaUniqPtr<PageIndexPair>{};
+        // The ring first: it is the allocation a request too large fails, and the slot tables scale with it.
         auto ring = std::make_unique<StaticHostMem>(numSlots * slotBytes);
+        std::vector<int32_t> freeSlots;
+        freeSlots.reserve(numSlots);
+        for (size_t i = numSlots; i > 0; --i)
+        {
+            freeSlots.push_back(static_cast<int32_t>(i - 1));
+        }
+        std::vector<HostDropSlotState> slotState(numSlots, HostDropSlotState::kFree);
 
         mHostDropCtx = context;
         mHostDropStream = std::move(stream);
@@ -1178,12 +1263,8 @@ HostDropRingInfo StorageManager::setUpHostDropRing(
         mHostDropPairsCap = kernel ? kHostDropMaxPairsPerLaunch : 0;
         mHostDropRing = std::move(ring);
         mHostDropSlotBytes = slotBytes;
-        mHostDropFree.clear();
-        for (size_t i = numSlots; i > 0; --i)
-        {
-            mHostDropFree.push_back(static_cast<int32_t>(i - 1));
-        }
-        mHostDropSlotState.assign(numSlots, HostDropSlotState::kFree);
+        mHostDropFree = std::move(freeSlots);
+        mHostDropSlotState = std::move(slotState);
         mHostDropRequest
             = HostDropRingRequest{.ringBytes = ringBytes, .preferKernel = preferKernel, .config = lossless};
         mHostDropLossless = lossless.enabled;
@@ -1191,9 +1272,8 @@ HostDropRingInfo StorageManager::setUpHostDropRing(
             = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(lossless.maxWaitS))
                   .count();
         mHostDropMinChunk = std::clamp<size_t>(lossless.minChunk, 1, std::max<size_t>(1, numSlots / 2));
-        mHostDropPausedUntilNs = 0;
-        mHostDropWaitWindowStartNs = 0;
-        mHostDropWaitBudgetNs = 0;
+        mHostDropWaitSpans.clear();
+        mHostDropClosing = false;
         mHostDropAsync.store(true, std::memory_order_release);
         TLLM_LOG_INFO("KV cache host-drop ring: %zu slots x %zu B, copy=%s, lossless=%s", numSlots, slotBytes,
             mHostDropKernel ? "kernel" : "hostfn", mHostDropLossless ? "on" : "off");
@@ -1208,7 +1288,8 @@ std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords
 {
     std::vector<HostDropRingRecord> out;
     std::lock_guard<std::mutex> lock(mHostDropMutex);
-    if (mHostDropCtx == nullptr)
+    // A poisoned copy recorded no completion event, so its batch would read as complete while the copy may still run.
+    if (mHostDropCtx == nullptr || mHostDropClosing || Poison::poisoned())
     {
         return out;
     }
@@ -1219,10 +1300,13 @@ std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords
     {
         return out;
     }
-    while (!mHostDropQueue.empty())
+    // The batches are picked and `out` sized first, so nothing below can throw once a batch leaves the queue: a
+    // drained record always reaches the caller.
+    size_t ready = 0;
+    size_t total = 0;
+    for (auto const& batch : mHostDropQueue)
     {
-        auto& batch = mHostDropQueue.front();
-        if (!out.empty() && out.size() + batch.records.size() > maxRecords)
+        if (total > 0 && total + batch.records.size() > maxRecords)
         {
             break;
         }
@@ -1230,9 +1314,15 @@ std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords
         {
             break;
         }
-        for (auto& r : batch.records)
+        total += batch.records.size();
+        ++ready;
+    }
+    out.reserve(total);
+    for (size_t i = 0; i < ready; ++i)
+    {
+        for (auto& r : mHostDropQueue.front().records)
         {
-            mHostDropSlotState.at(static_cast<size_t>(r.slot)) = HostDropSlotState::kDrained;
+            mHostDropSlotState[static_cast<size_t>(r.slot)] = HostDropSlotState::kDrained;
             out.push_back(std::move(r));
         }
         mHostDropQueue.pop_front();
@@ -1240,26 +1330,64 @@ std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords
     return out;
 }
 
+void StorageManager::returnUndeliveredHostDrops(std::vector<HostDropRingRecord> const& records)
+{
+    int64_t returned = 0;
+    {
+        std::lock_guard<std::mutex> lock(mHostDropMutex);
+        for (auto const& record : records)
+        {
+            auto const index = static_cast<size_t>(record.slot);
+            if (index < mHostDropSlotState.size() && mHostDropSlotState[index] == HostDropSlotState::kDrained)
+            {
+                mHostDropSlotState[index] = HostDropSlotState::kFree;
+                mHostDropFree.push_back(record.slot);
+                ++returned;
+            }
+        }
+    }
+    mHostDropStats.handed -= returned;
+    mHostDropStats.ringFull += returned;
+    mHostDropSlotsFreed.notify_all();
+}
+
 void StorageManager::releaseHostDropSlots(std::vector<int32_t> const& slots)
 {
     {
         std::lock_guard<std::mutex> lock(mHostDropMutex);
-        // Every slot is checked before any is released. A slot released twice, or before it was drained, would give
-        // two dropped pages one slot, and the consumer would store one page's KV under the other's key.
-        std::vector<bool> releasing(mHostDropSlotState.size(), false);
-        for (int32_t const slot : slots)
+        if (mHostDropClosing)
         {
-            TLLM_CHECK_WITH_INFO(slot >= 0 && static_cast<size_t>(slot) < mHostDropSlotState.size(),
-                "releaseHostDropSlots: %d is not a ring slot", slot);
-            auto const index = static_cast<size_t>(slot);
-            TLLM_CHECK_WITH_INFO(mHostDropSlotState[index] == HostDropSlotState::kDrained && !releasing[index],
-                "releaseHostDropSlots: slot %d was not drained, or is released twice", slot);
-            releasing[index] = true;
+            // The ring is going away or gone: a consumer that finishes after teardown started may still return the
+            // slots it drained, and anything else is ignored rather than raised on its thread.
+            for (int32_t const slot : slots)
+            {
+                auto const index = static_cast<size_t>(slot);
+                if (slot >= 0 && index < mHostDropSlotState.size()
+                    && mHostDropSlotState[index] == HostDropSlotState::kDrained)
+                {
+                    mHostDropSlotState[index] = HostDropSlotState::kFree;
+                }
+            }
         }
-        for (int32_t const slot : slots)
+        else
         {
-            mHostDropSlotState[static_cast<size_t>(slot)] = HostDropSlotState::kFree;
-            mHostDropFree.push_back(slot);
+            // Every slot is checked before any is released. A slot released twice, or before it was drained, would
+            // give two dropped pages one slot, and the consumer would store one page's KV under the other's key.
+            std::vector<bool> releasing(mHostDropSlotState.size(), false);
+            for (int32_t const slot : slots)
+            {
+                TLLM_CHECK_WITH_INFO(slot >= 0 && static_cast<size_t>(slot) < mHostDropSlotState.size(),
+                    "releaseHostDropSlots: %d is not a ring slot", slot);
+                auto const index = static_cast<size_t>(slot);
+                TLLM_CHECK_WITH_INFO(mHostDropSlotState[index] == HostDropSlotState::kDrained && !releasing[index],
+                    "releaseHostDropSlots: slot %d was not drained, or is released twice", slot);
+                releasing[index] = true;
+            }
+            for (int32_t const slot : slots)
+            {
+                mHostDropSlotState[static_cast<size_t>(slot)] = HostDropSlotState::kFree;
+                mHostDropFree.push_back(slot);
+            }
         }
     }
     mHostDropSlotsFreed.notify_all();
@@ -1268,6 +1396,19 @@ void StorageManager::releaseHostDropSlots(std::vector<int32_t> const& slots)
 void StorageManager::_releaseHostDropResources()
 {
     mHostDropAsync.store(false, std::memory_order_release);
+    {
+        // Close the ring first: a consumer still at work would otherwise keep draining, and holding, slots for as
+        // long as this waits. Records it has not drained are dropped.
+        std::lock_guard<std::mutex> lock(mHostDropMutex);
+        mHostDropClosing = true;
+        int64_t undrained = 0;
+        for (auto const& batch : mHostDropQueue)
+        {
+            undrained += static_cast<int64_t>(batch.records.size());
+        }
+        mHostDropStats.handed -= undrained;
+        mHostDropStats.ringFull += undrained;
+    }
     // A lossless hand-off waiting for slots sees the ring going away and stops staging.
     mHostDropSlotsFreed.notify_all();
     // The consumer that releases slots may be a Python thread, so the GIL is not held while waiting for it.
@@ -1277,11 +1418,11 @@ void StorageManager::_releaseHostDropResources()
     {
         // Slots the consumer drained and has not released may still be read. Wait for them, bounded; if a consumer
         // still holds some, leak the ring (as destroy() leaks unquiesced remote transfers) rather than free memory it
-        // may read.
+        // may read. The slot table stays, so a late release of those slots is a no-op.
         auto const heldByConsumer = [&]
         { return std::count(mHostDropSlotState.begin(), mHostDropSlotState.end(), HostDropSlotState::kDrained); };
-        auto const maxWait = std::min<std::chrono::nanoseconds>(
-            std::chrono::nanoseconds(mHostDropMaxWaitNs), kHostDropTeardownMaxWait);
+        auto const maxWait = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(kHostDropTeardownMaxWaitS));
         if (!mHostDropSlotsFreed.wait_for(lock, maxWait, [&] { return heldByConsumer() == 0; }))
         {
             TLLM_LOG_WARNING(
@@ -1300,7 +1441,6 @@ void StorageManager::_releaseHostDropResources()
     mHostDropCopier.reset();
     mHostDropRing.reset();
     mHostDropFree.clear();
-    mHostDropSlotState.clear();
     mHostDropCtx = nullptr;
 }
 
@@ -1313,32 +1453,41 @@ void StorageManager::_leakHostDropResources() noexcept
     static_cast<void>(mHostDropCopier.release());
 }
 
+int64_t StorageManager::_hostDropWaitBudgetNs(int64_t atNs)
+{
+    int64_t const intervalStart = atNs - 2 * mHostDropMaxWaitNs;
+    while (!mHostDropWaitSpans.empty() && mHostDropWaitSpans.front().second <= intervalStart)
+    {
+        mHostDropWaitSpans.pop_front();
+    }
+    int64_t used = 0;
+    for (auto const& [start, end] : mHostDropWaitSpans)
+    {
+        used += end - std::max(start, intervalStart);
+    }
+    return std::max<int64_t>(0, mHostDropMaxWaitNs - used);
+}
+
 void StorageManager::_waitForHostDropSlots(std::unique_lock<std::mutex>& lock, size_t want)
 {
-    // One budget for every wait in a window of 2 x maxWait: a consumer that releases each chunk just in time cannot
-    // keep an eviction (or several in a row) waiting for longer than maxWait. Once it is spent, waiting pauses for
-    // maxWait, which also outlasts the window, so the next wait starts a fresh one.
+    // Every wait is charged to one budget over a sliding interval of 2 x maxWait. A wait may take only what is left
+    // of it at its start; the interval ending with this wait then holds this wait and earlier waits that fell inside
+    // the interval ending at its start, so no interval of 2 x maxWait ever holds more than maxWait of waiting.
     int64_t const start = steadyNowNs();
-    if (start - mHostDropWaitWindowStartNs >= 2 * mHostDropMaxWaitNs)
+    int64_t const budget = _hostDropWaitBudgetNs(start);
+    if (budget <= 0)
     {
-        mHostDropWaitWindowStartNs = start;
-        mHostDropWaitBudgetNs = mHostDropMaxWaitNs;
+        return;
     }
     mHostDropStats.waits += 1;
-    bool const ready = mHostDropSlotsFreed.wait_for(lock, std::chrono::nanoseconds(mHostDropWaitBudgetNs),
+    bool const ready = mHostDropSlotsFreed.wait_for(lock, std::chrono::nanoseconds(budget),
         [&] { return mHostDropFree.size() >= want || !mHostDropAsync.load(std::memory_order_acquire); });
     int64_t const end = steadyNowNs();
+    mHostDropWaitSpans.emplace_back(start, end);
     mHostDropStats.waitNs += end - start;
-    mHostDropWaitBudgetNs -= end - start;
     if (!ready)
     {
         mHostDropStats.timeouts += 1;
-    }
-    if (!ready || mHostDropWaitBudgetNs <= 0)
-    {
-        // Take what is free, then drop without a hand-off until the pause ends.
-        mHostDropWaitBudgetNs = 0;
-        mHostDropPausedUntilNs = end + mHostDropMaxWaitNs;
     }
 }
 
@@ -1455,6 +1604,12 @@ void StorageManager::_queueHostDrops(std::vector<Page*> const& pages, CacheLevel
         }
         CachedCudaEvent const done(reinterpret_cast<CudaStream>(stream));
         HostDropBatch batch{.consumerDone = CachedCudaEvent(reinterpret_cast<CudaStream>(stream)), .records = {}};
+        if (Poison::poisoned())
+        {
+            // A poisoned KVCM2 records no events: the batch would read as complete while its copy may still run. The
+            // handler below synchronizes the stream and takes the chunk's slots back.
+            throw LogicError("KVCM2 is poisoned: a host-drop ring copy has no completion event");
+        }
         batch.records.reserve(items.size());
         for (auto const& item : items)
         {
@@ -1540,7 +1695,7 @@ void StorageManager::_queueHostDrops(std::vector<Page*> const& pages, CacheLevel
             {
                 std::lock_guard<std::mutex> lock(mHostDropMutex);
                 mustWait = mHostDropAsync.load(std::memory_order_acquire) && mHostDropFree.size() < want
-                    && steadyNowNs() >= mHostDropPausedUntilNs;
+                    && _hostDropWaitBudgetNs(steadyNowNs()) > 0;
             }
             if (mustWait)
             {
@@ -1569,7 +1724,7 @@ void StorageManager::_queueHostDrops(std::vector<Page*> const& pages, CacheLevel
             }
             if (items.empty())
             {
-                // Paused after the budget was spent, or the ring is going away: drop the rest without a hand-off.
+                // The waiting budget is spent, or the ring is going away: drop the rest without a hand-off.
                 ringFull += static_cast<int64_t>(left);
                 break;
             }
@@ -1580,13 +1735,12 @@ void StorageManager::_queueHostDrops(std::vector<Page*> const& pages, CacheLevel
     }
     catch (std::exception const& error)
     {
-        // Never leave a slot to its next owner while a copy may still read it: finish the stream first, then give back
-        // the slots of the chunk that was not queued (queued chunks belong to the consumer). A failed synchronize
-        // leaves nothing better to do, and the hand-off error is reported below.
-        if (launched && mHostDropStream)
-        {
-            static_cast<void>(cuStreamSynchronize(mHostDropStream->handle()));
-        }
+        // Never give a slot to its next owner while a copy may still write it: finish the stream first, then give back
+        // the slots of the chunk that was not queued (queued chunks belong to the consumer). If the stream cannot be
+        // shown idle, those slots stay out of circulation (staged, with no batch to drain them) until teardown.
+        CUresult const idle
+            = launched && mHostDropStream ? cuStreamSynchronize(mHostDropStream->handle()) : CUDA_SUCCESS;
+        if (idle == CUDA_SUCCESS)
         {
             std::lock_guard<std::mutex> lock(mHostDropMutex);
             for (auto const& item : items)
@@ -1594,6 +1748,11 @@ void StorageManager::_queueHostDrops(std::vector<Page*> const& pages, CacheLevel
                 mHostDropSlotState.at(static_cast<size_t>(item.slot)) = HostDropSlotState::kFree;
                 mHostDropFree.push_back(item.slot);
             }
+        }
+        else
+        {
+            TLLM_LOG_ERROR("KV cache host-drop ring: synchronizing a failed copy returned %d; quarantining %zu slots",
+                static_cast<int>(idle), items.size());
         }
         logHostDropError("ring copy", ++mHostDropStats.errors, error.what());
     }

@@ -3961,13 +3961,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     nb::gil_scoped_release release;
                     records = self.storage().drainHostDrops(maxRecords);
                 }
-                nb::list items;
-                for (auto const& r : records)
+                // The slots are drained, so only these records can release them: if converting one fails, the
+                // slots go back to the ring rather than leave it for good.
+                try
                 {
-                    items.append(nb::make_tuple(
-                        nb::bytes(r.key.data(), r.key.size()), r.lifeCycle, r.numTokens, r.slot, r.bytes));
+                    nb::list items;
+                    for (auto const& r : records)
+                    {
+                        items.append(nb::make_tuple(
+                            nb::bytes(r.key.data(), r.key.size()), r.lifeCycle, r.numTokens, r.slot, r.bytes));
+                    }
+                    return items;
                 }
-                return items;
+                catch (...)
+                {
+                    self.storage().returnUndeliveredHostDrops(records);
+                    throw;
+                }
             },
             nb::arg("max_records") = 4096)
         .def(

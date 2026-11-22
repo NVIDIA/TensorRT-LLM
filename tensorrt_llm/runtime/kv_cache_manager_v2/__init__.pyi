@@ -2005,8 +2005,9 @@ class KVCacheManager:
         address and size in bytes of its cold-page form. `address` is valid only during the call.
 
         The hook runs synchronously on the evicting thread, inside eviction and under the
-        manager's exclusive lock: it must not call the manager (a call from inside it raises),
-        and it delays the eviction for as long as it runs. An exception it raises is logged and
+        manager's exclusive lock, and delays the eviction for as long as it runs. It must not
+        call the manager: `set_host_drop_hook()` and `host_drop_ring()` raise if called from it,
+        and other methods are not guarded. An exception it raises is logged and
         counted in `host_drop_stats()["errors"]`, and eviction goes on. `shutdown()` removes the
         hook; until then the manager holds a reference to `callback`, so a hook that refers back
         to its owner keeps both alive. Ignored once `host_drop_ring()` is set up.
@@ -2022,18 +2023,29 @@ class KVCacheManager:
     ) -> tuple[int, int, int, bool]:
         """Set up the pinned ring the last host-memory level copies its drops into.
 
-        Returns `(address, slot_bytes, num_slots, kernel_copy)`. The ring takes at most
-        `ring_bytes` (at least 16 slots). From then on the hook is no longer called: each dropped
-        committed page is copied into a free slot on a dedicated stream, and the consumer gets it
-        from `drain_host_drops()`. A page that finds no free slot is dropped without a hand-off
-        and counted in `ring_full`, unless `lossless`: then the evicting call waits for released
-        slots, `lossless_chunk` at a time, within a budget of `lossless_max_wait_s` (finite, in
-        (0, 60]) per window of twice that, and drops pages without waiting for as long once the
-        budget is spent. The wait holds the manager's exclusive lock and releases the GIL.
+        Returns `(address, slot_bytes, num_slots, kernel_copy)`. The ring holds as many slots as
+        fit in `ring_bytes`, but never fewer than 16: `host_drop_ring(0)`, or any size under 16
+        slots, still allocates 16, so the ring can exceed `ring_bytes`. From then on the hook is
+        no longer called: each dropped committed page is copied into a free slot on a dedicated
+        stream, and the consumer gets it from `drain_host_drops()`. A page that finds no free
+        slot is dropped without a hand-off and counted in `ring_full`.
+
+        With `lossless`, capacity eviction waits for released slots instead, `lossless_chunk` at
+        a time. All waits share a budget: within any interval of twice `lossless_max_wait_s`
+        (finite, in (0, 60]), they total at most `lossless_max_wait_s`; while it is spent, pages
+        are dropped without waiting. The wait holds the manager's exclusive lock and releases the
+        GIL. Forced eviction (resize, defragmentation) and pages destroyed outside eviction never
+        wait, and can still count in `ring_full` with budget left.
 
         `prefer_kernel=False` forces the host-callback copy; `kernel_copy` says which one runs.
         A repeated call must pass the same arguments and returns the same ring. Must not be
         called from inside a manager callback.
+
+        At `shutdown()` the ring closes: `drain_host_drops()` returns nothing more, records not
+        yet drained move from `handed` to `ring_full`, and shutdown waits up to 5 s for every
+        drained slot to be released. If some are still held, the ring is leaked rather than
+        freed under a reader. Releasing a drained slot after that is a no-op, so a consumer
+        should release what it holds and stop draining before shutting the manager down.
         """
         ...
     def drain_host_drops(self, max_records: int = 4096) -> list[tuple[bytes, int, int, int, int]]:
@@ -2041,16 +2053,23 @@ class KVCacheManager:
 
         Slot `slot` of the ring holds the page's `bytes` bytes until it is released.
         `max_records` is a soft cap: a batch is never split, so one call may return more. Runs on
-        any thread, without the manager's lock, and never waits for it. Between this call and
-        `release_host_drop_slots()` the consumer must not take the manager's lock or call a
-        manager method that does, since an evicting thread may hold it while waiting for slots.
+        any thread, without the manager's lock, and never waits for it. Empty once the ring is
+        closed or the manager is poisoned.
+
+        Between this call and `release_host_drop_slots()` the consumer must not take the
+        manager's lock or call a manager method that does, since an evicting thread may hold it
+        while waiting for slots. That includes finalizers: dropping the last reference to an
+        open `KVCacheManager`-owned object such as an unclosed `_KVCache` or a
+        `PlannedDropHandle` takes the lock, and a garbage-collection pass on the consumer thread
+        can run one. Closed caches do not take it.
         """
         ...
     def release_host_drop_slots(self, slots: Sequence[int]) -> None:
         """Return drained ring slots once their contents are consumed.
 
         Each slot must have come from `drain_host_drops()` and is released once; otherwise the
-        call raises and releases none of `slots`. Runs without the manager's lock.
+        call raises and releases none of `slots`. Once the ring is closed, drained slots are
+        released and anything else is ignored. Runs without the manager's lock.
         """
         ...
     def host_drop_stats(self) -> dict[str, int]:

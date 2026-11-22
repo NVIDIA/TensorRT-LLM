@@ -473,6 +473,16 @@ CommittedPage* Block::unlinkPage(LifeCycleId lcIdx, CommittedPage* expectedPage)
     return page;
 }
 
+bool Block::unlinkRemovesSubtree(Block const& block, LifeCycle const& lc)
+{
+    // Reuse cleanup only applies to attention lifecycles.
+    // SSM lifecycles are allowed in the tree but don't trigger subtree eviction.
+    auto const* const alc = std::get_if<AttnLifeCycle>(&lc);
+    // A full-attention block or a sink block of a REQUIRED or SINK_REQUIRED_ONLY lifecycle.
+    return alc && (requiresPrefixCoverage(*alc) || alc->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY)
+        && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks});
+}
+
 std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     Block& block, LifeCycleId lcIdx, LifeCycle const& lc)
 {
@@ -483,15 +493,10 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
         return detachedBlocks;
     }
 
-    // Reuse cleanup only applies to attention lifecycles.
-    // SSM lifecycles are allowed in the tree but don't trigger subtree eviction.
-    auto const* const alc = std::get_if<AttnLifeCycle>(&lc);
     NodeBase* pruneStart = &block;
 
-    // If this is a full-attention block or a sink block of a REQUIRED or SINK_REQUIRED_ONLY lifecycle: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && (requiresPrefixCoverage(*alc) || alc->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY)
-        && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
+    if (unlinkRemovesSubtree(block, lc))
     {
         pruneStart = block.prev;
         detachedBlocks.push_back(removeSubtree(block));

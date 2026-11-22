@@ -67,26 +67,29 @@ bool allBytesEqual(void const* data, size_t size, uint8_t expected)
     return std::all_of(bytes, bytes + size, [expected](uint8_t byte) { return byte == expected; });
 }
 
-//! Joins a thread on every exit path, so a failed assertion does not leave it running past the test.
-class JoiningThread
+//! A worker that polls `stop`: on every exit path, a failed assertion or an exception included, it is told to stop
+//! before it is joined, so the test reports its failure instead of hanging on the join.
+class StoppingThread
 {
 public:
     template <typename F>
-    explicit JoiningThread(F&& body)
-        : mThread(std::forward<F>(body))
+    StoppingThread(std::atomic<bool>& stop, F&& body)
+        : mStop(stop)
+        , mThread(std::forward<F>(body))
     {
     }
 
-    ~JoiningThread()
+    ~StoppingThread()
     {
-        join();
+        stopAndJoin();
     }
 
-    JoiningThread(JoiningThread const&) = delete;
-    JoiningThread& operator=(JoiningThread const&) = delete;
+    StoppingThread(StoppingThread const&) = delete;
+    StoppingThread& operator=(StoppingThread const&) = delete;
 
-    void join()
+    void stopAndJoin()
     {
+        mStop.store(true);
         if (mThread.joinable())
         {
             mThread.join();
@@ -94,6 +97,7 @@ public:
     }
 
 private:
+    std::atomic<bool>& mStop;
     std::thread mThread;
 };
 
@@ -123,9 +127,15 @@ protected:
     //! with one byte pattern each. Returns the pages' radix keys, in commit order.
     std::vector<std::string> commitRound()
     {
+        return commitChain(2);
+    }
+
+    //! commitRound() for a chain of `numPages` pages.
+    std::vector<std::string> commitChain(int numPages)
+    {
         auto& storage = mManager->storage();
-        TypedVec<LifeCycleId, SlotCount> twoSlots(LifeCycleId{1}, 2);
-        auto slots = storage.newGpuSlots(twoSlots);
+        TypedVec<LifeCycleId, SlotCount> numSlots(LifeCycleId{1}, numPages);
+        auto slots = storage.newGpuSlots(numSlots);
         // The slots may come straight from pages this allocation offloaded: a writer waits for those copies (their
         // ready event) before it overwrites the slot, as a model step would in-stream.
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -325,16 +335,86 @@ TEST_F(HostDropTest, RingSetUpValidatesItsArguments)
         tensorrt_llm::common::TllmException);
 }
 
-TEST_F(HostDropTest, FailedRingSetUpLeavesNothingBehind)
+TEST_F(HostDropTest, FailedRingSetUpPublishesNothingAndCanBeRetried)
 {
     auto& storage = mManager->storage();
-    // No host can pin this much: the call fails at the last allocation.
-    EXPECT_ANY_THROW(storage.setUpHostDropRing(size_t{1} << 52, false));
-    EXPECT_FALSE(storage.hostDropAsync());
-    // A retry with other arguments sets the ring up afresh.
+    // No host can pin this much: each call fails at the ring, its last allocation, on either copy path.
+    for (bool const preferKernel : {true, false})
+    {
+        EXPECT_ANY_THROW(storage.setUpHostDropRing(size_t{1} << 52, preferKernel));
+        EXPECT_FALSE(storage.hostDropAsync());
+    }
+    // Nothing was published: a retry with other arguments is not taken for a repeat of a ring set up already, and
+    // sets the ring up afresh.
     auto const info = storage.setUpHostDropRing(0, false);
     EXPECT_NE(info.address, 0U);
+    EXPECT_EQ(info.numSlots, 16);
     EXPECT_TRUE(storage.hostDropAsync());
+}
+
+TEST_F(HostDropTest, PagesPrunedWithADroppedParentAreHandedOff)
+{
+    auto& storage = mManager->storage();
+    std::vector<std::string> handedKeys;
+    (void) storage.setHostDropHook(
+        [&](std::vector<HostDropRecord> const& records)
+        {
+            for (auto const& record : records)
+            {
+                handedKeys.push_back(record.key);
+            }
+        });
+    auto first = commitRound();
+    commitRound(); // moves `first` down to the host level
+    // A one-page round moves one page down, so the host level drops one page. Dropping the parent of `first` removes
+    // its block's subtree, which frees the child too: it must be handed off with the parent, not lost silently.
+    commitChain(1);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    std::sort(handedKeys.begin(), handedKeys.end());
+    std::sort(first.begin(), first.end());
+    EXPECT_EQ(handedKeys, first);
+    EXPECT_EQ(storage.hostDropStats().handed.load(), 2);
+}
+
+TEST_F(HostDropTest, TeardownClosesTheRing)
+{
+    auto& storage = mManager->storage();
+    (void) storage.setUpHostDropRing(/*ringBytes=*/0, /*preferKernel=*/false);
+    commitRound();
+    commitRound();
+    commitRound(); // the first round dropped into the ring
+    auto const drained = drainAtLeast(2);
+    ASSERT_EQ(drained.size(), 2U);
+    commitRound(); // two more records, which the consumer never drains
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_EQ(storage.hostDropStats().handed.load(), 4);
+
+    // The consumer still holds the drained slots when shutdown starts, and returns them a little later. Shutdown
+    // waits for them instead of leaking the ring, and drops the undrained records.
+    std::vector<int32_t> slots;
+    for (auto const& record : drained)
+    {
+        slots.push_back(record.slot);
+    }
+    std::atomic<bool> stop{false};
+    StoppingThread consumer(stop,
+        [&]
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            storage.releaseHostDropSlots(slots);
+        });
+    auto const t0 = std::chrono::steady_clock::now();
+    mManager->shutdown();
+    auto const elapsed = std::chrono::steady_clock::now() - t0;
+    consumer.stopAndJoin();
+
+    EXPECT_LT(elapsed, std::chrono::duration<double>(kHostDropTeardownMaxWaitS / 2)) << "the ring was not leaked";
+    EXPECT_TRUE(storage.drainHostDrops(4096).empty());
+    auto const& stats = storage.hostDropStats();
+    EXPECT_EQ(stats.handed.load(), 2);
+    EXPECT_EQ(stats.ringFull.load(), 2) << "the undrained records are dropped";
+    // After teardown a release is lenient: a repeated one is ignored instead of raised on the consumer's thread.
+    EXPECT_NO_THROW(storage.releaseHostDropSlots(slots));
 }
 
 TEST_F(HostDropTest, ReleaseRejectsSlotsNotDrainedOrReleasedTwice)
@@ -510,7 +590,7 @@ TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
     std::atomic<bool> stop{false};
     std::mutex recordsMutex;
     std::vector<std::pair<std::string, int>> seen;
-    JoiningThread consumer(
+    StoppingThread consumer(stop,
         [&]
         {
             while (!stop.load())
@@ -557,8 +637,7 @@ TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    stop.store(true);
-    consumer.join();
+    consumer.stopAndJoin();
     for (auto const& [key, fill] : seen)
     {
         EXPECT_EQ(fill, int{mPatterns.at(key)}) << "the ring slot held the dropped page's bytes";
@@ -611,7 +690,7 @@ TEST_P(HostDropRingTest, LosslessWaitsShareOneBudget)
     // A slow but live consumer: it frees two slots every 0.9 x maxWaitS, so each wait alone would end in time. The
     // waits share one budget per 2 x maxWaitS, so they still give up and pause instead of stalling every eviction.
     std::atomic<bool> stop{false};
-    JoiningThread consumer(
+    StoppingThread consumer(stop,
         [&]
         {
             std::vector<int32_t> held;
@@ -650,8 +729,7 @@ TEST_P(HostDropRingTest, LosslessWaitsShareOneBudget)
     double const elapsedS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     // Let the consumer catch up on the drops still in flight before it stops.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    stop.store(true);
-    consumer.join();
+    consumer.stopAndJoin();
     auto const& stats = storage.hostDropStats();
     EXPECT_GE(stats.timeouts.load(), 1) << "a wait spent the shared budget";
     EXPECT_GT(stats.ringFull.load(), 0) << "drops during the pause go without a hand-off";
@@ -659,6 +737,40 @@ TEST_P(HostDropRingTest, LosslessWaitsShareOneBudget)
     double const windows = std::floor(elapsedS / (2 * kMaxWaitS)) + 1;
     EXPECT_LE(waitedS, windows * kMaxWaitS + 0.1) << "at most maxWaitS of waiting per 2 x maxWaitS";
     EXPECT_EQ(stats.errors.load(), 0);
+}
+
+TEST_P(HostDropRingTest, LosslessBudgetHoldsOverAnySlidingInterval)
+{
+    bool const preferKernel = GetParam();
+    auto& storage = mManager->storage();
+    constexpr double kMaxWaitS = 0.5;
+    auto const info = storage.setUpHostDropRing(
+        /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{.enabled = true, .maxWaitS = kMaxWaitS, .minChunk = 2});
+    if (preferKernel && !info.kernelCopy)
+    {
+        GTEST_SKIP() << "the batched page-copy kernel is not available on this device";
+    }
+    for (int round = 0; round < 2 + 8; ++round)
+    {
+        commitRound(); // 16 drops fill the ring; nobody releases a slot
+    }
+    ASSERT_EQ(storage.hostDropStats().waits.load(), 0);
+    // A wait that spends the whole budget ...
+    auto const t0 = std::chrono::steady_clock::now();
+    commitRound();
+    auto const& stats = storage.hostDropStats();
+    ASSERT_EQ(stats.timeouts.load(), 1);
+    int64_t const firstWaitNs = stats.waitNs.load();
+    // ... then one starting 2.5 x maxWaitS after it began: half of the first lies in the interval of 2 x maxWaitS
+    // ending there, so only the other half of the budget is left. A budget reset per fixed window would grant it all.
+    std::this_thread::sleep_until(t0
+        + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(2.5 * kMaxWaitS)));
+    commitRound();
+    double const secondWaitS = static_cast<double>(stats.waitNs.load() - firstWaitNs) * 1e-9;
+    EXPECT_EQ(stats.waits.load(), 2);
+    EXPECT_GT(secondWaitS, 0.3 * kMaxWaitS);
+    EXPECT_LT(secondWaitS, 0.8 * kMaxWaitS);
 }
 
 INSTANTIATE_TEST_SUITE_P(CopyPath, HostDropRingTest, ::testing::Values(true, false),

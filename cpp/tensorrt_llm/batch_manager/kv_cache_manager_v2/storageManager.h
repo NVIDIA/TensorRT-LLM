@@ -41,6 +41,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -97,11 +98,12 @@ struct HostDropRingInfo
 struct HostDropLosslessConfig
 {
     bool enabled = false; //!< Wait for released slots instead of dropping pages when the ring is full.
-    //! Waiting budget, in seconds, finite and in (0, kHostDropMaxWaitS]. All waits share it: within any 2 x maxWaitS
-    //! window, the evicting threads wait at most maxWaitS in total. Once it is spent, waiting pauses for maxWaitS and
-    //! pages are dropped without a hand-off (counted in ringFull), so a slow or stuck consumer costs one budget, not
-    //! a hang. The wait holds the exclusive API lock (every call into the manager stalls) and bounds teardown, so
-    //! keep it short.
+    //! Waiting budget, in seconds, finite and in (0, kHostDropMaxWaitS]. All waits share it: within any interval of
+    //! 2 x maxWaitS, the evicting threads wait at most maxWaitS in total. While it is spent, pages are dropped without
+    //! a hand-off (counted in ringFull) until earlier waits age out of the interval, so a slow or stuck consumer
+    //! costs at most half the eviction time, never a hang. The wait holds the exclusive API lock (every call into the
+    //! manager stalls), so keep it short. Only capacity eviction waits: forced eviction (resize, defragmentation) and
+    //! pages destroyed outside eviction never do, and drop their pages when the ring is full.
     double maxWaitS = 2.0;
     //! A wait ends once this many slots (or every page still to stage) are free; capped at half the ring.
     size_t minChunk = 64;
@@ -109,12 +111,15 @@ struct HostDropLosslessConfig
 
 //! Upper bound of HostDropLosslessConfig::maxWaitS.
 inline constexpr double kHostDropMaxWaitS = 60.0;
+//! Longest teardown wait, in seconds, for ring slots a consumer still holds.
+inline constexpr double kHostDropTeardownMaxWaitS = 5.0;
 
 //! Cumulative host-drop hand-off counters, in pages.
 struct HostDropStats
 {
     std::atomic<int64_t> handed{0};   //!< Pages passed to the hook or staged in the ring.
-    std::atomic<int64_t> ringFull{0}; //!< Pages dropped without a hand-off because no ring slot was free.
+    std::atomic<int64_t> ringFull{0}; //!< Pages dropped without a hand-off: no ring slot was free, or the ring
+                                      //!< closed before the consumer drained them.
     std::atomic<int64_t> errors{0};   //!< Failed hand-off calls.
     std::atomic<int64_t> waits{0};    //!< Lossless ring only: waits of an evicting thread for released ring slots.
     std::atomic<int64_t> waitNs{0};   //!< Lossless ring only: their total duration.
@@ -455,15 +460,24 @@ public:
     //! without a hand-off: the evicting call stages the pages in chunks and waits for releaseHostDropSlots() between
     //! them (back-pressure on eviction). The waits share one bounded budget (HostDropLosslessConfig::maxWaitS) and
     //! release the Python GIL (OptionalGilRelease), which the consumer that releases the slots may need. Teardown
-    //! waits, bounded, for slots a consumer has drained and not released, and leaks the ring if some are still held.
     //! A repeated call must pass the same arguments; one after a failed call allocates afresh.
+    //!
+    //! Teardown closes the ring: drainHostDrops() returns nothing more, records not yet drained are dropped (moved from
+    //! handed to ringFull), and releasing a slot becomes lenient. It waits up to kHostDropTeardownMaxWaitS for slots
+    //! the consumer has drained and not released, and leaks the ring if some are still held, since the consumer may
+    //! still read them.
     HostDropRingInfo setUpHostDropRing(
         size_t ringBytes, bool preferKernel, HostDropLosslessConfig const& lossless = HostDropLosslessConfig{});
-    //! Ring records whose copies have completed, oldest first; a batch is never split.
+    //! Ring records whose copies have completed, oldest first; a batch is never split. Nothing once the ring is closed
+    //! or KVCM2 is poisoned, since a poisoned copy has no completion event to wait for.
     std::vector<HostDropRingRecord> drainHostDrops(size_t maxRecords);
+    //! Takes back drained records that never reached the consumer (e.g. a failed conversion), freeing their slots and
+    //! counting their pages in ringFull instead of handed.
+    void returnUndeliveredHostDrops(std::vector<HostDropRingRecord> const& records);
     //! Returns ring slots to the free list once their contents have been consumed. Each slot must have been drained and
-    //! is released once; otherwise nothing is released and this throws. The lossless wait holds the exclusive API
-    //! lock, so a consumer must not take the manager's lock between drainHostDrops() and this call.
+    //! is released once; otherwise nothing is released and this throws. Once the ring is closed this releases the
+    //! drained slots it names and ignores the rest. The lossless wait holds the exclusive API lock, so a consumer must
+    //! not take the manager's lock between drainHostDrops() and this call.
     void releaseHostDropSlots(std::vector<int32_t> const& slots);
 
     [[nodiscard]] bool hostDropAsync() const noexcept
@@ -730,12 +744,20 @@ private:
     //! ring is lossless and `mayWait`, and marks every page handled so its destruction does not hand it off again. The
     //! pages must be droppable and still hold their slots.
     void _handOffEvictedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level, bool mayWait);
+    //! _handOffEvictedPages() for `pages` alone, without the pages their destruction prunes.
+    void _handOffPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level, bool mayWait);
+    //! Droppable committed host pages that destroying `pages` frees with them: destroying a page whose life cycle
+    //! requires prefix coverage removes its block's subtree, and the other pages of those blocks are freed unlinked,
+    //! where no hand-off can see them. Excludes pages already handed off.
+    [[nodiscard]] std::vector<SharedPtr<Page>> _pagesPrunedWith(std::vector<SharedPtr<Page>> const& pages) const;
     //! `mayWait` allows the lossless hand-off to wait for released slots; a page destroyed outside eviction passes
     //! false, since its destructor may run anywhere.
     void _queueHostDrops(std::vector<Page*> const& pages, CacheLevel level, bool mayWait);
-    //! Waits for `want` free ring slots within the lossless waiting budget. Returns with `lock` held; on return the
-    //! budget may be spent and waiting paused.
+    //! Waits for `want` free ring slots within the lossless waiting budget. Returns with `lock` held.
     void _waitForHostDropSlots(std::unique_lock<std::mutex>& lock, size_t want);
+    //! Lossless waiting budget left at `atNs`: maxWait less the waiting inside [atNs - 2 x maxWait, atNs]. Prunes
+    //! older waits. The caller holds mHostDropMutex.
+    [[nodiscard]] int64_t _hostDropWaitBudgetNs(int64_t atNs);
     void _releaseHostDropResources();
     //! Leaks the ring and what may still access it (stream, page-index buffer, copier), for a teardown that cannot
     //! prove a consumer or a queued copy is done with them.
@@ -782,10 +804,9 @@ private:
     bool mHostDropLossless = false;                     //!< Lossless hand-off enabled.
     int64_t mHostDropMaxWaitNs = 0;                     //!< Lossless waiting budget per window.
     size_t mHostDropMinChunk = 0;                       //!< Slots a lossless wait asks for.
-    int64_t mHostDropPausedUntilNs = 0;                 //!< No lossless wait starts before this time.
-    int64_t mHostDropWaitWindowStartNs = 0;             //!< Start of the current waiting-budget window.
-    int64_t mHostDropWaitBudgetNs = 0;                  //!< Waiting budget left in the current window.
-    std::condition_variable mHostDropSlotsFreed;        //!< Signalled when slots are released or the ring goes away.
+    std::deque<std::pair<int64_t, int64_t>> mHostDropWaitSpans; //!< Recent lossless waits, as [start, end) in ns.
+    bool mHostDropClosing = false; //!< Set by teardown: nothing more is drained, and releases are lenient.
+    std::condition_variable mHostDropSlotsFreed; //!< Signalled when slots are released or the ring goes away.
 
     // Optional model-sized page staging is owned here and borrowed by CopyEngine.
     std::unique_ptr<StagingBufferManager> mPageStagingManager;
