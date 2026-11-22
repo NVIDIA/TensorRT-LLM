@@ -3366,10 +3366,12 @@ def test_code_fingerprint_follows_fallback_imports_and_modules_passed_whole(
         """)
     classes = (runners.Imported, runners.Passed)
     before = fp_modules.fingerprints(*classes)
-    # The fallback counts though no process path imported it.
+    # The fallback counts though no process path imported it, by its file:
+    # fingerprinting does not run it.
     fp_modules.edit("fp_backup", "[0]", "[0, 3]")
     after = fp_modules.fingerprints(*classes)
     assert _changed(before, after) == [True, False]
+    assert "fp_backup" not in sys.modules
     before = after
     fp_modules.edit("fp_primary", "[0, 1]", "[0, 2]")
     # A module the bundle's module imports whole uses another in turn.
@@ -3985,6 +3987,66 @@ def test_autotune_rescans_loaded_libraries_once_per_session(monkeypatch):
     assert rescans == [1]
 
 
+def test_a_later_save_keeps_what_another_process_wrote(tmp_path):
+    """Once a save removed the entries a process dropped, its next save does
+    not delete what another process wrote under those keys since."""
+    path = str(tmp_path / "cache.json")
+    key = ("test_dropped", "R", "()", ((16, 64), ), "aaaaaaaaaaaaaaaa")
+    first = autotuner.AutoTunerProfilingCache()
+    first.cache = {key: (0, 1, 1.0)}
+    first.drop([key])
+    first.save_cache(path, rank=0)
+    second = autotuner.AutoTunerProfilingCache()
+    second.cache = {key: (0, 2, 1.0)}
+    second.save_cache(path, rank=0)
+    first.save_cache(path, rank=0)
+    reloaded = autotuner.AutoTunerProfilingCache()
+    reloaded.load_cache(path, rank=0)
+    assert reloaded.cache == {key: (0, 2, 1.0)}
+
+
+def test_post_tune_merge_leaves_out_entries_a_rank_dropped():
+    """A rank that dropped a loser to tune its profile again does not get it
+    back from a rank that still holds it (one of another communicator)."""
+    tuner = autotuner.AutoTuner()
+    tuner.mapping = Mapping(world_size=2, rank=0, tp_size=2)
+    loser = ("op", "A", "()", ((16, 64), ), "aaaaaaaaaaaaaaaa")
+    winner = ("op", "B", "()", ((16, 64), ), "bbbbbbbbbbbbbbbb")
+    tuner.profiling_cache.cache = {loser: (0, 1, 0.01), winner: (1, 7, 1.0)}
+    tuner.profiling_cache.drop([loser])
+    gathered = []
+
+    class _FakeDist:
+
+        def tp_cp_allgather(self, obj):
+            gathered.append(obj)
+            return [obj, ({loser: (0, 1, 0.01), winner: (1, 7, 1.0)}, [])]
+
+    tuner._dist = _FakeDist()
+    tuner.post_tune_merge_tactics()
+    assert gathered[0][1] == [loser]
+    assert tuner.profiling_cache.cache == {winner: (1, 7, 1.0)}
+
+
+def test_profiles_of_a_bucket_function_are_built_each_time():
+    """Buckets a function makes can change for the same input: their profiles
+    are not memoized."""
+    buckets = [(8, )]
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, lambda m: buckets[0], lambda m: m), ))
+    tuner = autotuner.AutoTuner()
+    inputs = [torch.zeros(8, 64)]
+    shapes = tuple(tuner._get_input_sizes(inputs))
+
+    def opt_sizes():
+        return sorted(p.get_opt_shapes()[0][0]
+                      for p in tuner._profiles_for(config, inputs, shapes))
+
+    first = opt_sizes()
+    buckets[0] = (8, 16)
+    assert opt_sizes() != first
+
+
 def test_clear_forgets_dropped_entries():
     """After clear(), a save no longer removes from the file the entries
     dropped before."""
@@ -4454,7 +4516,8 @@ def test_post_tune_merge_tactics_min_time_and_subset_kept():
     class _FakeDist:
 
         def tp_cp_allgather(self, obj):
-            return [r0, r1]
+            # Each rank's entries, and the keys it dropped (none here).
+            return [(r0, []), (r1, [])]
 
     tuner._dist = _FakeDist()
     tuner.profiling_cache.cache = dict(r0)
@@ -4571,7 +4634,8 @@ def test_autotune_post_tune_merge_before_save(tmp_path):
         mapping = Mapping(world_size=2, rank=0, tp_size=2)
 
         def tp_cp_allgather(self, obj):
-            return [r0, r1]
+            # Each rank's entries, and the keys it dropped (none here).
+            return [(r0, []), (r1, [])]
 
     prev_mapping, prev_dist = tuner.mapping, tuner._dist
     path = str(tmp_path / "cache.json")

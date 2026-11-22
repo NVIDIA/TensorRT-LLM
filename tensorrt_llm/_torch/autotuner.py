@@ -1750,10 +1750,12 @@ class _FingerprintWalk:
         Module-level statements that change the value, in each module on the
         way, count with it."""
         for _ in range(16):
-            # A module the chain reaches is imported if it is not yet (the
-            # branch of a fallback import this process did not take), so that
-            # the fingerprint does not depend on what it happened to import.
-            if not self.counts(module) or _load_module(module) is None:
+            if not self.counts(module):
+                return module, attr, None
+            if module not in sys.modules:
+                # The branch of a fallback import this process did not take:
+                # counted by its file, which is not run.
+                self.add_unimported(module)
                 return module, attr, None
             index = self.index(sys.modules[module])
             if index is not None:
@@ -1767,18 +1769,37 @@ class _FingerprintWalk:
             # an `except` branch) count too: either may have bound the name.
             for other_level, other_source, other_attr in others:
                 other = _resolve_import(other_level, other_source, package)
-                # Imported if it is not yet, so that the fingerprint does not
-                # depend on whether this process happened to import it.
-                other_module = (_load_module(other) if other is not None
-                                and self.counts(other) else None)
-                if other_module is not None:
+                if other is None or not self.counts(other):
+                    continue
+                if other in sys.modules:
                     self.todo.append((f"{other}.{other_attr}",
-                                      _attribute(other_module, other_attr)))
+                                      _attribute(sys.modules[other],
+                                                 other_attr)))
+                else:
+                    self.add_unimported(other)
             resolved = _resolve_import(level, source, package)
             if resolved is None:
                 return module, attr, None
             module = resolved
         return module, attr, None
+
+    def add_unimported(self, module: str) -> None:
+        """A module this process has not imported counts by its file, found
+        without importing it (or its package, which must be imported)."""
+        if module.rpartition(".")[0] not in sys.modules and "." in module:
+            return
+        try:
+            spec = importlib.util.find_spec(module)
+        except (ImportError, ValueError):
+            return
+        origin = getattr(spec, "origin", None)
+        if not (isinstance(origin, str) and origin.endswith(".py")):
+            return
+        try:
+            index = _source_index(origin)
+        except (OSError, SyntaxError, ValueError):
+            return
+        self.sources[f"{module}:<module>"] = index.digest
 
     def add_mutations(self, module: str, name: str,
                       index: _SourceIndex) -> None:
@@ -3017,6 +3038,9 @@ class AutoTunerProfilingCache:
                 current_cache[rank_key].update(serialized_rank_cache)
 
                 self._atomic_write_json(file_path, current_cache)
+            # The file no longer holds them: a later save must not delete an
+            # entry another process writes there under the same key.
+            self.__dict__.pop("_dropped_keys", None)
             logger.info(
                 f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
             )
@@ -4024,8 +4048,13 @@ class AutoTuner:
     def _profiles_for(self, tuning_config: TuningConfig,
                       inputs: List[torch.Tensor],
                       input_shapes: Tuple) -> List[OptimizationProfile]:
-        """_optimization_profiles, memoized: a warm cache hit in tuning mode
-        checks every profile of the op on every call."""
+        """_optimization_profiles, memoized (a warm cache hit in tuning mode
+        checks every profile of the op on every call), unless a spec makes its
+        buckets with a function, which can return others for the same input."""
+        if any(
+                callable(spec.gen_tuning_buckets)
+                for spec in tuning_config.dynamic_tensor_specs):
+            return self._optimization_profiles(tuning_config, inputs)
         return self._memo(
             "_profiles_memo", (input_shapes, *self._config_key(tuning_config)),
             lambda: self._optimization_profiles(tuning_config, inputs))
@@ -5367,17 +5396,32 @@ class AutoTuner:
         Returns how many of this rank's tactics changed."""
         if not self._is_distributed():
             return 0
-        mine = self.profiling_cache.shareable({
+        cache = self.profiling_cache
+        mine = cache.shareable({
             key: value
-            for key, value in self.profiling_cache.cache.items()
+            for key, value in cache.cache.items()
             if custom_ops is None or key[0] in custom_ops
         })
-        per_rank = self._dist.tp_cp_allgather(obj=mine)
-        merged = (_majority_entries(per_rank)
-                  if majority else _fastest_entries(per_rank))
+        # The keys this rank dropped to tune their profiles again (a loser to
+        # the winner it holds now): a rank that never held that profile's
+        # winner, such as one of another communicator, must not hand them
+        # back.
+        dropped = [
+            key for key in cache.__dict__.get("_dropped_keys", ())
+            if key not in cache.cache and (custom_ops is None
+                                           or key[0] in custom_ops)
+        ]
+        per_rank = self._dist.tp_cp_allgather(obj=(mine, dropped))
+        stale = {key for _, keys in per_rank for key in keys}
+        entries = [{k: v
+                    for k, v in rank_mine.items() if k not in stale}
+                   for rank_mine, _ in per_rank]
+        merged = (_majority_entries(entries)
+                  if majority else _fastest_entries(entries))
         changed = sum(1 for key, value in merged.items()
                       if key not in mine or mine[key][1] != value[1])
-        self.profiling_cache.merge_cache_data(merged)
+        cache.merge_cache_data(merged)
+        cache.drop(key for key in stale if key in cache.cache)
         return changed
 
     def _broadcast_cache_data(
