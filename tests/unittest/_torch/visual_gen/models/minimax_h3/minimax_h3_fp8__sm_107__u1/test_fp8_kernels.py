@@ -300,10 +300,11 @@ def test_bf16_block_attention_cast_matches_the_family_route(scenario, monkeypatc
     if padded:
         valid_len = torch.tensor([max(length - 7, 1)], dtype=torch.int32, device="cuda")
     arguments = (qkv, weight_q, weight_k, angle.cos(), angle.sin(), descale, EPS)
-    arguments += (heads, head_dim, 0, valid_len)
+    arguments += (heads, head_dim)
+    block_id = torch.tensor(0, dtype=torch.int64, device="cpu")
 
-    got = modeling.qk_norm_rope(*arguments)
-    ref = torch.ops.h3_lever8.qk_norm_rope_fp8(*arguments)
+    got = modeling.qk_norm_rope(*arguments, block_id, valid_len)
+    ref = torch.ops.h3_lever8.qk_norm_rope_fp8(*arguments, 0, valid_len)
     for name, a, b in zip(("q", "k", "v", "descale"), got, ref):
         assert a.dtype == b.dtype and a.shape == b.shape, name
         assert _same_fraction(a, b) == 1.0, name

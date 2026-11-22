@@ -47,17 +47,21 @@ def table_lookup(
     weight: torch.Tensor,
     bias: torch.Tensor,
     cache_id: int,
-    block_id: int,
+    block_id: torch.Tensor,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     owner = _OWNERS[cache_id]
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("The conditioning cache is not qualified inside CUDA Graph capture")
+    if block_id.device.type != "cpu":
+        raise ValueError("Conditioning block identifiers must stay on the CPU")
+    index = int(block_id.item())
     if owner.key is None:
         owner.fallbacks += 1
-        return owner.tables[block_id](temb)
-    key = (block_id, owner.key, tuple(temb.shape), str(temb.dtype), str(temb.device))
+        return owner.tables[index](temb)
+    key = (index, owner.key, tuple(temb.shape), str(temb.dtype), str(temb.device))
     if key not in owner.cache:
-        owner.cache[key] = owner.tables[block_id](temb)
+        owner.cache[key] = owner.tables[index](temb)
         owner.misses += 1
     else:
         owner.hits += 1
@@ -65,11 +69,11 @@ def table_lookup(
 
 
 @table_lookup.register_fake
-def _table_fake(temb, weight, bias, cache_id, block_id):
+def _table_fake(temb, weight, bias, cache_id, block_id, output_dtype):
     return torch.empty(
         (temb.shape[0] * 3, 6 * 5376),
         device=temb.device,
-        dtype=_OWNERS[cache_id].table_dtypes[block_id],
+        dtype=output_dtype,
     )
 
 
@@ -84,6 +88,7 @@ def _table(module, temb: torch.Tensor) -> torch.Tensor:
         module.linear.bias,
         module._h3_fp8_cache_id,
         module._h3_fp8_block_id,
+        module.linear.dtype,
     )
 
 
@@ -108,9 +113,6 @@ class ConditioningCache:
         self.time_dim = int(transformer.time_proj.num_channels)
         self.original_time = transformer.time_proj.forward
         self.tables = [block.adaln_proj.table for block in transformer.transformer_blocks]
-        self.table_dtypes = [
-            block.adaln_proj.linear.dtype for block in transformer.transformer_blocks
-        ]
         _OWNERS[self.identifier] = self
         self._install(transformer)
 
@@ -131,5 +133,5 @@ class ConditioningCache:
         transformer.time_proj.forward = types.MethodType(_time_forward, transformer.time_proj)
         for index, block in enumerate(transformer.transformer_blocks):
             block.adaln_proj._h3_fp8_cache_id = self.identifier
-            block.adaln_proj._h3_fp8_block_id = index
+            block.adaln_proj._h3_fp8_block_id = torch.tensor(index, device="cpu", dtype=torch.int64)
             block.adaln_proj.table = types.MethodType(_table, block.adaln_proj)

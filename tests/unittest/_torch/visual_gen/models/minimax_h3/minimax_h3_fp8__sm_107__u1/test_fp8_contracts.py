@@ -679,9 +679,7 @@ class ForwardContract(unittest.TestCase):
             and "minimax_h3_fp8__sm_107__u1/kernels/" in node.value
         ]
         sources = {p.name for pattern in patterns for p in (REPO / "tensorrt_llm").glob(pattern)}
-        self.assertEqual(
-            sources, {"sharedCast.cpp", "sharedCast.cu", "staticQuant.cpp", "staticQuant.cu"}
-        )
+        self.assertEqual(sources, {"conversionBindings.cpp", "sharedCast.cu", "staticQuant.cu"})
 
     def test_heads_share_one_cast_through_the_family_hook(self):
         casts = []
@@ -939,6 +937,7 @@ class FusedDispatchContracts(unittest.TestCase):
         attention._use_fused_fp8_qk = lambda *args: True
         attention._use_packed_a2a = lambda *args: False
         attention.head_dim, attention.local_num_attention_heads, attention.layer_idx = 128, 56, 0
+        attention._fp8_block_id = SimpleNamespace(item=lambda: 0)
         attention.norm_q = attention.norm_k = SimpleNamespace(
             weight=tensor((128,)), variance_epsilon=1e-6
         )
@@ -1036,7 +1035,9 @@ class LifecycleContracts(unittest.TestCase):
                         {"ConditioningCache", "_table_fake", "_table", "_time_forward"},
                         {
                             "torch": SimpleNamespace(
-                                empty=lambda shape, *, device, dtype: _LayoutTensor(shape, dtype)
+                                empty=lambda shape, *, device, dtype: _LayoutTensor(shape, dtype),
+                                tensor=lambda value, **kwargs: value,
+                                int64="INT64",
                             ),
                             "types": SimpleNamespace(MethodType=MethodType),
                             "OrderedDict": OrderedDict,
@@ -1085,7 +1086,12 @@ class LifecycleContracts(unittest.TestCase):
                     temb = _LayoutTensor((timesteps, 2688))
                     actual = cache.tables[0](temb)
                     fake = namespace["_table_fake"](
-                        temb, modulation.linear.weight, modulation.linear.bias, cache.identifier, 0
+                        temb,
+                        modulation.linear.weight,
+                        modulation.linear.bias,
+                        cache.identifier,
+                        0,
+                        modulation.linear.dtype,
                     )
                     self.assertEqual(fake.shape, actual.shape)
                     self.assertEqual(fake.dtype, actual.dtype)

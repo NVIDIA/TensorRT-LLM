@@ -36,9 +36,11 @@ def qk_norm_rope(
     eps: float,
     num_heads: int,
     head_dim: int,
-    layer_idx: int,
+    layer_idx: torch.Tensor,
     valid_len: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if layer_idx.device.type != "cpu":
+        raise ValueError("The QK block identifier must stay on the CPU")
     outputs, scales = fused_fp8_qk._qk_norm_rope_fp8_impl(
         qkv,
         weight_q,
@@ -49,7 +51,7 @@ def qk_norm_rope(
         eps,
         num_heads,
         head_dim,
-        layer_idx,
+        int(layer_idx.item()),
         valid_len,
         0,
         # MiniMaxH3RotaryPosEmbed repeats its frequencies: cos and sin are cat((f, f)).
@@ -137,7 +139,7 @@ class Fp8Attention(ScenarioAttention):
             float(self.norm_q.variance_epsilon),
             self.local_num_attention_heads,
             self.head_dim,
-            int(self.layer_idx),
+            self._fp8_block_id,
             valid_len,
         )
         raw = self._attn_impl(
@@ -370,4 +372,6 @@ class Fp8Transformer(ScenarioTransformer):
                 "_fp8_output_quant_factor", factors[index : index + 1], persistent=False
             )
         self.fp8_conditioning_cache = ConditioningCache(self)
+        for block in blocks:
+            block.attn._fp8_block_id = block.adaln_proj._h3_fp8_block_id
         torch.cuda.synchronize(device)
