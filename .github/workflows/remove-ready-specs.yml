@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Removes the root specs/ folder (design documents shared for draft-stage
+# review) from a pull request's branch once the pull request is ready for
+# review, and comments on the pull request.
+#
+# Never checks out or executes pull request code: the branch is changed through
+# the GraphQL createCommitOnBranch API from PR metadata and tree listings only.
+# Do not add allow-unsafe-pr-checkout, and do not fetch the fork in a run step.
+
+name: Remove Ready Specs
+
+on:
+  pull_request_target:
+    # ready_for_review is required: marking a PR ready pushes no commit, so
+    # synchronize alone never fires for that transition.
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # Queue rather than cancel: an interrupted run could leave a commit without its notice.
+  group: spec-archive-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  remove-specs:
+    name: Remove specs/ from a ready pull request
+    # SPECS_REMOVAL_BOT_LOGIN is the login that owns SPECS_REMOVAL_TOKEN. Pushes
+    # it makes are this workflow's own removal commits and need no second look.
+    if: >-
+      vars.SPEC_ARCHIVE_ENABLED == 'true' &&
+      github.event.pull_request.draft == false &&
+      !(github.event.action == 'synchronize' &&
+        github.event.sender.login == vars.SPECS_REMOVAL_BOT_LOGIN)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The default ref of pull_request_target is the default branch, so the
+      # script always matches this workflow file.
+      - name: Checkout the default branch (scripts only)
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # GITHUB_TOKEN reads trees and posts the notice. SPECS_REMOVAL_TOKEN, a
+      # classic token of a machine user with write access to this repository,
+      # is used only to create the removal commit, so that checks run on it.
+      - name: Remove specs/ and post a notice
+        uses: actions/github-script@v9
+        env:
+          SPECS_REMOVAL_TOKEN: ${{ secrets.SPECS_REMOVAL_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SPEC_GITHUB_TOKEN: ${{ secrets.SPEC_ARCHIVE_SOURCE_TOKEN }}
+          ARTIFACTORY_URL: ${{ vars.SPEC_ARTIFACTORY_URL }}
+          ARTIFACTORY_REPOSITORY: ${{ vars.SPEC_ARTIFACTORY_REPOSITORY }}
+          ARTIFACTORY_TOKEN: ${{ secrets.SPEC_ARCHIVE_WRITE_TOKEN }}
+          SPECS_REMOVAL_SIGNOFF: ${{ vars.SPECS_REMOVAL_SIGNOFF }}
+        with:
+          script: |
+            const { run } = require('./.github/scripts/remove_ready_specs.js');
+            const { archiveSpecs } = require('./.github/scripts/spec_archive/github-archive-bridge.js');
+            const token = process.env.SPECS_REMOVAL_TOKEN;
+            await run({
+              github, context, core,
+              pusher: token ? getOctokit(token) : null,
+              signoff: process.env.SPECS_REMOVAL_SIGNOFF,
+              archive: archiveSpecs,
+            });
