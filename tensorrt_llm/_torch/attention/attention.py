@@ -1069,6 +1069,15 @@ class Attention(nn.Module):
         here), and kv_append is the KV-append plan of a GQA decode layer (see preprocess_qkv)."""
         num_tokens = attn_metadata.num_tokens
 
+        num_rows = q.shape[0]
+        if (mrope_rotary_cos_sin is not None and num_rows > num_tokens
+                and mrope_rotary_cos_sin.numel() % num_rows == 0):
+            # A padded prefill graph packs a cos/sin row for every row of q. Keep the live rows,
+            # as for q, k and v: locality-domain attention reads the row width from them.
+            row_width = mrope_rotary_cos_sin.numel() // num_rows
+            mrope_rotary_cos_sin = mrope_rotary_cos_sin.reshape(
+                -1)[:num_tokens * row_width].view(1, -1)
+
         q = q[:num_tokens, :]
         if k is not None:
             k = k[:num_tokens, :]
