@@ -120,6 +120,46 @@ def gelu_erf(gate_x: torch.Tensor) -> torch.Tensor:
     return F.gelu(gate) * x
 
 
+def _split_fused_qkv_tensor(
+    name: str, tensor: torch.Tensor, q_dim: int, kv_dim: int
+) -> Dict[str, torch.Tensor]:
+    """Split one fused ``q_k_v_proj`` checkpoint tensor into q/k/v parts.
+
+    Handles the tensor kinds a Spark checkpoint stores under the fused
+    projection:
+
+    - row tensors whose first dim is ``q_dim + 2 * kv_dim`` (the weight, or a
+      bias) are row-split ``[q, k, v]``;
+    - per-tensor scalar scales (``numel() == 1``) are shared by all three
+      parts;
+    - block-scale tensors (first dim = fused rows / block size, e.g. the
+      ``[48, 20]`` FP8 ``weight_scale_inv`` of the 4B checkpoint) are split by
+      the same row blocks;
+    - anything else raises, since silently mis-splitting a scale would
+      corrupt every layer's QKV.
+    """
+    total = q_dim + 2 * kv_dim
+    if tensor.numel() == 1:
+        return {"q": tensor, "k": tensor, "v": tensor}
+    if tensor.dim() >= 1 and tensor.shape[0] == total:
+        sizes = [q_dim, kv_dim, kv_dim]
+    elif (
+        tensor.dim() >= 1
+        and tensor.shape[0] > 1
+        and total % tensor.shape[0] == 0
+        and all(d % (total // tensor.shape[0]) == 0 for d in (q_dim, kv_dim))
+    ):
+        factor = total // tensor.shape[0]
+        sizes = [q_dim // factor, kv_dim // factor, kv_dim // factor]
+    else:
+        raise ValueError(
+            f"Cannot split fused q_k_v_proj tensor {name!r} of shape "
+            f"{tuple(tensor.shape)} for q_dim={q_dim}, kv_dim={kv_dim}"
+        )
+    q, k, v = torch.split(tensor, sizes, dim=0)
+    return {"q": q, "k": k, "v": v}
+
+
 class Spark2_5Attention(Attention):
     """Spark attention: per-layer-type RoPE, optional sliding window, and a
     headwise gate (``g_proj``) applied to the attention output before
@@ -183,6 +223,11 @@ class Spark2_5Attention(Attention):
             g_tp_mode = (
                 None if model_config.mapping.enable_attention_dp else TensorParallelMode.COLUMN
             )
+            # quant_config=None: quantized Spark checkpoints (e.g. FP8) keep
+            # g_proj in BF16 without scales; inheriting the model-wide quant
+            # config would build an FP8 layer, cast the BF16 weight without
+            # a scale, and trip the 128-alignment assert at TP >= 2.
+            # Same treatment as step3p7's headwise gate.
             self.g_proj = Linear(
                 config.hidden_size,
                 config.num_attention_heads,
@@ -190,7 +235,8 @@ class Spark2_5Attention(Attention):
                 dtype=config.torch_dtype,
                 mapping=model_config.mapping,
                 tensor_parallel_mode=g_tp_mode,
-                quant_config=model_config.get_quant_config(),
+                quant_config=None,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
 
     def forward(self, position_ids, hidden_states, *args, **kwargs):
@@ -245,6 +291,10 @@ class Spark2_5DecoderLayer(DecoderLayer):
             reduce_output=self.mapping.tp_size > 1,
         )
 
+        # In DEP mode each rank processes different tokens, so TP-sharding the
+        # MLP would all-reduce partial outputs across unrelated requests (or
+        # hang on diverging token counts); replicate it instead, as Llama and
+        # Qwen3 do.
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -253,6 +303,7 @@ class Spark2_5DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
+            overridden_tp_size=1 if model_config.mapping.enable_attention_dp else None,
         )
 
         self.input_layernorm = RMSNorm(
@@ -286,7 +337,7 @@ class Spark2_5DecoderLayer(DecoderLayer):
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, lora_params=kwargs.get("lora_params", None))
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
@@ -418,9 +469,8 @@ class SparkHfWeightMapper(HfWeightMapper):
                 tensor = weights[key]
                 del weights[key]
                 prefix, suffix = key.split("q_k_v_proj")
-                q, k, v = torch.split(tensor, [q_dim, kv_dim, kv_dim], dim=0)
-                weights[f"{prefix}q_proj{suffix}"] = q
-                weights[f"{prefix}k_proj{suffix}"] = k
-                weights[f"{prefix}v_proj{suffix}"] = v
+                parts = _split_fused_qkv_tensor(key, tensor, q_dim, kv_dim)
+                for part in ("q", "k", "v"):
+                    weights[f"{prefix}{part}_proj{suffix}"] = parts[part]
 
         return weights

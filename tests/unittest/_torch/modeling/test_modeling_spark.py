@@ -24,6 +24,7 @@ from tensorrt_llm._torch.models.modeling_spark import (
     Spark2_5ForCausalLM,
     _apply_output_gate,
     _build_rope_params,
+    _split_fused_qkv_tensor,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.functional import RotaryScalingType
@@ -208,6 +209,47 @@ class TestSparkRopeParams:
         config = _tiny_config()
         rp = _build_rope_params(config, "full_attention", max_positions=128)
         assert rp.max_positions == 128
+
+
+@pytest.mark.cpu_only
+class TestSparkQkvSplit:
+    """_split_fused_qkv_tensor must handle every tensor kind a Spark
+    checkpoint stores under the fused q_k_v_proj name (weight, block scales,
+    scalar scales) and reject anything it cannot split faithfully."""
+
+    Q_DIM = 256  # 4 heads x 64
+    KV_DIM = 128  # 2 heads x 64
+    TOTAL = Q_DIM + 2 * KV_DIM  # 512
+
+    def test_split_weight_rows(self):
+        tensor = torch.arange(self.TOTAL * 3, dtype=torch.float32).reshape(self.TOTAL, 3)
+        parts = _split_fused_qkv_tensor("w", tensor, self.Q_DIM, self.KV_DIM)
+        torch.testing.assert_close(parts["q"], tensor[: self.Q_DIM])
+        torch.testing.assert_close(parts["k"], tensor[self.Q_DIM : self.Q_DIM + self.KV_DIM])
+        torch.testing.assert_close(parts["v"], tensor[self.Q_DIM + self.KV_DIM :])
+
+    def test_split_block_scales_by_block_count(self):
+        # FP8 block-scale layout: one scale row per 128 weight rows, e.g. the
+        # [48, 20] weight_scale_inv of the 4B checkpoint. Here 512/128 = 4 rows.
+        scales = torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2)
+        parts = _split_fused_qkv_tensor("s", scales, self.Q_DIM, self.KV_DIM)
+        assert parts["q"].shape == (2, 2)
+        assert parts["k"].shape == (1, 2)
+        assert parts["v"].shape == (1, 2)
+        torch.testing.assert_close(torch.cat([parts["q"], parts["k"], parts["v"]]), scales)
+
+    def test_scalar_scale_shared(self):
+        scalar = torch.tensor(0.5)
+        parts = _split_fused_qkv_tensor("s", scalar, self.Q_DIM, self.KV_DIM)
+        for name in ("q", "k", "v"):
+            torch.testing.assert_close(parts[name], scalar)
+
+    def test_unsplittable_shape_raises(self):
+        with pytest.raises(ValueError, match="Cannot split"):
+            _split_fused_qkv_tensor("w", torch.zeros(7, 3), self.Q_DIM, self.KV_DIM)
+        # Row count divides the total but not the q/k/v boundaries.
+        with pytest.raises(ValueError, match="Cannot split"):
+            _split_fused_qkv_tensor("w", torch.zeros(3, 3), self.Q_DIM, self.KV_DIM)
 
 
 # ---------------------------------------------------------------------------
