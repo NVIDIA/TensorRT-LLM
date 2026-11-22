@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import array
 import functools
+import hashlib
 import math
 import os
 import sys
@@ -156,6 +158,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .page_table import ByHead, PageTableSpec, Replicated, explicit_layer_specs, kv_dtype_name
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
     HostHistoryReservations,
@@ -389,6 +392,12 @@ class Role:
     ALL = DataRole("all")
 
 
+# The roles the base manager splits by KV head (page_table_spec).
+_HEAD_SPLIT_ROLES = frozenset(
+    str(role) for role in (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
+)
+
+
 class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
@@ -533,6 +542,48 @@ def _request_conversation_id(request: LlmRequest) -> Optional[str]:
     return conversation_id or None
 
 
+_TOKEN_WORD_BYTES = 8
+
+
+def _token_word(token: TokenIdExt) -> int:
+    """Map one token to a signed 64-bit word; integer tokens map to themselves."""
+    if isinstance(token, int):
+        return token
+    payload = token if isinstance(token, bytes) else token.digest
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little", signed=True)
+
+
+def _token_words(tokens: Sequence[TokenIdExt]) -> bytes:
+    """Encode tokens as fixed-width 64-bit words so prefixes can be sliced."""
+    try:
+        return array.array("q", tokens).tobytes()
+    except TypeError:
+        return array.array("q", (_token_word(token) for token in tokens)).tobytes()
+
+
+def _prefix_digests(words: bytes, prefix_lengths: Iterable[int]) -> Dict[int, bytes]:
+    """Digest ``words`` truncated to each prefix length (in tokens) in one pass."""
+    hasher = hashlib.blake2b(digest_size=16)
+    digests: Dict[int, bytes] = {}
+    position = 0
+    for length in sorted(set(prefix_lengths)):
+        hasher.update(words[position * _TOKEN_WORD_BYTES : length * _TOKEN_WORD_BYTES])
+        position = length
+        digests[length] = hasher.copy().digest()
+    return digests
+
+
+@dataclass(slots=True)
+class _RetainedTurn:
+    """A completed conversation turn whose committed state is still retained."""
+
+    drop_handle: PlannedDropHandle
+    # Set only with drop_extended_turns: identifies the turn's committed tokens.
+    num_committed_tokens: int = 0
+    reuse_scope: Optional[ReuseScope] = None
+    committed_digest: bytes = b""
+
+
 def _request_conversation_key(request: LlmRequest) -> tuple[str, int | None, str | None] | None:
     conversation_id = _request_conversation_id(request)
     if conversation_id is None:
@@ -544,7 +595,7 @@ def _request_conversation_key(request: LlmRequest) -> tuple[str, int | None, str
 @dataclass(slots=True)
 class _ConversationState:
     current_request_id: Optional[int] = None
-    planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
+    retained_turns: deque[_RetainedTurn] = field(default_factory=deque)
     prefix_length: int = 0
     prefix_hash: bytes | None = None
 
@@ -552,8 +603,9 @@ class _ConversationState:
 class ConversationManager:
     """Track the current request and drop plan for each conversation."""
 
-    def __init__(self, max_num_turns: int) -> None:
+    def __init__(self, max_num_turns: int, drop_extended_turns: bool = False) -> None:
         self._max_num_turns = max_num_turns
+        self._drop_extended_turns = drop_extended_turns
         self._conversation_states: Dict[tuple[str, int | None, str | None], _ConversationState] = {}
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
@@ -592,11 +644,53 @@ class ConversationManager:
             if prefix_hash is not None:
                 state.prefix_length = prefix_length
                 state.prefix_hash = prefix_hash
-            state.planned_drop_handles.append(drop_handle)
-            if len(state.planned_drop_handles) > self._max_num_turns:
-                state.planned_drop_handles.popleft().drop()
+            # Plan the new turn before dropping older ones: pages the turns
+            # share keep a planned drop and stay reusable.
+            if self._drop_extended_turns:
+                turn = self._retain_and_drop_extended(state, drop_handle, kv_cache)
+            else:
+                turn = _RetainedTurn(drop_handle)
+            state.retained_turns.append(turn)
+            if len(state.retained_turns) > self._max_num_turns:
+                state.retained_turns.popleft().drop_handle.drop()
 
         self.finish_request(request)
+
+    @staticmethod
+    def _retain_and_drop_extended(
+        state: _ConversationState, drop_handle: PlannedDropHandle, kv_cache: _KVCache
+    ) -> _RetainedTurn:
+        """Drop the retained turns the new turn extends and describe the new turn."""
+        num_committed_tokens = kv_cache.num_committed_tokens
+        reuse_scope = kv_cache.reuse_scope
+        words = _token_words(kv_cache.committed_tokens)
+        candidates = [
+            turn
+            for turn in state.retained_turns
+            if turn.reuse_scope == reuse_scope and turn.num_committed_tokens <= num_committed_tokens
+        ]
+        digests = _prefix_digests(
+            words, [turn.num_committed_tokens for turn in candidates] + [num_committed_tokens]
+        )
+        extended = {
+            id(turn)
+            for turn in candidates
+            if digests[turn.num_committed_tokens] == turn.committed_digest
+        }
+        if extended:
+            kept: deque[_RetainedTurn] = deque()
+            for turn in state.retained_turns:
+                if id(turn) in extended:
+                    turn.drop_handle.drop()
+                else:
+                    kept.append(turn)
+            state.retained_turns = kept
+        return _RetainedTurn(
+            drop_handle,
+            num_committed_tokens=num_committed_tokens,
+            reuse_scope=reuse_scope,
+            committed_digest=digests[num_committed_tokens],
+        )
 
     def prepare_request(self, request: LlmRequest) -> None:
         """Register a context request unless its conversation has another active one."""
@@ -626,7 +720,7 @@ class ConversationManager:
             return
 
         state.current_request_id = None
-        if not state.planned_drop_handles:
+        if not state.retained_turns:
             self._conversation_states.pop(conversation_key)
 
     def clear(self) -> None:
@@ -2311,6 +2405,12 @@ class KVCacheManagerV2(BaseResourceManager):
         return cls is KVCacheManagerV2
 
     @property
+    def spec_recompute_tail(self) -> int:
+        """Prompt-tail tokens recomputed on a prefix hit for a hidden-state
+        drafter: 0 off, -1 the whole prompt."""
+        return self._spec_recompute_tail
+
+    @property
     def _kv_alloc_extra_tokens(self) -> int:
         """Tokens a request is allocated beyond its history for spec decoding.
 
@@ -3513,7 +3613,10 @@ class KVCacheManagerV2(BaseResourceManager):
             and self._can_publish_block_reuse
         )
         self.conversation_manager = (
-            ConversationManager(block_reuse_config.max_num_turns)
+            ConversationManager(
+                block_reuse_config.max_num_turns,
+                drop_extended_turns=block_reuse_config.drop_extended_turns,
+            )
             if enable_conversation_manager
             else None
         )
@@ -5732,6 +5835,23 @@ class KVCacheManagerV2(BaseResourceManager):
             own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
         return [high[layer_id] if layer_id in high else 2 * own[layer_id] for layer_id in layer_ids]
 
+    def _mixed_precision_model_layer_ids(self, layer_group_id: int) -> List[int]:
+        """Return the model layer of each layer of a layer group under mixed-precision KV, in the
+        order of ``_mixed_precision_global_layer_ids``; a high layer belongs to its layer's."""
+        high = {
+            int(high_layer): int(self.pp_layers[local])
+            for local, high_layer in self.mixed_precision_high_layers.items()
+        }
+        virtual = getattr(self, "_layer_attn_to_layer_id", None)
+        if virtual:
+            own = {}
+            for (model_layer, _), layer_id in virtual.items():
+                own.setdefault(int(layer_id), int(model_layer))
+        else:
+            own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
+        layer_ids = self._layer_ids_by_group[layer_group_id]
+        return [high[layer_id] if layer_id in high else own[layer_id] for layer_id in layer_ids]
+
     def _get_mixed_precision_buffers(
         self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
     ) -> torch.Tensor:
@@ -5858,6 +5978,52 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    def page_table_spec(self) -> PageTableSpec:
+        """What this manager says of its pages that its runtime config and storage do not: how
+        each role's bytes spread over ranks, which roles never move, are derived or are rebuilt
+        per request, how its layers are named and how its KV data is quantized.
+
+        The base manager lays out the roles it registers itself: K/V and their block scales
+        split by KV head, head-major (HND), as the TRTLLM attention kernels write them, a K-only
+        (MLA) cache holding one latent head, which every tensor rank holds whole; and index-K,
+        which every tensor rank projects alike. A K-only cache given layers of K and V of their
+        own (``layer_specs``), as a drafter's beside an MLA target's latent, splits each layer by
+        its own KV heads instead, the latent one head (``page_table._kv_heads``). A manager
+        registering other roles or laying these out otherwise returns its own, usually this one
+        with some fields replaced (``dataclasses.replace``); a role that moves and that its spec
+        does not lay out makes ``get_page_table`` fail rather than guess. Under mixed-precision
+        KV it names the layers (``_mixed_precision_layer_ids``)."""
+        latent = self.kv_factor == 1 and all(
+            int(layer.kv_factor) == 1 for layer in explicit_layer_specs(self).values()
+        )
+        head_split = ByHead(total=1) if latent else ByHead()
+        return PageTableSpec(
+            role_layouts={
+                **{role: head_split for role in _HEAD_SPLIT_ROLES},
+                Role.INDEX_KEY: Replicated(),
+            },
+            layer_ids=self._mixed_precision_layer_ids(),
+            quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
+        )
+
+    def _mixed_precision_layer_ids(self) -> Optional[Dict[int, Tuple[int, int]]]:
+        """Internal layer id -> (global layer id, model layer) under mixed-precision KV, as
+        ``_mixed_precision_global_layer_ids`` and ``_mixed_precision_model_layer_ids`` name each
+        layer group's layers: model layer ``L``'s high layer ``2 * L + 1`` and every other layer
+        twice the id it has without, alike on every pipeline stage, whether it holds high layers
+        or not; None without mixed-precision KV."""
+        if getattr(self, "mixed_precision_low_dtype", None) is None:
+            return None
+        layer_ids: Dict[int, Tuple[int, int]] = {}
+        for layer_group_id, layers in enumerate(self._layer_ids_by_group):
+            names = zip(
+                self._mixed_precision_global_layer_ids(layer_group_id),
+                self._mixed_precision_model_layer_ids(layer_group_id),
+            )
+            for layer, (global_layer, model_layer) in zip(layers, names):
+                layer_ids[int(layer)] = (int(global_layer), int(model_layer))
+        return layer_ids
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.
@@ -7081,9 +7247,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     kv_cache_retention_config=self._retention_config_for_request(req),
                     is_dummy=req.is_dummy,
                     enable_request_stats=req.return_perf_metrics,
-                    expected_prompt_length=(
-                        req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-                    ),
+                    expected_prompt_length=self._expected_prompt_length(req),
                     custom_priority_callback=self._context_priority_callback(req),
                     locality_domain_id=locality_domain_id,
                 )
@@ -7163,28 +7327,38 @@ class KVCacheManagerV2(BaseResourceManager):
         """Pending recovery rows fixed at resume; None keeps ordinary budgeting."""
         return None
 
+    def context_reuse_claim_limit(self, req: LlmRequest) -> int | None:
+        """Reuse-claim cap that leaves ``req`` its spec recompute tail, or None.
+
+        The claim is capped rather than the cursor rewound afterwards: a capped
+        claim is a shorter match, so the core materializes every page the
+        recompute needs (SWA life cycles onboard only the sink and live-window
+        pages at the matched endpoint). The tail check runs first: partially
+        constructed managers carry only the class-level zero tail.
+
+        A context-only (disaggregated) request is not capped unless the
+        drafter's layers share this manager: only then are its draft pages
+        transferred with the target's; otherwise the generation worker's
+        drafter starts from an empty context whatever the context server
+        recomputes.
+        """
+        if not self._spec_recompute_tail:
+            return None
+        if req.is_context_only_request and not self._shared_draft_block_width:
+            return None
+        return _spec_recompute_claim_limit(
+            req,
+            tail=self._spec_recompute_tail,
+            tokens_per_block=self.tokens_per_block,
+            is_draft=self.is_draft,
+        )
+
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create/resume the cache and expose local or reserved reuse before budgeting."""
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        # Hidden-state drafters need a recomputed prompt tail: cap the reuse
-        # CLAIM rather than rewinding the cursor afterwards. A capped claim is
-        # just a shorter match, so the core materializes every page the
-        # recompute needs (for SWA life cycles only sink and live-window pages
-        # at the matched endpoint are onboarded; a cursor rewound below that
-        # endpoint would read and write spans with no pages behind them). The
-        # tail check runs first: partially constructed managers carry only the
-        # class-level zero tail.
-        limit = None
-        if self._spec_recompute_tail:
-            limit = _spec_recompute_claim_limit(
-                req,
-                tail=self._spec_recompute_tail,
-                tokens_per_block=self.tokens_per_block,
-                is_draft=self.is_draft,
-            )
-        reused = self.prepare_context_cache(req, limit)
+        reused = self.prepare_context_cache(req, self.context_reuse_claim_limit(req))
         if reused is None:
             return False
         # First chunk only: num_committed_tokens holds at the initial prefix
@@ -7757,12 +7931,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # local reuse does. Cap the reservation at the same claim limit, so
         # the recomputed tail stays local by construction; a full-re-prefill
         # tail (-1) caps to zero and releases the reservation below.
-        limit = _spec_recompute_claim_limit(
-            req,
-            tail=self._spec_recompute_tail,
-            tokens_per_block=self.tokens_per_block,
-            is_draft=self.is_draft,
-        )
+        limit = self.context_reuse_claim_limit(req)
         if limit is not None:
             end = min(end, limit)
         if end <= local_end:
@@ -7855,6 +8024,14 @@ class KVCacheManagerV2(BaseResourceManager):
             req, local_end
         )
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        # A connector-served prefix starves a hidden-state drafter like local
+        # reuse does: leave the spec recompute tail to the forward pass.
+        # Defensive today: startup rejects a KV connector with speculative
+        # decoding on this manager (py_executor.py), so a tail never meets a
+        # connector offer until that guard is lifted.
+        limit = self.context_reuse_claim_limit(req)
+        if limit is not None:
+            offered_end = min(offered_end, max(limit, local_end))
 
         position = local_end
         if offered_end > local_end:
@@ -8279,6 +8456,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return self.impl.get_storage_statistics(cache_level)
+
+    def get_storage_statistics(self, cache_level: CacheLevel) -> list:
+        """Per-pool-group storage statistics at ``cache_level``, as the storage reports them."""
+        return self._get_storage_statistics(cache_level)
 
     def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
         """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
@@ -10657,6 +10838,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 # pages before the first generation allocation.
                 kv_cache.enable_swa_scratch_reuse = False
 
+    def _expected_prompt_length(self, req: LlmRequest) -> int:
+        """Return the cached prompt length after which allocations count as generation."""
+        return req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+
+    def _generation_history_length(self, req: LlmRequest) -> int | None:
+        """Return the history length a generation update records, or None to keep it."""
+        # Reuse (history's consumer) is disabled under helix, and under
+        # disaggregated helix max_beam_num_tokens mixes rank-local and global
+        # counts.
+        if self.kv_compression_manages_history or self._has_cp_helix:
+            return None
+        return req.max_beam_num_tokens - 1
+
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
         """Advance a context cache's history marker, or raise."""
         if not kv_cache.resize(None, history_length):
@@ -10727,14 +10921,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
-            history_length = (
-                None
-                # Reuse (history's consumer) is disabled under helix, and under
-                # disaggregated helix max_beam_num_tokens mixes rank-local and
-                # global counts.
-                if self.kv_compression_manages_history or self._has_cp_helix
-                else req.max_beam_num_tokens - 1
-            )
+            history_length = self._generation_history_length(req)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(

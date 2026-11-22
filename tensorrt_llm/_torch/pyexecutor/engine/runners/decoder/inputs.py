@@ -66,7 +66,7 @@ from tensorrt_llm._torch.utils import (
     helix_local_len,
     set_per_request_prefill_cuda_graph_flag,
 )
-from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
+from tensorrt_llm._utils import current_cuda_stream, maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
@@ -170,6 +170,17 @@ def _chunk_reads_prefetched_tensors(multimodal_params: MultimodalParams, use_mro
         mrope_config.get("mrope_position_ids") is not None
         or mrope_config.get("mrope_position_deltas") is not None
     )
+
+
+_token_iota_cache = torch.empty(0, dtype=torch.int)
+
+
+def _token_iota(count: int) -> torch.Tensor:
+    """Host int32 ``[0, count)``, sliced from one cached range."""
+    global _token_iota_cache
+    if _token_iota_cache.numel() < count:
+        _token_iota_cache = torch.arange(max(count, 2 * _token_iota_cache.numel()), dtype=torch.int)
+    return _token_iota_cache[:count]
 
 
 def _zero_fill_row_spans(buffer: torch.Tensor, spans: list[tuple[int, int]]) -> None:
@@ -648,8 +659,29 @@ class DecoderInputPreparer:
         counts = attn_metadata.get_adp_token_counts()
         if self.mapping.has_cp_helix():
             counts = [math.ceil(count / self.mapping.cp_size) for count in counts]
-        gathered = self.dist.tp_cp_allgather_int64([*counts, *spec_counts])
-        cols = gathered.T.tolist()
+        runner = self.cuda_graph_runner
+        replay_key = (
+            runner.take_agreed_replay_key(attn_metadata)
+            if runner is not None and self.mapping.cp_size == 1
+            else None
+        )
+        if replay_key is None:
+            gathered = self.dist.tp_cp_allgather_int64([*counts, *spec_counts])
+            cols = gathered.T.tolist()
+        else:
+            # Every rank replays a graph of the agreed size, which fixes these counts.
+            # The key uses the physical draft buffer: PARD's 2K-1 entries
+            # correspond to logical draft length K and 2K tokens per step.
+            if (
+                counts[0] != runner.graph_num_tokens(replay_key)
+                or spec_counts[1:3] != (replay_key.batch_size, replay_key.batch_size)
+                or spec_metadata.runtime_tokens_per_gen_step - 1 != replay_key.draft_len
+            ):
+                raise RuntimeError(
+                    f"Attention-DP counts {counts}, {spec_counts} do not match the agreed "
+                    f"CUDA graph {replay_key}"
+                )
+            cols = [[value] * self.mapping.tp_size for value in (*counts, *spec_counts)]
         return (attn_metadata.set_adp_token_counts(cols[: len(counts)]), cols[len(counts) :])
 
     def record_cached_kv_tokens_per_req(
@@ -1135,13 +1167,13 @@ class DecoderInputPreparer:
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
-            # Prefill CUDA graphs can also capture guided decoding.
+            # Prefill CUDA graphs capture only the decoder body; guided decoding runs after it.
+            # _skip_inactive raises if a capture ever records guided work while inactive.
             self.guided_decoder.add_batch(
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=runtime_draft_len,
-                is_cuda_graph=maybe_graph
-                or self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED,
+                is_cuda_graph=maybe_graph,
             )
 
         spec_config = self._config.spec_config if enable_spec_decode else None
@@ -1268,7 +1300,12 @@ class DecoderInputPreparer:
         )
 
         if enable_spec_decode:
-            self._gather_ids_buffer.update(torch.tensor(host.lists.gather_ids, dtype=torch.int))
+            gather_ids = host.lists.gather_ids
+            if host.num_ctx_requests == 0:
+                # Without context rows every token is gathered, in order.
+                self._gather_ids_buffer.update(_token_iota(len(gather_ids)))
+            else:
+                self._gather_ids_buffer.update(torch.tensor(gather_ids, dtype=torch.int))
 
         host.runtime_draft_len = runtime_draft_len
         self._prepare_attn_metadata(
@@ -1650,6 +1687,14 @@ class DecoderInputPreparer:
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
+        if not promoted_context_request_ids and next_draft_tokens_device is not None:
+            # Every request verifies drafts.
+            requests = scheduled_requests.generation_requests
+            all_gen_request_ids.extend([request.py_request_id for request in requests])
+            for request in requests:
+                (extend_dummy_requests if request.is_dummy else extend_requests).append(request)
+            extend_requests += extend_dummy_requests
+            return
         for request in scheduled_requests.generation_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
             if is_promoted_context:
@@ -1671,7 +1716,7 @@ class DecoderInputPreparer:
                 extend_requests.append(request)
             elif is_promoted_context:
                 generation_requests.append(request)
-            elif get_draft_token_length(request) > 0 or next_draft_tokens_device is not None:
+            elif next_draft_tokens_device is not None or get_draft_token_length(request) > 0:
                 if request.is_dummy:
                     extend_dummy_requests.append(request)
                 else:
@@ -1786,13 +1831,31 @@ class DecoderInputPreparer:
         # Under extend_ctx the attention kernel runs extend requests as chunked
         # context rows: their rotary comes from position_ids alone, and they take
         # no entry in the generation-indexed MRoPE delta read slots.
-        extend_requests_are_context = (
-            _use_mrope
-            and enable_spec_decode
+        extend_as_context = bool(
+            enable_spec_decode
             and spec_config.spec_dec_mode.extend_ctx(self._config.attention_backend)
             and spec_config.is_linear_tree
         )
-        for request in extend_requests:
+        extend_requests_are_context = _use_mrope and extend_as_context
+        add_generation_request = (
+            None if extra_inputs is _NO_EXTRA_INPUTS else extra_inputs.add_generation_request
+        )
+        num_packed = 0
+        if (
+            next_draft_tokens_device is not None
+            and not promoted_context_request_ids
+            and not _has_cp_helix
+            and not _use_mrope
+            and not self._dspark_trims_submitted_tokens
+            and add_generation_request is None
+        ):
+            num_packed = self._pack_verifying_prefix(
+                host, runtime_tokens_per_gen_step, extend_as_context
+            )
+            if num_packed:
+                previous_batch_token_start = 0
+                extend_tokens_emitted = num_packed * runtime_tokens_per_gen_step
+        for request in extend_requests[num_packed:] if num_packed else extend_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
             if getattr(request, "py_needs_onehot_draft_probs", False):
                 if request.py_seq_slot is not None:
@@ -1838,11 +1901,7 @@ class DecoderInputPreparer:
                     request.cached_tokens = past_seen_token_num
                 extend_tokens_emitted += 1 + num_draft_tokens
                 draft_lens.append(num_draft_tokens)
-                if (
-                    enable_spec_decode
-                    and spec_config.spec_dec_mode.extend_ctx(self._config.attention_backend)
-                    and spec_config.is_linear_tree
-                ):
+                if extend_as_context:
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
                     prompt_lengths.append(1 + num_draft_tokens)
@@ -1851,10 +1910,10 @@ class DecoderInputPreparer:
 
                 sequence_lengths.append(1 + num_draft_tokens)
                 gather_ids.extend(
-                    list(range(len(position_ids), len(position_ids) + 1 + num_draft_tokens))
+                    range(len(position_ids), len(position_ids) + 1 + num_draft_tokens)
                 )
                 position_ids.extend(
-                    list(range(past_seen_token_num, past_seen_token_num + 1 + num_draft_tokens))
+                    range(past_seen_token_num, past_seen_token_num + 1 + num_draft_tokens)
                 )
                 if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
                     # One position per token row, in batch order, so the rows
@@ -1903,10 +1962,10 @@ class DecoderInputPreparer:
 
                 draft_lens.append(request_tokens_per_step - 1)
                 gather_ids.extend(
-                    list(range(len(position_ids), len(position_ids) + request_tokens_per_step))
+                    range(len(position_ids), len(position_ids) + request_tokens_per_step)
                 )
                 position_ids.extend(
-                    list(range(past_seen_token_num, past_seen_token_num + request_tokens_per_step))
+                    range(past_seen_token_num, past_seen_token_num + request_tokens_per_step)
                 )
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
@@ -1929,11 +1988,7 @@ class DecoderInputPreparer:
                     local_full = _helix_local_len_host(base + group)
                     helix_owned_new_tokens.append(0)
                     num_cached_tokens_per_seq[-1] = local_full - request.py_num_compressed_tokens
-                if (
-                    enable_spec_decode
-                    and spec_config.spec_dec_mode.extend_ctx(self._config.attention_backend)
-                    and spec_config.is_linear_tree
-                ):
+                if extend_as_context:
                     prompt_lengths.append(request_tokens_per_step)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
@@ -1989,11 +2044,58 @@ class DecoderInputPreparer:
                         else mrope_dummy_seq_slot
                     )
 
-            extra_inputs.add_generation_request(request)
+            if add_generation_request is not None:
+                add_generation_request(request)
 
         host.has_gen_mrope_delta = has_gen_mrope_delta
         host.previous_batch_token_start = previous_batch_token_start
         host.previous_batch_tokens_per_request = previous_batch_tokens_per_request
+
+    @staticmethod
+    def _pack_verifying_prefix(
+        host: HostInputs, tokens_per_step: int, extend_as_context: bool
+    ) -> int:
+        """Pack the leading verifying extend requests at once, exactly as the per-request loop would
+        (no helix, MRoPE, ragged verify or model inputs); returns how many it packed."""
+        lists = host.lists
+        extend_requests = lists.extend_requests
+        count = 0
+        for request in extend_requests:
+            if request.is_dummy or request.py_batch_idx is None:
+                break
+            count += 1
+        if not count:
+            return 0
+        requests = extend_requests[:count] if count < len(extend_requests) else extend_requests
+        for request in requests:
+            if getattr(request, "py_needs_onehot_draft_probs", False):
+                if request.py_seq_slot is not None:
+                    lists.padding_gen_slots.append(request.py_seq_slot)
+                request.py_needs_onehot_draft_probs = False
+        past_seen = np.fromiter(
+            (request.max_beam_num_tokens for request in requests), dtype=np.int64, count=count
+        )
+        past_seen -= 1
+        compressed = np.fromiter(
+            (request.py_num_compressed_tokens for request in requests), dtype=np.int64, count=count
+        )
+        lists.request_ids.extend([request.py_request_id for request in requests])
+        lists.previous_batch_indices.extend([request.py_batch_idx for request in requests])
+        for request in requests:
+            request.py_batch_idx = request.py_seq_slot
+        lists.sequence_lengths.extend([tokens_per_step] * count)
+        lists.draft_lens.extend([tokens_per_step - 1] * count)
+        start = len(lists.position_ids)
+        lists.gather_ids.extend(range(start, start + count * tokens_per_step))
+        lists.position_ids.extend(
+            (past_seen[:, None] + np.arange(tokens_per_step, dtype=np.int64)).ravel().tolist()
+        )
+        lists.num_cached_tokens_per_seq.extend((past_seen + tokens_per_step - compressed).tolist())
+        if extend_as_context:
+            lists.prompt_lengths.extend([tokens_per_step] * count)
+        else:
+            lists.prompt_lengths.extend([request.py_prompt_len for request in requests])
+        return count
 
     def _pack_generation_requests(
         self,
@@ -3180,7 +3282,7 @@ class DecoderInputPreparer:
         """
         if self._prepare_inputs_event is None:
             self._prepare_inputs_event = torch.cuda.Event()
-        self._prepare_inputs_event.record()
+        self._prepare_inputs_event.record(current_cuda_stream())
 
     def wait_for_input_copy(self) -> None:
         if self._prepare_inputs_event is not None:
@@ -3359,10 +3461,16 @@ class DecoderInputPreparer:
         )
 
     def preprocess_inputs(
-        self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
+        self,
+        inputs: dict[str, Any],
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+        mark_prologue_start: Callable[[Any], None] | None = None,
     ) -> dict[str, Any]:
         """
-        Make some changes to the device inputs and avoid blocking the async data transfer
+        Make some changes to the device inputs and avoid blocking the async data transfer.
+        ``mark_prologue_start(attn_metadata)`` runs behind the position correction, else at the end.
         """
         attn_meta = inputs.get("attn_metadata")
         # A model's decode prologue may replace the device work below with one
@@ -3374,6 +3482,8 @@ class DecoderInputPreparer:
         ):
             if self.guided_decoder is not None:
                 self.guided_decoder.token_event.record()
+            if mark_prologue_start is not None:
+                mark_prologue_start(attn_meta)
             return inputs
         # Overlap scheduling corrects kv_lens_cuda below from the runtime
         # accepted-token counts and calls on_update_kv_lens() again after it.
@@ -3424,6 +3534,10 @@ class DecoderInputPreparer:
                     inputs["position_ids"][0, num_ctx_tokens:] += (
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
+                if mark_prologue_start is not None:
+                    # Behind the step's first launch, so a captured decode graph keeps a single root.
+                    mark_prologue_start(attn_meta)
+                    mark_prologue_start = None
 
                 if has_kv_lens_correction:
                     if fused_offsets:
@@ -3481,6 +3595,8 @@ class DecoderInputPreparer:
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
+        if mark_prologue_start is not None:
+            mark_prologue_start(attn_meta)
 
         return inputs
 

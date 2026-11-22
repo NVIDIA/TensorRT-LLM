@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import functools
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -35,6 +36,7 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..distributed import AllReduceStrategy
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..modules.bf16_draft_head import BF16DraftHead, build_bf16_draft_head
 from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor import step_inputs
 from ..pyexecutor.resource_manager import ResourceManagerType
@@ -46,7 +48,8 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+from tensorrt_llm.llmapi.llm_args import (AdvancedSamplingMode,
+                                          RejectionSampleMethod)
 
 from ...watermark.sampling import gumbel_sample_from_probs, keyed_recovery
 from ..pyexecutor.sampler import penalties as penalty_ops
@@ -56,6 +59,7 @@ from ..pyexecutor.sampler.ops.vanilla import (GREEDY_TEMPERATURE_THRESHOLD,
                                               greedy_search_sampling_batch)
 from ..pyexecutor.sampler.sampler_common import request_random_seed
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
+from .block_verification import block_verify, counter_uniforms
 from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
                            sample_and_strict_accept)
 from .greedy_argmax import greedy_argmax
@@ -474,6 +478,8 @@ class SpeculativeDecodingMode(IntEnum):
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
 
+    # Asked per request and per pass; the answer is fixed per mode.
+    @functools.cache
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
         ) or self.is_external_drafter() or self.is_sa()
@@ -628,15 +634,10 @@ class OneModelSamplingParams:
     top_p: float
     min_p: float
     is_greedy: bool
+    # Sampled with a temperature alone: no top-k, top-p or min-p filter.
+    is_temperature_only: bool
     # The user's ``SamplingParams.seed``, None when unset.
     seed: Optional[int]
-
-    @property
-    def is_temperature_only(self) -> bool:
-        """Sampled with a temperature alone: no top-k, top-p or min-p filter."""
-        return (not self.is_greedy
-                and self.top_k == torch.iinfo(torch.int32).max
-                and self.top_p >= 1.0 and self.min_p <= 0.0)
 
     @property
     def is_shard_sampleable(self) -> bool:
@@ -668,13 +669,17 @@ class OneModelSamplingParams:
         # Greedy rows get a sentinel below the kernels' greedy threshold
         # (non-zero, one-hot under softmax); it must not reach a non-greedy row.
         disable_temperature = GREEDY_TEMPERATURE_THRESHOLD / 10
+        # Very large values disable top-k.
+        no_top_k = torch.iinfo(torch.int32).max
+        top_k = row.top_k if row.top_k > 0 else no_top_k
         return cls(
             temperature=disable_temperature if is_greedy else row.temperature,
-            # Very large values disable top-k.
-            top_k=row.top_k if row.top_k > 0 else torch.iinfo(torch.int32).max,
+            top_k=top_k,
             top_p=row.top_p,
             min_p=row.min_p,
             is_greedy=is_greedy,
+            is_temperature_only=(not is_greedy and top_k == no_top_k
+                                 and row.top_p >= 1.0 and row.min_p <= 0.0),
             seed=request_random_seed(request),
         )
 
@@ -855,9 +860,16 @@ class SpecMetadata:
     # from the model's RuntimeHooks). The argmax path never reads them, and the
     # next sampled batch rewrites every row it reads.
     skip_greedy_rng_upload: bool = False
+    # Verification rule of the rejection path (deploy-time; from
+    # DecodingBaseConfig.rejection_sample_method): "standard" (token-level) or
+    # "block" (block verification, see block_verification.py).
+    rejection_sample_method: RejectionSampleMethod = "standard"
     # Stage the per-step Philox seed/offset uploads into the engine's step-input
     # pack (RuntimeHooks.pack_spec_rng_uploads) instead of copying each one.
     pack_rng_uploads: bool = False
+    # Verify a generation-only step's hidden states without the row gather
+    # (deploy-time; RuntimeHooks.skip_verify_row_gather).
+    skip_verify_row_gather: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -2082,6 +2094,9 @@ class SpecWorkerBase(nn.Module, ABC):
         self._gumbel_seed: Optional[torch.Tensor] = None
         self._auxiliary_state_handlers: list[
             AuxiliarySpeculativeStateHandler] = []
+        # Fused BF16 LM head + argmax + key exchange for greedy draft steps
+        # (see build_fused_draft_head); None keeps the GEMM path.
+        self.fused_draft_head: Optional[BF16DraftHead] = None
 
     def cache_derived_state(self) -> None:
         if self.key_exchange is not None and self._gumbel_seed is None:
@@ -2328,6 +2343,68 @@ class SpecWorkerBase(nn.Module, ABC):
                                      self.key_exchange,
                                      self._target_pair_exchange,
                                      channel=1)
+
+    def _fused_draft_lm_head(self, draft_model) -> Optional[nn.Module]:
+        """The vocab-sharded LM head whose greedy draft tokens the fused draft
+        head may produce in this worker's draft loop, or None. Workers whose
+        draft loop calls :meth:`_fused_draft_head_for` override this."""
+        del draft_model
+        return None
+
+    def build_fused_draft_head(self, draft_model) -> None:
+        """(Re)build :attr:`fused_draft_head` from the current weights of the
+        draft LM head (``trtllm::lm_head_argmax``: the shard GEMV, argmax and
+        key exchange in one launch, no draft logits), where the vocab-parallel
+        greedy argmax is enabled and the worker's draft head allows it.
+
+        Every TP rank reaches the same decision (configuration and device
+        type); the head reuses the key exchange's peer buffers.
+
+        A head built for the same LM head is kept: it reads the weights at
+        every call, and captured CUDA graphs hold its scratch (whose CTA
+        counter each launch leaves at zero), which must outlive a refit."""
+        lm_head = None
+        if self._vocab_parallel_argmax and draft_model is not None:
+            lm_head = self._fused_draft_lm_head(draft_model)
+        head = self.fused_draft_head
+        if head is not None and lm_head is not None and head.serves(lm_head):
+            return
+        self.fused_draft_head = None
+        if lm_head is not None and is_vocab_sharded_lm_head(lm_head):
+            self.fused_draft_head = build_bf16_draft_head(
+                lm_head, self.key_exchange)
+
+    def _fused_draft_head_for(self, rows: int,
+                              spec_metadata) -> Optional[BF16DraftHead]:
+        """The fused draft head when this draft step can take it: argmax
+        draft tokens (no advanced draft sampling), no guided decoding (it
+        masks the full draft logits) and at most the kernel's rows. Host-side
+        and identical on every TP rank."""
+        head = self.fused_draft_head
+        if (head is None or spec_metadata.wants_advanced_draft_sampling
+                or self.guided_decoder is not None or not head.supports(rows)):
+            return None
+        logger.info_once(
+            f"{type(self).__name__}: greedy draft tokens from the fused BF16 "
+            f"draft head (lm_head_argmax, up to {head.max_rows} rows)",
+            key=("spec_fused_draft_head", type(self).__name__))
+        return head
+
+    def _fused_draft_tokens(self,
+                            head: BF16DraftHead,
+                            hidden_states: torch.Tensor,
+                            out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Greedy draft tokens (int32, target vocab) of ``hidden_states``
+        ``[rows, hidden]`` from the fused head, d2t applied; into ``out`` when
+        given."""
+        if self._d2t is None:
+            return head.sample(hidden_states, out=out)
+        tokens = head.sample(hidden_states)
+        tokens = (self._d2t[tokens] + tokens).to(torch.int32)
+        if out is None:
+            return tokens
+        out.copy_(tokens)
+        return out
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.
@@ -2998,8 +3075,8 @@ class SpecWorkerBase(nn.Module, ABC):
         advanced_sampling_mode: AdvancedSamplingMode,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: Optional[torch.Tensor],
+        top_ps: Optional[torch.Tensor],
         min_ps: Optional[torch.Tensor],
         *,
         seed: Optional[torch.Tensor] = None,
@@ -3029,8 +3106,8 @@ class SpecWorkerBase(nn.Module, ABC):
         advanced_sampling_mode: AdvancedSamplingMode,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: Optional[torch.Tensor],
+        top_ps: Optional[torch.Tensor],
         min_ps: Optional[torch.Tensor],
         *,
         seed: Optional[torch.Tensor] = None,
@@ -3119,6 +3196,52 @@ class SpecWorkerBase(nn.Module, ABC):
             is_padding = is_padding.repeat_interleave(rows_per_request)
         return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
 
+    @staticmethod
+    def _draft_sampling_params(
+        spec_metadata: "SpecMetadata",
+        start: int = 0,
+        end: Optional[int] = None,
+        repeat: int = 1,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        """Per-row ``(temperatures, top_ks, top_ps, min_ps)`` for drawing drafts.
+
+        The request's own parameters. ``start`` / ``end`` select the requests;
+        ``repeat`` expands each to the rows a block sampler flattens.
+        """
+        temperatures = spec_metadata.request_temperatures[start:end]
+        top_ks = spec_metadata.request_top_ks[start:end]
+        top_ps = spec_metadata.request_top_ps[start:end]
+        min_ps = spec_metadata.request_min_ps[start:end]
+        if repeat > 1:
+            temperatures, top_ks, top_ps, min_ps = [
+                None if t is None else t.repeat_interleave(repeat)
+                for t in (temperatures, top_ks, top_ps, min_ps)
+            ]
+        return temperatures, top_ks, top_ps, min_ps
+
+    @staticmethod
+    def _unfiltered_sampling_params(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        like: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        """Per-row ``(top_ks, top_ps, min_ps)`` that apply no filter.
+
+        ``like`` gives the row count and device (e.g. the temperatures).
+
+        The fused kernel reads its per-row disable values (device-side fills:
+        CUDA graph capture rejects host-scalar copies); the flashinfer ops skip
+        the kernel of a ``None`` filter, so the draw is the temperature-only
+        softmax on either backend.
+        """
+        if not advanced_sampling_mode.is_fused:
+            return None, None, None
+        return (torch.full_like(like,
+                                torch.iinfo(torch.int32).max,
+                                dtype=torch.int32), torch.ones_like(like),
+                torch.zeros_like(like))
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -3134,12 +3257,10 @@ class SpecWorkerBase(nn.Module, ABC):
         only). Returns tokens in draft-vocab space (the caller applies d2t).
         Expects 2D ``[batch_size, vocab]`` logits (one row per request).
         """
-        temperatures = spec_metadata.request_temperatures[:batch_size]
-        top_ks = spec_metadata.request_top_ks[:batch_size]
-        top_ps = spec_metadata.request_top_ps[:batch_size]
-        min_ps = spec_metadata.request_min_ps[:batch_size]
+        temperatures, top_ks, top_ps, min_ps = self._draft_sampling_params(
+            spec_metadata, end=batch_size)
 
-        # One row per request here, matching the request_* slices above.
+        # One row per request here, as _draft_sampling_params returns them.
         # Callers that do not pass a draft_step run this sampler once per step
         # and take the first draft slot.
         seed, offset = self._rng_state_per_request(
@@ -3363,10 +3484,11 @@ class SpecWorkerBase(nn.Module, ABC):
                                                  batch_size,
                                                  runtime_draft_len + 1,
                                                  packed_verify=True)
-            # The target distribution the acceptance test divides by. It must be
-            # filtered exactly as the draft probs were (see advanced_sample_draft),
-            # which is why both use the same backend selection on the same mode --
-            # a mismatch here corrupts acceptance silently rather than raising.
+            # The target distribution of the acceptance ratio p / q: the
+            # request's own filters, computed by the same backend selection on
+            # the same mode as the stored draft probs q (see
+            # advanced_sample_draft). A backend mismatch corrupts acceptance
+            # silently rather than raising.
             target_probs_flat = self._compute_probs_from_logits(
                 spec_metadata.advanced_sampling_mode, gen_logits, temperatures,
                 spec_metadata.top_ks[gen_start:gen_end],
@@ -3454,13 +3576,23 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
-            gen_accepted, gen_num_accepted = rejection_sampling_one_model(
-                draft_probs=full_draft_probs,
-                draft_token_ids=full_draft_tokens,
-                target_probs=target_probs,
-                seed=seed,
-                offset=offset,
-            )
+            if spec_metadata.rejection_sample_method == "block":
+                # Ragged layouts come only from DSpark confidence scheduling,
+                # which admits no request this path verifies, and the config
+                # rejects 'block' with it.
+                assert not is_ragged, (
+                    "block verification of a ragged verify layout")
+                gen_accepted, gen_num_accepted = self._block_verify(
+                    spec_metadata, full_draft_tokens, full_draft_probs,
+                    target_probs, seed, offset)
+            else:
+                gen_accepted, gen_num_accepted = rejection_sampling_one_model(
+                    draft_probs=full_draft_probs,
+                    draft_token_ids=full_draft_tokens,
+                    target_probs=target_probs,
+                    seed=seed,
+                    offset=offset,
+                )
 
             if _watermark_active(spec_metadata):
                 # The kernel decides which drafts are accepted and draws the token that
@@ -3510,6 +3642,39 @@ class SpecWorkerBase(nn.Module, ABC):
                                    batch_size,
                                    has_drafts=True)
         return accepted_tokens, num_accepted_tokens
+
+    def _block_verify(
+            self, spec_metadata: SpecMetadata, draft_tokens: torch.Tensor,
+            draft_probs: torch.Tensor, target_probs: torch.Tensor,
+            seed: torch.Tensor,
+            offset: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Block verification of the gen subset (``rejection_sampling_one_model`` contract).
+
+        The acceptance uniforms (``counter_uniforms``) and the emitted token
+        (seeded sampler on the residual) are both keyed by the request's
+        acceptance-slot RNG state, identical on every rank.
+        """
+        num_drafts = draft_tokens.shape[1]
+        uniforms = counter_uniforms(seed, offset, num_drafts)
+
+        def sample_emitted(weights: torch.Tensor) -> torch.Tensor:
+            mode = spec_metadata.advanced_sampling_mode
+            ones = torch.ones(weights.shape[0],
+                              dtype=torch.float32,
+                              device=weights.device)
+            return self._sample_from_logits(mode,
+                                            weights.log(),
+                                            ones,
+                                            *self._unfiltered_sampling_params(
+                                                mode, ones),
+                                            seed=seed,
+                                            offset=offset)
+
+        return block_verify(draft_tokens,
+                            draft_probs,
+                            target_probs,
+                            uniforms,
+                            sample_emitted=sample_emitted)
 
     def _rng_state_per_request(
         self,
@@ -3757,14 +3922,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Take the gen slice and repeat each request's value K times to line up
         # with the flattened [num_gens*K, vocab] logits (K rows per request).
-        temps = spec_metadata.request_temperatures[
-            num_contexts:batch_size].repeat_interleave(K)
-        top_ks = spec_metadata.request_top_ks[
-            num_contexts:batch_size].repeat_interleave(K)
-        top_ps = spec_metadata.request_top_ps[
-            num_contexts:batch_size].repeat_interleave(K)
-        min_ps = spec_metadata.request_min_ps[
-            num_contexts:batch_size].repeat_interleave(K)
+        temps, top_ks, top_ps, min_ps = self._draft_sampling_params(
+            spec_metadata, num_contexts, batch_size, repeat=K)
 
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
         # A block sampler emits all K draft positions in one launch; they take

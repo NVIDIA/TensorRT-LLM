@@ -5,7 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Vendor source toolkit
 
-These tools work with any vendor key in `3rdparty/vendor_sources.lock.yaml`.
+These tools work with any vendor key in the repository lock
+`3rdparty/vendor_sources.lock.yaml` or in a scoped vendor lock
+`<scope>/3rdparty/vendor_sources.lock.yaml`. Pass `--lock` to `promote.py` and
+`bot.py` for a vendor in a scoped vendor lock.
 They contain no operator credentials, personal repository defaults, or private
 configuration. Use Python 3.10+, Git, PyYAML, and, for GitHub promotion/monitoring,
 an authenticated `gh` CLI. Promotion and monitoring currently support GitHub.com
@@ -243,6 +246,8 @@ python scripts/vendor/bot.py run \
 
 For PrimTS, use vendor `flashinfer-prims-ts`, upstream
 `flashinfer-ai/flashinfer`, and the operator's current canonical fork/branch.
+For a vendor in a scoped vendor lock, add
+`--lock <scope>/3rdparty/vendor_sources.lock.yaml`.
 The canonical repository is always explicit: the bot never adopts a contributor
 fork as the publishing destination merely because it appears in a lock or PR.
 
@@ -423,6 +428,7 @@ The JSON separates process liveness from work completion:
 | --- | --- |
 | `running`, `pid`, `publish` | Process lock held, recorded PID, and whether remote writes are enabled; not a health verdict |
 | `vendor`, `base_branch`, `canonical_repo`, `canonical_branch` | Cached monitor scope and publishing destination; verify these after a restart or migration |
+| `lock` | Vendor lock the workdir monitors; settings saved without a lock report the repository lock |
 | `refresh_branches`, `migration` | Explicit refresh-target policy and last verified canonical-branch migration; not authorization to publish to a refresh target |
 | `operation`, `progress_at` | Current phase/PR/start time and last worker checkpoint |
 | `counts` | Current poll's scanned records, tracked lock PRs, relevant vendor updates, processed PRs, author-blocked PRs, and errors |
@@ -430,7 +436,7 @@ The JSON separates process liveness from work completion:
 | `last_successful_poll` | Last completed poll with no blocked PRs or processing errors; not a code-review approval or guarantee that promotions have merged |
 | `last_poll_summary` | Duration, counts, and outcome: `ok`, `needs_attention`, `failed`, or `interrupted` |
 | `last_error` | Historical error timestamp, PR, and bounded single-line diagnostic; retained after recovery |
-| `next_poll_at` | Next scheduled poll, including exponential backoff after discovery failures |
+| `next_poll_at` | Next scheduled poll, including exponential backoff after discovery or vendor-lock check failures |
 | `state_available`, `state_error` | Whether cached telemetry could be read; missing/corrupt state does not mean a held process lock is healthy |
 
 `scanned` counts PR records visited, not unique PRs (the initial open/history
@@ -452,8 +458,8 @@ authorizes publication; restart recovery still verifies Git/GitHub provenance.
 
 Git/GitHub are the source of truth; SQLite is not required to reconstruct a
 promotion. Stop the old process before replacing or discarding its database.
-Relaunch with the **same account, repositories, consumer base branch, canonical
-branch, and cutoff**, and re-supply any `--refresh-branch` policy.
+Relaunch with the **same account, repositories, vendor and `--lock`, consumer base
+branch, canonical branch, and cutoff**, and re-supply any `--refresh-branch` policy.
 The bot accepts an existing workdir containing only recognized bot artifacts
 even if SQLite is missing. It preserves those artifacts and refuses unrelated
 files and symlinks. A new empty workdir also works; existing registered Git
@@ -479,7 +485,15 @@ artifacts. It is not recovery from deleted remote history or a replacement
 publishing account/fork. Tampered commits, unexpected branch moves, closed-unmerged
 promotion PRs, and unrelated worktree edits still stop the operation for inspection.
 
-One process monitors one vendor; separate workdirs can monitor different vendors.
+One process monitors one vendor in one `--lock`; separate workdirs can monitor
+different vendors. Each poll fails while the vendor is not in its `--lock` on
+the base branch, so start a monitor after the vendor's lock entry has merged.
+Move a vendor to another lock only after its pending promotions have merged,
+then start a new workdir with the new `--lock` (see
+[Vendored Sources](../../3rdparty/vendor-sources.md#promotion-and-local-monitoring)).
+Open source-update PRs for the vendor conflict with the move. After they are
+rebased onto the new lock, the new monitor tracks them and takes over earlier
+bot reviews, which are keyed by vendor and base branch rather than by lock.
 `--consumer-repo`, `--base-branch`, and `--upstream-branch` also support consumers
 and upstreams whose default branch is not `main`. `--repo` selects a **trusted**
 local consumer checkout; no code or hooks from source forks are executed.
@@ -576,6 +590,8 @@ with `--auto-match`, or an explicit `--unpaired-reason`. The existing
 assertions but cannot accompany automatic matching. `--source-repo` selects a
 local immutable source checkout for materialization; `--worktree` overrides the
 follow-up checkout location. `--wait` optionally waits for and verifies merge.
+`--lock` selects the lock that defines `--vendor` (default
+`3rdparty/vendor_sources.lock.yaml`).
 
 For the verified upstream-main exception, omit the attribution options
 (`--from-pr-description`, `--upstream-pr`, `--unpaired-reason`, `--map-upstream`). The engine infers

@@ -43,6 +43,8 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 from cutlass.experimental.task_scheduling.resources import MemoryResource, WorkQueue
 from cutlass.experimental.task_scheduling.task import Task
 
+from ..task_compat import TaskCacheStageInfoMixin
+
 from .fmha_resources import (
     FmhaConfig,
     GmemOResource,
@@ -64,14 +66,25 @@ from .fmha_resources import (
 from .vc_attention.vc_resources import SmemMuResource
 
 
+class ContextTask(TaskCacheStageInfoMixin, Task):
+    """Default context task.
+
+    Resource work in HEAD/TAIL reads the K loop state from ``StageInfo``, which
+    tree-walking tasks leave unavailable outside the loop.
+    """
+
+    restore_loop_state_outside_loop = True
+
+
 @dataclass(kw_only=True)
 class PackedContextWorkQueue(WorkQueue):
-    """Persistent queue that skips empty Q/KV requests and padded Q tiles."""
+    """Skip padded Q tiles, retaining empty KV rows when outputs must be written."""
 
     cfg: cutlass.Constexpr[FmhaConfig] = field(init=False, default=None)
     cum_seqlen_q: Any = field(init=False, default=None)
     cum_seqlen_k: Any = field(init=False, default=None)
     seq_lens_kv: Any = field(init=False, default=None)
+    keep_empty_kv: cutlass.Constexpr[bool] = field(init=False, default=False)
 
     def __init__(
         self,
@@ -79,6 +92,7 @@ class PackedContextWorkQueue(WorkQueue):
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None = None,
         seq_lens_kv: cute.Pointer | None = None,
+        keep_empty_kv: bool = False,
         **kwargs: Any,
     ) -> None:
         """Attach the live packed-Q metadata used by the skip predicate."""
@@ -87,6 +101,7 @@ class PackedContextWorkQueue(WorkQueue):
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
         self.seq_lens_kv = seq_lens_kv
+        self.keep_empty_kv = keep_empty_kv
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
@@ -103,10 +118,12 @@ class PackedContextWorkQueue(WorkQueue):
             q_begin = Int32(self.cum_seqlen_q[batch_coord])
             q_end = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
             skip = seq_coord * Int32(self.cfg.cta_tiler[0]) >= q_end - q_begin
-        if cutlass.const_expr(self.seq_lens_kv is not None):
+        if cutlass.const_expr(not self.keep_empty_kv and self.seq_lens_kv is not None):
             skip = skip or Int32(self.seq_lens_kv[batch_coord]) <= Int32(0)
         elif cutlass.const_expr(
-            self.cum_seqlen_k is not None and not self.cfg.has_uniform_varlen
+            not self.keep_empty_kv
+            and self.cum_seqlen_k is not None
+            and not self.cfg.has_uniform_varlen
         ):
             skip = (
                 skip
@@ -208,7 +225,7 @@ def create_load_task(
     smem_k_or_kv: SmemKVResource,
     smem_v: SmemKVResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None,
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None,
     smem_mu: SmemMuResource | None = None,
@@ -975,7 +992,7 @@ def create_mma_task(
     tmem_vec_done_0: TmemStatsDoneResource,
     tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     tmem_p_prefix_ready_0: TmemPPrefixReadyResource | None = None,
     tmem_p_prefix_ready_1: TmemPPrefixReadyResource | None = None,
     smem_p0: SmemPResource | None = None,
@@ -1966,7 +1983,7 @@ def create_softmax_task(
     tmem_p: TmemPResource | None,
     s0s1_seq: S0S1SequenceResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     tmem_p_prefix_ready: TmemPPrefixReadyResource | None = None,
     smem_p: SmemPResource | None = None,
     smem_sage_k: SmemSageKScalesResource | None = None,
@@ -3160,7 +3177,7 @@ def create_correction_task(
     tmem_vec_done_0: TmemStatsDoneResource,
     tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the four-warp Correction task (warps 8-11)."""
@@ -3456,7 +3473,7 @@ def create_epilogue_task(
     gmem_o_0: GmemOResource,
     gmem_o_1: GmemOResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp Epilogue store task (warp 14)."""
@@ -3585,7 +3602,7 @@ def create_padding_task(
     num_warps: int = 1,
     num_registers: int = 32,
     name: str = "PaddingTask",
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp padding task (warp 15 in the D128 schedule).
@@ -3762,7 +3779,7 @@ def create_page_offsets_task(
     gmem_qkv: GmemQKVResource,
     smem_page_offsets_kv: SmemPageOffsetsKvResource,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     num_registers: int = 32,
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None,
     **task_kwargs: Any,
@@ -3883,7 +3900,7 @@ def create_scheduler_task(
     work_queue: WorkQueue,
     warp_idx: int = 15,
     num_registers: int = 32,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp CLC scheduler task (warp 15 in D128).

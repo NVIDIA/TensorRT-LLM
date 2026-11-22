@@ -58,6 +58,8 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux1-ulysses2] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux2-tp2] TIMEOUT (20)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
 - condition:
     ranges:
@@ -74,6 +76,8 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # Modeling V2 all-reduce off MNNVL (x86 B200): the Kimi K3 all-reduce module reaches the runtime module's own all-reduce.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_allreduce_fallback_op_matrix.py
   - unittest/disaggregated/test_transfer_lifecycle_gpu.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-4-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-4-1]
@@ -160,8 +164,8 @@ l0_dgx_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_TWO_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=ALLGATHER-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
-  # GPT-OSS MXFP4/FP8 reference checks for DEP/DeepEP and aligned TTP.
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_FP8 and 1.702 and bfloat16 and Renormalize and ((DEP and DEEPEP and not DEEPEPLOWLATENCY and e60_k4_h2048_i1408) or (TTP and NVLINK_ONE_SIDED and e8_k1_h512_i512))"
+  # GPT-OSS MXFP4/FP8 reference checks for DEP/DeepEP and TTP (aligned and padded shards).
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_FP8 and 1.702 and bfloat16 and Renormalize and ((DEP and DEEPEP and not DEEPEPLOWLATENCY and e60_k4_h2048_i1408) or (TTP and NVLINK_ONE_SIDED and (e8_k1_h512_i512 or e60_k4_h2048_i1408)))"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
@@ -259,6 +263,7 @@ l0_dgx_b200:
   # ------------- VisualGen multi-GPU tests ---------------
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_cosmos3_transformer_parallel.py
+  - unittest/_torch/visual_gen/multi_gpu/test_parallel_wino_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_ulysses.py
@@ -309,7 +314,6 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op TIMEOUT (60)
   - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
 - condition:
     ranges:
@@ -408,3 +412,7 @@ l0_dgx_b200:
   # logits parity on TP=4 (skips cleanly when the Kimi-K3 checkpoint is not
   # staged under LLM_MODELS_ROOT).
   - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (45)
+  # GLM-5.3-Flash ModelingV2 target (glm5_next): GSM8K without and with MTP 3, and the MTP
+  # acceptance length, at both of its tp4 layouts.
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4] TIMEOUT (45)
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4_ep4] TIMEOUT (45)

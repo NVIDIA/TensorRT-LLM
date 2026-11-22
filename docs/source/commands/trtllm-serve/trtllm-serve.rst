@@ -23,6 +23,7 @@ The server also supports the following endpoints:
 - ``/start_profile`` (prototype)
 - ``/stop_profile`` (prototype)
 - ``/v1/chat/completions/render`` and ``/v1/completions/render`` (prototype, enabled with ``TRTLLM_ENABLE_RENDER_ENDPOINTS=1``)
+- ``/memory_report`` (prototype; served in the memory monitor's full mode, ``TLLM_MEM_MONITOR=1`` or ``memory_monitor_config.mode: full``, when ``TRTLLM_RUNTIME_CONTROL_API_KEY`` is set and there is a single serving frontend, with requests signed like the runtime-control endpoints and without needing sleep mode; returns every rank's GPU memory report, see :doc:`../../features/memory-monitor` and :doc:`../../features/sleep-wakeup`)
 
 The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below. The render endpoints return the prompt token ids that the server would use for a request, without running the model; see :doc:`render-endpoints`.
 
@@ -436,6 +437,46 @@ Example output:
         }
     ]
 
+Queue statistics
+~~~~~~~~~~~~~~~~
+
+``numQueuedRequests`` and the ``numQueued*`` fields of ``inflightBatchingStats``
+report the requests that the row's iteration did not schedule:
+
+- ``numQueuedContextRequests`` and ``numQueuedCtxTokens``: requests with prompt
+  tokens still to prefill, and the number of those tokens. A request that is not
+  admitted yet counts its whole prompt; an admitted request counts its remaining
+  context tokens.
+- ``numQueuedGenRequests`` and ``numQueuedGenKvTokens``: generation-only requests
+  of disaggregated serving that have not started generating, and their context
+  lengths in tokens.
+- ``numQueuedRequests``: ``numQueuedContextRequests + numQueuedGenRequests``.
+
+The counts cover the request queue, the waiting queue that holds requests until
+they are admitted, and admitted requests that are not scheduled yet. Each request
+is counted once. Cancelled requests and the requests that the iteration scheduled
+or paused are not counted.
+
+Records without a forward pass
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A row with ``"isQueueSnapshot": true`` belongs to a record that the engine took
+without running a forward pass. It reports the queues at that time; its
+``iterLatencyMS`` and step timings are ``0`` and are not measurements. Rows of
+measured iterations do not have the key. There are two kinds of such records:
+
+- Idle heartbeat: while the engine has no work, it exports one record per second.
+  A heartbeat that has not been retrieved is replaced by the next one.
+- Queue snapshot: when an iteration schedules nothing while requests are queued,
+  the engine exports the queued counts. An unchanged snapshot is exported at most
+  once per second.
+
+The record that the engine exports at startup, before any request, also has
+``iterLatencyMS`` ``0`` and is not marked.
+
+The Prometheus collector applies a marked row like any other row;
+``iteration_latency_seconds``, for example, becomes ``0``.
+
 Attention-DP statistics
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -447,6 +488,15 @@ retain cached blocks even when it schedules no requests. If a rank did not
 measure KV statistics for an iteration, its JSON row has ``kvCacheStats: null``;
 absence does not mean an empty cache. ``TLLM_METRICS_ALL_RANKS`` is not required for this
 attention-DP fanout.
+
+Each row's queued counts are those of its rank. Requests in the request queue and
+the waiting queue are not assigned to a rank yet; rank 0's row reports them
+together with rank 0's own admitted requests. The other rows report the requests
+assigned to their rank that are not scheduled yet. The rows of one record share
+``iter`` and ``timestamp``, and the sum of their queued counts is the backlog of
+the whole engine. An idle heartbeat has one row per rank. A queue snapshot has
+rows only for the ranks with scheduled or queued work. ``isQueueSnapshot`` and the
+timings are rank 0's and are the same on every row of a record.
 
 The shared Prometheus collector uses ``dp_rank`` on KV-cache and rank-local
 inflight-batching metrics. It takes the rank from ``attentionDpRank``, falls back
@@ -469,9 +519,11 @@ per iteration.
 
 Top-level request counts, queue, memory, iteration latency, batch configuration,
 average decoded tokens, and speculative-decoding measurements remain owned by
-rank 0 in the collector. They are not sums of rank-local measurements. The
-separate ``kvCacheIterationStats`` deltas retain their producer ownership and
-are attached only to rank 0 by attention-DP fanout.
+rank 0 in the collector. They are not sums of rank-local measurements:
+``num_requests_waiting`` is rank 0's ``numQueuedRequests``, the requests not
+assigned to a rank yet plus rank 0's own backlog, without the backlog of the
+other ranks. The separate ``kvCacheIterationStats`` deltas retain their producer
+ownership and are attached only to rank 0 by attention-DP fanout.
 
 When updating dashboards, retain ``dp_rank`` to inspect individual ranks or
 aggregate it explicitly. Used/free block counts can be summed across ranks;

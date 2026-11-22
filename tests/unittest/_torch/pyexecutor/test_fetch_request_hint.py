@@ -38,12 +38,15 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 def _make_stub_executor(rank=0, queued_items=None):
     queued_items = queued_items if queued_items is not None else []
     stub = SimpleNamespace()
+    stub._benchmark_sweep = False
     stub.control_requests = []
     stub.request_accumulated = []
     stub.active_requests = []
     stub.canceled_req_ids = []
     stub._disable_mpi = False
     stub.is_shutdown = False
+    # Iteration stats off: the idle wait publishes no heartbeats.
+    stub.enable_iter_perf_stats = False
     stub.dist = Mock(rank=rank)
     stub.hang_detector = MagicMock()
     stub.executor_request_queue = Mock()
