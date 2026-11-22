@@ -362,7 +362,7 @@ prompt = TextPrompt(
 - **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
 - **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
 
-**Items without a content hash:** An item gets a random digest instead when its content is not hashed (hashing is off or fails for the request, or embeddings are attached without hashes). No other request reuses its KV cache blocks then, even for the same input; a supplied UUID is still reported in events. When the prompt span of an item is not found either (for example, the input processor cannot count the tokens of its modality), the request gets a cache salt of its own, added to its `cache_salt`, and V2 events report that salt.
+**Items without a content hash:** An item gets a random digest instead when its content is not hashed (hashing is off or fails for the request, or embeddings are attached without hashes). No other request reuses its KV cache blocks then, even for the same input; a supplied UUID is still reported in events. When the prompt span of an item is not found either (for example, the input processor cannot count the tokens of its modality, or it attaches embeddings without item spans), the request gets a cache salt of its own, added to its `cache_salt`. Such a request reuses no KV cache blocks at all, not even a shared text prefix, and events that report the salt show the combined one.
 
 **UUID Format:**
 
