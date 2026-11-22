@@ -1000,6 +1000,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_verified=None,
         local_session_count: Optional[int] = None,
         locally_timed_out=None,
+        preserve_failures=False,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
@@ -1055,6 +1056,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             idx += 1
         if locally_timed_out is not None:
             result.append(self._union([p[idx] for p in packed]))
+        if preserve_failures:
+            result.append(global_failed)
         return tuple(result)
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
@@ -1109,7 +1112,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for rid in to_process
             if getattr(self._send_sessions.get(rid), "timed_out", False) is True
         ]
-        c, f, d, q, timed_out = self._consensus_outcome(
+        c, f, d, q, timed_out, failures = self._consensus_outcome(
             to_process,
             cancelled,
             failed,
@@ -1118,17 +1121,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._ctx_need_tp_sync,
             locally_quiesced,
             locally_timed_out=timed_out,
+            preserve_failures=True,
         )
         if self._ctx_need_pp_sync:
             pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-            c, f, d, q, timed_out = self._consensus_outcome(
-                to_process, c, f, d, pp_allgather, True, q, locally_timed_out=timed_out
+            c, f, d, q, timed_out, failures = self._consensus_outcome(
+                to_process,
+                c,
+                failures,
+                d,
+                pp_allgather,
+                True,
+                q,
+                locally_timed_out=timed_out,
+                preserve_failures=True,
             )
         for rid in timed_out.intersection(q, c + f):
             req = self._send_reqs.get(rid)
             if req is not None:
                 req.py_kv_transfer_timed_out = True
-        return c, f, d, q
+        return c, f, d, q, failures.intersection(q, c)
 
     def _sync_transfer_timing(self, reqs: list):
         """Return the rank-group timing envelope and bytes for the transfer CSV."""
@@ -1860,8 +1872,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_quiesced = [
             rid for rid in to_process if not self._send_sessions[rid].has_transferring_tasks()
         ]
-        cancelled, failed, completed, quiesced_ids = self._ctx_consensus_outcome(
-            to_process, cancelled, failed, completed, locally_quiesced
+        cancelled, failed, completed, quiesced_ids, cancelled_with_failures = (
+            self._ctx_consensus_outcome(to_process, cancelled, failed, completed, locally_quiesced)
         )
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
@@ -1917,7 +1929,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker.sweep_stale_req_infos()
 
         failed.extend(owned_cancelled)
-        return CtxTransferStatus(completed, failed, tuple(cancelled))
+        return CtxTransferStatus(
+            completed, failed, tuple(cancelled), tuple(sorted(cancelled_with_failures))
+        )
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:

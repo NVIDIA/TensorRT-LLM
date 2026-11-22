@@ -1090,6 +1090,7 @@ class DisaggTransferCoordinator:
         failed_req_ids = set(ctx_status.error_request_ids)
         succeeded_ids = set(ctx_status.completed_request_ids)
         cancelled_ids = set(getattr(ctx_status, "cancelled_request_ids", ()))
+        backend_failed_ids = set(getattr(ctx_status, "backend_failed_request_ids", ()))
         completed_req_ids = succeeded_ids | failed_req_ids | cancelled_ids
         failed_req_ids -= self._context_cancellation_drains
 
@@ -1102,6 +1103,8 @@ class DisaggTransferCoordinator:
                     logger.warning(f"Request {request_id} not found in transfer manager")
                 continue
             request = requests_in_transfer[request_id]
+            if request_id in backend_failed_ids:
+                self._record_transfer_outcome(request, "error", backend_failure=True)
             if request_id in cancelled_ids and not request.py_kv_transfer_timed_out:
                 # Preserve the terminal cancellation across the later error
                 # sweep, which also visits owned sends retired as errors.

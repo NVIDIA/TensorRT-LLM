@@ -1660,6 +1660,10 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             continue;
         }
+        if (mTimedOutRequesterIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
+        }
         requestIt->second->setKvCacheTransferLocalSize(requestIt->second->getKvCacheSize());
         requestIt->second->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
         completedRequests.push_back(requestIt->second.get());

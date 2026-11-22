@@ -246,16 +246,20 @@ class CtxTransferStatus(_CtxTransferStatusFields):
     """
 
     cancelled_request_ids: tuple[int, ...] = ()
+    backend_failed_request_ids: tuple[int, ...] = ()
 
     def __new__(
-            cls,
-            completed_request_ids: List[int],
-            error_request_ids: List[int],
-            cancelled_request_ids: tuple[int, ...] = (),
+        cls,
+        completed_request_ids: List[int],
+        error_request_ids: List[int],
+        cancelled_request_ids: tuple[int, ...] = (),
+        backend_failed_request_ids: tuple[int, ...] = (),
     ) -> "CtxTransferStatus":
         status = super().__new__(cls, completed_request_ids, error_request_ids)
         if cancelled_request_ids:
             status.cancelled_request_ids = cancelled_request_ids
+        if backend_failed_request_ids:
+            status.backend_failed_request_ids = backend_failed_request_ids
         return status
 
 

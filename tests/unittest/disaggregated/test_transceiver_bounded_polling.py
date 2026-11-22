@@ -163,6 +163,7 @@ def _make_transceiver(
             failed,
             completed,
             quiesced,
+            set(),
         )
     )
     return transceiver
@@ -553,7 +554,7 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> 
         ],
     )
 
-    cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
+    cancelled, failed, completed, quiesced, _ = transceiver._ctx_consensus_outcome(
         [21], [], [], [21], [21]
     )
 
@@ -562,6 +563,25 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> 
     assert req.py_kv_transfer_timed_out is peer_failed
     assert completed == []
     assert quiesced == ([21] if peer_failed else [])
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_ctx_consensus_keeps_failure_evidence_with_cancel(local_failure) -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_need_pp_sync = False
+    transceiver._dist = SimpleNamespace(
+        tp_allgather=lambda payload: [payload, [[21], [], [], [21], []]],
+    )
+
+    cancelled, failed, completed, quiesced, backend_failed = transceiver._ctx_consensus_outcome(
+        [21], [], [21] if local_failure else [], [] if local_failure else [21], [21]
+    )
+
+    assert (cancelled, failed, completed, quiesced) == ([21], [], [], [21])
+    assert backend_failed == ({21} if local_failure else set())
 
 
 def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
@@ -575,7 +595,7 @@ def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
         pp_allgather=lambda payload: [payload, [[], [], [], [], []]],
     )
 
-    cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
+    cancelled, failed, completed, quiesced, _ = transceiver._ctx_consensus_outcome(
         [22], [], [], [22], [22]
     )
 
@@ -612,7 +632,7 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     transceiver._dist.allreduce = Mock(return_value=0)
     transceiver._ctx_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], [], set()))
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._close_failed_sessions = Mock()
 
@@ -1234,7 +1254,7 @@ def test_check_context_runs_consensus_after_a_send() -> None:
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_consensus = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], [], set()))
 
     transceiver.check_context_transfer_status(0)
     transceiver._ctx_consensus.assert_called_once()

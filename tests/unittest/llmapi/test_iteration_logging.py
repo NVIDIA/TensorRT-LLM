@@ -35,7 +35,9 @@ class _Stats:
         await asyncio.sleep(0)
 
 
-async def _produce(address: str, count: int, request_seen: bool = True) -> None:
+async def _produce(
+    address: str, count: int, request_seen: bool = True, *, wait_for_delivery: bool = False
+) -> None:
     manager = asynchronous.LlmManager.__new__(asynchronous.LlmManager)
     manager.llm = _Stats(count)
     manager._stop = asyncio.Event()
@@ -44,8 +46,11 @@ async def _produce(address: str, count: int, request_seen: bool = True) -> None:
         manager.request_seen.set()
     manager._backend_task = asyncio.create_task(asyncio.sleep(0))
     manager._iteration_log_task = asyncio.create_task(manager.iteration_worker(address))
-    # Give the producer time to reach a blocked send, if the consumer is absent.
-    await asyncio.sleep(0.2)
+    if wait_for_delivery:
+        await asyncio.wait_for(manager.llm.sent.wait(), timeout=5)
+    else:
+        # Give the producer time to reach a blocked send if the consumer is absent.
+        await asyncio.sleep(0.2)
     await manager.stop()
     assert manager._backend_task.done()
     assert manager._iteration_log_task.done()
@@ -79,7 +84,7 @@ def _scenario(case: str, directory: str) -> None:
         else:
             with writer.capture():
                 if case != "empty":
-                    asyncio.run(_produce(writer.full_address, 2000))
+                    asyncio.run(_produce(writer.full_address, 2000, wait_for_delivery=True))
             expected = [] if case == "empty" else [{"iteration": i} for i in reversed(range(2000))]
             assert [ast.literal_eval(line) for line in log.read_text().splitlines()] == expected
     elif case == "disabled":

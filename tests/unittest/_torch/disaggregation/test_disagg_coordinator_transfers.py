@@ -136,6 +136,7 @@ def test_send_skips_requests_that_must_not_send() -> None:
         "local_cancel",
         "legacy_peer_cancel",
         "owned_peer_cancel",
+        "peer_cancel_with_backend_failure",
         "backend_error",
         "native_timeout",
     ],
@@ -158,14 +159,19 @@ def test_settled_send_releases_blocks_and_terminates_a_departed_request(outcome)
     else:
         errors = [req.py_request_id] if outcome == "owned_peer_cancel" else []
         h.transceiver.check_context_transfer_status = Mock(
-            return_value=CtxTransferStatus([], errors, (req.py_request_id,))
+            return_value=CtxTransferStatus(
+                [],
+                errors,
+                (req.py_request_id,),
+                (req.py_request_id,) if outcome == "peer_cancel_with_backend_failure" else (),
+            )
         )
 
     h.coordinator.reap_context_sends(0)
 
     assert h.coordinator.transfer_outcomes == (
         int(outcome == "success"),
-        int(outcome == "backend_error"),
+        int(outcome in ("backend_error", "peer_cancel_with_backend_failure")),
         int(outcome == "native_timeout"),
     )
     assert not h.in_transfer(req)
@@ -757,6 +763,21 @@ def test_receive_outcome_preserves_backend_failure_after_abort(cause, expected) 
     h.coordinator.reap_gen_receives()
 
     assert h.coordinator.transfer_outcomes == expected
+
+
+@pytest.mark.parametrize("polled_before_completion", [False, True])
+def test_native_receive_completion_preserves_observed_deadline(polled_before_completion) -> None:
+    h = _Harness()
+    req = _receiving(h, 1, started_at=0.0)
+    h.coordinator._started_gen_receives[1] = req
+    if polled_before_completion:
+        h.coordinator._flag_transfer_timeout(req, "generation", 10, current_time=0.011)
+    req.kv_cache_transfer_timed_out = True
+    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    h.coordinator.reap_gen_receives()
+
+    assert h.coordinator.transfer_outcomes == (0, 0, 1)
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
 
 
 # -- settling cancellations and hangs ----------------------------------------

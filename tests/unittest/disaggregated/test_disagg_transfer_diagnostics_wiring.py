@@ -1293,7 +1293,9 @@ def test_ctx_settlement_continues_when_diagnostic_emission_fails(
     transceiver._collect_done = Mock(return_value=([request_id], []))
     transceiver._ctx_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [request_id], [request_id]))
+    transceiver._ctx_consensus_outcome = Mock(
+        return_value=([], [], [request_id], [request_id], set())
+    )
 
     def retire_send_session(rid: int, **_kwargs) -> None:
         transceiver._send_sessions.pop(rid, None)
@@ -1353,9 +1355,9 @@ def test_ctx_settlement_continues_when_diagnostic_session_snapshot_is_stale(
     transceiver._ctx_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
 
-    def retire_before_diagnostic_snapshot(*_args) -> tuple[list, list, list, list]:
+    def retire_before_diagnostic_snapshot(*_args) -> tuple[list, list, list, list, set]:
         transceiver._send_sessions.pop(request_id)
-        return [], [], [request_id], [request_id]
+        return [], [], [request_id], [request_id], set()
 
     transceiver._ctx_consensus_outcome = Mock(side_effect=retire_before_diagnostic_snapshot)
     transceiver._retire_send_session = Mock(

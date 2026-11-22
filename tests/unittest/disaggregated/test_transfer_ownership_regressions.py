@@ -1028,6 +1028,7 @@ def test_send_terminal_session_is_retained_when_close_refuses(
             [rid for rid in failed if rid not in set(cancelled)],
             [rid for rid in completed if rid not in set(cancelled) | set(failed)],
             locally_quiesced,
+            set(),
         )
     )
     transceiver._transfer_worker = SimpleNamespace(sweep_stale_req_infos=Mock())
