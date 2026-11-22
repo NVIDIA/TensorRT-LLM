@@ -17,6 +17,8 @@ the gates' policy over the spool:
   :meth:`SpoolCommandExecutor.wait_for_session` waits for one to come back before a re-run.
 - **Nor is a cancelled job**: its ``infrastructure`` begins with :data:`CANCELLED`; the gate it
   ran for has no verdict, and is not re-run at once against whoever cancelled it.
+- **A long wait is said**: a job waited on for ``spoolctl.WAIT_NOTE_S`` is passed to ``note``
+  (the run's journal), whether queued or running and since when, and why the session holds it.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import placement, spoolctl
 from .commands import (
@@ -47,6 +49,7 @@ from .scheduler import (
     SpoolPaths,
     watcher_age,
 )
+from .sessions import GATE_ROLES
 
 #: How a command's ``infrastructure`` begins when its job was withdrawn through the spool
 #: (by the operator, or by a caller that gave up on it): no verdict, and not a lost session.
@@ -57,13 +60,6 @@ CANCELLED = "the job was cancelled through the spool"
 ACCURACY = 2
 #: Every other check: the feature units, the variants, the proofs, delivery.
 FEATURE = 1
-#: The tune campaign's measurements and candidates: background work, below every job of the
-#: onboarding (a worker's own jobs queue at 0). A negative class never ages (``scheduler``), so a
-#: campaign's job, however long it waits, never ranks ahead of the onboarding's or holds one back.
-PERF = -1
-#: A tuner's own jobs (its tests, micro-benches, A/Bs): below the campaign's measurements, which
-#: run one at a time and hold back every candidate behind the one being measured.
-TUNER = -2
 
 _local = threading.local()
 
@@ -84,7 +80,7 @@ def job_priority(priority: int) -> Iterator[None]:
 
 
 def current_job_priority() -> int:
-    """The class this thread's jobs queue at; the scheduler's 0 by default (never :data:`PERF`)."""
+    """The class this thread's jobs queue at; the scheduler's 0 by default (a worker's own jobs)."""
     priority = getattr(_local, "priority", None)
     return 0 if priority is None else int(priority)
 
@@ -103,6 +99,7 @@ class SpoolCommandExecutor(CommandExecutor):
         priority: int = 0,
         tree: str | Path | None = None,
         pool: Sequence[str | Path] = (),
+        note: Callable[[str], None] | None = None,
     ) -> None:
         self.root = Path(spool)
         #: Every spool a command may go to, ``spool`` first.
@@ -115,13 +112,15 @@ class SpoolCommandExecutor(CommandExecutor):
         if nodes < 1:
             raise ValueError("nodes must be positive")
         self.nodes = nodes
-        #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, :data:`PERF`).
+        #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, or 0).
         self.priority = priority
         #: The checkout a job runs against (its working directory and first ``PYTHONPATH``
         #: entry); the session refuses a result that imported the package from anywhere else.
         self.tree = str(Path(tree).resolve()) if tree else None
         #: Allowance past a job's own deadline for the session to stop it.
         self.grace_s = 180.0
+        #: Where a long wait on a job is said (``spoolctl.wait_for_job``); nowhere when ``None``.
+        self.note = note
         self._seq = itertools.count(1)
 
     def _name(self) -> str:
@@ -239,6 +238,7 @@ class SpoolCommandExecutor(CommandExecutor):
                 grace_s=self.grace_s,
                 unwatched_s=spec.timeout_s,
                 submitted_at=submitted,
+                note=self.note,
             )
         except spoolctl.SpoolError as exc:
             reason = str(exc) + self._withdraw(root, name)
@@ -279,16 +279,18 @@ def select_command_executor(
     gpus: str = "all",
     nodes: int = 1,
     priority: int = 0,
+    note: Callable[[str], None] | None = None,
 ) -> CommandExecutor:
     """The executor this run's commands go through.
 
     On a spool, ``tree`` (the checkout under test) is every job's working directory and first
     ``PYTHONPATH`` entry, and ``gpus`` (a count, or ``all``) what each job asks for. The spools of
-    every ``role: gates`` session form a pool beside ``environment.spool``, and each command goes
-    to the live one that would start it soonest.
+    every session whose role takes gate jobs (:data:`sessions.GATE_ROLES`) form a pool beside
+    ``environment.spool``, and each command goes to the live one that would start it soonest.
+    A long wait on a job is said to ``note``.
     """
     if environment.kind == "session_spool" and environment.spool:
-        pool = [session.spool for session in environment.sessions if session.role == "gates"]
+        pool = [session.spool for session in environment.sessions if session.role in GATE_ROLES]
         return SpoolCommandExecutor(
             environment.spool,
             name_prefix=name_prefix,
@@ -297,6 +299,7 @@ def select_command_executor(
             nodes=nodes,
             priority=priority,
             pool=pool,
+            note=note,
         )
     if nodes > 1:
         raise ValueError("multi-node commands require session_spool gang execution")
@@ -330,10 +333,8 @@ __all__ = [
     "ACCURACY",
     "CANCELLED",
     "FEATURE",
-    "PERF",
     "SESSION_LOSS_REASONS",
     "SpoolCommandExecutor",
-    "TUNER",
     "current_job_priority",
     "job_priority",
     "select_command_executor",

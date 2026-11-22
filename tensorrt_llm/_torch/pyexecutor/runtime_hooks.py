@@ -7,9 +7,13 @@ attribute). Every field defaults to off, and a model that declares nothing gets
 ``RuntimeHooks()``: the step loop, the samplers and the attention metadata then
 run exactly as they do without this module.
 
-The hooks change *where* and *how* the step loop moves data, never what a
-forward computes. Each one is armed only by a model that has measured it on its
-own deployment; none is a general default.
+The hooks change *where* and *how* the step loop moves data, or how the engine
+sizes and manages its resources (device memory, cache pages, scheduling), never
+what a forward computes. Each one is armed only by a model that has measured it
+on its own deployment; none is a general default.
+
+A modeling-v2 target declares them on the registered (outer) model class, the
+class the loader resolves and the engine holds as ``model_engine.model``.
 """
 
 from __future__ import annotations
@@ -144,9 +148,34 @@ class MsaRuntimePolicy:
     skip_unchanged_block_offsets: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
-    # Fill the per-request block-id table by slice-copying each request's page-index view instead of
-    # building a Python list of the whole padded row (max_seq_len / tokens_per_block entries) first.
-    block_ids_from_views: bool = False
+
+
+class KvBalancedAdmissionPlanner(Protocol):
+    """Chooses the requests attention-DP KV-balanced admission admits, and their ranks.
+
+    Used by ``DefaultADPRouter`` in place of its own window and planner when
+    ``attention_dp_config.enable_kv_balanced_admission`` is on. Every rank calls it
+    with the same all-gathered inputs, so it must be deterministic.
+    """
+
+    def window(self, max_new_requests: int, free_slots: int) -> int:
+        """Number of requests at the head of the queue to choose among."""
+
+    def plan(
+        self,
+        *,
+        candidate_tokens: list[int],
+        candidate_forced: list[bool],
+        rank_tokens: list[int],
+        rank_num_requests: list[int],
+        max_requests_per_rank: int,
+        max_new_requests: int,
+        candidate_groups: list[int],
+    ) -> list[tuple[int, int]]:
+        """``(candidate_index, rank)`` pairs in admission order.
+
+        The arguments are those of ``adp_router.plan_kv_balanced_admission``.
+        """
 
 
 class DecodePrologue(Protocol):
@@ -221,6 +250,9 @@ class RuntimeHooks:
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False
+    # Under multi-rank MPI attention DP, rank 0 sends each admitted request's prompt only to the rank
+    # that owns it instead of broadcasting every prompt to every rank (RequestBroadcaster).
+    prompts_to_owners: bool = False
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
@@ -240,13 +272,25 @@ class RuntimeHooks:
     # one-model speculative batches (the argmax path never reads them).
     skip_greedy_rng_upload: bool = False
     # Stage the one-model speculative sampler's per-step Philox seed and offset
-    # uploads into the step-input pack (pack_step_inputs), so they ride its one
-    # upload instead of each being a copy the next graph waits for.
+    # uploads into the step-input pack (pack_step_inputs), or into the steady MTP
+    # stager's slab on the steps it prepares, instead of four separate copies.
     pack_spec_rng_uploads: bool = False
     # The one-model speculative step's small per-step uploads: the accepted-draft
     # counts join the step-input pack, and the spec sampler keeps its slot ids in
     # a device buffer it re-uploads only when they change.
     spec_small_h2d: bool = False
+    # Stage a decode step's inputs in fewer launches: attention metadata through a
+    # private copy stream; a graph replay's ids, positions and speculative inputs in one launch each.
+    stage_decode_inputs: bool = False
+    # Capture the decode CUDA graphs (at most 256 tokens per step) on a high-priority stream.
+    prioritize_decode_graphs: bool = False
+    # Under attention DP, the graph-shape exchange also agrees on replaying one captured
+    # generation-only graph, whose shape fixes every rank's input counts; a speculative step
+    # then skips the all-gather of those counts.
+    skip_adp_count_gather: bool = False
+    # A generation-only one-model speculative step verifies its hidden states as they are: the
+    # decoder inputs gather every row there, in order.
+    skip_verify_row_gather: bool = False
     # Speculative step-input staging folded into the forward (see SpecStepFold).
     spec_step_fold: Optional[SpecStepFold] = None
     # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side
@@ -256,8 +300,31 @@ class RuntimeHooks:
     # stream that waits for the current stream, instead of an end and a start event back to back on the
     # current stream (the same instant, with no GPU work between them). The reported step times are unchanged.
     iteration_timing_one_event: bool = False
+    # Record the per-request perf-metrics timing events (return_perf_metrics) on a side stream that waits for
+    # the current stream, so a timing record does not cost the current stream. The elapsed times are unchanged.
+    perf_metrics_timing_side_stream: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
+    # Device memory, in bytes, the executor leaves outside the PyTorch cap for driver allocations made after
+    # setup (streams, events, copy launches of the KV cache manager and transfer agents, CUDA IPC mappings of
+    # peer buffers, kernel attribute and module loads), up to the memory free at that point. None keeps the
+    # engine's default margin (1 GiB). The KV cache budget does not change.
+    torch_mem_safety_margin: Optional[int] = None
+    # With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0), the
+    # KV cache manager V2 scheduler classifies context requests by the prefix cache rather than
+    # the router's estimate alone: an estimate above the threshold is checked once against the
+    # radix tree (read-only probe), a request that already holds its cache is judged by its exact
+    # remainder, and a request ordered as short whose first preparation shows a long remainder is
+    # retried after the rest of the iteration. Without demotion it does nothing.
+    exact_context_demotion: bool = False
+    # Replaces the attention-DP KV-balanced admission's window and planner
+    # (attention_dp_config.enable_kv_balanced_admission); None keeps the engine's.
+    kv_balanced_admission_planner: Optional[KvBalancedAdmissionPlanner] = None
+    # A subclass of the KV cache manager class the engine resolves for the model's own KV cache; the
+    # engine builds this subclass instead (KvCacheCreator rejects a class that is not a subclass). A
+    # separate draft model's KV cache manager is resolved from the draft model and does not use it.
+    # None keeps the resolved class.
+    kv_cache_manager_cls: Optional[type] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:

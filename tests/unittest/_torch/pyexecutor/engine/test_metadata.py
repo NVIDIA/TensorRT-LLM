@@ -295,6 +295,7 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
         kv_cache_manager=manager,
         enable_context_mla_with_cached_kv=override,
     )
+    global_lengths_storage = metadata.helix_global_kv_lens.data_ptr()
     # Fresh mixed batch, decode-only, then changed fresh context on the same object.
     for lengths, num_contexts, cached in [
         ([17, 3, 1], 2, [0, 0, 9]),
@@ -309,6 +310,8 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
         metadata.update_helix_param([cached[-1]], [False])
         metadata.prepare()
 
+        assert metadata.helix_global_kv_lens.data_ptr() == global_lengths_storage
+        assert metadata.helix_global_kv_lens[:1].tolist() == [cached[-1] + 1]
         assert metadata.num_ctx_cached_tokens == 0
         assert metadata.max_ctx_cached_token_len == 0
         assert metadata.max_ctx_seq_len == max(lengths[:num_contexts], default=0)

@@ -17,15 +17,16 @@
     "attention_backend": "TRTLLM",
     "cuda_graph": false
   },
+  "nvfp4_gemm_backend": "cutlass",
   "torch_compile": true,
   "deterministic_algorithms": false,
   "lpips_net": "alex",
   "lpips_threshold": 0.15,
   "diffusers_version": "0.40.0",
   "torch_version": "2.14.0a0+b2c75dd062.nv26.09",
-  "tensorrt_llm_version": "1.4.0rc2",
-  "tensorrt_llm_commit": "93aa1646cbfe8a09d1a17e121f2c0d55d12a903f",
-  "sha256": "701f70cbeb5d6842d93bc5787b72eb87f843a0857e13926984a05b5b07cbbe5a",
+  "tensorrt_llm_version": "1.4.0rc5.dev202611190007",
+  "tensorrt_llm_commit": "1f3b31be8764362a4aad232797356bcb13959ad6",
+  "sha256": "00d7358517835f710740ccfde35479b962312624b9041f166f3186bb20f1f02e",
   "copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
   "enable_fullgraph": false,
   "enable_autotune": true,
@@ -33,12 +34,11 @@
   "gpu": "NVIDIA B200",
   "generator": "_generate_ltx2_cuda_graph_trtllm_backend_video(output_path, enable_cuda_graph=False)",
   "reference_provenance": {
-    "test_commit": "93aa1646cbfe8a09d1a17e121f2c0d55d12a903f",
-    "ci_job": "LLM/main/L0_MergeRequest_PR",
-    "ci_build": 66013,
-    "ci_artifact_sha256": "2472b435a090c6eea06c258a2b73ed74d540a8a1fa0e59eff73adcd3f95df2b0",
-    "container_image": "nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc2.dev202610230007",
-    "container_digest": "sha256:8edbe2170c6a4575d99957ea46a5cc625ccc464ea03acbc75299943f5da3b035",
-    "driver_version": "615.71.09"
+    "test_commit": "9d3921216c2df20adf2f46462173340677c69dce + NVBug 7003734 CUTLASS-pin test change",
+    "generation": "pytest examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend on one B200 with the NVFP4 GEMM pinned to CUTLASS in the spawned workers; golden = the graph-off reference worker video (byte-identical to the graph-on video)",
+    "container_image": "nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc5.dev202611190007",
+    "container_digest": "sha256:a73ba95732d2cf11670843440e0baa02fd1f16f5d0454337e587cef2c9efe119",
+    "source_overlay": "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py from 9d3921216c (git blob afa83122485857c383a3a488362c096cfef58dd2, includes #21220); all other package files from the image",
+    "driver_version": "615.71.10"
   }
 }

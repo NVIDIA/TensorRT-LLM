@@ -8,16 +8,20 @@ built, packaged, and reviewed with the code that uses them. The generic
 vendoring tool records where each tree came from, materializes it reproducibly,
 and rejects destination edits that are not represented by its lock entry.
 
-The generated lock is `3rdparty/vendor_sources.lock.yaml`. It records an
+Each generated lock is a `vendor_sources.lock.yaml` file in a `3rdparty`
+directory: the repository lock `3rdparty/vendor_sources.lock.yaml`, or a scoped
+vendor lock owned by one subtree (see
+[Scoped vendor locks](#scoped-vendor-locks)). A lock records an
 upstream Git URL, an immutable commit, the source and destination directories,
 the selected files, any persistent compatibility patch and its content digest,
 and a digest of the materialized destination. A short branch or tag may explain
 where the commit came from, but the full commit is authoritative.
 
 Use `scripts/vendor/manage.py` for every lock or vendor-state change. Do not
-edit the YAML, generated patches, or digests by hand. All examples below use the
-default lock. For an isolated test or another consumer repository, place
-`--lock PATH` before the subcommand.
+edit the YAML, generated patches, or digests by hand. Run the examples below
+from the repository root: commands use every lock in the Git index and select
+the lock that owns the named vendor. For an isolated test or another consumer
+repository, place `--lock PATH` before the subcommand to use only that lock.
 
 For a code-changing PR, start with the
 [PrimTS contributor walkthrough](#contributor-workflow-primts-example).
@@ -44,6 +48,46 @@ fail. Resolve it by discarding it with `sync`, recording a TensorRT-LLM-only
 adaptation with `patch`, or exporting an upstream-worthy change and pinning the
 resulting commit. `export` accepts this pending destination delta by default and
 does not change the lock or persistent patch.
+
+## Scoped vendor locks
+
+A lock at `<scope>/3rdparty/vendor_sources.lock.yaml` owns the directory
+`<scope>`. Its `destination` paths are relative to `<scope>` and stay inside it.
+The tool writes its persistent patches to
+`<scope>/3rdparty/vendor_patches/<vendor>.patch` and records them in the lock as
+`3rdparty/vendor_patches/<vendor>.patch`. The repository lock is the case where
+`<scope>` is the repository root; a lock in any other directory is a scoped
+vendor lock. Lock discovery treats every file named `vendor_sources.lock.yaml`
+in the Git index as a lock, and a file with that name whose parent directory is
+not `3rdparty` is an error rather than being skipped. Committing such a file,
+for example a test fixture, therefore fails the pre-commit check for every
+commit until the file is renamed or moved.
+
+Put a vendor used by only one subtree, such as the kernels of one Modeling V2
+model, in a scoped vendor lock for that subtree, and use the repository lock for
+sources shared across subtrees. A scoped vendor lock keeps the lock entry,
+patches, and optional vendor notes (for example `<scope>/3rdparty/README.md`)
+with the code that uses them:
+
+```text
+tensorrt_llm/_torch/modeling_v2/models/<model>/
+├── 3rdparty/
+│   ├── README.md
+│   ├── vendor_sources.lock.yaml
+│   └── vendor_patches/<vendor>.patch
+└── kernels/<vendored tree>/
+```
+
+Without `--lock`, the tool runs lock discovery: it lists the Git index of the
+current work tree and uses every tracked
+`<scope>/3rdparty/vendor_sources.lock.yaml`. `create` writes a new
+lock but does not stage it; run `git add` on it before other commands or the
+pre-commit check can see it. A `vendor_sources.lock.yaml` outside a `3rdparty`
+directory is an error. Across all locks, vendor names must be unique,
+destinations must not overlap, and no destination may contain another lock or
+its `3rdparty/vendor_patches` directory.
+
+Scoped locks and patches are owned by the CODEOWNERS of their directory.
 
 ## Include patterns
 
@@ -113,15 +157,20 @@ until `pin` succeeds.
 ## Add or adopt a vendor
 
 When neither the lock entry nor destination exists, create both from an
-immutable commit and a local upstream checkout:
+immutable commit and a local upstream checkout. `--scope` names the directory
+that owns the vendor, relative to the current directory (for example,
+`tensorrt_llm/_torch/modeling_v2/models/<model>` from the repository root, or
+`.` at the repository root for the repository lock), and `--destination` is
+relative to that scope:
 
 ```bash
 python scripts/vendor/manage.py create VENDOR \
+  --scope path/owning/the/vendor \
   --url https://example.com/organization/repository.git \
   --branch main \
   --commit FULL_COMMIT \
   --source path/in/upstream \
-  --destination path/in/tensorrt-llm \
+  --destination path/in/scope \
   --include '**/*.py' \
   --repo /path/to/upstream
 ```
@@ -134,10 +183,11 @@ to require an exact upstream match:
 
 ```bash
 python scripts/vendor/manage.py create VENDOR \
+  --scope path/owning/the/vendor \
   --url https://example.com/organization/repository.git \
   --commit FULL_COMMIT \
   --source path/in/upstream \
-  --destination path/in/tensorrt-llm \
+  --destination path/in/scope \
   --include '**/*.py' \
   --adopt exact \
   --repo /path/to/upstream
@@ -181,9 +231,10 @@ currently locked upstream selection:
 python scripts/vendor/manage.py patch VENDOR drop --repo /path/to/upstream
 ```
 
-Generated patches live under `3rdparty/vendor_patches/`. Review them, but update
-them only through the tool. Do not use a persistent patch for a change that
-should be contributed upstream; use the export workflow instead.
+Generated patches live in the `3rdparty/vendor_patches/` directory next to their
+lock (`<scope>/3rdparty/vendor_patches/` for a scoped vendor lock). Review them,
+but update them only through the tool. Do not use a persistent patch for a
+change that should be contributed upstream; use the export workflow instead.
 
 ## Export a destination change upstream
 
@@ -533,6 +584,12 @@ python scripts/vendor/manage.py remove VENDOR
 The preserved destination is no longer protected by the lock. Delete or move
 it separately as part of the reviewed migration that removes the vendor.
 
+Without `--lock`, removing the last vendor of a scoped vendor lock also deletes
+that lock and its empty `3rdparty/vendor_patches/` and `3rdparty/` directories;
+stage the deletion with `git add`. Until then, commands without `--lock` fail,
+because the Git index still lists the deleted lock. The repository lock is kept
+even when it becomes empty.
+
 ## Source access and checks
 
 The default check is deliberately offline:
@@ -543,9 +600,10 @@ python scripts/vendor/manage.py check --offline
 ```
 
 It validates the lock schema and path safety, patch metadata, and the checked-in
-destination digest. It never invokes Git, performs DNS resolution, or contacts
-a recorded URL. This is the always-run pre-commit check. A pending destination
-delta therefore blocks a commit until it is synchronized, patched, or pinned.
+destination digest of every lock. It reads the local Git index to find locks,
+but never fetches, performs DNS resolution, or contacts a recorded URL. This
+is the always-run pre-commit check. A pending destination delta therefore
+blocks a commit until it is synchronized, patched, or pinned.
 
 When network access is available, attempt verification against every recorded
 upstream:
@@ -576,16 +634,20 @@ form.
 An offline digest proves that the committed destination matches the lock. It
 cannot independently prove that a URL, commit, and source directory produced
 that destination. Creating and pinning vendors therefore require a fetched or
-local repository, and URL or commit changes require vendor CODEOWNER review.
+local repository, and URL or commit changes require review by the CODEOWNERS
+of the lock file.
 Never put credentials in a lock URL. Run checks that use internal credentials
 only in a trusted environment, not with pull-request-controlled scripts.
 
 ## Promotion and local monitoring
 
-The generic toolkit under `scripts/vendor/` supports every vendor key in this
-lock. `promote.py` prepares a verified lock-only follow-up after a source-update
-PR merges; `bot.py` can monitor PRs locally, request missing contributor metadata,
-match upstream commits, and publish promotions with squash auto-merge.
+The generic toolkit under `scripts/vendor/` supports every vendor key in the
+repository lock and in scoped vendor locks. `promote.py` prepares a verified
+lock-only follow-up after a source-update PR merges; `bot.py` can monitor PRs
+locally, request missing contributor metadata, match upstream commits, and
+publish promotions with squash auto-merge. Both take `--lock PATH`, the
+repository-relative path of the lock that defines `--vendor` (default
+`3rdparty/vendor_sources.lock.yaml`).
 
 See the [toolkit guide](../scripts/vendor/README.md) for the workflow diagram,
 contributor description format, author resolution of ambiguous matches,
@@ -601,6 +663,18 @@ code-changing PR with normal CI: stop its monitor or configure an audited
 in the existing workdir after merge. See the toolkit guide's
 [base-branch setup](../scripts/vendor/README.md#different-consumer-base-branches)
 and [refresh cutover](../scripts/vendor/README.md#switching-canonical-branches-after-a-refresh).
+
+A monitor tracks only PRs that change its `--lock`, and every poll first checks
+that its vendor is in that lock on the base branch. Start a monitor after its
+vendor's lock entry has merged. Move a vendor to another lock only after its
+pending promotions have merged, then start a new workdir with `--lock` naming
+the new lock; the old monitor's polls fail until it is stopped. Open
+source-update PRs for the vendor conflict with the move. After they are rebased
+onto the new lock, the new monitor tracks them and takes over earlier bot
+reviews, which are keyed by vendor and base branch rather than by lock. A promotion
+still pending at the move can no longer complete: close it, and repoint the
+moved entry at the canonical repository and branch in a reviewed lock-only
+`manage.py pin` change once the canonical branch contains the pinned commit.
 
 Use the entry points under `scripts/vendor/` directly. The old top-level scripts
 and PrimTS-specific CLI aliases are not retained; callers must migrate to the

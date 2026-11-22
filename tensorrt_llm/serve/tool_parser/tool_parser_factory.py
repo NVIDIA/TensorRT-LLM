@@ -18,6 +18,7 @@ from .kimi_k2_tool_parser import KimiK2ToolParser
 from .kimi_k3_tool_parser import KimiK3ToolParser
 from .minimax_m2_parser import MiniMaxM2ToolParser
 from .minimax_m3_parser import MiniMaxM3ToolParser
+from .musespark_parser import MuseSparkToolParser
 from .poolside_v1_parser import PoolsideV1ToolParser
 from .qwen3_coder_parser import Qwen3CoderToolParser
 from .qwen3_tool_parser import Qwen3ToolParser
@@ -47,6 +48,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "gemma4_text": "gemma4",
     "laguna": "poolside_v1",
     "minimax_m3_vl": "minimax_m3",
+    "muse_spark": "musespark",
     # Nemotron 3.5 Super VL. Its chat template instructs the model to emit
     # the Qwen3-Coder <tool_call><function=...><parameter=...> XML shape,
     # not JSON, so it shares that parser.
@@ -84,6 +86,7 @@ class ToolParserFactory:
         "xing4_0": Xing4_0ToolParser,
         "minimax_m2": MiniMaxM2ToolParser,
         "minimax_m3": MiniMaxM3ToolParser,
+        "musespark": MuseSparkToolParser,
         "poolside_v1": PoolsideV1ToolParser,
     }
 
