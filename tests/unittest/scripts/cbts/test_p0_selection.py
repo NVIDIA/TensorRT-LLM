@@ -96,8 +96,8 @@ def test_formatting_bypasses_source_rules_without_adding_cpu_tests(
             str(tmp_path),
             "--test-db",
             str(REPO_ROOT / "tests/integration/test_lists/test-db"),
-            "--groovy-file",
-            str(REPO_ROOT / "jenkins/L0_Test.groovy"),
+            "--stage-config-file",
+            str(REPO_ROOT / "jenkins/scripts/test_stage_configs.json"),
         ],
     )
     assert result.exit_code == 0, result.output

@@ -17,13 +17,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import YAMLIndex, parse_stages_from_groovy, write_filtered_test_db
+from cbts.blocks import YAMLIndex, parse_stages, write_filtered_test_db
 from cbts.command.report_decision import _stage_group
 from cbts.coverage.selection.touch_db import stage_family
 from cbts.coverage.tier import write_coverage_test_db
@@ -37,15 +38,26 @@ _CONDITION = {"terms": {"stage": "post_merge", "backend": "pytorch"}}
 @pytest.mark.parametrize("suffix", ["", "-{split}_of_8"])
 def test_parse_generated_stages(tmp_path: Path, include_post_merge: bool, suffix: str) -> None:
     """Three splits in an eight-build cycle create only three SBSA stages."""
-    groovy = tmp_path / "L0_Test.groovy"
-    groovy.write_text(
-        "multiNodesSBSAConfigs += buildStageConfigs(\n"
-        f'    "GB300-12_GPUs-PerfSanity-Post-Merge{suffix}",\n'
-        '    "auto:gb300-flex", "perf_context", 3, 12, 3\n'
-        ")\n"
-        '// x86SlurmTestConfigs += buildStageConfigs("Disabled", "x86", "disabled", 1, 8, 1)\n'
+    config = tmp_path / "test_stage_configs.json"
+    config.write_text(
+        json.dumps(
+            {
+                "configs": [
+                    {
+                        "name": f"GB300-12_GPUs-PerfSanity-Post-Merge{suffix}",
+                        "arch": "SBSA",
+                        "slurm": True,
+                        "platform": "auto:gb300-flex",
+                        "testDB": "perf_context",
+                        "splits": 3,
+                        "gpuCount": 12,
+                        "nodeCount": 3,
+                    }
+                ]
+            }
+        )
     )
-    stages = parse_stages_from_groovy(groovy, include_post_merge=include_post_merge)
+    stages = parse_stages(config, include_post_merge=include_post_merge)
     assert list(stages) == (
         [
             f"GB300-12_GPUs-PerfSanity-Post-Merge-{k}" + ("_of_8" if suffix else "")

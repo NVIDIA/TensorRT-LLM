@@ -57,13 +57,10 @@ class Block:
     tests: list[str]
 
 
-# Strip trailing ` SKIP ...` / ` TIMEOUT ...` / ` ISOLATION` annotations from a
-# test id. YAML entries can carry `TIMEOUT (n)` and/or `ISOLATION` (see
-# jenkins/scripts/cbts/README.md), waives.txt entries can carry SKIP/TIMEOUT;
-# the lookup must hit either form so we normalize on both sides. `ISOLATION`
-# has no trailing argument of its own, but `\b.*$` still swallows anything
-# after it (e.g. a later `-k "..."`), matching how SKIP/TIMEOUT are handled.
-_TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT|ISOLATION)\b.*$")
+# Strip trailing ` SKIP ...` / ` TIMEOUT ...` annotations from a test id.
+# YAML entries can carry `TIMEOUT (n)`, waives.txt entries can carry both;
+# the lookup must hit either form so we normalize on both sides.
+_TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT)\b.*$")
 
 # ISOLATION is an execution directive, not part of the pytest identity. Match
 # only the trailing token so a quoted -k expression containing it stays intact.
@@ -187,8 +184,7 @@ def _normalize_target_path(target: str) -> str:
 def _entry_target(entry: str) -> str:
     """Canonical "target" key for indexing/lookup.
 
-    Strips SKIP/TIMEOUT/ISOLATION/full:gpu, pytest options (-k/-m), and
-    `[params]` suffix.
+    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m), and `[params]` suffix.
 
     `file.py::TestC::test_m[a-b] TIMEOUT (90)` → `file.py::TestC::test_m`
     `file.py -k "kw"`                          → `file.py`
