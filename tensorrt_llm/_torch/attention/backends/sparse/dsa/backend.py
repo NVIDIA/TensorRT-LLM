@@ -189,10 +189,11 @@ class DSATrtllmAttention(TrtllmAttention):
                 shared_topk_indices is not None
                 and not preserve_mtp_topk
                 and not (
-                    _GROUP_REMAP
-                    and is_generation
-                    and metadata.can_skip_shared_topk_copy(
-                        self.get_local_layer_idx(metadata), topk_indices.shape
+                    is_generation
+                    and metadata.skip_shared_topk_copy(
+                        self.get_local_layer_idx(metadata),
+                        topk_indices.shape,
+                        group_remap=_GROUP_REMAP,
                     )
                 )
             ):
@@ -540,6 +541,8 @@ class DSATrtllmAttention(TrtllmAttention):
             if grouped is not None:
                 return grouped
 
+        if is_generation and self.indexer is None:
+            metadata.check_shared_topk_fallback(local_layer_idx)
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, local_layer_idx, is_generation
         )
@@ -586,9 +589,7 @@ class DSATrtllmAttention(TrtllmAttention):
             # Shared layer: read the leader's precomputed batch. The batch is
             # cleared at every step boundary, so a present entry is from this
             # forward; still require it to match this layer's group slot and
-            # top-k shape, and otherwise fall back to the per-layer path. This
-            # makes any leader/follower ordering or shape mismatch a safe
-            # per-layer fallback rather than a stale/out-of-bounds read.
+            # top-k shape. A fallback is valid only if the leader published local TopK.
             batched = metadata._group_remap_batched.get(leader, None)
             if (
                 batched is None

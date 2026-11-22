@@ -311,6 +311,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._group_remap_struct = None
         self._group_remap_struct_kv_id = 0
         self._group_remap_batched = {}
+        self._skipped_topk_groups: dict[int, int] = {}  # leader -> exclusive end layer
         self.num_ctx_mla_kv_tokens = 0
         self.nvfp4_mla_context_fp8_scratch = None
         self._radix_rows_per_sequence = 1
@@ -1682,6 +1683,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # retained across idle steps. Python-only -> safe under graph replay
         # (replay does not re-run this).
         self._group_remap_batched.clear()
+        self._skipped_topk_groups = {}
         self.nvfp4_mla_context_fp8_scratch = None
 
     def _ensure_pool_view_cached(self):
@@ -1722,12 +1724,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_kv_mgr_id = id(kv_cache_manager)
         self._pool_cache_valid = True
 
-    def can_skip_shared_topk_copy(self, local_layer_idx: int, topk_shape: tuple[int, ...]) -> bool:
-        """Whether generation followers consume only their leader's grouped remap.
+    def skip_shared_topk_copy(
+        self, local_layer_idx: int, topk_shape: tuple[int, ...], *, group_remap: bool
+    ) -> bool:
+        """Record whether this leader skips publishing generation TopK for its followers.
 
         Offload and mixed-precision readers still need the local TopK values.
         Keep the copy until the current cache manager's group layout is built.
         """
+        self._skipped_topk_groups.pop(local_layer_idx, None)
+        if not group_remap:
+            return False
         struct = self._group_remap_struct
         shared_topk_indices = self.shared_topk_indices
         if (
@@ -1746,10 +1753,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             or leader_of[local_layer_idx] != local_layer_idx
         ):
             return False
-        return struct["group_active"].get(local_layer_idx, False) and topk_shape == (
+        if struct["group_active"].get(local_layer_idx, False) and topk_shape == (
             self.num_tokens - self.num_ctx_tokens,
             shared_topk_indices.shape[1],
-        )
+        ):
+            self._skipped_topk_groups[local_layer_idx] = (
+                local_layer_idx + struct["group_size"][local_layer_idx]
+            )
+            return True
+        return False
+
+    def check_shared_topk_fallback(self, local_layer_idx: int) -> None:
+        for leader, end in self._skipped_topk_groups.items():
+            if leader < local_layer_idx < end:
+                raise RuntimeError(
+                    f"DSA layer {local_layer_idx} needs local TopK, but leader {leader} skipped the copy"
+                )
 
     def _ensure_group_remap_struct(self):
         """Build (once) the static full+shared indexer group layout used by the

@@ -1063,6 +1063,7 @@ def test_shared_topk_lifecycle(monkeypatch):
 
     metadata = object.__new__(DSAtrtllmAttentionMetadata)
     metadata.sparse_metadata_params = sparse_metadata_params
+    metadata._skipped_topk_groups = {}
     metadata.max_num_sequences = 2
     metadata.max_num_tokens = 4
     metadata.num_sparse_topk = 3
@@ -1588,6 +1589,7 @@ def _make_group_remap_metadata(
         _group_remap_struct=None,
         _group_remap_struct_kv_id=0,
         _group_remap_batched={},
+        _skipped_topk_groups={},
         _ensure_pool_view_cached=Mock(),
         _cached_block_table_gen=block_table,
         _cached_req_idx_gen=req_idx,
@@ -1598,6 +1600,12 @@ def _make_group_remap_metadata(
     )
     metadata._ensure_group_remap_struct = MethodType(
         DSAtrtllmAttentionMetadata._ensure_group_remap_struct, metadata
+    )
+    metadata.skip_shared_topk_copy = MethodType(
+        DSAtrtllmAttentionMetadata.skip_shared_topk_copy, metadata
+    )
+    metadata.check_shared_topk_fallback = MethodType(
+        DSAtrtllmAttentionMetadata.check_shared_topk_fallback, metadata
     )
     # Bind the real per-step cache invalidation so tests exercise the actual
     # clear of _group_remap_batched at forward boundaries.
@@ -1619,9 +1627,9 @@ def _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=11):
     return topk
 
 
-def _make_group_remap_backend(indexer, local_idx):
-    """Minimal DSATrtllmAttention exposing just what the remap helpers touch."""
-    att = DSATrtllmAttention.__new__(DSATrtllmAttention)
+def _make_group_remap_backend(indexer, local_idx, backend_cls=DSATrtllmAttention):
+    """Minimal backend exposing just what the remap helpers touch."""
+    att = backend_cls.__new__(backend_cls)
     att.indexer = indexer
     att.get_local_layer_idx = lambda metadata: local_idx
     return att
@@ -1711,9 +1719,18 @@ def test_group_remap_matches_per_layer(mask, params, num_topk):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_group_remap_dispatch_and_fallback(monkeypatch):
-    """Leader computes+caches, followers read the slice, and every fallback
-    condition returns the per-layer result."""
+@pytest.mark.parametrize("rubin", [False, True], ids=["shared", "rubin"])
+def test_group_remap_dispatch_and_fallback(monkeypatch, rubin):
+    """Followers use the grouped result or fall back only when local TopK was published."""
+    module, backend_cls = dsa_backend, DSATrtllmAttention
+    if rubin:
+        from importlib import import_module
+
+        module = import_module(
+            "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
+            "glm_5_2_nvfp4__sm_107__high_throughput.ops.attention.backend"
+        )
+        backend_cls = module.RubinDSATrtllmAttention
     device = torch.device("cuda")
     num_tokens, num_requests, num_topk, block_size = 8, 4, 128, 64
     mask = [True, False, False, True, False]  # leaders at 0 and 3
@@ -1729,8 +1746,8 @@ def test_group_remap_dispatch_and_fallback(monkeypatch):
         )
         return out
 
-    leader = _make_group_remap_backend(indexer=object(), local_idx=0)
-    follower = _make_group_remap_backend(indexer=None, local_idx=1)
+    leader = _make_group_remap_backend(indexer=object(), local_idx=0, backend_cls=backend_cls)
+    follower = _make_group_remap_backend(indexer=None, local_idx=1, backend_cls=backend_cls)
 
     # Follower before the leader has run -> no cached batch -> fall back (None).
     assert follower._grouped_remap_topk_to_global(topk, md, 1, True) is None
@@ -1748,13 +1765,13 @@ def test_group_remap_dispatch_and_fallback(monkeypatch):
     md_solo, _, _ = _make_group_remap_metadata(
         [True], {0: (2, 0)}, num_tokens, num_requests, num_topk, block_size, device
     )
-    solo = _make_group_remap_backend(indexer=object(), local_idx=0)
+    solo = _make_group_remap_backend(indexer=object(), local_idx=0, backend_cls=backend_cls)
     assert solo._grouped_remap_topk_to_global(topk, md_solo, 0, True) is None
 
     # Full dispatch via _remap_topk_to_global with the flag forced on: the
     # generation forward uses the grouped path, while context and MTP-draft keep
     # the per-layer path. All three must be bit-exact vs the per-layer op.
-    monkeypatch.setattr(dsa_backend, "_GROUP_REMAP", True)
+    monkeypatch.setattr(module, "_GROUP_REMAP", True)
 
     md._group_remap_batched.clear()
     assert torch.equal(leader._remap_topk_to_global(topk, md, is_generation=True), per_layer(0))
@@ -1768,6 +1785,26 @@ def test_group_remap_dispatch_and_fallback(monkeypatch):
     md._group_remap_batched.clear()
     assert torch.equal(leader._remap_topk_to_global(topk, md, is_generation=True), per_layer(0))
     md.in_mtp_draft_loop = False
+
+    # Losing a grouped result is safe to fall back from only after local TopK was published.
+    md.shared_topk_indices = torch.full_like(topk, -1)
+    md.num_tokens, md.num_ctx_tokens = num_tokens, 0
+    md.sparse_metadata_params = SimpleNamespace(enable_kv_cache_offload=False)
+    md.has_mixed_precision_high_rows = False
+
+    def fallback():
+        return follower._remap_topk_to_global(md.shared_topk_indices, md, is_generation=True)
+
+    assert md.skip_shared_topk_copy(0, topk.shape, group_remap=True)
+    with pytest.raises(RuntimeError, match="leader 0 skipped the copy"):
+        fallback()
+    assert not md.skip_shared_topk_copy(0, topk.shape, group_remap=False)
+    md.shared_topk_indices.copy_(topk)
+    torch.testing.assert_close(fallback(), per_layer(1))
+
+    assert md.skip_shared_topk_copy(0, topk.shape, group_remap=True)
+    md._invalidate_pool_view_cache()
+    torch.testing.assert_close(fallback(), per_layer(1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
