@@ -66,21 +66,15 @@ from .runtime_hooks import runtime_hooks_of
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
-KV_POOL_LOG_INTERVAL_ENV_VAR_NAME = "TLLM_KV_POOL_LOG_INTERVAL"
+KV_POOL_LOG_ENV_VAR_NAME = "TLLM_KV_POOL_LOG"
 
 
-def load_kv_pool_log_interval(env_var: str = KV_POOL_LOG_INTERVAL_ENV_VAR_NAME) -> int:
-    """Parse the per-pool KV cache log interval; unset or empty means disabled (``0``)."""
+def load_kv_pool_log_enabled(env_var: str = KV_POOL_LOG_ENV_VAR_NAME) -> bool:
+    """Parse the per-pool KV cache log switch: ``1`` enables it; unset, empty or ``0`` does not."""
     raw = os.environ.get(env_var, "").strip()
-    if not raw:
-        return 0
-    try:
-        interval = int(raw)
-    except ValueError as e:
-        raise ValueError(f"Cannot parse environment variable `{env_var}`: {e}") from e
-    if interval < 0:
-        raise ValueError(f"Environment variable `{env_var}` must be non-negative, got {interval}")
-    return interval
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"Environment variable `{env_var}` must be 0 or 1, got {raw!r}")
+    return raw == "1"
 
 
 # The iteration log refreshes kv_cache_util (a full KV cache stats build) once
@@ -867,8 +861,8 @@ class PyExecutorProfileManager:
         self._metrics_log_rank_enabled = False
         # Parsed here so a malformed value fails at construction (like
         # ``TLLM_PROFILE_START_STOP``) instead of on the executor thread.
-        self._kv_pool_log_interval = load_kv_pool_log_interval()
-        self._kv_pool_log_lines = 0
+        self._kv_pool_log_enabled = load_kv_pool_log_enabled()
+        self._kv_pool_rank_snapshot = None
         self._kv_pool_gib_logged = False
 
     @property
@@ -885,22 +879,26 @@ class PyExecutorProfileManager:
     def expose_metrics(self, record: PerfMetricsRecord) -> None:
         """Select executor-loop logging after collection and rank filtering."""
         if self._executor.print_log and self._metrics_log_rank_enabled:
-            kv_pool_text = self._kv_pool_log_text() if self._kv_pool_log_interval else ""
+            kv_pool_text = self._kv_pool_log_text(record) if self._kv_pool_log_enabled else ""
             self.metrics_logger.emit(record, kv_pool_text=kv_pool_text)
 
-    def _kv_pool_log_text(self) -> str:
-        """Return per-pool KV cache fields for every ``TLLM_KV_POOL_LOG_INTERVAL``-th log line.
+    def _kv_pool_log_text(self, record: PerfMetricsRecord) -> str:
+        """Return per-pool KV cache fields on lines whose ``kv_cache_util`` was just read.
 
-        Sampling counts printed lines rather than ``iter_counter``, which stays at zero
-        while a gen-only benchmark fills its batch. Unsampled lines, warmup (a temporary
-        KV cache manager) and the V1 manager read nothing.
+        Each KV cache read makes a new rank snapshot: every ``ITER_LOG_KV_UTIL_REFRESH_ITERS``
+        loops in logger-only mode, or each measured iteration with iteration stats. The pool
+        counters are read only when a line carries a snapshot not seen before, so both fields
+        describe the same moment. Other lines, warmup (a temporary KV cache manager) and the
+        V1 manager read nothing.
         """
+        snapshot = record.per_rank
+        if snapshot is self._kv_pool_rank_snapshot or "kvCacheStats" not in snapshot:
+            return ""
+        # Remembered even when skipped, so a warmup snapshot is not sampled after warmup.
+        self._kv_pool_rank_snapshot = snapshot
         executor = self._executor
         manager = executor.kv_cache_manager
         if manager is None or not executor._is_kv_manager_v2 or executor.is_warmup:
-            return ""
-        self._kv_pool_log_lines += 1
-        if self._kv_pool_log_lines % self._kv_pool_log_interval:
             return ""
         gpu_pool_gib = None
         if not self._kv_pool_gib_logged:
@@ -951,12 +949,12 @@ class PyExecutorProfileManager:
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
         self._metrics_log_rank_enabled = log_all_ranks or executor.dist.rank in log_ranks
         if (
-            self._kv_pool_log_interval
+            self._kv_pool_log_enabled
             and not executor.is_warmup
             and not (executor._is_kv_manager_v2 and executor.print_log)
         ):
             logger.warning(
-                f"{KV_POOL_LOG_INTERVAL_ENV_VAR_NAME}={self._kv_pool_log_interval} has no "
+                f"{KV_POOL_LOG_ENV_VAR_NAME}=1 has no "
                 "effect: per-pool KV cache logging requires KV Cache Manager V2 and "
                 "print_iter_log=True."
             )
