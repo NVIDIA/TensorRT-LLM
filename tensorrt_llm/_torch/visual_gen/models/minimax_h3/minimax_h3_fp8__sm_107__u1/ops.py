@@ -163,7 +163,7 @@ def down(
     modulation: torch.Tensor,
     indices: torch.Tensor,
 ) -> torch.Tensor:
-    if projection_residual.supports(
+    if activation.dtype == torch.float8_e4m3fn and projection_residual.supports(
         activation, weight, hidden, modulation, indices, projection_residual.DOWN_GATE
     ):
         return projection_residual.run(
@@ -193,6 +193,11 @@ def _down_fake(activation, weight, input_scale, weight_scale, hidden, modulation
     return torch.empty_like(hidden)
 
 
+def _require_bf16_projection(activation, weight):
+    if activation.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("BF16 projection requires BF16 activation and weight")
+
+
 @torch.library.custom_op("h3_fp8::bf16_down_gated_residual", mutates_args=(), device_types="cuda")
 def bf16_down(
     activation: torch.Tensor,
@@ -202,6 +207,7 @@ def bf16_down(
     modulation: torch.Tensor,
     indices: torch.Tensor,
 ) -> torch.Tensor:
+    _require_bf16_projection(activation, weight)
     gate_column = projection_residual.DOWN_GATE
     if _valid_bf16_unit(unit, activation.device) and projection_residual.supports(
         activation, weight, hidden, modulation, indices, gate_column
@@ -319,6 +325,7 @@ def bf16_attention_projection(
     indices: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_bf16_projection(raw, weight)
     if (
         raw.shape[-1:] != (7168,)
         or hidden.shape[-1:] != (5376,)
