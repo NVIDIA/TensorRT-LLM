@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+#include <ATen/core/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
 #include <algorithm>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -8,7 +11,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#include <torch/extension.h>
 #include <vector>
 
 namespace

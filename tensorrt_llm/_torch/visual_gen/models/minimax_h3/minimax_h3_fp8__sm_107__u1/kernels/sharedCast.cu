@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: Apache-2.0
 // Exact BF16-to-FP32 conversion, preserving Torch .float() bit patterns.
+#include <ATen/core/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/empty.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <limits>
-#include <torch/extension.h>
 #include <vector>
 
 namespace

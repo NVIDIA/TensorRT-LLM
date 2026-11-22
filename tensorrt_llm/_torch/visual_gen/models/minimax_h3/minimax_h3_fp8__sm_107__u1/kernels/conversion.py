@@ -30,6 +30,7 @@ from ..config import missing_build_tools
 from .pdl import prove as prove_pdl_edges
 
 ROOT = Path(__file__).resolve().parent
+SOURCES = ("conversionBindings.cpp", "staticQuant.cu", "sharedCast.cu")
 THREADS = 256
 BLOCKS = 848
 GUARD = 256
@@ -66,18 +67,23 @@ def guards_ok(owner: torch.Tensor) -> bool:
     return bool((owner[:GUARD] == 165).all()) and bool((owner[-GUARD:] == 165).all())
 
 
-def build(name: str, cache: Path) -> ModuleType:
-    """Compile a content-addressed extension with precise FP32 operations."""
-    sources = [ROOT / (name + suffix) for suffix in (".cpp", ".cu")]
-    flags = ["-O3", "-lineinfo", "-arch=sm_107a", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__"]
+def build(cache: Path) -> ModuleType:
+    """Compile both conversion kernels in one content-addressed extension."""
+    sources = [ROOT / name for name in SOURCES]
+    flags = [
+        "-O3",
+        "-lineinfo",
+        "-gencode=arch=compute_107a,code=sm_107a",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    ]
     digest = hashlib.sha256(("".join(sha(p) for p in sources) + repr(flags)).encode()).hexdigest()
-    folder = cache / (name + "-" + digest[:16])
+    folder = cache / ("conversion-" + digest[:16])
     folder.mkdir(parents=True, exist_ok=True)
     jobs = os.environ.get("MAX_JOBS")
     os.environ.setdefault("MAX_JOBS", "1")
     try:
         return load(
-            name="h3_fp8_" + name + "_" + digest[:16],
+            name="h3_fp8_conversion_" + digest[:16],
             sources=[str(p) for p in sources],
             extra_cflags=["-O3"],
             extra_cuda_cflags=flags + ["--keep", "--keep-dir=" + str(folder)],
@@ -88,7 +94,34 @@ def build(name: str, cache: Path) -> ModuleType:
             os.environ.pop("MAX_JOBS", None)
 
 
-def inspect_kernel(module: ModuleType, mode: int, *, pdl: bool, vector: bool = True) -> dict:
+def read_sass(binary: Path) -> dict[str, list[str]]:
+    """Disassemble the shared extension once, retaining duplicate function entries."""
+    tool = shutil.which("cuobjdump")
+    if tool is None:
+        raise RuntimeError("cuobjdump is required before GPU execution")
+    result = subprocess.run(
+        [tool, "--dump-sass", str(binary)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    parts = re.split(r"Function\s*:\s*(\S+)", result.stdout)
+    sections: dict[str, list[str]] = {}
+    for name, body in zip(parts[1::2], parts[2::2]):
+        sections.setdefault(name, []).append(body)
+    return sections
+
+
+def inspect_kernel(
+    module: ModuleType,
+    mode: int,
+    sass_sections: dict[str, list[str]],
+    binary_sha256: str,
+    *,
+    pdl: bool,
+    vector: bool = True,
+) -> dict:
     """Inspect the actual linked CUfunction and its SASS before any launch."""
     values = list(module.kernel_info(mode, torch.cuda.current_device()))
     handle = cuda.CUfunction(values[0])
@@ -108,18 +141,7 @@ def inspect_kernel(module: ModuleType, mode: int, *, pdl: bool, vector: bool = T
     assert list(observed.values()) == values[1:5]
     assert observed["local"] == observed["static_smem"] == 0
     assert 0 < observed["regs"] * THREADS <= 65536 and observed["max_threads"] >= THREADS
-    tool = shutil.which("cuobjdump")
-    if tool is None:
-        raise RuntimeError("cuobjdump is required before GPU execution")
-    result = subprocess.run(
-        [tool, "--dump-sass", module.__file__],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
-    parts = re.split(r"Function\s*:\s*(\S+)", result.stdout)
-    sections = [parts[i + 1] for i in range(1, len(parts), 2) if parts[i] == name]
+    sections = sass_sections.get(name, [])
     assert len(sections) == 1
     sass = sections[0]
     if vector:
@@ -132,7 +154,7 @@ def inspect_kernel(module: ModuleType, mode: int, *, pdl: bool, vector: bool = T
         assert waits and reads and waits[0] < min(reads) and "PREEXIT" in sass
     else:
         assert "ACQBULK" not in sass and "PREEXIT" not in sass
-    return dict(name=name, driver=observed, extension_sha256=sha(Path(module.__file__)))
+    return dict(name=name, driver=observed, extension_sha256=binary_sha256)
 
 
 def capture_launch(
@@ -225,13 +247,18 @@ def prepare(
 
 
 def _build(cache: Path) -> tuple[ModuleType, ModuleType, dict]:
-    """Compile both extensions and inspect their binaries; nothing is launched."""
-    quant, cast = build("staticQuant", cache), build("sharedCast", cache)
+    """Compile and inspect both kernels before any launch."""
+    extension = build(cache)
+    quant, cast = extension.quant, extension.cast
+    quant.__file__ = cast.__file__ = extension.__file__
+    binary = Path(extension.__file__)
+    sections = read_sass(binary)
+    digest = sha(binary)
     resources = {
-        "quant": inspect_kernel(quant, 0, pdl=True),
-        "factor": inspect_kernel(quant, 3, pdl=True, vector=False),
-        "expression_factor": inspect_kernel(quant, 4, pdl=True, vector=False),
-        "cast": inspect_kernel(cast, 1, pdl=False),
+        "quant": inspect_kernel(quant, 0, sections, digest, pdl=True),
+        "factor": inspect_kernel(quant, 3, sections, digest, pdl=True, vector=False),
+        "expression_factor": inspect_kernel(quant, 4, sections, digest, pdl=True, vector=False),
+        "cast": inspect_kernel(cast, 1, sections, digest, pdl=False),
     }
     return quant, cast, resources
 
@@ -308,7 +335,7 @@ def _prepare(
         pdl=int(pdl),
         scale_bits_u32=[int(x) & 0xFFFFFFFF for x in scales.cpu().view(torch.int32).tolist()],
         factor_bits_u32=[int(x) & 0xFFFFFFFF for x in factors.cpu().view(torch.int32).tolist()],
-        source_files={p.name: sha(p) for p in ROOT.glob("*") if p.suffix in (".cpp", ".cu")},
+        source_files={name: sha(ROOT / name) for name in SOURCES},
     )
     cache.mkdir(parents=True, exist_ok=True)
     record = cache / f"qualification.{os.getpid()}.json"
