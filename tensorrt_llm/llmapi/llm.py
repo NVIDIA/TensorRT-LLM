@@ -32,7 +32,9 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import MultimodalParams, request_cache_salt
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            isolate_mm_request,
+                                            request_cache_salt)
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -1124,6 +1126,14 @@ class BaseLLM:
                 maybe_compute_mm_embed_cumsum(
                     prompt_token_ids, extra_processed_inputs,
                     cast(BaseMultimodalInputProcessor, self.input_processor))
+                if (extra_processed_inputs is not None and
+                        extra_processed_inputs.get("multimodal_input") is None):
+                    isolate_mm_request(
+                        extra_processed_inputs.setdefault(
+                            "multimodal_data", {}),
+                        type(self.input_processor).__name__,
+                        sorted(mm_embedding_info),
+                        "embeddings attached without item spans")
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(

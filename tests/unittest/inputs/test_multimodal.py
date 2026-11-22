@@ -1014,8 +1014,8 @@ def test_modality_set_to_none_is_like_no_modality(hashing_off) -> None:
         assert processor.multimodal_hashing_supported is True
 
 
-def test_generate_async_submits_the_multimodal_cache_salt() -> None:
-    """LLM.generate_async adds the request's multimodal salt to the caller's salt."""
+def _llm_with_mock_executor(input_processor: object = None) -> object:
+    """A BaseLLM whose generate_async submits to a mock executor."""
     from tensorrt_llm.llmapi.llm import BaseLLM
     from tensorrt_llm.sampling_params import SamplingParams
 
@@ -1029,6 +1029,14 @@ def test_generate_async_submits_the_multimodal_cache_salt() -> None:
     llm._check_arguments = Mock()
     llm._post_processor_hook = None
     llm._tokenizer = None
+    llm._hf_model_config = None
+    llm.input_processor = input_processor
+    return llm
+
+
+def test_generate_async_submits_the_multimodal_cache_salt() -> None:
+    """LLM.generate_async adds the request's multimodal salt to the caller's salt."""
+    llm = _llm_with_mock_executor()
     wrapped = create_input_processor_with_hash(_ProbeFakeProcessor(count_error=ValueError("x")))
     submitted = []
     for inputs in (_PROBE_INPUTS, {"prompt": "text only"}):
@@ -1041,6 +1049,80 @@ def test_generate_async_submits_the_multimodal_cache_salt() -> None:
 
     assert submitted[0].startswith("user/mm-no-item-spans-")
     assert submitted[1] == "user"
+
+
+class _AttachWithoutSpansProcessor(_ProbeFakeProcessor):
+    """Attaches embeddings as LLaVA-NeXT and Llama 4 do: no hashes and no item spans."""
+
+    def attach_multimodal_embeddings(
+        self, inputs: dict, multimodal_embedding: dict, sampling_params: object
+    ) -> tuple[list[int], dict]:
+        return [10, 101, 102, 20], {
+            "multimodal_data": {"multimodal_embedding": multimodal_embedding["image"][0]}
+        }
+
+
+def test_attached_embeddings_without_item_spans_get_a_cache_salt() -> None:
+    """Two requests with the same prompt and other embeddings of the same size.
+
+    Their tokens are the same, so without item spans only a cache salt of their own keeps the
+    second from reusing the KV cache of the first.
+    """
+    llm = _llm_with_mock_executor(_AttachWithoutSpansProcessor())
+    submitted = []
+    for embedding in (torch.zeros(2, 4), torch.ones(2, 4)):
+        inputs = {"prompt": "unused", "multi_modal_embeddings": {"image": [embedding]}}
+        with (
+            patch.object(MultimodalParams, "to_handle"),
+            patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+        ):
+            llm.generate_async(inputs, cache_salt="user")
+        kwargs = llm._executor.generate_async.call_args.kwargs
+        submitted.append(kwargs["cache_salt"])
+        assert kwargs["multimodal_params"].multimodal_data[MULTIMODAL_NO_CONTENT_HASHES_KEY]
+
+    assert all(salt.startswith("user/mm-no-item-spans-") for salt in submitted)
+    assert submitted[0] != submitted[1]
+
+
+_MM_SALT = "mm-no-item-spans-" + "0" * 32
+
+
+@pytest.mark.parametrize(
+    "cache_salt",
+    ["a" * 206, "a" * 207, "a" * 256, "\u00e9" * 128],
+    ids=["fits", "one_byte_over", "at_limit", "multibyte_at_limit"],
+)
+def test_multimodal_cache_salt_fits_the_salt_limit(cache_salt: str) -> None:
+    """A caller salt any request may have stays valid with the multimodal salt added."""
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    params = MultimodalParams(multimodal_data={MULTIMODAL_CACHE_SALT_KEY: _MM_SALT})
+    salt = request_cache_salt(cache_salt, params)
+
+    assert len(salt.encode("utf-8")) <= GenerationRequest.MAX_CACHE_SALT_LEN
+    assert salt.endswith(_MM_SALT)
+    if len(cache_salt.encode("utf-8")) + 1 + len(_MM_SALT) <= GenerationRequest.MAX_CACHE_SALT_LEN:
+        assert salt == f"{cache_salt}/{_MM_SALT}"
+    GenerationRequest([1], SamplingParams(max_tokens=1), cache_salt=salt)
+
+
+@pytest.mark.parametrize(
+    "cache_salt,error",
+    [(123, TypeError), ("a" * 257, ValueError)],
+    ids=["not_a_string", "too_long"],
+)
+def test_bad_caller_cache_salt_still_fails_with_a_multimodal_salt(cache_salt, error) -> None:
+    """A caller salt no request may have fails as it does without a multimodal salt."""
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    params = MultimodalParams(multimodal_data={MULTIMODAL_CACHE_SALT_KEY: _MM_SALT})
+    with pytest.raises(error, match="cache_salt"):
+        GenerationRequest(
+            [1], SamplingParams(max_tokens=1), cache_salt=request_cache_salt(cache_salt, params)
+        )
 
 
 def _process_mm_contract(

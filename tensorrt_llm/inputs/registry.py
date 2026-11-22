@@ -17,7 +17,6 @@
 
 import enum
 import importlib
-import secrets
 import traceback
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -43,8 +42,7 @@ from .content_format import ContentFormat
 from .data import TextPrompt
 from .model_config import resolve_top_level_model_type
 # yapf: disable
-from .multimodal import (MULTIMODAL_CACHE_SALT_KEY,
-                         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
                          MULTIMODAL_NO_CONTENT_HASHES_KEY, MultimodalInput,
                          MultimodalItemMetadata, _as_cpu_tensor,
                          _compute_mm_masks,
@@ -53,9 +51,9 @@ from .multimodal import (MULTIMODAL_CACHE_SALT_KEY,
                          _find_mm_token_start_pos_from_masks, _mm_items,
                          apply_mm_hashes, default_hasher, find_mm_token_lengths,
                          get_multimodal_item_metadata, has_mm_items,
-                         hexdigest_to_int32, modalities_without_token_count,
-                         random_mm_hashes, validate_mm_inputs,
-                         validate_mm_uuids)
+                         hexdigest_to_int32, isolate_mm_request,
+                         modalities_without_token_count, random_mm_hashes,
+                         validate_mm_inputs, validate_mm_uuids)
 # yapf: enable
 from .multimodal_data import serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
@@ -1702,20 +1700,10 @@ def create_input_processor_with_hash(
                                 hash_lib)
                 return prompt_token_ids, extra_processed_inputs
 
-        # Without item spans, the KV cache can key the items only by their
-        # placeholder tokens, which are the same for every item. A cache salt
-        # of its own keeps the request from sharing those blocks.
+        # No item spans: only a cache salt of its own keeps the request apart.
         modalities = sorted(m for m, items in _mm_items(mm_data).items()
                             if items)
-        multimodal_data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
-        multimodal_data[MULTIMODAL_CACHE_SALT_KEY] = (
-            f"mm-no-item-spans-{secrets.token_hex(16)}")
-        logger.warning_once(
-            f"{processor_name}: the prompt spans of {modalities} items were "
-            f"not found ({reason}). Such requests get a cache salt of their "
-            "own, so no other request reuses their KV cache.",
-            key=f"mm-no-item-spans:{processor_name}:{modalities}")
-        logger.debug(f"{processor_name}: no multimodal item spans: {reason}")
+        isolate_mm_request(multimodal_data, processor_name, modalities, reason)
         return prompt_token_ids, extra_processed_inputs
 
     def input_processor_wrapper(
