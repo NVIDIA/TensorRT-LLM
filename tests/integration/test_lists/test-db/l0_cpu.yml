@@ -131,6 +131,9 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm53_flash_default_text_only.py
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm53_flash_default_mtp_fused_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm53_flash_default_mtp_fused_text_only.py
+  # Qwen3.8-27B routing and checkpoint mapping use synthetic configs and tensors on the CPU.
+  - unittest/_torch/modeling_v2/models/qwen3_5/test_routing.py
+  - unittest/_torch/modeling_v2/models/qwen3_5/test_weight_transforms.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
   - unittest/_torch/sampler/test_stop_criteria.py

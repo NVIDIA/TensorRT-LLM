@@ -33,10 +33,10 @@ from transformers.utils import HF_MODULES_CACHE
 from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
-    get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
-    is_qwen4_exp, load_pretrained_config)
+    SSMStatePoolGeometry, get_glm5_next_layer_masks,
+    get_glm5_next_num_attention_layers, get_kimi_linear_num_attention_layers,
+    get_qwen3_hybrid_num_attention_layers, is_glm5_next, is_kimi_linear,
+    is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -497,6 +497,7 @@ class ModelConfig(Generic[TConfig]):
     # The modeling_v2 target class to build, or None for the built-in
     # implementation. Set by the model loader, read by `_resolve_class`.
     modeling_v2_target: Optional[type] = None
+    ssm_state_pool_geometry: Optional[SSMStatePoolGeometry] = None
 
     def get_encoder_attention_backend(self, encoder: str, default: str) -> str:
         """Return the attention backend selected for a logical encoder.
@@ -568,6 +569,8 @@ class ModelConfig(Generic[TConfig]):
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
         '_kv_cache_layer_specs' is set by models that publish per-layer KV geometry.
+        'ssm_state_pool_geometry' is set with the recurrent-state cache dtype, which
+        is resolved against the selected target after the config is built.
         '_preserve_kv_cache_quant_algo' scopes an explicit draft KV precision override.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
@@ -576,6 +579,7 @@ class ModelConfig(Generic[TConfig]):
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
                            'quant_config', '_kv_cache_layer_specs',
+                           'ssm_state_pool_geometry',
                            '_preserve_kv_cache_quant_algo'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
