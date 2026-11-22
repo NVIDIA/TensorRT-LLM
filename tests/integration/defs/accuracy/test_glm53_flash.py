@@ -105,7 +105,16 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    @parametrize_with_ids(
+        "tp_size,ep_size",
+        [
+            pytest.param(
+                4,
+                4,
+                marks=[pytest.mark.timeout(10800)] if get_sm_version() == 107 else [],
+            )
+        ],
+    )
     def test_block_reuse(self, tp_size, ep_size):
         """KV block reuse with periodic Mamba state snapshots.
 
@@ -273,7 +282,16 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    @parametrize_with_ids(
+        "tp_size,ep_size",
+        [
+            pytest.param(
+                4,
+                4,
+                marks=[pytest.mark.timeout(10800)] if get_sm_version() == 107 else [],
+            )
+        ],
+    )
     def test_mtp(self, tp_size, ep_size):
         # The checkpoint's single MTP layer is chained for three drafts per
         # step; KDA verification runs on the fused replay kernel.

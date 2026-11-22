@@ -134,8 +134,6 @@ full:VR200/accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test
 full:VR200/accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[no_reuse] SKIP (https://nvbugs/7045027)
 full:VR200/accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache] SKIP (https://nvbugs/7045027)
 full:VR200/accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache_offsets] SKIP (https://nvbugs/7045027)
-full:VR200/accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4] SKIP (https://nvbugs/7036883)
-full:VR200/accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] SKIP (https://nvbugs/7036883)
 full:VR200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl SKIP (https://nvbugs/7036886)
 full:VR200/accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[linear] SKIP (https://nvbugs/7045027)
 full:VR200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_block_reuse[TP4_MTP] SKIP (https://nvbugs/6949277)
