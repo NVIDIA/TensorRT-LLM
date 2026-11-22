@@ -7,8 +7,7 @@ One recipe and one layout, so the forward carries no recipe or layout branch:
 * checkpoint: the ModelOpt NVFP4 export as stored. The routed experts are NVFP4 (per-tensor
   input scale 1.0); the shared experts and the KDA projections are MXFP8 (one UE8M0 scale per 32
   values of a row); MLA, the latent MoE projections, the router, norms, embedding and LM head are
-  BF16. Nothing is quantized at load time, except by a generation server's MXFP8 levers
-  (``_Levers``): their BF16 weights load quantized to the checkpoint's MXFP8 recipe and layout.
+  BF16. Nothing is quantized at load time.
 * caches: FP8 (E4M3, scale 1) MLA latent KV on all 24 DSA layers, FP8 index keys, FP32 KDA
   recurrent state.
 * speculative decoding: DFlash2, with an FP8 drafter context history.
@@ -280,9 +279,7 @@ _MOE_EP = 16
 # exchange CTAs are resident while the kernel's 46 four-CTA clusters launch, so fewer of them wait
 # for the exchange's refine to end; every byte moved and every output is the same. On graph steps the shared
 # experts' gate_up GEMM keeps the exchange's CTAs and 8 spare SMs out of its grid
-# (shared_gate_up_leave_sms), so the exchange starts on them. Its MXFP8 levers
-# (mla_mxfp8, moe_latent_mxfp8, draft_mxfp8) hold some BF16 weights as MXFP8, quantized at load;
-# see ``_Levers``.
+# (shared_gate_up_leave_sms), so the exchange starts on them.
 _CONSTANTS = MappingProxyType(
     {
         "context": MappingProxyType(
@@ -322,7 +319,6 @@ _CONSTANTS = MappingProxyType(
                 "draft_ctx_latent": "precompute_context_kv",
                 "draft_history_dtype": "fp8",
                 "draft_mla_norm_rope": "mla_norm_rope",
-                "draft_mxfp8": True,
                 "draft_q_a_kv_a_fused": True,
                 "dsa_gate_early": True,
                 "dsa_idx_fork": True,
@@ -338,10 +334,8 @@ _CONSTANTS = MappingProxyType(
                 "kda_replay_seed_stacked": True,
                 "latent_bf16_gemm": "cublas_linear",
                 "megamoe_pusher_ctas": 12,
-                "mla_mxfp8": True,
                 "mla_output_gate": "sigmoid_gate_mul",
                 "moe_backend": "megamoe_cutedsl",
-                "moe_latent_mxfp8": True,
                 "moe_shared_stream_overlap": True,
                 "mxfp8_gemm": "rubin_dense_blockscaled_gemm",
                 "router_bf16": False,
@@ -373,55 +367,16 @@ class _Levers(NamedTuple):
     * ``dsa_rope_before_idx_join``: W_UK and the RoPE kernel, which read q and the latent rows only,
       run before the current stream joins the indexer's stream; the logits weights, the indexer
       and the attention after the join (``mla_generate``).
-
-    The MXFP8 levers are not bitwise: each holds some BF16 weights as MXFP8 instead, quantized once
-    at load (``weights._mx_rows``) to the checkpoint's MXFP8 recipe and layout (E4M3 values, one
-    UE8M0 scale per 32 values of a row, relaid R128c4; the BF16 parameter is not declared), and
-    projects with ``_dense``: the catalog MXFP8 quantization of the activation, then the dense
-    block-scaled GEMM, split-K-free, its tactic pinned at the 96-row verify bucket
-    (``rubin_mxfp8_linear(..., pinned=True)``). Same kernels on the same streams otherwise; the
-    rows each one takes are ``weights.MXFP8_MLA`` / ``MXFP8_MOE`` / ``MXFP8_DRAFT``:
-
-    * ``mla_mxfp8``: the DSA layers' g_proj (fork stream) and o_proj;
-    * ``moe_latent_mxfp8``: the latent MoE's latent_down (the latent stream on graph steps);
-    * ``draft_mxfp8``: each drafter layer's o_proj and MLP gate_up and down.
     """
 
     draft_q_a_kv_a_fused: bool = False
     dsa_rope_before_idx_join: bool = False
-    mla_mxfp8: bool = False
-    moe_latent_mxfp8: bool = False
-    draft_mxfp8: bool = False
 
 
 def _levers(role: str) -> _Levers:
     """The levers of a server role: its constants' values (``_CONSTANTS[role]``), off where unset."""
     c = _CONSTANTS[role]
     return _Levers(**{key: bool(c.get(key, False)) for key in _Levers._fields})
-
-
-class _Mx(NamedTuple):
-    """A weight an MXFP8 lever's table rows quantized at load (``weights._mx_rows``): E4M3 values
-    ``w`` [N, K] and their UE8M0 1x32 scales ``s``, relaid R128c4 (flat): the layout of the
-    checkpoint's own MXFP8 weights (``rubin_mxfp8_linear``'s operands)."""
-
-    w: torch.Tensor
-    s: torch.Tensor
-
-
-def _mx_view(w: Any, key: str) -> Any:
-    """``w[key]``, or the ``_Mx`` of ``{key}_w`` / ``{key}_s`` where an MXFP8 lever's rows hold
-    it."""
-    return _Mx(w[f"{key}_w"], w[f"{key}_s"]) if f"{key}_w" in w else w[key]
-
-
-def _dense(x: torch.Tensor, w: Any) -> torch.Tensor:
-    """``x @ w^T`` in BF16: ``rubin_linear`` (TF32 off) on a BF16 weight; on an MXFP8 lever's
-    ``_Mx`` the catalog quantization of ``x`` and the split-K-free block-scaled GEMM, pinned at the
-    96-row verify bucket (``rubin_mxfp8_linear(..., pinned=True)``)."""
-    if isinstance(w, _Mx):
-        return rubin_mxfp8_linear(x, w.w, w.s, pinned=True)
-    return rubin_linear(x, w, False)
 
 
 _CACHE_ARGS = MappingProxyType(
@@ -787,9 +742,8 @@ class _MlaW(NamedTuple):
     q_b: (
         torch.Tensor
     )  # q_b_proj: the query heads this rank computes [heads x (nope + rope), q_lora]
-    # g_proj, the sigmoid output gate: this rank's share [o_heads x v, H]; an _Mx under mla_mxfp8
-    g: Any
-    o: Any  # o_proj: this rank's input columns [H, o_heads x v]; an _Mx under mla_mxfp8
+    g: torch.Tensor  # g_proj, the sigmoid output gate: this rank's share [o_heads x v, H]
+    o: torch.Tensor  # o_proj: this rank's input columns [H, o_heads x v]
     idx_wk_wp: (
         torch.Tensor
     )  # indexer.wk then indexer.weights_proj rows [index_dim + heads, H], FP32
@@ -818,7 +772,7 @@ class _MoeW(NamedTuple):
     shared_gu_s: torch.Tensor
     shared_dn_w: torch.Tensor  # shared_experts down_proj: this rank's columns [H, S]
     shared_dn_s: torch.Tensor
-    latent_down: Any  # routed_expert_down_proj [latent, H], BF16; an _Mx under moe_latent_mxfp8
+    latent_down: torch.Tensor  # routed_expert_down_proj [latent, H], BF16
     latent_norm: torch.Tensor  # routed_expert_norm.weight [latent]
     latent_up: torch.Tensor  # routed_expert_up_proj [H, latent], BF16
     # The routed experts of this rank's window, as ``w2_rows`` declares them (E local experts, I
@@ -1064,8 +1018,8 @@ def _layer_views(core: Any) -> tuple[_LayerW, ...]:
                 q_a_norm=p("mla_q_a_norm"),
                 kv_a_norm=p("mla_kv_a_norm"),
                 q_b=p("mla_q_b"),
-                g=_mx_view(w, f"l{i}_mla_g"),
-                o=_mx_view(w, f"l{i}_mla_o"),
+                g=p("mla_g"),
+                o=p("mla_o"),
                 idx_wk_wp=p("mla_idx_wk_wp"),
                 idx_k_norm_w=p("mla_idx_k_norm_w"),
                 idx_k_norm_b=p("mla_idx_k_norm_b"),
@@ -1096,7 +1050,7 @@ def _layer_views(core: Any) -> tuple[_LayerW, ...]:
         moe = None
         if i in moe_layers:
             moe = _MoeW(
-                **{f: _mx_view(w, f"l{i}_moe_{f}") for f in _MOE_PARAMS},
+                **{f: p(f"moe_{f}") for f in _MOE_PARAMS},
                 expert_offset=d.expert_offset,
             )
         dense = (
@@ -2456,12 +2410,12 @@ def _mla_output(
     if out.shape[0] > n:
         out[n:].zero_()
     if gate is None:
-        g = _dense(x, L.g)
+        g = rubin_linear(x, L.g, False)
     else:
         g, ready = gate
         ready.wait()
     gated = k31_sigmoid_gate_mul(out, g)
-    return _dense(gated, L.o)
+    return rubin_linear(gated, L.o, False)
 
 
 def _mla_prefill_witness(x: torch.Tensor) -> None:
@@ -2519,8 +2473,7 @@ def mla_generate(L: _MlaW, i: int, x: torch.Tensor, st: _Step, rt: _Rt) -> torch
 
     A generation server's graph steps (``rt.levers.dsa_rope_before_idx_join``) issue W_UK and the
     RoPE kernel, which read q and the latent rows only, before the join on the idx stream; the
-    logits weights, the indexer and the attention after it. Under ``mla_mxfp8`` (a generation
-    server's) g_proj and o_proj are MXFP8 (``_dense``), on the same streams.
+    logits weights, the indexer and the attention after it.
     """
     n = st.num_tokens
     if not st.cuda_graph:
@@ -2549,7 +2502,7 @@ def mla_generate(L: _MlaW, i: int, x: torch.Tensor, st: _Step, rt: _Rt) -> torch
     with torch.cuda.stream(rt.fork_stream):
         q = rubin_linear(qr, L.q_b, False)
         q_ready.record()
-        g = _dense(x, L.g)
+        g = rubin_linear(x, L.g, False)
         g_ready.record()
     q8, qs = _idx_queries(L, qr)
     if rt.levers.dsa_rope_before_idx_join:
@@ -2684,14 +2637,6 @@ def _moe_cublas_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 #: The BF16 latent_down / latent_up GEMM (``latent_bf16_gemm``).
 _moe_latent_gemm = _moe_cublas_linear
-
-
-def _moe_latent_down(x: torch.Tensor, w: Any) -> torch.Tensor:
-    """latent_down on a generation server: ``_moe_latent_gemm``, or under ``moe_latent_mxfp8``
-    (``w`` an ``_Mx``) the catalog quantization and the pinned split-K-free MXFP8 GEMM."""
-    if isinstance(w, _Mx):
-        return rubin_mxfp8_linear(x, w.w, w.s, pinned=True)
-    return _moe_latent_gemm(x, w)
 
 
 def _moe_router(L: _MoeW, x: torch.Tensor) -> torch.Tensor:
@@ -2976,7 +2921,7 @@ def _moe_megamoe(L: _MoeW, logits, latent_in, st: _Step, rt: _Rt) -> torch.Tenso
 
 def _moe_dep_gen_routed(L: _MoeW, x: torch.Tensor, logits, st: _Step, rt: _Rt) -> torch.Tensor:
     """A generation server's routed experts, complete: down, MegaMoE, norm, up."""
-    latent_in = _moe_latent_down(x, L.latent_down)
+    latent_in = _moe_latent_gemm(x, L.latent_down)
     routed = _moe_megamoe(L, logits, latent_in, st, rt)
     return _moe_latent_gemm(flashinfer_rmsnorm(routed, L.latent_norm, _MOE_EPS), L.latent_up)
 
@@ -3014,7 +2959,7 @@ def _moe_dep_gen_streams(L: _MoeW, x: torch.Tensor, st: _Step, rt: _Rt, xf=None)
     # and later work on the latent stream forks from this stream.
     with torch.cuda.stream(c.latent_stream):
         c.latent_fork.wait()
-        latent_in = _moe_latent_down(x, L.latent_down)
+        latent_in = _moe_latent_gemm(x, L.latent_down)
         if b is not None:
             _moe_bucket_quantize(L, latent_in[:rows], b)
         c.latent_ready.record()
@@ -3101,9 +3046,9 @@ class _DraftLayerW(NamedTuple):
     kv_a_norm: torch.Tensor  # [kv_lora]: a row of d_kv_a_norm
     k_b: torch.Tensor  # [heads, nope, kv_lora]: W_UK
     v_b_t: torch.Tensor  # [heads, kv_lora, v]: W_UV, transposed view
-    o: Any  # [H, o heads * v]; o, gate_up and down are _Mx under draft_mxfp8
-    gate_up: Any  # [2 * I / tp, H]: gate rows, then up rows
-    down: Any  # [H, I / tp]
+    o: torch.Tensor  # [H, o heads * v]
+    gate_up: torch.Tensor  # [2 * I / tp, H]: gate rows, then up rows
+    down: torch.Tensor  # [H, I / tp]
     attn_conv_base: torch.Tensor  # [2, taps, H]: side 0 the input's, side 1 the output's
     attn_conv_proj: torch.Tensor  # [2 * taps * groups, H]
     mlp_conv_base: torch.Tensor
@@ -3244,9 +3189,9 @@ def _draft_views(w: nn.ParameterDict, layers: int, nope: int, kv_lora: int) -> _
                 kv_a_norm=kv_a_norm[j],
                 k_b=kv_b[: heads * nope].view(heads, nope, kv_lora),
                 v_b_t=kv_b[heads * nope :].view(heads, -1, kv_lora).transpose(1, 2),
-                o=_mx_view(w, f"d_l{j}_o"),
-                gate_up=_mx_view(w, f"d_l{j}_gate_up"),
-                down=_mx_view(w, f"d_l{j}_down"),
+                o=w[f"d_l{j}_o"],
+                gate_up=w[f"d_l{j}_gate_up"],
+                down=w[f"d_l{j}_down"],
                 attn_conv_base=w[f"d_l{j}_attn_conv_base"],
                 attn_conv_proj=w[f"d_l{j}_attn_conv_proj"],
                 mlp_conv_base=w[f"d_l{j}_mlp_conv_base"],
@@ -3529,7 +3474,6 @@ def draft_step(DW: _DraftW, hidden_streams: torch.Tensor, st: _DraftStep, rt: _R
     input side, the absorbed MLA query, the block latents into the pool, the exact FP32 window
     decode, W_UV, ``o_proj``, the conv's output side; then the MLP between the MLP conv's two
     sides. Then the final norm. Attention DP: every product is whole on the rank, no collective.
-    Under ``draft_mxfp8`` o_proj, gate_up and down are MXFP8 (``_dense``).
     """
     d = rt.draft
     eps, taps, groups, group = d.eps, d.taps, d.groups, d.group
@@ -3580,12 +3524,12 @@ def draft_step(DW: _DraftW, hidden_streams: torch.Tensor, st: _DraftStep, rt: _R
         )
         attn = ctx.new_empty(rows, heads * L.v_b_t.shape[-1])
         bmm_out(ctx.transpose(0, 1), L.v_b_t, attn.view(rows, heads, -1).transpose(0, 1))
-        a = _dense(attn, L.o)
+        a = rubin_linear(attn, L.o, False)
         a = dflash2_grouped_conv(a, coef[:, 1], L.attn_conv_base[1], block, group)
         x, residual = flashinfer_fused_add_rmsnorm(a, residual, L.post_norm, eps)
         coef = rubin_linear(x, L.mlp_conv_proj, False).view(rows, 2, taps, groups)
         x = dflash2_grouped_conv(x, coef[:, 0], L.mlp_conv_base[0], block, group)
-        m = _dense(flashinfer_silu_and_mul(_dense(x, L.gate_up)), L.down)
+        m = rubin_linear(flashinfer_silu_and_mul(rubin_linear(x, L.gate_up, False)), L.down, False)
         h = dflash2_grouped_conv(m, coef[:, 1], L.mlp_conv_base[1], block, group)
     h, _ = flashinfer_fused_add_rmsnorm(h, residual, DW.final_norm, eps)
     return h

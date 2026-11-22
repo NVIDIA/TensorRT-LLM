@@ -256,3 +256,27 @@ def test_table_covers_the_checkpoint(snapshot, layout):
     leftover = set(snapshot) - consumed
     expected = W.expected_unconsumed(core, snapshot)
     assert leftover == expected, (sorted(leftover - expected)[:5], sorted(expected - leftover)[:5])
+
+
+@pytest.mark.parametrize("role", [None, "generation"], ids=["aggregated", "generation"])
+def test_dep16_keeps_target_and_draft_projections_bf16(monkeypatch, role):
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kimi_k31_pro_nvfp4__sm_107__dep16 import (
+        modeling,
+        weights,
+    )
+
+    monkeypatch.setattr(modeling, "disagg_role", lambda: role)
+    server_role = modeling._server_role()
+    core = weights_core(weights.dims, "dep16", server_role)
+    core.levers = modeling._levers(server_role)
+    with torch.device("meta"):
+        params = weights.declare(weights.dims(core))
+
+    for i in MLA_LAYERS:
+        for projection in ("mla_g", "mla_o"):
+            assert params[f"l{i}_{projection}"].dtype == torch.bfloat16
+    for i in range(1, K31_TEXT["num_hidden_layers"]):
+        assert params[f"l{i}_moe_latent_down"].dtype == torch.bfloat16
+    for i in range(weights.DRAFT_SHAPE["num_hidden_layers"]):
+        for projection in ("o", "gate_up", "down"):
+            assert params[f"d_l{i}_{projection}"].dtype == torch.bfloat16

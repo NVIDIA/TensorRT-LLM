@@ -5,9 +5,8 @@
 The kernel and its runner are the family copy of the engine's SM107 dense block-scaled GEMM
 (``kernels/gemm/rubin_dense_blockscaled_gemm.py``) with the Kimi K3.1 tuning: 16-row tuning
 buckets up to 192 rows, a pruned tactic list, and split-K summed in FP32 planes and rounded once.
-``__call__`` asks the autotuner for a tactic under this family's own key and runs the runner;
-``pinned=True`` (dep16's MXFP8 levers) asks with a split-K-free runner and runs a pinned tactic at
-the 96-row verify bucket. Nothing here is registered as a torch op.
+``__call__`` asks the autotuner for a tactic under this family's own key and runs the runner.
+Nothing here is registered as a torch op.
 
 The scales are read in the R128c4 order (rows in tiles of 128, scale columns in groups of 4). The
 helpers below convert a row-major ``[rows, K / 32]`` byte matrix (a checkpoint's
@@ -29,37 +28,6 @@ SF_VEC = 32
 #: with its own runner classes, so the two never share a cache entry.
 TUNING_KEY = "kimi_k31::rubin_mxfp8_gemm"
 _E4M3_MAX = 448.0
-#: ``pinned=True``: the rows of the pinned tactics, the tuning bucket of a dep16 generation server's
-#: 96-row verify step (12 requests x 8 rows); other row counts take the autotuner's pick among the
-#: split-K-free tactics.
-PINNED_MIN_M, PINNED_MAX_M = 81, 96
-#: ``pinned=True``: the 81-96 row tactic of each weight shape ``(N, K)`` of dep16's MXFP8
-#: levers. None splits K: every split-K-free tactic adds the K tiles into one FP32 accumulator in
-#: the same order, so the bits do not depend on the tactic, and no server start can pick a split-K
-#: tactic for these GEMMs. Each is the fastest split-K-free tactic of the K3 runner's profiled set
-#: and the (4, 1) cluster tiles at 96 rows on sm_107 (CUPTI, L2 cold).
-PINNED_TACTICS: dict[tuple[int, int], tuple] = {
-    # MLA g_proj (96 heads x 128 rows), 10.98 us
-    (12288, 7168): ("base", (256, 128, 128), (256, 128, 64), (2, 1), True, False, "static", "m", 1),
-    # MLA and drafter o_proj, K = 96 heads x 128, 13.06 us
-    (7168, 12288): ("base", (256, 64, 128), (256, 64, 64), (4, 1), True, False, "static", "m", 1),
-    # the latent MoE's latent_down (3584 rows), 8.10 us
-    (3584, 7168): (
-        "base",
-        (256, 64, 128),
-        (256, 64, 64),
-        (2, 1),
-        True,
-        False,
-        "clc_dynamic",
-        "n",
-        1,
-    ),
-    # the drafter's MLP gate_up (2 x 14336 rows), 19.87 us
-    (28672, 7168): ("base", (512, 128, 128), (256, 128, 64), (2, 1), True, False, "static", "n", 1),
-    # the drafter's MLP down, K = 14336, 14.53 us
-    (7168, 14336): ("base", (256, 64, 128), (256, 64, 64), (4, 1), True, False, "static", "m", 1),
-}
 
 
 def _pad_up(value: int, multiple: int) -> int:
@@ -159,15 +127,6 @@ def _tuning_config(autotuner, runner):
     return runner.tuning_config
 
 
-@functools.cache
-def _split_k_free_runner():
-    """The family runner without split-K tactics (``pinned=True``): ``max_split_k`` is part of the
-    runner's autotuner cache key, so no entry tuned with split-K is ever taken."""
-    from ...kernels.gemm.rubin_dense_blockscaled_gemm import RubinMxfp8GemmRunner
-
-    return RubinMxfp8GemmRunner(max_split_k=1)
-
-
 def _mnk(m: int, n: int, k: int, why: str) -> Cell:
     return Cell(why=why, spec=dict(m=m, n=n, k=k))
 
@@ -202,10 +161,7 @@ class RubinMxfp8Gemm(OpWrapper):
     that serve the same requests (TP, Helix CP) merge their tuning into one tactic, so their
     replicated projections stay bit-identical; under attention DP each rank tunes alone. All
     tactics but split-K accumulate K in the same order; split-K sums FP32 planes in a fixed order.
-    ``pinned=True`` asks the autotuner with a split-K-free runner, and at PINNED_MIN_M to
-    PINNED_MAX_M rows runs the tactic PINNED_TACTICS holds for the weight shape (still asking, so a
-    tuning pass at 96 rows tunes the smaller buckets). The cells cover K a multiple of 128 and N a
-    multiple of 8.
+    The cells cover K a multiple of 128 and N a multiple of 8.
     ``reserve_sms`` keeps that many SMs out of the GEMM's persistent grid (the static scheduler
     over fewer clusters), for a GEMM that runs beside a kernel which needs them from its start;
     the tactic is the one the autotuner returns either way, so the output is the same.
@@ -217,19 +173,14 @@ class RubinMxfp8Gemm(OpWrapper):
         weight: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
-        pinned: bool = False,
         reserve_sms: int = 0,
     ) -> torch.Tensor:
         tuner, runner = _runner()
-        if pinned:
-            runner = _split_k_free_runner()
         inputs = [input, weight, input_scale, weight_scale, _alpha(input.device)]
         autotuner = tuner.get()
         _, tactic = autotuner.choose_one(
             TUNING_KEY, [runner], _tuning_config(autotuner, runner), inputs
         )
-        if pinned and PINNED_MIN_M <= input.shape[0] <= PINNED_MAX_M:
-            tactic = PINNED_TACTICS.get((weight.shape[0], input.shape[1]), tactic)
         if reserve_sms > 0:
             return runner(inputs, tactic=tactic, reserve_sms=reserve_sms)
         return runner(inputs, tactic=tactic)
@@ -240,11 +191,9 @@ class RubinMxfp8Gemm(OpWrapper):
         weight: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
-        pinned: bool = False,
         reserve_sms: int = 0,
     ) -> torch.Tensor:
-        """Both operands dequantized exactly, an FP32 product (TF32 off), one rounding to BF16; the
-        tactic (``pinned``) and ``reserve_sms`` (where the kernel runs) do not enter it."""
+        """Both operands dequantized exactly, an FP32 product (TF32 off), one rounding to BF16."""
         a = dequantize_mxfp8(input, input_scale)
         b = dequantize_mxfp8(weight, weight_scale)
         with true_fp32_matmul():
@@ -256,10 +205,8 @@ class RubinMxfp8Gemm(OpWrapper):
         weight: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
-        pinned: bool = False,
         reserve_sms: int = 0,
     ) -> None:
-        assert isinstance(pinned, bool), "pinned is a flag"
         # The runner turns the four tensors into raw pointers of the dtypes it was built for and
         # checks only the scale sizes, so each of these reads as a plausible wrong result.
         assert input.dtype == weight.dtype == torch.float8_e4m3fn, "E4M3 input and weight"

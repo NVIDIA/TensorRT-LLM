@@ -80,8 +80,8 @@ class RubinMxfp8Linear(OpWrapper):
     of the engine's ``block_scale_interleave``), ``pad128(N) * pad4(K / 32)`` UE8M0 bytes. The
     input is quantized with one power-of-two scale per 32 values, the smallest at or above
     ``amax / 448``; the product accumulates in FP32 and rounds once to BF16. sm_107 runs
-    ``rubin_mxfp8_gemm``, sm_103 the engine's MXFP8 GEMM; ``pinned`` and ``reserve_sms`` are
-    sm_107's (that GEMM's tactics and grid).
+    ``rubin_mxfp8_gemm``, sm_103 the engine's MXFP8 GEMM.
+    On sm_107, ``reserve_sms`` limits the GEMM's persistent grid.
     """
 
     ARCHS: frozenset[Arch] = frozenset({Arch.SM_103, Arch.SM_107})
@@ -107,9 +107,6 @@ class RubinMxfp8Linear(OpWrapper):
         _mnk(96, 12288, 7168, "shared experts [gate | up] whole (2 x 6144 rows), 96 rows"),
         _mnk(96, 7168, 6144, "shared experts down whole: K = 6144, 96 rows"),
         _mnk(2954, 12288, 7168, "shared experts [gate | up] whole, a DEP16 prefill chunk"),
-        _mnk(96, 3584, 7168, "dep16 latent_down under moe_latent_mxfp8 (pinned), 96 rows"),
-        _mnk(96, 28672, 7168, "dep16 drafter MLP gate_up under draft_mxfp8 (pinned), 96 rows"),
-        _mnk(96, 7168, 14336, "dep16 drafter MLP down under draft_mxfp8: K = 14336, 96 rows"),
     )
 
     note = """
@@ -119,9 +116,6 @@ class RubinMxfp8Linear(OpWrapper):
     The weight scales are the flat R128c4 buffer the GEMM reads. A 2-D scale is refused: a
     checkpoint's row-major [N, K / 32] matrix has the zero-padded R128c4 matrix's shape whenever
     N % 128 == 0 and K / 32 % 4 == 0 (o_proj, the shared experts). Relay it at load.
-    dep16's MXFP8 levers (MLA g_proj and o_proj: the shared [gate | up] and KDA o_proj shapes;
-    latent_down; the drafter's o_proj, gate_up and down) pass pinned=True: rubin_mxfp8_gemm's
-    split-K-free runner and pinned 96-row tactics.
     N must be a multiple of 8, so a projection with fewer rows per rank (the KDA b_proj at TP8 has
     12) runs stacked with other projections. The first call per device compiles; see
     rubin_mxfp8_gemm for the CUDA graph and autotuner notes, and for ``reserve_sms`` (SMs kept out
@@ -135,22 +129,18 @@ class RubinMxfp8Linear(OpWrapper):
         input: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        pinned: bool = False,
         reserve_sms: int = 0,
     ) -> torch.Tensor:
         if get_sm_version() == 103:
             return _sm103_linear(input, weight, weight_scale)
         act, act_scale = _quantize()(input, True, SF_VEC)
-        return rubin_mxfp8_gemm(
-            act, weight, act_scale, weight_scale, pinned=pinned, reserve_sms=reserve_sms
-        )
+        return rubin_mxfp8_gemm(act, weight, act_scale, weight_scale, reserve_sms=reserve_sms)
 
     def reference(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        pinned: bool = False,
         reserve_sms: int = 0,
     ) -> torch.Tensor:
         """The input quantized as ``mxfp8_quantize`` does, then ``rubin_mxfp8_gemm.reference``;
@@ -165,10 +155,8 @@ class RubinMxfp8Linear(OpWrapper):
         input: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        pinned: bool = False,
         reserve_sms: int = 0,
     ) -> None:
-        assert isinstance(pinned, bool), "pinned is a flag"
         # The quantization reads K in whole blocks and the GEMM runner checks only scale sizes;
         # each of these reads as a plausible wrong result.
         assert input.dtype == torch.bfloat16 and input.dim() == 2, "a BF16 [M, K] input"
@@ -181,7 +169,7 @@ class RubinMxfp8Linear(OpWrapper):
         )
         if get_sm_version() == 103:
             assert weight.shape[0] % N_MULTIPLE_SM103 == 0, "N must be a multiple of 32 on sm_103"
-            assert not pinned and reserve_sms == 0, "pinned and reserve_sms are sm_107's"
+            assert reserve_sms == 0, "reserve_sms requires sm_107"
         assert weight.is_contiguous(), "a contiguous K-major weight"
         # On most real weights a checkpoint's [N, K / 32] has the padded R128c4 matrix's shape,
         # so only the flat form marks relaid scales.

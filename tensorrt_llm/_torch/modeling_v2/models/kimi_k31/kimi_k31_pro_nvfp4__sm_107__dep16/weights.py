@@ -4,7 +4,6 @@
 
 Every weight the target reads is one ``W`` row at this rank's share, and every row fills a
 ``core.w`` parameter in the layout and dtype its kernel reads: nothing is relaid after the load.
-A generation server's MXFP8 levers load some BF16 rows quantized to MXFP8 (``_mx_rows``).
 
 dep16 shares: attention DP over the 16 ranks. A rank holds the whole attention and MLP
 weights; only the routed experts are split, EP16 (56 whole experts per rank). The LM head is
@@ -31,7 +30,6 @@ from safetensors import safe_open
 from torch import nn
 
 from ..config import modelopt_nvfp4_mismatch
-from ..ops.gemm.rubin_mxfp8_gemm import mxfp8_scales_to_r128c4, quantize_mxfp8_reference
 
 #: The LM head's checkpoint key (the shell's lm_head; load fills it).
 CKPT_LM_HEAD = "language_model.lm_head.weight"
@@ -110,11 +108,6 @@ class Dims(NamedTuple):
     # The lever whose weights the table lays out (modeling.py's ``_Levers``, on for a generation
     # server): each drafter layer's q_a stacked with its kv_a.
     draft_q_a_kv_a_fused: bool = False
-    # The MXFP8 levers (on for a generation server): their rows (``MXFP8_MLA``, ``MXFP8_MOE``,
-    # ``MXFP8_DRAFT``) load as MXFP8 (``_mx_rows``) instead of BF16.
-    mla_mxfp8: bool = False
-    moe_latent_mxfp8: bool = False
-    draft_mxfp8: bool = False
     # Whether this server builds the vision tower and projector (``w4_rows``): the checkpoint's
     # composite config has a vision config and the server is not text-only (``disable_mm_encoder``).
     # Both roles of this layout can run context steps.
@@ -188,71 +181,6 @@ def cut_cols(block: Callable[[Dims], tuple[int, int]]) -> Callable[[Dims], Cut]:
         return (slice(None), slice(rank * span, (rank + 1) * span))
 
     return cut
-
-
-# --- the MXFP8 levers: BF16 rows quantized at load ---
-
-#: The rows each MXFP8 lever quantizes (modeling.py's ``_Levers``), by ``core.w`` name; a drafter
-#: name is each layer's ``d_l{j}_<name>``. The other BF16 GEMMs stay BF16: at the 96-row verify
-#: step the activation's quantization kernel costs about what MXFP8 saves there (sm_107).
-MXFP8_MLA = ("mla_g", "mla_o")
-MXFP8_MOE = ("moe_latent_down",)
-MXFP8_DRAFT = ("o", "gate_up", "down")
-#: Values per UE8M0 scale of an MXFP8 row.
-_MX_BLOCK = 32
-
-
-def _mx_sf_flat(rows: int, k: int) -> tuple[int]:
-    """The flat R128c4 scales of an ``[rows, k]`` MXFP8 weight: ``pad128(rows) * pad4(k / 32)``."""
-    return (-(-rows // 128) * 128 * (-(-(k // _MX_BLOCK) // 4) * 4),)
-
-
-def _mx_quantize(fix: Callable | None, scales: bool) -> Callable:
-    """A row transform: the row's own (``fix``), then MXFP8 by the family recipe
-    (``quantize_mxfp8_reference``: per 32 values of a row the smallest power of two at or above
-    amax / 448, E4M3 by round-to-nearest-even, the checkpoint MXFP8 weights' rule): the E4M3
-    values, or with ``scales`` the UE8M0 scales relaid R128c4, flat. Runs on meta tensors too."""
-
-    def quantize(t: Any, core: Any) -> torch.Tensor:
-        values, sf = quantize_mxfp8_reference(fix(t, core) if fix is not None else t)
-        return mxfp8_scales_to_r128c4(sf) if scales else values
-
-    return quantize
-
-
-def _mx_rows(rows: tuple, names: tuple[str, ...]) -> tuple:
-    """``rows`` with each row named in ``names`` replaced by its MXFP8 pair: ``{name}_w`` (E4M3, the
-    row's shape) and ``{name}_s`` (its scales), both read from the row's source through its cut and
-    quantized once at load. The BF16 parameter is not declared: the lever's weight is held once,
-    in MXFP8 (about 0.52 of its BF16 bytes)."""
-    missing = set(names) - {r.name for r in rows}
-    assert not missing, f"no rows {sorted(missing)}"
-    out = []
-    for r in rows:
-        if r.name not in names:
-            out.append(r)
-            continue
-        out += [
-            W(
-                f"{r.name}_w",
-                shape=r.shape,
-                src=r.src,
-                dtype=torch.float8_e4m3fn,
-                cut=r.cut,
-                transform=_mx_quantize(r.transform, False),
-                layers=r.layers,
-            ),
-            W(
-                f"{r.name}_s",
-                shape=lambda d, r=r: _mx_sf_flat(*r.shape(d)),
-                src=r.src,
-                dtype=torch.uint8,
-                cut=r.cut,
-                transform=_mx_quantize(r.transform, True),
-                layers=r.layers,
-            ),
-        ]
-    return tuple(out)
 
 
 # --- dims ---
@@ -372,7 +300,7 @@ def dims(core: Any) -> Dims:
     m = mc.mapping
     assert m.enable_attention_dp and m.cp_size == 1, "dep16 runs attention DP without CP"
     cfg = _text_config(mc.pretrained_config)
-    levers = getattr(core, "levers", None)  # modeling.py's _Levers: the rows' layouts
+    levers = getattr(core, "levers", None)  # modeling.py's _Levers: the stacked rows' layout
     return _dims(
         cfg,
         mc.torch_dtype,
@@ -387,9 +315,6 @@ def dims(core: Any) -> Dims:
     )._replace(
         draft_context_kv_only=_draft_context_kv_only(mc, core.role),
         draft_q_a_kv_a_fused=bool(getattr(levers, "draft_q_a_kv_a_fused", False)),
-        mla_mxfp8=bool(getattr(levers, "mla_mxfp8", False)),
-        moe_latent_mxfp8=bool(getattr(levers, "moe_latent_mxfp8", False)),
-        draft_mxfp8=bool(getattr(levers, "draft_mxfp8", False)),
         vision=_vision(core),
     )
 
@@ -983,7 +908,7 @@ def w1_rows(d: Dims) -> tuple[W, ...]:
     kda_rows = _w1_rows(_w1_kda_channels)
     kda_head_rows = _w1_rows(_w1_kda_heads)
     fab_src = (*_W1_KDA_QKVG, _W1_KDA_FA, _W1_KDA_B)
-    rows = (
+    return (
         # --- KDA layers ---
         W(
             "kda_qkvgfab_w",
@@ -1221,8 +1146,6 @@ def w1_rows(d: Dims) -> tuple[W, ...]:
         ),
         W("final_norm", shape=lambda d: (d.hidden,), src=_W1_MODEL + "norm.weight", layers=None),
     )
-    mx = (MXFP8_MLA if d.mla_mxfp8 else ()) + (MXFP8_MOE if d.moe_latent_mxfp8 else ())
-    return _mx_rows(rows, mx) if mx else rows
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1783,10 +1706,9 @@ def _history_rows() -> tuple[W, ...]:
     )
 
 
-def _layer_rows(j: int, q_a_kv_a: bool = False, mx: bool = False) -> tuple[W, ...]:
+def _layer_rows(j: int, q_a_kv_a: bool = False) -> tuple[W, ...]:
     """Drafter layer ``j``'s rows; ``q_a_kv_a`` (draft_q_a_kv_a_fused): q_a's row stacked with the
-    layer's kv_a rows (``d_l{j}_q_a_kv_a``), which ``d_kv_a`` also holds; ``mx`` (draft_mxfp8):
-    the ``MXFP8_DRAFT`` rows as MXFP8 pairs (``_mx_rows``)."""
+    layer's kv_a rows (``d_l{j}_q_a_kv_a``), which ``d_kv_a`` also holds."""
 
     def key(name: str) -> str:
         return _layer_key(j, name)
@@ -1794,7 +1716,7 @@ def _layer_rows(j: int, q_a_kv_a: bool = False, mx: bool = False) -> tuple[W, ..
     heads = cut_rows(lambda d: (_draft_heads(d)[0], _draft_heads(d)[1] * (_NOPE + _ROPE)))
     kv_heads = cut_rows(lambda d: (_draft_heads(d)[0], _draft_heads(d)[1] * (_NOPE + _V)))
     mlp_rows = cut_rows(_draft_mlp)
-    rows = (
+    return (
         W(f"d_l{j}_in_norm", lambda d: (_DH,), key("input_layernorm.weight"), layers=None),
         W(
             f"d_l{j}_post_norm",
@@ -1874,7 +1796,6 @@ def _layer_rows(j: int, q_a_kv_a: bool = False, mx: bool = False) -> tuple[W, ..
             layers=None,
         ),
     )
-    return _mx_rows(rows, tuple(f"d_l{j}_{n}" for n in MXFP8_DRAFT)) if mx else rows
 
 
 def w3_rows(d: Dims) -> tuple[W, ...]:
@@ -1904,7 +1825,7 @@ def w3_rows(d: Dims) -> tuple[W, ...]:
         ),
     ]
     for j in range(_DL):
-        rows += _layer_rows(j, d.draft_q_a_kv_a_fused, d.draft_mxfp8)
+        rows += _layer_rows(j, d.draft_q_a_kv_a_fused)
     return tuple(rows)
 
 
