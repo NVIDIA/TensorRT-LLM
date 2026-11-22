@@ -215,7 +215,7 @@ independently, so use this line, not the pool-group order, when pinning `pool_ra
 
 ```text
 pool_group_id=0, layer_group_ids=[1], slots=..., slot_bytes=..., bytes=... (172.031 GiB), share=0.9443
-GPU KV pools total 182.173 GiB; equivalent pool_ratio (layer_group order) = [0.0270, 0.9443, 0.0287]
+GPU KV pools total 182.173 GiB; equivalent pool_ratio (layer_group order) = [0.027000, 0.944300, 0.028700]
 ```
 
 With a host tier, the host pool-group mapping is logged too.

@@ -4608,9 +4608,12 @@ class KVCacheManagerV2(BaseResourceManager):
             if len(layer_groups[pool_group_id]) == 1
         }
         if len(share_by_layer_group) == len(sizes):
-            ratio = ", ".join(
-                f"{share_by_layer_group[g]:.4f}" for g in sorted(share_by_layer_group)
-            )
+            # ``pool_ratio`` must sum to 1.0 within 1e-6, so the rounding remainder goes to
+            # the largest share and the printed list can be pasted into the config as is.
+            shares = [round(share_by_layer_group[g], 6) for g in sorted(share_by_layer_group)]
+            largest = shares.index(max(shares))
+            shares[largest] = round(1.0 - sum(shares) + shares[largest], 6)
+            ratio = ", ".join(f"{share:.6f}" for share in shares)
             logger.info(
                 f"GPU KV pools total {total / 2**30:.3f} GiB; "
                 f"equivalent pool_ratio (layer_group order) = [{ratio}]"

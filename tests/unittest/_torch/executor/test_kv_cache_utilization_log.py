@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.profiling import (
     PyExecutorProfileManager,
     load_kv_pool_log_interval,
 )
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.metrics.logging import format_kv_pool_fields
 from tensorrt_llm.metrics.perf import PerfMetricsCollector
 from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheLevel, CacheTier
@@ -161,8 +162,19 @@ def test_construction_log_prints_pool_sizes_and_equivalent_pool_ratio(monkeypatc
     )
     assert lines[-1] == (
         "GPU KV pools total 8.000 GiB; equivalent pool_ratio (layer_group order) = "
-        "[0.1250, 0.7500, 0.1250]"
+        "[0.125000, 0.750000, 0.125000]"
     )
+
+
+def test_construction_log_pool_ratio_sums_to_one(monkeypatch):
+    # Thirds round to 0.333333 each; the remainder goes to the largest share so the
+    # printed list passes the pool_ratio sum check when pasted into the config.
+    manager = _manager([CacheTier.GPU_MEM], {0: [_capacity(1, 0, 0)] * 3})
+    manager.impl.pool_group_descs = [_pool_group(i, [i]) for i in range(3)]
+    lines = _construction_logs(manager, monkeypatch)
+    ratio = [float(v) for v in lines[-1].rsplit("[", 1)[1].rstrip("]").split(", ")]
+    assert ratio == [0.333334, 0.333333, 0.333333]
+    KvCacheConfig(pool_ratio=ratio)
 
 
 def test_construction_log_skips_pool_ratio_for_shared_pool_groups(monkeypatch):
