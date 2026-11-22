@@ -72,7 +72,7 @@ class MultimodalEncoder(_TorchLLM):
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size),
-            is_llm_executor=True,  # TODO: check if this is correct or needed
+            is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
             llm_args=self.args)

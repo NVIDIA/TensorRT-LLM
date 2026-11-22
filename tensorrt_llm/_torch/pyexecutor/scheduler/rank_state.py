@@ -128,6 +128,13 @@ class RankIterStatsPayload:
     _ITER_STATS_FIELD_COUNT: ClassVar[int] = 9
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
     _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -3
+    _QUEUED_WIRE_VERSION: ClassVar[int] = -4
+    _QUEUED_FIELDS: ClassVar[tuple[str, ...]] = (
+        "num_queued_context_requests",
+        "num_queued_ctx_tokens",
+        "num_queued_gen_requests",
+        "num_queued_gen_kv_tokens",
+    )
     _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 6
 
     has_iter_stats: int = 0
@@ -146,6 +153,13 @@ class RankIterStatsPayload:
     cross_kv_cache_stats: RankKvCacheStats | None = None
     specdec_stats: RankSpecDecodingStats | None = None
     scheduling_counters: RankSchedulingCounters | None = None
+    num_queued_context_requests: int = 0
+    num_queued_ctx_tokens: int = 0
+    num_queued_gen_requests: int = 0
+    num_queued_gen_kv_tokens: int = 0
+    # Current activity is refreshed at each routing exchange, independently
+    # of the sampled iteration whose counters travel in this payload.
+    has_pending_work: bool = False
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int | float]:
         """Serialize to a flat list for allgather transport."""
@@ -174,11 +188,13 @@ class RankIterStatsPayload:
             self.specdec_stats,
             self.scheduling_counters,
         )
-        if any(snapshot is not None for snapshot in snapshots):
+        queued_values = [getattr(self, name) for name in self._QUEUED_FIELDS]
+        has_extended_stats = any(queued_values) or self.has_pending_work
+        if any(snapshot is not None for snapshot in snapshots) or has_extended_stats:
             # The negative version cannot be confused with has_iter_stats (0/1).
             # Presence flags frame the snapshots and the independent load fields.
             values = [
-                self._SNAPSHOT_WIRE_VERSION,
+                self._QUEUED_WIRE_VERSION if has_extended_stats else self._SNAPSHOT_WIRE_VERSION,
                 int(include_kv_cache_load),
                 *(int(snapshot is not None) for snapshot in snapshots),
                 *values,
@@ -186,6 +202,9 @@ class RankIterStatsPayload:
             for snapshot in snapshots:
                 if snapshot is not None:
                     values.extend(snapshot)
+            if has_extended_stats:
+                values.extend(queued_values)
+                values.append(int(self.has_pending_work))
         return values
 
     @classmethod
@@ -203,7 +222,7 @@ class RankIterStatsPayload:
         """
         if (
             len(data) < cls._SNAPSHOT_HEADER_SIZE
-            or data[0] != cls._SNAPSHOT_WIRE_VERSION
+            or data[0] not in (cls._SNAPSHOT_WIRE_VERSION, cls._QUEUED_WIRE_VERSION)
             or any(flag not in (0, 1) for flag in data[1 : cls._SNAPSHOT_HEADER_SIZE])
         ):
             raise ValueError("Invalid snapshot payload header")
@@ -214,6 +233,7 @@ class RankIterStatsPayload:
             + int(data[2] + data[3]) * RankKvCacheStats.wire_size()
             + int(data[4]) * RankSpecDecodingStats.wire_size()
             + int(data[5]) * RankSchedulingCounters.wire_size()
+            + (len(cls._QUEUED_FIELDS) + 1 if data[0] == cls._QUEUED_WIRE_VERSION else 0)
         )
 
     @classmethod
@@ -250,6 +270,12 @@ class RankIterStatsPayload:
                 result.scheduling_counters = RankSchedulingCounters.deserialize(
                     values[cursor : cursor + RankSchedulingCounters.wire_size()]
                 )
+                cursor += RankSchedulingCounters.wire_size()
+            if values[0] == cls._QUEUED_WIRE_VERSION:
+                queue_end = cursor + len(cls._QUEUED_FIELDS)
+                for name, value in zip(cls._QUEUED_FIELDS, values[cursor:queue_end]):
+                    setattr(result, name, int(value))
+                result.has_pending_work = bool(values[queue_end])
             return result
         scalar_field_count = cls._ITER_STATS_FIELD_COUNT + cls._KV_LOAD_FIELD_COUNT
         if len(values) > scalar_field_count:
@@ -303,7 +329,6 @@ class RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
         prefix_field_count = 5
-        rank_state_fields = fields(cls)[:prefix_field_count]
         if not values:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > prefix_field_count and values[prefix_field_count] < 0:
@@ -331,7 +356,13 @@ class RankState:
                 f"RankState payload has {len(values)} fields, expected at most {max_field_count}"
             )
         rank_values = values[:prefix_field_count]
-        for field_info in rank_state_fields[len(rank_values) :]:
+        # Only a legacy payload misses prefix fields; fields() is slow per call.
+        missing_fields = (
+            fields(cls)[len(rank_values) : prefix_field_count]
+            if len(rank_values) < prefix_field_count
+            else ()
+        )
+        for field_info in missing_fields:
             if field_info.default is not MISSING:
                 rank_values.append(field_info.default)
             elif field_info.default_factory is not MISSING:

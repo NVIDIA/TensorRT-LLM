@@ -18,6 +18,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._startup_errors import OomKind, out_of_memory_kind
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
 from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
@@ -43,9 +44,17 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 if TYPE_CHECKING:
     from tensorrt_llm.executor.ipc import IpcQueue
 
+    from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
+from ..memory.monitor import pools as monitor_pools
+from ..memory.monitor import providers as monitor_providers
+from ..memory.monitor import settings as monitor_settings
+from ..memory.monitor import startup as monitor_startup
+from ..memory.monitor import tagging as monitor_tagging
+from ..memory.monitor import triggers as monitor_triggers
 from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
@@ -53,7 +62,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
-                    instantiate_sampler, is_disagg_enabled, is_mla)
+                    instantiate_sampler, is_agg_helix, is_disagg_enabled,
+                    is_mla)
 from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -68,6 +78,7 @@ from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
 from .runtime_hooks import runtime_hooks_of
+from .scheduled_encoder_executor import ScheduledEncoderExecutor
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -135,6 +146,17 @@ class _ExecutorMemoryMonitor:
     def __init__(self):
         self._total_gpu_memory_bytes = torch.cuda.mem_get_info()[1]
         self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
+        # The memory monitor reuses these names and suggestions in its reports.
+        monitor_startup.set_stage_advice(
+            {
+                k.value: v
+                for k, v in self.memory_type_friendly_names.items()
+            },
+            {
+                k.value: v
+                for k, v in self.memory_type_tuning_suggestion.items()
+            },
+        )
 
     @staticmethod
     def _bytes_to_gib(bytes: int) -> float:
@@ -198,15 +220,16 @@ class _ExecutorMemoryMonitor:
     def _maybe_explain_if_oom(self, e: Exception, *,
                               current_stage: ExecutorMemoryType,
                               free_gpu_memory_bytes_pre: int) -> Optional[str]:
-        if isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e):
-            msg = "Executor creation failed due to insufficient GPU memory."
-        elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
-              and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
-              in str(e)):
-            msg = f"Executor creation failed with NCCL error: {str(e)}"
-            return msg
-        else:
+        # The same test startup classification and the memory monitor use;
+        # host-memory failures get no GPU memory explanation.
+        kind = out_of_memory_kind(e)
+        if kind is None or kind is OomKind.HOST:
             return None
+        if (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e) and
+                "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
+                in str(e)):
+            return f"Executor creation failed with NCCL error: {str(e)}"
+        msg = "Executor creation failed due to insufficient GPU memory."
 
         msg = "\n".join([
             msg,
@@ -235,10 +258,17 @@ class _ExecutorMemoryMonitor:
         """Catches OOM and prints instructive message."""
 
         free_gpu_memory_bytes_pre = torch.cuda.mem_get_info()[0]
+        monitor_process_pre = monitor_startup.begin_stage(current_stage.value)
 
         try:
-            yield
+            # Tag what the step allocates so the memory monitor can name its
+            # owner; a no-op unless the monitor is in full mode.
+            with monitor_tagging.tag(current_stage.value):
+                yield
         except Exception as e:
+            monitor_startup.record_failed_stage(current_stage.value,
+                                                free_gpu_memory_bytes_pre,
+                                                monitor_process_pre)
             explanation = self._maybe_explain_if_oom(
                 e,
                 current_stage=current_stage,
@@ -248,6 +278,10 @@ class _ExecutorMemoryMonitor:
             raise RuntimeError(explanation) from e
         else:
             free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
+            monitor_startup.record_stage(current_stage.value,
+                                         free_gpu_memory_bytes_pre,
+                                         free_gpu_memory_bytes_post,
+                                         monitor_process_pre)
             self._samples.append(
                 self._GpuMemoryUsageSample(
                     creation_stage=current_stage,
@@ -277,6 +311,35 @@ def _check_dense_dwdp_launch(llm_args: TorchLlmArgs) -> Optional[DenseMode]:
     if dwdp_config is not None and dwdp_config.enable_dense:
         return validate_dense_gate(llm_args)
     return None
+
+
+_AGG_HELIX_SPARSE_ERROR = (
+    "Aggregated Helix context parallelism supports dense MLA only. Every sparse "
+    "attention algorithm is rejected, including skip_softmax: it keeps dense MLA "
+    "but is not yet supported with aggregated Helix. Helix with sparse attention "
+    "requires disaggregated serving.")
+
+
+def _validate_agg_helix_args(llm_args: TorchLlmArgs) -> None:
+    """Reject aggregated Helix settings that are known before weights load.
+
+    The checks that need the loaded model (MLA architecture, sparse attention
+    supplied by the checkpoint, and the engine's chunked-prefill and KV cache
+    manager choices) run again after the model engine is built.
+    """
+    if get_sm_version() < 100:
+        raise NotImplementedError(
+            "Aggregated Helix context parallelism requires SM100 or newer.")
+    if getattr(llm_args.sparse_attention_config, "algorithm", None) is not None:
+        raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
+    if not llm_args.enable_chunked_prefill:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires chunked prefill; "
+            "set enable_chunked_prefill=True.")
+    if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires KVCacheManagerV2; "
+            "set kv_cache_config.use_kv_cache_manager_v2=True.")
 
 
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
@@ -432,11 +495,8 @@ def _branch_snapshot_ctx_chunk_config(
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
-def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
-                           is_generation: bool) -> None:
+def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
     """Reject the settings a non-generation model cannot run with; warn on those it ignores."""
-    if is_generation:
-        return
     if mapping.has_pp():
         raise ValueError(
             "Pipeline parallelism is not supported for non-generation models "
@@ -450,6 +510,68 @@ def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
             "enable_chunked_prefill is ignored for non-generation models: each "
             "request runs whole in one forward, and requests longer than "
             "max_num_tokens are rejected.")
+
+
+def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
+                                     mapping: Mapping) -> None:
+    """Reject the settings ScheduledEncoderExecutor cannot serve a non-generation model with."""
+    _check_no_kv_execution(llm_args, mapping)
+    if mapping.cp_size > 1:
+        raise ValueError(
+            "Context parallelism is not supported for non-generation models; "
+            "set context_parallel_size=1.")
+    checks = (
+        ("lora_config", llm_args.lora_config is not None),
+        ("speculative_config", llm_args.speculative_config is not None),
+        ("cache_transceiver_config",
+         is_disagg_enabled(llm_args.cache_transceiver_config)),
+        ("kv_connector_config", llm_args.kv_connector_config is not None),
+        ("dwdp_config", llm_args.dwdp_config is not None),
+        ("moe_config.load_balancer", llm_args.moe_config.load_balancer
+         is not None),
+        ("enable_resource_governor", llm_args.enable_resource_governor),
+        ("sleep_config", llm_args.sleep_config is not None),
+        ("orchestrator_type='ray'", llm_args.orchestrator_type == "ray"),
+        ("enable_client_io_during_gpu_wait",
+         llm_args.enable_client_io_during_gpu_wait),
+    )
+    settings = [name for name, used in checks if used]
+    if settings:
+        message = (
+            f"Non-generation models do not support {', '.join(settings)}; "
+            "remove these settings.")
+        if llm_args.orchestrator_type == "ray":
+            message += (
+                " AsyncLLM and TLLM_DISABLE_MPI=1 select orchestrator_type='ray' "
+                "themselves; serve these models with LLM and MPI enabled.")
+        raise ValueError(message)
+
+
+def _create_scheduled_encoder_executor(
+        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str],
+        checkpoint_loader: "BaseCheckpointLoader", startup_timer: _StartupTimer,
+        creation_metrics: dict[str, float]) -> ScheduledEncoderExecutor:
+    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    _check_scheduled_encoder_support(llm_args, mapping)
+    dist = Distributed.get(mapping)
+    startup_timer.mark_initialization("configuration_and_distributed_init")
+    with startup_timer.phase("scheduled_encoder_creation",
+                             metrics=creation_metrics,
+                             metric_name="scheduled_encoder_creation_seconds"):
+        executor = ScheduledEncoderExecutor.create(
+            llm_args,
+            model_path=checkpoint_dir,
+            checkpoint_loader=checkpoint_loader,
+            mapping=mapping,
+            dist=dist,
+        )
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
+    with startup_timer.phase("executor_start_worker",
+                             metrics=creation_metrics,
+                             metric_name="worker_start_seconds"):
+        executor.start_worker()
+    return executor
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -509,7 +631,9 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 
 
 def _load_config_and_create_checkpoint_loader(
-        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None
+) -> tuple[TorchLlmArgs, "BaseCheckpointLoader", bool]:
     torch.cuda.set_per_process_memory_fraction(1.0)
     checkpoint_loader = construct_checkpoint_loader(
         llm_args.checkpoint_loader,
@@ -519,9 +643,9 @@ def _load_config_and_create_checkpoint_loader(
         load_format=llm_args.load_format,
         partial_model_loading=llm_args.is_partial_model_loading,
     )
-    llm_args = ModelLoader.load_config_and_apply_defaults(
+    llm_args, config = ModelLoader.load_config_with_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
-    return llm_args, checkpoint_loader
+    return llm_args, checkpoint_loader, config.is_generation
 
 
 def create_encoder_executor(
@@ -544,7 +668,7 @@ def create_encoder_executor(
     """
     from .encoder_executor import EncoderExecutor
 
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+    llm_args, checkpoint_loader, _ = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
@@ -588,7 +712,7 @@ def _create_py_executor_impl(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue: "Optional[IpcQueue]" = None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
     Loads model configuration, applies model-specific defaults, constructs the
@@ -632,15 +756,21 @@ def _create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
                        creation_metrics):
-        llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_loader, is_generation = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
+
+    if not is_generation:
+        return _create_scheduled_encoder_executor(llm_args, checkpoint_dir,
+                                                  checkpoint_loader,
+                                                  _startup_timer,
+                                                  creation_metrics)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -687,7 +817,6 @@ def _create_py_executor(
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
 
-    mm_encoder_only = llm_args.mm_encoder_only
     enable_chunked_context = llm_args.enable_chunked_prefill
 
     (
@@ -698,18 +827,6 @@ def _create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-
-    # RocketKV's Vanilla path keeps its landmark (KT) cache in a single block per
-    # sequence: RocketVanillaAttention writes the whole sequence into
-    # kt_cache_block_offsets[0], and kt_tokens_per_block is derived from
-    # tokens_per_block. It does not support a paged KT cache, so force one block
-    # per sequence for it. Plain Vanilla attention supports paged KV cache and is
-    # left untouched.
-    sparse_config = llm_args.sparse_attention_config
-    if (llm_args.attn_backend == "VANILLA" and sparse_config is not None
-            and getattr(sparse_config, "algorithm", None) == "rocket"):
-        tokens_per_block = max_num_tokens
-        kv_cache_config.tokens_per_block = tokens_per_block
 
     # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
     # of 32.
@@ -749,16 +866,6 @@ def _create_py_executor(
         llm_args.disable_overlap_scheduler,
         sparse_attention_config=llm_args.sparse_attention_config)
 
-    if mm_encoder_only:
-        llm_args.mm_encoder_only = True
-        llm_args.disable_overlap_scheduler = True
-
-        # Disable overlap scheduler for multimodal encoder-only mode
-        logger.warning(
-            "Disabling overlap scheduler for multimodal encoder-only mode. "
-            "The overlap scheduler is designed for generation models and is not needed "
-            "when only processing vision encoder inputs.")
-
     _rank_dspark_on_host_without_overlap(spec_config,
                                          llm_args.disable_overlap_scheduler)
 
@@ -795,15 +902,6 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
-    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
-    if (mapping.has_cp_helix()
-            and not is_disagg_enabled(cache_transceiver_config)
-            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
-        raise NotImplementedError(
-            "Helix context parallelism is supported only on disaggregated "
-            "generation servers; aggregated serving with Helix is not "
-            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
-            "development only).")
     if (is_decode_only(llm_args.sparse_attention_config)
             and not is_disagg_enabled(cache_transceiver_config)):
         raise NotImplementedError(
@@ -811,6 +909,8 @@ def _create_py_executor(
             "servers: it admits one input token per request per step, so it "
             "cannot serve context requests. Set cache_transceiver_config, or "
             "disable sparse_attention_config.enable_kv_cache_offload.")
+    if is_agg_helix(mapping, cache_transceiver_config):
+        _validate_agg_helix_args(llm_args)
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -962,12 +1062,6 @@ def _create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
-    is_generation = model_engine.model.model_config.is_generation
-    _check_no_kv_execution(llm_args, mapping, is_generation)
-    if not is_generation:
-        enable_chunked_context = False
-        model_engine.attn_runtime_features.chunked_prefill = False
-
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
         kv_cache_config.enable_block_reuse)
@@ -1004,6 +1098,16 @@ def _create_py_executor(
 
     # Resolve this before cache reuse and cache manager selection consume it.
     resolve_cache_transceiver_config(cache_transceiver_config)
+
+    if is_agg_helix(mapping, cache_transceiver_config):
+        if not is_mla(model_engine.model.model_config.pretrained_config):
+            raise NotImplementedError(
+                "Aggregated Helix context parallelism supports MLA models only."
+            )
+        # The checkpoint can supply a sparse attention config that llm_args
+        # does not carry.
+        if getattr(sparse_attention_config, "algorithm", None) is not None:
+            raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
 
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = model_engine.max_num_seq_slots
@@ -1173,7 +1277,6 @@ def _create_py_executor(
             mapping,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
-            mm_encoder_only=mm_encoder_only,
             speculative_config=spec_config,
             max_num_sequences=max_num_seq_slots,
         )
@@ -1301,82 +1404,81 @@ def _create_py_executor(
     logger.info(
         f"[create_py_executor] Created execution_stream: {execution_stream}")
 
-    if model_engine.model.model_config.is_generation:
-        #NOTE: non-generation models do not have kv cache
+    is_disagg = is_disagg_enabled(cache_transceiver_config)
+    is_hybrid = is_hybrid_linear(
+        model_engine.model.model_config.pretrained_config)
 
-        is_disagg = is_disagg_enabled(cache_transceiver_config)
-        is_hybrid = is_hybrid_linear(
-            model_engine.model.model_config.pretrained_config)
+    if is_disagg and is_hybrid:
+        # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
+        # no effect in disagg. The disagg manager choice is driven by
+        # get_kv_cache_manager_cls and cache_transceiver_config.
+        if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
+            logger.warning(
+                "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
+                "configure transceiver_runtime='PYTHON' with backend='NIXL' "
+                "to select MixedMambaHybridCacheManager.")
+        else:
+            logger.info("Disaggregated serving with hybrid model detected. "
+                        "Using the configured Mamba cache manager.")
 
-        if is_disagg and is_hybrid:
-            # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
-            # no effect in disagg. The disagg manager choice is driven by
-            # get_kv_cache_manager_cls and cache_transceiver_config.
-            if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
-                logger.warning(
-                    "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
-                    "configure transceiver_runtime='PYTHON' with backend='NIXL' "
-                    "to select MixedMambaHybridCacheManager.")
-            else:
-                logger.info("Disaggregated serving with hybrid model detected. "
-                            "Using the configured Mamba cache manager.")
+    # Get draft config for one-engine speculative decoding if available
+    draft_config = getattr(model_engine.model, 'draft_config', None)
 
-        # Get draft config for one-engine speculative decoding if available
-        draft_config = getattr(model_engine.model, 'draft_config', None)
+    if not skip_est and is_decode_only(sparse_attention_config):
+        # The estimation dry run prefills dummy prompts, which a
+        # decode-only worker cannot execute. Size the KV cache from free
+        # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
+        logger.info("KV cache size estimation is not supported for a "
+                    "decode-only worker, disable it.")
+        skip_est = True
 
-        if not skip_est and is_decode_only(sparse_attention_config):
-            # The estimation dry run prefills dummy prompts, which a
-            # decode-only worker cannot execute. Size the KV cache from free
-            # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
-            logger.info("KV cache size estimation is not supported for a "
-                        "decode-only worker, disable it.")
-            skip_est = True
+    kv_cache_creator = KvCacheCreator(
+        model_engine=model_engine,
+        mapping=mapping,
+        net_max_seq_len=net_max_seq_len,
+        kv_connector_manager=kv_connector_manager,
+        max_num_tokens=max_num_tokens,
+        max_beam_width=max_beam_width,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        llm_args=llm_args,
+        speculative_config=spec_config,
+        profiling_stage_data=profiling_stage_data,
+        sparse_attention_config=sparse_attention_config,
+        execution_stream=execution_stream,
+        draft_config=draft_config,
+        gen_preemption_headroom=getattr(model_engine, "gen_preemption_headroom",
+                                        0),
+        skip_est=skip_est,
+        is_disagg=is_disagg,
+    )
 
-        kv_cache_creator = KvCacheCreator(
-            model_engine=model_engine,
-            mapping=mapping,
-            net_max_seq_len=net_max_seq_len,
-            kv_connector_manager=kv_connector_manager,
-            max_num_tokens=max_num_tokens,
-            max_beam_width=max_beam_width,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            kv_cache_config=kv_cache_config,
-            llm_args=llm_args,
-            speculative_config=spec_config,
-            profiling_stage_data=profiling_stage_data,
-            sparse_attention_config=sparse_attention_config,
-            execution_stream=execution_stream,
-            draft_config=draft_config,
-            gen_preemption_headroom=getattr(model_engine,
-                                            "gen_preemption_headroom", 0),
-            skip_est=skip_est,
-            is_disagg=is_disagg,
-        )
+    if not skip_est:
+        log_memory_usage("after loading weights")
 
-        if not skip_est:
-            log_memory_usage("after loading weights")
+    estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
-        estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+    # Resources each executor owns are named for the final executor only.
+    monitor_startup.set_sizing_pass(estimating_kv_cache)
 
-        # Without the estimation, build_managers sizes the final KV cache from
-        # the device memory free now, so DWDP is set up first: the KV cache
-        # then gets the replicated dense weights dense DWDP frees, and the
-        # expert prefetch ring holds its memory before the KV cache takes its
-        # share of the rest. With the estimation, it is set up below, before
-        # the estimation run measures the memory.
-        if not estimating_kv_cache and (dwdp_manager is not None
-                                        or dense_dwdp_manager is not None):
-            manager = (dwdp_manager
-                       if dwdp_manager is not None else dense_dwdp_manager)
-            manager.setup(model_engine.model)
-            dwdp_set_up = True
+    # Without the estimation, build_managers sizes the final KV cache from
+    # the device memory free now, so DWDP is set up first: the KV cache
+    # then gets the replicated dense weights dense DWDP frees, and the
+    # expert prefetch ring holds its memory before the KV cache takes its
+    # share of the rest. With the estimation, it is set up below, before
+    # the estimation run measures the memory.
+    if not estimating_kv_cache and (dwdp_manager is not None
+                                    or dense_dwdp_manager is not None):
+        manager = (dwdp_manager
+                   if dwdp_manager is not None else dense_dwdp_manager)
+        manager.setup(model_engine.model)
+        dwdp_set_up = True
 
-        with allocation_scope(
-                ExecutorMemoryType.INIT_KV_CACHE
-                if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
-            kv_cache_creator.build_managers(resources, estimating_kv_cache)
+    with allocation_scope(ExecutorMemoryType.INIT_KV_CACHE if
+                          estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
+        kv_cache_creator.build_managers(resources, estimating_kv_cache)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
     # weight manager + MoE backend fixup (single entry point). Dense DWDP is set
@@ -1480,6 +1582,7 @@ def _create_py_executor(
                 kv_cache_creator.teardown_managers(resources)
                 gc.collect()
                 torch.cuda.empty_cache()
+            monitor_startup.set_sizing_pass(False)
 
             with allocation_scope(ExecutorMemoryType.KV_CACHE):
                 # Before estimating KV cache size, a minimal KV cache has been allocated using
@@ -1563,7 +1666,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create a PyExecutor and roll back a partially initialized DWDP runtime.
 
     On an error, a DWDP manager and a dense DWDP manager registered during the
@@ -1573,10 +1676,14 @@ def create_py_executor(
     """
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
+    # The memory monitor follows one executor per process, the first one
+    # alive; the others are built and served without it.
+    monitor_token = _begin_monitor(llm_args)
     try:
-        with monitor_executor_initialization(), _StartupTimer(
-                "executor_creation") as startup_timer:
-            return _create_py_executor_impl(
+        with _monitor_startup_scope(
+                monitor_token.monitored), monitor_executor_initialization(
+                ), _StartupTimer("executor_creation") as startup_timer:
+            py_executor = _create_py_executor_impl(
                 _startup_timer=startup_timer,
                 llm_args=llm_args,
                 checkpoint_dir=checkpoint_dir,
@@ -1585,6 +1692,8 @@ def create_py_executor(
                 resource_governor_queue=resource_governor_queue,
             )
     except BaseException:
+        monitor_providers.end_executor(monitor_token)
+        monitor_startup.set_sizing_pass(False)
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):
@@ -1604,3 +1713,54 @@ def create_py_executor(
                     "Failed to roll back dense DWDP after PyExecutor construction "
                     f"error\n{traceback.format_exc()}")
         raise
+    py_executor._memory_monitor_token = monitor_token
+    if monitor_token.monitored:
+        # Armed only once startup is over: KV sizing, warmup and graph
+        # capture run allocations into the wall on purpose and catch the
+        # error. The executor releases it at shutdown, through
+        # end_executor; reports describe its device, the current one, which
+        # every executor type takes as its own when it is built.
+        monitor_triggers.install_oom_reporter(
+            device=torch.cuda.current_device(),
+            owner=monitor_token,
+            world_size=llm_args.parallel_config.world_size)
+    # Classify the pools startup created now, in every mode, rather than
+    # inside the first report: that may be an OOM report on the executor
+    # thread, or a report request answered next to the serving loop.
+    monitor_pools.prime()
+    return py_executor
+
+
+def _begin_monitor(llm_args: TorchLlmArgs) -> "monitor_providers.ExecutorToken":
+    """Register the executor about to be built with the memory monitor.
+
+    The monitor follows the first executor alive in the process. For it,
+    ``memory_monitor_config`` is applied, with the environment's overrides
+    ``TorchLlmArgs`` folded in already, and a rank filter that selects none
+    of the job's ranks is ignored before startup is recorded, so it does not
+    turn the record off. Any other executor leaves the monitor's settings as
+    they are.
+    """
+    monitor_settings.configure(llm_args.memory_monitor_config,
+                               read_environment=False,
+                               world_size=llm_args.parallel_config.world_size)
+    return monitor_providers.begin_executor()
+
+
+@contextmanager
+def _monitor_startup_scope(monitored: bool):
+    """The memory monitor's view of an executor being built.
+
+    For the monitored executor: creation runs allocations out of memory on
+    purpose and catches the error, so no OOM is reported meanwhile, and its
+    startup is recorded. Any other executor leaves the monitor alone: it
+    records nothing (the monitor drops what it registers), and the
+    monitored executor's OOMs are still reported while it is built.
+    """
+    if monitored:
+        with monitor_triggers.suspend_reporting(
+        ), monitor_tagging.startup_window():
+            yield
+    else:
+        with monitor_startup.recording_paused():
+            yield

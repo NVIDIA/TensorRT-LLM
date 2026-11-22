@@ -25,6 +25,8 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
@@ -37,10 +39,16 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.indexer import DeepseekV4Indexer
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepSeekV4Params
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseBackendForwardArgs
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
@@ -504,8 +512,12 @@ def calculate_deepseek_v4_ref_gen_sparse(
     compress_ratio: int,
     attn_sink: Optional[torch.Tensor] = None,
     seq_lens_q: Optional[List[int]] = None,
+    return_lse: bool = False,
 ):
-    """Reference attention for DeepSeek-V4 generation phase."""
+    """Reference attention for DeepSeek-V4 generation phase.
+
+    With return_lse, also returns the per-token, per-head log-sum-exp of the logits and the sink.
+    """
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
     bmm1_scale = 1 / (math.sqrt(qk_nope_head_dim + qk_rope_head_dim) * q_scaling)
     num_requests = len(seq_lens_kv)
@@ -515,6 +527,7 @@ def calculate_deepseek_v4_ref_gen_sparse(
         q_starts.append(q_starts[-1] + q_len)
 
     ref_results = []
+    lse_results = []
     latent_cache_list = []
     total_past_tokens = 0
     for i in range(num_requests):
@@ -576,6 +589,11 @@ def calculate_deepseek_v4_ref_gen_sparse(
             v_sel = all_kv[:, :v_head_dim].unsqueeze(0).expand(num_heads, -1, -1)
 
             attn_w = torch.matmul(q_tok.unsqueeze(1), k_sel.transpose(1, 2)) * bmm1_scale
+            if return_lse:
+                logits = (q_tok.float() @ all_kv.float().transpose(0, 1)) * bmm1_scale
+                if attn_sink is not None:
+                    logits = torch.cat([logits, attn_sink.float().view(-1, 1)], dim=-1)
+                lse_results.append(torch.logsumexp(logits, dim=-1))
             attn_w = _softmax_with_sink(attn_w, attn_sink, fused_q_rot.dtype)
             out = torch.matmul(attn_w, v_sel).squeeze(1)
             ref_results.append(out.reshape(1, num_heads * v_head_dim))
@@ -584,6 +602,8 @@ def calculate_deepseek_v4_ref_gen_sparse(
 
     ref_result = torch.cat(ref_results, dim=0)
     new_latent_cache_out = torch.cat(latent_cache_list).squeeze(-2)
+    if return_lse:
+        return ref_result, new_latent_cache_out, torch.stack(lse_results)
     return ref_result, new_latent_cache_out
 
 
@@ -653,6 +673,294 @@ def _create_pos_embd_params(scenario: Scenario) -> PositionalEmbeddingParams:
         rope=RopeParams.from_config(_create_rope_config(scenario)),
         is_neox=False,
     )
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_deepseek_v4_indexer_decode_start_event(monkeypatch, phase: str):
+    """Forward the real CUDA event to decode selection without delaying logits or prefill."""
+    scenario = Scenario(hidden_size=128, q_lora_rank=32, max_position_embeddings=4096)
+    context_lengths = [2048]
+    cache_manager, sparse_config = _create_cache_manager(scenario, context_lengths, 4096)
+
+    class DecodeStartEvent(torch.cuda.Event):
+        def __init__(self):
+            super().__init__()
+            self.was_waited = False
+
+        def wait(self, stream=None):
+            self.was_waited = True
+            return super().wait(stream)
+
+    try:
+        request = LlmRequest(
+            request_id=0,
+            max_new_tokens=2,
+            input_tokens=list(range(context_lengths[0])),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        scheduled_batch = ScheduledRequests()
+        scheduled_batch.append_context_request(request)
+        cache_manager.prepare_context(request)
+        cache_manager.resize_context(request, request.context_chunk_size)
+        indexer = DeepseekV4Indexer(
+            quant_config=None,
+            pos_embd_params=_create_pos_embd_params(scenario),
+            mla_params=MLAParams(
+                q_lora_rank=scenario.q_lora_rank,
+                qk_rope_head_dim=scenario.qk_rope_head_dim,
+                hidden_size=scenario.hidden_size,
+            ),
+            skip_create_weights_in_init=False,
+            sparse_params=DeepSeekV4Params(
+                index_n_heads=64,
+                index_head_dim=128,
+                index_topk=scenario.index_topk,
+                indexer_k_dtype=sparse_config.indexer_k_dtype,
+                compress_ratios=scenario.compress_ratios,
+                skip_indexer_for_short_seqs=False,
+                use_cute_dsl_paged_mqa_logits=False,
+            ),
+            dtype=scenario.dtype,
+            compress_ratio=4,
+            layer_idx=1,
+        ).cuda()
+        with torch.no_grad():
+            for parameter in indexer.parameters():
+                parameter.zero_()
+
+        metadata = DeepseekV4TrtllmAttentionMetadata(
+            seq_lens=torch.tensor(context_lengths, dtype=torch.int32),
+            request_ids=[0],
+            max_num_requests=1,
+            num_contexts=1,
+            prompt_lens=context_lengths,
+            max_num_tokens=context_lengths[0],
+            kv_cache_manager=cache_manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            sparse_attention_config=sparse_config,
+        )
+        metadata.prepare()
+        qr = torch.zeros(
+            (context_lengths[0], scenario.q_lora_rank), dtype=scenario.dtype, device="cuda"
+        )
+        hidden_states = torch.zeros(
+            (context_lengths[0], scenario.hidden_size), dtype=scenario.dtype, device="cuda"
+        )
+        position_ids = torch.arange(context_lengths[0], dtype=torch.int32, device="cuda")
+        with torch.no_grad():
+            indexer(qr, hidden_states, metadata, position_ids)
+
+        if phase == "decode":
+            request.context_current_position = context_lengths[0]
+            request.add_new_token(context_lengths[0], 0)
+            cache_manager.update_context_resources(scheduled_batch)
+            _allocate_kv_cache_for_generation(cache_manager, [request], num_new_tokens=1)
+            metadata = DeepseekV4TrtllmAttentionMetadata(
+                seq_lens=torch.tensor([1], dtype=torch.int32),
+                request_ids=[0],
+                max_num_requests=1,
+                num_contexts=0,
+                prompt_lens=context_lengths,
+                max_num_tokens=1,
+                kv_cache_manager=cache_manager,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=context_lengths
+                ),
+                mapping=Mapping(world_size=1, rank=0, tp_size=1),
+                sparse_attention_config=sparse_config,
+            )
+            metadata.prepare()
+            qr = qr[:1]
+            hidden_states = hidden_states[:1]
+            position_ids = torch.tensor(context_lengths, dtype=torch.int32, device="cuda")
+
+        event = DecodeStartEvent()
+        event.record()
+        selection_phases = set()
+        original_topk = indexer.top_k.forward
+        original_decode_logits = indexer._call_paged_mqa_logits
+
+        def observed_decode_logits(*args, **kwargs):
+            assert not event.was_waited, "Q completion must not delay indexer logits"
+            return original_decode_logits(*args, **kwargs)
+
+        def observed_topk(*args, **kwargs):
+            is_prefill = kwargs["is_prefill"]
+            assert event.was_waited == (not is_prefill)
+            selection_phases.add(is_prefill)
+            return original_topk(*args, **kwargs)
+
+        monkeypatch.setattr(indexer, "_call_paged_mqa_logits", observed_decode_logits)
+        monkeypatch.setattr(indexer.top_k, "forward", observed_topk)
+        with torch.no_grad():
+            result = indexer(
+                qr, hidden_states, metadata, position_ids, decode_topk_start_event=event
+            )
+        torch.cuda.synchronize()
+
+        assert selection_phases == {phase == "prefill"}
+        assert event.was_waited == (phase == "decode")
+        assert result.shape == (hidden_states.shape[0], scenario.index_topk)
+        assert (result >= 0).any()
+    finally:
+        cache_manager.shutdown()
+
+
+@skip_pre_blackwell
+def test_deepseek_v4_module_decode_start_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Enqueue Q and its completion record before dispatching the overlapping indexer."""
+    monkeypatch.setenv("TRTLLM_MLA_EXTRA_OVERLAP", "1")
+    monkeypatch.setenv("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "0")
+    scenario = Scenario(
+        hidden_size=128,
+        num_heads=16,
+        q_lora_rank=64,
+        qk_nope_head_dim=448,
+        max_position_embeddings=4096,
+    )
+    context_lengths = [2048]
+    cache_manager, sparse_config = _create_cache_manager(scenario, context_lengths, 4096)
+    try:
+        mapping = Mapping(world_size=1, rank=0, tp_size=1)
+        mla = MLA(
+            hidden_size=scenario.hidden_size,
+            num_attention_heads=scenario.num_heads,
+            num_key_value_heads=scenario.num_kv_heads,
+            qk_nope_head_dim=scenario.qk_nope_head_dim,
+            qk_rope_head_dim=scenario.qk_rope_head_dim,
+            v_head_dim=scenario.v_head_dim,
+            q_lora_rank=scenario.q_lora_rank,
+            kv_lora_rank=scenario.kv_lora_rank - scenario.qk_rope_head_dim,
+            predicted_tokens_per_seq=1,
+            max_position_embeddings=scenario.max_position_embeddings,
+            bias=False,
+            aux_stream_dict={
+                role: torch.cuda.Stream()
+                for role in (
+                    AuxStreamType.Attention,
+                    AuxStreamType.MlaCompressor,
+                    AuxStreamType.MlaIndexer,
+                    AuxStreamType.MlaIndexerAux,
+                )
+            },
+            pos_embd_params=_create_pos_embd_params(scenario),
+            layer_idx=1,
+            dtype=scenario.dtype,
+            config=ModelConfig(mapping=mapping, sparse_attention_config=sparse_config),
+            num_groups=1,
+            o_lora_rank=128,
+        ).cuda()
+        with torch.no_grad():
+            for parameter in mla.parameters():
+                parameter.zero_()
+
+        request = LlmRequest(
+            request_id=0,
+            max_new_tokens=2,
+            input_tokens=list(range(context_lengths[0])),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        scheduled_batch = ScheduledRequests()
+        scheduled_batch.append_context_request(request)
+        cache_manager.prepare_context(request)
+        cache_manager.resize_context(request, request.context_chunk_size)
+        metadata = DeepseekV4TrtllmAttentionMetadata(
+            seq_lens=torch.tensor(context_lengths, dtype=torch.int32),
+            request_ids=[0],
+            max_num_requests=1,
+            num_contexts=1,
+            prompt_lens=context_lengths,
+            max_num_tokens=context_lengths[0],
+            kv_cache_manager=cache_manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            mapping=mapping,
+            sparse_attention_config=sparse_config,
+        )
+        metadata.prepare()
+        hidden_states = torch.zeros(
+            (context_lengths[0], scenario.hidden_size), dtype=scenario.dtype, device="cuda"
+        )
+        position_ids = torch.arange(context_lengths[0], dtype=torch.int32, device="cuda")
+        output = torch.empty(
+            (context_lengths[0], scenario.num_heads * scenario.v_head_dim),
+            dtype=scenario.dtype,
+            device="cuda",
+        )
+        with torch.no_grad():
+            mla.forward_impl(position_ids, hidden_states, metadata, [output])
+
+        request.context_current_position = context_lengths[0]
+        request.add_new_token(context_lengths[0], 0)
+        cache_manager.update_context_resources(scheduled_batch)
+        _allocate_kv_cache_for_generation(cache_manager, [request], num_new_tokens=1)
+        metadata = DeepseekV4TrtllmAttentionMetadata(
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            request_ids=[0],
+            max_num_requests=1,
+            num_contexts=0,
+            prompt_lens=context_lengths,
+            max_num_tokens=1,
+            kv_cache_manager=cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=context_lengths
+            ),
+            mapping=mapping,
+            sparse_attention_config=sparse_config,
+        )
+        metadata.prepare()
+        hidden_states = hidden_states[:1]
+        position_ids = torch.tensor(context_lengths, dtype=torch.int32, device="cuda")
+        output = output[:1]
+        q_projected = False
+        indexer_entered = False
+
+        class QCompletionEvent(torch.cuda.Event):
+            def __init__(self) -> None:
+                super().__init__()
+                self.was_recorded = False
+
+            def record(self, stream: torch.cuda.Stream | None = None) -> None:
+                assert q_projected, "Q must be enqueued before its completion record"
+                result = super().record(stream)
+                self.was_recorded = True
+                return result
+
+        producer = QCompletionEvent()
+        original_q_projection = mla.q_b_proj.forward
+        original_indexer = mla.indexer.forward
+
+        def observed_q_projection(*args, **kwargs) -> torch.Tensor:
+            nonlocal q_projected
+            result = original_q_projection(*args, **kwargs)
+            q_projected = True
+            return result
+
+        def observed_indexer(*args, **kwargs) -> torch.Tensor:
+            nonlocal indexer_entered
+            assert q_projected, "Q must be enqueued before indexer entry"
+            assert producer.was_recorded, "Q completion must be recorded before indexer entry"
+            assert kwargs.get("decode_topk_start_event") is producer, (
+                "The indexer must receive the same Q completion event"
+            )
+            indexer_entered = True
+            return original_indexer(*args, **kwargs)
+
+        monkeypatch.setattr(mla, "dsv4_compressor_event", producer)
+        monkeypatch.setattr(mla.q_b_proj, "forward", observed_q_projection)
+        monkeypatch.setattr(mla.indexer, "forward", observed_indexer)
+        with torch.no_grad(), with_multi_stream(True):
+            mla.forward_impl(position_ids, hidden_states, metadata, [output])
+        torch.cuda.synchronize()
+
+        assert indexer_entered, "The decode forward must exercise indexer overlap"
+        assert torch.isfinite(output).all()
+    finally:
+        torch.cuda.synchronize()
+        cache_manager.shutdown()
 
 
 @skip_pre_blackwell
@@ -829,6 +1137,44 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
     ],
 )
 def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q: int | List[int]):
+    _run_deepseek_v4_sparse_mla(context_lengths, generation_seq_len_q)
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+# Large sinks hold up to most of the softmax mass; the small ones of the cases above stay below
+# the tolerance even when dropped.
+@pytest.mark.parametrize(
+    "sinks,exports_softmax_stats",
+    [("large", False), ("large", True), ("none", False), ("none", True)],
+)
+def test_deepseek_v4_sparse_mla_split_kv_reduction(
+    monkeypatch, sinks: str, exports_softmax_stats: bool
+):
+    """The TRTLLM-Gen split-KV reduction adds the sink term and exports the softmax stats.
+
+    PrimTS serves SM100 generation by default; it is turned off to keep these cases on TRTLLM-Gen.
+    """
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "-prims_ts_sparse_mla")
+    generation_fmhas: list[type] = []
+    for fmha_cls in (PrimsTSSparseMlaFmha, FallbackFmha):
+
+        def spy_forward(self, q, k, v, metadata, forward_args, _forward=fmha_cls.forward):
+            if forward_args.attention_input_type == AttentionInputType.generation_only:
+                generation_fmhas.append(type(self))
+            return _forward(self, q, k, v, metadata, forward_args)
+
+        monkeypatch.setattr(fmha_cls, "forward", spy_forward)
+    _run_deepseek_v4_sparse_mla([14, 508, 3947], 2, sinks, exports_softmax_stats)
+    assert generation_fmhas and set(generation_fmhas) == {FallbackFmha}, generation_fmhas
+
+
+def _run_deepseek_v4_sparse_mla(
+    context_lengths: List[int],
+    generation_seq_len_q: int | List[int],
+    sinks: str = "small",
+    exports_softmax_stats: bool = False,
+):
     num_generation_steps = 2
     is_ragged = isinstance(generation_seq_len_q, list)
     generation_lens = (
@@ -927,9 +1273,15 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
         layers[layer_idx] = layer
 
     # Install a per-layer attention sink
-    attn_sinks: Dict[int, torch.Tensor] = {}
+    attn_sinks: Dict[int, Optional[torch.Tensor]] = {}
     for layer_idx in TEST_LAYERS:
-        sink = torch.randn(num_heads, dtype=torch.float32, device=device).mul_(0.5)
+        if sinks == "none":
+            attn_sinks[layer_idx] = None
+            continue
+        if sinks == "large":
+            sink = torch.empty(num_heads, dtype=torch.float32, device=device).uniform_(3.0, 9.0)
+        else:
+            sink = torch.randn(num_heads, dtype=torch.float32, device=device).mul_(0.5)
         layers[layer_idx].attn_sink = torch.nn.Parameter(sink, requires_grad=False)
         attn_sinks[layer_idx] = sink
 
@@ -1307,6 +1659,11 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                     device,
                 )
 
+            softmax_stats = (
+                torch.empty(total_gen_tokens, num_heads, 2, dtype=torch.float32, device=device)
+                if exports_softmax_stats
+                else None
+            )
             result = layers[layer_idx].forward(
                 fused_q,
                 None,
@@ -1319,6 +1676,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 cu_kv_seqlens=cu_kv_seqlens,
                 fmha_scheduler_counter=fmha_scheduler_counter,
                 sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
+                softmax_stats_tensor=softmax_stats,
             )
 
             if uniform_metadata is not None:
@@ -1365,7 +1723,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 qk_rope_head_dim,
                 seq_lens_q=generation_lens,
             )
-            ref_result, new_latent_cache = calculate_deepseek_v4_ref_gen_sparse(
+            ref_result, new_latent_cache, ref_lse = calculate_deepseek_v4_ref_gen_sparse(
                 fused_q_rot,
                 new_latent,
                 latent_cache_ref_all[layer_idx],
@@ -1382,6 +1740,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 ratio,
                 attn_sink=attn_sinks[layer_idx],
                 seq_lens_q=generation_lens,
+                return_lse=True,
             )
             latent_cache_ref_all[layer_idx] = new_latent_cache
 
@@ -1401,6 +1760,15 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
                 f"Gen step {step + 1} mismatch at layer {layer_idx} "
                 f"(ratio={ratio}): max diff={diff.max().item():.6f}"
             )
+            if sinks != "small":
+                rel_l2 = (
+                    (result.float() - ref_result.float()).norm() / ref_result.float().norm()
+                ).item()
+                assert rel_l2 <= 0.02, f"layer {layer_idx}: relative L2 error {rel_l2:.4f}"
+            if exports_softmax_stats:
+                # The stats hold the max logit and the sum of exp(logit - max), sink included.
+                lse = softmax_stats[..., 0] + softmax_stats[..., 1].log()
+                torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=0)
             print("  PASSED")
 
     cache_manager.shutdown()

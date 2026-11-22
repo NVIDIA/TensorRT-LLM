@@ -16,7 +16,8 @@
 
 Ten leaves are ``trtllm.cutlass.grouped_gemm.<quant>``. Each ``fp8_block_scales``
 leaf names the kernel it runs instead: ``deepgemm.cuda.hopper_grouped_gemm``
-(:mod:`.fp8_block_scales_hopper`) and ``trtllm.triton.grouped_gemm``
+(:mod:`.fp8_block_scales_hopper`), ``trtllm.triton.fp8_act_grouped_gemm``
+(:mod:`.fp8_block_scales_hopper_triton`) and ``trtllm.triton.grouped_gemm``
 (:mod:`.fp8_block_scales_triton`).
 """
 
@@ -37,6 +38,8 @@ TECHNIQUE_TRITON = "triton"
 
 KERNEL_GROUPED_GEMM = "grouped_gemm"
 KERNEL_HOPPER_GROUPED_GEMM = "hopper_grouped_gemm"
+#: Grouped GEMM over FP8 activations quantized per 1 x 128 group.
+KERNEL_FP8_ACT_GROUPED_GEMM = "fp8_act_grouped_gemm"
 
 CUTLASS_CAPABILITIES = MoEStaticCapability(
     supports_expert_bias=True,
@@ -63,8 +66,8 @@ def cutlass_descriptor(
         quant: The one quantization format the leaf implements.
         doc: One line naming the kernel.
         provider: Identity segment. The defaults name the CUTLASS grouped
-            GEMM; only the two FP8 block-scale leaves, which run another
-            kernel, override the segments.
+            GEMM; only the FP8 block-scale leaves, which run other kernels,
+            override the segments.
         technique: Identity segment; see ``provider``.
         kernel_name: Identity segment; see ``provider``.
         supports_moe_lora: Whether ``torch.ops.trtllm.fused_moe`` fuses

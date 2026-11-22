@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the moe/k3_moe catalog entry: trtllm::k3_moe on its caller-owned state, both builds.
+"""GPU test for the moe/k3_moe op: trtllm::k3_moe on its caller-owned state, both builds.
 
 One GPU (sm_100), one rank of the Kimi K3 TP16 deployment's routed experts: experts TP4 x EP4, so 224 of the 896
 experts are local (global ids [224, 448)) with intermediate 768 per rank. The experts are random checkpoint-format
@@ -880,3 +880,34 @@ def test_negative_control_weights_rebound_after_layer():
         t.copy_(e2[name])  # in place: the buffers the stale layers read now hold E2
     assert _same(_call(stale, lg8, x8), y_e2)
     assert _same(_call(stale_wide, lg40, x40), yw_e2)
+
+
+@pytest.mark.parametrize("rows", [9, 33, 64])
+def test_k3_moe_wide_shared_experts(rows):
+    """Shared experts span partial groups, both token masks, and all eight groups per expert."""
+    state, layers = _wide()
+    layer = layers[0]
+    proc, raw, bias = _experts()
+    generator = torch.Generator(device=DEV).manual_seed(20261031 + rows)
+    chosen = list(range(OFFSET + E_LOCAL - TOP_K, OFFSET + E_LOCAL))
+    logits = _chosen_logits([chosen] * rows, generator)
+    latent = torch.randn(rows, H, generator=generator, device=DEV).bfloat16()
+    stock, ids, weights, x_fp8, x_sf = _stock(proc, bias, latent, logits)
+    expected_ids = torch.tensor(chosen, dtype=ids.dtype, device=ids.device)
+    assert torch.equal(ids.sort(dim=1).values, expected_ids.expand(rows, -1))
+    assert bool((weights > 0).all())
+    assert _groups_wide(ids) == TOP_K * ((rows + DECODE_MAX - 1) // DECODE_MAX)
+
+    output = k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer)
+    torch.cuda.synchronize()
+    assert output.shape == (rows, H) and output.dtype == torch.bfloat16
+    assert output.device == latent.device and output.is_contiguous()
+    reference = k3_moe.reference(raw, x_fp8, x_sf, ids, weights, OFFSET)
+    assert _compare(output, reference)["ok"]
+    assert _compare(output, stock)["ok"]
+    assert _armed(state, layers)
+
+    repeated = k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer)
+    torch.cuda.synchronize()
+    assert _same(repeated, output)
+    assert _armed(state, layers)

@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import gpu_keepalive as ka
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 
 pytestmark = pytest.mark.cpu_only
 
@@ -269,6 +270,8 @@ def test_fill_gate_wiring():
             _check_benchmark_disagg_gate = pe.PyExecutor._check_benchmark_disagg_gate
 
         stub = Stub()
+        stub._benchmark_sweep = False
+        stub._benchmark_gate_rearm_pending = False
         stub.is_warmup = warmup
         stub._gpu_keepalive = Mock()
         stub._benchmark_gen_transfer_made_progress = lambda: False
@@ -324,8 +327,8 @@ def test_fill_gate_wiring():
             self.events = []
             self._staged_responses = []
             self._intake_window = threading.Event()
-            self.response_cv = threading.Condition(threading.Lock())
-            self.response_cv.notify_all = lambda: self.events.append("notify_all")
+            self._response_channel = ResponseChannel()
+            self._response_channel.response_cv.notify_all = lambda: self.events.append("notify_all")
             self.is_shutdown = False
             self.shutdown_event = threading.Event()
             self.num_micro_batches = 1

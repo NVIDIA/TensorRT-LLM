@@ -138,6 +138,14 @@ class DenseShardStore(ABC):
     def release(self) -> None:
         """Unmap and free the peer imports, then the local chunks; idempotent."""
 
+    @property
+    def local_bytes_outside_torch(self) -> int:
+        """Device memory this rank's own chunks hold outside PyTorch's allocator.
+
+        Imported peer chunks are not counted: they are another rank's memory.
+        """
+        return 0
+
     def __del__(self) -> None:
         """Best-effort :meth:`release` for owners that miss the explicit teardown.
 
@@ -305,6 +313,11 @@ class FabricShardStore(DenseShardStore):
         self._imports: list[_Mapping] = []
         self._views: list[torch.Tensor] = []
         self._exported: list[bytes] | None = None
+
+    @property
+    def local_bytes_outside_torch(self) -> int:
+        """See :attr:`DenseShardStore.local_bytes_outside_torch`; the local FABRIC handles."""
+        return sum(mapping.size for mapping in self._local)
 
     def allocate(self) -> None:
         """See :meth:`DenseShardStore.allocate`.

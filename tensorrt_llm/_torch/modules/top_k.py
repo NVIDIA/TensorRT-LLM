@@ -158,7 +158,9 @@ class TopK(nn.Module):
                 ``[num_requests, top_k]`` on ``scores.device``. The
                 self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
-                shape ``[num_requests]`` on the same device.
+                shape ``[num_requests]`` on the same device. ``gvr_pdl``,
+                ``gvr_r_cap`` and ``gvr_finalize`` (``done`` set once the launch
+                ran it) are the self-sampling decode's ``run_varlen`` options.
             radix_aux_indices: Caller-owned int32 workspace for native CUDA
                 Radix split work.
             radix_aux_logits: Caller-owned float32 workspace for native CUDA
@@ -452,6 +454,9 @@ class TopK(nn.Module):
         radix_aux_logits: torch.Tensor | None,
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
+        gvr_pdl: bool = False,
+        gvr_r_cap: int = 0,
+        gvr_finalize: dict | None = None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
@@ -502,6 +507,8 @@ class TopK(nn.Module):
                     max_seq_len=kv_max_seq_len,
                     **({"deterministic": True} if self.gvr_deterministic else {}),
                     **({"wide_cta_rows": True} if self.wide_cta_rows else {}),
+                    **({"pdl": True} if gvr_pdl else {}),
+                    **({"r_cap": gvr_r_cap} if gvr_r_cap else {}),
                 ):
                     # the engine never JIT-compiles under capture; a launcher
                     # missed by warmup takes the exact radix path in the graph
@@ -535,6 +542,9 @@ class TopK(nn.Module):
                         max_seq_len=kv_max_seq_len,
                         **self._gvr_det_kwargs,
                         **({"wide_cta_rows": True} if self.wide_cta_rows else {}),
+                        **({"pdl": True} if gvr_pdl else {}),
+                        **({"r_cap": gvr_r_cap} if gvr_r_cap else {}),
+                        **({"finalize": gvr_finalize} if gvr_finalize is not None else {}),
                     )
                     return output_indices
             else:

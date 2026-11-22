@@ -51,6 +51,7 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_checks_slot_capacity_after_plan_hit
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_cache_is_bounded
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
+  - unittest/_torch/models/test_minimax_m3.py::test_registered_conditional_generation_text_forward
   # MiniMax-M3 VL checkpoint-backed processor parity (the CPU stage's -m cpu_only leaves these out)
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_input_ids_match_trt_build_helper
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_video_input_ids_match_trt_build_helper
@@ -78,9 +79,11 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_prims_ts_bfloat16
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=trtllm_gen-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[unchunked] TIMEOUT (30)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[chunked] TIMEOUT (30)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=none-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=nvfp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=True-fp8kv=False-overlap_scheduler=True]
@@ -88,6 +91,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=nvfp4-kv_cache_reuse=True-fp8kv=False-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=nvfp4-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_breakable_prefill_cuda_graph
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-v2_kv_cache=True]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
@@ -100,15 +104,17 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[bf16-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[fp8-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[TRTLLM] # SM100+ only; l0_h100 runs [VANILLA]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[standard-fused_chain]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[block-per_position]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-trtllm_gen]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-trtllm_gen]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-trtllm_gen]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_kv_cache_manager_v1
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16_breakable_prefill_cuda_graph
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[trtllm_gen]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_dflash[VANILLA]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_dflash[TRTLLM]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8_mmmu_encoder_cuda_graph]
@@ -142,15 +148,18 @@ l0_b200:
   - unittest/_torch/kv_cache_compression
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
+  # Locality domains via mock localization: per-domain KV pools on one GPU.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_locality_domains
   - unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
-  - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
+  - unittest/_torch/modules/test_mega_mhc_pipeline.py::test_mega_mhc_pipeline_changed_input_graph[bf16-shifted-many-task-waves]
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
+  - unittest/_torch/modules/test_logits_cast.py
   # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2 (decode / route fronts below).
   - unittest/_torch/moe/test_moe_nvfp4_engine.py
   - unittest/_torch/moe/test_moe_bf16_engine.py
@@ -205,14 +214,25 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
   - unittest/_torch/modules/kimi_kda/test_kda_replay_acceptance.py
   # Shared catalog entries used by K3's generic path.
-  - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
+  - unittest/_torch/modeling_v2/moe/ops/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
   - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
-  - unittest/_torch/modeling_v2/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
+  - unittest/_torch/modeling_v2/moe/ops/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_context_bf16_page64
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_generation_bf16_page64
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_generation.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_append_paged_kv_assign_q.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/graph/test_modeling_v2_eager_on_graph.py
+  # Kimi K3 MLA tests that run on sm_100 only (the MLA kernels the generic path picks there).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_cute_dsl_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_flashinfer_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_merge_chunked_attention_for_mla.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_mla_steps.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_mla_drafter.py
+  # The family's attention-residual CUDA against the built-in ops it was copied from, on the targets' SM.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_attn_res_v1_parity.py
   # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
@@ -221,6 +241,9 @@ l0_b200:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  # GLM-5.3-Flash FP8 modeling_v2 target (sm_100): its operations. The 4-rank boundary matrix runs in
+  # l0_dgx_b200.
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4 --ignore=unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/comm/test_modeling_v2_mhc_ar_boundary.py
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
@@ -244,7 +267,12 @@ l0_b200:
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp8_quant.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp8_quant.py
+  - unittest/_torch/kernels/fused_ops/test_soft_cap_logits.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
+  - unittest/_torch/modeling/test_gemma4_fused_ops.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_swiglu_nvfp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
@@ -271,8 +299,11 @@ l0_b200:
   - unittest/_torch/modules/dwdp/test_dense_attached_gpu.py
   # Real ConfigurableMoE layers sized and registered for DWDP while the model is built.
   - unittest/_torch/modules/dwdp/test_dwdp_moe_construction_gpu.py
+  # PagePool occupancy on the real VMM path, read by the memory monitor.
+  - unittest/_torch/modules/dwdp/test_page_pool_statistics.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
+  - unittest/_torch/moe/test_trtllm_gen_bf16_moe_inplace_refit.py
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/test_moe_comm_timeout_guard.py
@@ -285,11 +316,13 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/moe/test_megamoe_combine_dedup_tactic.py
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_mxe2m1_weights_valid_dimensions
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_in_kernel_routing_256_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
@@ -309,8 +342,8 @@ l0_b200:
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
-  # B-tier only runs the FP8 MoE parametrize (DEEPGEMM path is SM100-only via
-  # _get_moe_config_for_blackwell); dense bf16 variants are covered on Hopper.
+  # B-tier only runs the FP8 MoE parametrize (deepgemm.grouped_gemm, SM100 family
+  # only, via fp8_block_scales_moe_config); dense bf16 variants are covered on Hopper.
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
   # UUID KV-event tests hardcode Qwen3-VL-2B (no model_dir fixture id), so they
@@ -358,10 +391,12 @@ l0_b200:
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
   # Vocab-parallel token selection kernels on a single shard.
   - unittest/_torch/speculative/test_vocab_parallel.py
+  - unittest/_torch/speculative/test_vocab_parallel_argmax.py
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
+  - unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"
@@ -370,7 +405,6 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
-  - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
@@ -442,8 +476,8 @@ l0_b200:
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
-  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
+  - unittest/_torch/visual_gen/test_cuda_graph_cache.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
@@ -466,6 +500,8 @@ l0_b200:
   - unittest/_torch/kernels/parallel_hw_agnostic/test_rotate_rows.py
   - unittest/_torch/kernels/parallel_hw_agnostic/test_scatter_kv_slots.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_wino_vae.py
+  - unittest/_torch/visual_gen/test_wino_vae_kernels.py
   - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
@@ -502,6 +538,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_teacache.py
   - unittest/_torch/visual_gen/test_offloading.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
+  - unittest/_torch/visual_gen/test_wan22_t2v_a14b_component.py
   - unittest/_torch/visual_gen/test_cosmos3_action.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_attention_qkv_share.py
@@ -516,6 +553,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_pipeline.py
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux1_example
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_http TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
@@ -562,7 +601,6 @@ l0_b200:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/disaggregated/test_openai_server_info.py
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)
@@ -587,8 +625,8 @@ l0_b200:
   # Covered by H100 pre_merge for primary HW-agnostic signal; keep B200 runtime
   # canary in post_merge for CUDA IPC / virtual memory / profiling paths.
   - unittest/_torch/misc
-  # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
-  # checkpoint); ~13 min, too heavy for pre_merge. Mirrors l0_gb300_multi_gpus.
+  # Kimi K3 routing shape (896 experts, top_k 16) on the TRTLLM backend.
+  # Single-GPU, random weights; too heavy for pre_merge.
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   # Keep new full-corpus EAGLE-3 baselines in post_merge until repeated green
   # runs establish stable references.
@@ -600,23 +638,23 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-CUTLASS]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRITON]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=trtllm_gen-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=trtllm_gen-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=False]
@@ -625,8 +663,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=True]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-cutlass]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-trtllm_gen]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_branch_snapshot[enable_branch_snapshot=True]
   - accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
@@ -703,11 +741,28 @@ l0_b200:
   - visual_gen/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1-cuda-graph] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1-multiple-outputs] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux2] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[qwen-image] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[qwen-image-cuda-graph] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[qwen-image-50-steps] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[qwen-image-compile-50-steps] TIMEOUT (30)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[qwen-image-compile-cuda-graph] TIMEOUT (30)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1-dynamic-nvfp4] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux2-dynamic-nvfp4] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1-dynamic-fp8] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux2-dynamic-fp8] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1-static-nvfp4] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_quantized_attention_fallback[cudnn-fp8] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_quantized_attention_fallback[flashinfer-mxfp8] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_quantized_attention_fallback[trtllm-v-fp8] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_quantized_attention_fallback[trtllm-qkv-fp8] TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=trtllm_gen-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"

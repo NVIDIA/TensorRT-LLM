@@ -9,7 +9,8 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 4. [Using Checkpoint Loaders](#using-checkpoint-loaders)
 5. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
 6. [Checkpoint I/O Policies](#checkpoint-io-policies)
-7. [Startup Telemetry](#startup-telemetry)
+7. [Releasing the Page Cache After Loading](#releasing-the-page-cache-after-loading)
+8. [Startup Telemetry](#startup-telemetry)
 
 ## Overview
 
@@ -373,7 +374,14 @@ options to speed up weight loading via efficient streaming from storage.
   reads each piece into the OS page cache while copying tensors to GPU at the
   same time. This assumes most tensors being copied are from the OS page cache.
   It runs only when the whole checkpoint fits in the available host memory,
-  minus some headroom. Otherwise it falls back to `native`.
+  minus some headroom. Otherwise it falls back to `native`. Inside a
+  memory-limited cgroup, file-backed page cache charged to it, such as
+  checkpoints that earlier loads left cached, counts as available, as it does
+  for host memory, because the kernel reclaims it before the cgroup runs out
+  of memory.
+  On cgroup v2, page cache that a child of a limited cgroup protects with
+  `memory.min` or `memory.low` does not count under that limit, because
+  reclaim for the limit keeps it or takes it last.
 - `auto` (default): use `rank_striped_read_ahead` when the load supports it,
   and `native` I/O otherwise.
 
@@ -404,9 +412,10 @@ is a refresh.
   headroom. If the check fails, or the reader cannot read the memory status,
   the refresh stays queued and the reader checks again at later polls. A
   warning is logged once each time a refresh starts to wait on memory. This
-  check is conservative and does not reserve memory: pages that are already in
-  memory and charged to a cgroup can defer a refresh even when only a small
-  part of the checkpoint is missing from the page cache.
+  check is conservative and does not reserve memory: memory charged to a
+  cgroup that is not file-backed page cache, such as process memory, can defer
+  a refresh even when only a small part of the checkpoint is missing from the
+  page cache.
 - Tensor copies to GPU continue while a refresh waits.
 
 ### Logs
@@ -433,6 +442,37 @@ checkpoint read, and `draft_checkpoint_io_policy` for a separate draft
 checkpoint read. The value is `null` when the built-in HF weight loader did not
 read the checkpoint from storage, for example with preloaded weights, a custom
 weight loader, or a GMS reader.
+
+## Releasing the Page Cache After Loading
+
+Once the weights are loaded, the checkpoint files stay in the host's page cache
+until the kernel needs the memory or the file system drops them. A Lustre client
+drops a file's cached pages once its lock has been idle for
+`ldlm.namespaces.*.lru_max_age`. When that is 10 minutes, the drop of a few
+hundred GB, and the kernel's compaction of the freed memory, can land about 10
+minutes into serving, where host threads that touch pages under migration stall.
+
+`TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE=1` (default: off) moves both into startup.
+Once every rank of the server on a node has finished loading, rank 0 of the node
+advises the kernel to drop (`POSIX_FADV_DONTNEED`) the page cache of the
+top-level files of every directory the load read checkpoint files from: the
+checkpoint (or a multimodal model's LLM checkpoint) and a separate draft model.
+If the files total at least 1 GiB, it then waits, up to 120 s, until page
+migration (`pgmigrate_success` in `/proc/vmstat`) settles. Loads that read no checkpoint
+files, such as GMS read-only instances and ModelExpress P2P receivers, drop
+nothing. The time spent is reported as the
+`checkpoint_page_cache_release_seconds` startup metric.
+
+- A later restart reads the checkpoint from storage again.
+- Other servers on the node that read the same files are not coordinated with.
+- The setting is ignored when MPI is disabled (`TLLM_DISABLE_MPI=1`, as under Ray).
+
+Perf-sanity turns it on for its GB300 servers on nodes whose Lustre client ages
+idle locks out within 10 minutes (`lru_max_age` of at most 600000 ms), as on
+oci-jhb and oci-aga. It sets it through `env_overrides` in the generated server
+config, which every rank applies before loading, and leaves DWDP context
+instances out. A server's YAML `env_vars`, then the job's environment, take
+precedence.
 
 ## Startup Telemetry
 

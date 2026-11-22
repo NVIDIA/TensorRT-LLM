@@ -3,8 +3,11 @@
 
 import copy
 import os
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import replace
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
@@ -19,7 +22,9 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     ArtifactIdentity, PostTransformConfigIdentity,
     PostTransformQualificationDecision, SourceIdentity)
-from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, get_sm_version,
+                                 local_mpi_comm, mpi_disabled,
+                                 str_dtype_to_torch)
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -36,6 +41,10 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from ..locality_domain.policy import LocalityDomainPolicy
+from ..memory.monitor import claims as monitor_claims
+from ..memory.monitor import names as monitor_names
+from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
+                          wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
 from ..modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..models import AutoModelForCausalLM
@@ -74,6 +83,7 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
                           "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
                           "mixed_nvfp4_bfloat16")
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
+_WEIGHT_LOAD_THREADS_ENV = "TLLM_WEIGHT_LOAD_THREADS"
 
 # TorchLlmArgs fields that only the model classes listing them in
 # `model_specific_llm_args` implement.
@@ -221,12 +231,17 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     sparse_config = model_config.sparse_attention_config
     uses_minimax_m3_msa = (is_minimax_m3(sparse_config)
                            and sparse_config.implementation == "msa")
+    # DSA never hands trtllm-gen its NVFP4 latent cache: attention reads FP8
+    # rows gathered from it, or PrimTS reads its records in place.
+    uses_dsa_nvfp4_latent = (sparse_config is not None
+                             and sparse_config.algorithm == "dsa"
+                             and not pyt_kv_cache_dtype.startswith("mixed_"))
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
             and not getattr(getattr(model_config, "modeling_v2_target", None),
                             "supports_nvfp4_kv_cache", False)
-            and not uses_minimax_m3_msa and torch.cuda.is_available()
-            and get_sm_version() == 107):
+            and not uses_minimax_m3_msa and not uses_dsa_nvfp4_latent
+            and torch.cuda.is_available() and get_sm_version() == 107):
         if pyt_kv_cache_dtype.startswith("mixed_"):
             raise ValueError(
                 f'kv_cache_config.dtype="{pyt_kv_cache_dtype}" keeps the history '
@@ -295,7 +310,18 @@ def validate_fp4_mla_config(model_config: ModelConfig,
     if not supports_fp4_mla_attention(model_config):
         raise UnsupportedError(
             "Dense FP4 MLA requires the TRTLLM attention backend.")
+    from ..attention.backends.fp4_mla.cache_manager import \
+        is_fp4_mla_context_only_cache
+    from ..attention.backends.fp4_mla.config import validate_fp4_mla_backend
+    from ._util import is_disagg_enabled
+
+    sm_version = get_sm_version()
     mapping = model_config.mapping
+    context_only = is_fp4_mla_context_only_cache(
+        is_disagg_enabled(llm_args.cache_transceiver_config))
+    validate_fp4_mla_backend(sm_version,
+                             context_only=context_only,
+                             helix=mapping.has_cp_helix())
     if mapping.cp_size != 1 and not mapping.has_cp_helix():
         raise UnsupportedError(
             "FP4 MLA supports context parallelism only through Helix.")
@@ -615,6 +641,59 @@ def construct_checkpoint_loader(
     return checkpoint_loader
 
 
+def _weight_load_num_threads() -> Optional[int]:
+    """Threads ``TLLM_WEIGHT_LOAD_THREADS`` asks for, capped at usable CPUs."""
+    value = os.environ.get(_WEIGHT_LOAD_THREADS_ENV)
+    if value is None or not value.strip():
+        return None
+    try:
+        requested = int(value)
+    except ValueError as error:
+        raise ConfigInputError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                               f"integer, got {value!r}") from error
+    if requested <= 0:
+        raise ConfigInputError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                               f"integer, got {value!r}")
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available = os.cpu_count() or 1
+    return min(requested, available)
+
+
+@contextmanager
+def _weight_load_threads(requested: Optional[int]) -> Iterator[None]:
+    """Run this thread's load on ``requested`` torch threads.
+
+    None keeps the process's count. Only raises; restores on exit and on error.
+    """
+    previous = torch.get_num_threads()
+    if requested is None or requested <= previous:
+        yield
+        return
+    # The native backend sets one count per process, once; a raise would stay.
+    if "ATen parallel backend: OpenMP" not in torch.__config__.parallel_info():
+        logger.warning(f"Ignoring {_WEIGHT_LOAD_THREADS_ENV}: only torch's "
+                       "OpenMP backend can restore the thread count")
+        yield
+        return
+    logger.info(f"Weight loading uses {requested} torch threads (was "
+                f"{previous}), as {_WEIGHT_LOAD_THREADS_ENV} asks")
+    try:
+        # The first call also sizes torch's pthreadpool for good; keep its size.
+        torch.set_num_threads(previous)
+        torch.set_num_threads(requested)
+        # New threads start from torch's process-wide count; set it back from
+        # another thread so this one keeps the raise and loader pools do not.
+        setter = threading.Thread(target=torch.set_num_threads,
+                                  args=(previous, ))
+        setter.start()
+        setter.join()
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
 def _inspect_shadow_weight_load_plan(
         checkpoint_loader: Any, checkpoint_dir: str, weight_mapper: Any,
         **kwargs: Any) -> tuple[CheckpointCatalog, WeightLoadPlan] | None:
@@ -804,7 +883,8 @@ def _load_checkpoint_into_model(
         mapping: parallel mapping of this rank
         weight_mapper: initialized weight mapper for this checkpoint
         extra_load_weights_kwargs: extra kwargs for the read, e.g.
-            ``source_identity`` and the MX kwargs for the target; or None
+            ``source_identity`` and the MX kwargs for the target, or the
+            draft's ``key_prefixes``, outside which no key is copied; or None
         metrics: model loader timing metrics, updated in place
 
     Returns:
@@ -826,6 +906,7 @@ def _load_checkpoint_into_model(
         # the target checkpoint lazily.
         load_weights_kwargs["model"] = model
     load_weights_kwargs.update(extra_load_weights_kwargs or {})
+    key_prefixes = load_weights_kwargs.get("key_prefixes")
 
     # If possible, use rank-striped read-ahead IO policy to faster reading:
     # - Must be HfCheckpointLoader, not its derived class
@@ -842,8 +923,10 @@ def _load_checkpoint_into_model(
         weight_loader = checkpoint_loader.weight_loader
         with weight_loader.open_weight_session(
                 checkpoint_dir, **load_weights_kwargs) as weights:
-            _copy_weights_into_model(model_load_weights, weights, weight_mapper,
-                                     population_metric.value, metrics)
+            _copy_weights_into_model(
+                model_load_weights,
+                model_hooks.select_draft_weights(weights, key_prefixes),
+                weight_mapper, population_metric.value, metrics)
         # The weight loader's session records its own timings.
         io_status = weight_loader.last_checkpoint_io_status
         metrics[preparation_metric.value] = io_status.preparation_seconds
@@ -866,8 +949,10 @@ def _load_checkpoint_into_model(
         # `weights` as empty. It does not yet support draft model.
         if (weights or is_draft_model
                 or not checkpoint_loader.is_weights_preloaded()):
-            _copy_weights_into_model(model_load_weights, weights, weight_mapper,
-                                     population_metric.value, metrics)
+            _copy_weights_into_model(
+                model_load_weights,
+                model_hooks.select_draft_weights(weights, key_prefixes),
+                weight_mapper, population_metric.value, metrics)
         metrics.setdefault(finalization_metric.value, 0.0)
 
     _inspect_shadow_weight_load_plan(checkpoint_loader, checkpoint_dir,
@@ -962,6 +1047,7 @@ def load_model_from_auto_load_format(
     if spec_config is not None and spec_config.needs_separate_draft_weights:
         draft_weight_mapper = checkpoint_loader.get_initialized_draft_weight_mapper(
             model, weight_mapper)
+        draft_load_kwargs = model_hooks.draft_checkpoint_load_kwargs(model)
         startup_metadata[
             "draft_checkpoint_io_policy"] = _load_checkpoint_into_model(
                 checkpoint_loader,
@@ -970,7 +1056,7 @@ def load_model_from_auto_load_format(
                 is_draft_model=True,
                 mapping=mapping,
                 weight_mapper=draft_weight_mapper,
-                extra_load_weights_kwargs=None,
+                extra_load_weights_kwargs=draft_load_kwargs,
                 metrics=metrics)
     return weight_mapper, weights_preloaded
 
@@ -997,11 +1083,104 @@ def captured_cuda_graph_batch_sizes(
                                       config.enable_padding))
 
 
+_RELEASE_CHECKPOINT_PAGE_CACHE_ENV = "TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE"
+_CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS = "checkpoint_page_cache_release_seconds"
+# Smaller files can free too little memory to set off compaction worth
+# waiting for.
+_MIN_ADVISED_BYTES_TO_SETTLE = 1 << 30
+
+
+def _drop_page_cache_of_dirs(checkpoint_dirs: list[str]) -> None:
+    """Drop the page cache of the top-level files in ``checkpoint_dirs``.
+
+    Then waits for the page migration that follows to settle, unless the files
+    total less than 1 GiB. The wait depends on the files' size, not on how
+    much of them was cached: the drop in the host's page cache, which the log
+    reports, also counts what other processes read meanwhile.
+    """
+    try:
+        files = []
+        for checkpoint_dir in checkpoint_dirs:
+            if not os.path.isdir(checkpoint_dir):
+                continue
+            with os.scandir(checkpoint_dir) as entries:
+                files += [entry.path for entry in entries if entry.is_file()]
+    except OSError as error:
+        logger.warning(f"Skipping the checkpoint page-cache release: {error}")
+        return
+    start = time.monotonic()
+    cached_before = page_cache_bytes()
+    advised_bytes = release_file_page_cache(files)
+    cached_after = page_cache_bytes()
+    release_seconds = time.monotonic() - start
+    if advised_bytes >= _MIN_ADVISED_BYTES_TO_SETTLE:
+        settle = (f"page migration settled after "
+                  f"{wait_for_page_migration_to_settle():.1f} s")
+    else:
+        settle = "no wait for page migration"
+    shrank = ("by an unknown amount"
+              if cached_before is None or cached_after is None else
+              f"by {(cached_before - cached_after) / 2**30:.1f} GiB")
+    logger.info(
+        f"Advised DONTNEED on {len(files)} checkpoint files "
+        f"({advised_bytes / 2**30:.1f} GiB) in {release_seconds:.1f} s; "
+        f"the host's page cache shrank {shrank}; {settle}")
+
+
+def _release_checkpoint_page_cache(
+        checkpoint_dirs: list[str]) -> Optional[float]:
+    """Drop the page cache of the checkpoint files this server read on this node.
+
+    Opt-in with ``TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE=1``. The weights are on the
+    GPU at this point. Left cached, the files are dropped later, at a time the
+    process does not choose, and the kernel's compaction of the freed memory then
+    stalls the server's host threads while it serves. Dropping them here, and
+    waiting for the page migration that follows to settle, moves both into
+    startup. A later restart reads the checkpoint from storage again.
+
+    Every rank of this server calls it after loading, with the directories it
+    read files from (top-level files only). Once all of them have finished,
+    rank 0 of each node drops the files of every directory any rank on its node
+    read; the others wait for it. Other servers on the node that read the same
+    files are not coordinated with.
+
+    Returns the seconds this rank spent here, or None if the release is off.
+    """
+    if os.environ.get(_RELEASE_CHECKPOINT_PAGE_CACHE_ENV, "0") != "1":
+        return None
+    if ENABLE_MULTI_DEVICE and mpi_disabled():
+        logger.warning_once(
+            f"{_RELEASE_CHECKPOINT_PAGE_CACHE_ENV}=1 is ignored without MPI, which "
+            "tells when every rank on the node has finished reading.",
+            key=_RELEASE_CHECKPOINT_PAGE_CACHE_ENV)
+        return None
+    start = time.monotonic()
+    checkpoint_dirs = sorted({d for d in checkpoint_dirs if d})
+    node_comm = None
+    is_dropper = True
+    if ENABLE_MULTI_DEVICE:
+        # Returns once every rank on the node has finished reading.
+        node_comm = local_mpi_comm()
+        checkpoint_dirs = sorted(
+            set().union(*node_comm.allgather(checkpoint_dirs)))
+        is_dropper = node_comm.Get_rank() == 0
+    try:
+        if is_dropper and checkpoint_dirs:
+            _drop_page_cache_of_dirs(checkpoint_dirs)
+    finally:
+        if node_comm is not None:
+            node_comm.Barrier()
+    return time.monotonic() - start
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
     This class isolates model loading logic from the main execution engine.
     """
+
+    # Loaders built without __init__ keep the process's torch thread count.
+    _weight_load_num_threads: Optional[int] = None
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -1038,6 +1217,7 @@ class ModelLoader:
         self.lora_config = lora_config
         self.model_weights_memory_tag = model_weights_memory_tag
         self.model_weights_restore_mode = model_weights_restore_mode
+        self._weight_load_num_threads = _weight_load_num_threads()
         self.weight_mapper = None
         self._weight_pool_proxy = None
         self._gms_backend = None
@@ -1061,12 +1241,32 @@ class ModelLoader:
             checkpoint_dir: str, llm_args: TorchLlmArgs,
             checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
         """Load model config and apply model-specific defaults to llm_args."""
+        return ModelLoader.load_config_with_defaults(checkpoint_dir, llm_args,
+                                                     checkpoint_loader)[0]
+
+    @staticmethod
+    def load_config_with_defaults(
+        checkpoint_dir: str, llm_args: TorchLlmArgs,
+        checkpoint_loader: BaseCheckpointLoader
+    ) -> tuple[TorchLlmArgs, Optional[ModelConfig]]:
+        """Load the model config and apply its model-specific defaults to llm_args.
+
+        The config has ``model_kwargs`` applied, as model loading applies them.
+
+        Args:
+            checkpoint_dir: The checkpoint to read the config from.
+            llm_args: The arguments the defaults are applied to, in place.
+            checkpoint_loader: The loader that reads the config.
+
+        Returns:
+            ``llm_args``, and the loaded config, which is None without a checkpoint loader.
+        """
         if checkpoint_loader is None:
             # No config to resolve a model class from; still resolve the
             # "auto" sentinel so it never leaks past config loading.
             _resolve_transceiver_runtime_auto(llm_args)
             _resolve_kv_cache_manager_v2_auto(llm_args)
-            return llm_args
+            return llm_args, None
 
         config_kwargs = {
             'trust_remote_code': llm_args.trust_remote_code,
@@ -1164,7 +1364,7 @@ class ModelLoader:
                 model_cls.__name__
                 if model_cls is not None else "unknown model")
 
-        return llm_args
+        return llm_args, config
 
     @staticmethod
     def _needs_source_identity(checkpoint_loader: BaseCheckpointLoader,
@@ -1241,16 +1441,27 @@ class ModelLoader:
         """
         # Reset before the total timer starts: the timer writes into this dict.
         self._metrics = {}
+        # Directories _timed_load read checkpoint files from.
+        self._checkpoint_dirs_read: list[str] = []
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
                 self._metrics):
             model, moe_load_balancer = self._timed_load(checkpoint_dir,
                                                         checkpoint_loader)
 
+        release_seconds = _release_checkpoint_page_cache(
+            self._checkpoint_dirs_read)
+        if release_seconds is not None:
+            self._metrics[
+                _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
+
         metrics = ", ".join(f"{name}={value:.4f}"
                             for name, value in self._metrics.items())
         logger.info(
             f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+        # Attribute the parameters the model ended up with, whichever load
+        # path produced them. Only a weak reference; read when reporting.
+        monitor_claims.claim_module_memory(model, monitor_names.WEIGHTS)
         return model, moe_load_balancer
 
     def _timed_load(
@@ -1329,20 +1540,28 @@ class ModelLoader:
             )
 
         weights_preloaded = False
+        weights_checkpoint_dir = getattr(model, "llm_checkpoint_dir",
+                                         checkpoint_dir)
         if load_format == LoadFormat.AUTO:
             # read the checkpoint with the checkpoint loader, built-in or custom
-            self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
-                checkpoint_loader,
-                checkpoint_dir,
-                model_config=model_config,
-                model=model,
-                mapping=self.mapping,
-                llm_args=self.llm_args,
-                spec_config=self.spec_config,
-                source_identity=source_identity,
-                qualification=post_transform_qualification,
-                metrics=self._metrics,
-                startup_metadata=self._startup_metadata)
+            with _weight_load_threads(self._weight_load_num_threads):
+                self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
+                    checkpoint_loader,
+                    checkpoint_dir,
+                    model_config=model_config,
+                    model=model,
+                    mapping=self.mapping,
+                    llm_args=self.llm_args,
+                    spec_config=self.spec_config,
+                    source_identity=source_identity,
+                    qualification=post_transform_qualification,
+                    metrics=self._metrics,
+                    startup_metadata=self._startup_metadata)
+            if not weights_preloaded:
+                self._checkpoint_dirs_read.append(weights_checkpoint_dir)
+            if loads_draft_weights:
+                self._checkpoint_dirs_read.append(
+                    self.spec_config.speculative_model)
 
         elif load_format == LoadFormat.GMS:
             gms_result = gms_loading.load_gms_weights(
@@ -1365,6 +1584,15 @@ class ModelLoader:
             weights_preloaded = gms_result.weights_preloaded
             if gms_result.weight_mapper is not None:
                 self.weight_mapper = gms_result.weight_mapper
+            # A writer reads the checkpoint unless its loader preloaded the
+            # weights, and reads a separate draft; a reader reads neither.
+            gms_writer = (gms_result.weight_mapper is not None
+                          or gms_result.weights_preloaded)
+            if gms_result.weight_mapper is not None:
+                self._checkpoint_dirs_read.append(weights_checkpoint_dir)
+            if gms_writer and loads_draft_weights:
+                self._checkpoint_dirs_read.append(
+                    self.spec_config.speculative_model)
 
         elif load_format == LoadFormat.DUMMY:
             self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
@@ -1491,11 +1719,12 @@ class ModelLoader:
         _check_compile_wrapper_before_reload(model)
         if not allow_partial_loading:
             model_hooks.reset_weights_transformed(model)
-        model_hooks.call_load_weights(
-            model.load_weights,
-            weights,
-            self.weight_mapper,
-            allow_partial_loading=allow_partial_loading)
+        with _weight_load_threads(self._weight_load_num_threads):
+            model_hooks.call_load_weights(
+                model.load_weights,
+                weights,
+                self.weight_mapper,
+                allow_partial_loading=allow_partial_loading)
         if torch.cuda.is_available():  # CPU guard
             torch.cuda.current_stream().synchronize()
 
@@ -1587,6 +1816,7 @@ class ModelLoader:
             replicate_embedding=self.llm_args.replicate_embedding,
             cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
                 self.llm_args, self.max_num_tokens, self.spec_config),
+            max_batch_size=self.llm_args.max_batch_size,
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,

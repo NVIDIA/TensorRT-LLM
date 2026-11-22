@@ -35,7 +35,16 @@ def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     Args:
         t: The tensor to convert
     """
-    assert t.dim() <= 2, "t.dim() should be less than or equal to 2"
+    if t.dim() > 2:
+        # MoeWeight is a 2D (height, width, pitch) cudaMemcpy2D descriptor, so a
+        # higher-rank weight -- e.g. a TRTLLM-Gen BlockMajorK expert weight,
+        # [K / blockK, Mn, blockK] -- is described by its leading dims collapsed,
+        # which covers the same bytes. Contiguity makes that flatten a view; a
+        # copy would leave weight_ptr dangling once this function returns.
+        assert t.is_contiguous(), (
+            f"a {t.dim()}D weight must be contiguous to be described by a "
+            f"single pitch, shape={tuple(t.shape)}, strides={t.stride()}")
+        t = t.flatten(0, -2)
     shape = [1, 1]
     pitch = 1
     elt_size = torch.tensor([], dtype=t.dtype).element_size()
@@ -131,8 +140,6 @@ class HostMoeTensorSharer:
             expert_id: The ID of the expert
             name: The name of the weight
         """
-        assert len(tensor_shape
-                   ) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert 0 <= expert_id < self.expert_count
         assert expert_id < self.expert_start or expert_id >= self.expert_end
         if name not in self.name_info:
@@ -154,8 +161,6 @@ class HostMoeTensorSharer:
             name: The name of the weight
             t: The weight tensor
         """
-        assert len(
-            t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert t.is_contiguous() == True, "t.is_contiguous() must be True"
         assert (expert_id, name) not in self.shared_tensors.keys()
         assert self.expert_start <= expert_id < self.expert_end
@@ -285,7 +290,10 @@ class HostMoeTensorSharer:
 
     def pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ load balancer has shut down, so no weight update
+        still reads them, and before the barrier that lets the owner unlink them.
         """
         for shm in self.imported_shms:
             shm.close()
@@ -757,7 +765,9 @@ class SingleLayerMoeLoadBalancer:
 
     def py_pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ shutdown and before the barrier.
         """
         if self.updates_enabled:
             self.host_tensor_sharer.pre_shutdown_cleanup()
@@ -1076,9 +1086,11 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         local_safe = bool(local_safe and not self.in_iter)
         if not all(self.shared_mpi_comm.allgather(local_safe)):
             return False
+        # Stop the C++ weight-update threads first. They read the host weights
+        # that the cleanup below closes.
+        self.load_balancer_impl.shutdown()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
-        self.load_balancer_impl.shutdown()
         # use this sync to make sure all the shm resources can be cleaned up
         self.shared_mpi_comm.barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:

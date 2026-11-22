@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""K3-owned fused-verify cache payload and replay state."""
+"""Kimi K3 cache manager: KDA fused-verify replay state, FP4 MLA layout and drafter layers."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import math
 import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -18,6 +18,10 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
@@ -32,11 +36,19 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttnLifeCycle,
+    BufferConfig,
+    DataRole,
+    KVCacheManagerConfig,
+    SsmLayerConfig,
+)
 
 from .replay_region import REPLAY_STATE_REGION, KDAReplayRegion, ReplayLayout
 
@@ -1012,11 +1024,66 @@ def get_kda_replay_num_spec(
     return kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
 
 
+def _uses_fp4_mla_cache_layout(
+    dtype: DataType, kv_cache_type: CacheTypeCpp, pretrained_config: object
+) -> bool:
+    """Whether a hybrid V2 manager stores its MLA latent cache as FP4 MLA."""
+    return (
+        dtype == DataType.NVFP4
+        and kv_cache_type == CacheTypeCpp.SELFKONLY
+        and getattr(pretrained_config, "kv_lora_rank", None) is not None
+        and getattr(pretrained_config, "qk_rope_head_dim", None) is not None
+    )
+
+
+def _insert_draft_pool_ratio(
+    target_ratio: Sequence[float],
+    life_cycle_block_bytes: Sequence[int],
+    full_history: Sequence[bool],
+    draft_life_cycle: int,
+) -> list[float]:
+    """Pool ratio per lifecycle with the drafter's share inserted.
+
+    ``target_ratio`` lists the other lifecycles' shares in registration order.
+    The drafter keeps one context entry per target token, so its share is
+    solved for as many blocks as the scarcest full-history target lifecycle
+    holds: ``d / B_draft == (1 - d) * min_i(r_i / B_i)``. The target shares
+    keep their split of ``1 - d``.
+    """
+    target_ids = [i for i in range(len(life_cycle_block_bytes)) if i != draft_life_cycle]
+    if len(target_ratio) != len(target_ids):
+        raise ValueError(
+            f"pool_ratio has {len(target_ratio)} entries for {len(target_ids)} target layer groups"
+        )
+    blocks_per_byte = [
+        ratio / life_cycle_block_bytes[i]
+        for ratio, i in zip(target_ratio, target_ids)
+        if full_history[i]
+    ]
+    if not blocks_per_byte:
+        raise ValueError("the drafter's pool share needs a full-history target layer group")
+    draft_blocks = life_cycle_block_bytes[draft_life_cycle] * min(blocks_per_byte)
+    draft_share = draft_blocks / (1 + draft_blocks)
+    ratio = [share * (1 - draft_share) for share in target_ratio]
+    ratio.insert(draft_life_cycle, draft_share)
+    return ratio
+
+
 class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
-    """KDA/MLA cache layout and K3-only replay lifecycle handling."""
+    """KDA/MLA cache layout and K3-only replay lifecycle handling.
+
+    With an NVFP4 KV cache the MLA latent cache takes the FP4 MLA V2 layout
+    (``Fp4MlaV2CacheLayoutPolicy``), and a standalone drafter (DSpark) can
+    keep its context KV layers in this manager after the target layers.
+    """
 
     kda_context_only = False
     _kda_replay_region: KDAReplayRegion | None = None
+    # Draft-owned attention layers kept after the target layers (layer_specs).
+    _draft_layer_specs: tuple[KVCacheLayerSpec, ...] = ()
+    # Set per instance by the FP4 MLA layout on a disaggregated context
+    # worker, which keeps no generation-only V scales or packed V.
+    fp4_mla_context_only_cache = False
 
     @classmethod
     @override
@@ -1031,10 +1098,24 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         kda_replay_num_spec: int | None = None,
         kda_draft_records: bool = False,
         use_replay_state_update: bool = False,
+        layer_specs: Sequence[KVCacheLayerSpec] | None = None,
         **kwargs,
     ) -> None:
+        """See the class docstring.
+
+        Args:
+            kda_replay_num_spec: Draft tokens per KDA fused-verify replay step;
+                taken from the speculative configuration when ``None``.
+            kda_draft_records: Whether the replay state keeps the drafts'
+                records in the recurrent-state slots.
+            use_replay_state_update: Mamba2 replay; rejected for KDA.
+            layer_specs: Draft-owned attention layers a standalone drafter
+                keeps in this manager, appended after the target layers that
+                the mask arguments describe (see ``_append_draft_layers``).
+        """
         if use_replay_state_update:
             raise ValueError("KDA replay and Mamba2 replay are mutually exclusive")
+        self._draft_layer_specs = tuple(layer_specs or ())
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
@@ -1043,6 +1124,192 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _append_draft_layers(
+        draft_layer_specs: Sequence[KVCacheLayerSpec],
+        mamba_layer_mask: list[bool],
+        layer_mask: list[bool] | None,
+        num_kv_heads: int | list[int | None],
+        *,
+        k_only: bool,
+    ) -> tuple[list[bool], list[bool] | None, int | list[int | None]]:
+        """Masks and KV heads with a standalone drafter's layers appended.
+
+        The masks describe this manager's recurrent and target attention
+        layers; the drafter's layers follow them in global layer id order and
+        keep the storage of their specs.
+        """
+        if not draft_layer_specs:
+            return mamba_layer_mask, layer_mask, num_kv_heads
+        num_target_layers = len(mamba_layer_mask)
+        expected_ids = list(range(num_target_layers, num_target_layers + len(draft_layer_specs)))
+        if [layer.global_layer_id for layer in draft_layer_specs] != expected_ids:
+            raise ValueError(
+                "KimiK3HybridCacheManager layer_specs must be the drafter's layers "
+                f"{expected_ids} after the target layers"
+            )
+        for layer in draft_layer_specs:
+            if layer.owner is not KVCacheLayerOwner.DRAFT:
+                raise ValueError(
+                    "KimiK3HybridCacheManager describes its target layers itself; "
+                    f"layer_specs may add only draft-owned layers (layer {layer.global_layer_id})"
+                )
+            if layer.kv_factor != (1 if k_only else 2):
+                raise ValueError(
+                    f"draft layer {layer.global_layer_id} has kv_factor {layer.kv_factor}, "
+                    "unlike the target cache type"
+                )
+        if layer_mask is None:
+            layer_mask = [False] * num_target_layers
+        if isinstance(num_kv_heads, int):
+            num_kv_heads = [num_kv_heads] * num_target_layers
+        num_draft = len(draft_layer_specs)
+        return (
+            list(mamba_layer_mask) + [False] * num_draft,
+            list(layer_mask) + [True] * num_draft,
+            # Placeholders: the base manager takes the rank-local heads from the specs.
+            list(num_kv_heads) + [layer.num_kv_heads for layer in draft_layer_specs],
+        )
+
+    @override
+    def _append_layers(
+        self,
+        mamba_layer_mask: list[bool],
+        layer_mask: list[bool] | None,
+        num_kv_heads: int | list[int | None],
+        *,
+        k_only: bool,
+    ) -> tuple[list[bool], list[bool] | None, int | list[int | None]]:
+        return self._append_draft_layers(
+            self._draft_layer_specs, mamba_layer_mask, layer_mask, num_kv_heads, k_only=k_only
+        )
+
+    @override
+    def _bind_appended_layers(self) -> None:
+        local_ids = {layer_idx: offset for offset, layer_idx in enumerate(self.pp_layers)}
+        self._appended_draft_layer_specs = {
+            local_ids[layer.global_layer_id]: layer
+            for layer in self._draft_layer_specs
+            if layer.global_layer_id in local_ids
+        }
+
+    @override
+    def _configure_attention_cache_layout(
+        self,
+        kv_cache_config: KvCacheConfig,
+        kv_cache_type: CacheTypeCpp,
+        *,
+        dtype: DataType,
+        tokens_per_block: int,
+        head_dim: int,
+        spec_config: object | None,
+        mapping: Mapping,
+        **kwargs,
+    ) -> KvCacheConfig:
+        pretrained_config = kwargs.get("pretrained_config")
+        if not _uses_fp4_mla_cache_layout(dtype, kv_cache_type, pretrained_config):
+            return kv_cache_config
+        # NVFP4 MLA latent cache: compose the FP4 MLA V2 layout (K, K scales,
+        # V scales, BF16 HP ring) with the recurrent-state lifecycle. The base
+        # manager forwards attention-layout operations to the policy; SSM
+        # operations stay on this manager.
+        from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+            Fp4MlaV2CacheLayoutPolicy,
+        )
+
+        return Fp4MlaV2CacheLayoutPolicy.configure_manager(
+            self,
+            kv_cache_config,
+            kv_cache_type,
+            dtype=dtype,
+            tokens_per_block=tokens_per_block,
+            head_dim=head_dim,
+            pretrained_config=pretrained_config,
+            spec_config=spec_config,
+            is_disagg=kwargs.get("is_disagg", False),
+            mapping=mapping,
+        )
+
+    @classmethod
+    @override
+    def get_cache_size_per_token(cls, model_config, mapping: Mapping, **kwargs):
+        # Appended draft layers grow with every token like the target's pages.
+        draft_layer_specs = kwargs.pop("layer_specs", None) or ()
+        kwargs.pop("shared_draft_block_width", None)
+        draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
+        # Every request also reserves room for the drafter's next block in the
+        # target's attention layers and in the draft layers: max_draft_len + 1
+        # tokens, enough for either DSpark slot convention.
+        spec_config = kwargs.get("spec_config")
+        draft_scratch_tokens = (
+            spec_config.max_draft_len + 1 if draft_layer_specs and spec_config is not None else 0
+        )
+        slope, intercept = super().get_cache_size_per_token(
+            model_config, mapping, draft_scratch_tokens=draft_scratch_tokens, **kwargs
+        )
+        intercept += kwargs["max_batch_size"] * draft_scratch_tokens * draft_slope
+        return slope + draft_slope, intercept
+
+    @classmethod
+    @override
+    def _estimate_attention_cache_cost(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        tokens_per_block: int,
+        **kwargs,
+    ) -> tuple[int | None, int, int]:
+        # Estimator callers may pass a bare config stand-in; only an FP4 MLA
+        # model (which always carries a pretrained_config) takes this branch.
+        config = getattr(model_config, "pretrained_config", None)
+        quant_config = getattr(model_config, "quant_config", None)
+        if not (
+            getattr(config, "kv_lora_rank", None) is not None
+            and getattr(config, "qk_rope_head_dim", None) is not None
+            and quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+        ):
+            return super()._estimate_attention_cache_cost(
+                model_config,
+                mapping,
+                max_batch_size=max_batch_size,
+                tokens_per_block=tokens_per_block,
+                **kwargs,
+            )
+        # FP4 MLA pages carry K scales and V scales, and every resident
+        # sequence pins one BF16 HP ring page per FP4 MLA layer.
+        from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+            Fp4MlaKVCacheManagerV2,
+        )
+
+        spec_config = kwargs.get("spec_config")
+        gen_preemption_headroom = int(kwargs.get("gen_preemption_headroom", 0))
+        _, _, local_attention_layers = _get_local_mamba_cache_layout(
+            model_config,
+            mapping,
+            spec_config=spec_config,
+            is_draft=kwargs.get("is_draft", False),
+            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+        )
+        attention_slope, attention_intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
+            model_config,
+            mapping,
+            num_layers=local_attention_layers,
+            tokens_per_block=tokens_per_block,
+            max_batch_size=max_batch_size,
+            spec_config=spec_config,
+            is_disagg=kwargs.get("is_disagg", False),
+            gen_preemption_headroom=gen_preemption_headroom,
+        )
+        attention_page_bytes = 0
+        # GEN slot preemption pauses residents in place, so the headroom keeps HP rings too.
+        max_resident_sequences = max_batch_size * mapping.pp_size + gen_preemption_headroom
+        if max_resident_sequences > 0:
+            attention_page_bytes = attention_intercept // max_resident_sequences
+        return attention_slope, attention_intercept, attention_page_bytes
 
     @override
     def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState | None:
@@ -1085,11 +1352,6 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay.pool_layout(self._state_layout)
 
     @override
-    def _managed_replay_state(self) -> None:
-        """``KDAReplayRegion`` declares, binds and indexes the KDA replay state."""
-        return None
-
-    @override
     def _region_providers(self) -> Sequence[RegionProvider]:
         providers = super()._region_providers()
         if self._kda_replay is None or not self.mamba_pp_layers:
@@ -1109,6 +1371,17 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if self._kda_replay_region is not None:
             buffers += self._kda_replay_region.shared_buffers(global_layer_id)
         return buffers
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """The KDA replay caches are generation-local and never move."""
+        spec = super().page_table_spec()
+        if self._kda_replay_region is None:
+            return spec
+        return replace(
+            spec,
+            untransferred_roles=spec.untransferred_roles | self._kda_replay_region.roles,
+        )
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
@@ -1131,13 +1404,11 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         super()._setup_model_state()
 
     @property
-    @override
     def replay_layer_group_id(self) -> int | None:
         region = self._kda_replay_region
         return region.group_id if region is not None else None
 
     @property
-    @override
     def cuda_replay_state_indices(self) -> torch.Tensor:
         region = self._kda_replay_region
         return (
@@ -1146,7 +1417,6 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             else self.cuda_state_indices
         )
 
-    @override
     def get_replay_state_indices(
         self, request_ids: list[int] | None = None
     ) -> torch.Tensor | list[int]:
@@ -1192,7 +1462,61 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                 "and a rebalance can resize the pools past them: set "
                 "kv_cache_config.enable_kv_pool_rebalance=False."
             )
-        return super()._build_cache_config(config)
+        return self._with_draft_pool_ratio(super()._build_cache_config(config))
+
+    def _with_draft_pool_ratio(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
+        """Give appended draft layers of their own lifecycle a pool share.
+
+        A configured ``pool_ratio`` lists the target's lifecycles; the draft
+        lifecycle's share is inserted for token parity (see
+        ``_insert_draft_pool_ratio``). Native lifecycles are registered in
+        layer and buffer order.
+        """
+        ratio = config.initial_pool_ratio
+        if ratio is None or not self._appended_draft_layer_specs:
+            return config
+        keys: list[tuple] = []
+        block_bytes: list[int] = []
+        draft_keys = set()
+        target_keys = set()
+        for layer in config.layers:
+            # Empty buffers are dropped before the native manager sees them.
+            for buffer in (buffer for buffer in layer.buffers if buffer.size):
+                policy = (
+                    buffer.reuse_policy if buffer.reuse_policy is not None else layer.reuse_policy
+                )
+                if isinstance(layer, SsmLayerConfig):
+                    key = ("ssm", policy)
+                else:
+                    life_cycle = AttnLifeCycle.make(
+                        layer.sliding_window_size,
+                        layer.num_sink_tokens,
+                        config.tokens_per_block,
+                        policy,
+                    )
+                    key = (life_cycle.window_size, life_cycle.num_sink_blocks, policy)
+                if key not in keys:
+                    keys.append(key)
+                    block_bytes.append(0)
+                block_bytes[keys.index(key)] += buffer.size
+                is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
+                (draft_keys if is_draft else target_keys).add(key)
+        if len(ratio) == len(keys):
+            return config
+        if len(draft_keys) != 1 or draft_keys & target_keys or len(ratio) != len(keys) - 1:
+            raise ValueError(
+                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
+                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)})"
+            )
+        full_history = [
+            key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
+        ]
+        return replace(
+            config,
+            initial_pool_ratio=_insert_draft_pool_ratio(
+                ratio, block_bytes, full_history, keys.index(draft_keys.pop())
+            ),
+        )
 
     @override
     def suspend_request(self, request) -> None:

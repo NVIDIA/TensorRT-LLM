@@ -23,6 +23,31 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "preserve", [False, True], ids=["weight_exclusion_only", "local_kv_policy"]
+)
+def test_exclusion_preserves_only_explicit_module_kv_policy(preserve: bool) -> None:
+    attention = nn.Module()
+    attention.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    attention._preserve_kv_cache_quant_algo = preserve
+    attention._skip_layerwise_quant_config = not preserve
+    config = SimpleNamespace(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            kv_cache_quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=["*self_attn*"],
+        )
+    )
+    modeling_utils.apply_quant_config_exclude_modules(
+        config, iter([("draft_model.layers.0.self_attn", attention)])
+    )
+    assert attention.quant_config.quant_algo is None
+    assert attention.quant_config.kv_cache_quant_algo == (
+        QuantAlgo.FP8 if preserve else QuantAlgo.NVFP4
+    )
+
+
 def test_timing_metric_accumulates_and_records_failures(monkeypatch) -> None:
     perf_counter_values = iter([1.0, 1.25, 2.0, 2.5])
     monkeypatch.setattr(modeling_utils.time, "perf_counter", lambda: next(perf_counter_values))

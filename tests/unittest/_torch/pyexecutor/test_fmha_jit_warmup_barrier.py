@@ -71,6 +71,7 @@ class _Recorder:
 class _GraphRunnerStub:
     def __init__(self) -> None:
         self.is_warmup_only = False
+        self.enabled = False
         self.padding_dummy_requests: dict[str, object] = {"stale": object()}
 
     @contextlib.contextmanager
@@ -91,6 +92,11 @@ class _RecordingGraphs(DecoderCudaGraphs):
         self.cuda_graph_runner = _GraphRunnerStub()
         self._recorder = recorder
         self.mapping = mapping
+        # Short-circuit the in-forward split prewarm (new from main): the stub
+        # has no KV-cache manager, sparse config or warm flag, so setting the
+        # flag here makes _warm_inforward_split return immediately.
+        self._inforward_split_warmed = True
+        self.sparse_attention_config = None
 
     def run_cuda_graph_warmup(self, resource_manager: object) -> None:
         self._recorder.events.append(
@@ -120,6 +126,9 @@ def _engine(
     engine.model = SimpleNamespace(modules=lambda: iter(()))
     engine._config = SimpleNamespace(
         max_beam_width=1,
+        max_batch_size=1,
+        max_num_tokens=1,
+        max_seq_len=1,
         attention_backend=SimpleNamespace(
             Metadata=TrtllmAttentionMetadata if trtllm_attention else AttentionMetadata
         ),
@@ -142,6 +151,8 @@ def _engine(
     engine._prewarm_minimax_m3_msa_indexer = mock.Mock()
     engine._prewarm_throwaway_topk = mock.Mock()
     engine._prewarm_model_decode_kernels = mock.Mock()
+    engine._prewarm_lowm_mma_row_buckets = mock.Mock()
+    engine._prims_ts_dense_mla_warmup = SimpleNamespace(run=mock.Mock())
     engine._warmup_dg_paged_mqa_logits_metadata = mock.Mock()
     engine._warmup_cute_dsl_radix_topk = mock.Mock()
     engine._ensure_dsa_attn_metadata_for_warmup = mock.Mock()

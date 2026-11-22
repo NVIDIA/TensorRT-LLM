@@ -11,8 +11,9 @@ TF32 product of ``mhc_fused_hc``. Up to one wave of tokens, a 16-CTA cluster own
 its CTAs push their partial mixes and sums of squares to the CTA that owns the token through
 distributed shared memory (``MhcBoundaryKernel``). Larger batches stream token groups through
 persistent CTAs that keep their weight slice in shared memory and write the partials to global
-memory for a second kernel (``MhcStreamKernel``, ``MhcFinalizeKernel``). Every reduction runs in a
-fixed order, so results are deterministic.
+memory for a second kernel (``MhcStreamKernel``, ``MhcFinalizeKernel``). A split boundary computes its
+coefficients alone from the updated residual (``MhcCoefficientKernel``), off the critical path. Every
+reduction runs in a fixed order, so results are deterministic.
 """
 
 import functools
@@ -158,6 +159,48 @@ def ldg_v4_u32_ordered(addr, *, loc=None, ip=None):
         ip=ip,
     )
     return _fields(out, 4, T.i32(), Uint32, loc, ip)
+
+
+@dsl_user_op
+def l2_policy(priority, *, loc=None, ip=None):
+    """An L2 cache policy (``createpolicy``) of eviction ``priority`` for the accesses it tags."""
+    return Int64(
+        _asm(
+            T.i64(),
+            [],
+            f"createpolicy.fractional.L2::{priority}.b64 $0, 1.0;",
+            "=l",
+            side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ldg_v4_u32_l2(addr, policy, *, loc=None, ip=None):
+    """``ldg_v4_u32_ordered`` tagged with an ``l2_policy``."""
+    out = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [Int64(addr), Int64(policy)],
+        "ld.global.nc.L2::cache_hint.v4.u32 {$0, $1, $2, $3}, [$4], $5;",
+        "=r,=r,=r,=r,l,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _fields(out, 4, T.i32(), Uint32, loc, ip)
+
+
+@dsl_user_op
+def stg_v4_u32_l2(addr, w, policy, *, loc=None, ip=None):
+    _asm(
+        None,
+        [Int64(addr)] + [Uint32(v) for v in w] + [Int64(policy)],
+        "st.global.L2::cache_hint.v4.u32 [$0], {$1, $2, $3, $4}, $5;",
+        "l,r,r,r,r,l",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -493,6 +536,54 @@ def fp8_1x128_block(amax, vals, *, loc=None, ip=None):
 @dsl_user_op
 def stg_u32(addr, w, *, loc=None, ip=None):
     _asm(None, [Int64(addr), Uint32(w)], "st.global.u32 [$0], $1;", "l,r", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_cg_v4_f32(addr, *, loc=None, ip=None):
+    """Four floats from L2, not from this SM's L1: data other CTAs of the running kernel wrote."""
+    out = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int64(addr)],
+        "ld.global.cg.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _fields(out, 4, T.f32(), Float32, loc, ip)
+
+
+@dsl_user_op
+def fence_gpu(*, loc=None, ip=None):
+    _asm(None, [], "fence.acq_rel.gpu;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def atom_add_acq_rel(addr, value, *, loc=None, ip=None):
+    """``atomicAdd`` with acquire-release semantics at GPU scope; returns the old value."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int64(addr), Int32(value)],
+            "atom.add.acq_rel.gpu.global.s32 $0, [$1], $2;",
+            "=r,l,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def shfl_idx_i32(value, src, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int32(value), Int32(src)],
+            "shfl.sync.idx.b32 $0, $1, $2, 0x1f, 0xffffffff;",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def sigmoid(v):
@@ -1403,6 +1494,617 @@ class MhcSinkhornKernel(MhcBoundaryKernel):
                 stg_v4_u32(row + i * 16, [f32_bits(v) for v in out[4 * i : 4 * i + 4]])
 
 
+# Residual chunks each ``MhcCoefficientKernel`` warp keeps in flight; it divides a slice's chunks.
+COEFFICIENT_LOAD_DEPTH = 5
+
+
+class MhcCoefficientKernel(MhcBoundaryKernel):
+    """A boundary's ``pre`` / ``post`` / ``comb`` from its residual in one launch, off the critical path.
+
+    ``ctas`` persistent CTAs per hidden slice compute the mixes and the sum of squares of each token
+    group (8 tokens) and slice as ``MhcStreamKernel`` does without a post update, bit for bit, and
+    store them to ``partials``; each warp keeps ``COEFFICIENT_LOAD_DEPTH`` chunks of loads in
+    flight. The warp that stores the last of a group's 16 slice partials (a per-group arrival
+    counter, reset by that warp) sums them in slice order and runs the coefficients of the group's 8
+    tokens with the Sinkhorn iterations, value for value as ``MhcFinalizeKernel`` does. Few CTAs per
+    slice leave the other SMs to the sublayer this kernel overlaps.
+    """
+
+    def __init__(self, hidden: int, sinkhorn_iters: int):
+        super().__init__(hidden, False, sinkhorn_iters)
+        self.stream = MhcStreamKernel(hidden, False, 1)
+        self.w_bytes = self.stream.w_bytes
+        assert self.stream.chunks % COEFFICIENT_LOAD_DEPTH == 0
+
+    @cute.jit
+    def __call__(
+        self,
+        residual,
+        weight,
+        scale,
+        base,
+        partials,
+        counters,
+        pre_out,
+        post_out,
+        comb_out,
+        rms_eps: Float32,
+        hc_eps: Float32,
+        sinkhorn_eps: Float32,
+        post_mult: Float32,
+        ctas: Int32,
+        stream,
+    ):
+        self.kernel(
+            residual,
+            weight,
+            scale,
+            base,
+            partials,
+            counters,
+            pre_out,
+            post_out,
+            comb_out,
+            rms_eps,
+            hc_eps,
+            sinkhorn_eps,
+            post_mult,
+            ctas,
+        ).launch(
+            grid=[CLUSTER * ctas, 1, 1],
+            block=[STREAM_WARPS * 32, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        residual,
+        weight,
+        scale,
+        base,
+        partials,
+        counters,
+        pre_out,
+        post_out,
+        comb_out,
+        rms_eps: Float32,
+        hc_eps: Float32,
+        sinkhorn_eps: Float32,
+        post_mult: Float32,
+        ctas: Int32,
+    ):
+        tid = cute.arch.thread_idx()[0]
+        bid = cute.arch.block_idx()[0]
+        r = bid % CLUSTER
+        p = bid // CLUSTER
+        M = residual.shape[0]
+        groups = ((M + 7) // 8 - p + ctas - 1) // ctas
+
+        smem = SmemAllocator()
+        s_w = smem.allocate(self.w_bytes + 8 + 32 * 4 + STREAM_WARPS * 8 * (PART + 16) * 4, 128)
+        s_w = s_w.toint()
+        bar_w = s_w + self.w_bytes
+        s_hcw = bar_w + 8
+        s_scratch = s_hcw + 32 * 4
+        if tid == 0:
+            mbar_init(bar_w, 1)
+            mbar_fence_init()
+            mbar_expect_tx(bar_w, self.w_bytes)
+        elif (tid >= 32) & (tid < 32 + 3 + MIXES):
+            i = tid - 32
+            if i < 3:
+                sts_f32(s_hcw + i * 4, ldg_f32(scale.iterator.toint() + i * 4))
+            else:
+                sts_f32(s_hcw + i * 4, ldg_f32(base.iterator.toint() + (i - 3) * 4))
+        cute.arch.sync_threads()
+        copies = 10
+        jw = tid - (STREAM_WARPS * 32 - copies)
+        if jw >= 0:
+            size = self.w_bytes // copies
+            bulk_g2s(
+                s_w + jw * size,
+                weight.iterator.toint() + Int64(r) * self.w_bytes + jw * size,
+                size,
+                bar_w,
+            )
+
+        warp = tid // 32
+        lane = tid % 32
+        n = lane // 4
+        q = lane % 4
+        CH = self.stream.chunks
+        D = COEFFICIENT_LOAD_DEPTH
+        s_tot = s_scratch + warp * 8 * (PART + 16) * 4
+        s_rows = s_tot + 8 * PART * 4
+        waited = Int32(0)
+        # The residual keeps the L2 priority its writer (the critical half) gave it.
+        keep = l2_policy("evict_unchanged")
+        # Chunk c of a group sits in ring slot c % D; the loads run D chunks ahead, into the next
+        # group across the end of one (CH % D == 0 keeps the slots aligned from group to group).
+        first = p + cutlass.max(cutlass.min(warp, groups - 1), Int32(0)) * ctas
+        ring = [self.load_chunk(residual, first, c, r, n, q, M, keep) for c in range(D)]
+        for u in cutlass.range(warp, groups, STREAM_WARPS, unroll=1):
+            grp = p + u * ctas
+            nxt_grp = p + cutlass.min(u + STREAM_WARPS, groups - 1) * ctas
+            t = grp * 8 + n
+            acc = [[Float32(0.0)] * 4 for _ in range(3)]
+            ssq_rc = (Float32(0.0), Float32(0.0))
+            for c in cutlass.range_constexpr(CH):
+                cur = ring[c % D]
+                if cutlass.const_expr(c + D < CH):
+                    ring[c % D] = self.load_chunk(residual, grp, c + D, r, n, q, M, keep)
+                else:
+                    ring[c % D] = self.load_chunk(residual, nxt_grp, c + D - CH, r, n, q, M, keep)
+                # lagged_collapse's order of the sum of squares
+                for w in cutlass.range_constexpr(4):
+                    for j in cutlass.range_constexpr(MULT):
+                        v = (bf16x2_lo(cur[j][w]), bf16x2_hi(cur[j][w]))
+                        ssq_rc = cute.arch.fma_packed_f32x2(v, v, ssq_rc)
+                if cutlass.const_expr(c == 0):
+                    if waited == 0:
+                        mbar_wait(bar_w, 0)
+                        waited = Int32(1)
+                frag = s_w + (c * 8 * 32 + lane) * 48
+                for kb in cutlass.range_constexpr(8):
+                    a = [lds_v4_u32(frag + kb * 32 * 48 + 16 * mt) for mt in range(3)]
+                    b = (cur[kb // 2][2 * (kb % 2)], cur[kb // 2][2 * (kb % 2) + 1])
+                    for mt in cutlass.range_constexpr(3):
+                        acc[mt] = list(mma_bf16(a[mt], b, acc[mt]))
+            src = ssq_rc[0] + ssq_rc[1]
+            for m in cutlass.range_constexpr(2):
+                src = src + shfl_xor_f32(src, 1 << m)
+            g = lane // 4
+            for e in cutlass.range_constexpr(2):
+                tok = grp * 8 + 2 * q + e
+                if tok < M:
+                    dst = partials.iterator.toint() + (Int64(tok) * CLUSTER + r) * PART * 4
+                    for mi in cutlass.range_constexpr(3):
+                        hi_t, hi_r = ((0, 0), (0, 2), (1, 0))[mi]
+                        lo_t, lo_r = ((1, 2), (2, 0), (2, 2))[mi]
+                        stg_f32(dst + (mi * 8 + g) * 4, acc[hi_t][hi_r + e] + acc[lo_t][lo_r + e])
+            if (q == 0) & (t < M):
+                dst = partials.iterator.toint() + (Int64(t) * CLUSTER + r) * PART * 4
+                stg_f32(dst + MIXES * 4, src)
+            # ---- the group's last slice partial finalizes its coefficients
+            fence_gpu()
+            cute.arch.sync_warp()
+            old = Int32(0)
+            counter = counters.iterator.toint() + Int64(grp) * 4
+            if lane == 0:
+                old = atom_add_acq_rel(counter, 1)
+            old = shfl_idx_i32(old, 0)
+            if old == CLUSTER - 1:
+                fence_gpu()
+                if lane == 0:
+                    stg_u32(counter, Uint32(0))
+                t0 = grp * 8
+                valid = cutlass.min(8, M - t0)
+                # Slice sums in slice order: 7 float4 of each of the 8 tokens, 32 lanes a pass.
+                quads = (MIXES + 1 + 3) // 4
+                for k in cutlass.range_constexpr((8 * quads + 31) // 32):
+                    item = lane + 32 * k
+                    if item < 8 * quads:
+                        tt = item // quads
+                        k4 = item % quads
+                        src_p = (
+                            partials.iterator.toint()
+                            + ((Int64(t0 + cutlass.min(tt, valid - 1)) * CLUSTER) * PART + k4 * 4)
+                            * 4
+                        )
+                        parts = [ldg_cg_v4_f32(src_p + rr * PART * 4) for rr in range(CLUSTER)]
+                        tot = [Float32(0.0)] * 4
+                        for rr in cutlass.range_constexpr(CLUSTER):
+                            tot = [tot[x] + parts[rr][x] for x in range(4)]
+                        for x in cutlass.range_constexpr(4):
+                            sts_f32(s_tot + (tt * PART + k4 * 4 + x) * 4, tot[x])
+                cute.arch.sync_warp()
+                self.coefficients8(
+                    s_tot,
+                    s_rows,
+                    s_hcw,
+                    lane,
+                    t0,
+                    valid,
+                    pre_out,
+                    post_out,
+                    comb_out,
+                    rms_eps,
+                    hc_eps,
+                    sinkhorn_eps,
+                    post_mult,
+                )
+                cute.arch.sync_warp()
+
+    @cute.jit
+    def load_chunk(self, residual, grp, c, r, n, q, M, policy):
+        """This lane's residual words of chunk ``c`` of token group ``grp`` (``MhcStreamKernel``'s
+        without ``x``), tagged with an L2 policy."""
+        H = self.hidden
+        tc = Int64(cutlass.min(grp * 8 + n, M - 1))
+        h0 = Int64(r * self.slice + c * 32 + q * 8)
+        row = residual.iterator.toint() + (tc * MULT * H + h0) * 2
+        return [ldg_v4_u32_l2(row + j * H * 2, policy) for j in range(MULT)]
+
+    @cute.jit
+    def coefficients8(
+        self,
+        s_tot,
+        s_rows,
+        s_hcw,
+        lane,
+        t0,
+        valid,
+        pre_out,
+        post_out,
+        comb_out,
+        rms_eps: Float32,
+        hc_eps: Float32,
+        eps: Float32,
+        post_mult: Float32,
+    ):
+        """``coefficients`` of 8 tokens in one warp pass, value for value: lane ``(j, i)`` computes
+        pre ``i``, post ``i`` and the softmax of comb row ``i`` of token ``j``, then lanes 0-7 run
+        the Sinkhorn iterations of their token."""
+        j = lane // 4
+        i = lane % 4
+        tot = s_tot + j * PART * 4
+        rstd = cute.math.rsqrt(lds_f32(tot + MIXES * 4) / Float32(MULT * self.hidden) + rms_eps)
+        gt = Int64(t0 + j)
+        v_pre = cute.math.fma(
+            lds_f32(tot + i * 4) * rstd, lds_f32(s_hcw), lds_f32(s_hcw + (3 + i) * 4)
+        )
+        v_post = cute.math.fma(
+            lds_f32(tot + (MULT + i) * 4) * rstd,
+            lds_f32(s_hcw + 4),
+            lds_f32(s_hcw + (3 + MULT + i) * 4),
+        )
+        if j < valid:
+            stg_f32(pre_out.iterator.toint() + (gt * MULT + i) * 4, sigmoid(v_pre) + hc_eps)
+            stg_f32(post_out.iterator.toint() + (gt * MULT + i) * 4, sigmoid(v_post) * post_mult)
+        s2 = lds_f32(s_hcw + 2 * 4)
+        row = [
+            cute.math.fma(
+                lds_f32(tot + (8 + 4 * i + k) * 4) * rstd,
+                s2,
+                lds_f32(s_hcw + (11 + 4 * i + k) * 4),
+            )
+            for k in range(MULT)
+        ]
+        row_max = cute.arch.fmax(cute.arch.fmax(row[0], row[1]), cute.arch.fmax(row[2], row[3]))
+        row = [cute.math.exp(v - row_max) for v in row]
+        inv = rcp(row[0] + row[1] + row[2] + row[3])
+        row = [cute.math.fma(v, inv, eps) for v in row]
+        for k in cutlass.range_constexpr(MULT):
+            sts_f32(s_rows + (j * 16 + 4 * i + k) * 4, row[k])
+        cute.arch.sync_warp()
+        if lane < valid:
+            rows = s_rows + lane * 64
+            out = self.sinkhorn([lds_f32(rows + k * 4) for k in range(MULT * MULT)], eps)
+            for x in cutlass.range_constexpr(MULT):
+                stg_v4_u32(
+                    comb_out.iterator.toint() + (Int64(t0 + lane) * 16 + x * 4) * 4,
+                    [f32_bits(v) for v in out[4 * x : 4 * x + 4]],
+                )
+
+
+# ``MhcSmallCoefficientKernel``'s K slices, BF16 weight parts (3 sum exactly) and warps per CTA.
+SMALL_SLICES, SMALL_PARTS, SMALL_WARPS = 32, 3, 8
+
+
+def weight_parts(v):
+    """BF16 parts of 4 FP32 weights that sum to them exactly, as word pairs ``(w01, w23)``."""
+    out = []
+    for p in range(SMALL_PARTS):
+        w01 = pack_bf16x2(v[0], v[1])
+        w23 = pack_bf16x2(v[2], v[3])
+        out.append((w01, w23))
+        if p + 1 < SMALL_PARTS:
+            v = [
+                v[0] - bf16x2_lo(w01),
+                v[1] - bf16x2_hi(w01),
+                v[2] - bf16x2_lo(w23),
+                v[3] - bf16x2_hi(w23),
+            ]
+    return out
+
+
+class MhcSmallCoefficientKernel(MhcCoefficientKernel):
+    """``pre`` / ``post`` / ``comb`` from the residual and FP32 ``fn``: K slices x ``ctas`` CTAs, a
+    warp per 8-token group; a group's last slice sums the partials in slice order. Deterministic."""
+
+    def __init__(self, hidden: int, sinkhorn_iters: int):
+        super().__init__(hidden, sinkhorn_iters)
+        assert self.supports(hidden)
+        self.slices = SMALL_SLICES
+        self.tiles = (MIXES * SMALL_PARTS + 15) // 16
+        self.cslice = hidden // SMALL_SLICES
+        self.ch = self.cslice // 32
+        self.ring = 5 if self.ch % 5 == 0 else self.ch
+        self.warps = SMALL_WARPS
+        self.w_bytes = self.ch * 8 * 32 * 16 * self.tiles
+        assert self.ch * 8 * 32 % (SMALL_WARPS * 32) == 0
+        # Weight slots a thread loads before splitting them (3 float4 loads each).
+        self.stage_batch = 5
+
+    @staticmethod
+    def supports(hidden: int) -> bool:
+        return (
+            hidden % (SMALL_SLICES * 32) == 0
+            and hidden // CLUSTER // 32 % COEFFICIENT_LOAD_DEPTH == 0
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        residual,
+        fn,
+        scale,
+        base,
+        partials,
+        counters,
+        pre_out,
+        post_out,
+        comb_out,
+        rms_eps: Float32,
+        hc_eps: Float32,
+        sinkhorn_eps: Float32,
+        post_mult: Float32,
+        ctas: Int32,
+        stream,
+    ):
+        self.kernel(
+            residual,
+            fn,
+            scale,
+            base,
+            partials,
+            counters,
+            pre_out,
+            post_out,
+            comb_out,
+            rms_eps,
+            hc_eps,
+            sinkhorn_eps,
+            post_mult,
+            ctas,
+        ).launch(
+            grid=[self.slices * ctas, 1, 1],
+            block=[self.warps * 32, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        residual,
+        fn,
+        scale,
+        base,
+        partials,
+        counters,
+        pre_out,
+        post_out,
+        comb_out,
+        rms_eps: Float32,
+        hc_eps: Float32,
+        sinkhorn_eps: Float32,
+        post_mult: Float32,
+        ctas: Int32,
+    ):
+        H = self.hidden
+        S = self.slices
+        TL = self.tiles
+        CH = self.ch
+        D = self.ring
+        tid = cute.arch.thread_idx()[0]
+        bid = cute.arch.block_idx()[0]
+        r = bid % S
+        p = bid // S
+        M = residual.shape[0]
+        groups = ((M + 7) // 8 - p + ctas - 1) // ctas
+
+        smem = SmemAllocator()
+        s_w = smem.allocate(self.w_bytes + 32 * 4 + self.warps * 8 * (PART + 16) * 4, 128)
+        s_w = s_w.toint()
+        s_hcw = s_w + self.w_bytes
+        s_scratch = s_hcw + 32 * 4
+
+        warp = tid // 32
+        lane = tid % 32
+        n = lane // 4
+        q = lane % 4
+        # Keeps the critical half's L2 priority; the first chunks load while the weight stages.
+        keep = l2_policy("evict_unchanged")
+        first = p + cutlass.max(cutlass.min(warp, groups - 1), Int32(0)) * ctas
+        ring = [self.load_chunk(residual, first, c, r, n, q, M, keep) for c in range(D)]
+
+        if tid < 3 + MIXES:
+            if tid < 3:
+                sts_f32(s_hcw + tid * 4, ldg_f32(scale.iterator.toint() + tid * 4))
+            else:
+                sts_f32(s_hcw + tid * 4, ldg_f32(base.iterator.toint() + (tid - 3) * 4))
+        # A fragments of the slice: slot (8 c + kb) * 32 + lane holds the lane's words of every
+        # tile; the stacked rows are part-major (row 24 part + mix), zero past the last part.
+        K = MULT * H
+        T = self.warps * 32
+        per = CH * 8 * 32 // T
+        for b in cutlass.range_constexpr(0, per, self.stage_batch):
+            loads = []
+            for it in cutlass.range_constexpr(b, min(per, b + self.stage_batch)):
+                slot = tid + it * T
+                s_lane = slot % 32
+                s_kb = (slot // 32) % 8
+                s_h = r * self.cslice + (slot // 256) * 32 + (s_lane % 4) * 8 + (s_kb % 2) * 4
+                s_k = Int64((s_kb // 2) * H + s_h)
+                row = fn.iterator.toint() + (Int64(s_lane // 4) * K + s_k) * 4
+                loads.append([ldg_v4_f32(row + Int64(jb * 8) * K * 4) for jb in range(3)])
+            for it in cutlass.range_constexpr(b, min(per, b + self.stage_batch)):
+                slot = tid + it * T
+                words = [Uint32(0)] * (4 * TL)
+                for jb in cutlass.range_constexpr(3):
+                    wsplit = weight_parts(list(loads[it - b][jb]))
+                    for wp in cutlass.range_constexpr(SMALL_PARTS):
+                        widx = 3 * wp + jb
+                        words[4 * (widx // 2) + widx % 2] = wsplit[wp][0]
+                        words[4 * (widx // 2) + widx % 2 + 2] = wsplit[wp][1]
+                for wt in cutlass.range_constexpr(TL):
+                    sts_v4_u32(s_w + slot * 16 * TL + 16 * wt, words[4 * wt : 4 * wt + 4])
+        cute.arch.sync_threads()
+
+        s_tot = s_scratch + warp * 8 * (PART + 16) * 4
+        s_rows = s_tot + 8 * PART * 4
+        for u in cutlass.range(warp, groups, self.warps, unroll=1):
+            grp = p + u * ctas
+            nxt_grp = p + cutlass.min(u + self.warps, groups - 1) * ctas
+            acc = [[Float32(0.0)] * 4 for _ in range(TL)]
+            ssq_rc = (Float32(0.0), Float32(0.0))
+            for c in cutlass.range_constexpr(CH):
+                cur = ring[c % D]
+                if cutlass.const_expr(c + D < CH):
+                    ring[c % D] = self.load_chunk(residual, grp, c + D, r, n, q, M, keep)
+                else:
+                    ring[c % D] = self.load_chunk(residual, nxt_grp, c + D - CH, r, n, q, M, keep)
+                # lagged_collapse's order of the sum of squares
+                for w in cutlass.range_constexpr(4):
+                    for j in cutlass.range_constexpr(MULT):
+                        v = (bf16x2_lo(cur[j][w]), bf16x2_hi(cur[j][w]))
+                        ssq_rc = cute.arch.fma_packed_f32x2(v, v, ssq_rc)
+                frag = s_w + (c * 8 * 32 + lane) * 16 * TL
+                for kb in cutlass.range_constexpr(8):
+                    a = [lds_v4_u32(frag + kb * 32 * 16 * TL + 16 * mt) for mt in range(TL)]
+                    b = (cur[kb // 2][2 * (kb % 2)], cur[kb // 2][2 * (kb % 2) + 1])
+                    for mt in cutlass.range_constexpr(TL):
+                        acc[mt] = list(mma_bf16(a[mt], b, acc[mt]))
+            self.finish_group(
+                acc,
+                ssq_rc,
+                grp,
+                r,
+                lane,
+                M,
+                partials,
+                counters,
+                s_tot,
+                s_rows,
+                s_hcw,
+                pre_out,
+                post_out,
+                comb_out,
+                rms_eps,
+                hc_eps,
+                sinkhorn_eps,
+                post_mult,
+            )
+
+    @cute.jit
+    def finish_group(
+        self,
+        acc,
+        ssq_rc,
+        grp,
+        r,
+        lane,
+        M,
+        partials,
+        counters,
+        s_tot,
+        s_rows,
+        s_hcw,
+        pre_out,
+        post_out,
+        comb_out,
+        rms_eps: Float32,
+        hc_eps: Float32,
+        sinkhorn_eps: Float32,
+        post_mult: Float32,
+    ):
+        """Store this slice's partials of the group (mixes, sum of squares); the last of the group's
+        slices sums them in slice order and runs the coefficients."""
+        S = self.slices
+        q = lane % 4
+        t = grp * 8 + lane // 4
+        src = ssq_rc[0] + ssq_rc[1]
+        for m in cutlass.range_constexpr(2):
+            src = src + shfl_xor_f32(src, 1 << m)
+        # Accumulator columns 2q, 2q + 1 are tokens 2q, 2q + 1 of the group; the parts of mix
+        # 8 mi + g sum as high + (middle + low).
+        g = lane // 4
+        for e in cutlass.range_constexpr(2):
+            tok = grp * 8 + 2 * q + e
+            if tok < M:
+                dst = partials.iterator.toint() + (Int64(tok) * S + r) * PART * 4
+                for mi in cutlass.range_constexpr(3):
+                    vals = [
+                        acc[(3 * pp + mi) // 2][2 * ((3 * pp + mi) % 2) + e]
+                        for pp in range(SMALL_PARTS)
+                    ]
+                    total = vals[SMALL_PARTS - 1]
+                    for pp in cutlass.range_constexpr(SMALL_PARTS - 1):
+                        total = vals[SMALL_PARTS - 2 - pp] + total
+                    stg_f32(dst + (mi * 8 + g) * 4, total)
+        if (q == 0) & (t < M):
+            dst = partials.iterator.toint() + (Int64(t) * S + r) * PART * 4
+            stg_f32(dst + MIXES * 4, src)
+        # ---- the group's last slice partial finalizes its coefficients
+        fence_gpu()
+        cute.arch.sync_warp()
+        old = Int32(0)
+        counter = counters.iterator.toint() + Int64(grp) * 4
+        if lane == 0:
+            old = atom_add_acq_rel(counter, 1)
+        old = shfl_idx_i32(old, 0)
+        if old == S - 1:
+            fence_gpu()
+            if lane == 0:
+                stg_u32(counter, Uint32(0))
+            t0 = grp * 8
+            valid = cutlass.min(8, M - t0)
+            # Slice sums in slice order: 7 float4 of each of the 8 tokens, 32 lanes a pass.
+            quads = (MIXES + 1 + 3) // 4
+            for k8 in cutlass.range_constexpr((8 * quads + 31) // 32):
+                item = lane + 32 * k8
+                if item < 8 * quads:
+                    tt = item // quads
+                    k4 = item % quads
+                    src_p = (
+                        partials.iterator.toint()
+                        + ((Int64(t0 + cutlass.min(tt, valid - 1)) * S) * PART + k4 * 4) * 4
+                    )
+                    tot = [Float32(0.0)] * 4
+                    batch = [ldg_cg_v4_f32(src_p + rr * PART * 4) for rr in range(S)]
+                    for rr in cutlass.range_constexpr(S):
+                        tot = [tot[x] + batch[rr][x] for x in range(4)]
+                    for x in cutlass.range_constexpr(4):
+                        sts_f32(s_tot + (tt * PART + k4 * 4 + x) * 4, tot[x])
+            cute.arch.sync_warp()
+            self.coefficients8(
+                s_tot,
+                s_rows,
+                s_hcw,
+                lane,
+                t0,
+                valid,
+                pre_out,
+                post_out,
+                comb_out,
+                rms_eps,
+                hc_eps,
+                sinkhorn_eps,
+                post_mult,
+            )
+            cute.arch.sync_warp()
+
+    @cute.jit
+    def load_chunk(self, residual, grp, c, r, n, q, M, policy):
+        """This lane's residual words of chunk ``c`` of token group ``grp`` in this slice."""
+        H = self.hidden
+        tc = Int64(cutlass.min(grp * 8 + n, M - 1))
+        h0 = Int64(r * self.cslice + c * 32 + q * 8)
+        row = residual.iterator.toint() + (tc * MULT * H + h0) * 2
+        return [ldg_v4_u32_l2(row + j * H * 2, policy) for j in range(MULT)]
+
+
 class Nvfp4QuantizeKernel:
     """``fp4_quantize(x, global_scale, 16, False, False)`` of contiguous BF16 rows: E2M1 bytes
     ``[rows, hidden / 2]`` and one E4M3 scale per 16 elements ``[rows, hidden / 16]`` (row-major).
@@ -1509,22 +2211,27 @@ class Nvfp4Fp8QuantizeKernel(Nvfp4QuantizeKernel):
                     stg_u8(fp8_sf.iterator.toint() + offset, scale)
 
 
-def prepare_boundary_weight(fn: torch.Tensor) -> torch.Tensor:
-    """``fn [24, 4 * hidden]`` -> int32 mma A fragments ``[16 slices, k16 steps, 32 lanes, 12]``.
-
-    The weight is rounded to TF32 (nearest, ties away, as the TF32 tensor-core path) and split into
-    BF16 high and low parts whose sum is exact; the 12 words of a lane are its A fragments of the
-    three m16 tiles of the stacked ``[high; low]`` rows. k16 step ``8 c + kb`` of a slice is chunk
-    ``c`` (hidden ``[32 c, 32 c + 32)``), stream ``kb // 2``; fragment columns ``2q, 2q + 1`` and
-    ``2q + 8, 2q + 9`` hold hidden ``8 q + 4 (kb % 2) + {0, 1}`` and ``+ {2, 3}`` of the chunk.
-    """
-    hidden = fn.shape[1] // MULT
-    S = hidden // CLUSTER
+def prepare_coefficient_weight(fn: torch.Tensor) -> torch.Tensor:
+    """``fn [24, 4 * hidden]`` -> BF16 ``[high; low]`` rows ``[48, 4 * hidden]``: rounded to TF32
+    (nearest, ties away, as the TF32 tensor-core path) and split into parts whose sum is exact."""
     bits = fn.contiguous().view(torch.int32)
     rounded = ((bits + 0x1000) & -0x2000).view(torch.float32)
     hi = rounded.to(torch.bfloat16)
     lo = (rounded - hi.float()).to(torch.bfloat16)
-    pairs = torch.cat([hi, lo]).view(torch.int32)
+    return torch.cat([hi, lo]).contiguous()
+
+
+def prepare_boundary_weight(fn: torch.Tensor) -> torch.Tensor:
+    """``fn [24, 4 * hidden]`` -> int32 mma A fragments ``[16 slices, k16 steps, 32 lanes, 12]``.
+
+    The 12 words of a lane are its A fragments of the three m16 tiles of the
+    ``prepare_coefficient_weight`` rows. k16 step ``8 c + kb`` of a slice is chunk ``c`` (hidden
+    ``[32 c, 32 c + 32)``), stream ``kb // 2``; fragment columns ``2q, 2q + 1`` and
+    ``2q + 8, 2q + 9`` hold hidden ``8 q + 4 (kb % 2) + {0, 1}`` and ``+ {2, 3}`` of the chunk.
+    """
+    hidden = fn.shape[1] // MULT
+    S = hidden // CLUSTER
+    pairs = prepare_coefficient_weight(fn).view(torch.int32)
     dev = fn.device
     rank = torch.arange(CLUSTER, device=dev).view(-1, 1, 1, 1)
     kk = torch.arange(MULT * S // 16, device=dev).view(1, -1, 1, 1)
@@ -1855,3 +2562,159 @@ def mhc_sinkhorn(comb, sinkhorn_eps, sinkhorn_iters):
     """Runs the Sinkhorn iterations of ``comb [B, 16]`` from ``mhc_boundary(..., sinkhorn_iters=0)`` in
     place."""
     _compile_sinkhorn(sinkhorn_iters)(comb, sinkhorn_eps)
+
+
+# CTAs per hidden slice of ``mhc_coefficients``: enough for one token group (8 tokens) per warp,
+# within these bounds; few CTAs leave the SMs to the sublayer it overlaps.
+COEFFICIENT_MIN_CTAS_PER_SLICE = 2
+COEFFICIENT_MAX_CTAS_PER_SLICE = 8
+# Tokens one ``coefficient_counters`` buffer serves (one counter per group of 8).
+COEFFICIENT_MAX_TOKENS = 4096
+
+
+def coefficient_ctas_per_slice(tokens: int) -> int:
+    """CTAs per hidden slice of ``mhc_coefficients`` for ``tokens`` rows."""
+    ctas = ceil_div(ceil_div(tokens, 8), STREAM_WARPS)
+    return min(max(ctas, COEFFICIENT_MIN_CTAS_PER_SLICE), COEFFICIENT_MAX_CTAS_PER_SLICE)
+
+
+@functools.cache
+def _compile_coefficients(hidden: int, sinkhorn_iters: int):
+    tokens = cute.sym_int()
+    fn = cute.compile(
+        MhcCoefficientKernel(hidden, sinkhorn_iters),
+        _mat(cutlass.BFloat16, tokens, MULT, hidden),
+        _mat(Int32, CLUSTER, MULT * (hidden // CLUSTER) // 16, 32, 12),
+        _mat(Float32, 3),
+        _mat(Float32, MIXES),
+        _mat(Float32, tokens, CLUSTER, PART),
+        _mat(Int32, cute.sym_int()),
+        _mat(Float32, tokens, MULT),
+        _mat(Float32, tokens, MULT),
+        _mat(Float32, tokens, MULT * MULT),
+        Float32(0.0),
+        Float32(0.0),
+        Float32(0.0),
+        Float32(0.0),
+        Int32(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    _COMPILED.add(("coefficients", hidden, sinkhorn_iters))
+    return fn
+
+
+def coefficients_compiled(hidden: int, sinkhorn_iters: int) -> bool:
+    """Whether ``mhc_coefficients`` is compiled for this variant (not allowed inside graph capture)."""
+    return ("coefficients", hidden, sinkhorn_iters) in _COMPILED
+
+
+def coefficient_counters(device) -> torch.Tensor:
+    """Zeroed per-token-group arrival counters for ``mhc_coefficients``; the kernel leaves them
+    zeroed. One buffer per boundary: launches sharing it must not overlap."""
+    return torch.zeros(COEFFICIENT_MAX_TOKENS // 8, dtype=torch.int32, device=device)
+
+
+def mhc_coefficients(
+    residual,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_eps,
+    post_mult,
+    sinkhorn_iters,
+    counters,
+):
+    """``(pre, post, comb)`` of a boundary from its BF16 residual ``[B, 4, hidden]`` alone.
+
+    One launch of ``MhcCoefficientKernel``, bit for bit the coefficients of the stream boundary
+    (``MhcStreamKernel`` + ``MhcFinalizeKernel``) of the same residual. ``counters`` is
+    ``coefficient_counters``'s.
+    """
+    tokens, mult, hidden = residual.shape
+    assert 0 < tokens <= 8 * counters.numel()
+    dev = residual.device
+    pre, post = torch.empty(2, tokens, mult, dtype=torch.float32, device=dev)
+    comb = torch.empty(tokens, mult * mult, dtype=torch.float32, device=dev)
+    partials = torch.empty(tokens, CLUSTER, PART, dtype=torch.float32, device=dev)
+    _compile_coefficients(hidden, sinkhorn_iters)(
+        residual,
+        weight,
+        scale,
+        base,
+        partials,
+        counters,
+        pre,
+        post,
+        comb,
+        rms_eps,
+        hc_eps,
+        sinkhorn_eps,
+        post_mult,
+        coefficient_ctas_per_slice(tokens),
+    )
+    return pre, post, comb
+
+
+@functools.cache
+def _compile_small_coefficients(hidden: int, sinkhorn_iters: int):
+    tokens = cute.sym_int()
+    fn = cute.compile(
+        MhcSmallCoefficientKernel(hidden, sinkhorn_iters),
+        _mat(cutlass.BFloat16, tokens, MULT, hidden),
+        _mat(Float32, MIXES, MULT * hidden),
+        _mat(Float32, 3),
+        _mat(Float32, MIXES),
+        _mat(Float32, tokens, SMALL_SLICES, PART),
+        _mat(Int32, cute.sym_int()),
+        _mat(Float32, tokens, MULT),
+        _mat(Float32, tokens, MULT),
+        _mat(Float32, tokens, MULT * MULT),
+        Float32(0.0),
+        Float32(0.0),
+        Float32(0.0),
+        Float32(0.0),
+        Int32(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    _COMPILED.add(("small_coefficients", hidden, sinkhorn_iters))
+    return fn
+
+
+def small_coefficients_compiled(hidden: int, sinkhorn_iters: int) -> bool:
+    """Whether ``mhc_small_coefficients`` is compiled for this variant (not allowed in capture)."""
+    return ("small_coefficients", hidden, sinkhorn_iters) in _COMPILED
+
+
+def mhc_small_coefficients(
+    residual, fn, scale, base, rms_eps, hc_eps, sinkhorn_eps, post_mult, sinkhorn_iters, counters
+):
+    """``(pre, post, comb)`` from the BF16 residual ``[B, 4, hidden]`` and the FP32 mixer weight
+    ``fn [24, 4 * hidden]`` in one launch; ``counters`` is ``coefficient_counters``'s."""
+    tokens, mult, hidden = residual.shape
+    assert 0 < tokens <= 8 * counters.numel()
+    ctas = ceil_div(ceil_div(tokens, 8), SMALL_WARPS)
+    dev = residual.device
+    pre, post = torch.empty(2, tokens, mult, dtype=torch.float32, device=dev)
+    comb = torch.empty(tokens, mult * mult, dtype=torch.float32, device=dev)
+    partials = torch.empty(tokens, SMALL_SLICES, PART, dtype=torch.float32, device=dev)
+    _compile_small_coefficients(hidden, sinkhorn_iters)(
+        residual,
+        fn,
+        scale,
+        base,
+        partials,
+        counters,
+        pre,
+        post,
+        comb,
+        rms_eps,
+        hc_eps,
+        sinkhorn_eps,
+        post_mult,
+        ctas,
+    )
+    return pre, post, comb
