@@ -1786,25 +1786,52 @@ def test_group_remap_dispatch_and_fallback(monkeypatch, rubin):
     assert torch.equal(leader._remap_topk_to_global(topk, md, is_generation=True), per_layer(0))
     md.in_mtp_draft_loop = False
 
-    # Losing a grouped result is safe to fall back from only after local TopK was published.
+    # Exercise publication through the same entry point as a generation forward.
+    md._invalidate_pool_view_cache()
     md.shared_topk_indices = torch.full_like(topk, -1)
     md.num_tokens, md.num_ctx_tokens = num_tokens, 0
     md.sparse_metadata_params = SimpleNamespace(enable_kv_cache_offload=False)
     md.has_mixed_precision_high_rows = False
+    leader.sparse_params = follower.sparse_params = md.sparse_metadata_params
+    leader.indexer = SimpleNamespace(forward_from_projected=Mock(return_value=topk))
+    args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
+    )
+    q = torch.empty((num_tokens, 1), device=device)
 
-    def fallback():
-        return follower._remap_topk_to_global(md.shared_topk_indices, md, is_generation=True)
+    def predict(layer):
+        return layer.sparse_attn_predict(q, None, md, args)[0]
 
-    assert md.skip_shared_topk_copy(0, topk.shape, group_remap=True)
+    predict(leader)
+    assert (md.shared_topk_indices == -1).all()
+    torch.testing.assert_close(predict(follower), per_layer(1))
+
+    md._group_remap_batched.clear()
     with pytest.raises(RuntimeError, match="leader 0 skipped the copy"):
-        fallback()
-    assert not md.skip_shared_topk_copy(0, topk.shape, group_remap=False)
-    md.shared_topk_indices.copy_(topk)
-    torch.testing.assert_close(fallback(), per_layer(1))
+        predict(follower)
 
-    assert md.skip_shared_topk_copy(0, topk.shape, group_remap=True)
+    # Stub the shared backend's downstream readers; the publication decision stays real.
+    if not rubin:
+        monkeypatch.setattr(leader, "_sparse_offload_arena_indices", Mock(return_value=topk))
+        md.kv_cache_manager.mixed_precision_low_dtype = DataType.FP8
+        md.kv_cache_manager.mixed_precision_high_dtype = DataType.FP8
+        md.req_idx_per_token = md._cached_req_idx_gen
+        monkeypatch.setattr(module, "mixed_precision_high_row_indices", Mock(return_value=topk))
+    for offload, mixed_precision in [(True, False), (False, True)]:
+        md.sparse_metadata_params.enable_kv_cache_offload = offload
+        md.has_mixed_precision_high_rows = mixed_precision
+        md.shared_topk_indices.fill_(-1)
+        predict(leader)
+        torch.testing.assert_close(md.shared_topk_indices, topk)
+
+    md.has_mixed_precision_high_rows = False
+    md._group_remap_batched.clear()
+    torch.testing.assert_close(predict(follower), per_layer(1))
+
+    predict(leader)
     md._invalidate_pool_view_cache()
-    torch.testing.assert_close(fallback(), per_layer(1))
+    torch.testing.assert_close(predict(follower), per_layer(1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
