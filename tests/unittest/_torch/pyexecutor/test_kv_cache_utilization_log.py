@@ -6,17 +6,15 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.profiling import (
     KV_POOL_LOG_ENV_VAR_NAME,
     PyExecutorProfileManager,
     load_kv_pool_log_enabled,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.metrics.logging import format_kv_pool_fields
 from tensorrt_llm.metrics.perf import PerfMetricsCollector
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheLevel, CacheTier
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 pytestmark = pytest.mark.cpu_only
 
@@ -43,11 +41,6 @@ def _manager(tiers, snapshots):
     manager.get_kv_cache_stats = Mock(side_effect=AssertionError("must not build KvCacheStats"))
     manager._get_storage_statistics = Mock(side_effect=lambda level: snapshots[int(level)])
     return manager
-
-
-def _pool_group(index, layer_group_ids):
-    variants = [SimpleNamespace(layer_group_id=g) for g in layer_group_ids]
-    return SimpleNamespace(pool_group_index=index, slot_desc=SimpleNamespace(variants=variants))
 
 
 def _executor(manager, is_v2=True):
@@ -145,66 +138,6 @@ def test_gpu_pool_bytes_count_every_role_of_a_slot():
         [CacheTier.GPU_MEM], {0: [_capacity(10, 0, 0, (100, 28)), _capacity(4, 0, 0)]}
     )
     assert manager.get_gpu_pool_bytes() == [1280, 4 * GIB]
-
-
-def _construction_logs(manager, monkeypatch):
-    manager.kv_cache_manager_py_config = SimpleNamespace(
-        layers=[SimpleNamespace(layer_id=0, buffers=[SimpleNamespace(role="K")])]
-    )
-    manager._format_kv_cache_pool_lifecycle_entry = Mock(return_value="role=K")
-    log = Mock()
-    monkeypatch.setattr(kv_module.logger, "info", log)
-    manager._log_kv_cache_pool_lifecycle_mapping()
-    return [c.args[0] for c in log.call_args_list]
-
-
-def test_construction_log_prints_pool_sizes_and_equivalent_pool_ratio(monkeypatch):
-    # Pool groups are numbered differently from layer groups; the ratio follows layer groups.
-    manager = _manager(
-        [CacheTier.GPU_MEM],
-        {0: [_capacity(6, 0, 0), _capacity(1, 0, 0), _capacity(1, 0, 0, (GIB // 2, GIB // 2))]},
-    )
-    manager.impl.pool_group_descs = [
-        _pool_group(0, [1]),
-        _pool_group(1, [0]),
-        _pool_group(2, [2]),
-    ]
-    lines = _construction_logs(manager, monkeypatch)
-    assert lines[2] == (
-        "pool_group_id=0, layer_group_ids=[1], slots=6, slot_bytes=1073741824, "
-        "bytes=6442450944 (6.000 GiB), share=0.7500"
-    )
-    assert lines[-1] == (
-        "GPU KV pools total 8.000 GiB; equivalent pool_ratio (layer_group order) = "
-        "[0.125000, 0.750000, 0.125000]"
-    )
-
-
-def test_construction_log_pool_ratio_sums_to_one(monkeypatch):
-    # Thirds round to 0.333333 each; the remainder goes to the largest share so the
-    # printed list passes the pool_ratio sum check when pasted into the config.
-    manager = _manager([CacheTier.GPU_MEM], {0: [_capacity(1, 0, 0)] * 3})
-    manager.impl.pool_group_descs = [_pool_group(i, [i]) for i in range(3)]
-    lines = _construction_logs(manager, monkeypatch)
-    ratio = [float(v) for v in lines[-1].rsplit("[", 1)[1].rstrip("]").split(", ")]
-    assert ratio == [0.333334, 0.333333, 0.333333]
-    KvCacheConfig(pool_ratio=ratio)
-
-
-def test_construction_log_skips_pool_ratio_for_shared_pool_groups(monkeypatch):
-    manager = _manager([CacheTier.GPU_MEM], {0: [_capacity(2, 0, 0)]})
-    manager.impl.pool_group_descs = [_pool_group(0, [0, 1])]
-    lines = _construction_logs(manager, monkeypatch)
-    assert lines[-1].startswith("pool_group_id=0, layer_group_ids=[0, 1], ")
-
-
-def test_construction_log_includes_cold_tier_pool_mapping(monkeypatch):
-    manager = _manager([CacheTier.GPU_MEM, CacheTier.HOST_MEM, CacheTier.DISK], {0: []})
-    manager.impl.pool_group_descs = []
-    manager.impl.get_life_cycle_pool_group_indices = Mock(return_value=[0, 1, 0])
-    lines = _construction_logs(manager, monkeypatch)
-    manager.impl.get_life_cycle_pool_group_indices.assert_called_once_with(CacheLevel(1))
-    assert lines[-1] == "HOST_MEM pool_group_id -> layer_group_ids = {0: [0, 2], 1: [1]}"
 
 
 def test_format_kv_pool_fields():
