@@ -172,7 +172,8 @@ def check_cutlass_leaf(
     """Return the first rejection of the family gates and ``leaf_gates``, else admit.
 
     Identity runs first, so a foreign format is never reported as an SM or
-    dtype miss; the build gate runs last, so a build limit is never blamed for a
+    dtype miss; spare slots run after ``leaf_gates``, so a leaf's own reason
+    wins; the build gate runs last, so a build limit is never blamed for a
     problem the leaf turns down anyway. ``leaf_gates`` are pre-evaluated, so
     each must be pure and abstain (``None``) on formats it does not police.
     """
@@ -182,8 +183,8 @@ def check_cutlass_leaf(
         check_dtype(cls, p),
         check_gptoss_activation(cls, p),
         check_moe_lora(cls, d),
-        spare_slots_rejection(cls, d),
         *leaf_gates,
+        spare_slots_rejection(cls, d),
         check_oss_cutlass_build(cls, p, d),
     ):
         if verdict is not None:
