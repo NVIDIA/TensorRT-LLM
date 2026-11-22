@@ -82,6 +82,8 @@ If the mean cannot be parsed for a `gen_only` run, `check_test_failure` raises `
 
 Seconds from a server's launch until its `/health` first returns 200, so weight loading and the executor warmup are included; the client warmup requests are not. An aggregated row (also `ctx_only`) has one `d_warmup_time`; a disaggregated row has one field per worker (`d_ctx_0_warmup_time`, ..., `d_gen_0_warmup_time`, ...). They are uploaded only: not in `MINIMIZE_METRICS`, so they get no baseline and never gate.
 
+In a stage that runs several cases, a case reuses the compile and tuning caches of the cases before it, so its value depends on its position. `test_warmup[<aggregated, ctx_only or gen_only_no_context id>]` measures a cold start instead: it drops the checkpoint's page cache, starts the server with empty cache directories (`HOME`, `XDG_CACHE_HOME`, `TMPDIR` and every cache path the job sets, such as `TLLM_AUTOTUNER_CACHE_PATH`), records the same field and stops the server without running a client. Its rows are named `<server>-warmup` and carry `b_warmup_only`. CI runs it for the GB300 key models every 4th post-merge build (`l0_gb300_multi_gpus_perf_sanity_warmup`).
+
 ### Match Keys
 
 Match keys are the fields that identify a test case when looking up its history to

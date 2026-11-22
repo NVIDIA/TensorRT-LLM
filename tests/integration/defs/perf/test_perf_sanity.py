@@ -1779,6 +1779,175 @@ class WarmupTimeRecorder:
         self.stop()
 
 
+#: Compile and tuning caches that a cold start must not inherit even where the
+#: job sets an explicit path (CI points TLLM_AUTOTUNER_CACHE_PATH at one file for
+#: a whole stage): each one that is set moves into the cold start's own directory.
+#: The caches nobody sets derive from HOME, XDG_CACHE_HOME or TMPDIR, which a cold
+#: start redirects too.
+COLD_START_CACHE_ENV = (
+    "TLLM_AUTOTUNER_CACHE_PATH",
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TORCH_EXTENSIONS_DIR",
+    "DG_JIT_CACHE_DIR",
+    "FLASHINFER_WORKSPACE_BASE",
+    "CUDA_CACHE_PATH",
+    "TRTLLM_CACHE_DIR",
+    "TRTLLM_DG_CACHE_DIR",
+    "TRTLLM_CUTE_DSL_CACHE_DIR",
+    "CUTE_DSL_CACHE_DIR",
+    "MINFER_FMHA_CACHE_DIR",
+    "MM_SPARSE_ATTN_AOT_CACHE",
+)
+#: Lets a server reuse the JIT builds of other processes.
+COLD_START_UNSET_ENV = ("TLLM_JIT_SHARE_DIR",)
+#: Default homes of those caches under HOME. One that grows during a cold start
+#: is a cache the redirection missed.
+COLD_START_WATCHED_HOME_PATHS = (
+    ".cache/flashinfer",
+    ".cache/minfer",
+    ".cache/tensorrt_llm",
+    ".cache/torch",
+    ".triton",
+    ".nv/ComputeCache",
+    ".deep_gemm",
+)
+
+
+def cold_start_env(env: Dict[str, str], cold_dir: str) -> Dict[str, str]:
+    """Return env with every compile and tuning cache moved under the empty cold_dir."""
+    env = dict(env)
+    # One-letter names: MPI and ZeroMQ create Unix sockets under TMPDIR, and a
+    # socket path may not exceed 107 bytes.
+    for name, subdir in (("HOME", "h"), ("XDG_CACHE_HOME", "x"), ("TMPDIR", "t")):
+        env[name] = os.path.join(cold_dir, subdir)
+        os.makedirs(env[name])
+    for name in COLD_START_CACHE_ENV:
+        if name in env:
+            env[name] = os.path.join(cold_dir, name.lower())
+    for name in COLD_START_UNSET_ENV:
+        env.pop(name, None)
+    return env
+
+
+def drop_page_cache(paths: List[str]) -> None:
+    """Drop the page cache of every file under paths, so that a server reads them cold."""
+    for path in paths:
+        for dirpath, _, filenames in os.walk(path):
+            for filename in filenames:
+                try:
+                    fd = os.open(os.path.join(dirpath, filename), os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+
+
+def _tree_bytes(path: str) -> int:
+    if not os.path.isdir(path):
+        return os.path.getsize(path)
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for filename in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, filename)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _cache_footprint(cold_dir: str) -> Dict[str, int]:
+    """Bytes in each place a cold start must not write to.
+
+    The default cache homes, the explicitly set cache paths, and every entry of
+    the temp dir but cold_dir.
+    """
+    home = os.path.expanduser("~")
+    paths = [os.path.join(home, path) for path in COLD_START_WATCHED_HOME_PATHS]
+    paths += [os.environ[name] for name in COLD_START_CACHE_ENV if name in os.environ]
+    tmp = tempfile.gettempdir()
+    paths += [os.path.join(tmp, name) for name in os.listdir(tmp)]
+    footprint = {}
+    for path in paths:
+        if path != cold_dir and os.path.exists(path):
+            try:
+                footprint[path] = _tree_bytes(path)
+            except OSError:
+                pass
+    return footprint
+
+
+def run_cold_warmup(
+    server_cmd: List[str],
+    server_env: Dict[str, str],
+    model_dirs: List[str],
+    num_frontends: int,
+    test_output_dir: str,
+    server_name: str,
+    server_idx: int,
+) -> None:
+    """Start a server cold, save its warmup time once /health returns 200, and stop it.
+
+    Cold means no compile, tuning or page cache left by an earlier server of the
+    same job: the checkpoint's page cache is dropped, and the server gets empty
+    cache directories of its own, removed afterwards.
+    """
+    host = "localhost"
+    addr_path = os.path.join(test_output_dir, f"trtllm-serve.{server_name}.{server_idx}.addr")
+    log_path = os.path.join(test_output_dir, f"trtllm-serve.{server_name}.{server_idx}.log")
+    if os.path.exists(addr_path):
+        os.remove(addr_path)
+    if num_frontends > 1:
+        port = reserve_multi_frontend_port(host)
+        cmd = add_host_port_to_cmd(server_cmd, host, port)
+        publish_addr_file(addr_path, host, port)
+    else:
+        cmd = add_host_port_to_cmd(server_cmd, host, 0) + ["--report_addr", addr_path]
+    timeout = min(DEFAULT_TIMEOUT, server_ready_timeout(AGG_SERVER_READY_TIMEOUT, "AGG"))
+
+    drop_page_cache(model_dirs)
+    cold_dir = tempfile.mkdtemp(prefix="psc_")
+    footprint = _cache_footprint(cold_dir)
+    env = cold_start_env({**os.environ, **server_env}, cold_dir)
+    server_proc = None
+    print_info(f"Starting {server_name} cold, caches in {cold_dir}. cmd is {cmd}")
+    try:
+        with open(log_path, "w") as log_file:
+            launch_time = time.monotonic()
+            server_proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+            _, port = wait_for_reported_addr(addr_path, timeout, server_proc)
+            wait_for_endpoint_ready(
+                f"http://{host}:{port}/health",
+                timeout=timeout,
+                check_files=[log_path],
+                server_proc=server_proc,
+            )
+            write_warmup_time(
+                test_output_dir, server_name, server_idx, time.monotonic() - launch_time
+            )
+    except Exception as error:
+        report_error(error_msg=error, log_files=[log_path])
+        raise
+    finally:
+        if server_proc is not None:
+            server_proc.terminate()
+            server_proc.wait()
+        shutil.rmtree(cold_dir, ignore_errors=True)
+
+    grown = [
+        path for path, size in _cache_footprint(cold_dir).items() if size > footprint.get(path, -1)
+    ]
+    if grown:
+        print_warning(
+            f"{server_name} wrote outside its cold cache directory, so its warmup "
+            f"time may not be a cold start: {grown}"
+        )
+
+
 def get_model_dir(model_name: str) -> str:
     """Get model directory path from model name."""
     if model_name in MODEL_PATH_DICT:
@@ -5588,6 +5757,94 @@ class PerfSanityTestConfig:
 
         return outputs
 
+    def run_cold_warmups(self) -> None:
+        """Start each server of the case cold, save its warmup time and stop it.
+
+        No client runs. Outputs go under ``<output_dir>/warmup`` so that they never
+        mix with a test_e2e run of the same id.
+        """
+        self._output_dir = os.path.join(self._output_dir, "warmup")
+        commands = self.get_commands()
+        for server_idx, server_cmd in enumerate(commands.server_cmds):
+            if self.runtime == GEN_ONLY_NO_CONTEXT_RUNTIME:
+                server_config = self.server_configs[server_idx][1]
+                server_cmd = server_cmd[0]
+                server_env = {**server_config.to_env(), GEN_ONLY_NO_CONTEXT_ENV: "1"}
+                server_name = "GEN_0"
+            else:
+                server_config = self.server_configs[server_idx]
+                server_env = server_config.to_env()
+                server_name = AGGREGATE_SERVER_NAME
+            if server_config.gpus > server_config.gpus_per_node:
+                raise ValueError(
+                    f"test_warmup runs single-node servers only; {server_config.name} uses "
+                    f"{server_config.gpus} GPUs at {server_config.gpus_per_node} per node."
+                )
+            model_dirs = [server_config.model_path]
+            if server_config.speculative_model:
+                model_dirs.append(os.path.join(llm_models_root(), server_config.speculative_model))
+            run_cold_warmup(
+                server_cmd,
+                server_env,
+                model_dirs,
+                getattr(server_config, "num_serve_frontends", 1) or 1,
+                self.test_output_dir,
+                server_name,
+                server_idx,
+            )
+
+    def upload_warmup_results_to_database(self) -> None:
+        """Upload one row per server with its cold-start warmup time.
+
+        A row is named ``<server>-warmup`` and carries ``b_warmup_only``, so that it
+        never shares a series with the server's test_e2e rows, and it has no metric
+        that can fail the test.
+        """
+        new_data_dict = {}
+        for server_idx, server_config in enumerate(self.server_configs):
+            if self.runtime == GEN_ONLY_NO_CONTEXT_RUNTIME:
+                _, gen_config, disagg_config = server_config
+                warmup_times = warmup_time_fields(self.test_output_dir, server_idx, ["GEN_0"])
+                new_data = {
+                    "s_gpu_type": self.gpu_type,
+                    "s_runtime": self.runtime,
+                    "s_benchmark_mode": disagg_config.benchmark_mode,
+                    "s_server_env_var": disagg_config.server_env_var,
+                    "l_num_ctx_servers": 0,
+                    "l_num_gen_servers": 1,
+                    **{
+                        f"{key[:2]}gen_{key[2:]}": value
+                        for key, value in gen_config.to_db_data().items()
+                    },
+                    "s_test_case_name": f"{disagg_config.name}-warmup",
+                }
+            else:
+                warmup_times = warmup_time_fields(
+                    self.test_output_dir, server_idx, [AGGREGATE_SERVER_NAME]
+                )
+                new_data = {
+                    "s_gpu_type": self.gpu_type,
+                    "s_runtime": "aggr_server",
+                    **server_config.to_db_data(),
+                    "s_test_case_name": f"{server_config.name}-warmup",
+                }
+            if warmup_times:
+                new_data_dict[server_idx] = {**new_data, **warmup_times, "b_warmup_only": True}
+
+        process_and_upload_test_results(
+            new_data_dict=new_data_dict,
+            match_keys=get_test_case_match_keys(),
+            maximize_metrics=MAXIMIZE_METRICS,
+            minimize_metrics=MINIMIZE_METRICS,
+            regression_metrics=[],
+            extra_fields={
+                "s_stage_name": os.environ.get("stageName", ""),
+                "s_test_list": self._test_param_labels,
+            },
+            upload_to_db=self.upload_to_db,
+            fail_on_regression=False,
+        )
+
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
 
@@ -6150,3 +6407,23 @@ def test_e2e(output_dir, perf_sanity_test_case):
 
     # Upload results to database
     config.upload_test_results_to_database()
+
+
+#: The ids of the aggregated launch path: an aggregated server, ctx_only and
+#: gen_only_no_context.
+WARMUP_TEST_CASES = [
+    case for case in PERF_SANITY_TEST_CASES if case.split("-")[0] in AGG_TEST_TYPES
+]
+
+
+@pytest.mark.parametrize("perf_sanity_test_case", WARMUP_TEST_CASES)
+def test_warmup(output_dir, perf_sanity_test_case):
+    """Upload each server's cold-start warmup time; no benchmark client runs.
+
+    test_e2e's warmup time reuses the caches of the cases before it in the same
+    stage; this one does not depend on them.
+    """
+    config = PerfSanityTestConfig(perf_sanity_test_case, output_dir)
+    config.parse_config_file()
+    config.run_cold_warmups()
+    config.upload_warmup_results_to_database()

@@ -7927,6 +7927,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         4,
         1, true
     )
+    // Cold-start warmup time of the key-model cases (test_warmup): each case every 4 builds,
+    // one split per build.
+    SBSASlurmTestConfigs += buildStageConfigs(
+        "GB300-4_GPUs-PyTorch-PerfSanity-Warmup-Post-Merge-{split}_of_4",
+        "auto:gb300-x4",
+        "l0_gb300_multi_gpus_perf_sanity_warmup",
+        4,
+        4,
+        1, true
+    )
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
 
