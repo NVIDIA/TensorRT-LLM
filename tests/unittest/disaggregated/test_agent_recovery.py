@@ -37,6 +37,9 @@ def worker(monkeypatch):
         _loaded_remote_agents={"decode11"},
         _remote_agent_descriptors={"decode11": b"peer"},
         _deferred_remote_agents={},
+        _peer_transfer_counts={},
+        _device_id=0,
+        _registrar=Mock(),
         _unreleased_statuses=[],
         _shutdown_requested=False,
     )
@@ -222,10 +225,63 @@ def test_failed_peer_replay_retries_without_new_registration(worker, task, monke
         with pytest.raises(transfer._TransferNotSubmittedError):
             submit(sender, task, 1, "dead0")
     replacement.load_remote_agent.assert_called_once_with("dead0", b"stale")
+    new_info = SimpleNamespace(instance_name="dead", instance_rank=0, transfer_engine_info=b"fresh")
+    monkeypatch.setattr(transfer.RankInfo, "from_bytes", Mock(return_value=new_info))
+    sender._register_peer_rank(b"", [transfer.MessageType.REGISTER_RANK_INFO, b""])
+    replacement.load_remote_agent.assert_called_with("dead0", b"fresh")
     replacement.load_remote_agent.side_effect = None
     now[0] = 2.0
     assert submit(sender, task, 1, "dead0") == (True, None)
+    replacement.load_remote_agent.assert_called_with("dead0", b"fresh")
     assert not sender._deferred_remote_agents and not sender._agent_failed
+
+
+def test_reciprocal_peer_refresh_keeps_unrelated_transfers_running(worker, task, monkeypatch):
+    sender, agent = worker._sender, worker._agent
+    sender._agent_failed = False
+    new_info = SimpleNamespace(
+        instance_name="decode", instance_rank=11, transfer_engine_info=b"new"
+    )
+    monkeypatch.setattr(transfer.RankInfo, "from_bytes", Mock(return_value=new_info))
+    original = SimpleNamespace(remote_name="decode11")
+    unrelated = SimpleNamespace(remote_name="other0")
+    with sender._direct_peer_transfers((unrelated,)):
+        with sender._direct_peer_transfers((original,)):
+            sender._register_peer_rank(b"", [transfer.MessageType.REGISTER_RANK_INFO, b""])
+            agent.invalidate_remote_agent.assert_not_called()
+            with pytest.raises(transfer._TransferNotSubmittedError):
+                submit(sender, task, 0)
+        agent.invalidate_remote_agent.assert_called_once_with("decode11")
+        agent.load_remote_agent.assert_called_once_with("decode11", b"new")
+        assert sender._peer_transfer_counts == {"other0": 1}
+        assert sender._agent_generation == 0
+        assert not sender._agent_failed
+    sender._recover_agent.assert_not_called()
+
+
+def test_recovery_releases_terminal_outbound_handles_before_inbound_drain(worker, task):
+    sender, old = worker._sender, worker._agent
+    outbound_retired = threading.Event()
+    status = Mock(in_progress=True, release=Mock(return_value=True))
+
+    def complete(timeout_ms):
+        assert timeout_ms == 0
+        status.in_progress = False
+
+    status.wait.side_effect = complete
+    task._native_inflight = 1
+    sender._unreleased_statuses = [(status, task, outbound_retired)]
+    worker._receiver._sessions[73] = object()
+
+    assert not worker._recover_transfer_agent(0)
+    status.release.assert_called_once()
+    assert outbound_retired.is_set() and task._native_inflight == 0
+    assert worker._receiver._sessions
+    old.shutdown.assert_not_called()
+
+    worker._receiver._sessions.clear()
+    assert worker._recover_transfer_agent(0)
+    old.shutdown.assert_called_once()
 
 
 @pytest.mark.parametrize(

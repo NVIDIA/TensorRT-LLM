@@ -1695,7 +1695,9 @@ def test_legacy_routed_cancel_drains_admitted_writes_and_fences_late_writes(aux)
         sender._submit_transfer(task, 1, request, session=session)
     sender._agent.submit_transfer_requests.assert_called_once_with(request)
     assert session.close()
-    sender._retired_rids[rid] -= sender._RETIRED_SESSION_TTL_S + 1
+    sender._retired_rids[rid] = transfer_mod._RetiredSendSession(
+        time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1, frozenset()
+    )
     sender.sweep_stale_req_infos()
     assert rid not in sender._routed_cancels
     assert rid not in sender._pre_cancelled_rids
@@ -1709,7 +1711,9 @@ def test_routed_cancel_preserves_fence_during_ack_registration(retired) -> None:
     sender._enforce_physical_ownership = False
     sender._context_first_ownership = True
     if retired:
-        sender._retired_rids[rid] = time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1
+        sender._retired_rids[rid] = transfer_mod._RetiredSendSession(
+            time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1, frozenset()
+        )
 
     def get_peer_rank_info(_name, _rank):
         sender.sweep_stale_req_infos()
@@ -1750,6 +1754,63 @@ def test_failed_legacy_bounce_receive_keeps_waiting_after_session_ack() -> None:
     )
     Receiver.send_cancel_to_senders(listener, 112, {"sender"})
     dealer.send.assert_called_once_with([MessageType.CANCEL_SESSION, b"112"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("other_writer_failed", [False, True])
+@pytest.mark.parametrize("sender_retired", [False, True])
+def test_mixed_bounce_rank_receives_proof_for_fenced_first_publication(
+    other_writer_failed, sender_retired
+):
+    rid = 114
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
+    )
+    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender._peer_requests[rid] = {0: SimpleNamespace(instance_rank=0)}
+    sender._handle_cancel_session([MessageType.CANCEL_SESSION, b"114", b"gen", b"0"])
+    if sender_retired:
+        assert ctx.close()
+
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    receiver._registrar = Mock()
+    session = _make_rx_session(receiver, rid)
+    session.receive(_sole_piece())
+    _publish_report_tokens(session, ranks=(0, 1))
+    session._aux_expected_writers = 1
+    result = AgentResult.FAILED if other_writer_failed else AgentResult.SUCCESS
+    session.process_kv_agent_result(1, 0, True, result, _KV_RESULT_REPORT_TOKEN)
+    session.process_aux_agent_result(1, result)
+    assert session.cancel()
+
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=1,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        aux_slot=0,
+        slice_id=0,
+        wants_no_submission_result=True,
+    )
+    sender._respond_with_kv(
+        b"", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
+    assert isinstance(sender._send_task_queues[0].get_nowait(), transfer_mod._SessionQuiescence)
+    endpoint, message = sender._send_task_queues[0].get_nowait()
+    assert endpoint == "1"
+    receiver._get_session = lambda _: session
+    Receiver._process_kv_agent_result(receiver, b"", message)
+
+    slot = _OneSlotAllocator(rid)
+    slot.apply_reuse_decision(not KvCacheTransceiverV2._retirement_blocked(session))
+    assert slot.is_reusable is not other_writer_failed
+    assert not session.kv_write_verified()
+    assert 1 not in (sender._get_req_info(rid) or {})
 
 
 @pytest.mark.cpu_only

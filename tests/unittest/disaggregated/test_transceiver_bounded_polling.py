@@ -208,9 +208,11 @@ def _assert_context_timeout_retains_transfer(
     assert session.aux_slot == 0
     assert req.state is None
     assert not req.py_kv_send_session_retired
-    assert warning.call_count == 2
-    for args, _kwargs in warning.call_args_list:
-        message = args[0]
+    messages = [
+        args[0] for args, _kwargs in warning.call_args_list if args[0].startswith("TxSession ")
+    ]
+    assert len(messages) == 2
+    for message in messages:
         assert "rid=16" in message
         assert "kv_transfer_timeout_ms=60000ms" in message
         assert "keeping it in progress" in message

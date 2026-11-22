@@ -239,6 +239,7 @@ class RecvReqInfo:
     # Context-first receivers send REQUEST_DATA only after the context phase
     # produced the KV cache, so a TxSession must already exist (or have ended).
     context_first: bool = False
+    wants_no_submission_result: bool = False
     # Single-use token the receiver minted for this writer; echoed in every
     # KV result. Carried as a separate REQUEST_DATA frame, not in to_bytes().
     kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
@@ -257,6 +258,7 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "slice_id": self.slice_id,
                 "context_first": self.context_first,
+                **({"wants_no_submission_result": True} if self.wants_no_submission_result else {}),
             }
         )
 
@@ -530,6 +532,7 @@ class AgentResult(Enum):
     FAILED = "FAILED"
     IN_DOUBT = "IN_DOUBT"
     FAILED_QUIESCED = "FAILED_QUIESCED"
+    NOT_SUBMITTED = "NOT_SUBMITTED"
 
 
 # KV_AGENT_RESULT is [type, frame]; the frame is one binary struct carrying instance_rank,
@@ -542,12 +545,14 @@ _AGENT_RESULT_CODE = {
     AgentResult.FAILED: 1,
     AgentResult.IN_DOUBT: 2,
     AgentResult.FAILED_QUIESCED: 3,
+    AgentResult.NOT_SUBMITTED: 4,
 }
 _AGENT_RESULT_BY_CODE = {
     0: AgentResult.SUCCESS,
     1: AgentResult.FAILED,
     2: AgentResult.IN_DOUBT,
     3: AgentResult.FAILED_QUIESCED,
+    4: AgentResult.NOT_SUBMITTED,
 }
 
 
@@ -736,6 +741,12 @@ class _SessionQuiescence:
     endpoint: Optional[str]
 
 
+@dataclass(frozen=True)
+class _RetiredSendSession:
+    retired_at: float
+    published_peer_ranks: frozenset[int]
+
+
 class Sender(SenderBase):
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
@@ -778,11 +789,11 @@ class Sender(SenderBase):
         self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
         self._routed_cancels: set[int] = set()
         self._quiescence_closed = False
-        # unique_rid -> clear time, for sessions already cleared (completed, failed, cancelled or
+        # Sessions already cleared (completed, failed, cancelled or
         # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
         # parking it as an early generation-first request would leave the peer's receive
         # unresolved for good. Protected by _sessions_lock.
-        self._retired_rids: dict[int, float] = {}
+        self._retired_rids: dict[int, _RetiredSendSession] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -798,6 +809,7 @@ class Sender(SenderBase):
         self._recover_agent: Optional[Callable[[int], None]] = None
         self._remote_agent_descriptors: dict[str, bytes] = {}
         self._deferred_remote_agents: dict[str, tuple[bytes, float]] = {}
+        self._peer_transfer_counts: dict[str, int] = {}
         self._unreleased_statuses: list[tuple[TransferStatus, SendTaskBase, threading.Event]] = []
         self._ownership_poisoned: Optional[Exception] = None
         self._ownership_poison_lock = (
@@ -906,8 +918,8 @@ class Sender(SenderBase):
         with self._sessions_lock:
             # Oldest first (see clear_session), so only expired entries are visited.
             expired = []
-            for rid, ts in self._retired_rids.items():
-                if now - ts <= self._RETIRED_SESSION_TTL_S:
+            for rid, retired in self._retired_rids.items():
+                if now - retired.retired_at <= self._RETIRED_SESSION_TTL_S:
                     break
                 expired.append(rid)
             pending_rids = (
@@ -1130,27 +1142,46 @@ class Sender(SenderBase):
             return self._get_or_connect_dealer(endpoint)
         return self._get_or_connect_thread_dealer(endpoint)
 
-    def _retry_deferred_peer(self, name: str) -> None:
-        """Retry a failed replay on demand, at most once per peer per second."""
-        # Match recovery's descriptor-lock -> operation-gate ordering. This
-        # runs before acquiring a transfer lease and never fences healthy peers.
-        if name not in self._deferred_remote_agents:
+    def _load_deferred_peer_locked(self, name: str) -> None:
+        pending = self._deferred_remote_agents.get(name)
+        if pending is None or self._agent_failed or self._shutdown_requested:
             return
+        descriptor, retry_at = pending
+        if self._peer_transfer_counts.get(name) or time.monotonic() < retry_at:
+            return
+        try:
+            if name in self._loaded_remote_agents:
+                self._agent.invalidate_remote_agent(name)
+                self._loaded_remote_agents.discard(name)
+            self._agent.load_remote_agent(name, descriptor)
+        except RuntimeError:
+            self._deferred_remote_agents[name] = (descriptor, time.monotonic() + 1.0)
+            return
+        self._remote_agent_descriptors[name] = descriptor
+        self._loaded_remote_agents.add(name)
+        del self._deferred_remote_agents[name]
+
+    @contextmanager
+    def _direct_peer_transfers(self, requests: tuple[TransferRequest, ...]):
+        names = {request.remote_name for request in requests}
         with self._loaded_remote_agents_lock:
-            pending = self._deferred_remote_agents.get(name)
-            if pending is None or self._agent_failed or self._shutdown_requested:
-                return
-            descriptor, retry_at = pending
-            if time.monotonic() < retry_at:
-                return
-            try:
-                self._agent.load_remote_agent(name, descriptor)
-            except RuntimeError:
-                self._deferred_remote_agents[name] = (descriptor, time.monotonic() + 1.0)
-                return
-            self._remote_agent_descriptors[name] = descriptor
-            self._loaded_remote_agents.add(name)
-            del self._deferred_remote_agents[name]
+            for name in names:
+                self._load_deferred_peer_locked(name)
+                if name in self._deferred_remote_agents:
+                    raise _TransferNotSubmittedError(
+                        f"NIXL peer {name} is awaiting metadata refresh"
+                    )
+            for name in names:
+                self._peer_transfer_counts[name] = self._peer_transfer_counts.get(name, 0) + 1
+        try:
+            yield
+        finally:
+            with self._loaded_remote_agents_lock:
+                for name in names:
+                    self._peer_transfer_counts[name] -= 1
+                    if self._peer_transfer_counts[name] == 0:
+                        del self._peer_transfer_counts[name]
+                        self._load_deferred_peer_locked(name)
 
     def _submit_direct_transfer(
         self,
@@ -1163,9 +1194,7 @@ class Sender(SenderBase):
         recover = self._recover_agent
         assert recover is not None
         retirement_event = None
-        for member in requests:
-            self._retry_deferred_peer(member.remote_name)
-        with self._agent_operation_gate.transfer():
+        with self._direct_peer_transfers(requests), self._agent_operation_gate.transfer():
             generation = self._agent_generation
             if agent_generation is not None and agent_generation != generation:
                 return False, "transfer belongs to a retired NIXL agent generation"
@@ -1237,9 +1266,6 @@ class Sender(SenderBase):
                                         retired = status.release()
                                     except RuntimeError:
                                         retired = False
-                                # An interrupted wait is not a terminal backend result.
-                                if not completed and self._agent_failed:
-                                    retired = False
                             if not retired:
                                 retirement_event = threading.Event()
                                 self._unreleased_statuses.append((status, task, retirement_event))
@@ -2294,29 +2320,20 @@ class Sender(SenderBase):
         with self._loaded_remote_agents_lock:
             if self._shutdown_requested:
                 return
-            self._deferred_remote_agents.pop(agent_name, None)
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
             if getattr(self, "_recover_agent", None) is None:
                 self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
+                self._loaded_remote_agents.add(agent_name)
             else:
-                previous = self._remote_agent_descriptors.get(agent_name)
-                if self._agent_failed:
-                    self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
-                    self._loaded_remote_agents.add(agent_name)
-                    return
-                replacing = previous is not None and previous != ri.transfer_engine_info
-                if replacing:
-                    self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
-                    with self._admission_lock:
-                        self._agent_failed = True
-                    self._recover_agent(self._agent_generation)
-                    return
-                with nullcontext():
-                    if replacing:
-                        self._agent.invalidate_remote_agent(agent_name)
-                    self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
-                    self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
-            self._loaded_remote_agents.add(agent_name)
+                descriptor = ri.transfer_engine_info
+                pending = self._deferred_remote_agents.get(agent_name)
+                if (
+                    pending is not None
+                    or self._remote_agent_descriptors.get(agent_name) != descriptor
+                ):
+                    if pending is None or pending[0] != descriptor:
+                        self._deferred_remote_agents[agent_name] = (descriptor, 0.0)
+                    self._load_deferred_peer_locked(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
@@ -2460,6 +2477,15 @@ class Sender(SenderBase):
                 self.ownership_enabled(info.context_first)
                 or info.unique_rid in getattr(self, "_routed_cancels", ())
             )
+            rejected_publication = False
+            if fenced and info.wants_no_submission_result:
+                closed_session = self._retired_rids.get(info.unique_rid)
+                published = (
+                    closed_session.published_peer_ranks
+                    if closed_session is not None
+                    else self._get_req_info(info.unique_rid) or {}
+                )
+                rejected_publication = info.instance_rank not in published
             refused = False
             retired = False
             if session is None and not fenced:
@@ -2497,6 +2523,21 @@ class Sender(SenderBase):
                     timestamp=received_timestamp,
                 )
         if fenced:
+            if rejected_publication:
+                # This receiver publication never entered the dispatch table.
+                # Echo its token so it cannot settle any earlier publication.
+                message = _make_kv_result_msg(
+                    self._instance_rank,
+                    info.unique_rid,
+                    info.slice_id or 0,
+                    True,
+                    AgentResult.NOT_SUBMITTED,
+                    kv_result_report_token=info.kv_result_report_token,
+                )
+                self._route_result_messages_to_receiver(
+                    info, self._get_result_receiver_endpoint(info), [message], defer_to_worker=True
+                )
+                return
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
         if session is None:
@@ -2704,7 +2745,9 @@ class Sender(SenderBase):
                 del self._sessions[unique_rid]
                 # Re-insert so the dict stays ordered by clear time.
                 self._retired_rids.pop(unique_rid, None)
-                self._retired_rids[unique_rid] = time.monotonic()
+                self._retired_rids[unique_rid] = _RetiredSendSession(
+                    time.monotonic(), frozenset(self._get_req_info(unique_rid) or ())
+                )
         self._remove_req_info(unique_rid)
 
     def send_cancel_to_receivers(self, unique_rid: int, *, failure: bool = False) -> None:
@@ -3394,6 +3437,7 @@ class KVRecvTask(_LogicalTask):
         self.expected_transfers = 0
         # One terminal result per writer rank, keyed by the rank the result frame carries.
         self._writer_reports: dict[int, bool] = {}
+        self._unsubmitted_writers: set[int] = set()
         # Verified-range admission accounting: the receiver-computed byte
         # total the writers must cover for this piece, and the bytes the
         # writers attested as actually submitted-and-completed. None means
@@ -3729,6 +3773,10 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
             context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
+            wants_no_submission_result=(
+                not task._enforce_physical_ownership
+                and getattr(getattr(self, "_agent", None), "bounce_enabled", False) is True
+            ),
         )
 
     def dispatch_task(self, task: KVRecvTask) -> None:
@@ -4642,6 +4690,16 @@ class RxSession(RxSessionBase):
                     f"KV result for request {self.request_id} slice={receiver_slice_id} "
                     f"does not match the report token published for writer {peer_rank}"
                 )
+            if status == AgentResult.NOT_SUBMITTED:
+                if not self._uses_legacy_bounce:
+                    raise RuntimeError("unexpected no-submission evidence")
+                if peer_rank in task._writer_reports:
+                    return
+                task._unsubmitted_writers.add(peer_rank)
+                task.fail(RuntimeError("CTX fenced this destination before submission"))
+                if self._terminal_status is None:
+                    self._terminal_status = SessionStatus.ERROR
+                return
             if status not in (
                 AgentResult.SUCCESS,
                 AgentResult.FAILED,
@@ -4892,13 +4950,10 @@ class RxSession(RxSessionBase):
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
             if self._terminal_status == SessionStatus.CANCELLED:
-                quiesced = self._legacy_quiesced_writers
                 return (
                     not any(
                         (
-                            task._kv_result_report_tokens.keys()
-                            - task._writer_reports.keys()
-                            - quiesced
+                            self._legacy_outstanding_writers(task)
                             if task._legacy_published and task._kv_result_report_tokens
                             else task.status == TaskStatus.TRANSFERRING
                         )
@@ -4917,6 +4972,18 @@ class RxSession(RxSessionBase):
         aux_drained = self._aux_physical_owner is None or self._aux_physical_owner.resources_drained
         return kv_drained and aux_drained
 
+    def _legacy_outstanding_writers(self, task: KVRecvTask) -> set[int]:
+        reports = task._writer_reports.keys()
+        if self._uses_legacy_bounce and task._unsubmitted_writers:
+            # A failed bounce writer can still have a scatter in progress.
+            reports = {rank for rank, succeeded in task._writer_reports.items() if succeeded}
+        return (
+            task._kv_result_report_tokens.keys()
+            - reports
+            - self._legacy_quiesced_writers
+            - task._unsubmitted_writers
+        )
+
     def record_recovery_failure(self, error: Exception) -> None:
         """Latch failure before drain cancellation can claim the outcome."""
         with self.lock:
@@ -4934,11 +5001,21 @@ class RxSession(RxSessionBase):
     def _terminal_aux_awaits_writers(self) -> bool:
         if self._aux_expected_writers == 0:
             return False
-        if self._terminal_status == SessionStatus.CANCELLED or self._legacy_quiesced_writers:
-            tokens = self._kv_tasks[0]._kv_result_report_tokens
+        first_task = self._kv_tasks[0]
+        if (
+            self._terminal_status == SessionStatus.CANCELLED
+            or self._legacy_quiesced_writers
+            or first_task._unsubmitted_writers
+        ):
+            tokens = first_task._kv_result_report_tokens
             if not tokens:
                 return len(self._aux_writer_reports) < self._aux_expected_writers
-            return bool(tokens.keys() - self._aux_writer_reports - self._legacy_quiesced_writers)
+            return bool(
+                tokens.keys()
+                - self._aux_writer_reports
+                - self._legacy_quiesced_writers
+                - first_task._unsubmitted_writers
+            )
         return (
             self._logical_outcomes.failed
             and len(self._aux_writer_reports) < self._aux_expected_writers
@@ -5049,12 +5126,9 @@ class RxSession(RxSessionBase):
         if self._writer_wait_expired:
             return False
         if not any(
-            bool(
-                task._kv_result_report_tokens.keys()
-                - task._writer_reports.keys()
-                - self._legacy_quiesced_writers
-            )
-            if self._legacy_quiesced_writers and task._kv_result_report_tokens
+            self._legacy_outstanding_writers(task)
+            if (self._legacy_quiesced_writers or task._unsubmitted_writers)
+            and task._kv_result_report_tokens
             else task.reports_outstanding
             for task in self._kv_tasks
         ):
@@ -5694,17 +5768,31 @@ class TransferWorker:
         with sender._loaded_remote_agents_lock, sender._agent_operation_gate.metadata():
             if failed_generation != sender._agent_generation or not sender._agent_failed:
                 return True
+            pending = []
+            active = False
+            for status, task, retired in sender._unreleased_statuses:
+                try:
+                    if status.in_progress:
+                        status.wait(timeout_ms=0)
+                    released = not status.in_progress and status.release()
+                except RuntimeError:
+                    released = False
+                if released:
+                    with task.lock:
+                        task._native_inflight -= 1
+                    retired.set()
+                else:
+                    active |= status.in_progress
+                    pending.append((status, task, retired))
+            sender._unreleased_statuses[:] = pending
+            if active:
+                return False
             with receiver._sessions_lock:
                 for rid, entry in list(receiver._sessions.items()):
                     if isinstance(entry, weakref.ReferenceType) and entry() is None:
                         del receiver._sessions[rid]
                 if receiver._sessions:
                     return False
-                for status, _task, _retired in sender._unreleased_statuses:
-                    if getattr(status, "in_progress", False) is True:
-                        status.wait(timeout_ms=0)
-                        if getattr(status, "in_progress", False) is True:
-                            return False
                 old_agent = self._agent
                 try:
                     if old_agent is not None:
@@ -5727,14 +5815,25 @@ class TransferWorker:
                         for desc in self._registered_mem:
                             agent.register_memory(desc)
                             check_deadline()
-                        for name, descriptor in list(sender._remote_agent_descriptors.items()):
+                        descriptors = sender._remote_agent_descriptors | {
+                            name: descriptor
+                            for name, (
+                                descriptor,
+                                _retry_at,
+                            ) in sender._deferred_remote_agents.items()
+                        }
+                        for name, descriptor in descriptors.items():
                             try:
                                 agent.load_remote_agent(name, descriptor)
                             except RuntimeError as error:
                                 logger.warning(f"Dropping unavailable NIXL peer {name}: {error}")
                                 sender._deferred_remote_agents[name] = (descriptor, 0.0)
-                                del sender._remote_agent_descriptors[name]
+                                sender._remote_agent_descriptors.pop(name, None)
                                 sender._loaded_remote_agents.discard(name)
+                            else:
+                                sender._remote_agent_descriptors[name] = descriptor
+                                sender._deferred_remote_agents.pop(name, None)
+                                sender._loaded_remote_agents.add(name)
                         descriptor = bytes(agent.get_local_agent_desc())
                         check_deadline()
                     except Exception:
