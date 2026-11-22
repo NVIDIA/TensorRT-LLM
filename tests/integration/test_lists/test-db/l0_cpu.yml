@@ -353,6 +353,7 @@ l0_cpu:
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
   - unittest/executor/test_llm_result_unpickle.py
+  - unittest/executor/test_undelivered_exports.py
   - unittest/grpc/openengine/test_coordinator.py
   - unittest/_torch/test_shared_tensor_cpu.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py

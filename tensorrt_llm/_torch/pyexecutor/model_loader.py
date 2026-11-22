@@ -42,6 +42,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from ..kernel_builder import KernelBuilder
 from ..locality_domain.policy import LocalityDomainPolicy
+from ..memory.monitor import claims as monitor_claims
+from ..memory.monitor import names as monitor_names
 from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
                           wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
@@ -1611,6 +1613,10 @@ class ModelLoader:
         # checkpoint.
         if self._deferred is None:
             self._finish_load()
+        # Attribute the parameters the model ended up with, whichever load
+        # path produced them (a deferred load keeps the same modules). Only a
+        # weak reference; read when reporting.
+        monitor_claims.claim_module_memory(model, monitor_names.WEIGHTS)
         return model, moe_load_balancer
 
     def _timed_load(
@@ -2191,6 +2197,7 @@ class ModelLoader:
             replicate_embedding=self.llm_args.replicate_embedding,
             cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
                 self.llm_args, self.max_num_tokens, self.spec_config),
+            max_batch_size=self.llm_args.max_batch_size,
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,

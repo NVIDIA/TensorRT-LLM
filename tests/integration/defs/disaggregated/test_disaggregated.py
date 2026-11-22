@@ -2142,12 +2142,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
     # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
     # and gen TP2 yields the 16 heads/rank the lib's bf16-KV path admits at any
-    # batch size (the fp8 checkpoint keeps a bf16 KV cache), so the lib takes
-    # essentially every gen forward. Require its kernel-compile marker (logged
+    # batch size (the fp8 checkpoint keeps a bf16 KV cache). Select the lib
+    # explicitly on the generation server. Require its kernel-compile marker (logged
     # at INFO) in a generation-worker log: correct client output alone would
     # not distinguish the CuTe DSL path from a silent fallback to another FMHA
-    # library. TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
-    # documented off switch.
+    # library.
     gen_env = None
     assert_gen_log_contains = None
     # Default readiness budget. On Blackwell (SM100/103) the CuTe DSL MLA decode
@@ -2159,7 +2158,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # there rather than delaying those failures.
     server_start_timeout = 300
     if get_sm_version() in (100, 103):
-        gen_env = {"TLLM_LOG_LEVEL": "INFO"}
+        gen_env = {
+            "TLLM_LOG_LEVEL": "INFO",
+            "TLLM_FMHA_LIBS": "cute_dsl_mla,fallback"
+        }
         assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
         server_start_timeout = 1200
 

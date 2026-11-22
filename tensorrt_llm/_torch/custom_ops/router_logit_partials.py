@@ -14,9 +14,14 @@ from typing import List, Sequence
 
 import torch
 
+from tensorrt_llm._utils import is_blackwell_datacenter
+
 # Token counts served by partials (up to the hi GEN batch, 320 requests x 4 rows); the router GEMM keeps its
 # other paths outside them.
 MIN_ROWS = 65
+# Fewest rows for callers that opt in (``small_m``) on SM100/SM103: below them the small-M
+# warp-MMA router GEMM is faster.
+SMALL_M_MIN_ROWS = 12
 MAX_ROWS = 1280
 
 
@@ -53,11 +58,13 @@ def num_splits(num_tokens: int, num_experts: int) -> int:
     return 8 if num_logits <= 256 * 384 else 4 if num_logits <= 768 * 384 else 2
 
 
-def applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether ``router_logit_partials`` serves ``x @ weight.T``."""
+def applies(x: torch.Tensor, weight: torch.Tensor, small_m: bool = False) -> bool:
+    """Whether ``router_logit_partials`` serves ``x @ weight.T``; with ``small_m`` from
+    ``SMALL_M_MIN_ROWS`` rows on SM100/SM103."""
     num_tokens, hidden = x.shape
+    min_rows = SMALL_M_MIN_ROWS if small_m and is_blackwell_datacenter() else MIN_ROWS
     return (
-        MIN_ROWS <= num_tokens <= MAX_ROWS
+        min_rows <= num_tokens <= MAX_ROWS
         and x.is_cuda
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
