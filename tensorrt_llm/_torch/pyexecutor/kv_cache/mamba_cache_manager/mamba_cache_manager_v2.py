@@ -946,8 +946,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         The live floor grows with max_batch_size (resident sequences scale
         with max_batch_size * pp_size). Search in [0, max_batch_size).
+        The CUDA-graph padding dummy slots also depend on max_batch_size
+        (draft_len_schedule), so each candidate uses its own count.
         """
         original = self.max_batch_size
+        original_dummy_slots = self._num_reserved_dummy_slots
         if original <= 0:
             return 0
         try:
@@ -955,6 +958,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             while low + 1 < high:
                 mid = (low + high) // 2
                 self.max_batch_size = mid
+                dummy_slots = _get_num_cuda_graph_padding_dummy_slots(self.spec_config, mid)
+                self._num_reserved_dummy_slots = dummy_slots + int(self.mapping.enable_attention_dp)
                 if self._minimum_live_gpu_quota() <= gpu_quota:
                     low = mid
                 else:
@@ -962,6 +967,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return low
         finally:
             self.max_batch_size = original
+            self._num_reserved_dummy_slots = original_dummy_slots
 
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states, one attention page and the fixed regions."""

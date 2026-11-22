@@ -3488,7 +3488,7 @@ def _live_quota_floor_stub(
     max_batch_size: int = 2,
     pp_size: int = 1,
     gen_preemption_headroom: int = 0,
-    dummy_slots: int = 1,
+    spec_config: MTPDecodingConfig | None = None,
 ) -> MambaHybridCacheManagerV2:
     """A V2 hybrid manager stub for live GPU-quota checks. No CUDA."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
@@ -3502,7 +3502,10 @@ def _live_quota_floor_stub(
     mgr._mamba_layer_mask = [True, False]
     mgr.ssm_bytes = 64
     mgr.conv_bytes = 32
-    mgr._num_reserved_dummy_slots = dummy_slots
+    mgr.spec_config = spec_config
+    mgr._num_reserved_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
+        spec_config, max_batch_size
+    )
     mgr.tokens_per_block = 32
     mgr.num_local_layers = 2
     mgr.pp_layers = [0, 1]
@@ -3596,6 +3599,24 @@ def test_v2_hybrid_quota_error_when_even_batch_size_one_does_not_fit():
     assert "a value of" not in message
     assert mgr._largest_max_batch_size_for_gpu_quota(quota) == 0
     assert mgr.max_batch_size == 2
+
+
+@pytest.mark.cpu_only
+def test_v2_hybrid_quota_search_recomputes_dummy_slots_per_batch_size():
+    # max_batch_size=2 reaches draft lengths {4, 2} (two dummy slots), while
+    # max_batch_size=1 only reaches 4 (one dummy slot).
+    spec_config = MTPDecodingConfig(max_draft_len=4, draft_len_schedule={1: 4, 2: 2})
+    mgr = _live_quota_floor_stub(max_batch_size=2, spec_config=spec_config)
+    one = _live_quota_floor_stub(max_batch_size=1, spec_config=spec_config)
+    assert mgr._num_reserved_dummy_slots == 2
+    assert one._num_reserved_dummy_slots == 1
+    quota = one._minimum_live_gpu_quota()
+    assert mgr._minimum_live_gpu_quota() > quota
+
+    assert mgr._largest_max_batch_size_for_gpu_quota(quota) == 1
+    # The search must not leave the configured state mutated.
+    assert mgr.max_batch_size == 2
+    assert mgr._num_reserved_dummy_slots == 2
 
 
 @skip_no_cuda
