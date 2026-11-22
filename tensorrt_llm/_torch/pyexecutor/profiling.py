@@ -70,11 +70,20 @@ KV_POOL_LOG_ENV_VAR_NAME = "TLLM_KV_POOL_LOG"
 
 
 def load_kv_pool_log_enabled(env_var: str = KV_POOL_LOG_ENV_VAR_NAME) -> bool:
-    """Parse the per-pool KV cache log switch: ``1`` enables it; unset, empty or ``0`` does not."""
-    raw = os.environ.get(env_var, "").strip()
-    if raw not in ("", "0", "1"):
-        raise ValueError(f"Environment variable `{env_var}` must be 0 or 1, got {raw!r}")
-    return raw == "1"
+    """Parse the per-pool KV cache log switch, ignoring case and surrounding spaces.
+
+    ``1``, ``true``, ``on`` and ``yes`` enable it; unset, empty, ``0``, ``false``, ``off`` and
+    ``no`` do not. Any other value leaves it disabled with a warning.
+    """
+    raw = os.environ.get(env_var, "").strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw not in ("", "0", "false", "off", "no"):
+        logger.warning(
+            f"Ignoring unrecognized {env_var}={raw!r}; per-pool KV cache logging stays "
+            "disabled. Use 1/true/on/yes to enable it."
+        )
+    return False
 
 
 # The iteration log refreshes kv_cache_util (a full KV cache stats build) once
@@ -859,8 +868,6 @@ class PyExecutorProfileManager:
         self.metrics = executor._perf_metrics
         self.metrics_logger = LoggerExposure(logger.info)
         self._metrics_log_rank_enabled = False
-        # Parsed here so a malformed value fails at construction (like
-        # ``TLLM_PROFILE_START_STOP``) instead of on the executor thread.
         self._kv_pool_log_enabled = load_kv_pool_log_enabled()
         self._kv_pool_rank_snapshot = None
         self._kv_pool_gib_logged = False
@@ -954,7 +961,7 @@ class PyExecutorProfileManager:
             and not (executor._is_kv_manager_v2 and executor.print_log)
         ):
             logger.warning(
-                f"{KV_POOL_LOG_ENV_VAR_NAME}=1 has no "
+                f"{KV_POOL_LOG_ENV_VAR_NAME} has no "
                 "effect: per-pool KV cache logging requires KV Cache Manager V2 and "
                 "print_iter_log=True."
             )

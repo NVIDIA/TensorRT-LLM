@@ -7,6 +7,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor import profiling
 from tensorrt_llm._torch.pyexecutor.profiling import (
     KV_POOL_LOG_ENV_VAR_NAME,
     PyExecutorProfileManager,
@@ -240,18 +241,36 @@ def test_pool_fields_stay_out_of_the_collected_record(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "raw,expected", [(None, False), ("", False), ("  ", False), ("0", False), (" 1 ", True)]
+    "raw,expected",
+    [
+        (None, False),
+        ("", False),
+        ("0", False),
+        (" False ", False),
+        ("off", False),
+        ("no", False),
+        ("1", True),
+        (" True ", True),
+        ("ON", True),
+        ("yes", True),
+    ],
 )
 def test_load_kv_pool_log_enabled(monkeypatch, raw, expected):
     if raw is None:
         monkeypatch.delenv(KV_POOL_LOG_ENV_VAR_NAME, raising=False)
     else:
         monkeypatch.setenv(KV_POOL_LOG_ENV_VAR_NAME, raw)
+    warning = Mock()
+    monkeypatch.setattr(profiling.logger, "warning", warning)
     assert load_kv_pool_log_enabled() is expected
+    warning.assert_not_called()
 
 
-@pytest.mark.parametrize("raw", ["2", "50", "yes", "-1"])
-def test_invalid_switch_fails_at_construction_and_names_the_variable(monkeypatch, raw):
+@pytest.mark.parametrize("raw", ["2", "50", "ture"])
+def test_unrecognized_switch_stays_disabled_with_a_warning(monkeypatch, raw):
     monkeypatch.setenv(KV_POOL_LOG_ENV_VAR_NAME, raw)
-    with pytest.raises(ValueError, match=KV_POOL_LOG_ENV_VAR_NAME):
-        PyExecutorProfileManager(Mock())
+    warning = Mock()
+    monkeypatch.setattr(profiling.logger, "warning", warning)
+    assert load_kv_pool_log_enabled() is False
+    warning.assert_called_once()
+    assert KV_POOL_LOG_ENV_VAR_NAME in warning.call_args.args[0]
