@@ -54,7 +54,9 @@ ADMISSION_TIMEOUT_S = 20.0
 # progress is bounded by the hang timeout instead.
 DEAD_TIMEOUT_S = 60.0
 HELLO_TIMEOUT_S = 10.0
-RENDEZVOUS_TIMEOUT_S = 600.0
+# Startup progress counts completed startup collectives, and a large MoE model can spend most of
+# this loading its weights and tuning before its next collective completes.
+RENDEZVOUS_TIMEOUT_S = 1800.0
 # Node supervisors start with the job and connect within seconds of the authority, so one still
 # missing after this is a launch mistake.
 NODE_SUPERVISOR_TIMEOUT_S = 60.0
