@@ -388,7 +388,7 @@ def test_rebalance_reserves_execution_row_before_resuming_real_requests(
 ) -> None:
     executor = _make_executor()
     executor._enable_remote_tail_adp = True
-    executor.resource_manager = SimpleNamespace(resource_managers={})
+    executor._read_kv_cache_capacity = Mock(return_value={})
     real = SimpleNamespace(py_request_id=1)
     dummy = SimpleNamespace(py_request_id=2)
     executor.active_requests = [real]

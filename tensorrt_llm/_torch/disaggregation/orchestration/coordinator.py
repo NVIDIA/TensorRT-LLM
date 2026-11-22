@@ -20,6 +20,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 )
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.logger import logger
@@ -78,13 +79,6 @@ def transfer_window_bypass_eligible(transceiver, dist, is_kv_manager_v2: bool) -
         and dist.pp_size == 1
         and is_kv_manager_v2
     )
-
-
-def attach_ctx_usage(request: LlmRequest, response) -> None:
-    """Copy gen-first context usage from the transfer aux data onto the response."""
-    disagg_params = request.py_disaggregated_params
-    if disagg_params is not None and disagg_params.ctx_usage is not None:
-        response.result.ctx_usage = disagg_params.ctx_usage
 
 
 class DisaggTransferCoordinator:
@@ -1140,13 +1134,7 @@ class DisaggTransferCoordinator:
                 return
             # Create the response while the state is still TRANS_IN_PROGRESS
             # (required by C++ createResult).
-            response = request.create_response()
-            if response:
-                response.result.cached_tokens = request.cached_tokens
-                response.result.ctx_computed_tokens = getattr(request, "py_ctx_computed_tokens", 0)
-                response.result.ctx_first_begin = getattr(request, "py_ctx_first_begin", -1)
-                response.result.ctx_num_chunks = getattr(request, "py_ctx_num_chunks", 0)
-                attach_ctx_usage(request, response)
+            response = prepare_response(request)
             released = self._transfers.end_transfer(request)
             if released:
                 self._registry.remove(request)

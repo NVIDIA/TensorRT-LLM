@@ -259,7 +259,7 @@ class PrefillMoe(OpWrapper):
     :class:`PrefillMoeWorkspace`. Returns BF16 ``[T, H]``.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # GLM-5.3-Flash at moe_tp4: hidden 4096, intermediate 2048 / 4 = 512, 288 experts. The
     # target runs every row of a step with context rows here (the rows gathered from all

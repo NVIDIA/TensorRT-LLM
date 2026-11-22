@@ -36,14 +36,17 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_LOCK = _REPO_ROOT / "3rdparty" / "vendor_sources.lock.yaml"
 _SCHEMA_VERSION = 1
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
 _DIGEST_PREFIX = "sha256-tree-v1:"
 _PATCH_DIGEST_PREFIX = "sha256:"
 _GIT_TIMEOUT_SECONDS = 60
+# A vendor lock at <scope>/3rdparty/vendor_sources.lock.yaml manages destinations under <scope>
+# and keeps its persistent patches in <scope>/3rdparty/vendor_patches/.
+_LOCK_FILENAME = "vendor_sources.lock.yaml"
+_CONTROL_DIRECTORY = "3rdparty"
+_PATCH_DIRECTORY = PurePosixPath(_CONTROL_DIRECTORY, "vendor_patches")
 _GIT_LOCAL_ENVIRONMENT_VARIABLES = {
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_ATTR_GLOBAL",
@@ -64,6 +67,14 @@ _GIT_LOCAL_ENVIRONMENT_VARIABLES = {
     "GIT_REPLACE_REF_BASE",
     "GIT_SHALLOW_FILE",
     "GIT_WORK_TREE",
+}
+# The tools choose their own pathspec semantics: GIT_LITERAL_PATHSPECS here, and explicit magic
+# such as :(top,literal) in promotion. An inherited global mode would change or reject them.
+_GIT_PATHSPEC_ENVIRONMENT_VARIABLES = {
+    "GIT_GLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
 }
 _VENDOR_FIELDS = {
     "url",
@@ -235,6 +246,17 @@ def _validate_relative_path(value: object, description: str) -> str:
     return path.as_posix()
 
 
+def _lock_location(value: str, description: str) -> str:
+    """Return a repository-relative lock path that follows the lock layout rule."""
+    relative = PurePosixPath(_validate_relative_path(value, description))
+    if relative.name != _LOCK_FILENAME or relative.parent.name != _CONTROL_DIRECTORY:
+        raise VendorError(
+            f"{description} must be <scope>/{_CONTROL_DIRECTORY}/{_LOCK_FILENAME} "
+            f"relative to the repository root: {value!r}."
+        )
+    return relative.as_posix()
+
+
 def _validate_url(value: object, vendor_name: str) -> str:
     url = _require_string(value, f"Vendor {vendor_name!r} url")
     parsed = urllib.parse.urlsplit(url)
@@ -326,7 +348,7 @@ def _validate_vendor(name: object, value: object) -> Vendor:
         if patch_value is None
         else _validate_relative_path(patch_value, f"Vendor {vendor_name!r} patch")
     )
-    expected_patch = f"3rdparty/vendor_patches/{vendor_name}.patch"
+    expected_patch = f"{_PATCH_DIRECTORY}/{vendor_name}.patch"
     if patch is not None and patch != expected_patch:
         raise VendorError(f"Vendor {vendor_name!r} patch must be {expected_patch!r}.")
     patch_digest_value = mapping.get("patch_digest")
@@ -358,9 +380,13 @@ def _validate_vendor(name: object, value: object) -> Vendor:
 
 
 def _consumer_root(lock_path: Path) -> Path:
-    if lock_path.parent.name == "3rdparty":
+    if lock_path.parent.name == _CONTROL_DIRECTORY:
         return lock_path.parent.parent.resolve()
     return lock_path.parent.resolve()
+
+
+def _paths_overlap(first: PurePosixPath, second: PurePosixPath) -> bool:
+    return first == second or first.is_relative_to(second) or second.is_relative_to(first)
 
 
 def _validate_destination_layout(lock: LockFile) -> None:
@@ -369,37 +395,22 @@ def _validate_destination_layout(lock: LockFile) -> None:
         lock_relative = PurePosixPath(lock.path.relative_to(lock.root).as_posix())
     except ValueError as error:
         raise VendorError(f"Vendor lock must be inside the consumer root: {lock.path}.") from error
-    patch_directory = PurePosixPath("3rdparty/vendor_patches")
     for name, vendor in lock.vendors.items():
         path = PurePosixPath(vendor.destination)
         for other_name, other_path in destinations:
-            if (
-                path == other_path
-                or path.is_relative_to(other_path)
-                or other_path.is_relative_to(path)
-            ):
+            if _paths_overlap(path, other_path):
                 raise VendorError(
                     f"Vendor destinations overlap: {name!r} ({path}) and {other_name!r} ({other_path})."
                 )
         destinations.append((name, path))
-        if (
-            path == patch_directory
-            or path.is_relative_to(patch_directory)
-            or patch_directory.is_relative_to(path)
-        ):
+        if _paths_overlap(path, _PATCH_DIRECTORY):
             raise VendorError(
                 f"Vendor {name!r} destination overlaps vendoring control files: {path}."
             )
         if lock_relative == path or lock_relative.is_relative_to(path):
             raise VendorError(f"Vendor {name!r} destination contains the vendor lock: {path}.")
-        if vendor.patch is not None:
-            patch_path = PurePosixPath(vendor.patch)
-            if (
-                patch_path == path
-                or patch_path.is_relative_to(path)
-                or path.is_relative_to(patch_path)
-            ):
-                raise VendorError(f"Vendor {name!r} destination overlaps its patch path: {path}.")
+        if vendor.patch is not None and _paths_overlap(PurePosixPath(vendor.patch), path):
+            raise VendorError(f"Vendor {name!r} destination overlaps its patch path: {path}.")
 
 
 def _load_lock(
@@ -498,6 +509,151 @@ def _checked_root_path(root: Path, relative_path: str, description: str) -> Path
         if not current.exists():
             break
     return target
+
+
+@dataclasses.dataclass
+class LockSet:
+    """Every vendor lock tracked in one Git work tree."""
+
+    work_tree: Path
+    locks: list[LockFile]
+
+
+def _work_tree(directory: Path) -> Path:
+    try:
+        output = _run_git(["rev-parse", "--show-toplevel"], cwd=directory)
+    except VendorError as error:
+        raise VendorError(
+            f"Lock discovery needs a Git work tree; run inside the repository or pass --lock. {error}"
+        ) from error
+    assert isinstance(output, str)
+    return Path(output.strip()).resolve()
+
+
+def _discover_locks(work_tree: Path) -> list[Path]:
+    # Read the index being committed: `git commit -a` gives the pre-commit hook a temporary
+    # index through GIT_INDEX_FILE. _git_environment() sets GIT_LITERAL_PATHSPECS, so filter
+    # the index listing here instead of passing a glob pathspec.
+    index_file = os.environ.get("GIT_INDEX_FILE")
+    output = _run_git(
+        ["ls-files", "-z", "--cached"],
+        cwd=work_tree,
+        capture_bytes=True,
+        index_file=os.path.abspath(index_file) if index_file else None,
+    )
+    assert isinstance(output, bytes)
+    locks: set[Path] = set()
+    for entry in os.fsdecode(output).split("\0"):
+        if not entry.endswith(_LOCK_FILENAME):
+            continue
+        relative = PurePosixPath(entry)
+        if relative.name != _LOCK_FILENAME:
+            continue
+        if relative.parent.name != _CONTROL_DIRECTORY:
+            raise VendorError(
+                f"Misplaced vendor lock {entry!r}; a lock must be "
+                f"<scope>/{_CONTROL_DIRECTORY}/{_LOCK_FILENAME}."
+            )
+        path = _checked_root_path(work_tree, entry, f"Vendor lock {entry!r}")
+        if not path.is_file():
+            raise VendorError(
+                f"Vendor lock {entry!r} is in the Git index but missing from the work tree; "
+                "restore it, or stage its deletion with git add."
+            )
+        locks.add(path)
+    return sorted(locks)
+
+
+def _display_lock(lock_set: LockSet, lock: LockFile) -> str:
+    return lock.path.relative_to(lock_set.work_tree).as_posix()
+
+
+def _work_tree_path(
+    lock_set: LockSet, lock: LockFile, relative_path: str | PurePosixPath
+) -> PurePosixPath:
+    return PurePosixPath(lock.root.relative_to(lock_set.work_tree).as_posix()) / relative_path
+
+
+def _validate_lock_set(lock_set: LockSet) -> None:
+    owners: dict[str, LockFile] = {}
+    destinations: list[tuple[str, LockFile, PurePosixPath]] = []
+    control_paths: list[tuple[LockFile, PurePosixPath]] = []
+    for lock in lock_set.locks:
+        control_paths.append((lock, PurePosixPath(_display_lock(lock_set, lock))))
+        control_paths.append((lock, _work_tree_path(lock_set, lock, _PATCH_DIRECTORY)))
+        for name, vendor in lock.vendors.items():
+            owner = owners.setdefault(name, lock)
+            if owner is not lock:
+                raise VendorError(
+                    f"Vendor {name!r} is defined in both {_display_lock(lock_set, owner)} and "
+                    f"{_display_lock(lock_set, lock)}; vendor names must be unique."
+                )
+            destinations.append((name, lock, _work_tree_path(lock_set, lock, vendor.destination)))
+    for index, (name, lock, path) in enumerate(destinations):
+        for other_name, other_lock, other_path in destinations[index + 1 :]:
+            if _paths_overlap(path, other_path):
+                raise VendorError(
+                    f"Vendor destinations overlap: {name!r} ({path}, in "
+                    f"{_display_lock(lock_set, lock)}) and {other_name!r} ({other_path}, in "
+                    f"{_display_lock(lock_set, other_lock)})."
+                )
+        for control_lock, control_path in control_paths:
+            if _paths_overlap(path, control_path):
+                raise VendorError(
+                    f"Vendor {name!r} destination {path} overlaps the control files of "
+                    f"{_display_lock(lock_set, control_lock)}: {control_path}."
+                )
+
+
+def _load_lock_set(work_tree: Path, *, target: Path | None = None) -> LockSet:
+    paths = _discover_locks(work_tree)
+    if target is not None and target not in paths:
+        paths = sorted([*paths, target])
+    locks: list[LockFile] = []
+    for path in paths:
+        try:
+            locks.append(_load_lock(path, allow_missing=path == target, allow_patch_recovery=True))
+        except VendorError as error:
+            raise VendorError(
+                f"{path.relative_to(work_tree).as_posix()}: {error} "
+                "Pass --lock to work on a single lock."
+            ) from error
+    lock_set = LockSet(work_tree=work_tree, locks=locks)
+    _validate_lock_set(lock_set)
+    return lock_set
+
+
+def _replace_lock(lock_set: LockSet, lock: LockFile) -> LockSet:
+    others = [item for item in lock_set.locks if item.path != lock.path]
+    return LockSet(work_tree=lock_set.work_tree, locks=[*others, lock])
+
+
+def _owning_lock(lock_set: LockSet, name: str) -> LockFile:
+    for lock in lock_set.locks:
+        if name in lock.vendors:
+            return lock
+    searched = ", ".join(_display_lock(lock_set, lock) for lock in lock_set.locks) or "none"
+    raise VendorError(
+        f"Unknown vendor: {name!r} (searched locks: {searched}). "
+        "Lock discovery reads the Git index; stage a new lock with git add."
+    )
+
+
+def _scope_lock_path(work_tree: Path, scope: str) -> Path:
+    scope_directory = (Path.cwd() / scope).resolve()
+    if not scope_directory.is_dir():
+        raise VendorError(f"--scope must name an existing directory: {scope!r}.")
+    try:
+        relative = scope_directory.relative_to(work_tree).as_posix()
+    except ValueError as error:
+        raise VendorError(
+            f"--scope must be inside the Git work tree {work_tree}: {scope!r}."
+        ) from error
+    if relative != ".":
+        _validate_relative_path(relative, "--scope")
+    return _checked_root_path(
+        work_tree, f"{relative}/{_CONTROL_DIRECTORY}/{_LOCK_FILENAME}", "--scope lock"
+    )
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -731,10 +887,14 @@ def _atomic_file_replacement(path: Path, content: bytes) -> Iterator[None]:
         raise
 
 
-def _git_environment(*, isolated: bool, repository_ceiling: Path | None = None) -> dict[str, str]:
+def _git_environment(
+    *, isolated: bool, repository_ceiling: Path | None = None, index_file: str | None = None
+) -> dict[str, str]:
     environment = os.environ.copy()
-    for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES:
+    for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES | _GIT_PATHSPEC_ENVIRONMENT_VARIABLES:
         environment.pop(variable, None)
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = index_file
     environment.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
@@ -766,6 +926,7 @@ def _run_git(
     isolated: bool = False,
     input_bytes: bytes | None = None,
     repository_ceiling: Path | None = None,
+    index_file: str | None = None,
 ) -> bytes | str:
     if input_bytes is not None and not capture_bytes:
         raise ValueError("Git commands with byte input must capture byte output.")
@@ -777,6 +938,7 @@ def _run_git(
             env=_git_environment(
                 isolated=isolated,
                 repository_ceiling=repository_ceiling,
+                index_file=index_file,
             ),
             check=True,
             capture_output=True,
@@ -1134,25 +1296,57 @@ def _verify_source(lock: LockFile, vendor: Vendor, repo: Path | None) -> None:
         )
 
 
+def _resolve_discovery(args: argparse.Namespace) -> None:
+    work_tree = _work_tree(Path.cwd())
+    if args.command == "create":
+        if args.scope is None:
+            raise VendorError(
+                "create needs --scope DIR (use '.' at the repository root for the repository lock) "
+                "or an explicit --lock."
+            )
+        args.lock = _scope_lock_path(work_tree, args.scope)
+        args.lock_set = _load_lock_set(work_tree, target=args.lock)
+        return
+    args.lock_set = _load_lock_set(work_tree)
+    if not args.lock_set.locks:
+        print(f"note: no tracked vendor locks in {work_tree}.", file=sys.stderr)
+    name = getattr(args, "name", None)
+    if name is not None:
+        args.lock = _owning_lock(args.lock_set, name).path
+
+
+def _target_locks(args: argparse.Namespace) -> list[Path]:
+    if args.lock is not None:
+        return [args.lock]
+    return [lock.path for lock in args.lock_set.locks]
+
+
 def _command_list(args: argparse.Namespace) -> None:
-    lock = _load_lock(args.lock)
-    for vendor in _select_vendors(lock, None):
-        state = "patched" if vendor.patch else "exact"
-        print(f"{vendor.name}\t{state}\t{vendor.commit}\t{vendor.destination}")
+    for path in _target_locks(args):
+        lock = _load_lock(path)
+        for vendor in _select_vendors(lock, None):
+            state = "patched" if vendor.patch else "exact"
+            destination = (
+                vendor.destination
+                if args.lock_set is None
+                else _work_tree_path(args.lock_set, lock, vendor.destination)
+            )
+            print(f"{vendor.name}\t{state}\t{vendor.commit}\t{destination}")
 
 
 def _command_status(args: argparse.Namespace) -> None:
-    lock = _load_lock(args.lock)
     failed = False
-    for vendor in _select_vendors(lock, args.name):
-        try:
-            _verify_offline(lock, vendor)
-        except VendorError as error:
-            failed = True
-            print(f"FAIL-LOCAL-INTEGRITY {vendor.name}: {error}")
-        else:
-            state = "patched" if vendor.patch is not None else "exact"
-            print(f"PASS-OFFLINE {vendor.name}: {state} at {vendor.commit}")
+    for path in _target_locks(args):
+        lock = _load_lock(path)
+        for vendor in _select_vendors(lock, args.name):
+            try:
+                _verify_offline(lock, vendor)
+            except VendorError as error:
+                failed = True
+                print(f"FAIL-LOCAL-INTEGRITY {vendor.name}: {error}")
+            else:
+                state = "patched" if vendor.patch is not None else "exact"
+                print(f"PASS-OFFLINE {vendor.name}: {state} at {vendor.commit}")
     if failed:
         raise VendorError("One or more vendor snapshots failed offline integrity checks.")
 
@@ -1181,6 +1375,8 @@ def _command_create(args: argparse.Namespace) -> None:
     vendor = _new_vendor_from_args(args)
     lock.vendors[vendor.name] = vendor
     _validate_destination_layout(lock)
+    if args.lock_set is not None:
+        _validate_lock_set(_replace_lock(args.lock_set, lock))
     destination = _checked_root_path(
         lock.root, vendor.destination, f"Vendor {vendor.name!r} destination"
     )
@@ -1211,7 +1407,7 @@ def _command_create(args: argparse.Namespace) -> None:
         else:
             patch = _generate_patch(source_tree, result_tree)
             if patch:
-                patch_relative = f"3rdparty/vendor_patches/{vendor.name}.patch"
+                patch_relative = f"{_PATCH_DIRECTORY}/{vendor.name}.patch"
                 patch_path = _checked_root_path(
                     lock.root, patch_relative, f"Vendor {vendor.name!r} patch"
                 )
@@ -1219,11 +1415,19 @@ def _command_create(args: argparse.Namespace) -> None:
                 vendor.patch_digest = _patch_digest(patch)
                 patch_transaction = _atomic_file_replacement(patch_path, patch)
     vendor.digest = _tree_digest(result_tree)
+    unstaged = args.lock_set is not None and args.lock not in _discover_locks(
+        args.lock_set.work_tree
+    )
     with contextlib.ExitStack() as transaction:
         transaction.enter_context(destination_transaction)
         transaction.enter_context(patch_transaction)
         _save_lock_checked(lock, f"lock state for new vendor {vendor.name!r}")
     print(f"Created {vendor.name} at {vendor.commit} ({'patched' if vendor.patch else 'exact'}).")
+    if unstaged:
+        print(
+            f"Vendor lock {_display_lock(args.lock_set, lock)} is not staged; stage it with "
+            "git add so that lock discovery finds it."
+        )
 
 
 def _command_sync(args: argparse.Namespace) -> None:
@@ -1249,7 +1453,11 @@ def _command_check(args: argparse.Namespace) -> None:
         raise VendorError("Use either --repo or --upstream, not both.")
     if args.repo is not None and args.offline:
         raise VendorError("Use either --repo or --offline, not both.")
-    lock = _load_lock(args.lock)
+    for path in _target_locks(args):
+        _check_lock(args, _load_lock(path))
+
+
+def _check_lock(args: argparse.Namespace, lock: LockFile) -> None:
     vendors = _select_vendors(lock, args.name)
     for vendor in vendors:
         _verify_offline(lock, vendor)
@@ -1294,7 +1502,7 @@ def _update_patch(lock: LockFile, vendor: Vendor, repo: Path | None, *, create: 
     )
     written_patch_path: Path | None = None
     if patch:
-        patch_relative = old_patch or f"3rdparty/vendor_patches/{vendor.name}.patch"
+        patch_relative = old_patch or f"{_PATCH_DIRECTORY}/{vendor.name}.patch"
         patch_path = _checked_root_path(lock.root, patch_relative, f"Vendor {vendor.name!r} patch")
         _atomic_write(patch_path, patch)
         written_patch_path = patch_path
@@ -1530,7 +1738,25 @@ def _command_remove(args: argparse.Namespace) -> None:
         _checked_root_path(lock.root, vendor.patch, f"Vendor {vendor.name!r} patch").unlink(
             missing_ok=True
         )
+    delete_lock = (
+        args.lock_set is not None and not lock.vendors and lock.root != args.lock_set.work_tree
+    )
+    if delete_lock:
+        _remove_empty_scoped_lock(lock)
     print(f"Removed {vendor.name} from the lock; destination bytes were preserved.")
+    if delete_lock:
+        print(
+            f"Deleted the empty vendor lock {_display_lock(args.lock_set, lock)}; "
+            "stage its deletion with git add."
+        )
+
+
+def _remove_empty_scoped_lock(lock: LockFile) -> None:
+    lock.path.unlink()
+    control_directory = lock.path.parent
+    for directory in (control_directory / _PATCH_DIRECTORY.name, control_directory):
+        if directory.is_dir() and not directory.is_symlink() and not any(directory.iterdir()):
+            directory.rmdir()
 
 
 def _add_repo_argument(parser: argparse.ArgumentParser, *, required: bool = False) -> None:
@@ -1547,9 +1773,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lock",
         type=Path,
-        default=_DEFAULT_LOCK,
-        help=f"Vendor lock path (default: {_DEFAULT_LOCK.relative_to(_REPO_ROOT)}).",
+        help=(
+            "Use only this vendor lock. By default, every "
+            f"<scope>/{_CONTROL_DIRECTORY}/{_LOCK_FILENAME} in the Git index of the current "
+            "work tree is used."
+        ),
     )
+    parser.set_defaults(scope=None, lock_set=None)
     commands = parser.add_subparsers(dest="command", required=True)
 
     list_parser = commands.add_parser("list", help="List configured vendors.")
@@ -1567,7 +1797,17 @@ def _build_parser() -> argparse.ArgumentParser:
     reference.add_argument("--tag")
     create.add_argument("--commit", required=True)
     create.add_argument("--source", required=True)
-    create.add_argument("--destination", required=True)
+    create.add_argument(
+        "--scope",
+        help=(
+            "Directory that owns the new vendor (relative to the current directory); its lock "
+            f"is <scope>/{_CONTROL_DIRECTORY}/{_LOCK_FILENAME}. Use '.' at the repository root "
+            "for the repository lock."
+        ),
+    )
+    create.add_argument(
+        "--destination", required=True, help="Destination directory relative to the lock's scope."
+    )
     create.add_argument("--include", action="append")
     create.add_argument("--adopt", choices=("exact", "patched"))
     _add_repo_argument(create)
@@ -1630,9 +1870,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the vendoring command-line interface."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.lock != _DEFAULT_LOCK:
-        args.lock = args.lock.resolve()
     try:
+        if args.lock is None:
+            _resolve_discovery(args)
+        elif args.scope is not None:
+            raise VendorError("Use either --lock or --scope, not both.")
+        else:
+            args.lock = args.lock.resolve()
         args.handler(args)
     except VendorError as error:
         print(f"error: {error}", file=sys.stderr)

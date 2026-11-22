@@ -33,7 +33,11 @@ from ..helpers.query import (
     public_query_flat_row,
     split_o_element_offset,
 )
-from ..helpers.tile import runtime_seq_len_kv_for_q, runtime_split_count
+from ..helpers.tile import (
+    runtime_seq_len_kv_for_q,
+    runtime_split_count,
+    runtime_request_publishes,
+)
 
 
 # Baseline split-KV reduction uses one 128-thread CTA.  Each thread owns eight
@@ -217,6 +221,7 @@ def runtime_seq_len_kv_for_reduction(
     batch_idx,
     cta_idx_q,
     cu_seqlens_q=None,
+    cp_rank=0,
 ):
     """Return the runtime KV length visible to split-KV reduction."""
     return runtime_seq_len_kv_for_q(
@@ -225,6 +230,7 @@ def runtime_seq_len_kv_for_reduction(
         batch_idx,
         cta_idx_q,
         cu_seqlens_q,
+        cp_rank=cp_rank,
     )
 
 
@@ -240,11 +246,12 @@ def run_gmem_reduction_kernel(
     cfg,
     num_reduction_ctas,
     requested_splits=None,
+    cp_rank=0,
 ):
     """Preserve inactive output and never consume stale split scratch."""
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     _, _, batch_idx = cute.arch.block_idx()
-    if cache_seqs[batch_idx] > Int32(0):
+    if runtime_request_publishes(cfg, cache_seqs, batch_idx, cp_rank):
         _run_active_gmem_reduction_kernel(
             kernel,
             output,
