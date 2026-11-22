@@ -18,7 +18,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import async_tensor_h2d, is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.math_utils import ceil_div
 
 from .block_select import PUBLISH_BLOCK, block_select_supported
@@ -3594,7 +3594,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         device = record["prior"].device
         record["prior"].fill_(-1)
         if count:
-            source_rows = torch.tensor(rows, dtype=torch.int64, device=device)
+            source_rows = async_tensor_h2d(rows, torch.int64, device)
             valid = (source_rows >= 0) & record["published_valid"][source_rows.clamp_min(0)]
             record["prior"][:count].copy_(
                 torch.where(valid[:, None], record["published"][source_rows.clamp_min(0)], -1)
