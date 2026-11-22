@@ -351,7 +351,8 @@ def test_cutlass_moe_public_activation_ids(
 
 
 def test_cutlass_moe_tunes_only_the_active_slots(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tune only the active slots and reuse the tactics once restored experts fill spare slots."""
+    """Tune only the active slots, under the cache keys of a layer without spare slots, and reuse
+    the tactics once restored experts fill spare slots."""
     if not torch.cuda.is_available() or get_sm_version() < 80:
         pytest.skip("BF16 CUTLASS MoE requires CUDA and SM80 or newer")
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
@@ -415,6 +416,10 @@ def test_cutlass_moe_tunes_only_the_active_slots(monkeypatch: pytest.MonkeyPatch
         actual = run_moe(w1, w2, routed, **active_slots)
         assert hits == [True, True]
         torch.testing.assert_close(actual, reference, atol=1e-2, rtol=1e-2)
+    # A layer without spare slots that runs the same problem uses the same cache entries.
+    hits.clear()
+    run_moe(w1[:num_active], w2[:num_active])
+    assert hits == [True, True]
 
 
 def test_cutedsl_nvfp4_grouped_gemm_tunes_only_the_active_slots(
