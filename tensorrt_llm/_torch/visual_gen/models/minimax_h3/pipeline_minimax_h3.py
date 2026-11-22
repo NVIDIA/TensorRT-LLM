@@ -250,8 +250,9 @@ class MiniMaxH3Pipeline(BasePipeline):
                 if not (passes_mask or passes_length):
                     raise NotImplementedError(
                         "MiniMax-H3 Ulysses requires an attention backend that takes "
-                        "key_padding_mask or valid_seq_len for the padded packed rows; the "
-                        f"{pipeline_config.attention.backend} backend takes neither."
+                        "key_padding_mask or valid_seq_len for the padded packed rows, such "
+                        f"as VANILLA; the {pipeline_config.attention.backend} backend takes "
+                        "neither."
                     )
         self._text_encoder_tp_group = None
         if (

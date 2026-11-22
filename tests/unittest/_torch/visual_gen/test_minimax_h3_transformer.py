@@ -503,7 +503,7 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
     transformer blocks hand the backend the token tags of the packed sequence and its padding
     as a key padding mask: trailing padding becomes one length per sample, and padding between
     the tokens the order that puts the tokens first."""
-    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
+    from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
 
     require_deco_kernels()
     config = _make_model_config(

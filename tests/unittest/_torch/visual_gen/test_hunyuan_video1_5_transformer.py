@@ -194,7 +194,7 @@ def test_deco_joint_blocks_pass_one_mask_and_the_token_tags(monkeypatch, require
     """Under a DeCo-Attention recipe the joint attention of a CFG batch with two text lengths
     reaches the kernels with the token count of every sample and with basis rows drawn from
     that sample's video and text tokens; the blocks of a forward share one mask tensor."""
-    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
+    from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
     from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import deco as deco_backend
     from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
     from tensorrt_llm._torch.visual_gen.models.hunyuan_video1_5 import (
