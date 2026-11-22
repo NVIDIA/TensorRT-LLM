@@ -84,7 +84,7 @@ class MoEDecodeOptions:
     fc2_weights_evict_first_rows: int = 0
     # TRTLLM-Gen BF16: logits-routed un-finalized SwiGLU runs of up to 32 rows take the BF16 decode MoE engine.
     bf16_decode_engine: bool = False
-    # TRTLLM-Gen NVFP4 op without ``tuning``: un-finalized attention-TP calls of up to this many rows run FC2 on the
+    # TRTLLM-Gen FP4 ops without ``tuning``: un-finalized attention-TP calls of up to this many rows run FC2 on the
     # CuTe DSL kernel where it reproduces the tactic's cubin (trtllm_gen.decode_moe.cute_fc2_opt_in; 0: none).
     cute_fc2_rows: int = 0
     # TRTLLM-Gen NVFP4 on the DS-V4 route kernel's tables: launches of the shapes dsv4_route_one.applies takes route

@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import is_blackwell_datacenter, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -61,6 +61,12 @@ _GROUP_VERIFY_MAX_ROWS = 256
 
 # Widest draft the one-warp acceptance and next-token kernels serve: a lane per verified token.
 _ONE_WARP_MAX_DRAFT_LEN = 31
+
+
+def _backfills_main_kv() -> bool:
+    """Whether the forked back-fill also writes the bonus rows' main-KV frames."""
+    return is_blackwell_datacenter()
+
 
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
@@ -1312,7 +1318,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             rows = torch.arange(num_tokens, device=captured.device).view(num_gens, width)
-            main_x, kv = draft_model.project_backfill_rows(captured, rows)
+            main_x, kv = draft_model.project_backfill_rows(
+                captured, rows, all_rows=_backfills_main_kv()
+            )
             done = torch.cuda.Event()
             done.record(side)
         self._prep_fork = (spec_metadata, num_gens, width, main_x, kv, done)
@@ -1359,6 +1367,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         all_rank_num_tokens: Optional[List[int]] = None,
         return_tokens: bool = False,
         prepared: Optional[tuple] = None,
+        next_tokens: bool = False,
     ) -> Optional[torch.Tensor]:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
 
@@ -1375,6 +1384,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         enabled, fixed-shape confidence scores are stored separately for
         verification scheduling; they never truncate the proposal.
         ``prepared`` is ``_advance_generation_state``'s result when the acceptance launch ran it.
+        ``next_tokens``: a fused Markov chain writes the next inputs too (``take_next_new_tokens``).
         """
         num_gens = batch_size - num_contexts
 
@@ -1430,14 +1440,42 @@ class DSv4DSparkWorker(SpecWorkerBase):
         fork = self._take_prep_fork(
             spec_metadata, gen_start, accepted_tokens.shape[1], num_gens, captured.shape[0]
         )
+        windows_ready = main_kv = None
         if fork is not None:
             # Projected on the side stream: request g's interim rows are its first K rows.
             main_x, kv = fork
-            draft_model.write_context_windows_batched(
-                None, interim_pos, slots, interim_valid, self._kv_windows, kv=kv
-            )
-            # index_select: a vectorized gather; advanced indexing runs the slow generic kernel.
-            bonus_x = main_x.flatten(0, 1).index_select(0, main_rows)
+            if kv.shape[1] > K:
+                # The fork projected all rows: the bonus rows' frames are back-filled too.
+                from .dspark_backfill_inputs import main_kv_backfill_inputs
+
+                main = torch.cuda.current_stream()
+                side = private_stream(kv.device.index, "dspark_prep_fork")
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    positions, valid, slots32, start32, bonus_x = main_kv_backfill_inputs(
+                        start_pos,
+                        num_accepted_tokens[num_contexts:batch_size],
+                        slots,
+                        main_rows,
+                        main_x.flatten(0, 1),
+                        kv.shape[1],
+                    )
+                    draft_model.write_context_windows_batched(
+                        None, positions, slots, valid, self._kv_windows, kv=kv
+                    )
+                    main_kv = (slots32, start32)
+                    windows_ready = torch.cuda.Event()
+                    windows_ready.record(side)
+                for tensor in (num_accepted_tokens, start_pos, slots, kv, main_x, main_rows):
+                    tensor.record_stream(side)
+                for tensor in (bonus_x, *main_kv):
+                    tensor.record_stream(main)
+            else:
+                draft_model.write_context_windows_batched(
+                    None, interim_pos, slots, interim_valid, self._kv_windows, kv=kv
+                )
+                # index_select: a vectorized gather; advanced indexing runs the generic kernel.
+                bonus_x = main_x.flatten(0, 1).index_select(0, main_rows)
         else:
             row_index = torch.cat((interim_rows, main_rows.unsqueeze(1)), dim=1)
             projected = draft_model.project_captured_rows(captured, row_index)  # [G, K + 1, hidden]
@@ -1460,6 +1498,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             return_logits=not return_tokens,
             all_rank_num_tokens=all_rank_num_tokens,
             main_x=bonus_x,
+            next_tokens=next_tokens and return_tokens,
+            windows_ready=windows_ready,
+            main_kv=main_kv,
         )
         # Stash the [G, K] confidence for the verification scheduler.
         # Slot-indexed (survives batch reshuffles), written in place (a
@@ -1823,6 +1864,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
             max(all_rank_num_gens) > 0 if all_rank_num_gens is not None else num_gens > 0
         )
 
+        # Gen-only batches (arange batch indices) take [bonus, drafts] from the fused Markov chain.
+        markov_next = (
+            num_contexts == 0
+            and num_gens > 0
+            and is_blackwell_datacenter()
+            and hasattr(draft_model, "take_next_new_tokens")
+        )
         if num_gens > 0:
             reuse_draft_tokens = self._can_reuse_draft_tokens(draft_model, spec_metadata)
             draft_output = self._draft_gen_block_batched(
@@ -1838,6 +1886,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 all_rank_num_tokens=all_rank_draft_tokens,
                 return_tokens=reuse_draft_tokens,
                 prepared=prepared,
+                next_tokens=markov_next,
             )
             if reuse_draft_tokens:
                 gen_draft_tokens = draft_output
@@ -1888,13 +1937,18 @@ class DSv4DSparkWorker(SpecWorkerBase):
         else:
             next_draft_tokens = gen_draft_tokens
 
-        next_new_tokens = self._prepare_next_new_tokens(
-            accepted_tokens,
-            next_draft_tokens,
-            spec_metadata.batch_indices_cuda,
+        next_new_tokens = draft_model.take_next_new_tokens() if markov_next else None
+        if next_new_tokens is None or next_new_tokens.shape != (
             batch_size,
-            num_accepted_tokens,
-        )
+            next_draft_tokens.shape[1] + 1,
+        ):
+            next_new_tokens = self._prepare_next_new_tokens(
+                accepted_tokens,
+                next_draft_tokens,
+                spec_metadata.batch_indices_cuda,
+                batch_size,
+                num_accepted_tokens,
+            )
         # A forked projection this forward did not take (no graph may end with side-stream work).
         self._join_prep_fork()
 

@@ -185,6 +185,8 @@ l0_b200:
   - unittest/_torch/speculative/test_dspark_fused_accept.py
   - unittest/_torch/speculative/test_dspark_tp1_argmax.py
   - unittest/_torch/speculative/test_dspark_compact_argmax.py
+  - unittest/_torch/speculative/test_dspark_stage0_table.py
+  - unittest/_torch/moe/test_dspark_draft_moe_tables.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_wkv_projection.py
   - unittest/_torch/speculative/test_spec_sampling_param_cache.py
   - unittest/_torch/speculative/test_spec_store_scatter.py

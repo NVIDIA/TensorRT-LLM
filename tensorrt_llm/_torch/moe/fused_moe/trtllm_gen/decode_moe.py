@@ -12,7 +12,8 @@ produces the runner's gemm2 rows bit for bit and returns its ``do_finalize=False
   entry: ``TLLM_USE_FINE_GRAINED_SYNC`` with such a cubin for the shape).
 
 A model that declares only ``MoEDecodeOptions.cute_fc2_rows`` takes ``CUTE_FC2`` alone (:func:`cute_fc2_opt_in`), on the
-NVFP4 runner's entries with routing tables too.
+NVFP4 runner's entries with routing tables too; ``mxe4m3_mxe2m1_block_scale_moe_runner_ext`` takes the same rows from
+its caller for the MXFP4 x MXFP8 runner (``moe_lowm_fc2`` with ``mx``).
 
 Lamport FC2 (:class:`LamportFc2Buffer`): ``ENGINE`` / ``CUTE_FC2`` store nothing before their PDL wait, release their
 dependents only after it and write each word of a real row once (``cvt.rn.satfinite.bf16x2.f32``, never 0xFFFFFFFF),
@@ -34,7 +35,10 @@ from .decode_front import max_num_tiles
 from .kernel_inputs import get_data_or_none, to_trtllm_gen_act_type
 
 if TYPE_CHECKING:
-    from ....custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoEInputs
+    from ....custom_ops.trtllm_gen_custom_ops import (
+        FP4BlockScaleMoEInputs,
+        MxE4m3MxE2m1BlockScaleMoEInputs,
+    )
     from .fp4_block_scale import TRTLLMGenFp4BlockScaleBase
 
 #: Most tokens of a CuTe FC2 call (the kernel walks the runner's tile tables and has no token bound of its own).
@@ -71,10 +75,15 @@ _CUTE_FC2_OPTIONS = {
 }
 
 
-def cute_fc2_reproduces(gemm2_kernel_options: Mapping[str, str]) -> bool:
+#: The same for the MXFP4 x MXFP8 runner's FC2 cubins (``moe_lowm_fc2`` with ``mx``): M128 N8 K32 MMAs.
+_CUTE_FC2_MX_OPTIONS = {**_CUTE_FC2_OPTIONS, "dtypeA": "MxE2m1", "dtypeB": "MxE4m3", "mmaK": "32"}
+
+
+def cute_fc2_reproduces(gemm2_kernel_options: Mapping[str, str], mx: bool = False) -> bool:
     """Whether ``moe_lowm_fc2`` reproduces the FC2 cubin of these options (the runner's
-    ``get_gemm2_kernel_options(tile, config)``) bit for bit."""
-    return all(gemm2_kernel_options.get(key) == value for key, value in _CUTE_FC2_OPTIONS.items())
+    ``get_gemm2_kernel_options(tile, config)``) bit for bit; ``mx``: the MXFP4 x MXFP8 runner's."""
+    expected = _CUTE_FC2_MX_OPTIONS if mx else _CUTE_FC2_OPTIONS
+    return all(gemm2_kernel_options.get(key) == value for key, value in expected.items())
 
 
 class DecodeKernel(enum.Enum):
@@ -83,19 +92,19 @@ class DecodeKernel(enum.Enum):
     ENGINE = 2
 
 
-#: (act type, tile, config) -> the tile K of that tactic's FC2 cubin where ``moe_lowm_fc2`` reproduces it, else None.
-#: The C++ runners are shared per act type (``FP4BlockScaleMoERunner.get_runner``), so the key names the cubin.
-_FC2_REPRODUCED: Dict[Tuple[int, int, int], Optional[int]] = {}
+#: (mx, act type, tile, config) -> the tile K of that tactic's FC2 cubin where ``moe_lowm_fc2`` reproduces it, else
+#: None. The C++ runners are shared per format and act type (``get_runner``), so the key names the cubin.
+_FC2_REPRODUCED: Dict[Tuple[bool, int, int, int], Optional[int]] = {}
 
 
 def fc2_cubin_tile_k(
-    kernel_runner: torch.ScriptObject, act_type: int, tactic: List[int]
+    kernel_runner: torch.ScriptObject, act_type: int, tactic: List[int], mx: bool = False
 ) -> Optional[int]:
     """The tile K of the tactic's FC2 cubin where ``moe_lowm_fc2`` reproduces it, else None."""
-    key = (int(act_type), int(tactic[0]), int(tactic[1]))
+    key = (mx, int(act_type), int(tactic[0]), int(tactic[1]))
     if key not in _FC2_REPRODUCED:
-        options = kernel_runner.get_gemm2_kernel_options(key[1], key[2])
-        _FC2_REPRODUCED[key] = int(options["tileK"]) if cute_fc2_reproduces(options) else None
+        options = kernel_runner.get_gemm2_kernel_options(key[2], key[3])
+        _FC2_REPRODUCED[key] = int(options["tileK"]) if cute_fc2_reproduces(options, mx) else None
     return _FC2_REPRODUCED[key]
 
 
@@ -103,13 +112,16 @@ def cute_fc2_tile_k(
     kernel_runner: torch.ScriptObject,
     act_type: int,
     tactic: List[int],
-    args: "FP4BlockScaleMoEInputs",
+    args: "FP4BlockScaleMoEInputs | MxE4m3MxE2m1BlockScaleMoEInputs",
     top_k: int,
     intermediate_size: int,
     max_tokens: int = MAX_TOKENS,
+    mx: bool = False,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> Optional[int]:
     """The tile K of the tactic's FC2 cubin where ``moe_lowm_fc2`` stands in for it on a call of up to ``max_tokens``
-    tokens, else None."""
+    tokens, else None. ``mx``: the MXFP4 x MXFP8 runner, whose FC2 reads ``valid_intermediate_size`` columns."""
     if len(tactic) != 2 or tactic[0] != TILE_N or tactic[1] < 0 or not IS_CUTLASS_DSL_AVAILABLE:
         return None
     x, w2, w2_sf = args.hidden_states, args.gemm2_weights, args.gemm2_weights_scale
@@ -117,18 +129,31 @@ def cute_fc2_tile_k(
         return None
     if w2.shape[2] * 2 != intermediate_size:
         return None
-    tile_k = fc2_cubin_tile_k(kernel_runner, act_type, tactic)
+    tile_k = fc2_cubin_tile_k(kernel_runner, act_type, tactic, mx)
     if tile_k is None:
         return None
     from tensorrt_llm._torch.kernels.blackwell.moe_lowm_fc2 import supports
 
-    if not supports(w2.shape, tile_k):
+    if not supports(w2.shape, tile_k, mx, valid_intermediate_size):
         return None
     # The CuTe FC2 stands in for the tuned tactic's FC2; the runner runs its fine-grained-sync pair instead (which
     # has no FC1-only entry) only where TLLM_USE_FINE_GRAINED_SYNC is set and such a cubin exists for this shape.
-    fine_grained = kernel_runner.uses_fine_grained_sync(
-        tactic[0], top_k, 2 * x.shape[1], intermediate_size, w2.shape[0], x.shape[0]
-    )
+    if mx:
+        hidden = x.shape[1]
+        fine_grained = kernel_runner.uses_fine_grained_sync(
+            tactic[0],
+            top_k,
+            hidden,
+            intermediate_size,
+            w2.shape[0],
+            x.shape[0],
+            valid_hidden_size or hidden,
+            valid_intermediate_size or intermediate_size,
+        )
+    else:
+        fine_grained = kernel_runner.uses_fine_grained_sync(
+            tactic[0], top_k, 2 * x.shape[1], intermediate_size, w2.shape[0], x.shape[0]
+        )
     return None if fine_grained else tile_k
 
 
@@ -280,7 +305,7 @@ def cute_fc2_opt_in(
     kernel_runner: torch.ScriptObject,
     act_type: int,
     tactic: List[int],
-    args: "FP4BlockScaleMoEInputs",
+    args: "FP4BlockScaleMoEInputs | MxE4m3MxE2m1BlockScaleMoEInputs",
     *,
     top_k: int,
     intermediate_size: int,
@@ -288,6 +313,9 @@ def cute_fc2_opt_in(
     use_dp: bool,
     do_finalize: bool,
     output: Optional[torch.Tensor],
+    mx: bool = False,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> Optional[int]:
     """:func:`cute_fc2_tile_k` for a model's ``MoEDecodeOptions.cute_fc2_rows`` (``rows``): un-finalized attention-TP
     calls of up to that many tokens on SM 10.0 / 10.3, without FC2 bias or output tensor."""
@@ -304,6 +332,9 @@ def cute_fc2_opt_in(
         top_k,
         intermediate_size,
         max_tokens=rows,
+        mx=mx,
+        valid_hidden_size=valid_hidden_size,
+        valid_intermediate_size=valid_intermediate_size,
     )
 
 
@@ -423,9 +454,11 @@ def fc1_only_args(run_args: Sequence[object]) -> Tuple[object, ...]:
 
 def run_cute_fc2(
     fc1_outputs: List[torch.Tensor],
-    args: "FP4BlockScaleMoEInputs",
+    args: "FP4BlockScaleMoEInputs | MxE4m3MxE2m1BlockScaleMoEInputs",
     lamport_out: Optional[torch.Tensor],
     cubin_tile_k: Optional[int] = None,
+    mx: bool = False,
+    valid_intermediate_size: Optional[int] = None,
     record: bool = False,
 ) -> List[torch.Tensor]:
     """``CUTE_FC2`` on the FC1-only runner's outputs, bit for bit the FC2 cubin of tile K ``cubin_tile_k`` (None: the
@@ -450,12 +483,14 @@ def run_cute_fc2(
         gemm1_output_scale.view(torch.uint8),
         args.gemm2_weights.view(torch.uint8),
         args.gemm2_weights_scale.view(torch.uint8),
-        args.output2_scale_scalar,
+        None if mx else args.output2_scale_scalar,
         cta_batch,
         cta_limit,
         num_ctas.view(-1),
         out,
         cubin_k_tile=cubin_tile_k,
+        mx=mx,
+        k_valid=valid_intermediate_size,
     )
     if record:
         state = _capture_state()

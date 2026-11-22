@@ -234,7 +234,7 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         pytest.fail("invalid inputs reached compilation or a kernel launch")
 
     monkeypatch.setattr(attention_op, "_get_dspark_arch_str", lambda: "sm_100")
-    key = (6, 128, 32, attention_op._get_dspark_arch_str())
+    key = (6, 128, 32, attention_op._get_dspark_arch_str(), False)
     monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {key: unexpected_launch})
     monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_launch)
     with pytest.raises(ValueError, match=reason):
@@ -372,7 +372,7 @@ def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypa
     monkeypatch.setattr(
         attention_op,
         "_dspark_attention_kernel_cache",
-        {(5, 128, 32, arch_str): compiled},
+        {(5, 128, 32, arch_str, False): compiled},
     )
     inputs = _make_inputs(41, block=5, positions=[257, 9])
 
@@ -1195,3 +1195,112 @@ def test_tp_attention_shards_sum_to_replicated():
     actual = torch.stack([p.float() for p in partials]).sum(0).bfloat16()
     diff = actual.float() - expected.float()
     assert diff.norm() / expected.float().norm() < 1e-2
+
+
+@pytest.mark.skipif(get_sm_version() not in (100, 103), reason="MXFP8 projections on SM100/103")
+@pytest.mark.parametrize("requests,block", ((25, 5), (320, 3)))
+def test_mxfp8_projections_match_bf16(monkeypatch, requests, block):
+    """The MXFP8 draft attention stays within MXFP8 activation rounding of the BF16 path on the
+    exact dequantization of the same FP8 weights, and its CUDA graph replays the eager bits."""
+    import types
+
+    import tensorrt_llm._torch.attention.backends.sparse.csa2.projection as projection
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        _prepare_dspark_attention_rope,
+        dspark_attention_forward_batched,
+        dspark_mxfp8_projections,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(requests)
+    shapes = {
+        "wq_a": (_TP_Q_RANK, _TP_HIDDEN, 0.02),
+        "wkv": (_TP_HEAD_DIM, _TP_HIDDEN, 0.02),
+        "wq_b": (_TP_HEADS * _TP_HEAD_DIM, _TP_Q_RANK, 0.03),
+        "wo_a": (_TP_GROUPS * _TP_O_RANK, _TP_HEADS * _TP_HEAD_DIM // _TP_GROUPS, 0.02),
+        "wo_b": (_TP_HIDDEN, _TP_GROUPS * _TP_O_RANK, 0.02),
+    }
+    # The stage's CSA2 module holds MXFP8 Linears; wo_a comes as the checkpoint's 32x32 pair.
+    attn, weights = types.SimpleNamespace(_fp8_alpha=torch.ones(1, device="cuda")), {}
+    for name, (n, k, std) in shapes.items():
+        q, scales, weights[name] = _fp8_rows(n, k, std, gen)
+        if name == "wo_a":
+            wo_a = (q, scales[::32].contiguous().view(torch.float8_e8m0fnu))
+        else:
+            linear = types.SimpleNamespace(
+                weight=q, weight_scale=torch.ops.trtllm.block_scale_interleave(scales)
+            )
+            setattr(attn, "o_b_proj" if name == "wo_b" else name, linear)
+    rows = requests * block
+    mxfp8 = dspark_mxfp8_projections(attn, wo_a, 32, _TP_GROUPS, _TP_O_RANK, _ROPE_DIM, rows)
+    weights.update(
+        q_norm_w=(1 + 0.1 * torch.randn(_TP_Q_RANK, generator=gen, device="cuda")).bfloat16(),
+        kv_norm_w=(1 + 0.1 * torch.randn(_TP_HEAD_DIM, generator=gen, device="cuda")).bfloat16(),
+        attn_sink=torch.randn(_TP_HEADS, generator=gen, device="cuda"),
+    )
+    x = torch.randn(requests, block, _TP_HIDDEN, generator=gen, device="cuda").bfloat16()
+    main_x = torch.randn(requests, 1, _TP_HIDDEN, generator=gen, device="cuda").bfloat16()
+    window = (
+        torch.randn(requests + 1, _TP_WINDOW, _TP_HEAD_DIM, generator=gen, device="cuda") / 2
+    ).bfloat16()
+    slots = torch.randperm(requests, generator=gen, device="cuda")
+    start_pos = 3000 + torch.randint(0, 900, (requests,), generator=gen, device="cuda")
+    valid_len = torch.randint(1, _TP_WINDOW + 1, (requests,), generator=gen, device="cuda")
+    freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 4000, device="cuda")
+    rope = _prepare_dspark_attention_rope(start_pos, block, freqs)
+    kwargs = dict(
+        persist=True,
+        rope_metadata=rope,
+        freqs_cis=freqs,
+        q_b_norm_enabled=False,
+        n_heads=_TP_HEADS,
+        head_dim=_TP_HEAD_DIM,
+        rope_head_dim=_ROPE_DIM,
+        n_groups=_TP_GROUPS,
+        o_lora_rank=_TP_O_RANK,
+        window_size=_TP_WINDOW,
+        eps=_TP_EPS,
+        softmax_scale=_TP_HEAD_DIM**-0.5,
+        **weights,
+    )
+
+    grouped = []
+    grouped_output = projection.grouped_output_mxfp8
+
+    def counted(*args, **kw):
+        grouped.append(grouped_output(*args, **kw))
+        return grouped[-1]
+
+    monkeypatch.setattr(projection, "grouped_output_mxfp8", counted)
+
+    def run(window_in, mxfp8_in):
+        return dspark_attention_forward_batched(
+            x, main_x, start_pos, window_in, slots, valid_len, mxfp8=mxfp8_in, **kwargs
+        )
+
+    bf16_window, mxfp8_window = window.clone(), window.clone()
+    expected = run(bf16_window, None)
+    actual = run(mxfp8_window, mxfp8)
+    assert len(grouped) == 1 and grouped[0] is not None
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    out_err = rel(actual, expected)
+    frames = (slots.long(), (start_pos % _TP_WINDOW).long())
+    window_err = rel(mxfp8_window[frames], bf16_window[frames])
+    # One MXFP8 rounding of an activation costs about 2-3 % rel L2; the output takes four.
+    assert out_err < 8e-2 and window_err < 5e-2
+
+    graph_window = window.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = run(graph_window, mxfp8)
+    for _ in range(2):
+        x.normal_(generator=gen)
+        main_x.normal_(generator=gen)
+        graph_window.copy_(window)
+        graph.replay()
+        eager_window = window.clone()
+        eager = run(eager_window, mxfp8)
+        torch.cuda.synchronize()
+        assert torch.equal(replayed, eager) and torch.equal(graph_window, eager_window)

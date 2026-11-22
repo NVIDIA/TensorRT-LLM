@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkDraftModel, dspark_propose
+from tensorrt_llm._torch.models.modeling_dspark import (
+    CompactTPArgmax,
+    DSv4DSparkDraftModel,
+    dspark_propose,
+)
 from tensorrt_llm._torch.models.modeling_speculative import DSparkConfidenceHead, build_markov_head
 
 pytestmark = pytest.mark.cpu_only
@@ -56,6 +60,7 @@ def test_confidence_uses_prenorm_without_changing_proposals(physical_k, head_typ
         block_size=physical_k,
         uses_lagged_pre=False,
         confidence_uses_normalized_hidden=True,
+        _compact_tp_argmax=CompactTPArgmax(),
     )
     hidden = torch.randn(batch, physical_k, 4, hidden_size) * 3
     bonus = torch.arange(batch) + 2

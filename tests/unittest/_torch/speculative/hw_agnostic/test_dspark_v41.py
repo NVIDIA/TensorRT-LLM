@@ -144,6 +144,7 @@ def test_dspark_confidence_uses_prenorm_and_lm_head_uses_normalized_hidden_state
     cls = DSv41DSparkDraftModel if v41 else modeling_dspark.DSv4DSparkDraftModel
     model = cls.__new__(cls)
     nn.Module.__init__(model)
+    model._compact_tp_argmax = modeling_dspark.CompactTPArgmax()
     model.block_size = 2
     collapsed = torch.tensor([[[2.0, 4.0], [6.0, 8.0]]])
     normalized = collapsed / 2
@@ -393,6 +394,7 @@ def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch)
 def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
     model = DSv41DSparkDraftModel.__new__(DSv41DSparkDraftModel)
     nn.Module.__init__(model)
+    model._compact_tp_argmax = modeling_dspark.CompactTPArgmax()
     model.hc_mult = 2
     model.block_size = 2
     model.model_config = SimpleNamespace(

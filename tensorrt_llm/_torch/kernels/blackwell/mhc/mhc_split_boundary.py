@@ -144,6 +144,56 @@ def _ld_volatile_v4(addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_volatile_v4_or(
+    addr: Int64, use_words: Int32, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None, ip=None
+):
+    """``_ld_volatile_v4`` of ``addr``, or ``w0..w3`` without a load where ``use_words`` != 0."""
+    words = _asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(use_words).ir_value(loc=loc, ip=ip)]
+        + [Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $5, 0;\n\t"
+        "@!p ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];\n\t"
+        "@p mov.b32 $0, $6;\n\t@p mov.b32 $1, $7;\n\t@p mov.b32 $2, $8;\n\t@p mov.b32 $3, $9;\n\t}",
+        "=&r,=&r,=&r,=&r,l,r,r,r,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), words, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _ld_relaxed_s32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    """A gpu-scope relaxed load: the L2 value, never an L1 copy."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.b32 $0, [$1];",
+            "=r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_relaxed_bf16_as_f32(addr: Int64, *, loc=None, ip=None) -> Float32:
+    """The BF16 at ``addr`` (gpu-scope relaxed load) as FP32, exactly."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 h, z;\n\t.reg .b32 w;\n\tld.relaxed.gpu.global.b16 h, [$1];\n\t"
+            "mov.b16 z, 0;\n\tmov.b32 w, {z, h};\n\tmov.b32 $0, w;\n\t}",
+            "=f,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _st_v4(addr: Int64, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None, ip=None) -> None:
     _asm(
         None,
@@ -151,6 +201,18 @@ def _st_v4(addr: Int64, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None,
         + [Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
         "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
         "l,r,r,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _prefetch_l2_bulk(addr: Int64, nbytes: Int32, *, loc=None, ip=None) -> None:
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
         loc=loc,
         ip=ip,
     )
@@ -248,6 +310,32 @@ def _red_async_release_add_u32(addr: Int64, value: Int32, *, loc=None, ip=None) 
 
 
 @dsl_user_op
+def _atom_release_add_if_u32(addr: Int64, value: Int32, pred: Int32, *, loc=None, ip=None) -> Int32:
+    """``atom.release.gpu`` add returning the previous value where ``pred`` != 0 (-1 elsewhere), in
+    one predicated asm statement so that no branch merge waits for its return."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int32(value).ir_value(loc=loc, ip=ip),
+                Int32(pred).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $3, 0;\n\tmov.u32 $0, 0xFFFFFFFF;\n\t"
+            "@p atom.release.gpu.global.add.u32 $0, [$1], $2;\n\t}",
+            "=&r,l,r,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fence_acq_rel_gpu(*, loc=None, ip=None) -> None:
+    _asm(None, [], "fence.acq_rel.gpu;", "~{memory}", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _arrive_barrier_1(threads: Int32, *, wait: bool, loc=None, ip=None) -> None:
     """Named barrier 1 over ``threads`` threads: wait for every arrival, or only arrive."""
     _asm(
@@ -297,6 +385,87 @@ def _st_dsmem_f32(smem_addr: Int32, cta_rank: Int32, value: Float32, *, loc=None
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_init(addr: Int32, count: Int32, *, loc=None, ip=None) -> None:
+    _asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(count).ir_value(loc=loc, ip=ip)],
+        "mbarrier.init.shared::cta.b64 [$0], $1;",
+        "r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _fence_mbar_init_cluster(*, loc=None, ip=None) -> None:
+    _asm(None, [], "fence.mbarrier_init.release.cluster;", "~{memory}", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _cluster_arrive_relaxed_wait(*, loc=None, ip=None) -> None:
+    _asm(
+        None,
+        [],
+        "barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;",
+        "~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_expect_tx(addr: Int32, nbytes: Int32, *, loc=None, ip=None) -> None:
+    _asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;",
+        "r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_try_wait(addr: Int32, parity: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip), Int32(parity).ir_value(loc=loc, ip=ip)],
+            # Cluster-scope acquire: the completions come from peer CTAs' st.async.
+            "{\n\t.reg .pred p;\n\t"
+            "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n\t"
+            "selp.b32 $0, 1, 0, p;\n\t}",
+            "=r,r,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_async_dsmem_f32(
+    slot: Int32, mbar: Int32, cta_rank: Int32, value: Float32, *, loc=None, ip=None
+) -> None:
+    """``st.async`` of FP32 ``value`` to shared address ``slot`` of cluster CTA ``cta_rank``,
+    completing 4 bytes on that CTA's mbarrier at shared address ``mbar``."""
+    _asm(
+        None,
+        [
+            Int32(slot).ir_value(loc=loc, ip=ip),
+            Int32(mbar).ir_value(loc=loc, ip=ip),
+            Int32(cta_rank).ir_value(loc=loc, ip=ip),
+            Float32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .b32 ra, rb, rv;\n\tmapa.shared::cluster.u32 ra, $0, $2;\n\t"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n\tmov.b32 rv, $3;\n\t"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [ra], rv, [rb];\n\t}",
+        "r,r,r,f,~{memory}",
         loc=loc,
         ip=ip,
     )
@@ -795,6 +964,7 @@ class MhcPostCollapseNormKernel:
         q_addr: Int64,
         sf_addr: Int64,
         gscale: Float32,
+        mbar_addr=None,
     ) -> None:
         """Everything after ``x`` is known: post update, residual store, collapse, RMSNorm.
 
@@ -858,6 +1028,7 @@ class MhcPostCollapseNormKernel:
                 q_addr,
                 sf_addr,
                 gscale,
+                mbar_addr,
             )
 
     @cute.jit
@@ -875,6 +1046,7 @@ class MhcPostCollapseNormKernel:
         q_addr: Int64,
         sf_addr: Int64,
         gscale: Float32,
+        mbar_addr=None,
     ) -> None:
         warp = tidx // 32
         lane = tidx % 32
@@ -903,18 +1075,31 @@ class MhcPostCollapseNormKernel:
                 total = total + red[w]
         else:
             # Every CTA holds all ctas x num_warps partials: lane 0 of each warp pushes its partial
-            # into slot (this CTA, warp) of every CTA, one cluster barrier publishes them, and the
-            # sum runs over local shared memory in the same order.
+            # into slot (this CTA, warp) of every CTA, and the sum runs over local shared memory in
+            # the same order.
             all_red = smem.allocate_tensor(
                 Float32, cute.make_layout((ctas * num_warps,)), byte_alignment=16
             )
             me = (vi - tidx) // (num_warps * 32)
-            if lane == 0:
-                slot_addr = Int32(all_red.iterator.toint()) + Int32(4) * (me * num_warps + warp)
-                for p in cutlass.range_constexpr(ctas):
-                    _st_dsmem_f32(slot_addr, Int32(p), sum_sq)
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+            slot_addr = Int32(all_red.iterator.toint()) + Int32(4) * (me * num_warps + warp)
+            if const_expr(self.mbar_exchange):
+                # The partials complete on this CTA's mbarrier at ``mbar_addr`` (from _mbar_setup,
+                # before the dependency wait), so no cluster barrier waits for the residual stores.
+                if tidx == 0:
+                    _mbar_expect_tx(mbar_addr, Int32(4 * ctas * num_warps))
+                if lane == 0:
+                    for p in cutlass.range_constexpr(ctas):
+                        _st_async_dsmem_f32(slot_addr, mbar_addr, Int32(p), sum_sq)
+                done = _mbar_try_wait(mbar_addr, Int32(0))
+                while done == 0:
+                    done = _mbar_try_wait(mbar_addr, Int32(0))
+            else:
+                # One cluster barrier publishes the partials.
+                if lane == 0:
+                    for p in cutlass.range_constexpr(ctas):
+                        _st_dsmem_f32(slot_addr, Int32(p), sum_sq)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             for p in cutlass.range_constexpr(ctas):
                 for w in cutlass.range_constexpr(num_warps):
                     total = total + all_red[p * num_warps + w]
@@ -995,6 +1180,17 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
     output (as TensorRT-LLM's MoE-finalize all-reduce): ``sum_k scale[t, k] * fc2[perm[t, k]]`` plus
     the shared-expert output, accumulated in FP32 and rounded to BF16 once (``perm < 0`` rows are
     skipped). ``gX`` is then unused; without it ``gFc2`` / ``gScale`` / ``gPerm`` / ``gShared`` are.
+
+    Same sums in the same order with ``mbar_exchange`` (cluster CTAs exchange RMSNorm partials by
+    ``st.async`` on a per-CTA mbarrier) and ``early_moe_rows`` (MoE rows load before the flags).
+    ``early_clear`` (MNNVL, MoE-finalize input): the Lamport state and the routing are read and the
+    previous buffer cleared before the dependency wait; the caller guarantees the previous launch has
+    completed and the routing is final. ``own_slot``: this rank's slot is taken from the words the
+    thread pushed instead of being polled. ``handover_warp`` (with ``mbar_exchange``): an extra warp
+    per CTA counts the CTA once its threads have read the Lamport state, and the CTA counted last
+    hands the state over, so no thread waits for the others' arrivals. ``l2_prefetch`` (with the
+    hand-over warp): that warp also reads up to two given regions into L2 once the dependency wait
+    returns, the CTAs splitting them.
     """
 
     def __init__(
@@ -1008,6 +1204,12 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
         ctas_per_token: int = 1,
         mnnvl: bool = False,
         quant: str | None = None,
+        mbar_exchange: bool = False,
+        early_moe_rows: bool = False,
+        early_clear: bool = False,
+        own_slot: bool = False,
+        handover_warp: bool = False,
+        l2_prefetch: bool = False,
     ):
         super().__init__(
             hidden=hidden, norm_eps=norm_eps, use_pdl=use_pdl, post_update=True, quant=quant
@@ -1022,6 +1224,12 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
         # A cluster of CTAs per token spreads the token's pushes, polls and math over SMs.
         self.ctas = ctas_per_token
         self.threads_cta = self.threads // ctas_per_token
+        self.mbar_exchange = mbar_exchange and ctas_per_token > 1
+        self.early_moe_rows = early_moe_rows and moe_topk > 0
+        self.early_clear = early_clear and mnnvl and moe_topk > 0
+        self.own_slot = own_slot
+        self.handover_warp = handover_warp and self.mbar_exchange
+        self.l2_prefetch = l2_prefetch and self.handover_warp
 
     @cute.jit
     def __call__(
@@ -1043,6 +1251,10 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
         q_addr: Int64,
         sf_addr: Int64,
         scale_addr: Int64,
+        pf0_addr: Int64,
+        pf0_bytes: Int64,
+        pf1_addr: Int64,
+        pf1_bytes: Int64,
         stream,
     ) -> None:
         m = cute.size(gRes, mode=[0])
@@ -1079,20 +1291,259 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
             q_addr,
             sf_addr,
             scale_addr,
+            pf0_addr,
+            pf0_bytes,
+            pf1_addr,
+            pf1_bytes,
             copy_bf16,
             copy_f32,
             store_bf16,
         ).launch(
             grid=[m * self.ctas, 1, 1],
-            block=[self.threads_cta, 1, 1],
+            block=[self.threads_cta + (32 if self.handover_warp else 0), 1, 1],
             cluster=[self.ctas, 1, 1],
-            smem=self.num_warps * 4 * (2 if self.ctas > 1 else 1),
+            smem=self.num_warps * 4 * (2 if self.ctas > 1 else 1)
+            + (64 if self.mbar_exchange else 0),
             stream=stream,
             use_pdl=self.use_pdl,
         )
 
+    @cute.jit
+    def _mbar_setup(self, tidx):
+        """This CTA's RMSNorm-partials mbarrier, initialized and cluster-visible before any peer's
+        ``st.async``; returns its shared address. Reads no producer data: runs before the wait."""
+        smem = SmemAllocator()
+        mbar = smem.allocate_tensor(Int64, cute.make_layout((1,)), byte_alignment=16)
+        addr = Int32(mbar.iterator.toint())
+        if tidx == 0:
+            _mbar_init(addr, Int32(1))
+            _fence_mbar_init_cluster()
+        _cluster_arrive_relaxed_wait()
+        return addr
+
+    @cute.jit
+    def _mnnvl_state(self, flags: Int64):
+        cur = _ld_volatile_s32(flags)
+        dirty = _ld_volatile_s32(flags + Int64(4))
+        buf_bytes = Int64(_ld_volatile_s32(flags + Int64(8)))
+        dirty_stages = _ld_volatile_s32(flags + Int64(12))
+        stage_sizes = cute.make_rmem_tensor(cute.make_layout((4,)), Int32)
+        for s in cutlass.range_constexpr(4):
+            stage_sizes[s] = _ld_volatile_s32(flags + Int64(16 + 4 * s))
+        return cur, dirty, buf_bytes, dirty_stages, stage_sizes
+
+    @cute.jit
+    def _advance_state(self, state, m, flag_addr: Int64, layout_addr: Int64) -> None:
+        """Hand the triple buffer to the next launch once every CTA has read the state (``state``:
+        MNNVL the current buffer index, IPC the flag value)."""
+        nranks: cutlass.Constexpr = self.nranks
+        if const_expr(self.mnnvl):
+            # This launch's buffer becomes the dirty one (one stage, all ranks' slices).
+            _st_s32(flag_addr, (state + 1) % 3)
+            _st_s32(flag_addr + Int64(4), state)
+            _st_s32(flag_addr + Int64(12), Int32(1))
+            _st_s32(flag_addr + Int64(16), Int32(m) * Int32(self.hidden * nranks * 2))
+            _st_s32(flag_addr + Int64(20), Int32(0))
+            _st_s32(flag_addr + Int64(24), Int32(0))
+            _st_s32(flag_addr + Int64(28), Int32(0))
+            _st_s32(flag_addr + Int64(32), Int32(0))
+        else:
+            _st_s32(flag_addr + Int64(8), (state + 1) % 3)
+            _st_s64(layout_addr, Int64(m) * Int64(self.hidden * nranks * 2))
+            _st_s32(flag_addr, Int32(0))
+
+    @cute.jit
+    def _clear_mnnvl_dirty(
+        self,
+        own: Int64,
+        dirty: Int32,
+        buf_bytes: Int64,
+        dirty_stages: Int32,
+        stage_sizes: cute.Tensor,
+        idx: Int64,
+        tot: Int64,
+    ) -> None:
+        """This thread's share of the clear of the previous launch's (dirty) buffer."""
+        neg0 = Int32(_NEG_ZERO)
+        for s in cutlass.range_constexpr(4):
+            if Int32(s) < dirty_stages:
+                stage_bytes = buf_bytes // Int64(dirty_stages)
+                stage = own + (Int64(dirty) * Int64(dirty_stages) + Int64(s)) * stage_bytes
+                clear_vecs = Int64(stage_sizes[s]) // Int64(16)
+                c = idx
+                while c < clear_vecs:
+                    _st_v4(stage + c * Int64(16), neg0, neg0, neg0, neg0)
+                    c = c + tot
+
+    @cute.jit
+    def _load_routing(
+        self,
+        tok,
+        gPerm: cute.Tensor,
+        gScale: cute.Tensor,
+        perm: cute.Tensor,
+        weight: cute.Tensor,
+        before_wait: cutlass.Constexpr,
+    ) -> None:
+        """The token's expert rows ``perm`` and routing weights ``weight`` (FP32); ``before_wait``
+        reads them from L2, as no L1 line is known to be fresh before the dependency wait."""
+        for k in cutlass.range_constexpr(self.moe_topk):
+            if const_expr(before_wait):
+                perm[k] = _ld_relaxed_s32(
+                    gPerm.iterator.toint() + (Int64(tok) * self.moe_topk + k) * 4
+                )
+                weight[k] = _ld_relaxed_bf16_as_f32(
+                    gScale.iterator.toint() + (Int64(tok) * self.moe_topk + k) * 2
+                )
+            else:
+                perm[k] = Int32(gPerm[tok, k])
+                weight[k] = gScale[tok, k].to(Float32)
+
+    @cute.jit
+    def _load_moe_rows(
+        self,
+        tok,
+        vi,
+        perm: cute.Tensor,
+        gFc2_v: cute.Tensor,
+        gShared_v: cute.Tensor,
+        rows: cute.Tensor,
+        shared: cute.Tensor,
+        copy_bf16: cute.CopyAtom,
+    ) -> None:
+        """The token's routed FC2 rows and shared-expert row for vector ``vi``; all rows are loaded
+        before the sum (a skipped row, ``perm < 0``, reads row 0 unused)."""
+        for k in cutlass.range_constexpr(self.moe_topk):
+            p = perm[k]
+            if p < 0:
+                p = Int32(0)
+            cute.copy(copy_bf16, gFc2_v[p, (None, vi)], rows[k, None])
+        cute.copy(copy_bf16, gShared_v[tok, (None, vi)], shared)
+
     @cute.kernel
     def ar_kernel(
+        self,
+        gX: cute.Tensor,
+        gRes: cute.Tensor,
+        gPost: cute.Tensor,
+        gComb: cute.Tensor,
+        gPre: cute.Tensor,
+        gW: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        gWs: cute.Tensor,
+        rank: Int32,
+        gFc2: cute.Tensor,
+        gScale: cute.Tensor,
+        gPerm: cute.Tensor,
+        gShared: cute.Tensor,
+        q_addr: Int64,
+        sf_addr: Int64,
+        scale_addr: Int64,
+        pf0_addr: Int64,
+        pf0_bytes: Int64,
+        pf1_addr: Int64,
+        pf1_bytes: Int64,
+        copy_bf16: cute.CopyAtom,
+        copy_f32: cute.CopyAtom,
+        store_bf16: cute.CopyAtom,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        token = True
+        if const_expr(self.handover_warp):
+            token = tidx < self.threads_cta
+        if token:
+            self._ar_token(
+                gX,
+                gRes,
+                gPost,
+                gComb,
+                gPre,
+                gW,
+                gResOut,
+                gOut,
+                gWs,
+                rank,
+                gFc2,
+                gScale,
+                gPerm,
+                gShared,
+                q_addr,
+                sf_addr,
+                scale_addr,
+                copy_bf16,
+                copy_f32,
+                store_bf16,
+            )
+        else:
+            self._handover_warp(tidx, gWs, pf0_addr, pf0_bytes, pf1_addr, pf1_bytes)
+
+    @cute.jit
+    def _prefetch_l2_slice(self, lane, addr: Int64, nbytes: Int64) -> None:
+        """This CTA's share of ``nbytes`` (a multiple of 16) at ``addr``: 16 KB per lane at a time."""
+        grid, _, _ = cute.arch.grid_dim()
+        bid, _, _ = cute.arch.block_idx()
+        share = (nbytes // Int64(16) + Int64(grid) - Int64(1)) // Int64(grid) * Int64(16)
+        start = Int64(bid) * share
+        end = start + share
+        if end > nbytes:
+            end = nbytes
+        off = start + Int64(lane) * Int64(16384)
+        while off < end:
+            n = end - off
+            if n > Int64(16384):
+                n = Int64(16384)
+            _prefetch_l2_bulk(addr + off, Int32(n))
+            off = off + Int64(32 * 16384)
+
+    @cute.jit
+    def _handover_warp(
+        self,
+        tidx,
+        gWs: cute.Tensor,
+        pf0_addr: Int64,
+        pf0_bytes: Int64,
+        pf1_addr: Int64,
+        pf1_bytes: Int64,
+    ) -> None:
+        """Count the CTA once its token threads have read the Lamport state; the CTA counted last
+        advances the state. With ``l2_prefetch`` it first issues the CTA's prefetches."""
+        grid, _, _ = cute.arch.grid_dim()
+        nranks: cutlass.Constexpr = self.nranks
+        # Every thread of the cluster takes part in the barrier of the token threads' _mbar_setup.
+        _cluster_arrive_relaxed_wait()
+        if const_expr(self.l2_prefetch):
+            # After the wait: the producer's own weight reads are done by then.
+            if const_expr(self.use_pdl):
+                griddepcontrol_wait()
+            self._prefetch_l2_slice(tidx - self.threads_cta, pf0_addr, pf0_bytes)
+            self._prefetch_l2_slice(tidx - self.threads_cta, pf1_addr, pf1_bytes)
+        flag_addr = Int64(0)
+        layout_addr = Int64(0)
+        counter = Int64(0)
+        if const_expr(self.mnnvl):
+            flag_addr = Int64(gWs[2])
+            layout_addr = flag_addr
+            counter = flag_addr + Int64(32)
+        else:
+            flag_addr = Int64(gWs[nranks])
+            layout_addr = Int64(gWs[nranks + 1])
+            counter = flag_addr
+        _arrive_barrier_1(Int32(self.threads_cta + 32), wait=True)
+        # The state the token threads read (no launch advances it before every CTA is counted).
+        state = Int32(0)
+        if const_expr(self.mnnvl):
+            state = _ld_volatile_s32(flag_addr)
+        else:
+            state = _ld_volatile_s32(flag_addr + Int64(8))
+        prior = _atom_release_add_if_u32(counter, Int32(1), Int32(tidx == self.threads_cta))
+        if tidx == self.threads_cta:
+            if prior == grid - 1:
+                _fence_acq_rel_gpu()
+                self._advance_state(state, grid // self.ctas, flag_addr, layout_addr)
+
+    @cute.jit
+    def _ar_token(
         self,
         gX: cute.Tensor,
         gRes: cute.Tensor,
@@ -1115,6 +1566,7 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
         copy_f32: cute.CopyAtom,
         store_bf16: cute.CopyAtom,
     ) -> None:
+        """The boundary of token ``block // ctas``, one 8-wide vector per thread."""
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         grid, _, _ = cute.arch.grid_dim()
@@ -1161,6 +1613,19 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
             own = Int64(gWs[rank])
             for r in cutlass.range_constexpr(nranks):
                 peers[r] = Int64(gWs[r])
+        mbar_addr = Int32(0)
+        if const_expr(self.mbar_exchange):
+            mbar_addr = self._mbar_setup(tidx)
+        tot = Int64(m) * Int64(vecs)
+        idx = Int64(tok) * Int64(vecs) + Int64(vi)
+        perm = cute.make_rmem_tensor(cute.make_layout((max(self.moe_topk, 1),)), Int32)
+        weight = cute.make_rmem_tensor(cute.make_layout((max(self.moe_topk, 1),)), Float32)
+        routing_early: cutlass.Constexpr = self.early_clear and gScale.element_type == BFloat16
+        if const_expr(routing_early):
+            self._load_routing(tok, gPerm, gScale, perm, weight, before_wait=True)
+        if const_expr(self.early_clear):
+            cur, dirty, buf_bytes, dirty_stages, stage_sizes = self._mnnvl_state(flags)
+            self._clear_mnnvl_dirty(own, dirty, buf_bytes, dirty_stages, stage_sizes, idx, tot)
 
         if const_expr(self.use_pdl):
             griddepcontrol_wait()
@@ -1172,29 +1637,32 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
         # Lamport state below, in one round trip ----
         x_in = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
         if const_expr(self.moe_topk > 0):
-            perm = cute.make_rmem_tensor(cute.make_layout((self.moe_topk,)), Int32)
-            weight = cute.make_rmem_tensor(cute.make_layout((self.moe_topk,)), Float32)
-            for k in cutlass.range_constexpr(self.moe_topk):
-                perm[k] = Int32(gPerm[tok, k])
-                weight[k] = gScale[tok, k].to(Float32)
+            gFc2_v = cute.logical_divide(gFc2, (None, VEC))
+            gShared_v = cute.logical_divide(gShared, (None, VEC))
+            rows = cute.make_rmem_tensor(
+                cute.make_layout((self.moe_topk, VEC), stride=(VEC, 1)), BFloat16
+            )
+            shared = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
+            if const_expr(not routing_early):
+                self._load_routing(tok, gPerm, gScale, perm, weight, before_wait=False)
+            if const_expr(self.early_moe_rows):
+                self._load_moe_rows(tok, vi, perm, gFc2_v, gShared_v, rows, shared, copy_bf16)
         else:
             cute.copy(copy_bf16, gX_v[tok, (None, vi)], x_in)
 
         # ---- Lamport state of this launch (read before any CTA bumps the arrival counter) ----
         if const_expr(self.mnnvl):
             # Flags (uint32): current, dirty, bytes per buffer, dirty stages, 4 x dirty bytes per
-            # stage, arrival counter. All of them are read before this CTA arrives: CTA 0 rewrites
-            # them for the next launch once every CTA has arrived.
-            cur = _ld_volatile_s32(flags)
-            dirty = _ld_volatile_s32(flags + Int64(4))
-            buf_bytes = Int64(_ld_volatile_s32(flags + Int64(8)))
-            dirty_stages = _ld_volatile_s32(flags + Int64(12))
-            stage_sizes = cute.make_rmem_tensor(cute.make_layout((4,)), Int32)
-            for s in cutlass.range_constexpr(4):
-                stage_sizes[s] = _ld_volatile_s32(flags + Int64(16 + 4 * s))
+            # stage, arrival counter. All of them are read before this CTA arrives: the CTA counted
+            # last (CTA 0 without the hand-over warp) rewrites them for the next launch.
+            if const_expr(not self.early_clear):
+                cur, dirty, buf_bytes, dirty_stages, stage_sizes = self._mnnvl_state(flags)
             data_off = Int64(cur) * buf_bytes
-            # Warp 0 counts the CTA once all its threads have read the flags; the other warps go on.
-            if tidx < 32:
+            # Warp 0, or the hand-over warp, counts the CTA once all its threads have read the flags;
+            # the other warps go on.
+            if const_expr(self.handover_warp):
+                _arrive_barrier_1(Int32(self.threads_cta + 32), wait=False)
+            elif tidx < 32:
                 _arrive_barrier_1(Int32(self.threads_cta), wait=True)
                 if tidx == 0:
                     _red_async_release_add_u32(flags + Int64(32), Int32(1))
@@ -1206,7 +1674,9 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
             comm_size = _ld_volatile_s64(layout_addr + Int64(8))
             data_off = Int64(flag % 3) * comm_size
             clear_off = Int64((flag + 2) % 3) * comm_size
-            if tidx < 32:
+            if const_expr(self.handover_warp):
+                _arrive_barrier_1(Int32(self.threads_cta + 32), wait=False)
+            elif tidx < 32:
                 _arrive_barrier_1(Int32(self.threads_cta), wait=True)
                 if tidx == 0:
                     _atomic_add_s32(flag_addr, Int32(1))
@@ -1216,23 +1686,10 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
             griddepcontrol_launch_dependents()
 
         # ---- push this rank's slice of the token to every rank ----
-        tot = Int64(m) * Int64(vecs)
-        idx = Int64(tok) * Int64(vecs) + Int64(vi)
         if const_expr(self.moe_topk > 0):
-            # MoE finalize: FP32 sum of the routed expert rows and the shared-expert output. All
-            # rows are loaded before the sum (a skipped row, ``perm < 0``, reads row 0 unused).
-            gFc2_v = cute.logical_divide(gFc2, (None, VEC))
-            gShared_v = cute.logical_divide(gShared, (None, VEC))
-            rows = cute.make_rmem_tensor(
-                cute.make_layout((self.moe_topk, VEC), stride=(VEC, 1)), BFloat16
-            )
-            for k in cutlass.range_constexpr(self.moe_topk):
-                p = perm[k]
-                if p < 0:
-                    p = Int32(0)
-                cute.copy(copy_bf16, gFc2_v[p, (None, vi)], rows[k, None])
-            shared = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
-            cute.copy(copy_bf16, gShared_v[tok, (None, vi)], shared)
+            # MoE finalize: FP32 sum of the routed expert rows and the shared-expert output.
+            if const_expr(not self.early_moe_rows):
+                self._load_moe_rows(tok, vi, perm, gFc2_v, gShared_v, rows, shared, copy_bf16)
             acc = cute.make_rmem_tensor(cute.make_layout((VEC,)), Float32)
             for v in cutlass.range_constexpr(VEC):
                 acc[v] = Float32(0.0)
@@ -1269,18 +1726,10 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
             for r in cutlass.range_constexpr(nranks):
                 _st_v4(peers[r] + data_off + slot, w0, w1, w2, w3)
 
-        # ---- clear the slot the previous launch used ----
+        # ---- clear the slot the previous launch used (``early_clear``: before the wait) ----
         if const_expr(self.mnnvl):
-            # Stage s of the dirty buffer holds the previous launch's bytes (flags[4 + s]).
-            for s in cutlass.range_constexpr(4):
-                if Int32(s) < dirty_stages:
-                    stage_bytes = buf_bytes // Int64(dirty_stages)
-                    stage = own + (Int64(dirty) * Int64(dirty_stages) + Int64(s)) * stage_bytes
-                    clear_vecs = Int64(stage_sizes[s]) // Int64(16)
-                    c = idx
-                    while c < clear_vecs:
-                        _st_v4(stage + c * Int64(16), neg0, neg0, neg0, neg0)
-                        c = c + tot
+            if const_expr(not self.early_clear):
+                self._clear_mnnvl_dirty(own, dirty, buf_bytes, dirty_stages, stage_sizes, idx, tot)
         else:
             # Its size in bytes (every Lamport kernel on the workspace), as whole 16-byte stores.
             clear_vecs = (clear_size + Int64(15)) // Int64(16)
@@ -1295,7 +1744,12 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
         while pending != 0:
             pending = Int32(0)
             for r in cutlass.range_constexpr(nranks):
-                a, b, cc, d = _ld_volatile_v4(own + data_off + (Int64(r) * tot + idx) * Int64(16))
+                at = own + data_off + (Int64(r) * tot + idx) * Int64(16)
+                if const_expr(self.own_slot):
+                    # This rank's slot holds the words just pushed: no wait for their copy.
+                    a, b, cc, d = _ld_volatile_v4_or(at, Int32(rank == r), w0, w1, w2, w3)
+                else:
+                    a, b, cc, d = _ld_volatile_v4(at)
                 got[r, 0] = a
                 got[r, 1] = b
                 got[r, 2] = cc
@@ -1338,28 +1792,20 @@ class MhcAllReduceBoundaryKernel(MhcPostCollapseNormKernel):
             q_addr,
             sf_addr,
             gscale,
+            mbar_addr,
         )
 
         # ---- hand the triple buffer to the next launch once every CTA has read the flag ----
-        if bid == 0:
-            if tidx == 0:
-                if const_expr(self.mnnvl):
-                    arrived = _ld_acquire_s32(flags + Int64(32))
-                    while arrived != grid:
+        if const_expr(not self.handover_warp):
+            if bid == 0:
+                if tidx == 0:
+                    if const_expr(self.mnnvl):
                         arrived = _ld_acquire_s32(flags + Int64(32))
-                    # This launch's buffer becomes the dirty one (one stage, all ranks' slices).
-                    _st_s32(flags, (cur + 1) % 3)
-                    _st_s32(flags + Int64(4), cur)
-                    _st_s32(flags + Int64(12), Int32(1))
-                    _st_s32(flags + Int64(16), Int32(m) * Int32(self.hidden * nranks * 2))
-                    _st_s32(flags + Int64(20), Int32(0))
-                    _st_s32(flags + Int64(24), Int32(0))
-                    _st_s32(flags + Int64(28), Int32(0))
-                    _st_s32(flags + Int64(32), Int32(0))
-                else:
-                    arrived = _ld_volatile_s32(flag_addr)
-                    while arrived != grid:
+                        while arrived != grid:
+                            arrived = _ld_acquire_s32(flags + Int64(32))
+                        self._advance_state(cur, m, flags, flags)
+                    else:
                         arrived = _ld_volatile_s32(flag_addr)
-                    _st_s32(flag_addr + Int64(8), (flag + 1) % 3)
-                    _st_s64(layout_addr, Int64(m) * Int64(self.hidden * nranks * 2))
-                    _st_s32(flag_addr, Int32(0))
+                        while arrived != grid:
+                            arrived = _ld_volatile_s32(flag_addr)
+                        self._advance_state(flag, m, flag_addr, layout_addr)

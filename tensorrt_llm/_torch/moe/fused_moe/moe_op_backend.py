@@ -185,7 +185,8 @@ class MoEOpBackend:
         ``decode_spare_sms``: see ``fp4_block_scale_moe_decode_runner``.
         ``routing_tables`` replace the kernel's routing pass for tactics of their tiles
         (calls without the decode kernels only). ``cute_fc2_rows``: the model's
-        ``MoEDecodeOptions.cute_fc2_rows`` for the native NVFP4 op.
+        ``MoEDecodeOptions.cute_fc2_rows`` for the native NVFP4 op and the MXFP4 x MXFP8
+        ``_ext`` op.
         ``dynamic_experts`` > 0: the per-expert inputs hold that many experts, of which
         ``[local_expert_offset, local_expert_offset + local_num_experts)`` is this rank's static
         slot range, and ``routing_tables`` assign this call's share of all of them.
@@ -540,6 +541,46 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
                 # mxfp4
+                if not do_finalize or routing_tables is not None:
+                    outputs = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner_ext(
+                        router_logits,
+                        routing_bias,
+                        hidden_states,
+                        hidden_states_scale,
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm1_bias,
+                        gemm1_alpha,
+                        gemm1_beta,
+                        gemm1_clamp_limit,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        gemm2_bias,
+                        num_experts,
+                        top_k,
+                        n_group,
+                        topk_group,
+                        intermediate_size,
+                        valid_hidden_size,
+                        valid_intermediate_size,
+                        local_expert_offset,
+                        local_num_experts,
+                        routed_scaling_factor,
+                        routing_method_type,
+                        gated_act_type,
+                        do_finalize,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        output=output,
+                        tune_max_num_tokens=tune_max_num_tokens,
+                        use_dp=use_dp,
+                        routing_tables=None if routing_tables is None else routing_tables.tables,
+                        routing_tiles=None
+                        if routing_tables is None
+                        else list(routing_tables.tiles),
+                        cute_fc2_rows=cute_fc2_rows,
+                    )
+                    return outputs if not do_finalize else outputs[0]
                 return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                     router_logits,
                     routing_bias,
