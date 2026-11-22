@@ -449,14 +449,15 @@ def _fill_dummy_quantized(tensor: torch.Tensor,
 def runner_rehearses(model: torch.nn.Module, llm_args: TorchLlmArgs) -> bool:
     """Whether the runner ``model`` starts with runs the KernelBuilder rehearsal's
     forwards: a decoder runner with context warmups (``resolve_runner_type``),
-    not an encoder-decoder or multimodal-encoder one. Encode-only and pooling
+    not an encoder-decoder one. Encode-only, multimodal-encoder-only and pooling
     (not generation) models run on encoder executors, without a decoder runner.
     """
-    if llm_args.encode_only or not model.model_config.is_generation:
+    if (llm_args.encode_only or llm_args.mm_encoder_only
+            or not model.model_config.is_generation):
         return False
     from .engine.runners import DecoderRunner, resolve_runner_type
 
-    runner_cls = resolve_runner_type(model, llm_args)
+    runner_cls = resolve_runner_type(model)
     return (issubclass(runner_cls, DecoderRunner)
             and runner_cls._context_warmups_supported)
 
