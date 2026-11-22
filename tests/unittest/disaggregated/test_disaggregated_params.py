@@ -180,7 +180,7 @@ def test_multimodal_spans_round_trip_through_openai_json():
     assert restored == original
 
 
-def test_embedding_handles_without_hashes_get_a_random_hash_each():
+def test_embedding_handles_without_hashes_get_a_random_hash_each() -> None:
     """KV block reuse keys an item by its hash, so no two items may share one."""
     params = [
         DisaggregatedParams(multimodal_embedding_handles=[{"tensor_size": [1, 16]}] * 2)

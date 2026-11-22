@@ -32,7 +32,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams, request_cache_salt
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -945,7 +945,7 @@ class BaseLLM:
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             conversation_params=conversation_params,
-            cache_salt=cache_salt,
+            cache_salt=request_cache_salt(cache_salt, multimodal_params),
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,

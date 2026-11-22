@@ -32,6 +32,16 @@ from tensorrt_llm.logger import logger
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
+# `multimodal_data` flag: the items of the request have no content hashes. They
+# have random hashes, or no hashes and a cache salt of their own, so no other
+# request reuses their KV cache blocks. Code that shares KV blocks by name
+# across requests or servers reads it to leave the request alone.
+MULTIMODAL_NO_CONTENT_HASHES_KEY = "multimodal_no_content_hashes"
+# `multimodal_data` entry: a cache salt drawn for a request whose items have no
+# content hashes and no prompt spans. The KV cache can key such items only by
+# their placeholder tokens, which are the same for every item, so the request
+# is submitted with this salt added to its own (see `request_cache_salt`).
+MULTIMODAL_CACHE_SALT_KEY = "multimodal_cache_salt"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
@@ -670,7 +680,8 @@ class MultimodalInput:
 
     Each element can be:
     - A string UUID: Used as the cache identifier (returned in events)
-    - None: Falls back to content-based hashing for that item
+    - None: No UUID; the item is keyed by its content hash, or by a random
+      hash when it has no content hash
 
     If the UUID string is longer than 32 bytes, it will be hashed internally
     for cache key computation, but the original UUID string is preserved and
@@ -1002,7 +1013,8 @@ class MultimodalParams:
         shared-tensor handle. Item output lengths describe those rows; prompt
         lengths also count model-specific MM framing tokens. Hashes key the
         KV cache blocks of the items. Without hashes, each item gets a random
-        one, so no other request reuses the KV cache of these items.
+        one, so no other request reuses the KV cache of these items, and the
+        data is flagged with `MULTIMODAL_NO_CONTENT_HASHES_KEY`.
         """
         item_metadata.validate()
         embedding_lengths = item_metadata.output_embedding_lengths
@@ -1011,7 +1023,8 @@ class MultimodalParams:
             raise ValueError("Embeddings and item output lengths must align")
         if any(length <= 0 for length in embedding_lengths):
             raise ValueError("Attached embedding lengths must be positive")
-        if multimodal_hashes is None:
+        content_hashed = multimodal_hashes is not None
+        if not content_hashed:
             multimodal_hashes = random_mm_hashes(len(embedding_lengths))
         if len(multimodal_hashes) != len(embedding_lengths):
             raise ValueError(
@@ -1033,6 +1046,8 @@ class MultimodalParams:
             if any(offset < 0 for offset in special_token_offsets):
                 raise ValueError("special_token_offsets must be non-negative")
             data["special_token_offsets"] = special_token_offsets
+        if not content_hashed:
+            data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
         return cls(multimodal_input=multimodal_input, multimodal_data=data)
 
     @property
@@ -1375,7 +1390,7 @@ class MMHashResult(NamedTuple):
     `None` when the caller supplied no UUIDs at all."""
 
 
-def _mm_items(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
+def _mm_items(mm_data: dict[str, Any]) -> dict[str, list[Any]]:
     """Modality -> list of items. A modality set to None has no items."""
     return {
         modality: items if isinstance(items, list) else [items]
@@ -1383,15 +1398,36 @@ def _mm_items(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
     }
 
 
+def has_mm_items(mm_data: dict[str, Any] | None) -> bool:
+    """Whether `mm_data` has at least one item of any modality."""
+    return any(_mm_items(mm_data or {}).values())
+
+
+def modalities_without_token_count(mm_data: dict[str, Any],
+                                   input_processor: Any) -> list[str]:
+    """Modalities of `mm_data` with items whose tokens cannot be counted.
+
+    Counting needs a media modality and a `get_num_tokens_per_<modality>`
+    method on `input_processor`. Without the counts, the prompt span of the
+    items cannot be found.
+    """
+    return [
+        modality for modality, items in _mm_items(mm_data).items()
+        if items and (modality not in MEDIA_MODALITIES or not hasattr(
+            input_processor, f"get_num_tokens_per_{modality}"))
+    ]
+
+
 def validate_mm_uuids(
-    mm_data: Dict[str, Any],
-    mm_uuids: Optional[Dict[str, Any]],
-) -> Dict[str, List[Optional[str]]]:
+    mm_data: dict[str, Any],
+    mm_uuids: dict[str, Any] | None,
+) -> dict[str, list[str | None]]:
     """Check a request's `multi_modal_uuids` against its `mm_data`.
 
-    Returns modality -> one UUID string or None per item, for each modality of
-    `mm_data` that has UUIDs. Raises ValueError for a malformed value, which is
-    an error in the request.
+    Returns modality -> one UUID string or None per item, for each modality
+    with items and UUIDs. A modality set to None in `mm_uuids` has no UUIDs.
+    Raises ValueError for a malformed value or a modality that `mm_data` does
+    not have, which is an error in the request.
     """
     if mm_uuids is None:
         return {}
@@ -1399,13 +1435,18 @@ def validate_mm_uuids(
         raise ValueError(
             "multi_modal_uuids must be a dict of modality to UUIDs, got "
             f"{type(mm_uuids).__name__}")
-    uuids_by_modality: Dict[str, List[Optional[str]]] = {}
-    for modality, items in _mm_items(mm_data).items():
-        if modality not in mm_uuids:
+    items_by_modality = _mm_items(mm_data)
+    uuids_by_modality: dict[str, list[str | None]] = {}
+    for modality, uuids in mm_uuids.items():
+        if modality not in mm_data:
+            raise ValueError(
+                f"multi_modal_uuids has modality '{modality}', which "
+                "multi_modal_data does not have")
+        if uuids is None:
             continue
-        uuids = mm_uuids[modality]
         if not isinstance(uuids, list):
             uuids = [uuids]
+        items = items_by_modality.get(modality, [])
         if len(uuids) != len(items):
             raise ValueError(
                 f"UUID list length ({len(uuids)}) doesn't match "
@@ -1415,8 +1456,30 @@ def validate_mm_uuids(
                 raise ValueError(
                     f"multi_modal_uuids['{modality}'] items must be strings "
                     f"or None, got {type(uuid).__name__}")
-        uuids_by_modality[modality] = uuids
+        if items:
+            uuids_by_modality[modality] = uuids
     return uuids_by_modality
+
+
+def request_cache_salt(
+        cache_salt: str | None,
+        multimodal_params: "MultimodalParams | None") -> str | None:
+    """The cache salt to submit a request with.
+
+    `cache_salt`, with the request's own multimodal salt added when its
+    processed data has one (`MULTIMODAL_CACHE_SALT_KEY`), so no other request
+    reuses its KV cache blocks.
+    """
+    multimodal_data = (None if multimodal_params is None else
+                       multimodal_params.multimodal_data)
+    if not isinstance(multimodal_data, dict):
+        return cache_salt
+    multimodal_salt = multimodal_data.get(MULTIMODAL_CACHE_SALT_KEY)
+    if multimodal_salt is None:
+        return cache_salt
+    if cache_salt is None:
+        return multimodal_salt
+    return f"{cache_salt}/{multimodal_salt}"
 
 
 def apply_mm_hashes(mm_data: Dict[str, Any],
@@ -1511,7 +1574,7 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
     return result
 
 
-def random_mm_hashes(num_items: int) -> List[List[int]]:
+def random_mm_hashes(num_items: int) -> list[list[int]]:
     """A random hash (8 int32 values) for each of `num_items` multimodal items.
 
     For items without a content hash. KV block reuse keys the blocks of an item
@@ -1571,16 +1634,18 @@ def find_mm_token_lengths(
         if video_grid_thw.ndim != 2 or video_grid_thw.shape[-1] != 3:
             raise ValueError("video_grid_thw must have shape [num_segments, 3]")
 
+    uncountable = modalities_without_token_count(mm_data, input_processor)
+    if uncountable:
+        raise UnsupportedError(
+            f"Input processor {type(input_processor).__name__} cannot count "
+            f"the tokens of {uncountable} items: it needs a "
+            "'get_num_tokens_per_<modality>' method for a media modality.")
+
     for modality, items in mm_items.items():
         if not items:
-            # Nothing to count, so a missing hook does not matter: an empty
-            # list must not turn hashing off for the other modalities.
+            # Nothing to count, so a missing hook does not matter.
             num_mm_tokens[modality] = []
             continue
-        if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
-            raise UnsupportedError(
-                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
-            )
 
         video_grid_thw_for_items = None
         if modality == "video" and video_grid_thw is not None:
@@ -1796,6 +1861,20 @@ def _compute_mm_masks(
     return mm_mask, embed_mask, special_mask
 
 
+def _check_mm_token_count(mm_positions: torch.Tensor, lengths_t: torch.Tensor,
+                          num_mm_tokens: List[int]) -> None:
+    """Raise ValueError when the prompt has another number of multimodal tokens.
+
+    The per-item counts come from the processor's token-count methods, so a
+    request they get wrong (for example, other processor kwargs) fails here.
+    """
+    if mm_positions.numel() != lengths_t.sum().item():
+        raise ValueError(
+            f"Number of multimodal tokens ({mm_positions.numel()}) does not "
+            f"match sum of per-unit lengths ({lengths_t.sum().item()}): "
+            f"num_mm_tokens={num_mm_tokens}")
+
+
 def _find_mm_token_start_pos_from_masks(
     mm_mask: torch.Tensor,
     special_mask: Optional[torch.Tensor],
@@ -1828,10 +1907,7 @@ def _find_mm_token_start_pos_from_masks(
         start_special_token_positions = []
 
     lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    _check_mm_token_count(mm_positions, lengths_t, num_mm_tokens)
 
     offsets = torch.zeros(len(num_mm_tokens), dtype=torch.long)
     if len(num_mm_tokens) > 1:
@@ -1853,10 +1929,7 @@ def _find_mm_token_runs_from_mask(
 
     mm_positions = torch.where(mm_mask)[0]
     lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    _check_mm_token_count(mm_positions, lengths_t, num_mm_tokens)
 
     # Full-prompt start index for each emitted flat multimodal run.
     run_positions: List[int] = []
@@ -1901,10 +1974,7 @@ def _find_mm_embedding_lengths_from_masks(
 
     mm_positions = torch.where(mm_mask)[0]
     lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    _check_mm_token_count(mm_positions, lengths_t, num_mm_tokens)
 
     embedding_lengths: List[int] = []
     offset = 0
@@ -1923,13 +1993,12 @@ def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
     """Validates multimodal inputs for consistency and correctness."""
     # Validate number of hashes matches number of chunks
     if len(mm_hashes) != len(num_mm_tokens):
-        raise AssertionError(
-            f"Number of hashes ({len(mm_hashes)}) does not match "
-            f"number of multimodal chunks ({len(num_mm_tokens)})")
+        raise ValueError(f"Number of hashes ({len(mm_hashes)}) does not match "
+                         f"number of multimodal chunks ({len(num_mm_tokens)})")
 
     # Validate number of start positions matches number of chunks
     if len(start_positions) != len(num_mm_tokens):
-        raise AssertionError(
+        raise ValueError(
             f"Number of start positions ({len(start_positions)}) does not match "
             f"number of multimodal chunks ({len(num_mm_tokens)})")
     # Validate each chunk's position and length
@@ -1937,18 +2006,17 @@ def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
     # Verify start_positions are sorted
     if not all(start_positions[i] < start_positions[i + 1]
                for i in range(len(start_positions) - 1)):
-        raise AssertionError(
-            "start_positions must be sorted in ascending order")
+        raise ValueError("start_positions must be sorted in ascending order")
     for chunk_idx, (start_pos,
                     chunk_len) in enumerate(zip(start_positions,
                                                 num_mm_tokens)):
         if start_pos < 0:
-            raise AssertionError(
+            raise ValueError(
                 f"Invalid negative start position {start_pos} for chunk {chunk_idx}"
             )
 
         if start_pos + chunk_len > prompt_len:
-            raise AssertionError(
+            raise ValueError(
                 f"Multimodal chunk {chunk_idx} at position {start_pos} with length {chunk_len} "
                 f"exceeds input sequence length {prompt_len}")
 
@@ -1956,7 +2024,7 @@ def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
         if chunk_idx < len(start_positions) - 1:
             next_start = start_positions[chunk_idx + 1]
             if start_pos + chunk_len > next_start:
-                raise AssertionError(
+                raise ValueError(
                     f"Multimodal chunk {chunk_idx} at position {start_pos} with length {chunk_len} "
                     f"overlaps with chunk {chunk_idx + 1} at position {next_start}"
                 )

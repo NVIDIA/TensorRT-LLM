@@ -163,7 +163,8 @@ class DisaggregatedParams:
                     assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
                     assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
             else:
-                # if user did not provide mm embedding handles, kvcache reuse will be disabled
+                # No hashes given: each item gets a random one, so no other request reuses its
+                # KV cache blocks.
                 assert len(self.multimodal_embedding_handles) > 0, (
                     "multimodal_embedding_handles must be provided"
                 )
