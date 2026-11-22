@@ -425,7 +425,8 @@ def test_cutlass_moe_tunes_only_the_active_slots(monkeypatch: pytest.MonkeyPatch
 def test_cutedsl_nvfp4_grouped_gemm_tunes_only_the_active_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Tune only the active slots and reuse the tactics once restored experts fill spare slots."""
+    """Tune only the active slots, under the cache key of a layer without spare slots, and reuse
+    the tactics once restored experts fill spare slots."""
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
     if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
@@ -446,15 +447,16 @@ def test_cutedsl_nvfp4_grouped_gemm_tunes_only_the_active_slots(
     w = w.view(torch.float4_e2m1fn_x2)
     w_sf = w_sf.view(num_slots, inter_size, hidden_size // sf_vec_size)
 
-    def gemm_inputs(routed: torch.Tensor) -> Tuple[list, int]:
-        """Return the grouped GEMM inputs of ``routed`` tokens and the rows of their tiles."""
+    def gemm_inputs(routed: torch.Tensor, slots: int = num_slots) -> Tuple[list, int]:
+        """Return the grouped GEMM inputs of ``routed`` tokens on ``slots`` slots and the rows of
+        their tiles."""
         tile_idx_to_group_idx, *_, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=routed,
             token_final_scales=torch.ones(routed.shape, dtype=torch.float32, device="cuda"),
-            num_experts=num_slots,
+            num_experts=slots,
             top_k=1,
             local_expert_offset=0,
-            local_num_experts=num_slots,
+            local_num_experts=slots,
             tile_tokens_dim=tile_size,
         )
         x = torch.randint(
@@ -468,21 +470,21 @@ def test_cutedsl_nvfp4_grouped_gemm_tunes_only_the_active_slots(
         x, x_sf = torch.ops.trtllm.fp4_quantize(x, 1 / x_global_sf, sf_vec_size, False)
         inputs = [
             x.view(torch.float4_e2m1fn_x2),
-            w,
+            w[:slots],
             x_sf,
-            w_sf,
-            x_global_sf * w_global_sf,
+            w_sf[:slots],
+            (x_global_sf * w_global_sf)[:slots],
             tile_idx_to_group_idx,
             num_non_exiting_tiles,
         ]
         return inputs, num_non_exiting_tiles.item() * tile_size
 
-    def run_gemm(inputs: list, **kwargs) -> torch.Tensor:
+    def run_gemm(inputs: list, slots: int = num_slots, **kwargs) -> torch.Tensor:
         return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
             *inputs,
-            num_experts=num_slots,
+            num_experts=slots,
             top_k=1,
-            num_local_experts=num_slots,
+            num_local_experts=slots,
             local_expert_offset=0,
             tile_size=tile_size,
             output_dtype=torch.bfloat16,
@@ -537,6 +539,138 @@ def test_cutedsl_nvfp4_grouped_gemm_tunes_only_the_active_slots(
         actual = run_gemm(inputs, **active_slots)
         assert hits == [True]
         torch.testing.assert_close(actual[:rows], reference[:rows], atol=1e-2, rtol=1e-2)
+    # A layer without spare slots that runs the same problem uses the same cache entry.
+    hits.clear()
+    without_spare_slots, _ = gemm_inputs(tokens.remainder(num_active).unsqueeze(1), num_active)
+    run_gemm(without_spare_slots, num_active)
+    assert hits == [True]
+
+
+@pytest.mark.parametrize("ep_rank", [0, 1])
+def test_cutedsl_nvfp4_moe_computes_a_restored_expert_in_a_spare_slot(ep_rank: int) -> None:
+    """A spare slot that holds a restored expert computes that expert's rows through the sort, the
+    gather FC1 and the finalize FC2, as the expert's own slot does in a layer without spare slots.
+
+    This guards the runtime over every slot buffer of rank ``ep_rank`` of two, not the layout the
+    kernels are tuned and keyed by.
+    """
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("The CuteDSL NVFP4 grouped GEMMs require SM100 or SM103")
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL is not available")
+
+    torch.manual_seed(23)
+    sf_vec_size, tile_size = 16, 128
+    ep_size, num_active, num_spare, restored_expert = 2, 4, 2, 1
+    num_slots = num_active + num_spare
+    restored_slot = num_active
+    num_tokens, top_k, hidden_size, inter_size = 256, 2, 256, 256
+
+    def nvfp4(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize ``t`` per expert: its FP4 bytes, block scales and global scales."""
+        global_sf = t.abs().amax(dim=tuple(range(1, t.dim()))).float() / (448 * 6)
+        t_fp4, t_sf = torch.ops.trtllm.fp4_quantize(t, 1 / global_sf, sf_vec_size, False)
+        return t_fp4.view(torch.uint8), t_sf.view(torch.uint8), global_sf
+
+    def experts(n: int, k: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        w = torch.randn(num_active, n, k, device="cuda", dtype=torch.bfloat16) * 0.1
+        w_fp4, w_sf, w_global_sf = nvfp4(w)
+        return w_fp4.view(num_active, n, k // 2), w_sf.view(num_active, n, -1), w_global_sf
+
+    def with_spare_slots(t: torch.Tensor) -> torch.Tensor:
+        """Local slots 0-3 hold local experts 0-3, slot 4 a restored copy of expert 1, and slot 5
+        nothing."""
+        restored = t[restored_expert : restored_expert + 1]
+        return torch.cat([t, restored, torch.zeros_like(restored)])
+
+    fc1 = experts(2 * inter_size, hidden_size)
+    fc2 = experts(hidden_size, inter_size)
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    x_global_sf = x.abs().max().float() / (448 * 6)
+    x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(x, 1 / x_global_sf, sf_vec_size, False)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
+    fc2_input_scale = torch.tensor([16 / (448 * 6)], device="cuda")
+    scales, routed = torch.randn(num_tokens, num_active, device="cuda").topk(top_k, dim=-1)
+    routed, scales = routed.to(torch.int32), scales.softmax(dim=-1)
+    # The load balancer sends half of expert 1's tokens to its restored copy.
+    odd_tokens = (torch.arange(num_tokens, device="cuda") % 2 == 1).unsqueeze(1)
+    routed_to_slots = torch.where(
+        odd_tokens & (routed == restored_expert), torch.full_like(routed, restored_slot), routed
+    )
+    assert (routed_to_slots == restored_slot).any()
+
+    def run_moe(routed: torch.Tensor, slots: int, weights: list, **active_slots) -> torch.Tensor:
+        """Run rank ``ep_rank``'s MoE of ``slots`` local slots on tokens ``routed`` to them."""
+        (w1, w1_sf, w1_global_sf), (w2, w2_sf, w2_global_sf) = weights
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            _,
+            permuted_idx_to_expanded_idx,
+            _,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=routed + ep_rank * slots,
+            token_final_scales=scales,
+            num_experts=ep_size * slots,
+            top_k=top_k,
+            local_expert_offset=ep_rank * slots,
+            local_num_experts=slots,
+            tile_tokens_dim=tile_size,
+        )
+        layout = dict(
+            num_experts=ep_size * slots,
+            top_k=top_k,
+            num_local_experts=slots,
+            local_expert_offset=ep_rank * slots,
+            tile_size=tile_size,
+            **active_slots,
+        )
+        sort_tables = dict(
+            tile_idx_to_group_idx=tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+        )
+        h, h_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+            input=x_fp4.view(torch.float4_e2m1fn_x2),
+            weight=w1.view(torch.float4_e2m1fn_x2),
+            input_scale=x_sf,
+            weight_scale=w1_sf,
+            alpha=x_global_sf * w1_global_sf,
+            global_sf=fc2_input_scale,
+            **sort_tables,
+            **layout,
+        )
+        output = torch.zeros(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            input=h,
+            weight=w2.view(torch.float4_e2m1fn_x2),
+            input_scale=h_sf,
+            weight_scale=w2_sf,
+            alpha=fc2_input_scale * w2_global_sf,
+            output=output,
+            token_final_scales=scales,
+            output_dtype=torch.bfloat16,
+            **sort_tables,
+            **layout,
+        )
+        return output
+
+    slot_weights = [[with_spare_slots(t) for t in fc] for fc in (fc1, fc2)]
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        run_moe(routed_to_slots, num_slots, slot_weights, tuner_num_local_experts=num_active)
+    actual = run_moe(routed_to_slots, num_slots, slot_weights, tuner_num_local_experts=num_active)
+    expected = run_moe(routed, num_active, [fc1, fc2])
+
+    restored_rows = (routed_to_slots == restored_slot).any(dim=1)
+    assert expected[restored_rows].abs().sum().item() > 0
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 _MEGAMOE_BACKEND_TYPES = {
@@ -819,10 +953,10 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
         "CuteDslFusedMoENvfp4Runner",
     ],
 )
-def test_cutedsl_runner_identity_has_tuner_layout(
+def test_cutedsl_runner_identity_is_the_active_layout(
     monkeypatch: pytest.MonkeyPatch, runner: str
 ) -> None:
-    """A tuning of only the active slots is cached apart from a tuning of every local slot."""
+    """Rank 1's four active slots of six have the identity of a layer without spare slots."""
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
     if not IS_CUTLASS_DSL_AVAILABLE:
@@ -830,23 +964,123 @@ def test_cutedsl_runner_identity_has_tuner_layout(
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
     monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 100)
-    layout = {"num_experts": 12, "top_k": 4, "num_local_experts": 6, "local_expert_offset": 6}
 
-    def build(tuner_num_local_experts: int | None):
+    def build(num_local_experts: int, tuner_num_local_experts: int | None = None):
+        layout = {
+            "num_experts": 2 * num_local_experts,
+            "top_k": 4,
+            "num_local_experts": num_local_experts,
+            "local_expert_offset": num_local_experts,
+            "tuner_num_local_experts": tuner_num_local_experts,
+        }
         if runner == "CuteDslFusedMoENvfp4Runner":
-            return CuteDslFusedMoENvfp4Runner(
-                forward_impl=MagicMock(),
-                **layout,
-                tuner_num_local_experts=tuner_num_local_experts,
-            )
+            return CuteDslFusedMoENvfp4Runner(forward_impl=MagicMock(), **layout)
         runner_cls = getattr(cute_dsl_custom_ops, runner)
         extra = {} if "ActFusion" in runner else {"output_dtype": torch.bfloat16}
-        return runner_cls(
-            **layout, tile_size=128, **extra, tuner_num_local_experts=tuner_num_local_experts
-        )
+        return runner_cls(**layout, tile_size=128, **extra)
 
-    every_slot = build(None).unique_id()
-    assert build(4).unique_id() == every_slot + ("tuner_num_local_experts", 4)
+    with_spare_slots, without_spare_slots = build(6, 4), build(4)
+    assert with_spare_slots.unique_id() == without_spare_slots.unique_id()
+    # The tuning profiles still cover the rows, and route to the slots, of each layout.
+    assert with_spare_slots.get_tuning_config() is not without_spare_slots.get_tuning_config()
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [
+        "Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner",
+        "Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner",
+    ],
+)
+def test_cutedsl_runner_kernel_takes_the_l2_policy_of_the_active_slots(
+    monkeypatch: pytest.MonkeyPatch, runner: str
+) -> None:
+    """With spare slots, the kernel takes the L2 policy of a layer without them and spans every
+    local slot."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("The CuteDSL NVFP4 grouped GEMMs require SM100 or SM103")
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL is not available")
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+    num_active, num_spare, num_tokens, top_k, tile_size, n, k = 18, 6, 160, 8, 128, 256, 256
+    num_slots = num_active + num_spare
+    # 160 tokens x 8 experts on one rank: evict-first with 24 local slots, not with 18.
+    evict_first = cute_dsl_custom_ops._moe_weight_evict_first
+    assert evict_first(num_tokens, top_k, num_slots, num_slots, tile_size)
+    assert not evict_first(num_tokens, top_k, num_active, num_active, tile_size)
+    runner_cls = getattr(cute_dsl_custom_ops, runner)
+
+    class _KernelBuilt(Exception):
+        pass
+
+    class _StoppingKernel(runner_cls.kernel_class):
+        """Stop the forward where it builds the kernel, with the kernel's arguments."""
+
+        def __init__(self, **kwargs) -> None:
+            raise _KernelBuilt(kwargs)
+
+    monkeypatch.setattr(runner_cls, "kernel_class", _StoppingKernel)
+    monkeypatch.setattr(runner_cls, "kernel_cache", {})
+
+    def fp4(*shape: int) -> torch.Tensor:
+        return torch.zeros(shape, dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+
+    def int32(*shape: int) -> torch.Tensor:
+        return torch.zeros(shape, dtype=torch.int32, device="cuda")
+
+    def kernel_args(slots: int, tuner_num_local_experts: int | None = None) -> dict:
+        """Return the kernel arguments of a forward over ``slots`` local slots."""
+        scale_k, num_tiles = k // 16, 4
+        weights = [
+            fp4(slots, n, k // 2),
+            torch.zeros(slots, n, scale_k, dtype=torch.uint8, device="cuda"),
+            torch.ones(slots, dtype=torch.float32, device="cuda"),
+        ]
+        metadata = [int32(num_tiles), int32(num_tiles), int32(num_tiles * tile_size), int32(1)]
+        if "Finalize" in runner:
+            num_rows = num_tiles * tile_size
+            inputs = [
+                fp4(num_rows, k // 2),
+                weights[0],
+                torch.zeros(num_rows * scale_k, dtype=torch.uint8, device="cuda"),
+                *weights[1:],
+                torch.zeros(num_tokens, n, dtype=torch.bfloat16, device="cuda"),
+                *metadata,
+                torch.ones(num_tokens, top_k, dtype=torch.float32, device="cuda"),
+            ]
+            extra = {"output_dtype": torch.bfloat16}
+        else:
+            inputs = [
+                fp4(num_tokens, k // 2),
+                weights[0],
+                torch.zeros(num_tokens, scale_k, dtype=torch.uint8, device="cuda"),
+                *weights[1:],
+                *metadata,
+                torch.ones(1, dtype=torch.float32, device="cuda"),
+            ]
+            extra = {}
+        kernel_runner = runner_cls(
+            slots,
+            top_k,
+            slots,
+            0,
+            tile_size,
+            **extra,
+            tuner_num_local_experts=tuner_num_local_experts,
+        )
+        with pytest.raises(_KernelBuilt) as built:
+            kernel_runner.forward(inputs, tactic=None)
+        return built.value.args[0]
+
+    without_spare_slots = kernel_args(num_active)
+    assert not without_spare_slots.get("weight_evict_first", False)
+    assert kernel_args(num_slots, num_active) == {
+        **without_spare_slots,
+        "num_local_experts": num_slots,
+    }
 
 
 @pytest.mark.cpu_only
@@ -1281,12 +1515,14 @@ def test_cutedsl_nvfp4_runner_gets_the_tuner_layout_only_with_spare_slots(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("use_fused_finalize", [True, False])
+@pytest.mark.parametrize("fc2", ["finalize", "finalize_after_fc1_zeroing", "unpermute"])
 @pytest.mark.parametrize("spare_slot_count", [0, 2])
 def test_cutedsl_nvfp4_grouped_gemms_get_the_tuner_layout_only_with_spare_slots(
-    spare_slot_count, use_fused_finalize, monkeypatch
+    spare_slot_count, fc2, monkeypatch
 ):
     """The forward's grouped GEMMs get the active slots' tuner layout only with spare slots."""
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
+
     calls = {}
 
     def record(name, result=None):
@@ -1296,7 +1532,13 @@ def test_cutedsl_nvfp4_grouped_gemms_get_the_tuner_layout_only_with_spare_slots(
 
         monkeypatch.setattr(torch.ops.trtllm, name, op, raising=False)
 
-    gather = "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell"
+    use_fused_finalize = fc2 != "unpermute"
+    fc1_zeroing = fc2 == "finalize_after_fc1_zeroing"
+    gather = (
+        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell"
+        if fc1_zeroing
+        else "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell"
+    )
     finalize = "cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell"
     gemm = "cute_dsl_nvfp4_grouped_gemm_blackwell"
     record(gather, (MagicMock(), MagicMock()))
@@ -1305,6 +1547,12 @@ def test_cutedsl_nvfp4_grouped_gemms_get_the_tuner_layout_only_with_spare_slots(
     record("moe_output_memset_inplace")
     record("moe_unpermute_inplace")
     backend = _cutedsl_nvfp4_after_create_weights(spare_slot_count, monkeypatch)
+    if fc1_zeroing:
+        # FC1 zeroes the FC2 output for DeepSeek-V4 routing behind the expert all-to-all. The
+        # forward tells that routing by its class; a stand-in that is no nn.Module can be set on
+        # the backend, which skipped Module.__init__.
+        monkeypatch.setattr(nvfp4, "DeepSeekV4MoeRoutingMethod", SimpleNamespace)
+        backend.routing_method = SimpleNamespace()
     backend.use_fused_finalize = use_fused_finalize
     backend._has_moe_output_memset_aux_stream = lambda: False
     backend.mapping = SimpleNamespace(moe_ep_size=1)
@@ -1320,6 +1568,7 @@ def test_cutedsl_nvfp4_grouped_gemms_get_the_tuner_layout_only_with_spare_slots(
         MagicMock(),
         MagicMock(),
         MagicMock(expert_size_per_partition=4, slot_start=0),
+        enable_alltoall=fc1_zeroing,
         sort_tables=sort_tables,
     )
 

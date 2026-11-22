@@ -106,11 +106,15 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             return
         super().create_weights()
         if self.uses_spare_slots:
-            # The GEMMs and their tuner profile only the active slots.
+            # The GEMMs tune for, and pick their L2 policy by, the active slots only.
             layout = self.tuner_layout_kwargs
             self._fused_moe_runner = partial(CuteDslFusedMoENvfp4Runner, **layout)
             self._gather_act_fusion_op = partial(
                 torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell, **layout
+            )
+            self._gather_act_fusion_zero_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell,
+                **layout,
             )
             self._finalize_inplace_op = partial(
                 torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell, **layout
@@ -128,6 +132,10 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     @cached_property
     def _gather_act_fusion_op(self) -> Callable[..., Any]:
         return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell
+
+    @cached_property
+    def _gather_act_fusion_zero_op(self) -> Callable[..., Any]:
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell
 
     @cached_property
     def _finalize_inplace_op(self) -> Callable[..., Any]:
@@ -638,7 +646,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
         if fc1_zero:
-            x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell(
+            x, x_sf = self._gather_act_fusion_zero_op(
                 **{
                     name: gather_act_kwargs[name]
                     for name in (
