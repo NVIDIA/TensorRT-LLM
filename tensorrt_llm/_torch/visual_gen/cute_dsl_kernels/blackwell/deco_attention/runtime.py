@@ -23,9 +23,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_ptr
 
-# Every buffer of a workspace starts at a multiple of ALIGN bytes of the workspace, whose own address is a multiple
-# of ALIGN: the alignment that the launches assume of their pointers (gmem_ptr)
-ALIGN = 256
+from .constants import ALIGN
 
 
 def _aligned_bytes(dtype, shape):

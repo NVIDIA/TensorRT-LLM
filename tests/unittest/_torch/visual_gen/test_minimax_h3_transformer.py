@@ -487,38 +487,33 @@ def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
     )
 
 
-def _deco_model() -> h3.MiniMaxH3Transformer3DModel:
-    """A one-layer model under a DeCo-Attention recipe; skips on a GPU without its kernels."""
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
-
-    try:
-        deco_attention.pv_formats()
-    except NotImplementedError:
-        pytest.skip("DeCo-Attention kernels need an SM100, SM103, SM107 or SM120 GPU.")
-    config = _make_model_config(
-        num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
-    )
-    config.attention = AttentionConfig(
+def _deco_attention_config() -> AttentionConfig:
+    return AttentionConfig(
         backend="CUTEDSL",
         quant_attention_config=QuantAttentionConfig(
             qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
         ),
     )
+
+
+@requires_cuda
+def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require_deco_kernels):
+    """Under a DeCo-Attention recipe every attention layer is a DeCo layer. The text sequence
+    of the token refiner is too short for the kernels, so the backend runs it unquantized. The
+    transformer blocks hand the backend the token tags of the packed sequence and its padding
+    as a key padding mask: trailing padding becomes one length per sample, and padding between
+    the tokens the order that puts the tokens first."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
+
+    require_deco_kernels()
+    config = _make_model_config(
+        num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
+    )
+    config.attention = _deco_attention_config()
     config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
     _initialize_weights(model, scale=0.1)
     model.requires_grad_(False)
-    return model
-
-
-@requires_cuda
-def test_deco_recipe_runs_every_attention_layer_on_its_backend(monkeypatch):
-    """Under a DeCo-Attention recipe every attention layer is a DeCo layer: the transformer
-    blocks hand it the token tags of the packed sequence, and the text sequence of the token
-    refiner is too short for the kernels, so the backend runs it unquantized."""
-    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
-
-    model = _deco_model()
 
     backends = {
         name: module.attn
@@ -529,76 +524,57 @@ def test_deco_recipe_runs_every_attention_layer_on_its_backend(monkeypatch):
     assert joint and len(joint) < len(backends)
     assert all(type(b) is DeCoAttention for b in backends.values())
 
-    seen = []
+    planned, launched = [], []
+    real_plan = DeCoAttention._plan
 
     def plan(self, key_padding_mask, valid_seq_len, token_tags, *shape):
-        seen.append(token_tags)
-        return None, None, None
+        planned.append(token_tags)
+        return real_plan(self, key_padding_mask, valid_seq_len, token_tags, *shape)
 
     def launch(self, q, k, v, rows=None, valid_seq_lens=None, order=None):
+        if rows is not None:
+            launched.append((rows, valid_seq_lens, order))
         return torch.zeros_like(q)
+
+    def forward(token_tags=None):
+        planned.clear()
+        launched.clear()
+        if token_tags is not None:
+            inputs["token_tags"] = token_tags
+        with torch.inference_mode():
+            model(**inputs)
 
     monkeypatch.setattr(DeCoAttention, "_plan", plan)
     monkeypatch.setattr(DeCoAttention, "_launch", launch)
     inputs = _model_inputs("cuda")
-    with torch.inference_mode():
-        model(**inputs)
-    assert not seen
+    forward()
+    assert not planned
 
     # With kernels that take every length, the calls with token tags are the joint blocks'.
     monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", 1)
-    with torch.inference_mode():
-        model(**inputs)
-    tagged = [tags for tags in seen if tags is not None]
-    assert len(tagged) == len(joint) and len(seen) == len(backends)
+    forward()
+    tagged = [tags for tags in planned if tags is not None]
+    assert len(tagged) == len(joint) and len(planned) == len(backends)
     assert all(torch.equal(tags, inputs["token_tags"]) for tags in tagged)
+
+    forward(torch.tensor([1, 0, 2, -1], device="cuda"))
+    assert launched and all(order is None for _, _, order in launched)
+    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in launched)
+    # The tags mark the padding: the batch shares one draw, from the tokens.
+    assert all(rows.dim() == 1 and int(rows.max()) < 3 for rows, _, _ in launched)
+
+    # The padding follows the content of the tags, also when one tags buffer is refilled.
+    inputs["token_tags"].copy_(torch.tensor([1, 2, -1, -1], device="cuda"))
+    forward()
+    assert launched and all(order is None for _, _, order in launched)
+    assert all(lens.tolist() == [2] * lens.numel() for _, lens, _ in launched)
+
+    forward(torch.tensor([1, -1, 2, 0], device="cuda"))
+    assert launched and all(order[0].tolist() == [0, 2, 3, 1] for _, _, order in launched)
+    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in launched)
 
 
 @requires_cuda
-def test_deco_recipe_takes_the_padding_of_a_packed_sequence_as_a_mask(monkeypatch):
-    """Under a DeCo-Attention recipe the padding of a packed sequence reaches the backend as a
-    key padding mask, like for VANILLA: trailing padding becomes one length per sample, and
-    padding between the tokens the order that puts the tokens first."""
-    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
-
-    model = _deco_model()
-    assert model._passes_key_padding_mask and not model._requires_trailing_padding
-    assert model.token_refiner._passes_key_padding_mask
-    monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", 1)
-
-    seen = []
-
-    def launch(self, q, k, v, rows=None, valid_seq_lens=None, order=None):
-        if rows is not None:
-            seen.append((rows, valid_seq_lens, order))
-        return torch.zeros_like(q)
-
-    monkeypatch.setattr(DeCoAttention, "_launch", launch)
-    inputs = _model_inputs("cuda")
-    inputs["token_tags"] = torch.tensor([1, 0, 2, -1], device="cuda")
-    with torch.inference_mode():
-        model(**inputs)
-    assert seen and all(order is None for _, _, order in seen)
-    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in seen)
-    # The tags mark the padding: the batch shares one draw, from the tokens.
-    assert all(rows.dim() == 1 and int(rows.max()) < 3 for rows, _, _ in seen)
-
-    # The padding follows the content of the tags, also when one tags buffer is refilled.
-    seen.clear()
-    inputs["token_tags"].copy_(torch.tensor([1, 2, -1, -1], device="cuda"))
-    with torch.inference_mode():
-        model(**inputs)
-    assert seen and all(order is None for _, _, order in seen)
-    assert all(lens.tolist() == [2] * lens.numel() for _, lens, _ in seen)
-
-    seen.clear()
-    inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
-    with torch.inference_mode():
-        model(**inputs)
-    assert seen and all(order[0].tolist() == [0, 2, 3, 1] for _, _, order in seen)
-    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in seen)
-
-
 @pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])
 def test_rope_preserves_autograd_fallback(grad_input):
     hidden_states = torch.randn((1, 7, 2, 8), device="cuda", dtype=torch.bfloat16)
@@ -1056,15 +1032,22 @@ def test_transformer_block_is_fullgraph_compile_safe(
         ("FLASHINFER", True, False, False),
         ("CUTEDSL", False, False, False),
         ("CUDNN", False, False, False),
+        ("DECO", True, False, False),
     ],
 )
 def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
-    backend: str, mask: bool, length: bool, trailing: bool
+    backend: str, mask: bool, length: bool, trailing: bool, require_deco_kernels
 ) -> None:
     """The model reads from the backend class how padding reaches it: as a key padding mask,
-    as the length of the valid prefix, or not at all."""
+    as the length of the valid prefix, or not at all. DECO is CUTEDSL under a DeCo-Attention
+    recipe."""
     config = _make_model_config()
-    config.attention = AttentionConfig(backend=backend)
+    if backend == "DECO":
+        require_deco_kernels()
+        config.attention = _deco_attention_config()
+        config.attention_metadata_state = create_attention_metadata_state()
+    else:
+        config.attention = AttentionConfig(backend=backend)
     model = h3.MiniMaxH3Transformer3DModel(config)
 
     assert model._passes_key_padding_mask is mask

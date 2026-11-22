@@ -29,18 +29,18 @@ from cutlass.cute.math import RoundingMode
 
 from ...common.dsl import Tcgen05Fence, tcgen05_fence
 from ...common.expmath import f2u, hash01, rcp_or_zero, u2f, warp_sum
-from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, store_vector
-from ...common.ptx import vote_ballot
-from ...common.state import State
-from ..ptx import (
-    cp_async_wait_all,
-    idesc_bf16,
-    mbar_wait_bounded,
-    smem_desc_mn_sw128,
-    tc_commit,
-    tc_mma,
+from ...common.mem import (
+    cp_async16,
+    gptr,
+    load_invariant,
+    load_vector,
+    mbar_wait,
+    sptr,
+    store_vector,
 )
-from ..tmem import ld_tmem_f32_x32_wait
+from ...common.state import State
+from ..ptx import idesc_bf16, smem_desc_mn_sw128
+from ..tmem import ld_tmem_f32_x32_wait, tc_commit, tc_mma
 from ..valid_len import valid_len
 
 EIG_THREADS = 288  # eigensolver CTA: eight row warps and the pivot warp
@@ -105,7 +105,7 @@ def _gram(
     rowsb = Int64(qk_rows.iterator.toint())
     for ch in cutlass.range(nch, unroll=1):
         if ch > 0:
-            mbar_wait_bounded(st.mbar, (ch - 1) & 1)
+            mbar_wait(st.mbar, (ch - 1) & 1)
         if st.tidx < 256:
             sample = cutlass.min(ch * 256 + st.tidx, NQK - 1)
             if cutlass.const_expr(lens is None):
@@ -146,7 +146,8 @@ def _gram(
                 )
                 cp_async16(st.dmb + dst, qb + off, nb)
                 cp_async16(st.ylb + dst, kb + off, nb)
-        cp_async_wait_all()
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
         cute.arch.fence_proxy("async.shared", space="cta")
         tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
         cute.arch.sync_threads()
@@ -161,7 +162,7 @@ def _gram(
                     tm + 128, dl, dl, idesc, acc0 if j == 0 else Int32(1), kind="f16", a_tmem=False
                 )
             tc_commit(st.mbar)
-    mbar_wait_bounded(st.mbar, (nch - 1) & 1)
+    mbar_wait(st.mbar, (nch - 1) & 1)
     tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
     # Only the first four warps use trace scratch.
     tl = (st.warp * 32) << 16
@@ -1070,8 +1071,8 @@ def _cluster_repair(st, span: Float32):
                 le1 = Int32(cute.math.abs(st.sLam[s + 1] - st.sLam[s]) <= tolc)
             isst = Int32((le == 0) & (le1 != 0))
             isen = Int32((le != 0) & (le1 == 0))
-            bst = vote_ballot(isst)
-            ben = vote_ballot(isen)
+            bst = Uint32(cute.arch.vote_ballot_sync(isst != 0))
+            ben = Uint32(cute.arch.vote_ballot_sync(isen != 0))
             if isst != 0:
                 cute.arch.store(
                     sptr(Uint32, st.cntb + (nst + Int32(cute.arch.popc(bst & below))) * 4),
@@ -1097,7 +1098,7 @@ def _cluster_repair(st, span: Float32):
         dup = Int32(0)
         for s in cutlass.range(cstart + 1 + st.lane, cend + 1, 32):
             dup = dup | Int32(st.sLam[s] == st.sLam[s - 1])
-        dup = Int32(vote_ballot(dup) != Uint32(0))
+        dup = Int32(cute.arch.vote_ballot_sync(dup != 0) != 0)
         hit = dup
         # a chain with a repeated eigenvalue has an empty range here: no MGS
         for sj in cutlass.range(cstart + 1, cend + 1 - (cend - cstart) * dup):

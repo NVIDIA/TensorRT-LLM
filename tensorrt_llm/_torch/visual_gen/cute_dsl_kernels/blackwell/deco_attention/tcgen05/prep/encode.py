@@ -28,7 +28,7 @@ from cutlass import Float32, Int32, Int64, Uint8, Uint16, Uint32
 
 from ...common.expmath import e4m3x4, f2u, pow2_ceil_448, u2f
 from ...common.mem import gptr, load_invariant, sptr, store_vector
-from ...constants import qk_scale_atoms
+from ...constants import E4M3_MAX, qk_scale_atoms
 
 ENC_G = 4  # Q/K scale tiles per staging round
 
@@ -112,7 +112,7 @@ def encode_kernel(
     ksb = Int64(k_sfv.iterator.toint())
     qfb = Int64(q_sf.iterator.toint())
     kfb = Int64(k_sf.iterator.toint())
-    lim = Float32(448.0)
+    lim = Float32(E4M3_MAX)
     for tb0 in cutlass.range(bidx * ENC_G, ntile, gdim * ENC_G):
         wq = []
         wk = []

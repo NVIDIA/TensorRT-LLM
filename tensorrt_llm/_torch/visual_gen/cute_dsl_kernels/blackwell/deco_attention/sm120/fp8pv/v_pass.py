@@ -28,7 +28,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.math import RoundingMode
 from cutlass.utils import SmemAllocator
 
-from ...common.expmath import bf16x2, e4m3x4, pow2_ceil, u2f, warp_max
+from ...common.expmath import bf16x2, e4m3x4, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_vector, sptr, store_vector
 from ..prep.basis import EIG_THREADS, SM_RED, basis_cta, bf16_f32, group16, stage_rows
 from ..ptx.fp8pv import st_global_cs_b32_pred, st_global_cs_b32_v2_pred
@@ -75,7 +75,7 @@ def tensor_scale(
     c = Float32(0.0)
     for wi in cutlass.range_constexpr(NT // 32):
         c = cute.arch.fmax(c, cute.arch.load(sptr(Float32, red + wi * 4), Float32))
-    return pow2_ceil(cute.math.div(c, Float32(448.0), rounding=RoundingMode.NEAREST_EVEN))
+    return pow2_ceil_448(c)
 
 
 def tile_mean(sums, cnt):

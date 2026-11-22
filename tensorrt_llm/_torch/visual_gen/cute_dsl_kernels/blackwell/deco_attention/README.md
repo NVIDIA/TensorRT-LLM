@@ -1,22 +1,25 @@
 # DeCo-Attention kernels
 
 Attention kernels of DeCo-Attention in CuTe DSL, with their preparation. A call computes `softmax(q k^T / sqrt(128)) v`
-per head for BF16 `q`, `k`, `v` of shape [B, S, H, 128] (queries and keys of the same length S; padding at the end of a
-batch element is given as its valid length) and returns BF16 [B, S, H, 128]. The head dimension is 128.
+per head for BF16 `q`, `k`, `v` of shape [B, S, H, 128], the queries and keys of one sequence, and returns BF16
+[B, S, H, 128].
 
-Every kernel takes NVFP4 Q' and K' of 128 + 2 x rank channels (the QK compensation of rank 32, or 64), forms P with
-I-ExpCast and rescales lazily at T = 4. The kernels of a GPU family differ in the format of the PV, selected by `pv`:
+Every kernel runs the QK on NVFP4 Q' and K' of 128 + 2 x rank channels, where the 2 x rank channels compensate the
+quantization error of the scores. The kernels of a GPU family differ in the PV, selected by `pv`:
 
-| GPU family | `pv` | PV | Row sum | `rank` |
+| GPU family | `pv` | P and V | Row sum | `rank` |
 |---|---|---|---|---|
-| `tcgen05`: B200, GB300, Rubin | `"fp8"` | E4M3 P and V, V smoothed over 128 keys | ones column of the PV MMA | 32; 64 where `ranks()` lists it |
-| `sm120`: RTX PRO 6000 | `"nvfp4"` (default) | NVFP4 P and V', V' = V minus its 16-key means; codes of P against the decoded block scale | in the softmax | 32 |
-| `sm120`: RTX PRO 6000 | `"fp8"` | E4M3 P and V, V smoothed over 128 keys | in the softmax | 32 |
+| `tcgen05`: B200, GB300, Rubin | `"fp8"` | E4M3, V smoothed over 128 keys | ones column of the PV MMA | 32; 64 where `ranks()` lists it |
+| `sm120`: RTX PRO 6000 | `"nvfp4"` (default) | NVFP4, V smoothed over 16 keys | in the softmax | 32 |
+| `sm120`: RTX PRO 6000 | `"fp8"` | E4M3, V smoothed over 128 keys | in the softmax | 32 |
 
-`pv_formats()` and `ranks()` return what the current GPU offers; `workspace_size` and `prepare` raise `ValueError`
-for another PV format or rank.
+The family is fixed per process: that of CUDA device 0, or of `CUTE_DSL_ARCH` when it is set.
 
-## Usage
+Requirements: `nvidia-cutlass-dsl` 4.8.0 or 4.8.1, the versions the kernels are validated with,
+`apache-tvm-ffi`, PyTorch with CUDA, `cuda-bindings` (all installed by TensorRT-LLM's `requirements.txt`).
+The package imports its own modules relatively and nothing else of TensorRT-LLM.
+
+## Interface
 
 ```python
 import torch
@@ -31,24 +34,33 @@ operands = prepare(q, k, v, workspace)     # contiguous BF16 [B, S, H, 128] in
 attention(operands, out)                   # BF16 [B, S, H, 128] out
 ```
 
-The functions keep nothing between calls. The caller owns the workspace, one flat buffer in which a call keeps the
-operands of the attention and its scratch: a one-dimensional `uint8` tensor on the device of `q`, of at least
-`workspace_size(batch, seq_len, heads, device, pv, rank)` bytes, at an address that is a multiple of 256 (`prepare`
-checks it). Its content does not matter: a call writes every byte it reads, so one buffer serves calls of any shape
-that fits, in any order. `workspace_size` returns the exact size, a small multiple of the bytes of `q`.
+| Function | Result |
+|---|---|
+| `pv_formats()`, `ranks()` | The PV formats and the ranks of the current GPU; `NotImplementedError` on a GPU without kernels. |
+| `workspace_size(batch, seq_len, heads, device, pv, rank)` | The bytes of workspace of a call, a small multiple of the bytes of `q`. |
+| `prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens)` | The operands of the attention, views into the workspace that hold until it is written again. |
+| `attention(operands, out)` | `out`, written by the attention kernel. |
+| `sample_rows(seq_len, device, token_tags, rank)` | The default `rows` of `prepare`. |
 
-`prepare` returns the operands of the attention as views into the workspace, with the PV format, the rank and the
-shape of the call; they hold until the workspace is written again. `q`, `k`, `v` and `out` are contiguous BF16
-tensors of one shape on one device. `rows` are the int32 indices of the tokens the compensation basis is estimated
-on, a one-dimensional tensor on that device: by default `sample_rows(seq_len, rank=rank)`, which holds 1/256 of the
-tokens and at least 2 x rank of them; a packed multimodal sequence passes
-`rows=sample_rows(seq_len, token_tags=tags, rank=rank)`. The family is fixed per process: that of CUDA device 0, or
-of `CUTE_DSL_ARCH` when it is set.
+`workspace_size` and `prepare` raise `ValueError` for a PV format or rank that the GPU does not offer.
 
-Every call enqueues its launches on the current stream, reads nothing back from the device and allocates nothing, so
-the caller can capture both calls into one CUDA graph, after one eager call of the shape. The eager call does what
-cannot be captured: it compiles the kernels, and it builds the sampled rows of the sequence length and the rotation
-matrix of the device, which are kept. A first use of either under capture raises a `RuntimeError` that says so.
+- **Tensors.** `q`, `k`, `v` and `out` are contiguous BF16 tensors of one shape on one device.
+- **Workspace.** The caller owns it: a one-dimensional `uint8` tensor on the device of `q`, of at least
+  `workspace_size(...)` bytes, at an address that is a multiple of 256. Its content does not matter. The functions
+  keep nothing between calls and a call writes every byte it reads, so one buffer serves calls of any shape that
+  fits, in any order.
+- **Basis rows.** `rows` are the int32 indices of the tokens the compensation basis is estimated on, a
+  one-dimensional tensor on the device of `q`. The default, `sample_rows(seq_len, rank=rank)`, holds 1/256 of the
+  tokens and at least 2 x rank of them. A packed multimodal sequence passes
+  `rows=sample_rows(seq_len, token_tags=tags, rank=rank)`, which takes half of the rows from the text and audio
+  tokens. A draw may hold fewer rows than 2 x rank; an empty one is rejected.
+- **Rank.** `rank=64` doubles the compensation channels where `ranks()` lists it.
+- **Compilation.** Kernels compile on first use and are cached per device and rank. The `tcgen05` attention takes the
+  shape at run time; the `sm120` attention compiles once per shape.
+- **CUDA graphs.** A call enqueues its launches on the current stream, reads nothing back from the device and
+  allocates nothing, so both calls can be captured into one graph after one eager call of the shape. The eager call
+  compiles the kernels and builds the sampled rows of the sequence length and the rotation matrix of the device; a
+  first use of either under capture raises a `RuntimeError`.
 
 ```python
 graph = torch.cuda.CUDAGraph()
@@ -64,122 +76,63 @@ lens = torch.tensor([4096, 3000], dtype=torch.int32, device="cuda")     # one va
 attention(prepare(q, k, v, workspace, valid_seq_lens=lens), out)
 ```
 
-`valid_seq_lens` is an int32 tensor [B] on the device of `q`: batch element b holds valid tokens on its first
-n = clamp(valid_seq_lens[b], 0, S) positions and padding after them. Its output rows below n are the attention of its
-first n queries over its first n keys; its output rows from n on are zero; what `q`, `k` and `v` hold from n on has
-no influence on the output. A batch element of length 0 is all zeros. The batch runs in one call: the kernels read
-the lengths on the device and compute only the tiles that hold a valid token, while the launches and
-`workspace_size` follow the padded S. `None` (the default) is a call without padding and runs the kernels without
-the lengths; a call with every length equal to S returns the same bits.
+`valid_seq_lens` is an int32 tensor [B] on the device of `q`: batch element b holds tokens on its first
+n = clamp(valid_seq_lens[b], 0, S) positions and padding after them.
 
-The kernels read the tensor in place, in `prepare` and in `attention`, so it must hold until `attention` has run,
-like `q`, `k` and `v`. A CUDA graph captured with a lengths tensor holds its address: the caller writes other lengths
-into the same tensor before a replay. A graph captured without lengths takes none later, so a caller that may see
-padding captures with a tensor (all S for full rows).
-
-Rows of the compensation basis with lengths: the default draw is mapped into each valid prefix (its row r stands
-for token floor(r n / S)). `rows` given by the caller are taken as given, a one-dimensional tensor for every batch
-element or a two-dimensional one [B, m] per batch element (for instance the tagged draw of each batch element's
-tags, with negative tags on its padding); a given row from n on stands for token n - 1.
-
-`rank=64` doubles the compensation channels: Q' and K' fill their 256-channel rows and the basis holds 64 directions.
-`ranks()` tells whether the current target offers it.
-
-Kernels compile on first use and are cached per device and rank. `tcgen05`: the preparation compiles once; the
-attention takes the shape at run time and compiles once per SM count and launch form (the main launch with or without
-CTA pairs, the split launch of a last partial wave with or without a main launch before it). `sm120`: the preparation
-compiles once per form of its chain (two); the attention is specialized on the shape and compiles once per shape.
-
-Requirements: `nvidia-cutlass-dsl` 4.8.0 or 4.8.1, the versions the kernels are validated with, `apache-tvm-ffi`,
-PyTorch with CUDA, `cuda-bindings` (all installed by
-TensorRT-LLM's `requirements.txt`). The package imports its own modules relatively and nothing else of TensorRT-LLM.
+- **Output.** The rows below n are the attention of the first n queries over the first n keys, and the rows from n
+  on are zero, whatever `q`, `k` and `v` hold from n on. `None` (the default) is a call without padding; a call with
+  every length equal to S returns the same bits. The kernels compute only the tiles that hold a valid token.
+- **Lifetime.** The kernels read the tensor in place, in `prepare` and in `attention`, so it must hold until
+  `attention` has run. A CUDA graph captured with a lengths tensor holds its address: the caller writes other
+  lengths into the same tensor before a replay. A graph captured without lengths takes none later.
+- **Basis rows.** The default draw is mapped into each valid prefix. `rows` given by the caller are taken as given,
+  one-dimensional for every batch element or [B, m] per batch element; a row from n on stands for token n - 1.
 
 ## Method
 
 For a score s = q k^T, quantizing q and k to NVFP4 leaves the first-order error dq k^T + q dk^T. The preparation
-rotates the 128 head channels of Q and K with a fixed sign-randomized Hadamard matrix, estimates on a sample of
-tokens the r = 32 directions that hold most of the energy of Q and K (one eigenproblem per batch element and head),
-and appends 2 x r compensation channels to the 128 rotated ones: the rounding residual of one operand, projected on
-the directions, against the projection of the other operand. The QK is then one block-scaled NVFP4 product over 192
-channels (256 at r = 64), and the scores come out in log2 units under one score scale.
+rotates the 128 head channels of Q and K with a fixed sign-randomized Hadamard matrix, estimates on the basis rows
+the r = 32 directions that hold most of the energy of Q and K, and appends 2 x r compensation channels: the rounding
+residual of one operand, projected on the directions, against the projection of the other operand. The QK is then
+one block-scaled NVFP4 product over 192 channels (256 at r = 64).
 
-The attention runs the online softmax over tiles of 128 keys. I-ExpCast forms P without an exponential instruction:
-a fused multiply-add puts the scaled score on the subnormal grid of FP32, where the bit pattern of the result is the
-FP16 pattern of 2^x, and a hardware conversion rounds that pattern to E4M3 or E2M1. The running maximum of a row (the
-anchor) only moves, and the accumulated output is only rescaled, when a tile exceeds it by more than T = 4 binades.
-
-V smoothing subtracts from V its means over blocks of keys before the cast, so that the PV rounds the small
-remainder, and adds the means back through a BF16 MMA weighted by the block sums of P.
-
-- `tcgen05`, `pv="fp8"`: P and V are E4M3, V minus its means over the 128 keys of a tile. The PV runs against
-  [V | ones], whose extra columns accumulate the sums of P per tile: they give the row sum and the weights of the
-  means, which are added once per eight tiles.
-- `sm120`, `pv="nvfp4"`: P is NVFP4 with one UE4M3 scale per 16 keys. A block scale is rounded to UE4M3 and read
-  back, and the E2M1 codes are formed against that stored scale. V' = V minus its 16-key means stays in V's own
-  channels, NVFP4 along the keys. The block sums and the row sum are those of P before its quantization, summed in
-  the softmax.
-- `sm120`, `pv="fp8"`: P and V are E4M3, V minus its means over the 128 keys of a tile. The softmax sums the row sum
-  of the quantized P and its 16-key block sums, the weights of the means.
+The attention runs the online softmax over tiles of 128 keys. It forms P without an exponential instruction: a fused
+multiply-add puts the scaled score on the subnormal grid of FP32, and a hardware conversion rounds it to E4M3 or
+E2M1. The running maximum of a row moves, and the output is rescaled, only when a tile exceeds it by more than 4
+binades. V smoothing subtracts from V its means over blocks of keys before the cast and adds them back weighted by
+the block sums of P.
 
 ## Layout
 
 ```
 tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/deco_attention/
-  api.py          workspace_size, prepare, attention, pv_formats, ranks: checks of the caller's arguments,
-                  dispatch to the family
+  api.py          workspace_size, prepare, attention, pv_formats, ranks: argument checks, dispatch to the family
   inputs.py       the sampled tokens of the compensation basis and the Hadamard rotation
-  constants.py    head dimension, ranks, QK channels, rescale threshold, score prescale, the grid of the exp2
-                  landing
+  constants.py    head dimension, ranks, QK channels, rescale threshold, score prescale
   target.py       compile target and the hardware capabilities the kernels branch on
   runtime.py      the buffers of a call in the workspace, pointers, the current stream, the compile cache
-  common/         the inline PTX that both families issue and its emitter (ptx.py), the
-                  cutlass.experimental.primitives imports (dsl.py), typed pointers to raw addresses with the
-                  vector load and store, the 16-byte asynchronous copy and the mbarrier wait (mem.py), the
-                  packing, scaling and summation arithmetic in DSL operations (expmath.py) and the state
-                  object that the steps of a kernel body share (state.py)
+  common/         what both families use: inline PTX and its emitter (ptx.py), DSL primitive imports (dsl.py),
+                  typed memory access (mem.py), packing and scaling arithmetic (expmath.py), the state object of
+                  a kernel body (state.py)
   tcgen05/        B200, GB300, Rubin
-    ptx.py          the inline PTX that the family alone issues
-    tmem.py         the tensor-memory loads and stores of register values in DSL operations
-    qk.py           the NVFP4 QK of the three targets
-    prep/           preparation passes of Q and K: basis (eigensolver), Q/K pass, encode launch
-    fp8pv/          the FP8-PV kernel: prep.py (its preparation chain), v_pass.py, launch.py, kernel.py,
-                    load.py, mma.py, softmax.py, epilogue.py, sched.py, tuning.py
+    ptx.py, tmem.py   inline PTX of the family, tensor-memory loads and stores
+    qk.py             the NVFP4 QK
+    prep/             preparation of Q and K: basis (eigensolver), Q/K pass, encode launch
+    fp8pv/            the FP8-PV kernel and its preparation chain
   sm120/          RTX PRO 6000
-    ptx/            the inline PTX that the family alone issues: shared.py (what both kernels or prep/ use),
-                    fp8pv.py and nvfp4pv.py (what one kernel alone uses)
-    prep/           preparation passes of Q and K: basis (eigensolver), Q/K pass, encode launch; chain.py, the
-                    host side that the preparation chains of both kernels share
-    nvfp4pv/        the NVFP4-PV kernel: prep.py (its preparation chain), v_pass.py, launch.py, layout.py,
-                    kernel.py, softmax.py
-    fp8pv/          the FP8-PV kernel: prep.py, v_pass.py, scan.py, launch.py, layout.py, kernel.py, mma.py,
-                    softmax.py, epilogue.py, small.py (sequences below 128 keys)
+    ptx/              inline PTX of the family: shared.py, fp8pv.py, nvfp4pv.py
+    prep/             preparation of Q and K: basis (eigensolver), Q/K pass, encode launch, chain
+    nvfp4pv/          the NVFP4-PV kernel and its preparation chain
+    fp8pv/            the FP8-PV kernel and its preparation chain
 ```
 
-A family package exports `pv_formats`, `ranks`, `workspace_size`, `prepare` and `attention`, dispatches on the PV
-format to a kernel package, and holds the inline PTX that the family alone issues (`tcgen05/ptx.py`, `sm120/ptx/`).
-Its `layout` lists the buffers of a call in their order in the workspace (name to dtype and shape): the operands,
-then the scratch of the preparation and of the attention, each at a multiple of 256 bytes. `workspace_size` and
-`prepare` share it. The only buffers that must hold a value when the launches of a call start are a few counters and
-flags of launches that run as several pieces, and `prepare` zeroes them. The module docstrings describe the schedule
-of each kernel and the passes of its preparation.
-
-The long kernel bodies are sequences of named steps: those of the eigensolvers (`prep/basis.py` of both families), of
-the Q/K pass of `tcgen05` (`prep/qk_pass.py`) and of the attention kernels (`kernel.py` of the kernel packages). The
-body holds the schedule of the CTA: its setup, then its phases or the roles of its warps in order; the eigensolver
-bodies also hold the CTA barriers between their steps. A step is a function or a role method of the kernel's package,
-named after what it computes. The steps of a body share a state object (`State` of `common/state.py`), which holds
-the addresses, typed views, trace-time constants and register tensors of the thread by name.
-
-An operation of a kernel is a CuTe DSL call where the DSL offers the operation in the form the kernel uses; it is an
-inline-PTX wrapper otherwise. Inline PTX is in three places only: `common/ptx.py`,
-with the one emitter that every wrapper calls and the wrappers both families use; `tcgen05/ptx.py`; and the package
-`sm120/ptx/`, where a wrapper is in the module of its importers: `shared.py` for both kernels of the family or its
-preparation, `fp8pv.py` and `nvfp4pv.py` for one kernel alone, so that a reader of one kernel reads the shared module
-and its own. A wrapper gives the emitter the instruction text, its typed operands and its result classes; the emitter
-derives the constraint string and the conversions from them. `common/ptx.py` has two sections: conversions and packed
-arithmetic, memory access. `tcgen05/ptx.py` has two more ahead of them: MMA and descriptors, barriers and waits; the
-modules of `sm120/ptx/` have the sections of `tcgen05/ptx.py` (each module has the sections it has wrappers of), and
-the conversions sections of `fp8pv.py` and `nvfp4pv.py` also hold the softmax blocks of their kernel. The docstring
-of a wrapper states its operand types and its effect, and the wrappers are named by one scheme, which the docstring
-of `common/ptx.py` states. The `cutlass.experimental.primitives` imports are in `common/dsl.py` only, each by name: a
-DSL release without one of them fails there, on import, with the installed version and the validated ones.
+- A family package exports `pv_formats`, `ranks`, `workspace_size`, `prepare` and `attention` and dispatches on the
+  PV format to a kernel package. Its `layout` lists the buffers of a call in their order in the workspace;
+  `workspace_size` and `prepare` share it.
+- The module docstrings describe the schedule of each kernel and the passes of its preparation. A long kernel body
+  is a sequence of named steps that share a `State` object (`common/state.py`).
+- Inline PTX is in `common/ptx.py`, `tcgen05/ptx.py` and `sm120/ptx/` only: operations the DSL does not offer in
+  the form a kernel uses, and operations of the hot loops that the kernels keep as PTX. Every wrapper goes through
+  the emitter of `common/ptx.py`.
+- The `cutlass.experimental.primitives` imports are in `common/dsl.py` only: a DSL release without one of them
+  fails there, on import.

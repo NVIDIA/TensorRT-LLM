@@ -643,9 +643,9 @@ class HunyuanVideo15Attention(Attention):
         batch_size, seq_len, *_ = query.shape
         key_padding_mask = None
         if attention_mask is not None:
-            # A mask of the joint sequence is passed on as it is, so that the layers of a
-            # forward hand one tensor to the backend; a mask of the context rows is extended
-            # over the rows before them.
+            # A mask of the joint sequence is passed on as it is: the layers of a forward
+            # hand one tensor to the backend. A mask of the context rows is extended over the
+            # rows before them.
             key_padding_mask = attention_mask
             if attention_mask.shape[1] != seq_len:
                 key_padding_mask = torch.nn.functional.pad(
@@ -1093,16 +1093,15 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         encoder_hidden_states = torch.stack(new_encoder_hidden_states)
         encoder_attention_mask = torch.stack(new_encoder_attention_mask)
 
-        # The joint sequence of the blocks is the video rows, then the context rows: image
-        # rows, text rows, and the padding of every sample last. The blocks share one mask
-        # and one tags tensor of it; attention backends key their caches on these tensors.
+        # The joint sequence of the blocks: video rows, then the context rows (image rows,
+        # text rows, the padding of every sample last). The blocks share one mask and one
+        # tags tensor of it; attention backends key their caches on these tensors.
         num_video, num_context = hidden_states.shape[1], encoder_hidden_states.shape[1]
         num_image = 0 if is_t2v else encoder_hidden_states_3.shape[1]
         joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
         tags_key = (num_video, num_image, num_context, hidden_states.device)
         if self._joint_token_tags is None or self._joint_token_tags[0] != tags_key:
-            # 0 video or image, positive text: the modality of a row where it holds a token.
-            # The mask says which rows of a sample are padding.
+            # 0 video or image, positive text; the mask says which rows are padding.
             token_tags = torch.ones(
                 num_video + num_context, dtype=torch.int32, device=hidden_states.device
             )

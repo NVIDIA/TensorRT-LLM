@@ -26,7 +26,6 @@ from cutlass import Float32, Int32, Int64, Uint32
 from ...common.dsl import nanosleep
 from ...common.expmath import bf16x2, e4m3x4, f2u, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
-from ...common.ptx import ld_global_acquire_b32
 from ..valid_len import valid_len
 
 V_BLOCK = 128  # keys per mean: one 128-key tile of the attention
@@ -64,7 +63,7 @@ def _grid_inv8(
         ) + Uint32(1)
         while seen < Uint32(gdim):
             nanosleep(256)
-            seen = ld_global_acquire_b32(gb + Int64(32))
+            seen = cute.arch.load(gptr(Uint32, gb + Int64(32)), Uint32, sem="acquire", scope="gpu")
     cute.arch.sync_threads()
     vmax = u2f(cute.arch.load(gptr(Uint32, gb + Int64(24)), Uint32, sem="acquire", scope="gpu"))
     return Float32(1.0) / pow2_ceil_448(vmax)

@@ -12,7 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Constants of the DeCo-Attention kernels that the host code and the kernel families share."""
+"""Constants of the DeCo-Attention kernels that the host code and the kernel families share. What one family alone
+uses (thread counts, ring depths, tilers, schedule constants) stays in its modules."""
+
+# The releases of nvidia-cutlass-dsl the kernels are validated with
+VALIDATED_DSL_VERSIONS = ("4.8.0", "4.8.1")
+# Every buffer of a workspace starts at a multiple of ALIGN bytes of the workspace, whose own address is a multiple
+# of ALIGN: the alignment that the launches assume of their pointers
+ALIGN = 256
+# The default draw of the rows that estimate the compensation basis takes one token in SAMPLE_FRAC (and at least
+# twice the rank)
+SAMPLE_FRAC = 256
 
 HEAD_DIM = 128  # channels of q, k, v and o per head
 # Rank of the compensation basis: Q' and K' carry 2 x rank compensation channels after the rotated head channels.
@@ -40,6 +50,7 @@ QK_SCALE_ATOMS = qk_scale_atoms(DEFAULT_RANK)
 # T: the anchor of a softmax row (its running maximum) only moves, and O is only rescaled, when the maximum of a key
 # tile exceeds it by more than T binades
 RESCALE_THRESHOLD = 4.0
+E4M3_MAX = 448.0  # the largest finite E4M3 value
 # f32 subnormal ulps per log2 unit of the exp2 landing: the landed bits are the f16 pattern of 2^t
 SUBNORMAL_ULPS = 1024
 # log2(e) / sqrt(HEAD_DIM), the score prescale folded into Q': the scores arrive in the log2 units the kernels

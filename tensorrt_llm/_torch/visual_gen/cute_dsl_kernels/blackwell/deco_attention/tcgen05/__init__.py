@@ -19,14 +19,10 @@ PV format "fp8" (fp8pv/: NVFP4 QK and FP8 PV with V smoothing).
     prepare(q, k, v, workspace, pv, rank, rows)           # BF16 q, k, v [B, S, H, 128] -> the buffers of the call
     attention(buffers, o, pv, rank)                       # the buffers -> BF16 o [B, S, H, 128]
 
-What does not depend on the PV format is at this level: ptx.py, the inline PTX that the family alone issues,
-tmem.py, the tensor-memory loads and stores of register values in DSL operations, qk.py, the NVFP4 QK with both
-operands in shared memory and its block-scaled layouts, and prep/, the preparation passes of Q and K (a
-sign-randomized Hadamard rotation, NVFP4 codes with one UE4M3 scale per 16 channels and 2 x rank compensation
-channels: the projections of the quantization residuals and of the quantized bodies on a shared basis of `rank`
-directions estimated from sampled tokens, so that Q' K'^T over the 128 + 2 rank channels adds the first-order error
-terms of the product back within that basis). The kernel package holds its attention, its V pass and the chain of
-its preparation.
+What does not depend on the PV format is at this level: ptx.py (the inline PTX that the family alone issues),
+tmem.py (tensor-memory loads and stores of register values), qk.py (the NVFP4 QK and its block-scaled layouts) and
+prep/ (the preparation passes of Q and K: rotation, NVFP4 codes and scales, the compensation channels and their
+basis). The kernel package holds its attention, its V pass and the chain of its preparation.
 
 The compensation rank is 32 on every target; targets with the K = 128 block-scaled MMA also offer rank 64 (qk.ranks).
 

@@ -33,7 +33,8 @@ from cutlass.cute.typing import (
 )
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ..constants import SUBNORMAL_ULPS
+from .. import target
+from ..constants import E4M3_MAX, SUBNORMAL_ULPS
 from .dsl import (
     FPRoundingMode,
     SaturationMode,
@@ -135,22 +136,18 @@ def u2f(x, *, loc=None, ip=None):
 
 def pow2_ceil(x):
     """The power of two at or above max(x, 1e-30), for a finite f32 x >= 0: the exponent field of the maximum,
-    raised by one when its mantissa is nonzero."""
+    raised by one when its mantissa is nonzero (adding the largest mantissa carries into the exponent exactly then)."""
     bits = f2u(cute.arch.fmax(x, Float32(1e-30)))
-    exponent = bits & Uint32(0x7F800000)
-    return u2f(
-        Uint32(
-            cutlass.select_(
-                (bits & Uint32(0x007FFFFF)) != Uint32(0), exponent + Uint32(0x00800000), exponent
-            )
-        )
-    )
+    return u2f((bits + Uint32(0x007FFFFF)) & Uint32(0x7F800000))
 
 
 def pow2_ceil_448(m):
     """The power of two at or above max(m / 448, 1e-30), for a finite f32 m >= 0: the scale that brings values of
-    magnitude up to m into the E4M3 range."""
-    return pow2_ceil(cute.math.div(m, Float32(448.0), rounding=cute.math.RoundingMode.NEAREST_EVEN))
+    magnitude up to m into the E4M3 range. The product with the f32 nearest to 1 / 448 gives the power of two of the
+    quotient for every such m."""
+    return pow2_ceil(
+        cute.math.mul(m, Float32(1.0 / E4M3_MAX), rounding=cute.math.RoundingMode.NEAREST_EVEN)
+    )
 
 
 def round_m3(x):
@@ -162,13 +159,10 @@ def round_m3(x):
 
 def scale_bf16x2(x, a):
     """i32 word x of two BF16, f32 a -> i32 word of the two halves times a, rounded back to BF16: each half in the
-    high 16 bits of an f32, a multiply that keeps subnormal results (mul.rn.f32), then the packing of bf16x2."""
+    high 16 bits of an f32, one packed multiply of the pair, then the packing of bf16x2."""
     lo = u2f(Uint32(x) << Uint32(16))
     hi = u2f(Uint32(x) & Uint32(0xFFFF0000))
-    nearest = cute.math.RoundingMode.NEAREST_EVEN
-    return Int32(
-        bf16x2(cute.math.mul(lo, a, rounding=nearest), cute.math.mul(hi, a, rounding=nearest))
-    )
+    return Int32(bf16x2(*cute.arch.mul_packed_f32x2((lo, hi), (a, a))))
 
 
 def warp_sum(x):
@@ -179,7 +173,10 @@ def warp_sum(x):
 
 
 def warp_max(x):
-    """The maximum of the f32 x over the lanes of the warp, by five butterfly shuffles."""
+    """The maximum of the f32 x over the lanes of the warp: one warp reduction where the target has it on f32, five
+    butterfly shuffles otherwise."""
+    if target.has_redux_f32():
+        return cute.arch.warp_redux_sync(x, "fmax")
     for o in (16, 8, 4, 2, 1):
         x = cute.arch.fmax(x, cute.arch.shuffle_sync_bfly(x, offset=Int32(o)))
     return x

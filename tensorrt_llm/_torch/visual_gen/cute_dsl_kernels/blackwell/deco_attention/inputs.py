@@ -22,9 +22,7 @@ import functools
 
 import torch
 
-from .constants import DEFAULT_RANK, HEAD_DIM
-
-SAMPLE_FRAC = 256
+from .constants import DEFAULT_RANK, HEAD_DIM, SAMPLE_FRAC
 
 
 def sample_count(s, rank=DEFAULT_RANK):

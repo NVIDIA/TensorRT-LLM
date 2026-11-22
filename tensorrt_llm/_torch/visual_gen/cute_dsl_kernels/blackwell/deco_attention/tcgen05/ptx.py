@@ -12,19 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inline PTX that the tcgen05 family alone issues (B200, GB300, Rubin), through the emitter of
-deco_attention/common/ptx.py, which also holds the wrappers both families share. Each wrapper emits exactly the
-instruction text it shows; whether it has side effects is part of its contract (the compiler may merge, move or drop
-a statement without them), and a docstring says "no side effects" where the wrapper declares none. Two wrappers of
-one instruction differ in an operand or result type, in the text or in the side effects, as their docstrings say.
-The sections:
+"""Inline PTX that the tcgen05 family alone issues (B200, GB300, Rubin), through asm of common/ptx.py, whose module
+docstring states the contract and the names of the wrappers.
 
-  MMA and descriptors                 the encodings of the shared-memory matrix descriptors and of the instruction
-                                      descriptors; tcgen05.mma of kind::f8f6f4 with A in tensor memory, of kind::f16
-                                      and kind::tf32 from an elected lane, and the means MMA of the attention
-  barriers and waits                  the bounded mbarrier wait, tcgen05.commit, cp.async.wait_all
-  conversions and packed arithmetic   E2M1 decoding, an opaque identity
-  memory access                       the load of the score scale by the epilogue warpgroup of the attention"""
+Here: the encodings of the shared-memory matrix descriptors and of the instruction descriptors; tcgen05.mma of
+kind::f8f6f4 with A in tensor memory and the means MMA of the attention; the bounded mbarrier wait of the Q/K pass,
+tcgen05.commit; E2M1 decoding, an opaque identity; the load of the score scale by the epilogue warpgroup of the
+attention."""
 
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
@@ -91,21 +85,6 @@ def tc_mma_f8f6f4(d_addr, a_addr, b_desc, idesc, acc, collector: str, *, loc=Non
 
 
 @dsl_user_op
-def tc_mma(d_addr, a, b_desc, idesc, acc, kind: str, a_tmem: bool, *, loc=None, ip=None):
-    """i32 TMEM address d_addr (D), A as a: an i32 TMEM address with a_tmem, an i64 shared-memory descriptor without;
-    i64 shared-memory descriptor b_desc (B), i32 instruction descriptor idesc, i32 acc: the lane elect.sync picks issues
-    tcgen05.mma.cta_group::1.kind::<kind> (kind "f16" or "tf32"), D += A B when acc != 0 and D = A B otherwise."""
-    asm(
-        "{\n .reg .pred p, e;\n setp.ne.b32 p, $4, 0;\n elect.sync _|e, 0xffffffff;\n"
-        f" @e tcgen05.mma.cta_group::1.kind::{kind} [$0], {'[$1]' if a_tmem else '$1'}, $2, $3, p;\n}}",
-        [i32(d_addr), i32(a) if a_tmem else i64(a), i64(b_desc), i32(idesc), i32(acc)],
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def tc_mma_means(
     d_addr,
     smem,
@@ -160,27 +139,12 @@ def tc_mma_means(
 @dsl_user_op
 def mbar_wait_bounded(addr, parity, *, loc=None, ip=None):
     """i32 shared address of an mbarrier, i32 parity: loops on mbarrier.try_wait.parity.shared::cta.b64 until the phase
-    of that parity has completed; trap after 2^25 failed tries."""
+    of that parity has completed; trap after 2^25 failed tries. The Q/K pass waits with it."""
     asm(
         "{\n .reg .pred p;\n .reg .u32 c;\n mov.u32 c, 0;\n LAB_WAIT:\n"
         " mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n @p bra LAB_DONE;\n add.u32 c, c, 1;\n"
         " setp.lt.u32 p, c, 0x2000000;\n @p bra LAB_WAIT;\n trap;\n LAB_DONE:\n}",
         [i32(addr), i32(parity)],
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tc_commit(addr, *, loc=None, ip=None):
-    """i32 shared address of an mbarrier: the lane elect.sync picks issues
-    tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64, an arrival on the mbarrier once the tcgen05
-    operations that thread issued before have completed."""
-    asm(
-        "{\n .reg .pred e;\n elect.sync _|e, 0xffffffff;\n"
-        " @e tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [$0];\n}",
-        [i32(addr)],
         side_effects=True,
         loc=loc,
         ip=ip,
@@ -206,12 +170,6 @@ def tc_commit_means(smem, stage, bar_off: int, *, loc=None, ip=None) -> None:
         loc=loc,
         ip=ip,
     )
-
-
-@dsl_user_op
-def cp_async_wait_all(*, loc=None, ip=None):
-    """cp.async.wait_all: waits for the cp.async copies the thread has issued."""
-    asm("cp.async.wait_all;", side_effects=True, loc=loc, ip=ip)
 
 
 # -------------------------------------------------------------------------------- Conversions and packed arithmetic

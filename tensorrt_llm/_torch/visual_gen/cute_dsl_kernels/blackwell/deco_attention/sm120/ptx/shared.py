@@ -16,9 +16,7 @@
 (sm120/prep/): one of the three modules of the package, see its docstring. The sections:
 
   MMA and descriptors                 mma.sync of BF16 and of block-scaled NVFP4 (kind::mxf4nvf4)
-  barriers and waits                  mbarrier initialization
-  conversions and packed arithmetic   the f32 exp2, the multiply and the FMA that keep subnormals, E2M1
-                                      conversions
+  conversions and packed arithmetic   E2M1 conversions
   memory access                       the predicated vector load of shared memory, ldmatrix, and the global loads
                                       and the global store under an L2 cache policy"""
 
@@ -63,47 +61,7 @@ def mma_nvf4(c, a, b, sfa, sfb, tidb: int, *, loc=None, ip=None):
     )
 
 
-# -------------------------------------------------------------------------------- Barriers and waits
-@dsl_user_op
-def mbar_init_imm(addr, count: int, *, loc=None, ip=None):
-    """i32 shared address of an mbarrier: mbarrier.init.shared::cta.b64 with the immediate count."""
-    asm(
-        f"mbarrier.init.shared::cta.b64 [$0], {count};",
-        [i32(addr)],
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
 # -------------------------------------------------------------------------------- Conversions and packed arithmetic
-@dsl_user_op
-def ex2_approx_f32(x, *, loc=None, ip=None):
-    """f32 x -> f32 2^x by ex2.approx.ftz.f32; no side effects."""
-    return asm("ex2.approx.ftz.f32 $0, $1;", [f32(x)], Float32, side_effects=False, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def mul_rn_f32(a, b, *, loc=None, ip=None):
-    """f32 a, b -> f32 a * b by mul.rn.f32, which keeps subnormal results (no flush to zero); no side effects."""
-    return asm(
-        "mul.rn.f32 $0, $1, $2;", [f32(a), f32(b)], Float32, side_effects=False, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def fma_rn_f32(a, b, c, *, loc=None, ip=None):
-    """f32 a, b, c -> f32 a * b + c by fma.rn.f32, which keeps subnormal results (no flush to zero); no side effects."""
-    return asm(
-        "fma.rn.f32 $0, $1, $2, $3;",
-        [f32(a), f32(b), f32(c)],
-        Float32,
-        side_effects=False,
-        loc=loc,
-        ip=ip,
-    )
-
-
 @dsl_user_op
 def f32x4_to_e2m1x4(a, b, c, d, *, loc=None, ip=None):
     """f32 a, b, c, d -> u32 with four E2M1 codes in its low 16 bits, byte 0 = (b << 4) | a and byte 1 = (d << 4) | c

@@ -12,24 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Loads and stores of tensor memory in CuTe DSL operations, the experimental primitives of common/dsl.py:
+"""Tensor memory and tensor core operations in CuTe DSL operations, the experimental primitives of common/dsl.py:
 tcgen05.ld and tcgen05.st of register values in the 32x32b and 16x32bx2 shapes, with their waits and the reducing
-load. The tcgen05 operations that are inline PTX are in tcgen05/ptx.py."""
+load; tcgen05.mma and tcgen05.commit from an elected lane. The tcgen05 operations that are inline PTX are in
+tcgen05/ptx.py."""
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Float32, Int32
+from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.typing import Float32, Int32, Int64
 
 from ..common.dsl import (
+    CTAGroup,
     ReductionKind,
     Tcgen05LdStShape,
+    Tcgen05MMAKind,
     Tcgen05Wait,
     make_tmem_ptr,
     tcgen05_ld,
     tcgen05_ld_red,
+    tcgen05_mma,
     tcgen05_st,
     tcgen05_wait,
 )
+from ..common.mem import sptr
 
 
 def ld_tmem_f32(addr, n):
@@ -97,3 +103,26 @@ def ld_tmem_16x32bx2_f32_x32_absmax_wait(addr, ld_red: bool):
                 tree = [cute.arch.fmax(tree[i], tree[i + half]) for i in range(half)]
             maxima.append(tree[0])
     return halves[0] + halves[1], maxima[0], maxima[1]
+
+
+def tc_mma(d_addr, a, b_desc, idesc, acc, kind: str, a_tmem: bool):
+    """i32 TMEM address d_addr (D), A as a: an i32 TMEM address with a_tmem, an i64 shared-memory descriptor without;
+    i64 shared-memory descriptor b_desc (B), i32 instruction descriptor idesc, i32 acc: the lane elect_one picks issues
+    tcgen05.mma of cta_group 1 and kind `kind` ("f16" or "tf32"), D += A B when acc != 0 and D = A B otherwise."""
+    with cute.arch.elect_one():
+        tcgen05_mma(
+            Tcgen05MMAKind(kind),
+            CTAGroup.CTA_1,
+            make_tmem_ptr(d_addr, Float32),
+            make_tmem_ptr(a, Float32) if a_tmem else Int64(a),
+            Int64(b_desc),
+            Int32(idesc),
+            Int32(acc) != 0,
+        )
+
+
+def tc_commit(addr):
+    """i32 shared address of an mbarrier: the lane elect_one picks issues tcgen05.commit, an arrival on the mbarrier
+    once the tcgen05 operations that thread issued before have completed."""
+    with cute.arch.elect_one():
+        tcgen05.commit(sptr(Int64, addr))

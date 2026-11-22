@@ -48,10 +48,9 @@ from ...common.expmath import (
     tree_sum,
 )
 from ...common.mem import sptr, store_vector
-from ...constants import RESCALE_THRESHOLD, SUBNORMAL_ULPS
+from ...constants import E4M3_MAX, RESCALE_THRESHOLD, SUBNORMAL_ULPS
 from ..tmem import ld_tmem_f32, st_tmem_f32
 
-E4M3_MAX = 448.0
 # P pre-scale: s_P = 2^floor(log2(largest finite E4M3) - T)
 P_PRESCALE_LOG2 = int(math.log2(E4M3_MAX) - RESCALE_THRESHOLD)
 # The score-scale floor of this family: log2 of the smallest multiplier of the raw scores the landing takes exactly.

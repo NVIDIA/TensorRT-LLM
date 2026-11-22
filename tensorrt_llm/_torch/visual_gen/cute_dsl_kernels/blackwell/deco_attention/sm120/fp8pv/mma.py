@@ -33,8 +33,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.typing import BFloat16, Float8E4M3FN, Float32, Int32, Int64
 
-from ...common.mem import load_invariant, load_vector, sptr
-from ..ptx.fp8pv import ldsm_b8_x2_trans, mbar_wait, mma_means_branch, mma_pv_quarters_branch
+from ...common.mem import load_invariant, load_vector, mbar_wait, sptr
+from ..ptx.fp8pv import ldsm_b8_x2_trans, mma_means_branch, mma_pv_quarters_branch
 from ..ptx.shared import ldsm_b16_x4, ldsm_b16_x4_trans, mma_bf16, mma_nvf4
 from .layout import K_STEPS, KA_BYTES, QT, SF_BYTES
 

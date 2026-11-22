@@ -19,10 +19,9 @@ provisional BF16 scales."""
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
-from cutlass.cute.math import RoundingMode
 from cutlass.utils import SmemAllocator
 
-from ...common.expmath import e4m3x4, f2u, pow2_ceil, u2f, warp_max
+from ...common.expmath import e4m3x4, f2u, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_vector, sptr, store_vector
 
 ENCODE_THREADS = 256
@@ -67,12 +66,12 @@ def encode_kernel(
         for wi in cutlass.range_constexpr(ENCODE_THREADS // 32):
             mv = cute.arch.fmax(mv, cute.arch.load(sptr(Float32, red + (wi * 6 + j) * 4), Float32))
         gmv[j] = mv
-    gq0 = pow2_ceil(cute.math.div(gmv[0], Float32(448.0), rounding=RoundingMode.NEAREST_EVEN))
-    gq1 = pow2_ceil(cute.math.div(gmv[1], Float32(448.0), rounding=RoundingMode.NEAREST_EVEN))
-    gq2 = pow2_ceil(cute.math.div(gmv[2], Float32(448.0), rounding=RoundingMode.NEAREST_EVEN))
-    gk0 = pow2_ceil(cute.math.div(gmv[3], Float32(448.0), rounding=RoundingMode.NEAREST_EVEN))
-    gk1 = pow2_ceil(cute.math.div(gmv[4], Float32(448.0), rounding=RoundingMode.NEAREST_EVEN))
-    gk2 = pow2_ceil(cute.math.div(gmv[5], Float32(448.0), rounding=RoundingMode.NEAREST_EVEN))
+    gq0 = pow2_ceil_448(gmv[0])
+    gq1 = pow2_ceil_448(gmv[1])
+    gq2 = pow2_ceil_448(gmv[2])
+    gk0 = pow2_ceil_448(gmv[3])
+    gk1 = pow2_ceil_448(gmv[4])
+    gk2 = pow2_ceil_448(gmv[5])
     prod = cute.arch.fmax(cute.arch.fmax(gq0 * gk0, gq1 * gk1), gq2 * gk2)
     minp = u2f(Uint32((127 + 7 + msl) << 23))
     ep = Int32(f2u(prod) >> Uint32(23))

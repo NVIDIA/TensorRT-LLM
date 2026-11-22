@@ -48,11 +48,13 @@ from ...common.expmath import f2u, warp_max
 from ...common.mem import gptr, load_invariant, sptr, store_vector
 from ...common.state import State
 from ...constants import QPRE, qk_scale_atoms
-from ..ptx import idesc_bf16, idesc_tf32, mbar_wait_bounded, smem_desc_sw128, tc_commit, tc_mma
+from ..ptx import idesc_bf16, idesc_tf32, mbar_wait_bounded, smem_desc_sw128
 from ..tmem import (
     ld_tmem_16x32bx2_f32_x32_absmax_wait,
     ld_tmem_f32_x32_wait,
     st_tmem_16x32bx2_f32_x32_wait,
+    tc_commit,
+    tc_mma,
 )
 from ..valid_len import valid_len
 from .quant import quant16, quant16_dq_knownmax

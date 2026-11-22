@@ -54,16 +54,9 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32, Int64
 
 from ...common.dsl import BarrierRedux, barrier_cta_red, barrier_cta_sync
-from ...common.mem import load_invariant, sptr
+from ...common.mem import load_invariant, mbar_wait, sptr
 from ...common.state import State
-from ..ptx.fp8pv import (
-    atom_add_shared_u32_lane0,
-    lane_zero,
-    mbar_wait,
-    packed_pv_needed,
-    stage_next,
-)
-from ..ptx.shared import mbar_init_imm
+from ..ptx.fp8pv import atom_add_shared_u32_lane0, lane_zero, packed_pv_needed, stage_next
 from ..valid_len import valid_len
 from .epilogue import inv_row_sums, store_partials, store_rows, store_zero_rows
 from .layout import (
@@ -166,7 +159,7 @@ def start_ring(st, ops, H: cutlass.Constexpr, nT: cutlass.Constexpr):
     st.tma = make_tma_views(st.sp, *tiles, st.hh, st.bb)
     if st.tidx == 0:
         for stage in cutlass.range_constexpr(STAGES):
-            mbar_init_imm(st.fbar + stage * 8, 1)
+            cute.arch.mbarrier_init(sptr(Int64, st.fbar + stage * 8), 1)
             cute.arch.store(sptr(Int32, st.smem + CNT_OFF + stage * 4), Int32(0))
         cute.arch.mbarrier_init_fence()
     # a non-finite V or v_mean anywhere in this (batch, head) disables zero-P skipping for the head
@@ -274,51 +267,35 @@ def issue_tile(st, stage, ktile, vtile, has_k, has_v, vma, vmb, nvm, vbuf):
         cute.copy(tma_atom_m, tMgM[(None, vma)], tM1sM[(None, stage)], tma_bar_ptr=bar_ptr + stage)
 
 
-def first_stages_full(st, rot, nT):
-    """The first loads of a whole unit, issued by warp 4. Stage j (phases 0 .. 2): K' of step j and V of step j - 1;
-    phase 2 takes the v_mean rows of the step pair (0, 1), a last odd phase 1 (nT == 1) those of step 0."""
-    for tl in range(min(STAGES, nT + 1)):
-        kt = step_tile(tl, rot, nT)
-        vt = step_tile(tl - 1, rot, nT)
-        nvm = 2 if (tl % 2 == 0 and tl >= 2) else (1 if (tl % 2 == 1 and tl - 1 == nT - 1) else 0)
-        vma = step_tile(tl - 2, rot, nT) if nvm == 2 else vt
-        issue_tile(
-            st,
-            tl,
-            kt,
-            vt,
-            Int32(1 if tl < nT else 0),
-            Int32(1 if tl >= 1 else 0),
-            vma,
-            vt,
-            Int32(nvm),
-            Int32(((tl - 1) >> 1) & 1 if tl >= 1 else 0),
-        )
-
-
 @cute.jit
-def first_stages_part(st, t0, nK):
-    """The first loads of a key-range piece (tiles t0 .. t0 + nK - 1, nK >= 2), issued by warp 4. Stage j (phases
-    0 .. 2): K' of tile t0 + j (stage 2: when the piece has a third tile) and V of tile t0 + j - 1."""
+def first_stages(st, tile, n, n_min: cutlass.Constexpr):
+    """The first loads of a CTA over n key tiles, issued by warp 4; tile(j): the key tile of step j. Stage j (phases
+    0 .. 2, as far as the CTA has a phase j): K' of step j (j < n) and V of step j - 1; phase 2 takes the v_mean rows
+    of the step pair (0, 1), a last phase 1 (n == 1) those of step 0. n is known at trace time (a whole unit) or at
+    run time with the trace-time lower bound n_min (a key-range piece: 2; a range with lengths: 1): what the bound
+    decides is decided at trace time."""
+    static = isinstance(n, int)
     for tl in cutlass.range_constexpr(STAGES):
-        hk = Int32(1)
-        if cutlass.const_expr(tl == 2):
-            hk = Int32(0)
-            if tl < nK:
-                hk = Int32(1)
-        # phase 2 takes the v_mean rows of the step pair (0, 1) (pieces have nK >= 2 tiles)
-        issue_tile(
-            st,
-            tl,
-            t0 + tl,
-            t0 + max(tl - 1, 0),
-            hk,
-            Int32(1 if tl >= 1 else 0),
-            t0,
-            t0 + 1,
-            Int32(2 if tl == 2 else 0),
-            Int32(0),
-        )
+        # the CTA has a phase tl; step tl has a tile; a single step brings its own v_mean rows in stage 1
+        phase = (tl <= n) if static else (True if tl <= n_min else n >= tl)
+        has_k = Int32(1 if tl < n else 0) if static else (Int32(1) if tl < n_min else Int32(tl < n))
+        nvm = Int32(2 if tl == 2 else 0)
+        if cutlass.const_expr(tl == 1 and (n == 1 if static else n_min < 2)):
+            nvm = Int32(1) if static else Int32(n == 1)
+        vt = tile(max(tl - 1, 0))
+        if phase:
+            issue_tile(
+                st,
+                tl,
+                tile(tl),
+                vt,
+                has_k,
+                Int32(1 if tl >= 1 else 0),
+                tile(0) if tl == 2 else vt,
+                vt,
+                nvm,
+                Int32(0),
+            )
 
 
 @cute.jit
@@ -434,22 +411,6 @@ def lens_tile(j, rng):
     if j < n - 1:
         t = rot_tile(j, rng[2](), n - 1)
     return rng[0]() + t
-
-
-@cute.jit
-def first_stages_lens(st, rng):
-    """The first loads of the range, issued by warp 4, as first_stages_full for a run-time n: stage 0 K' of step 0;
-    stage 1 K' of step 1 (n >= 2) and V of step 0, with its v_mean rows when it is the only step; stage 2 (n >= 2)
-    K' of step 2 (n >= 3), V of step 1 and the v_mean rows of the step pair (0, 1)."""
-    n = rng[1]()
-    ta = lens_tile(0, rng)
-    tb = lens_tile(1, rng)
-    issue_tile(st, 0, ta, ta, Int32(1), Int32(0), ta, ta, Int32(0), Int32(0))
-    issue_tile(st, 1, tb, ta, Int32(n >= 2), Int32(1), ta, ta, Int32(n == 1), Int32(0))
-    if n >= 2:
-        issue_tile(
-            st, 2, lens_tile(2, rng), tb, Int32(n >= 3), Int32(1), ta, tb, Int32(2), Int32(0)
-        )
 
 
 @cute.jit
@@ -719,7 +680,7 @@ def full_body(ops, vs_ptr, o_ptr, S: cutlass.Constexpr, H: cutlass.Constexpr, un
     rot = st.qt % (nT - 1) if nT >= 2 else Int32(0)
     start_ring(st, ops, H, nT)
     if st.warp == 4:
-        first_stages_full(st, rot, nT)
+        first_stages(st, lambda j: step_tile(j, rot, nT), nT, nT)
     if st.grp == 1:
         # warp w takes the first turn of its pair
         pass_turn(st)
@@ -796,7 +757,7 @@ def partial_body(
     st = cta_state(tidx, qt, hh, bb, min(DIST, nT // split))
     start_ring(st, ops, H, nT)
     if st.warp == 4:
-        first_stages_part(st, t0, nK)
+        first_stages(st, lambda j: t0 + j, nK, 2)
     if st.grp == 1:
         # warp w takes the first turn of its pair
         pass_turn(st)
@@ -830,13 +791,13 @@ def partial_body(
 
 @cute.jit
 def lens_phases(st, ops, rng, S: cutlass.Constexpr, H: cutlass.Constexpr, vs_ptr=None):
-    """The phases of a CTA of a call with lengths over the key tiles of the range rng (see first_stages_lens), the
+    """The phases of a CTA of a call with lengths over the key tiles of the range rng (see lens_tile), the
     keys of the last tile from its valid count on masked: the ring and the operands as in full_body, the phases as in
     partial_body, a single tile going from its QK straight to the last phase. Returns the softmax state."""
     nT = (S + KT - 1) // KT
     start_ring(st, ops, H, nT)
     if st.warp == 4:
-        first_stages_lens(st, rng)
+        first_stages(st, lambda j: lens_tile(j, rng), rng[1](), 1)
     if st.grp == 1:
         # warp w takes the first turn of its pair
         pass_turn(st)

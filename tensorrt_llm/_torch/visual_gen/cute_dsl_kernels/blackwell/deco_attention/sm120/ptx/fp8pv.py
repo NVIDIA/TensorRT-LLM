@@ -17,9 +17,8 @@ the package, see its docstring. The sections:
 
   MMA and descriptors                 mma.sync of E4M3 (the PV of the 32-key quarters) and of BF16 (the means
                                       term), each with its ldmatrix loads behind an indexed branch
-  barriers and waits                  the mbarrier wait
-  conversions and packed arithmetic   the comparison, a per-lane zero, the step of a ring stage, the warp vote, and
-                                      the blocks of the softmax (fp8pv/softmax.py, fp8pv/small.py): the I-ExpCast
+  conversions and packed arithmetic   the comparison, a per-lane zero, the step of a ring stage, and the
+                                      blocks of the softmax (fp8pv/softmax.py, fp8pv/small.py): the I-ExpCast
                                       landing, the E4M3 words, row sums, block sums and flags of P
   memory access                       the transposed ldmatrix of bytes, predicated streaming stores, the predicated
                                       atomic of the release count"""
@@ -128,22 +127,6 @@ def mma_means_branch(o, b, addr, idx, *, loc=None, ip=None):
     )
 
 
-# -------------------------------------------------------------------------------- Barriers and waits
-@dsl_user_op
-def mbar_wait(addr, parity, *, loc=None, ip=None):
-    """i32 shared address of an mbarrier, i32 parity: loops on mbarrier.try_wait.parity.shared::cta.b64 until the phase
-    of that parity has completed, without a limit on the tries; the loop label is unique per use (${:uid})."""
-    asm(
-        "{\n.reg .pred p;\nWAIT_${:uid}:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n"
-        "@!p bra WAIT_${:uid};\n}",
-        [i32(addr), i32(parity)],
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
 # -------------------------------------------------------------------------------- Conversions and packed arithmetic
 @dsl_user_op
 def compare(a, b, op: str, dtype, *, loc=None, ip=None):
@@ -186,20 +169,6 @@ def stage_next(sk, ph, stages: int, *, loc=None, ip=None):
         [i32(sk), i32(ph)],
         [Int32] * 2,
         side_effects=False,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def vote_any(x, *, loc=None, ip=None):
-    """i32 x -> i32 1 if x != 0 on any lane of the warp, else 0 (setp.ne.s32, vote.sync.any.pred over all 32 lanes)."""
-    return asm(
-        "{\n.reg .pred pi, po;\nsetp.ne.s32 pi, $1, 0;\nvote.sync.any.pred po, pi, 0xffffffff;\n"
-        "selp.s32 $0, 1, 0, po;\n}",
-        [i32(x)],
-        Int32,
-        side_effects=True,
         loc=loc,
         ip=ip,
     )

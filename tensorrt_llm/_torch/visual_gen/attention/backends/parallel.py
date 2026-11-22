@@ -893,9 +893,8 @@ class UlyssesAttention(AttentionBackend):
         return True
 
     def support_key_padding_mask(self) -> bool:
-        """The inner backend attends the whole sequence with the keywords of the call, so
-        this and the two capabilities below are those of the wrapped backend: they are
-        asked of an instance, not of the class."""
+        """The inner backend attends the whole sequence with the keywords of the call: this
+        and the two capabilities below are those of the wrapped backend, per instance."""
         return self.inner_backend.support_key_padding_mask()
 
     def requires_trailing_padding(self) -> bool:

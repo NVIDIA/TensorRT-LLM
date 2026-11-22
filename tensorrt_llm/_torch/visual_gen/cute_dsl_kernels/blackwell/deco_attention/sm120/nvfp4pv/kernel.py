@@ -47,27 +47,19 @@ from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 
 from ...common.expmath import bf16x2, f2u, u2f
 from ...common.mem import gptr, load_invariant, load_vector, mbar_wait, sptr, store_vector
-from ...common.ptx import ld_global_cg_v4
 from ...common.state import State
 from ..ptx.nvfp4pv import (
-    atom_add_global_u32,
     atom_add_shared_u32_elect,
     barrier_turn,
     bulk_complete,
     ld_global_nc_b32_pred,
 )
-from ..ptx.shared import (
-    ex2_approx_f32,
-    ldsm_b16_x4,
-    ldsm_b16_x4_trans,
-    mbar_init_imm,
-    mma_bf16,
-    mma_nvf4,
-    mul_rn_f32,
-)
+from ..ptx.shared import ldsm_b16_x4, ldsm_b16_x4_trans, mma_bf16, mma_nvf4
 from ..valid_len import valid_len
 from .layout import IMG_NOVM, SK_OFF, SKSF_OFF, STAGE, SV_OFF, SVM_OFF, SVSF_OFF
 from .softmax import softmax_phase
+
+RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
 
 NWARPS = 8
 NTHREADS = 32 * NWARPS
@@ -519,8 +511,8 @@ def attn_kernel(
 
     if tidx == 0:
         for s in cutlass.range_constexpr(NST):
-            mbar_init_imm(bar + 8 * s, 1)
-            mbar_init_imm(ebar + 8 * s, NTHREADS)
+            cute.arch.mbarrier_init(sptr(Int64, bar + 8 * s), 1)
+            cute.arch.mbarrier_init(sptr(Int64, ebar + 8 * s), NTHREADS)
             cute.arch.store(sptr(Int32, cnt + 4 * s), Int32(0))
         cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(lens_ptr is not None):
@@ -574,8 +566,8 @@ def attn_kernel(
 
     c = load_invariant(Float32, score_scale_ptr.toint())
     vscale = load_invariant(Float32, vs_ptr.toint())
-    M = mul_rn_f32(
-        c, u2f(0x400)
+    M = cute.math.mul(
+        c, u2f(0x400), rounding=RN
     )  # c * 2^-139: a subnormal multiplier (exact for a power-of-two c >= 2^-10)
     ninf = Float32(-math.inf)
 
@@ -651,7 +643,9 @@ def attn_kernel(
 
     # The folded landing needs c * 2^-139 exact: detect rounded-away bits here, without reading device data on the
     # host, and take the two-step copy of the tile loop for them.
-    restored_c = mul_rn_f32(mul_rn_f32(M, u2f(0x7F000000)), Float32(4096.0))
+    restored_c = cute.math.mul(
+        cute.math.mul(M, u2f(0x7F000000), rounding=RN), Float32(4096.0), rounding=RN
+    )
     if cutlass.const_expr(lens_ptr is None):
         if (c < Float32(2.0**-10)) | (restored_c != c):
             run_dispatch(st, part, unit, NFULL, RSPLIT, KMID, True)
@@ -765,14 +759,16 @@ def epilogue_partial(st, slot, part):
     cute.arch.fence_acq_rel_gpu()
     cute.arch.sync_threads()
     if st.tidx == 0:
-        old = atom_add_global_u32(st.cnt_g + 4 * slot, Int32(1))
+        old = cute.arch.atomic_add(
+            gptr(Int32, st.cnt_g + 4 * slot), Int32(1), sem="acq_rel", scope="gpu"
+        )
         cute.arch.store(sptr(Int32, st.cnt + 4 * NST), old)
     cute.arch.sync_threads()
     old2 = cute.arch.load(sptr(Int32, st.cnt + 4 * NST), Int32)
     if old2 == 1:
         cute.arch.fence_acq_rel_gpu()
         other = st.ws + Int64((slot * 2 + (2 - part)) * NTHREADS + st.tidx) * PART_BYTES
-        w = [ld_global_cg_v4(other + 16 * i, Int32) for i in range(17)]
+        w = [load_vector(gptr(Int32, other + 16 * i, 16), 4, cop="cg") for i in range(17)]
         # the halves combine in key order (part 1, then part 2) whichever of them merges: the products contract into
         # FMAs, which round differently with the halves swapped, so an order that followed which half finishes second
         # would make the output depend on it
@@ -786,8 +782,8 @@ def epilogue_partial(st, slot, part):
             a1 = Float32(cutlass.select_(is_part1 != 0, anchor[rr], ao))
             a2 = Float32(cutlass.select_(is_part1 != 0, ao, anchor[rr]))
             am = cute.arch.fmax(a1, a2)
-            e1 = ex2_approx_f32(a1 - am)
-            e2 = ex2_approx_f32(a2 - am)
+            e1 = cute.arch.exp2(a1 - am)
+            e2 = cute.arch.exp2(a2 - am)
             f1.append(e1)
             f2.append(e2)
             inv.append(

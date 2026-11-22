@@ -19,7 +19,7 @@ of the package, see its docstring. The sections:
   conversions and packed arithmetic   the E4M3 decoding, and the blocks of the softmax (nvfp4pv/softmax.py): the
                                       anchor update, the rescale of O, the block scales, the landing with the
                                       sums of P
-  memory access                       predicated global loads, atomics, TMA bulk copies"""
+  memory access                       predicated global loads, the atomic of the release count, TMA bulk copies"""
 
 import math
 
@@ -27,7 +27,7 @@ from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
 from ...common.ptx import asm, f32, i32, i64, tied, u32
-from ...constants import RESCALE_THRESHOLD
+from ...constants import E4M3_MAX, RESCALE_THRESHOLD
 from .shared import f32_literal
 
 
@@ -221,7 +221,7 @@ def block_scales2(bm0, bm1, c, anchor0, anchor1, *, loc=None, ip=None):
     # the results: the decoded scales, the UE4M3 bytes and the two shifts; then the operands: the maxima, c, the anchors
     schi, sfi, shifti, bmi, ci, anchori = 0, 1, 2, 4, 6, 7
     # the headroom of the P block scales, UE4M3(448 * 2^(bm - anchor - T)), as a PTX literal
-    k = f32_literal(math.log2(448.0) - RESCALE_THRESHOLD)
+    k = f32_literal(math.log2(E4M3_MAX) - RESCALE_THRESHOLD)
     body = [
         "{",
         ".reg .b64 bb, cc, ll, tt;",
@@ -449,20 +449,6 @@ def ld_global_nc_b32_v4_pred(addr, pred, *, loc=None, ip=None):
         "mov.b32 $3, 0;\n@p ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$4];\n}",
         [i64(addr), i32(pred)],
         [Int32] * 4,
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def atom_add_global_u32(addr, val, *, loc=None, ip=None):
-    """i64 global address, i32 val -> i32 old value: atom.acq_rel.gpu.global.add.u32 (device scope, acquire and
-    release)."""
-    return asm(
-        "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
-        [i64(addr), i32(val)],
-        Int32,
         side_effects=True,
         loc=loc,
         ip=ip,

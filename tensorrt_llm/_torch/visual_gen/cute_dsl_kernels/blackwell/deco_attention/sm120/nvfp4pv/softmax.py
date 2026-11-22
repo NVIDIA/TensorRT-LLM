@@ -57,13 +57,14 @@ from ..ptx.nvfp4pv import (
     prepare_land64_flag,
     rescale64_loop,
 )
-from ..ptx.shared import fma_rn_f32
 
 # The score-scale floor of this family: the preparation raises the score scale to a power of two of at least
 # 2^MIN_SCORE_LOG2 (its encode launch grows the Q group scales up to it), inside the range of the folded landing
 MIN_SCORE_LOG2 = -6
 # the P block scales carry T = RESCALE_THRESHOLD binades of headroom, UE4M3(448 * 2^(c bm - m - T)): the anchor m
 # (running max) only moves, and O is only rescaled, when a tile max exceeds it by more than T
+
+RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
 
 
 # ------------------------------------------------------------------------------------------------ softmax of one tile
@@ -156,7 +157,9 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
                     vals.extend(prepared[8 * gi : 8 * gi + 8])
                     # the shift of the decoded scale, on the subnormal grid of the folded offset (K0 - bm M, or K0
                     # after the subtraction)
-                    offsets.append(fma_rn_f32(dsh[s_][h_][rr], u2f(0x400), prepared[64 + gi]))
+                    offsets.append(
+                        cute.math.fma(dsh[s_][h_][rr], u2f(0x400), prepared[64 + gi], rounding=RN)
+                    )
         words, sums = land32_sum(vals, offsets, pm, sch[h_], par, kofs)
         for s_ in range(2):
             for rr in range(2):

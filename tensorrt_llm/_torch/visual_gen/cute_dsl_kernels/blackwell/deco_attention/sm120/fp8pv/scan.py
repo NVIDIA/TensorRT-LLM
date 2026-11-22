@@ -23,7 +23,6 @@ from cutlass.cute.typing import Int32, Int64
 
 from ...common.dsl import barrier_cta_sync
 from ...common.mem import gptr, load_invariant, load_vector, sptr
-from ..ptx.fp8pv import vote_any
 from ..valid_len import valid_len
 from .layout import KT, NTHR
 
@@ -69,7 +68,7 @@ def v_tile_nan_kernel(
         mvals = load_invariant(Int32, vm_ptr.toint() + Int64(mrow) * 256 + (tidx & 15) * 16, 4)
         for w in cutlass.range_constexpr(4):
             bad = bad | (((mvals[w] & 0x7F807F80) + 0x00800080) & Int32(-2147450880))
-    bad = vote_any(bad)
+    bad = Int32(cute.arch.vote_any_sync(bad != 0))
     sp = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
     sa = Int32(sp.toint())
     if lane == 0:

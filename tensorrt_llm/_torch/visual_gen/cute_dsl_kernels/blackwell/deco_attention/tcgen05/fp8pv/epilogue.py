@@ -26,8 +26,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Float32, Int32, Int64
 
-from ...common.mem import gptr, store_vector
-from ...common.ptx import ld_global_acquire_b32, ld_global_cg_v4
+from ...common.mem import gptr, load_vector, store_vector
 from ...constants import HEAD_DIM
 from ..valid_len import valid_len
 from .sched import SplitTileScheduler, TileScheduler
@@ -170,9 +169,10 @@ class EpilogueRole:
                 m_fin = row_max
                 for j in cutlass.range(0, n_other, 1, unroll=1):
                     slot_p = _merge_slot(slot_base, j, merger, stage)
-                    flag = ld_global_acquire_b32(split_flag_addr + Int64(slot_p) * 4, Int32)
+                    flag_ptr = gptr(Int32, split_flag_addr + Int64(slot_p) * 4)
+                    flag = cute.arch.load(flag_ptr, Int32, sem="acquire", scope="gpu")
                     while flag != split_ready:
-                        flag = ld_global_acquire_b32(split_flag_addr + Int64(slot_p) * 4, Int32)
+                        flag = cute.arch.load(flag_ptr, Int32, sem="acquire", scope="gpu")
                     m_p = cute.arch.load(
                         gptr(Float32, split_ml_addr + Int64(slot_p * 128 + thread_idx) * 8),
                         Float32,
@@ -231,11 +231,15 @@ class EpilogueRole:
                         vals_b = []
                         for jj in cutlass.range_constexpr(0, cute.size(tTMrO), 4):
                             _, col = tTMEM_LOADoO_i[jj]
-                            vals_a += ld_global_cg_v4(
-                                split_o_addr + (rb_a * 128 + col) * 4, Float32
+                            vals_a += load_vector(
+                                gptr(Float32, split_o_addr + (rb_a * 128 + col) * 4, 16),
+                                4,
+                                cop="cg",
                             )
-                            vals_b += ld_global_cg_v4(
-                                split_o_addr + (rb_b * 128 + col) * 4, Float32
+                            vals_b += load_vector(
+                                gptr(Float32, split_o_addr + (rb_b * 128 + col) * 4, 16),
+                                4,
+                                cop="cg",
                             )
                         s_a = scale * cute.math.exp2(score_scale * (m_a - m_fin), fastmath=True)
                         s_b = cutlass.select_(

@@ -33,7 +33,7 @@ from cutlass.cute.typing import Float32, Int32, Int64
 from ...common.dsl import barrier_cta_sync
 from ...common.mem import cp_async16, load_invariant, load_vector, mbar_wait, sptr
 from ..ptx.fp8pv import block_sums_of_p, expcast_transpose4, ldsm_b8_x2_trans
-from ..ptx.shared import ldsm_b16_x4, ldsm_b16_x4_trans, mbar_init_imm, mma_nvf4
+from ..ptx.shared import ldsm_b16_x4, ldsm_b16_x4_trans, mma_nvf4
 from ..valid_len import valid_len
 from .epilogue import inv_row_sums, store_rows
 from .layout import EP, K_STEPS, KT, NTHR, SF_BYTES, V_BYTES, VM_BYTES, key_grp, key_rot
@@ -261,7 +261,7 @@ def small_kernel(
     vmb = vm_ptr.toint() + Int64(bb * H + hh) * (8 * 256)
 
     if tidx == 0:
-        mbar_init_imm(fbar, 128)
+        cute.arch.mbarrier_init(sptr(Int64, fbar), 128)
         cute.arch.mbarrier_init_fence()
     barrier_cta_sync(Int32(0), thread_count=NTHR)
     if grp == 1:

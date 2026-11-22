@@ -19,8 +19,7 @@ version and the validated ones."""
 
 import cutlass
 
-# the releases of nvidia-cutlass-dsl the kernels are validated with
-VALIDATED_DSL_VERSIONS = ("4.8.0", "4.8.1")
+from ..constants import VALIDATED_DSL_VERSIONS
 
 try:
     from cutlass.experimental.primitives import (
@@ -34,6 +33,8 @@ try:
         Tcgen05CpShape,
         Tcgen05Fence,
         Tcgen05LdStShape,
+        Tcgen05MMACollectorOp,
+        Tcgen05MMAKind,
         Tcgen05Wait,
         barrier_cta_red,
         barrier_cta_sync,
@@ -48,6 +49,7 @@ try:
         tcgen05_fence,
         tcgen05_ld,
         tcgen05_ld_red,
+        tcgen05_mma,
         tcgen05_st,
         tcgen05_wait,
     )
@@ -69,6 +71,8 @@ __all__ = [
     "Tcgen05CpShape",
     "Tcgen05Fence",
     "Tcgen05LdStShape",
+    "Tcgen05MMACollectorOp",
+    "Tcgen05MMAKind",
     "Tcgen05Wait",
     "barrier_cta_red",
     "barrier_cta_sync",
@@ -83,6 +87,7 @@ __all__ = [
     "tcgen05_fence",
     "tcgen05_ld",
     "tcgen05_ld_red",
+    "tcgen05_mma",
     "tcgen05_st",
     "tcgen05_wait",
 ]

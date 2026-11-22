@@ -16,41 +16,32 @@
 DeCo-Attention CuTe DSL Backend for Visual Generation Models
 
 Runs self-attention on the DeCo-Attention kernels (``cute_dsl_kernels.blackwell.deco_attention``):
-each call runs the DeCo preparation and then the attention kernel of the recipe, two stateless
-functions that work in a workspace buffer this backend hands them.
+NVFP4 Q/K with compensation channels for the quantization error of the scores, and V smoothed
+over blocks of keys and quantized to FP8 (``v_dtype="fp8"``) or NVFP4 (``v_dtype="nvfp4"``).
+``supported_v_dtypes()`` lists the V formats that have a kernel on the current GPU.
 
-* ``qk_dtype="nvfp4", v_dtype="fp8"``: NVFP4 Q/K with compensation channels and FP8 PV, on SM100,
-  SM103, SM107 (tcgen05 MMA) and SM120 (warp-level MMA).
-* ``qk_dtype="nvfp4", v_dtype="nvfp4"``: the same Q/K with NVFP4 PV, on SM120.
+The kernels take one sequence attending itself: bfloat16 q, k and v of one shape
+[B, S, H, 128] on a CUDA device, with no mask other than padding. The backend is a complete
+attention layer: it runs every other call on the VANILLA backend, so a model builds it like
+any other backend.
 
-The preparation rotates Q and K, quantizes them to NVFP4 and appends compensation channels for
-the first-order quantization error of the scores; it smooths V over blocks of keys before
-quantizing it. It estimates the compensation channels from a sample of the tokens: a model
-whose sequence packs text or audio tokens with the video tokens passes ``token_tags``, and the
-sample then takes half of its rows from the text and audio tokens instead of a draw over the
-whole sequence, which leaves the few text and audio tokens almost unsampled.
-
-The kernels take NHD layout ([B, S, H, D]) with D = 128, as many K/V heads as Q heads, queries
-and keys of one sequence and bfloat16. The backend is a complete attention layer: it runs every
-other call on the VANILLA backend by itself, so a model builds it like any other backend.
-
-* Padding. A self-attention call says which rows hold tokens with ``key_padding_mask``
-  ([B, S], True = token), with ``valid_seq_len`` (a host integer: the rows after this prefix are
-  padding) or with both, and a row is then a token where both say so. The kernels attend the
-  token keys of every sample only, whatever the padding holds, and the padded rows come back
-  zero. A mask whose tokens are a prefix in every sample goes to the kernels as one length per
-  sample. Any other mask is served by compaction on the device: the tokens of every sample are
-  gathered to the front in their order, the kernels run on the lengths, and the output rows are
-  scattered back to their positions. The compaction changes no position: the call attends one
-  sequence to itself and the positions are encoded in Q and K.
-* Delegated calls. Cross-attention, a causal ``attention_mask``, inputs that are not bfloat16
-  CUDA tensors and self-attention over fewer than ``MIN_SEQ_LEN`` rows run on VANILLA. A layer
-  whose head dimension or K/V head count the kernels do not take runs all its calls there.
-* One sequence. The layer sees tensors, not the model: a call whose Q, K and V have one shape
-  is taken as attention of one sequence to itself, on the kernels and on VANILLA alike, so its
-  padding excludes the rows as keys and returns them zero as queries. A cross-attention call
-  with as many query rows as key rows and a ``key_padding_mask`` is therefore read as such a
-  sequence; a model with that call gives the layer different row counts or no mask.
+* Padding: ``key_padding_mask`` ([B, S], True = token), ``valid_seq_len`` (a host integer: the
+  rows after this prefix are padding) or both; a row is a token where both say so. Padded rows
+  get no attention weight, whatever they hold, and come back zero. A mask whose tokens are a
+  prefix in every sample reaches the kernels as one length per sample. For any other mask the
+  backend gathers the tokens of every sample to the front, runs the kernels on the lengths and
+  scatters the output rows back; Q and K carry their positions, so the order of the rows does
+  not change the result.
+* Token tags: the kernels estimate the compensation channels from a sample of the tokens. With
+  ``token_tags`` (see ``AttentionBackend.forward``) half of the sample comes from the text and
+  audio tokens of a packed sequence, which a draw over the whole sequence almost misses.
+* Delegated calls: cross-attention, a causal ``attention_mask``, inputs that are not bfloat16
+  CUDA tensors, self-attention over fewer than ``MIN_SEQ_LEN`` rows, and every call of a layer
+  whose head dimension or K/V head count the kernels do not take.
+* One sequence: a call whose q, k and v have one shape is read as one sequence attending
+  itself, on the kernels and on VANILLA alike: its padding excludes the rows as keys and
+  returns them zero as queries. This includes a cross-attention call with as many query rows
+  as key rows and a ``key_padding_mask``.
 """
 
 from dataclasses import dataclass
@@ -72,17 +63,29 @@ except (ImportError, OSError) as e:
     deco_attention = None
     _deco_import_error = e
 
-# The plans of this many recent pairs of token tags and padding are kept; a plan whose basis
-# rows a CUDA graph was captured with stays for the life of the component state, as the graph
-# reads the rows on replay.
+# A self-attention call over fewer rows runs on VANILLA: the text sequence of a token refiner.
+MIN_SEQ_LEN = 8192
+
+# The component state keeps the plans of this many recent pairs of token tags and padding, and
+# every plan whose basis rows a CUDA graph was captured with: the graph reads them on replay.
 _PLANS_KEPT = 4
+
+
+def supported_v_dtypes() -> tuple[str, ...]:
+    """The ``v_dtype`` values DeCo-Attention has a kernel for on the current GPU, as the kernel
+    package reports them; empty when the package does not import or the GPU has no kernels."""
+    if deco_attention is None:
+        return ()
+    try:
+        return tuple(deco_attention.pv_formats())
+    except NotImplementedError:
+        return ()
 
 
 @dataclass(eq=False)
 class _Plan:
-    """What the kernels need besides q, k and v for one tags tensor, mask tensor (with its
-    version counter) and prefix length: the basis rows, the token count of every sample and
-    the order that puts the tokens first; and whether a CUDA graph was captured with the rows."""
+    """The result of ``DeCoAttention._plan`` for one tags tensor, mask tensor (with its version
+    counter) and prefix length, and whether a CUDA graph was captured with the rows."""
 
     tags: torch.Tensor | None
     mask: torch.Tensor | None
@@ -94,29 +97,21 @@ class _Plan:
     captured: bool = False
 
 
-# A self-attention call over fewer rows runs on VANILLA: the text sequence of a token refiner.
-MIN_SEQ_LEN = 8192
-
-
 class DeCoAttention(AttentionBackend):
     """DeCo-Attention backend for diffusion self-attention (see the module docstring).
 
-    The DeCo layers of one model component share one workspace through
-    ``attention_metadata_state``: the layers run one after another on one stream, the kernels keep
-    nothing in the workspace between calls, and each call writes its output into its own tensor.
+    The DeCo layers of a model component share one workspace through
+    ``attention_metadata_state``: they run one after another on one stream, and the kernels
+    keep nothing in the workspace between calls.
 
-    The kernels compile, and the inputs of the preparation that depend only on the sequence length
-    or the device are built, on first use. A CUDA graph capture therefore follows an eager forward
-    of the same shape, which the CUDA graph runner's warm-up provides; a first use under capture
-    raises a ``RuntimeError``.
-
-    A call under capture with a ``key_padding_mask`` always takes the compaction: the lengths and
-    the order of the tokens are computed on the device inside the graph, so a replay follows the
-    mask tensor of the capture, also after its content changed in place. ``valid_seq_len`` and
-    the basis rows of ``token_tags`` are host values of the capture: the rows are those an
-    eager forward drew for the same tags tensor and ``valid_seq_len``, whatever mask tensor it
-    had, and a replay keeps them; a row that the mask of a replay excludes is read as the last
-    token of its sample.
+    CUDA graphs. The kernels compile, and the preparation builds its inputs for a sequence
+    length and draws the basis rows of token tags, on first use: a capture follows an eager
+    forward of the same shape and tags tensor, which the CUDA graph runner's warm-up provides,
+    and a first use under capture raises a ``RuntimeError``. A captured call with a
+    ``key_padding_mask`` computes the lengths and the order of the tokens inside the graph, so a
+    replay follows the content of the mask tensor of the capture. ``valid_seq_len`` and the
+    basis rows are host values of the capture; a row that the mask of a replay excludes is
+    read as the last token of its sample.
     """
 
     def __init__(
@@ -140,17 +135,16 @@ class DeCoAttention(AttentionBackend):
             )
         num_kv_heads = num_kv_heads or num_heads
         # The V format of the recipe names the PV format of the kernel; Q/K are always NVFP4.
-        try:
-            pv_formats = deco_attention.pv_formats()
-        except NotImplementedError as e:
+        v_dtypes = supported_v_dtypes()
+        if not v_dtypes:
             raise ValueError(
                 "DeCo-Attention has kernels for SM100, SM103, SM107 and SM120 GPUs only."
-            ) from e
+            )
         qk_dtype, v_dtype = quant_attention_config.qk_dtype, quant_attention_config.v_dtype
-        if qk_dtype != "nvfp4" or v_dtype not in pv_formats:
+        if qk_dtype != "nvfp4" or v_dtype not in v_dtypes:
             raise ValueError(
                 f"DeCo-Attention has no kernel for qk_dtype={qk_dtype!r}, v_dtype={v_dtype!r} on "
-                f"this GPU, whose kernels take qk_dtype='nvfp4' with v_dtype in {pv_formats}."
+                f"this GPU, whose kernels take qk_dtype='nvfp4' with v_dtype in {v_dtypes}."
             )
 
         if attention_metadata_state is None:
@@ -206,14 +200,11 @@ class DeCoAttention(AttentionBackend):
     ) -> torch.Tensor:
         """Run a call the kernels do not take on VANILLA, which works in HND ([B, H, S, D]).
 
-        A model's cross-attention layers take this path on every call, inside the compiled
-        model, so it logs nothing; ``forward`` warns once when a self-attention call takes it.
-        The padded rows of a call of one sequence come back zero, as from the kernels: VANILLA
-        takes no ``valid_seq_len``, so the queries and keys of the valid prefix are attended
-        alone, with the prefix of a ``key_padding_mask``, and the rows that the mask excludes
-        are zeroed. A call with other key rows than query rows keeps all its keys, whose
-        ``key_padding_mask`` describes them only: ``valid_seq_len`` zeroes its padded query
-        rows.
+        Cross-attention layers take this path on every call, so it logs nothing. VANILLA takes
+        no ``valid_seq_len``: a call of one sequence attends its valid prefix alone, and the
+        rows that the length or the mask excludes come back zero, as from the kernels. A call
+        with other key rows than query rows keeps all its keys, which its ``key_padding_mask``
+        describes; ``valid_seq_len`` zeroes its padded query rows.
         """
         valid_seq_len = kwargs.pop("valid_seq_len", None)
         if valid_seq_len is not None and valid_seq_len < q.shape[1]:
@@ -265,13 +256,11 @@ class DeCoAttention(AttentionBackend):
     def _basis_rows(
         token_tags: torch.Tensor, tokens: torch.Tensor | None, seq_len: int, device: torch.device
     ) -> torch.Tensor:
-        """The tokens the preparation estimates its basis from with token tags: the draw by
-        modality of the kernels' ``sample_rows``, half of it from the text and audio tokens.
+        """The basis rows of token tags: the draw by modality of the kernels' ``sample_rows``.
 
-        The tags give the modality of a position where it holds a token, and ``tokens``
-        (``[B, S]`` or ``[1, S]``, None without padding) says where a sample holds tokens. When
-        the tags mark the padding of every sample themselves, the batch shares one draw
-        ``[m]``. Otherwise every row of ``tokens`` gets the draw of its own tokens,
+        ``tokens`` (``[B, S]`` or ``[1, S]``, None without padding) says where a sample holds
+        tokens. When the tags mark the padding of every sample themselves, the batch shares one
+        draw ``[m]``. Otherwise every row of ``tokens`` gets the draw of its own tokens,
         ``[B, m]``: a draw shorter than the longest repeats its rows, and a sample without
         tokens gets row 0, which the kernels read as padding.
         """
@@ -306,15 +295,13 @@ class DeCoAttention(AttentionBackend):
         (int32 ``[B]`` on the device; None without padding) and, when the tokens of a sample
         are not a prefix, the order ``[B, S]`` that puts them first (None otherwise).
 
-        Drawing the rows and telling a prefix from other padding read back to the host, so a
-        plan is made once per tags tensor, mask tensor and prefix length: the component state
-        keeps them with the plan, and every layer and step of a request that passes the same
-        tensors reuses it. The mask is kept with its version counter; an inference tensor has
-        none, so its content must not change in place while it is passed. Under CUDA graph
-        capture nothing is read back or kept: the counts and the order are computed inside the
-        graph, which serves every mask, and the rows are those of a plan with the same tags
-        and prefix length, which then stays in the component state: the graph reads the rows
-        on every replay.
+        Drawing the rows and telling a prefix from other padding read back to the host, so the
+        component state keeps one plan per tags tensor, mask tensor and prefix length, and the
+        layers and steps of a request that pass the same tensors reuse it. The mask is kept
+        with its version counter; an inference tensor has none, so its content must not change
+        in place while it is passed. Under CUDA graph capture nothing is read back: the counts
+        and the order are computed inside the graph, and the rows are those of a plan with the
+        same tags and prefix length, which is then kept for the replays.
         """
         if valid_seq_len is not None and valid_seq_len >= seq_len:
             valid_seq_len = None
@@ -473,13 +460,8 @@ class DeCoAttention(AttentionBackend):
     ) -> torch.Tensor:
         """Attention over q, k, v ``[B, S, H, D]``; returns ``[B, S, H, D]`` in q's dtype.
 
-        ``token_tags`` (keyword, ``[S]``): the modality of every position of a packed
-        multimodal sequence where it holds a token (``AttentionBackend.forward``); the
-        preparation then draws its basis rows by modality, for every sample from its tokens.
-        ``key_padding_mask`` (keyword, ``[B, S]``, True = token) and ``valid_seq_len`` (keyword,
-        a host integer: the rows after this prefix are padding): the padding of a
-        self-attention call. A row is a token where both say so; the other rows get no
-        attention weight, whatever they hold, and come back zero.
+        The module docstring describes the keywords ``key_padding_mask``, ``valid_seq_len``
+        and ``token_tags``.
         """
         valid_seq_len = kwargs.get("valid_seq_len")
         if valid_seq_len is not None and (

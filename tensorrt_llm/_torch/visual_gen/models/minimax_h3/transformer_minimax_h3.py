@@ -36,10 +36,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.attention.backends import (
-    AttentionBackend,
-    get_visual_gen_attention_backend,
-)
+from tensorrt_llm._torch.visual_gen.attention.backends import get_visual_gen_attention_backend
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
@@ -114,15 +111,20 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
     return dense_config
 
 
-def _attention_backend_class(model_config: DiffusionModelConfig) -> type[AttentionBackend]:
-    """Return the backend class the dense attention layers of the config run on; its
-    capabilities say how the padding of a sequence reaches it."""
+def _padding_support(model_config: DiffusionModelConfig) -> tuple[bool, bool, bool]:
+    """How the dense attention backend of the config takes the padding of a sequence: whether
+    as a key padding mask, whether as the length of the valid prefix (a backend without mask
+    support), and whether the padding must follow the tokens. A backend that takes neither a
+    mask nor a length cannot attend a padded sequence."""
 
     attention = model_config.attention
-    return get_visual_gen_attention_backend(
+    backend_cls = get_visual_gen_attention_backend(
         getattr(attention, "backend", "VANILLA"),
         quant_attention_config=getattr(attention, "quant_attention_config", None),
     )
+    passes_mask = backend_cls.support_key_padding_mask()
+    passes_length = not passes_mask and backend_cls.support_valid_seq_len()
+    return passes_mask, passes_length, passes_length or backend_cls.requires_trailing_padding()
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -556,13 +558,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
     ) -> None:
         super().__init__()
         self._attn_backend = model_config.attention.backend.upper()
-        # Padding goes to the backend as a key padding mask, or as the length of the valid
-        # prefix when the backend takes no mask.
-        backend_cls = _attention_backend_class(model_config)
-        self._passes_key_padding_mask = backend_cls.support_key_padding_mask()
-        self._supports_key_padding_mask = (
-            self._passes_key_padding_mask or backend_cls.support_valid_seq_len()
-        )
+        self._passes_key_padding_mask, passes_valid_seq_len, _ = _padding_support(model_config)
+        self._supports_key_padding_mask = self._passes_key_padding_mask or passes_valid_seq_len
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
             num_attention_heads=num_attention_heads,
@@ -778,20 +775,14 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         self._padded_token_tags: tuple[torch.Tensor, int, torch.Tensor] | None = None
         self._key_padding_mask: tuple[torch.Tensor, int, torch.Tensor] | None = None
-        # Padding goes to the backend as a key padding mask, or as the length of the valid
-        # prefix when the backend takes no mask. A backend that reads either as one prefix
-        # needs the padding after the tokens; the others take padding between packed
-        # modalities.
-        backend_cls = _attention_backend_class(model_config)
-        self._passes_key_padding_mask = backend_cls.support_key_padding_mask()
-        self._passes_valid_seq_len = (
-            not self._passes_key_padding_mask and backend_cls.support_valid_seq_len()
-        )
+        # Padding between packed modalities needs a backend that takes it anywhere.
+        (
+            self._passes_key_padding_mask,
+            self._passes_valid_seq_len,
+            self._requires_trailing_padding,
+        ) = _padding_support(model_config)
         self._supports_key_padding_mask = (
             self._passes_key_padding_mask or self._passes_valid_seq_len
-        )
-        self._requires_trailing_padding = (
-            self._passes_valid_seq_len or backend_cls.requires_trailing_padding()
         )
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
@@ -1114,10 +1105,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             valid_seq_len = sequence_length
             if has_existing_padding:
                 valid_seq_len = int((token_tags >= 0).sum().item())
-        # One tags tensor of the padded sequence per tags content: an attention backend keeps
-        # what it derives from the tags and from the mask with the tensors it is given. The
-        # memo holds its own copy of the tags, so a caller that refills one tags buffer in
-        # place gets the tags and the mask of the new content.
+        # One tags tensor of the padded sequence per tags content: attention backends key
+        # their caches on the tags and mask tensors. The memo compares against its own copy,
+        # so tags that a caller refills in place give a new tensor.
         padded_tags = self._padded_token_tags
         if (
             padded_tags is None
@@ -1185,9 +1175,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 key_padding_mask,
                 timestep,
                 valid_seq_len=valid_seq_len,
-                # Each attention call sees the whole packed sequence, so the tags of the
-                # padded sequence describe its rows; a backend that samples tokens by
-                # modality reads them.
+                # Each attention call sees the whole packed sequence, whose rows these tags
+                # describe.
                 token_tags=token_tags_for_mask,
             )
 

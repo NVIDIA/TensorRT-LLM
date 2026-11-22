@@ -35,9 +35,12 @@ def sptr(dtype, addr, align=None):
     return cute.make_ptr(dtype, addr, cute.AddressSpace.smem, assumed_align=align)
 
 
-def load_vector(ptr, n):
-    """The n elements at ptr, read by one vector load, as a list."""
-    vector = cutlass.Vector(cute.arch.load(ptr, T.vector(n, ptr.dtype.mlir_type)), dtype=ptr.dtype)
+def load_vector(ptr, n, cop=None):
+    """The n elements at ptr, read by one vector load, as a list; cop: its cache modifier ("cg": cached at the global
+    level and not in L1, for data another CTA writes)."""
+    vector = cutlass.Vector(
+        cute.arch.load(ptr, T.vector(n, ptr.dtype.mlir_type), cop=cop), dtype=ptr.dtype
+    )
     return [vector[i] for i in range(n)]
 
 

@@ -41,6 +41,8 @@ _K128_FP4_MMA = _archs("sm_107a")
 _K64_FP8_MMA = _archs("sm_107a")
 # tcgen05.ld.red: a TMEM load that also returns the max (or max |x|) of the loaded values
 _TMEM_LD_RED = _archs("sm_103a", "sm_107a")
+# redux.sync on f32: the maximum of a value over the lanes of a warp in one instruction
+_REDUX_F32 = _archs("sm_100a", "sm_103a", "sm_107a")
 # the tcgen05 targets -> the family name of CuTe's TMEM helpers
 _NAMES = {a: family for family in ("sm_100", "sm_103", "sm_107") for a in _archs(family + "a")}
 # the targets with DeCo kernels -> their kernel family (deco_attention/<family>): the tcgen05 targets, and the
@@ -84,3 +86,7 @@ def has_k64_fp8_mma():
 
 def has_tmem_ld_red():
     return arch() in _TMEM_LD_RED
+
+
+def has_redux_f32():
+    return arch() in _REDUX_F32

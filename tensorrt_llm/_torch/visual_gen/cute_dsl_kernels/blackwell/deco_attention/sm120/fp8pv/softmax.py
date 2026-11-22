@@ -52,12 +52,13 @@ from cutlass.cute.typing import Float32, Int32
 from ...common.expmath import scale_bf16x2
 from ...constants import RESCALE_THRESHOLD
 from ..ptx.fp8pv import compare, expcast_guard, land_finish, land_pack, landed_flags
-from ..ptx.shared import ex2_approx_f32, mul_rn_f32
 from .layout import KT, key_grp, key_rot
 
 # The score-scale floor of this kernel: the preparation raises the score scale to a power of two of at least
 # 2^MIN_SCORE_LOG2, from which the one-FMA landing's multiplier is exact on the subnormal grid
 MIN_SCORE_LOG2 = -10
+
+RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
 
 
 # ------------------------------------------------------------------------------------------------ softmax of one tile
@@ -90,7 +91,7 @@ def tile_max(acc, sc):
     m0 = cute.arch.fmax(m0, cute.arch.shuffle_sync_bfly(m0, offset=2))
     m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=2))
     # The maxima are multiplied by sc, so the anchors are in log2 units for every positive scale.
-    return mul_rn_f32(m0, sc), mul_rn_f32(m1, sc)
+    return cute.math.mul(m0, sc, rounding=RN), cute.math.mul(m1, sc, rounding=RN)
 
 
 def rescale_o(O, al0, al1, q):
@@ -159,8 +160,8 @@ def softmax_tile(
         na0 = Float32(cutlass.select_(mv0 != 0, m0, anc0))
         na1 = Float32(cutlass.select_(mv1 != 0, m1, anc1))
         exp_path = expcast_guard(sc, na0, na1)
-        al0 = Float32(cutlass.select_(mv0 != 0, ex2_approx_f32(anc0 - na0), Float32(1.0)))
-        al1 = Float32(cutlass.select_(mv1 != 0, ex2_approx_f32(anc1 - na1), Float32(1.0)))
+        al0 = Float32(cutlass.select_(mv0 != 0, cute.arch.exp2(anc0 - na0), Float32(1.0)))
+        al1 = Float32(cutlass.select_(mv1 != 0, cute.arch.exp2(anc1 - na1), Float32(1.0)))
         l0 = l0 * al0
         l1 = l1 * al1
         rescale_o(O, al0, al1, q)

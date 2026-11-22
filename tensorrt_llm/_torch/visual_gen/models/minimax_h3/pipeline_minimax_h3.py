@@ -81,7 +81,7 @@ from .packing import (
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
-from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel, _attention_backend_class
+from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel, _padding_support
 from .vsa import build_h3_vsa_metadata, set_h3_vsa_context
 
 if TYPE_CHECKING:
@@ -246,10 +246,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                 )
             if vgm.ulysses_size > 1:
                 # Ulysses pads the packed sequence to a multiple of its size.
-                backend_cls = _attention_backend_class(pipeline_config)
-                if not (
-                    backend_cls.support_key_padding_mask() or backend_cls.support_valid_seq_len()
-                ):
+                passes_mask, passes_length, _ = _padding_support(pipeline_config)
+                if not (passes_mask or passes_length):
                     raise NotImplementedError(
                         "MiniMax-H3 Ulysses requires an attention backend that takes "
                         "key_padding_mask or valid_seq_len for the padded packed rows; the "

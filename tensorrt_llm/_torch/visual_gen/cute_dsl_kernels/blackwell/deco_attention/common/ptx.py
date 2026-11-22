@@ -12,44 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inline PTX that both kernel families issue, and the one emitter of the inline PTX of the package: asm, which takes
-the instruction text, the typed operands and the result classes of a statement and derives the rest. The wrappers of
-the PTX modules call it: this one, deco_attention/tcgen05/ptx.py and the modules of the package
-deco_attention/sm120/ptx/, which hold what one family alone issues.
+"""Inline PTX that both kernel families issue, and asm, the one emitter of the package's inline PTX: it takes the
+instruction text, the typed operands and the result classes of a statement. The family modules (tcgen05/ptx.py,
+sm120/ptx/) hold what one family alone issues.
 
-The rule of the package: an operation is a CuTe DSL call (cute.arch, cute.math, the typed pointers of common/mem.py,
-the experimental primitives of common/dsl.py) where the DSL offers the operation in the form the kernel uses; it is
-an inline-PTX wrapper of one of these modules otherwise.
+An operation is a CuTe DSL call where the DSL offers it in the form the kernel uses, and a wrapper of these modules
+otherwise. A wrapper emits exactly the text it shows; its docstring says "no side effects" where it declares none
+(the compiler may then merge, move or drop the statement).
 
-Each wrapper emits exactly the instruction text it shows; whether it has side effects is part of its contract (the
-compiler may merge, move or drop a statement without them), and a docstring says "no side effects" where the wrapper
-declares none.
+Names: a wrapper of one instruction is named after it, as operation, address space, mode, type, vector length
+(ld_global_nc_f32, st_global_cs_b32_v2_pred); the type is left out where it is the argument `dtype`. Suffixes: _pred
+(predicated), _imm (an immediate operand), _hint (an L2 cache policy), _trans (transposed). A conversion is
+<source>_to_<result> with the element counts (f32x8_to_e2m1x8). A block of several instructions is named after what
+it computes.
 
-The names, in all PTX modules. A wrapper of one instruction is named after it, in the order operation, address space,
-mode (the cache or ordering mode of a memory access, the rounding of an arithmetic instruction), type, vector length:
-ld_global_nc_f32, st_global_cs_b32_v2_pred, mul_rn_f32. The type is left out where the wrapper takes it
-as an argument (`dtype`: ld_global_cg_v4), and the address of a memory access is the parameter `addr` (dst and src
-where there are two). A suffix names a variant: _pred (predicated on an operand), _imm (an immediate in place of an
-operand), _hint (an L2 cache policy), _trans (transposed). A conversion is <source>_to_<result> with the element
-counts (f32x8_to_e2m1x8, e2m1x8_to_f32x8). A block of several instructions is named after what it computes, and one
-operation has one name in both families (tc_mma and tc_mma_f8f6f4, mma_bf16 and mma_nvf4).
-
-The sections:
-
-  conversions and packed arithmetic   E2M1 packing and the warp ballot
-  memory access                       the vector load of global memory that is not cached in L1, the acquire load of a
-                                      word"""
+Here: E2M1 packing."""
 
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-# Per class of an operand or a result of asm: its register class in the constraint string, its IR type, and the PTX
-# type of a load of a value of the class
+# Per class of an operand or a result of asm: its register class in the constraint string and its IR type
 _REGISTER = {Int32: "r", Uint32: "r", Float32: "f", Int64: "l"}
 _IR_TYPE = {Int32: T.i32, Uint32: T.i32, Float32: T.f32, Int64: T.i64}
-_PTX_TYPE = {Int32: "b32", Uint32: "b32", Float32: "f32", Int64: "b64"}
 
 
 def operand(dtype, x):
@@ -145,42 +131,4 @@ def f32x8_to_e2m1x8(y, *, loc=None, ip=None):
         side_effects=False,
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def vote_ballot(p, *, loc=None, ip=None):
-    """i32 p -> u32 mask of the lanes of the warp with p != 0 (setp.ne.s32, vote.sync.ballot.b32 over all 32 lanes)."""
-    return asm(
-        "{ .reg .pred q; setp.ne.s32 q, $1, 0; vote.sync.ballot.b32 $0, q, 0xffffffff; }",
-        [i32(p)],
-        Uint32,
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-# -------------------------------------------------------------------------------- Memory access
-@dsl_user_op
-def ld_global_cg_v4(addr, dtype, *, loc=None, ip=None):
-    """i64 global address -> four 32-bit words (16 bytes) as dtype, cached at the global level and not in L1 (data
-    another CTA writes): by ld.global.cg.v4.b32 for Int32, by ld.global.cg.v4.f32 for Float32. The merging piece of a
-    split unit reads the rows of the other pieces with it (tcgen05/fp8pv/epilogue.py, sm120/nvfp4pv/kernel.py)."""
-    return asm(
-        f"ld.global.cg.v4.{_PTX_TYPE[dtype]} {{$0, $1, $2, $3}}, [$4];",
-        [i64(addr)],
-        [dtype] * 4,
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def ld_global_acquire_b32(addr, dtype=Uint32, *, loc=None, ip=None):
-    """i64 global address -> 32-bit word by ld.acquire.gpu.global.b32, as dtype (Uint32 or Int32): the coherent read
-    of a word that another CTA writes, a counter or a flag."""
-    return asm(
-        "ld.acquire.gpu.global.b32 $0, [$1];", [i64(addr)], dtype, side_effects=True, loc=loc, ip=ip
     )

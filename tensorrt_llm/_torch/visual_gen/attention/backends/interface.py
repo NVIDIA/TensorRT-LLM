@@ -104,20 +104,18 @@ class AttentionBackend(ABC):
           the tensor shapes.
         * ``attention_mask``: the mask type, if the backend takes one.
         * ``key_padding_mask``: a bool tensor ``[B, S_kv]``, True where a key row holds a
-          token. Only backends whose ``support_key_padding_mask()`` is true honour it: the
-          keys it excludes get no attention weight. A backend whose
-          ``requires_trailing_padding()`` is true reads it as one valid prefix per sample.
-        * ``valid_seq_len``: a host integer, the number of leading rows that hold tokens
-          when the rows after them are padding. Only backends whose
-          ``support_valid_seq_len()`` is true honour it: they attend the keys of that
-          prefix only and return zeros in the padded rows. TRTLLM honours it on calls
-          that also pass ``discard_padded_queries=True``.
-        * ``token_tags``: an integer tensor ``[S]`` with the modality of every row of a
-          packed multimodal sequence where it holds a token: 0 video or image, positive
-          text or audio, negative a row that holds a token in no sample. The batch shares
-          one layout; which rows of a sample hold tokens is said by ``key_padding_mask``
-          or ``valid_seq_len``, and a row they exclude is padding whatever its tag.
-          Advisory: a backend that samples tokens by modality reads it.
+          token; the other keys get no attention weight. Honoured by backends whose
+          ``support_key_padding_mask()`` is true; one whose ``requires_trailing_padding()``
+          is true reads it as one valid prefix per sample.
+        * ``valid_seq_len``: a host integer, the number of leading rows that hold tokens.
+          Backends whose ``support_valid_seq_len()`` is true attend the keys of that prefix
+          only and return zeros in the rows after it; TRTLLM does so on calls that also
+          pass ``discard_padded_queries=True``.
+        * ``token_tags``: an integer tensor ``[S]``, one layout for the batch, with the
+          modality of every row of a packed multimodal sequence: 0 video or image,
+          positive text or audio, negative a row that holds a token in no sample. A row
+          that ``key_padding_mask`` or ``valid_seq_len`` excludes is padding whatever its
+          tag. Advisory: a backend that samples tokens by modality reads it.
         * ``kv``: a ``ForwardPlan`` from a ``RolloutKVCacheInterface``; only backends
           whose ``support_kv_cache()`` is true accept it. ``k``/``v`` are then this
           call's new tokens, staged into the cache and attended together with what the
@@ -156,13 +154,11 @@ class AttentionBackend(ABC):
     @classmethod
     def support_key_padding_mask(cls) -> bool:
         """Whether ``forward`` honours ``key_padding_mask`` on dense attention. A backend
-        without support would silently drop the keyword through ``**kwargs`` and attend the
-        padding, so callers with padded rows must check before relying on it.
+        that does not drops the keyword through ``**kwargs`` and attends the padding.
 
-        This and the two capabilities below are answered by the class of a backend, which is
-        what a model has before it builds its layers
-        (``get_visual_gen_attention_backend``). A wrapper such as ``UlyssesAttention``
-        answers for the backend it wraps and therefore per instance."""
+        A model asks this and the two capabilities below of the backend class before it
+        builds its layers (``get_visual_gen_attention_backend``). A wrapper such as
+        ``UlyssesAttention`` answers per instance, for the backend it wraps."""
         return False
 
     @classmethod
@@ -173,8 +169,7 @@ class AttentionBackend(ABC):
 
     @classmethod
     def support_valid_seq_len(cls) -> bool:
-        """Whether ``forward`` honours ``valid_seq_len`` on dense self-attention. A backend
-        without support would silently drop the keyword through ``**kwargs``."""
+        """Whether ``forward`` honours ``valid_seq_len`` on dense self-attention."""
         return False
 
     @classmethod

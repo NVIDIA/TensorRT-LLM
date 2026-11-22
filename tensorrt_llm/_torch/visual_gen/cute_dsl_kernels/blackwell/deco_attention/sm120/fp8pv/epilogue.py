@@ -27,25 +27,28 @@ import cutlass.cute as cute
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
-from ..ptx.shared import ex2_approx_f32, fma_rn_f32, mul_rn_f32
 from ..valid_len import valid_len
 from .layout import EP, NTHR, QT
+
+RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
 
 PART_N = 68  # FP32 words per thread of a piece's partials: 64 of O, 2 anchors, 2 row sums
 
 
 def inv_row_sums(l0, l1, q):
     """1 / l of the O^T fragment columns (as in rescale_o), l the row sums of rows g, g + 8 from the quad's partial
-    sums l0, l1."""
+    sums l0, l1: every lane divides for its own rows, then fetches the reciprocals of its columns."""
     l0 = l0 + cute.arch.shuffle_sync_bfly(l0, offset=1)
     l1 = l1 + cute.arch.shuffle_sync_bfly(l1, offset=1)
     l0 = l0 + cute.arch.shuffle_sync_bfly(l0, offset=2)
     l1 = l1 + cute.arch.shuffle_sync_bfly(l1, offset=2)
+    r0 = Float32(1.0) / l0
+    r1 = Float32(1.0) / l1
     return (
-        Float32(1.0) / cute.arch.shuffle_sync(l0, 8 * q),
-        Float32(1.0) / cute.arch.shuffle_sync(l0, 8 * q + 4),
-        Float32(1.0) / cute.arch.shuffle_sync(l1, 8 * q),
-        Float32(1.0) / cute.arch.shuffle_sync(l1, 8 * q + 4),
+        cute.arch.shuffle_sync(r0, 8 * q),
+        cute.arch.shuffle_sync(r0, 8 * q + 4),
+        cute.arch.shuffle_sync(r1, 8 * q),
+        cute.arch.shuffle_sync(r1, 8 * q + 4),
     )
 
 
@@ -76,16 +79,24 @@ def store_rows(
         for h in cutlass.range_constexpr(2):
             ch = ep + (16 * ct + 8 * h + g) * 2
             sptr(BFloat16, ch + (2 * q) * EP).store(
-                mul_rn_f32(mul_rn_f32(O[8 * ct + 2 * h], fa), vsc).to(BFloat16)
+                cute.math.mul(
+                    cute.math.mul(O[8 * ct + 2 * h], fa, rounding=RN), vsc, rounding=RN
+                ).to(BFloat16)
             )
             sptr(BFloat16, ch + (2 * q + 1) * EP).store(
-                mul_rn_f32(mul_rn_f32(O[8 * ct + 2 * h + 1], fb), vsc).to(BFloat16)
+                cute.math.mul(
+                    cute.math.mul(O[8 * ct + 2 * h + 1], fb, rounding=RN), vsc, rounding=RN
+                ).to(BFloat16)
             )
             sptr(BFloat16, ch + (8 + 2 * q) * EP).store(
-                mul_rn_f32(mul_rn_f32(O[8 * ct + 4 + 2 * h], fc), vsc).to(BFloat16)
+                cute.math.mul(
+                    cute.math.mul(O[8 * ct + 4 + 2 * h], fc, rounding=RN), vsc, rounding=RN
+                ).to(BFloat16)
             )
             sptr(BFloat16, ch + (9 + 2 * q) * EP).store(
-                mul_rn_f32(mul_rn_f32(O[8 * ct + 4 + 2 * h + 1], fd), vsc).to(BFloat16)
+                cute.math.mul(
+                    cute.math.mul(O[8 * ct + 4 + 2 * h + 1], fd, rounding=RN), vsc, rounding=RN
+                ).to(BFloat16)
             )
     cute.arch.sync_warp()
     for it in cutlass.range_constexpr(8):
@@ -159,10 +170,10 @@ def _merge_rows(
     l1 = Float32(0.0)
     for p in cutlass.range_constexpr(split):
         # the anchors are in log2 units already: the score scale is not applied again
-        a0 = ex2_approx_f32(an0[p] - m0)
-        a1 = ex2_approx_f32(an1[p] - m1)
-        l0 = fma_rn_f32(load_invariant(Float32, pb[p] + 66 * (NTHR * 4)), a0, l0)
-        l1 = fma_rn_f32(load_invariant(Float32, pb[p] + 67 * (NTHR * 4)), a1, l1)
+        a0 = cute.arch.exp2(an0[p] - m0)
+        a1 = cute.arch.exp2(an1[p] - m1)
+        l0 = cute.math.fma(load_invariant(Float32, pb[p] + 66 * (NTHR * 4)), a0, l0, rounding=RN)
+        l1 = cute.math.fma(load_invariant(Float32, pb[p] + 67 * (NTHR * 4)), a1, l1, rounding=RN)
         # the factors belong to the rows g, g + 8 of a quad; the transposed O holds the queries 2q, 2q + 1, 8 + 2q,
         # 9 + 2q
         fa = cute.arch.shuffle_sync(a0, 8 * q)
@@ -174,7 +185,9 @@ def _merge_rows(
                 factor = fa if i % 2 == 0 else fb
             else:
                 factor = fc if i % 2 == 0 else fd
-            O[i] = fma_rn_f32(load_invariant(Float32, pb[p] + i * (NTHR * 4)), factor, O[i])
+            O[i] = cute.math.fma(
+                load_invariant(Float32, pb[p] + i * (NTHR * 4)), factor, O[i], rounding=RN
+            )
     f = inv_row_sums(l0, l1, q)
     vsc = load_invariant(Float32, vs_ptr.toint())
     smem = Int32(cute.arch.get_dyn_smem(cutlass.Uint8, alignment=16).toint())

@@ -31,7 +31,6 @@ from cutlass.utils import SmemAllocator
 from ...common.dsl import MMALayout, ldmatrix, nanosleep
 from ...common.expmath import bf16x2, f2u, hash01, u2f, warp_max, warp_sum
 from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, store_vector
-from ...common.ptx import ld_global_acquire_b32, vote_ballot
 from ...common.state import State
 from ..ptx.shared import ld_global_nc_b32_hint_pred, ld_shared_f32_v4_pred, mma_bf16
 from ..valid_len import valid_len
@@ -506,7 +505,7 @@ def multisect(st, lo0, hi0, span):
         wdt = (hi - lo) * Float32(1.0 / 17.0)
         x = lo + wdt * Float32(st.sv + 1)
         cnt = sturm_count(st, x)
-        bal = vote_ballot(Int32(Int32(cnt) >= mtarget + 1))
+        bal = Uint32(cute.arch.vote_ballot_sync(Int32(cnt) >= mtarget + 1))
         bits = (bal >> Uint32((st.lane >> 4) * 16)) & Uint32(0xFFFF)
         first = Int32(cute.arch.popc((~bits) & (bits - Uint32(1))))
         nlo = Float32(cutlass.select_(first > 0, lo + wdt * Float32(first), lo))
@@ -964,10 +963,10 @@ def basis_cta(
         # scan has finished (the host takes this form only for a grid of at most as many CTAs as the device has SMs).
         # Nothing ever waits on an eigensolver CTA.
         if tid == 0:
-            seen = ld_global_acquire_b32(done_p)
+            seen = cute.arch.load(gptr(Uint32, done_p), Uint32, sem="acquire", scope="gpu")
             while seen < Uint32(nspare):
                 nanosleep(Int32(200))
-                seen = ld_global_acquire_b32(done_p)
+                seen = cute.arch.load(gptr(Uint32, done_p), Uint32, sem="acquire", scope="gpu")
             cute.arch.fence_acq_rel_gpu()
         cute.arch.sync_threads()
         vpass(ntiles, pid, tid, sb)
