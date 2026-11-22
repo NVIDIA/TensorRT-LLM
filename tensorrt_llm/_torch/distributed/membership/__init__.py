@@ -57,7 +57,9 @@ from .rendezvous import (
     RECORD_KEY,
     STALLED_SINCE_KEY,
     TRANSACTION_KEY,
+    StoreGroup,
     rendezvous_host_port,
+    wait_for_keys,
 )
 from .signed_store import SignedStore, UnsignedValueError, parse_shared_secret
 
@@ -84,6 +86,7 @@ __all__ = [
     "SHARED_SECRET_ENV",
     "STALLED_SINCE_KEY",
     "SignedStore",
+    "StoreGroup",
     "TRANSACTION_KEY",
     "TransactionSummary",
     "UnsignedValueError",
@@ -99,4 +102,5 @@ __all__ = [
     "remove_cpu_affinity_constraints",
     "rendezvous_host_port",
     "rendezvous_store",
+    "wait_for_keys",
 ]

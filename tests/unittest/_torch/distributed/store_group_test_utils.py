@@ -60,3 +60,16 @@ class InMemoryStore:
     def delete_key(self, key):
         with self._lock:
             return self.values.pop(key, None) is not None
+
+
+class Unpickled:
+    """A value whose unpickling runs code, as a forged pickle in the store would."""
+
+    calls = []
+
+    @staticmethod
+    def record():
+        Unpickled.calls.append("unpickled")
+
+    def __reduce__(self):
+        return (Unpickled.record, ())
