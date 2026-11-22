@@ -976,7 +976,7 @@ class MultimodalParams:
         shared-tensor handle. Item output lengths describe those rows; prompt
         lengths also count model-specific MM framing tokens. Hashes enable
         the C++ KV-cache representation. Without hashes, only the processed
-        data is retained, as for external embeddings without KV-cache reuse.
+        data is retained, and block reuse sees the placeholder tokens alone.
         """
         item_metadata.validate()
         embedding_lengths = item_metadata.output_embedding_lengths
@@ -1484,6 +1484,26 @@ def int32_to_hexdigest(int32_values: List[int]) -> str:
         # Format as 8 hex characters (zero-padded)
         result.append(f'{value:08x}')
     return ''.join(result)
+
+
+def hash_mm_embeddings(embeddings: Sequence[torch.Tensor],
+                       hash_lib=default_hasher) -> List[List[int]]:
+    """Hash attached multimodal embeddings, one 8-int32 digest per item.
+
+    These digests key the embeddings' prompt tokens for KV-cache reuse, as
+    `apply_mm_hashes` does for media. Each hash covers the dtype, shape and
+    raw bytes, so dtypes NumPy cannot represent (e.g. bfloat16) hash as well.
+    """
+    digests = []
+    for embedding in embeddings:
+        embedding = embedding.detach().cpu().contiguous()
+        raw_bytes = embedding.view(-1).view(torch.uint8)
+        hasher = hash_lib()
+        hasher.update(b"<embedding>")
+        _update_hash(hasher,
+                     (str(embedding.dtype), list(embedding.shape), raw_bytes))
+        digests.append(hexdigest_to_int32(hasher.hexdigest()))
+    return digests
 
 
 def find_mm_token_lengths(
