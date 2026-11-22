@@ -105,7 +105,8 @@ class PackedGateUpMethod(FP8QDQLinearMethod):
 
 
 class Fp8Attention(ScenarioAttention):
-    """Raw attention for FP8 producers; projected family attention for BF16 inputs."""
+    """The scenario's QK-norm, RoPE and FP8 cast for every block: raw attention for a fused
+    block's FP8 producer, projected attention for a BF16 block's family forward."""
 
     def forward(
         self,
@@ -115,14 +116,7 @@ class Fp8Attention(ScenarioAttention):
         timestep=None,
         valid_seq_len=None,
     ) -> torch.Tensor:
-        if hidden_states.dtype == torch.bfloat16:
-            return super().forward(
-                hidden_states,
-                rotary_emb,
-                key_padding_mask,
-                timestep,
-                valid_seq_len,
-            )
+        bf16_block = hidden_states.dtype == torch.bfloat16
         if rotary_emb is None or not self.on_fp8_path():
             raise ValueError("The FP8 scenario needs rotary embeddings and FP8 QKV attention")
         if self.use_async_ulysses or getattr(self.attn, "world_size", 1) != 1:
@@ -146,7 +140,7 @@ class Fp8Attention(ScenarioAttention):
             int(self.layer_idx),
             valid_len,
         )
-        return self._attn_impl(
+        raw = self._attn_impl(
             query,
             key,
             value,
@@ -155,6 +149,9 @@ class Fp8Attention(ScenarioAttention):
             timestep=timestep,
             fp8_descales=descales,
         )
+        # The fused block projects the raw output in its residual kernel; the family block
+        # expects the projected output.
+        return self._out_proj(raw) if bf16_block else raw
 
 
 class Fp8Block(MiniMaxH3TransformerBlock):

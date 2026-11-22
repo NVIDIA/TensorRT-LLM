@@ -388,6 +388,51 @@ class RoutingContracts(unittest.TestCase):
         self.assertIsNone(cfg.model_configs["transformer"].quant_config_dict)
         self._select_with_stub_pipeline(cfg)
 
+    def test_exact_linear_names_of_a_block_select_fp8_as_the_loader_reads_them(self):
+        # The loader keeps a Linear in BF16 when its own name or all its checkpoint names are
+        # excluded, so either spelling of one block's four main Linears is a whole BF16 block.
+        checkpoint_names = [
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
+            "ff.net.0.proj",
+            "ff.net.2",
+        ]
+        module_names = ["attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj"]
+        mixed_names = ["attn.qkv_proj", "attn.to_out.0", "ff.net.0.proj", "ff.net.2"]
+        for names in (checkpoint_names, module_names, mixed_names):
+            with self.subTest(names=names):
+                cfg = _config()
+                cfg.model_configs["transformer"].quant_config.exclude_modules = (
+                    _uniform_ignore_patterns() + [f"transformer_blocks.3.{name}" for name in names]
+                )
+                self._select_with_stub_pipeline(cfg)
+
+    def test_partly_excluded_fused_linear_is_rejected_with_its_name(self):
+        for names in (["attn.to_q"], ["attn.to_q", "attn.to_v"]):
+            with self.subTest(names=names):
+                cfg = _config()
+                cfg.model_configs["transformer"].quant_config.exclude_modules = [
+                    f"transformer_blocks.3.{name}" for name in names
+                ]
+                namespace = _routing_namespace()
+                with self.assertRaisesRegex(
+                    namespace["NoScenario"],
+                    r"transformer_blocks\.3\.attn\.qkv_proj is excluded from quantization only in part",
+                ):
+                    namespace["route_fp8_sm_107_u1"](cfg)
+
+    def test_partly_excluded_block_is_rejected_with_its_excluded_linears(self):
+        cfg = _config()
+        cfg.model_configs["transformer"].quant_config.exclude_modules = ["transformer_blocks.7.ff*"]
+        namespace = _routing_namespace()
+        with self.assertRaisesRegex(
+            namespace["NoScenario"],
+            "block 7 has only ff.gate_up_proj, ff.down_proj excluded from quantization",
+        ):
+            namespace["route_fp8_sm_107_u1"](cfg)
+
     def test_partly_excluded_block_and_all_bf16_blocks_are_rejected(self):
         for ignored, reason in [
             (_earlytop8_ignore_patterns() + ["transformer_blocks.3.attn.to_out.0"], "excluded"),
@@ -502,13 +547,13 @@ class RoutingContracts(unittest.TestCase):
             for n in ast.walk(route)
             if isinstance(n, ast.Assign)
             and isinstance(n.targets[0], ast.Name)
-            and n.targets[0].id == "main_projections"
+            and n.targets[0].id == "main_linears"
         )
-        expected = set()
-        for projection in ["attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj"]:
-            expected.add(projection)
-            expected.update(namespace["_checkpoint_linear_names"](model, projection))
-        self.assertEqual(set(ast.literal_eval(projections.value)), expected)
+        expected = {
+            projection: namespace["_checkpoint_linear_names"](model, projection)
+            for projection in ["attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj"]
+        }
+        self.assertEqual(ast.literal_eval(projections.value), expected)
 
     def test_non_bf16_model_dtype_declines_before_selection(self):
         config = _config()
@@ -962,7 +1007,7 @@ class FusedDispatchContracts(unittest.TestCase):
             [
                 "family_norm",
                 "bf16_qkv",
-                "family_qk_norm",
+                "qk_norm_rope",
                 "bf16_out",
                 "family_gate_res_norm",
                 "family_ffn",

@@ -269,6 +269,46 @@ def test_one_projection_kernel_serves_every_length(scenario, weights, branch):
     assert branch == {"fused": 3, "unfused": 0}
 
 
+@pytest.mark.parametrize("padded", (False, True), ids=("full", "padded"))
+@pytest.mark.parametrize("length", (1, 300, 4097, 38169))
+def test_bf16_block_attention_cast_matches_the_family_route(scenario, monkeypatch, length, padded):
+    """A block the checkpoint keeps in BF16 feeds its BF16 QKV projection to the scenario's
+    QK-norm, RoPE and FP8 cast; the codes and descales are those of the family route's op."""
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_fp8__sm_107__u1 import modeling
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_nvfp4__sm_107__u1_u4.kernels import (
+        fused_fp8_qk,
+    )
+
+    # The scenario's kernel settings, pinned here because no scenario is selected in this process.
+    monkeypatch.setattr(fused_fp8_qk, "_MODE", "qkstatic")
+    monkeypatch.setattr(fused_fp8_qk, "_V2", True)
+    monkeypatch.setattr(fused_fp8_qk, "_VAMAX_FOLD", False)
+    monkeypatch.setattr(fused_fp8_qk, "_split_launch", lambda: True)
+    monkeypatch.setattr(fused_fp8_qk, "_REDUCE_GROUP", None)
+    monkeypatch.setattr(fused_fp8_qk, "_launch_config", lambda: (8, 2))
+
+    heads, head_dim, rot = 56, 128, 96
+    randn = _inputs(length, 1)["randn"]
+    qkv = randn(1, length, 3 * QK, std=2.0).to(BF16)
+    weight_q = (1 + randn(head_dim, std=0.1)).to(BF16)
+    weight_k = (1 + randn(head_dim, std=0.1)).to(BF16)
+    position = torch.arange(length, dtype=torch.float32, device="cuda")[:, None]
+    frequency = 1.0 / (10000.0 ** (torch.arange(0, rot, 2, device="cuda").float() / rot))
+    angle = torch.cat([position * frequency, position * frequency], dim=-1)  # the family table
+    descale = fused_fp8_qk.qk_static_descale(head_dim, qkv.device)
+    valid_len = None
+    if padded:
+        valid_len = torch.tensor([max(length - 7, 1)], dtype=torch.int32, device="cuda")
+    arguments = (qkv, weight_q, weight_k, angle.cos(), angle.sin(), descale, EPS)
+    arguments += (heads, head_dim, 0, valid_len)
+
+    got = modeling.qk_norm_rope(*arguments)
+    ref = torch.ops.h3_lever8.qk_norm_rope_fp8(*arguments)
+    for name, a, b in zip(("q", "k", "v", "descale"), got, ref):
+        assert a.dtype == b.dtype and a.shape == b.shape, name
+        assert _same_fraction(a, b) == 1.0, name
+
+
 def _misaligned(tensor):
     """The same values in contiguous storage that starts 2 bytes off any 256-byte boundary."""
     storage = torch.empty(tensor.numel() + 1, device=tensor.device, dtype=tensor.dtype)
