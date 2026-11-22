@@ -3034,6 +3034,23 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         }
     };
 
+    if (isLast && lvlId != kHotLevel)
+    {
+        // Pages the last host level drops go to the host-drop hook (or ring) before their slots are freed: every pool
+        // group's, and the pages they prune, before any group is cleared. Clearing a full-attention page prunes its
+        // block's subtree, which unlinks the pages this eviction popped into a later group (an SSM or windowed page of
+        // the same block or a descendant), and an unlinked page can no longer be handed off.
+        std::vector<SharedPtr<Page>> dropped;
+        for (auto const& ev : evicted)
+        {
+            dropped.insert(dropped.end(), ev.begin(), ev.end());
+        }
+        if (!dropped.empty())
+        {
+            _handOffEvictedPages(dropped, lvlId, /*mayWait=*/true);
+        }
+    }
+
     for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
     {
         auto& ev = evicted.at(pgIdx);
@@ -3046,11 +3063,6 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             TLLM_CHECK_DEBUG_WITH_INFO(
                 std::all_of(ev.begin(), ev.end(), [](auto const& p) { return p->status() == PageStatus::DROPPABLE; }),
                 "Evicted page at last level must be DROPPABLE");
-            if (lvlId != kHotLevel && !ev.empty())
-            {
-                // Pages the last host level drops go to the host-drop hook (or ring) before their slots are freed.
-                _handOffEvictedPages(ev, lvlId, /*mayWait=*/true);
-            }
             if (dropRecorder && !ev.empty())
             {
                 dropRecorder(ev, lvlId);

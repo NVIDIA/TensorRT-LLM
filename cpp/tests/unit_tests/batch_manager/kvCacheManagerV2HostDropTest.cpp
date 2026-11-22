@@ -51,6 +51,7 @@ namespace
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeHybridTieredConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 
 constexpr CacheLevel kHostLevel{1};
@@ -473,6 +474,108 @@ TEST_F(HostDropTest, DrainWorksWithoutAContextAndLeavesTheCallersCurrent)
         slots.push_back(record.slot);
     }
     storage.releaseHostDropSlots(slots);
+}
+
+//! makeHybridTieredConfig(): full attention (life cycle 0) and SSM (life cycle 1) in separate pool groups, with 4 and
+//! 1 GPU slots and 2 and 1 host slots.
+class HybridHostDropTest : public ::testing::Test
+{
+protected:
+    static constexpr LifeCycleId kAttention{0};
+    static constexpr LifeCycleId kSsm{1};
+
+    void SetUp() override
+    {
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        mManager = std::make_shared<KvCacheManager>(makeHybridTieredConfig());
+        mRoot = &mManager->radixTree().addOrGetExisting({});
+        auto& storage = mManager->storage();
+        ASSERT_NE(storage.getPoolGroupIndex(kHostLevel, kAttention), storage.getPoolGroupIndex(kHostLevel, kSsm));
+    }
+
+    void TearDown() override
+    {
+        mManager.reset();
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    }
+
+    //! Commits a chain of `numBlocks` blocks on the GPU, each with an attention page, and an SSM page on the last.
+    //! Returns the blocks' radix keys, in chain order.
+    std::vector<std::string> commitChain(int numBlocks)
+    {
+        auto& storage = mManager->storage();
+        TypedVec<LifeCycleId, SlotCount> numSlots(LifeCycleId{2}, 0);
+        numSlots[kAttention] = numBlocks;
+        numSlots[kSsm] = 1;
+        auto slots = storage.newGpuSlots(numSlots);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        std::vector<std::string> keys;
+        NodeBase* previous = mRoot;
+        for (int i = 0; i < numBlocks; ++i)
+        {
+            std::vector<TokenIdExt> tokens;
+            for (int j = 0; j < mManager->tokensPerBlock(); ++j)
+            {
+                tokens.emplace_back(TokenId{mNextToken++});
+            }
+            auto block = addOrGetExistingBlock(previous, std::move(tokens), /*knownNoDigest=*/true);
+            commitPage(block, kAttention, slots[kAttention][static_cast<size_t>(i)]);
+            if (i + 1 == numBlocks)
+            {
+                commitPage(block, kSsm, slots[kSsm][0]);
+            }
+            keys.push_back(keyOf(*block));
+            previous = block.get();
+        }
+        return keys;
+    }
+
+    std::shared_ptr<KvCacheManager> mManager;
+    RootBlock* mRoot = nullptr;
+    int mNextToken = 0;
+
+private:
+    void commitPage(SharedPtr<Block> const& block, LifeCycleId lifeCycle, Slot& slot)
+    {
+        auto& storage = mManager->storage();
+        auto page = makeShared<CommittedPage>(
+            &storage, block, lifeCycle, kHotLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
+        page->setSlot(slot);
+        block->storage[lifeCycle] = page.get();
+        // The eviction queue owns a droppable page; the block lives as long as its pages.
+        storage.scheduleForEviction(*page);
+    }
+};
+
+TEST_F(HybridHostDropTest, PagesOfEveryPoolGroupAreHandedOffBeforeAnyIsCleared)
+{
+    auto& storage = mManager->storage();
+    std::vector<std::pair<std::string, int32_t>> handed;
+    (void) storage.setHostDropHook(
+        [&](std::vector<HostDropRecord> const& records)
+        {
+            for (auto const& record : records)
+            {
+                handed.emplace_back(record.key, record.lifeCycle);
+            }
+        });
+    // Chain A (two attention pages, an SSM page on its child) goes down to the host level, filling both of its pools.
+    auto const chainA = commitChain(2);
+    commitChain(4);
+    ASSERT_TRUE(handed.empty());
+    ASSERT_EQ(storage.getStatistics(kHostLevel, storage.getPoolGroupIndex(kHostLevel, kSsm)).free, 0);
+    // One more page of each life cycle comes down, so one eviction drops an attention page of chain A and its SSM
+    // page together, from two pool groups. Clearing the attention group first prunes chain A's subtree, which would
+    // unlink the SSM page already popped for the other group: every page of chain A must still be handed off.
+    commitChain(1);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    std::sort(handed.begin(), handed.end());
+    std::vector<std::pair<std::string, int32_t>> const expected{
+        {chainA[0], kAttention.value()}, {chainA[1], kAttention.value()}, {chainA[1], kSsm.value()}};
+    auto sortedExpected = expected;
+    std::sort(sortedExpected.begin(), sortedExpected.end());
+    EXPECT_EQ(handed, sortedExpected);
+    EXPECT_EQ(storage.hostDropStats().handed.load(), 3);
 }
 
 class HostDropRingTest : public HostDropTest, public ::testing::WithParamInterface<bool>
