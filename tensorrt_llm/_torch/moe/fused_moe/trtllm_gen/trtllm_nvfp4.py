@@ -34,9 +34,11 @@ from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
 if IS_CUTLASS_DSL_AVAILABLE:
     from ....moe.kernels.blackwell.dsv4_route_quant import (
         ROUTING_TABLE_TILES,
+        ROUTING_TABLES_MAX_TOKENS,
         can_build_routing_tables,
         dsv4_route,
         dsv4_route_nvfp4_quant,
+        routing_table_max_ctas,
     )
 
 
@@ -58,6 +60,9 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
 
     #: The native op's ``lamport_fc2_out``.
     takes_lamport_fc2_out = True
+
+    #: Rows up to which the route kernel's tables split each call's experts over the EP ranks.
+    dynamic_ep_max_rows = ROUTING_TABLES_MAX_TOKENS if IS_CUTLASS_DSL_AVAILABLE else 0
 
     #: Whether routing runs as one launch, fused with quantization, and with routing tables; set
     #: after loading.
@@ -111,6 +116,25 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
             return self.slot_start, self.expert_size_per_partition
         return None
 
+    def _table_scope(self, rows: int) -> tuple[bool, dict]:
+        """Whether a run of ``rows`` tokens gets routing tables, and the route kernel's scope for
+        them: this rank's slot range, or with dynamic expert parallelism its rank and EP size."""
+        local_experts = self._routing_table_experts(rows)
+        if local_experts is None:
+            return False, {}
+        dynamic_ep = getattr(self, "dynamic_ep", None)
+        if dynamic_ep is not None:
+            return True, {"dynamic_ep": (dynamic_ep[2], dynamic_ep[3])}
+        return True, {"local_experts": local_experts}
+
+    def _routing_tables(
+        self, tables: torch.Tensor, tiles: tuple[int, ...], rows: int, scope: dict
+    ) -> MoERoutingTables:
+        max_ctas = routing_table_max_ctas(
+            rows, self.routing_method.top_k, self.num_experts, scope.get("dynamic_ep")
+        )
+        return MoERoutingTables(tables, tiles, max_ctas)
+
     def try_fused_route(
         self, x: Fp4QuantizedTensor, router_logits: torch.Tensor
     ) -> MoEFusedRouteQuant | None:
@@ -120,8 +144,7 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
         if not self._fuses_route or x.is_sf_swizzled or self.fc31_act_scale is not None:
             return None
         rows = x.shape[0]
-        local_experts = self._routing_table_experts(rows)
-        with_tables = local_experts is not None
+        with_tables, scope = self._table_scope(rows)
         tiles = self._routing_table_tiles(rows)
         ids, weights, tables = dsv4_route(
             router_logits,
@@ -131,15 +154,18 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
             self.input_requirement.routing_scales_dtype,
             self.hidden_size,
             with_routing_tables=with_tables,
-            local_experts=local_experts,
             routing_tiles=tiles,
+            one_cluster=self.one_cluster_route,
+            **scope,
         )
         return MoEFusedRouteQuant(
             ids,
             weights,
             x.fp4_tensor,
             x.scaling_factor.view(rows, -1),
-            routing_tables=MoERoutingTables(tables, tiles) if with_tables else None,
+            routing_tables=self._routing_tables(tables, tiles, rows, scope)
+            if with_tables
+            else None,
         )
 
     def try_fused_route_quant(
@@ -149,8 +175,7 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
         routing tables for small batches."""
         if not self._fuses_route_quant:
             return None
-        local_experts = self._routing_table_experts(x.shape[0])
-        with_tables = local_experts is not None
+        with_tables, scope = self._table_scope(x.shape[0])
         tiles = self._routing_table_tiles(x.shape[0])
         ids, weights, x_fp4, x_sf, tables = dsv4_route_nvfp4_quant(
             router_logits,
@@ -161,13 +186,16 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
             self.routing_method.routed_scaling_factor,
             self.input_requirement.routing_scales_dtype,
             with_routing_tables=with_tables,
-            local_experts=local_experts,
             routing_tiles=tiles,
+            one_cluster=self.one_cluster_route,
+            **scope,
         )
         return MoEFusedRouteQuant(
             ids,
             weights,
             x_fp4,
             x_sf,
-            routing_tables=MoERoutingTables(tables, tiles) if with_tables else None,
+            routing_tables=self._routing_tables(tables, tiles, x.shape[0], scope)
+            if with_tables
+            else None,
         )

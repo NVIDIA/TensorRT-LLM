@@ -187,22 +187,23 @@ torch::Tensor alltoallvTokens(
  * Helix All-to-All operation with two fields.
  *
  * Input tensors have shape [..., cp_size, kv_lora_rank] for partial_o and [...,
- * cp_size, 2] for softmax_stats. The operation exchanges data along the cp_size
+ * cp_size, stats_width] for softmax_stats. The operation exchanges data along the cp_size
  * dimension across all ranks.
  *
  * @param partial_o Field 0 tensor (half precision, shape [..., cp_size,
  * kv_lora_rank])
- * @param softmax_stats Field 1 tensor (float32, shape [..., cp_size, 2])
+ * @param softmax_stats Field 1 tensor (float32, shape [..., cp_size, stats_width])
  * @param workspace Workspace tensor (uint64, strided across ranks)
  * @param cp_rank Current context parallel rank
  * @param cp_size Total number of context parallel ranks
  * @param zero_kv_mask Optional bool mask of rows this rank owns no KV for. The
  * sender replaces them with a no-op contribution, so the caller must not
  * sanitize itself. Its length must divide entry_count.
+ * @param is_lse Whether field 1 contains compact base-2 LSE instead of max/sum pairs.
  * @return tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs
  */
 std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor partial_o, torch::Tensor softmax_stats,
-    torch::Tensor workspace, int64_t cp_rank, int64_t cp_size, std::optional<torch::Tensor> zero_kv_mask)
+    torch::Tensor workspace, int64_t cp_rank, int64_t cp_size, std::optional<torch::Tensor> zero_kv_mask, bool is_lse)
 {
 
     // Input validation
@@ -228,9 +229,10 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor par
     int kv_lora_rank = partial_o.size(-1);
     TORCH_CHECK(partial_o.size(-2) == cp_size && softmax_stats.size(-2) == cp_size,
         "partial_o/softmax_stats second-to-last dimension must equal cp_size");
-    TORCH_CHECK(softmax_stats.size(-1) % 2 == 0 && softmax_stats.size(-1) >= 2,
-        "softmax_stats last dimension must be divisible by 2 (float2)");
-    bool allowVariableField1 = softmax_stats.size(-1) > 2;
+    int const statsWidth = is_lse ? 1 : 2;
+    TORCH_CHECK(softmax_stats.size(-1) % statsWidth == 0 && softmax_stats.size(-1) >= statsWidth,
+        "softmax_stats last dimension does not match its format");
+    bool allowVariableField1 = is_lse || softmax_stats.size(-1) != 2;
 
     // Check that leading dimensions match
     for (int i = 0; i < partial_o.dim() - 2; i++)
@@ -301,6 +303,7 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor par
     // Optional zero-local-KV sanitization, applied by the sender in shared memory
     params.zeroKvMask = nullptr;
     params.zeroKvMaskDivisor = 1;
+    params.lseStats = is_lse;
     if (zero_kv_mask.has_value())
     {
         auto const& mask = zero_kv_mask.value();
@@ -359,7 +362,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
     m.def(
         "alltoall_helix_native(Tensor partial_o, Tensor softmax_stats, Tensor(a!) workspace, int "
-        "cp_rank, int cp_size, Tensor? zero_kv_mask=None) -> (Tensor, Tensor)");
+        "cp_rank, int cp_size, Tensor? zero_kv_mask=None, bool is_lse=False) -> (Tensor, Tensor)");
     m.def(
         "initialize_helix_workspace(Tensor(a!) workspace, int cp_rank, int cp_size) "
         "-> ()");

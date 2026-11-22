@@ -159,6 +159,7 @@ l0_b200:
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
+  - unittest/_torch/modules/test_logits_cast.py
   # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2 (decode / route fronts below).
   - unittest/_torch/moe/test_moe_nvfp4_engine.py
   - unittest/_torch/moe/test_moe_bf16_engine.py
@@ -298,6 +299,8 @@ l0_b200:
   - unittest/_torch/modules/dwdp/test_dense_attached_gpu.py
   # Real ConfigurableMoE layers sized and registered for DWDP while the model is built.
   - unittest/_torch/modules/dwdp/test_dwdp_moe_construction_gpu.py
+  # PagePool occupancy on the real VMM path, read by the memory monitor.
+  - unittest/_torch/modules/dwdp/test_page_pool_statistics.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
   - unittest/_torch/moe/test_trtllm_gen_bf16_moe_inplace_refit.py
@@ -393,6 +396,7 @@ l0_b200:
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
+  - unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"

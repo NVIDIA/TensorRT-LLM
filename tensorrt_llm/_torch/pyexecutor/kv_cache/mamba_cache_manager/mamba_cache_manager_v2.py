@@ -48,6 +48,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     PagePriorityCallback,
     Role,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Sectioned
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -589,6 +590,44 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         cost as they are, like the quota does.
         """
         return 0
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """Lay out the recurrent roles as well.
+
+        Convolution state is sectioned: its flat per-layer buffer is a
+        concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
+        each split by byte over the ranks recurrent state splits over. SSM
+        state is split by head. Both name their element types, which their
+        dtypes configure apart from the KV cache's. An attention layout policy adds its own roles and layer names.
+        """
+        spec = super().page_table_spec()
+        if self.local_num_mamba_layers > 0:
+            d_conv_m1 = int(self.conv_state_shape[1])
+            _, head_dim, d_state = self.ssm_state_shape
+            spec = replace(
+                spec,
+                role_layouts={
+                    **spec.role_layouts,
+                    MambaRole.CONV_STATE: Sectioned(
+                        tuple(
+                            int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
+                            for dim in self.conv_section_dims
+                        ),
+                        dtype=self.conv_state_dtype,
+                    ),
+                    MambaRole.SSM_STATE: ByHead(
+                        head_bytes=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize,
+                        dtype=self.ssm_state_dtype,
+                    ),
+                },
+            )
+        layout_policy = self._attention_cache_layout_policy
+        if layout_policy is not None:
+            spec = layout_policy.extend_page_table_spec(
+                self, spec, recurrent=self._is_local_mamba_layer
+            )
+        return spec
 
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
