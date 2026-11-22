@@ -30,6 +30,7 @@ pytestmark = pytest.mark.cpu_only
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
     executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
     executor._kv_connector_failed = False
     executor._kv_connector_has_pending = False
@@ -76,6 +77,12 @@ def _request(request_id: int = 1) -> SimpleNamespace:
         is_finished=False,
         py_decoding_iter=0,
         cached_tokens=32,
+        py_draft_tokens=[],
+        py_per_pos_drafted=[],
+        py_per_pos_accepted=[],
+        py_total_draft_tokens=0,
+        py_total_accepted_draft_tokens=0,
+        py_disaggregated_params=None,
         create_response=Mock(return_value=response),
     )
 
@@ -312,7 +319,9 @@ def test_polling_continues_for_save_after_load_completion(use_kv_cache_manager_v
     assert not executor.async_transfer_manager.has_any_inflight_requests()
 
     executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
-    executor.executor_request_queue.get_from_request_queue.assert_called_with(None)
+    executor.executor_request_queue.get_from_request_queue.assert_called_with(
+        None, wait_for_batch=True
+    )
     executor.is_shutdown = True
     assert executor.should_stop_processing
 
@@ -375,13 +384,19 @@ def test_completion_is_broadcast_without_new_requests(control_pending: bool) -> 
     executor.executor_request_queue.get_from_request_queue.return_value = []
     waiting_queue = Mock()
     waiting_queue.__len__ = Mock(return_value=0)
+    waiting_queue.__iter__ = Mock(return_value=iter(()))
+    executor.async_transfer_manager = AsyncTransferManager(
+        SimpleNamespace(resource_managers={}), should_store_blocks=False
+    )
 
     executor._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests=0)
 
     connector.finish_prefix_loads.assert_called_once_with([17])
     waiting_queue.add_requests.assert_called_once_with([])
     if control_pending:
-        executor.executor_request_queue.get_from_request_queue.assert_not_called()
+        args, kwargs = executor.executor_request_queue.get_from_request_queue.call_args
+        assert args[0].total_seconds() == 0
+        assert kwargs == {"wait_for_batch": False}
     else:
         timeout = executor.executor_request_queue.get_from_request_queue.call_args.args[0]
         assert timeout.total_seconds() == 0
@@ -426,7 +441,7 @@ def test_empty_iteration_keeps_request_broadcast_fast_path() -> None:
     broadcaster = RequestBroadcaster(dist, SimpleNamespace(pause=nullcontext))
     broadcaster._broadcast_requests = Mock(side_effect=AssertionError("Unexpected payload"))
 
-    assert broadcaster.broadcast([]) == ([], None)
+    assert broadcaster.broadcast([]) == []
 
 
 def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> None:
@@ -799,6 +814,7 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     executor.virtual_memory_pools = None
     executor.sampler = Mock()
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
 
     executor.shutdown()
 

@@ -6,7 +6,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
 - **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local MP4/AVI file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); the encoded bytes pass through and each worker decodes just that window on NVDEC (see [Media I/O dependencies](#media-io-dependencies)). Validated for Nano / Super only.
-- **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint also accepts a precomputed control clip (`{"edge": "control.mp4"}` — the example reads it and sends encoded bytes, the same contract as the `video` reference). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames) — but only past the first chunk, so raise `num_frames` above the pipeline default to generate one: it bounds how many frames are decoded from the inputs, and so how long the output can be. A single-hint request picks up that hint's tuned sampling preset — guidance scale, control guidance and flow shift — for any of those the request leaves unset; requests with several hints fall back to the generic video defaults. The active hint names are also appended to the prompt as a one-sentence control-adherence directive; pass `"emphasize_control_in_prompt": false` to suppress it for clean baselines or ablations.
+- **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint also accepts a precomputed control clip (`{"edge": "control.mp4"}` — the example reads it and sends encoded bytes, the same contract as the `video` reference). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames) — but only past the first chunk, so raise `num_frames` above the pipeline default to generate one: it bounds how many frames are decoded from the inputs, and so how long the output can be. A single-hint request picks up that hint's tuned defaults — guidance scale and control guidance — for whichever of those it leaves unset; a request with several hints does not combine them and runs at the generic video guidance scale with control guidance 1.0. Flow shift is the request's value, else 10.0 (see [Sampling schedule](#sampling-schedule)). The active hint names are also appended to the prompt as a one-sentence control-adherence directive; pass `"emphasize_control_in_prompt": false` to suppress it for clean baselines or ablations.
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 - **Action** — policy / forward dynamics / inverse dynamics generation (`--action_mode` selects the generic workflow; a checkpoint carrying a `policy` manifest selects policy automatically). `inverse_dynamics` reads its observation clip from `--video_path` (MP4/AVI, decoded on worker NVDEC like V2V). State-conditioned policy requests supply the current model-space state through `action`; the model pipeline does not perform robot-protocol conversion. Action and audio generation are mutually exclusive. A predicted trajectory has no representation in a video container, so action runs are saved as `safetensors` or `pt`, keeping the rollout and the action tensor in one payload. Over `trtllm-serve`, checkpoint-selected Policy also makes `format=auto` resolve to `safetensors`, so `format` may be omitted; generic Action requests that explicitly set `action_mode` may likewise leave `format=auto`.
 
@@ -49,6 +49,16 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step --revision fp8 
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
+[`nvidia/Cosmos3-Edge-FP8`](https://huggingface.co/nvidia/Cosmos3-Edge-FP8) is
+the same static ModelOpt FP8 recipe on the Edge Nemotron-dense backbone, but it
+is published as its own repository rather than an `fp8` revision. Pass that ID
+(or a local checkout) to `--model` and do not set `--revision`. It has no audio
+tower. Its `diffusion_step_policy` runs W8A16 on the first 3 and last 3
+denoising steps and keeps W8A8 in between; the reasoner tower stays W8A16.
+Sampling stays on the Edge defaults (832×480, shift 3.0, guidance 5.0 for
+video). The checkpoint's quantization metadata records the calibration
+sampler, which is not the inference recipe.
+
 `../../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
@@ -58,11 +68,12 @@ refused, with an explicit error. Note that CFG parallelism is irrelevant to the
 distilled checkpoints — they bake guidance into the weights (guidance 1.0, one
 branch per step).
 
-These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
+The Nano, Super, and distilled checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
 rather than being refused — audio is quantized and generated like any other
 supported task. It simply has not been exercised as thoroughly as the four
 video/image tasks above, and no FP8 audio quality claim is made. FP8 output
-quality in general has not been benchmarked against BF16.
+quality in general has not been benchmarked against BF16. Edge-FP8 has
+`sound_gen: false` and does not run the audio path.
 
 ## Guardrails
 
@@ -265,3 +276,52 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --output_path inverse_video.safetensors \
     --action_output_path inverse_action.json
 ```
+
+## Sampling schedule
+
+Without a selection, each mode samples its own grid. On Nano and Super, T2V, I2V
+and T2I use the checkpoint's Karras grid, and V2V and transfer use the Diffusers
+shifted-linear flow grid. Edge uses its checkpoint-declared linear flow grid in
+every mode.
+
+A request that sends no `flow_shift` runs at 10.0 for V2V and transfer, and at 3.0
+for T2I and for Edge video. These values stand in for the `flow_shift` of 1.0 in
+the published scheduler configs, which those configs' own grid never reads. A
+checkpoint whose scheduler config carries any other `flow_shift` runs at its own
+value, and T2V and I2V on Nano and Super always take the checkpoint's.
+
+`extra_params.sigma_grid` selects a grid explicitly for base
+(non-distilled) checkpoints:
+
+| `sigma_grid` | Grid | `flow_shift` |
+|---|---|---|
+| `"karras"` | The checkpoint's Karras levels | Not used; an explicit value is rejected |
+| `"native"` | The Cosmos framework's shifted-linear flow grid | Used; resolved shift when omitted |
+| `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; resolved shift when omitted |
+
+Selecting a linear grid does not change the shift: pass `flow_shift` with it.
+A `flow_shift` so extreme that the grid's sigmas are not finite, strictly
+decreasing and below 1 is rejected with an error before denoising starts.
+To sample the way the Cosmos framework does, request its grid and shift
+explicitly; the examples below select that schedule, they do not change any
+default:
+
+```bash
+# Video modes (T2V, I2V, V2V, transfer): the framework's video schedule
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/t2v.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --extra_params '{"sigma_grid": "native", "flow_shift": 10.0}'
+
+# T2I: the framework's image schedule
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt_file prompts/t2i.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --output_path output.png \
+    --extra_params '{"sigma_grid": "native", "flow_shift": 3.0}'
+```
+
+Distilled 4-step checkpoints sample a fixed schedule from the checkpoint and
+reject `sigma_grid`; omit both `sigma_grid` and `flow_shift` for them. A
+`flow_shift` sent without `sigma_grid` to a mode that samples the Karras grid has
+no effect, and the server logs a warning.

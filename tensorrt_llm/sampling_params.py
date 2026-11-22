@@ -19,7 +19,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields, make_dataclass
-from typing import Any, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import torch
 from pydantic import BaseModel
@@ -107,6 +107,10 @@ class LogprobMode(StrEnum):
     RAW = "raw"
     """
     Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+    For single-beam requests, they exclude the embedding bias, the repetition, presence and frequency penalties, the
+    token bans (bad words, no-repeat n-grams and min_length), temperature, and top-k/top-p. Guided decoding and
+    logits processors still apply. Requests with a beam width above 1 return the log probabilities recorded in
+    their beam search history, so these exclusions do not apply to them.
     """
     PROCESSED = "processed"
     """
@@ -182,6 +186,9 @@ class BatchedLogitsProcessor(ABC):
         pass  # noqa
 
 
+EmbeddingBias: TypeAlias = tuple[tuple[int, float], ...]
+
+
 @dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """Sampling parameters for text generation.
@@ -204,7 +211,10 @@ class SamplingParams:
         stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
-        embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
+        embedding_bias (EmbeddingBias, torch.Tensor, List[float], optional): The embedding bias tensor in dense or sparse representation.
+            Dense representations can be torch.Tensor (float32 dtype, shape (vocab_size,)) or list of length vocab_size.
+            Sparse representation is a tuple of (vocabulary index, bias value) pairs. The behavior for repeated indices is undefined.
+            Defaults to None.
         logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, List[tensorrt_llm.sampling_params.LogitsProcessor], optional): The logits postprocessor callback(s). Defaults to None.
             If a list, each processor is applied in order during generation (supported in PyTorch backend only).
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
@@ -262,6 +272,7 @@ class SamplingParams:
 
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
         thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
+        watermarking (bool, optional): Whether to watermark the generated text. Takes effect only when the engine is configured with `watermark_config`. None or True requests a watermark; False opts this request out (unless the engine sets `allow_request_opt_out=False`). Greedy and beam-search requests cannot carry a watermark and are generated normally. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -291,7 +302,7 @@ class SamplingParams:
     include_stop_str_in_output: bool = False
     _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
 
-    embedding_bias: Optional[torch.Tensor] = None
+    embedding_bias: Optional[Union[EmbeddingBias, torch.Tensor, List[float]]] = None
     logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
@@ -348,6 +359,8 @@ class SamplingParams:
     guided_decoding: Optional[GuidedDecodingParams] = None
     thinking_token_budget: Optional[int] = None
 
+    watermarking: Optional[bool] = None
+
     # Tokenizer-related configs
     ignore_eos: bool = False
     detokenize: bool = True
@@ -368,12 +381,6 @@ class SamplingParams:
             self.pad_id = self.end_id
 
         self.best_of = self.best_of or self.n
-
-        if self.embedding_bias is not None:
-            if isinstance(self.embedding_bias, torch.Tensor):
-                self.embedding_bias = self.embedding_bias.detach().clone()
-            else:
-                self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
 
         self._validate()
 
@@ -435,6 +442,14 @@ class SamplingParams:
                 f"TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 "
                 f"under the greedy decoding."
             )
+
+        # An empty stop string tokenizes to no tokens, and the sampler rejects a
+        # stop word without tokens while setting up the request, which fails
+        # every request in flight with it instead of just this one.
+        if self.stop is not None:
+            stop_strings = [self.stop] if isinstance(self.stop, str) else self.stop
+            if any(stop_string == "" for stop_string in stop_strings):
+                raise ValueError("stop must not contain an empty string")
 
         self.logprobs_mode = LogprobMode(self.logprobs_mode)
 
@@ -589,20 +604,7 @@ class SamplingParams:
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
-        def _encode(tokenizer, text, add_special_tokens):
-            try:
-                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
-            except TypeError:
-                # For tiktokenizer, the encode method does not have add_special_tokens argument
-                return tokenizer.encode(text)
-
-        if self.bad is not None:
-            strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
-
-        if self.stop is not None:
-            strs = [self.stop] if isinstance(self.stop, str) else self.stop
-            self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+        self._setup_word_ids(tokenizer, add_special_tokens)
 
         # Add eos_token_id in generation_config to stop_token_ids
         # The eos_token_id in generation_config are really mean to stop the text generation.
@@ -620,6 +622,28 @@ class SamplingParams:
                 self.stop_token_ids = None
 
         return self
+
+    def _setup_word_ids(self, tokenizer, add_special_tokens: bool = False) -> None:
+        """Tokenize the ``stop`` and ``bad`` strings into the token sequences the engine matches.
+
+        This only depends on the tokenizer, so it is needed whether or not ``end_id`` was
+        given explicitly.
+        """
+
+        def _encode(text):
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            except TypeError:
+                # For tiktokenizer, the encode method does not have add_special_tokens argument
+                return tokenizer.encode(text)
+
+        if self.bad is not None:
+            strs = [self.bad] if isinstance(self.bad, str) else self.bad
+            self._bad_word_ids = [_encode(s) for s in strs]
+
+        if self.stop is not None:
+            strs = [self.stop] if isinstance(self.stop, str) else self.stop
+            self._stop_word_ids = [_encode(s) for s in strs]
 
     def _get_bad_words(self) -> List[List[int]]:
         words = []
@@ -707,13 +731,9 @@ class SamplingParams:
                 "internally enabling context logits for prompt logprobs computation. "
                 "context logits will be dropped after computation as the user didn't explicitly request them."
             )
-            # TODO: Find a more elegant way to do this.
-            # NOTE: This is an internal hack, so we can entirely avoid introducing
-            # `prompt_logprobs` into the executor bindings and further into
-            # model engine / sampler.
-            # This is because, prompt_logprobs is a derived quantity from
-            # context logits, and the capability to post-compute it
-            # already exists in the worker. (see _get_logprobs in base_worker.py)
+            # The context-output flag requests per-position predictions.
+            # Python workers carry prompt-logprob options separately to
+            # distinguish compact probability results from full logits.
             config_kwargs["return_context_logits"] = True
 
         if config_kwargs.get("additional_model_outputs") is not None:

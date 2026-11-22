@@ -38,9 +38,11 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     type: Required[Literal["video_url"]]
 
 
-class ImageEmbedsData(TypedDict):
+class ImageEmbedsData(TypedDict, total=False):
     """Type definition for serialized image embeddings structure."""
     data: Required[str]
+    # Image grid (t, h, w) from the image processor. mRoPE models need it.
+    image_grid_thw: List[int]
 
 
 class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
@@ -116,7 +118,7 @@ async def _load_request_media(media_io: BaseMediaIO, url: str) -> Any:
     """Load one media URL taken from a request.
 
     A local reference (`file://` URI or bare path) is read only from the
-    directory allowed by `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`, through
+    directory allowed by `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, through
     `BaseMediaIO.async_load_allowed_local_file`: the file is opened once on
     the media executor and decoded through that open descriptor. The check
     runs when the load is awaited, so a request whose media is discarded
@@ -173,9 +175,13 @@ def parse_chat_message_content_part(
 
     if part_type == "image_embeds":
         str_content = cast(str, content)
+        image_grid_thw = cast(dict, part)["image_embeds"].get("image_grid_thw")
 
         async def decode_image_embeds():
-            return load_base64_image_embeds(str_content)
+            embeds = load_base64_image_embeds(str_content)
+            if image_grid_thw is None:
+                return embeds
+            return {"mm_embeddings": embeds, "image_grid_thw": image_grid_thw}
 
         return MultimodalData(modality="image",
                               data=decode_image_embeds(),

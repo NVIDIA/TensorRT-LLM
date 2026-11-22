@@ -8,7 +8,9 @@ import inspect
 import os
 from typing import Any, Literal, Optional
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._errors import UnsupportedError
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
+from tensorrt_llm.logger import logger
 
 HP_BLOCK_SIZE: int = 16
 
@@ -70,6 +72,14 @@ FP4_MLA_Q_SF_GROUPS: int = FP4_MLA_Q_LOGICAL_DIM // FP4_BLOCK_SIZE
 
 FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
 
+_FP4_MLA_RETIRED_TRITON_ENV = (
+    "TRTLLM_FP4_MLA_PREPACK_V",
+    "TRTLLM_FP4_MLA_TRITON_PREPACK_V",
+    "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
+)
+
+_FP8_CONTEXT_SUPPORTED_SMS = frozenset((90, 100, 103, 107, 120))
+
 
 FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV = "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE"
 
@@ -108,6 +118,7 @@ _FP4_MLA_PAGE_TABLE_TILE_SIZE = 128
 
 
 _FP4_MLA_MAX_GRID_Z = 65_535
+_FP4_MLA_MAX_REDUCE_GROUPS = 64
 
 
 # Environment helpers
@@ -130,6 +141,11 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
+# four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x.py): the four-CTA-cluster variant of the FP4 MLA decode kernel
+# (256 packed [token, head] rows of one request per cluster, two CTA pairs splitting the KV tiles and exchanging P
+# over DSMEM; same FP4 operands as the two-CTA packed kernel). Opt-in sub-selection of the cutedsl backend for even-q
+# MTP shapes (see fp4_mla_cutedsl_4x_host.envelope_reason_static). Default off.
+FP4_MLA_CUTEDSL_4X_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X"
 # Packed decode: each request owns a 128-row-padded block of [query token, head]
 # Q rows, the kernel splits KV across grid.z tasks and reads per-row causal
 # bounds, so no Q padding/copies, no Q replication, and Helix stays split.
@@ -137,6 +153,28 @@ _FP4_MLA_PACKED_MAX_M = 1024
 _FP4_MLA_PACKED_MAX_SPLITS = 16
 _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT = 2
 _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+FP4_MLA_PACKED_WAVE_PLAN_ENV = "TRTLLM_FP4_MLA_PACKED_WAVE_PLAN"
+
+
+def _fp4_mla_packed_wave_plan_enabled() -> bool:
+    """Enable the optional wave simulation only when explicitly requested."""
+    return _env_enabled_default(FP4_MLA_PACKED_WAVE_PLAN_ENV, False)
+
+
+# Packed decode launches its split budget (grid.z slots past one per request) only for steps whose balanced
+# plan splits a request; an even step launches one task per request, without plan, reduction or empty slots.
+# Decode graphs are keyed by that decision (packed_plan.packed_split_variants). 0 restores the budget always.
+FP4_MLA_SPLIT_ON_DEMAND_ENV = "TRTLLM_FP4_MLA_SPLIT_ON_DEMAND"
+
+
+def _fp4_mla_split_on_demand_enabled() -> bool:
+    """Whether the packed decode launches its split budget only for steps that split (default on)."""
+    return _env_enabled_default(FP4_MLA_SPLIT_ON_DEMAND_ENV, True)
+
+
+def _fp4_mla_cutedsl_4x_enabled() -> bool:
+    """Whether the 4x kernel may replace the packed 2x decode inside its envelope (default off)."""
+    return _env_enabled_default(FP4_MLA_CUTEDSL_4X_ENV, False)
 
 
 def _fp4_mla_packed_q_enabled() -> bool:
@@ -170,6 +208,54 @@ def _fp4_mla_attention_backend() -> str:
     if get_sm_version() == 107 and _cutedsl_backend_available():
         return _FP4_MLA_CUTEDSL_BACKEND
     return "triton"
+
+
+def fp4_mla_generation_backend_supported(sm_version: int, backend: str) -> bool:
+    """Static hardware/backend eligibility shared by validation and generation."""
+    return backend in _FP4_MLA_K_RESIDUAL_BACKENDS and (
+        sm_version == 107 or (backend == "triton" and is_blackwell_datacenter(sm_version))
+    )
+
+
+def require_fp4_mla_fp8_context_support(sm_version: int | None = None) -> None:
+    """Validate the worker's FP8 context FMHA support for an NVFP4 MLA cache."""
+    sm_version = get_sm_version() if sm_version is None else sm_version
+    if sm_version not in _FP8_CONTEXT_SUPPORTED_SMS:
+        supported_sms = ", ".join(str(version) for version in sorted(_FP8_CONTEXT_SUPPORTED_SMS))
+        raise UnsupportedError(
+            f"NVFP4 MLA context does not support SM{sm_version}. Supported SM versions: "
+            f"{supported_sms}. Change kv_cache_config.dtype to a supported KV-cache precision."
+        )
+
+
+def validate_fp4_mla_backend(sm_version: int, *, context_only: bool, helix: bool) -> None:
+    """Validate the attention path used by this worker's NVFP4 KV cache."""
+    retired_variables = [name for name in _FP4_MLA_RETIRED_TRITON_ENV if name in os.environ]
+    if retired_variables:
+        logger.warning_once(
+            "Triton V prepacking was removed; these variables have no effect: "
+            + ", ".join(retired_variables)
+        )
+    if context_only:
+        require_fp4_mla_fp8_context_support(sm_version)
+        return
+    backend = _fp4_mla_attention_backend()
+    if not fp4_mla_generation_backend_supported(sm_version, backend):
+        override = os.getenv(FP4_MLA_ATTENTION_BACKEND_ENV)
+        selected = f" ({FP4_MLA_ATTENTION_BACKEND_ENV}={override})" if override else ""
+        raise UnsupportedError(
+            f"NVFP4 KV cache selects FP4 MLA generation, which does not support "
+            f"SM{sm_version} with {backend}{selected}. Use Triton on SM100/SM103, "
+            "or Triton/CuTe DSL on SM107."
+        )
+    if helix and backend != _FP4_MLA_CUTEDSL_BACKEND:
+        raise UnsupportedError("FP4 MLA Helix generation requires the CuTe DSL backend.")
+    if backend == _FP4_MLA_CUTEDSL_BACKEND and not _cutedsl_backend_available():
+        raise UnsupportedError(
+            "FP4 MLA CuTe DSL backend is unavailable. Install a CuTe DSL build with "
+            "the tcgen05 descriptor K-segment offset and cuda-python, or select "
+            f"{FP4_MLA_ATTENTION_BACKEND_ENV}=triton."
+        )
 
 
 # Modules the FP4 MLA CuTe DSL kernels import.

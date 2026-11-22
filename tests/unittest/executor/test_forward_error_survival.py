@@ -54,6 +54,7 @@ def _request(mm_data=None):
         py_disaggregated_params=None,
         sampling_config=None,
         py_multimodal_data=mm_data,
+        raise_if_validation_failed=Mock(),
     )
 
 
@@ -67,6 +68,8 @@ def _validating_executor(model):
     executor.sampler = Mock()
     executor._validate_token_id_range = Mock()
     executor._validate_request_budget = Mock()
+    executor._validate_embedding_bias = Mock()
+    executor._num_embeddings = 1234
     return executor
 
 
@@ -108,8 +111,10 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.kv_cache_transceiver = None
     executor.kv_connector_manager = None
     executor.guided_decoder = None
+    executor.capturable_guided_decoder = None
     executor.drafter = None
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     executor.speculation_gate = None
     executor.model_engine = SimpleNamespace(
         attn_metadata=None, kv_cache_dtype_byte_size=None, spec_metadata=None
@@ -129,7 +134,7 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.resource_manager = MagicMock()
 
     batches = iter([(_scheduled_batch(), None), (None, None)])
-    executor._prepare_and_schedule_batch = lambda: next(batches)
+    executor._prepare_and_schedule_batch = lambda defer_gen_receives=False: next(batches)
     executor._can_queue = Mock(return_value=(True, True))
     executor._kv_connector_start_batch = Mock(return_value=(True, True))
     executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
@@ -157,7 +162,7 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
         "_maybe_prefetch_next_iter_mm_encoders",
         "_submit_encoder_step",
         "_run_encoder_step",
-        "_revert_gen_alloc",
+        "_revert_unexecuted_alloc",
     ):
         setattr(executor, name, Mock())
     return executor

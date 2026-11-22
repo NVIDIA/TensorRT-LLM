@@ -15,12 +15,13 @@
 
 """Page pool for the DWDP remote prefetch slots.
 
-The page pool manages per-page fabric handles for the remote regions of the
+The page pool manages per-page handles for the remote regions of the
 composite buffer. One pool per prefetch slot (``DwdpConfig.num_prefetch_slots``,
 two by default).
 
-Each pool is a list of page-sized fabric handles that can be mapped at different
-VA positions for different layers. Pages are reused across layers in the same slot:
+Each pool is a list of page-sized local (``CU_MEM_HANDLE_TYPE_NONE``) handles
+that can be mapped at different VA positions for different layers. Pages are
+reused across layers in the same slot:
     - Layer 3 (buf_idx=0): pool[0] pages 0..K for pre/post regions
     - Layer 5 (buf_idx=0): SAME pool[0] pages (slot reuse)
     - Layer 4 (buf_idx=1): pool[1] pages 0..M
@@ -28,10 +29,9 @@ VA positions for different layers. Pages are reused across layers in the same sl
 This naturally handles heterogeneous layers: each layer maps exactly the pages
 it needs, even if remote sizes differ across layers.
 
-Verified on GB200:
-    - Per-page fabric handles composited into one VA: PASS
-    - Same page handles reused across layers: PASS
-    - Non-fabric handles cannot be mapped: FAIL (not supported on GB200)
+The pages are never exported: they are mapped next to the fabric handle of a
+weight's local experts in one VA reservation, and one set_access covers the
+whole reservation.
 """
 
 from __future__ import annotations
@@ -49,12 +49,22 @@ from .vmm import (
     unmap_va,
 )
 
+#: Bytes of page handles whose release raised, over every pool this process
+#: has released. Such memory may still be mapped, and the pool that held it
+#: is gone, so the count lives here rather than on the pool.
+_unreleased_bytes = 0
+
+
+def unreleased_page_bytes() -> int:
+    """Bytes of DWDP page handles that failed to release in this process."""
+    return _unreleased_bytes
+
 
 class PagePool:
-    """Pool of per-page fabric handles for the remote prefetch slots.
+    """Pool of per-page local handles for the remote prefetch slots.
 
-    One pool per prefetch slot. Each pool is a list
-    of page-sized fabric handles. Different layers map these pages at
+    One pool per prefetch slot. Each pool is a list of page-sized
+    ``CU_MEM_HANDLE_TYPE_NONE`` handles. Different layers map these pages at
     different VA positions within their composite VA.
 
     Pages are reused across layers in the same slot:
@@ -65,9 +75,8 @@ class PagePool:
     Pool page size vs VMM granularity:
         Each pool handle is ``page_size`` bytes (default 8 * granularity =
         16MB on GB200).  Larger pool pages reduce the number of cuMemMap
-        calls by 8x, avoiding the CUDA driver internal tracking limit
-        (~130K mappings per process) that causes OOM when 4 processes share
-        a GB200 node with 2MB pages.
+        calls and live mappings by 8x.  With 2MB pages, 4 processes on a
+        GB200 node run out of memory at ~130K live mappings per process.
 
     Attributes:
         device_id: CUDA device ordinal.
@@ -85,6 +94,7 @@ class PagePool:
         "_slot_pages",
         "_page_handles",
         "_released",
+        "_num_release_failures",
     )
 
     # Default pool page multiplier: each pool handle = 8 * granularity.
@@ -112,6 +122,7 @@ class PagePool:
                 ``DEFAULT_PAGE_SIZE_MULTIPLIER * granularity`` (16MB on GB200).
         """
         self._device_id = device_id
+        self._num_release_failures = 0
 
         if granularity is None:
             self._granularity = get_allocation_granularity(device_id)
@@ -156,15 +167,16 @@ class PagePool:
                     handle = create_local_handle(self._page_size, device_id)
                     handles.append(handle)
                 except Exception as e:
-                    # Cleanup on failure
-                    for h in handles:
-                        release_handle(h)
-                    for prev_handles in self._page_handles:
-                        for h in prev_handles:
-                            release_handle(h)
+                    # Release every page made so far exactly once, here, as release() does: a
+                    # page that fails to release is logged, so the others are still released and
+                    # this allocation error stays the one raised; release() also marks the pool
+                    # released, so __del__ does not release the handles again once the driver
+                    # may have reused their values.
+                    self._page_handles.append(handles)
+                    self.release()
                     raise RuntimeError(
                         f"Failed to allocate page {page_idx} in slot {slot_idx}: {e}"
-                    )
+                    ) from e
             self._page_handles.append(handles)
             logger.debug(
                 f"[PagePool] Allocated {num_pages} pages ({self._page_size} B each) "
@@ -213,15 +225,40 @@ class PagePool:
         return len(self._page_handles)
 
     def num_pages(self, slot: int) -> int:
-        """Get number of pages in a slot.
+        """Get the number of pages a slot is configured to hold.
+
+        This is a configuration value, not a measure of occupancy: it keeps
+        its value after :meth:`release` has handed every page back to the
+        driver. Use :meth:`held_pages` for what the pool currently holds.
 
         Args:
             slot: Prefetch slot index.
 
         Returns:
-            Number of pages in the slot.
+            Number of pages the slot is configured for; unchanged by :meth:`release`.
         """
         return self._slot_pages[slot]
+
+    def held_pages(self, slot: int) -> int:
+        """Pages whose handles the pool currently owns.
+
+        Drops to zero once :meth:`release` runs, which makes this the figure
+        to use for physical occupancy. :meth:`num_pages` would still report
+        a full pool at that point.
+
+        A handle whose release raised is dropped from this count; its bytes
+        are added to :func:`unreleased_page_bytes`, since the memory may still
+        be resident.
+
+        Args:
+            slot: Prefetch slot index.
+
+        Returns:
+            Number of page handles currently held.
+        """
+        if slot < 0 or slot >= len(self._page_handles):
+            raise IndexError(f"Invalid slot {slot}, must be in [0, {len(self._page_handles)})")
+        return len(self._page_handles[slot])
 
     def slot_size(self, slot: int) -> int:
         """Get the size of a slot in bytes.
@@ -338,16 +375,24 @@ class PagePool:
 
         self._released = True
 
+        global _unreleased_bytes
         for slot_idx, handles in enumerate(self._page_handles):
             for page_idx, handle in enumerate(handles):
                 try:
                     release_handle(handle)
                 except Exception as e:
+                    self._num_release_failures += 1
+                    _unreleased_bytes += self._page_size
                     logger.warning(
                         f"[PagePool] Failed to release page {page_idx} in slot {slot_idx}: {e}"
                     )
 
         self._page_handles = [[] for _ in self._slot_pages]
+        if self._num_release_failures:
+            logger.warning(
+                f"[PagePool] {self._num_release_failures} page handle(s) failed to "
+                "release; that memory may still be resident"
+            )
         logger.debug("[PagePool] Released all page handles")
 
     def __del__(self):

@@ -985,6 +985,11 @@ def _normalize_vision_patches(
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     """Shared multimodal encoder flow for Gemma4 conditional generation models."""
 
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
+        "audio": frozenset(),  # Chunked local attention with relative-position bias.
+    }
+
     supports_encoder_cache = True
     supports_vision_gpu_normalize: ClassVar[bool] = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
@@ -1246,7 +1251,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        attn_backend = model_config.attn_backend if name == "text_config" else "TRTLLM"
+        attn_backend = (
+            model_config.attn_backend
+            if name == "text_config"
+            else model_config.get_encoder_attention_backend(name.removesuffix("_config"), "TRTLLM")
+        )
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
@@ -1288,6 +1297,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def get_language_model_extra_forward_kwargs(
         self,
         *,
+        attn_metadata: Any,
         raw_input_ids: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         mm_inputs: PreparedLlmInputs,
@@ -1296,10 +1306,17 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         resource_manager=None,
         **forward_kwargs,
     ) -> Dict:
-        """Build Gemma4-specific language-model forward arguments."""
+        """Build Gemma4-specific language-model forward arguments.
+
+        Generation-only batches need no multimodal token-type ids for context masking.
+        """
         del position_ids, forward_kwargs
         mm_token_type_ids = None
-        if raw_input_ids is not None and mm_inputs.input_ids is None:
+        if (
+            attn_metadata.num_contexts > 0
+            and raw_input_ids is not None
+            and mm_inputs.input_ids is None
+        ):
             mm_token_type_ids = torch.zeros_like(raw_input_ids, dtype=torch.long)
             mm_token_type_ids[raw_input_ids == self.image_token_ids[0]] = 1
             if self.video_token_ids is not None:
@@ -1380,6 +1397,10 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     - Support for image_position_ids (2D patch coordinates)
     - mm_token_type_ids-based bidirectional masking
     """
+
+    # fmt: off
+    supported_encoder_attention_backends = Gemma4MultimodalModelBase.supported_encoder_attention_backends
+    # fmt: on
 
     build_mtp_draft_model_from_config = True
     supports_mm_encoder_item_scheduling = True

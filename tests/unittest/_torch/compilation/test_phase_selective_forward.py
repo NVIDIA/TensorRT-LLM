@@ -15,7 +15,10 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    AutotunerWarmupMode,
+    DecoderWarmup,
+)
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
@@ -237,22 +240,32 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     )
     graphs.preallocate_padding_dummies = Mock()
     warmup = object.__new__(DecoderWarmup)
+    warmup.model = model
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
+    warmup.sparse_attention_config = None
     warmup._inputs = SimpleNamespace(guided_decoder=None)
     warmup._metrics = {}
-    warmup._config = SimpleNamespace(max_beam_width=1)
+    warmup._config = SimpleNamespace(
+        max_beam_width=1, max_batch_size=8, max_num_tokens=64, max_seq_len=128
+    )
     warmup._warmup_timer = _WarmupTimer(rank=0)
     warmup._agreement = SimpleNamespace(agree_flag=lambda value: value, agree_shapes=lambda s: s)
     warmup._graphs = graphs
-    warmup._metadata = SimpleNamespace(_warmup_dspark_ragged_compressor_metadata=Mock())
+    warmup._metadata = SimpleNamespace(
+        attn_metadata=object(), _warmup_dspark_ragged_compressor_metadata=Mock()
+    )
+    warmup._prims_ts_dense_mla_warmup = SimpleNamespace(run=Mock())
     warmup._context_warmups_supported = True
+    warmup._context_logits_heads = ()
     warmup._torch_compile_bypass = runner._bypass_torch_compile
     warmup._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])
     warmup._get_max_shape_warmup_requests = Mock(return_value=[(8, 0)])
     observed = []
 
     def observe(phase):
-        def forward(*args):
+        def forward(*args, **kwargs):
+            if phase == "_run_autotuner_warmup":
+                assert kwargs == {"mode": AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION}
             observed.append((phase, model.use_compiled_forward()))
 
         return forward
@@ -268,14 +281,22 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         "_freeze_eager_workspace_floor",
     ):
         monkeypatch.setattr(warmup, method, Mock())
+    monkeypatch.setattr(
+        warmup,
+        "_prewarm_fmha_libraries",
+        lambda _: observed.append(("_prewarm_fmha_libraries", None)),
+    )
     for method in (
         "_run_attention_warmup",
         "_run_autotuner_warmup",
         "_run_mamba_hybrid_warmup",
+        "_prewarm_lowm_mma_row_buckets",
         "_general_warmup",
     ):
         monkeypatch.setattr(warmup, method, observe(method))
     monkeypatch.setattr(graphs, "run_cuda_graph_warmup", observe("_run_cuda_graph_warmup"))
+    monkeypatch.setattr(graphs, "_warm_inforward_split", Mock())
+    warmup._prims_ts_dense_mla_warmup.run.side_effect = observe("_prims_ts_dense_mla_warmup")
     monkeypatch.setattr(warmup_module, "warmup_sampling_module", Mock())
     monkeypatch.setattr(warmup_module, "log_mem_snapshot", Mock())
     monkeypatch.setattr(warmup_module.AutoTuner, "get", Mock())
@@ -295,15 +316,25 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         warmup._warmup_scheduled(Mock(), SimpleNamespace(context_swa_layer_limit=None))
 
     assert observed == [
+        ("_prewarm_fmha_libraries", None),
         ("_run_attention_warmup", not enabled),
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),
         ("_run_mamba_hybrid_warmup", not enabled),
+        ("_prewarm_lowm_mma_row_buckets", True),
         ("_run_cuda_graph_warmup", True),
         ("_run_cuda_graph_warmup", True),
+        ("_prims_ts_dense_mla_warmup", True),
         ("_general_warmup", not enabled),
     ]
     assert not model._bypass_active
+    warmup._prims_ts_dense_mla_warmup.run.assert_called_once_with(
+        model,
+        warmup._metadata.attn_metadata,
+        max_batch_size=8,
+        max_num_tokens=64,
+        max_seq_len=128,
+    )
 
 
 @skip_pre_hopper

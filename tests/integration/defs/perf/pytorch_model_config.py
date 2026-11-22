@@ -231,6 +231,41 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Spark Flash-Next bench: no TRTLLM-Gen MoE, and MTP does not run on these backends.
+        {
+            'patterns': [
+                'qwen3.8_flash_next_fp4-bench-pytorch-streaming-',
+                'qwen3.8_flash_next_fp8-bench-pytorch-streaming-',
+            ],
+            'config': {
+                'speculative_config': None,
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp4-bench-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp8-bench-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_27b'],
+            'config': {
+                'trust_remote_code': True,
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
         # Deepseek default cases
         {
             'patterns': ['deepseek_r1'],
@@ -381,9 +416,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Single-node experimental adaptation of the NVFP4 DSpark generation
-        # recipe in tests/scripts/perf/disaggregated/
-        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Single-node experimental NVFP4 DSpark generation recipe.
         # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
         # The blog does not provide a tuned single-node NVFP4 DSpark config.
         {
@@ -543,6 +576,38 @@ def get_model_yaml_config(model_label: str,
         },
         {
             'patterns': ['glm_5.3_flash_fp8_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        # NVFP4 on SM100 requires the Modeling V2 split/fused targets.
+        {
+            'patterns': [
+                'glm_5.3_flash_nvfp4-serve-pytorch',
+                'glm_5.3_flash_nvfp4_mtp-serve-pytorch',
+            ],
+            'config': {
+                'modeling_v2': 'require',
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 8192,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_nvfp4_mtp-serve-pytorch'],
             'config': {
                 'speculative_config': {
                     'decoding_type': 'MTP',
@@ -885,6 +950,23 @@ def get_model_yaml_config(model_label: str,
                 'attn_backend': 'FLASHINFER',
             }
         },
+        {
+            'patterns': ['nemotron_3_nano_30b', 'nemotron_3_nano_4b'],
+            'config': {
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float32',
+                },
+            }
+        },
+        {
+            'patterns': ['nemotron_3_nano_30b'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+            }
+        },
         # Nemotron-3-Nano-Omni-30B-NVFP4 (text + image multimodal)
         {
             'patterns': ['nemotron_3_nano_omni_nvfp4'],
@@ -968,6 +1050,25 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {
                     'enable_padding': True,
                     'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+            }
+        },
+        {
+            'patterns': [
+                'nemotron_3_super_120b_fp8-bench-pytorch-streaming-',
+            ],
+            'config': {
+                # CUDA graphs with the overlap scheduler hang across two DGX Spark nodes.
+                'disable_overlap_scheduler': True,
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,

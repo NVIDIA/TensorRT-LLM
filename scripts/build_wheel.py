@@ -37,10 +37,8 @@ from typing import Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
-    from packaging.version import Version
 except (ImportError, ModuleNotFoundError):
     from pip._vendor.packaging.requirements import Requirement
-    from pip._vendor.packaging.version import Version
 
 build_run = partial(run, shell=True, check=True)
 
@@ -71,28 +69,6 @@ def working_directory(path):
 
 def get_project_dir():
     return Path(__file__).parent.resolve().parent
-
-
-def apply_version_override(project_dir: Path,
-                           version_override: Optional[str]) -> None:
-    """Apply the requested package version before building the wheel."""
-    if not version_override:
-        return
-
-    version_file = project_dir / "tensorrt_llm" / "version.py"
-    version_content = version_file.read_text()
-    version_match = re.search(r'(?m)^__version__ = "([^"]+)"$', version_content)
-    current_version = version_match.group(1)
-
-    resolved_version = version_override
-    if version_override.startswith((".", "+")):
-        resolved_version = current_version
-        if not current_version.endswith(version_override):
-            resolved_version += version_override
-    resolved_version = str(Version(resolved_version))
-    version_file.write_text(
-        version_content.replace(f'__version__ = "{current_version}"',
-                                f'__version__ = "{resolved_version}"', 1))
 
 
 def get_source_dir():
@@ -980,8 +956,7 @@ def main(*,
          nvrtc_dynamic_linking: bool = False,
          require_dynamic_attributions: bool = False,
          plat_name: Optional[str] = None,
-         yes: bool = False,
-         version_override: Optional[str] = None):
+         yes: bool = False):
 
     if clean:
         clean_wheel = True
@@ -1018,12 +993,7 @@ def main(*,
                 "--linking_install_binary and --install: editable installs "
                 "import compiled artifacts from the checkout, which a "
                 "out-of-tree build never writes.")
-        if version_override:
-            raise RuntimeError(
-                "--out-of-tree does not support --version-override (it would "
-                "modify tensorrt_llm/version.py in the checkout)")
 
-    apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
     on_windows = platform.system() == "Windows"
@@ -1634,6 +1604,48 @@ def main(*,
             msa_dst / relative_dir,
         )
     install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
+    for notice in ("LICENSE", "NOTICE"):
+        install_file(build_dir / "_deps" / "msa-src" / notice, msa_dst / notice)
+
+    # Stage the MiniMax-M3.1 MSA packages of the FetchContent-patched msa_vllm
+    # tree: the Q8KV8 index scorer (the files it needs from python/fmha_sm100/cute)
+    # and the BF16X sparse prefill (python/fmha_sm100/prefill_q8kv4).
+    msa_vllm_src = build_dir / "_deps" / "msa_vllm-src" / "python" / "fmha_sm100"
+    msa_vllm_packages = (
+        ("fmha_sm100_q8kv8", msa_vllm_src / "cute", (
+            "__init__.py",
+            "q8_indexer_interface.py",
+            "src/__init__.py",
+            "src/common/__init__.py",
+            "src/common/aot_cache.py",
+            "src/common/utils.py",
+            "src/sm100/__init__.py",
+            "src/sm100/q8kv4_indexer_decode.py",
+            "src/sm100/q8kv8_indexer_decode.py",
+            "src/sm100/q8kv8_indexer_prefill.py",
+            "src/sm100/q8kv8_indexer_prefill_plan.py",
+        )),
+        ("fmha_sm100_prefill_bf16x", msa_vllm_src / "prefill_q8kv4", None),
+    )
+    for package_name, package_src, package_files in msa_vllm_packages:
+        if not (package_src / "__init__.py").is_file():
+            raise FileNotFoundError(
+                f"MSA package missing at {package_src}; CMake FetchContent for "
+                "msa_vllm did not populate the expected sources.")
+        package_dst = wheel_project_dir / "3rdparty" / package_name
+        if package_dst.is_symlink():
+            package_dst.unlink()
+        elif package_dst.exists():
+            rmtree(package_dst)
+        if package_files is None:
+            install_tree(package_src, package_dst)
+        else:
+            for relative in package_files:
+                (package_dst / relative).parent.mkdir(parents=True,
+                                                      exist_ok=True)
+                install_file(package_src / relative, package_dst / relative)
+        for notice in ("LICENSE", "NOTICE"):
+            install_file(msa_vllm_src.parents[1] / notice, package_dst / notice)
 
     if not skip_stubs:
         with working_directory(pkg_dir):
@@ -1834,8 +1846,7 @@ def add_arguments(parser: ArgumentParser):
         "staging copy of the Python package (default wheel output: "
         "<build_root>/dist). Requires --build_root; the checkout may be "
         "mounted read-only. Incompatible with editable-install workflows "
-        "(--skip_building_wheel, --linking_install_binary, --install) and "
-        "with --version-override (it edits tensorrt_llm/version.py in place).")
+        "(--skip_building_wheel, --linking_install_binary, --install).")
     parser.add_argument(
         "--build_dir",
         type=Path,
@@ -1905,11 +1916,6 @@ def add_arguments(parser: ArgumentParser):
         default=False,
         help=
         "Skip interactive confirmation prompts (useful for non-interactive builds)",
-    )
-    parser.add_argument(
-        "--version-override",
-        help="Package version override. A leading '.' or '+' appends to the "
-        "current version; any other value replaces it.",
     )
 
 

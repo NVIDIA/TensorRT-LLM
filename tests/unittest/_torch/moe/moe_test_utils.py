@@ -17,18 +17,22 @@
 import logging
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
-from typing import Callable, Optional
+from types import SimpleNamespace
+from typing import Callable, Optional, cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
+    MoEActivation,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
@@ -45,8 +49,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     find_cutlass_leaf,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
@@ -60,6 +64,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEProblem,
     canonical_activation,
     canonical_quant,
+    identity_quant_of,
     normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
@@ -68,7 +73,6 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDe
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
-from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import trtllm_gen_leaves_in_resolution_order
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -126,15 +130,10 @@ def find_backend_class(
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
     ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
-    not one class each but sets of leaves keyed by quant (and, for TRTLLM-Gen,
-    provider), so each needs ``quant_algo``. CUTLASS publishes
-    ``fp8_block_scales`` twice, once per SM family, so for that format the leaf
-    is the one this device runs.
-    TRTLLM-Gen prefers the native leaf for that format and falls back to the
-    FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
-    unquantized format: bf16 has no native leaf, only
-    ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
-    exists and wins, so only bf16 tests are exercising a FlashInfer class.
+    not one class each but sets of leaves keyed by quant, so each needs
+    ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice, once per SM
+    family, so for that format the leaf is the one this device runs.
+    TRTLLM-Gen has one leaf per format, the unquantized one included.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
@@ -151,14 +150,14 @@ def find_backend_class(
         return find_cutedsl_grouped_gemm_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTE_DSL_B12X:
         # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
-        # W4A16_NVFP4 never leaves the b12x kernel. Compared after
-        # canonical_quant, as the leaves' can_implement sees the format.
-        quant = canonical_quant(quant_algo)
+        # W4A16_NVFP4 never leaves the b12x kernel. Compared as identities
+        # spell the format, as the leaves' can_implement sees it.
+        quant = normalize_quant(canonical_quant(quant_algo))
         return next(
             (
                 leaf
-                for leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE)
-                if canonical_quant(leaf.b12x_quant_algo) == quant
+                for leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl)
+                if identity_quant_of(leaf) == quant
             ),
             None,
         )
@@ -178,19 +177,13 @@ def find_backend_classes(
 ) -> tuple[type[MoE], ...]:
     """The classes a resolution walk would try, in its order; empty if none.
 
-    A tuple and not one class because ``TRTLLM`` is a provider pair, and
-    ``IMPL_PRIORITY`` ranks each FlashInfer leaf ahead of its native sibling:
-    resolution falls through to the native one when the FlashInfer leaf
-    rejects -- a missing wheel, an unmet shape -- and not only when it is
-    absent. A caller asking whether a case is *supported* has to ask the same
-    way, or it skips cases the layer under test goes on to serve.
-
-    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
+    A tuple and not one class because CUTLASS publishes ``fp8_block_scales``
+    twice, as the SM90 and SM120 leaves, and resolution asks each. A caller
+    asking whether a case is *supported* has to ask the same way, or it skips
+    cases the layer under test goes on to serve.
 
     :func:`find_backend_class` stays for callers that want to name one class.
     """
-    if backend_type is MoeBackendType.TRTLLM:
-        return trtllm_gen_leaves_in_resolution_order(quant_algo)
     if backend_type is MoeBackendType.CUTLASS:
         return cutlass_leaves_in_resolution_order(quant_algo)
     cls = find_backend_class(backend_type, quant_algo)
@@ -269,37 +262,17 @@ def _is_fp4_fp8_standalone_gemm_available() -> bool:
     return result
 
 
-def _is_sm103_gpu() -> bool:
-    """Return whether the current test GPU is an SM103 device such as B300."""
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability(0) == (10, 3)
-
-
-def skip_trtllm_bf16_on_sm103(
-    backend_type: MoeBackendType,
-    quant_algo: Optional[QuantAlgo],
-    dtype: torch.dtype,
-) -> None:
-    """Explicitly skip TRTLLM BF16 tests on SM103."""
-    if backend_type == MoeBackendType.TRTLLM and quant_algo is None and dtype == torch.bfloat16:
-        if _is_sm103_gpu():
-            pytest.skip(
-                "FIXME: TRTLLMGenFusedMoE BF16 (FlashInfer backend) is skipped on SM103 "
-                "due to CUDA errors"
-            )
-
-
 def should_skip_trtllm(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
     model_config: "MoeModelConfig",
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
-    comm_method: Optional[str] = None,
     seq_len: Optional[int] = None,
     moe_tp_size: int = 1,
     parallel_mode: Optional[str] = None,
+    dtype: Optional[torch.dtype] = None,
+    activation_type: Optional[ActivationType] = None,
 ) -> Optional[str]:
     """
     Check TRTLLM Gen backend specific constraints.
@@ -314,13 +287,12 @@ def should_skip_trtllm(
         routing_method_cls: Optional routing method class for compatibility checks
             (used by test_moe_module.py)
         swiglu_gptoss_style: Whether using swiglu gptoss style
-        comm_method: Optional communication method (e.g. "DEEPEP", "DEEPEPLOWLATENCY")
-            for multi-GPU EP mode checks
         seq_len: Optional sequence length for seq_len-sensitive skip checks
         moe_tp_size: MoE TP parallelism size (default: 1, no TP sharding)
         parallel_mode: Optional multi-GPU parallel mode label (e.g. "DEP",
-            "DTP", "TTP", "TEP"); used by parallel-mode-specific kernel-bug
-            skips that ``moe_tp_size`` alone cannot disambiguate.
+            "DTP", "TTP", "TEP") for parallel-mode-specific constraints.
+        dtype: Activation dtype for configuration-specific accuracy skips.
+        activation_type: Activation kind for configuration-specific accuracy skips.
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -416,11 +388,6 @@ def should_skip_trtllm(
                 "TRTLLMGenFusedMoE BF16 path requires hidden_size and intermediate_size "
                 f"to be multiples of 128 (got h={hidden_size}, i={intermediate_size})."
             )
-        if comm_method == "NVLINK_TWO_SIDED" and top_k % 8 != 0:
-            return (
-                "TRTLLMGenFusedMoE BF16 path with NVLinkTwoSidedFlashinfer requires "
-                f"top_k to be a multiple of 8 for 16-byte row alignment (got top_k={top_k})."
-            )
         if moe_tp_size > 1:
             if intermediate_size % moe_tp_size != 0:
                 return (
@@ -473,22 +440,30 @@ def should_skip_trtllm(
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
-        # NVFP4 flaky tactic failures with large model configs at seq=8.
-        # For example of observed failures:
-        #   - act=Relu2-e60_k4_h2048_i1408-seq=8: tactic[28] tile [32,36],
-        #     12.79% mismatch, 187/188 tactics pass.
+        # Keep unvalidated NVFP4 seq=8 configurations skipped, except for
+        # the restored Relu2 case below. This exemption assumes the single-GPU
+        # generators in test_moe_backend.py; multi-GPU sweeps use SwiGLU.
+        is_restored_relu2_seq8_case = (
+            model_config == MoeModelConfig(60, 4, 2048, 1408)
+            and dtype == torch.bfloat16
+            and activation_type == ActivationType.Relu2
+            and routing_method_cls is RenormalizeMoeRoutingMethod
+            and not swiglu_gptoss_style
+        )
         if (
             num_experts >= 60
             and model_config.top_k >= 4
             and model_config.hidden_size >= 2048
             and model_config.intermediate_size >= 1408
             and seq_len == 8
+            and not is_restored_relu2_seq8_case
         ):
             return (
-                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
+                f"TRTLLMGenFusedMoE NVFP4 seq_len=8 with large model config "
                 f"(num_experts={num_experts}, top_k={model_config.top_k}, "
-                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size})"
-                f"and seq_len=8: flaky happen tactics failure with tactic[24] and tactic[28]"
+                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size}) "
+                "is not yet validated on B200/B300; lift it per configuration once all tactics "
+                "pass the accuracy check"
             )
         # Issue: NVFP4 with large expert count + large hidden_size
         # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
@@ -524,76 +499,10 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
-    # W4A8_MXFP4_FP8 used to share the GatedMLP+W4A8MXFP4FP8LinearMethod
-    # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
-    # caused by the ref module's dynamic FP8 quantization being miswired to
-    # ``trtllm::w4a8_mxfp4_fp8_gemm`` (FP4GemmType.W4A8_MXFP4_MXFP8, which
-    # expects per-block activation scales with alpha=1). The reference now
-    # dequantizes the MXFP4 weights at load time AND emulates the kernel's
-    # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
-    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so the generic / default
-    # SwiGLU configs (any top_k, any model shape) see the same FP8 noise as
-    # the fused kernel and pass.
-    #
-    # The remaining failure surface is
-    # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
-    # any model shape, single- or multi-GPU). The element-wise reproducer at
-    # ``tests/unittest/_torch/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
-    # holds the model config / weights / input identical and only toggles
-    # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
-    #   * default SwiGLU (alpha=1, beta=0, limit=inf):
-    #       kernel ~ ref (1.00x magnitude, 0% mismatch_frac, PASS)
-    #   * gpt-oss SwiGLU (alpha=1.702, beta=1.0, limit=7.0):
-    #       kernel ~ 600-800x SMALLER than ref (94% mismatch_frac, FAIL)
-    # Eight ref variants that toggle gate clamp single/double-sided, drop
-    # the ``+beta`` term, drop the limit clamp, or skip the FC1/FC2 FP8
-    # round-trip all stay at ~94% mismatch, so the ref activation algebra
-    # is not the source. The CUTLASS backend with the same gpt-oss SwiGLU
-    # passes (Phase B verification, 16 passed / 0 failed). The bug is
-    # therefore in the TRTLLM-Gen kernel's gpt-oss SwiGLU code path itself
-    # (likely a wrong scale wired into the gpt-oss epilogue path - see
-    # ``GemmGatedActOptions.h`` ``scaleC`` / ``dequantScaleAb`` plumbing).
-    #
-    # Skip removal must be tied to the kernel bug fix tracked in
-    # https://nvbugspro.nvidia.com/bug/6178914.
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style:
-        return (
-            "[Kernel Bug NVBUG-6178914] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
-            "swiglu_gptoss_style: the kernel produces output ~600-800x smaller "
-            "than the bf16 reference across all top_k / model shapes / "
-            "parallel modes, while the same kernel matches ref under default "
-            "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
-            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path."
-        )
-
-    # W4A8_MXFP4_FP8 + DEP + NVLINK MoeAllReduce produces ~97% mismatch with
-    # default SwiGLU on the TRTLLM-Gen kernel. The same kernel + quant passes
-    # under TTP+NVLINK (no DEP combine), and DEP+DEEPEP / DEP+DEEPEPLOWLATENCY
-    # also pass on the same kernel - so the MoE kernel itself is correct and
-    # the bug is in how the NVLINK MoeAllReduce combine path consumes the
-    # FP8/per-tensor-scale output of the TRTLLM-Gen kernel under DEP. Tracked
-    # in https://nvbugspro.nvidia.com/bug/6178915. The gpt-oss SwiGLU subset
-    # of this intersection is already covered by the NVBUG-6178914 skip above,
-    # so we explicitly require ``not swiglu_gptoss_style`` to avoid double
-    # accounting of the same ID under two different bug numbers.
-    if (
-        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
-        and not swiglu_gptoss_style
-        and parallel_mode == "DEP"
-        and comm_method in ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED")
-    ):
-        return (
-            "[Kernel Bug NVBUG-6178915] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 in "
-            "DEP mode with NVLINK MoeAllReduce combine path produces ~97% "
-            "mismatch vs the bf16 reference (default SwiGLU). The same kernel "
-            "+ quant passes under TTP+NVLINK and under DEP+DEEPEP / "
-            "DEP+DEEPEPLOWLATENCY, so the bug is isolated to the DEP+NVLINK "
-            "MoeAllReduce combine path."
-        )
-
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
-    # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
-    # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:
+    # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8) auto-pad to
+    # 128 alignment, but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8)
+    # crash:
     #   - FP8_BLOCK_SCALES: block scale tensor size mismatch
     #     (ceil(per_shard/128) vs floor(per_shard/128))
     #   - NVFP4: unswizzle_sf shape '[-1, w3_w1, 128]' invalid
@@ -1116,7 +1025,6 @@ def should_skip_routing_method(
 def supports_autotuner_capture(
     backend_type: MoeBackendType,
     _quant_algo: Optional[QuantAlgo],
-    use_flashinfer: bool,
 ) -> bool:
     """
     Determine if a backend+quant_algo combination supports AutoTuner capture/replay.
@@ -1139,9 +1047,6 @@ def supports_autotuner_capture(
         MoeBackendType.CUTE_DSL_B12X,
         MoeBackendType.MARLIN,
     ):
-        return False
-
-    if use_flashinfer:
         return False
 
     return True
@@ -1182,7 +1087,11 @@ def build_test_activation(
     # cover the kinds this sweep supplies constants for, and a kind added to
     # ``ACTIVATION_PAYLOAD`` with a carrier of its own has to get that carrier.
     payload = ACTIVATION_PAYLOAD[kind]
-    return SimpleActivation(kind=kind) if payload is SimpleActivation else payload()
+    return (
+        SimpleActivation(kind=kind)
+        if payload is SimpleActivation
+        else cast(Callable[[], MoEActivation], payload)()
+    )
 
 
 def get_quick_skip_reason(
@@ -1200,8 +1109,8 @@ def get_quick_skip_reason(
     ``activation_type`` is a parameter rather than a constant because it is a
     selection input: a leaf declares which kinds it reaches, so a caller that
     parametrizes over Relu2 or SiTu and does not pass it here would prune its
-    sweep against the verdict for SwiGLU. Defaulted because today's callers
-    sweep SwiGLU only, and that is the historical shape of every MoE signature.
+    sweep against the verdict for SwiGLU. The default preserves SwiGLU-only
+    callers; generators sweeping other activations must pass their current kind.
     """
     import logging as _logging
 
@@ -1212,9 +1121,9 @@ def get_quick_skip_reason(
 
     try:
         # Every candidate a run would try, in resolution's order, because
-        # resolution falls through to the native leaf when the FlashInfer one
-        # rejects. Asking a single pre-picked class would skip cases the layer
-        # under test goes on to serve.
+        # resolution falls through to the next leaf publishing the format when
+        # one rejects. Asking a single pre-picked class would skip cases the
+        # layer under test goes on to serve.
         candidates = find_backend_classes(backend_type, quant_algo)
         if not candidates:
             # No leaf of this family publishes the format. Asked as a query,
@@ -1281,9 +1190,6 @@ def get_quick_skip_reason(
             if verdict.eligible:
                 reason = None
                 break
-            # The last candidate's reason, not the first: without the opt-in
-            # flag every FlashInfer leaf rejects for the flag alone, which says
-            # nothing about why the case is unsupported.
             reason = f"{verdict.reject_reason.value}: {verdict.detail}"
         if reason is not None:
             return reason
@@ -1298,6 +1204,8 @@ def get_quick_skip_reason(
                 routing_method_cls,
                 swiglu_gptoss_style,
                 seq_len=seq_len,
+                dtype=dtype,
+                activation_type=activation_type,
             ),
             lambda: should_skip_cutlass(
                 backend_type,
@@ -1540,8 +1448,8 @@ def should_skip_to_accelerate_ci(
         return None
 
     # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
-    # Keep TRTLLM BF16 for FlashInfer and CuteDSL BF16 with locality domain for the
-    # dedicated locality domain backend matrix.
+    # Keep TRTLLM BF16, and CuteDSL BF16 with locality domain for the dedicated
+    # locality domain backend matrix.
     keeps_unquantized_bf16_coverage = dtype == torch.bfloat16 and (
         backend_type == MoeBackendType.TRTLLM
         or (backend_type == MoeBackendType.CUTEDSL and enable_locality_domains)
@@ -1638,8 +1546,30 @@ def module_timer(request):
 # Base Test Config Iterator
 # ============================================================================
 def iter_base_test_configs(
-    swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods=None
-):
+    swiglu_combos: list[tuple[float, float, float]],
+    model_configs: list[MoeModelConfig],
+    seq_lens: list[int],
+    dtypes: list[torch.dtype],
+    backend_types: list[MoeBackendType],
+    quant_algos: list[QuantAlgo | None],
+    routing_methods: list[type] | None = None,
+    *,
+    activation_type: ActivationType = ActivationType.Swiglu,
+) -> Iterator[
+    tuple[
+        float,
+        float,
+        float,
+        MoeModelConfig,
+        int,
+        torch.dtype,
+        MoeBackendType,
+        QuantAlgo | None,
+        type,
+        str | None,
+        str,
+    ]
+]:
     """
     Iterate over base test configurations using itertools.product.
 
@@ -1654,14 +1584,13 @@ def iter_base_test_configs(
         backend_types: List of backend types
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes (default: [RenormalizeMoeRoutingMethod])
+        activation_type: Activation kind for eligibility and accuracy skip checks.
 
     Yields:
         Tuple of (swiglu_alpha, swiglu_beta, swiglu_limit, model_config, seq_len,
                   dtype, backend_type, quant_algo, routing_method_cls, skip_reason, base_test_id)
     """
     if routing_methods is None:
-        from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-
         routing_methods = [RenormalizeMoeRoutingMethod]
 
     for (
@@ -1680,6 +1609,7 @@ def iter_base_test_configs(
             routing_method_cls,
             swiglu_gptoss_style=swiglu_gptoss_style,
             seq_len=seq_len,
+            activation_type=activation_type,
         )
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         swiglu_id = (
@@ -1704,3 +1634,52 @@ def iter_base_test_configs(
             skip_reason,
             base_test_id,
         )
+
+
+# ============================================================================
+# RL weight refit
+# ============================================================================
+
+
+def _refit_extension(model: torch.nn.Module):
+    """A ``WorkerExtension`` that serves ``model`` in place of a running engine.
+
+    Its ``begin_weight_update`` and ``finalize_weight_update`` then run the
+    engine's own refit walk over ``model``: which modules it visits, which
+    hooks it calls, and in which order. Only what they touch outside the model
+    is stubbed, namely the model loader's update session and the
+    torch.compile unwrap.
+    """
+    # Imported here: rlhf_utils pulls in the Ray executor, which the other users
+    # of these utilities do not need.
+    from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
+
+    extension = WorkerExtension.__new__(WorkerExtension)
+    extension.engine = SimpleNamespace(
+        model_engine=SimpleNamespace(
+            model=model,
+            model_loader=MagicMock(),
+            unwrap_compiled_model_for_refit=MagicMock(),
+        )
+    )
+    return extension
+
+
+def begin_moe_refit(model: torch.nn.Module) -> None:
+    """Run ``WorkerExtension.begin_weight_update`` over ``model``."""
+    _refit_extension(model).begin_weight_update()
+
+
+def finalize_moe_refit(model: torch.nn.Module) -> None:
+    """Run ``WorkerExtension.finalize_weight_update`` over ``model``, then wait for the device."""
+    _refit_extension(model).finalize_weight_update()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def refit_moe_in_buckets(model: torch.nn.Module, buckets: list[dict[str, torch.Tensor]]) -> None:
+    """One RL refit of ``model``: begin, one partial load per bucket, finalize."""
+    begin_moe_refit(model)
+    for bucket in buckets:
+        model.load_weights([dict(bucket)], allow_partial_loading=True)
+    finalize_moe_refit(model)

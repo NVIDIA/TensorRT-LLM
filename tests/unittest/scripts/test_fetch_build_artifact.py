@@ -55,6 +55,40 @@ LAYOUT_PATH = f"{BUILD_DIR}/TensorRT-LLM.tar.gz"
 OTHER_FILE = "tensorrt_llm-1.2.0-cp312-cp312-linux_x86_64.whl"
 LEGACY_PATH = f"sw-tensorrt-generic/{LAYOUT_PATH}"
 SYNOPSIS = "fetch_build_artifact.sh [--properties | --exists] <artifact-path> [<dest-file>]"
+LIST_SYNOPSIS = "fetch_build_artifact.sh --list <directory-path>"
+SECONDARY_OPTIONAL_SYNOPSIS = (
+    "fetch_build_artifact.sh --secondary-optional [--exists] <artifact-path> [<dest-file>]"
+)
+SECONDARY_OPTIONAL_LIST_SYNOPSIS = (
+    "fetch_build_artifact.sh --secondary-optional --list <directory-path>"
+)
+
+RESULTS_DIR = "llm-artifacts/LLM/main/L0_MergeRequest_PR/1234/test-results"
+# The children of a run's test-results/ on each location, in the storage API's order; a name that
+# ends in "/" is a folder. aws holds four files and urm five, as after a failed upload to aws.
+RESULTS = {
+    "aws": [
+        "results-A10-PyTorch-1.tar.gz",
+        "results-A10-PyTorch-2-progress.tar.gz",
+        "logs/",
+        "doc-html-preview.tar.gz",
+        "rerun_report.html",
+    ],
+    "urm": [
+        "results-A10-PyTorch-1.tar.gz",
+        "results-A10-PyTorch-2-progress.tar.gz",
+        "results-A10-PyTorch-3.tar.gz",
+        "logs/",
+        "doc-html-preview.tar.gz",
+        "rerun_report.html",
+    ],
+}
+OTHER_LOCATION = {"aws": "urm", "urm": "aws"}
+# An earlier attempt's archive that the attempt never published.
+RESULT_FILE = f"{RESULTS_DIR}/results-A10-PyTorch-1-attempt-2.tar.gz"
+COVERAGE_DIR = "llm-artifacts/LLM/main/L0_PostMerge/88/cbts-coverage"
+COVERAGE_NAME = "cbts_pystart_report.tar.gz"
+COVERAGE_FILE = f"{COVERAGE_DIR}/{COVERAGE_NAME}"
 
 NETRC_LOGIN = "ci-reader"
 NETRC_PASSWORD = "Pw-6c1f0e93-must-never-be-printed"
@@ -140,6 +174,45 @@ def _storage_info(
         "uri": f"storage-uri/{layout_path}",
     }
     return json.dumps(info, indent=2).encode()
+
+
+def _folder_info(
+    location: str, children: list[str], layout_path: str = RESULTS_DIR
+) -> dict[str, object]:
+    """Build a storage API answer for the folder at ``layout_path``.
+
+    A child whose name ends in ``/`` is a folder. As in Artifactory's answer, the folder's own
+    ``uri`` follows its children.
+    """
+    return {
+        "repo": REPOS[location],
+        "path": f"/{layout_path}",
+        "created": "2026-10-27T08:00:00.000Z",
+        "lastModified": "2026-10-27T09:30:00.000Z",
+        "children": [
+            {"uri": f"/{name.removesuffix('/')}", "folder": name.endswith("/")} for name in children
+        ],
+        "uri": f"storage-uri/{layout_path}",
+    }
+
+
+def _artifactory_json(value: object, level: int = 0) -> str:
+    """Lay out ``value`` as Artifactory's storage API does.
+
+    An object has one member per line, indented by two spaces for each object around it, with
+    ``" : "`` between key and value. An array stays on its line: ``[ {`` ... ``}, {`` ... ``} ]``.
+    """
+    if isinstance(value, dict):
+        indent = "  " * (level + 1)
+        members = [
+            f"{indent}{json.dumps(key)} : {_artifactory_json(item, level + 1)}"
+            for key, item in value.items()
+        ]
+        return "{\n" + ",\n".join(members) + "\n" + "  " * level + "}"
+    if isinstance(value, list):
+        items = ", ".join(_artifactory_json(item, level) for item in value)
+        return f"[ {items} ]" if items else "[ ]"
+    return json.dumps(value)
 
 
 def _in_turn(*replies: Reply) -> Callable[[Request], Reply]:
@@ -241,6 +314,13 @@ class FakeArtifactory:
         info = _storage_info(location, content, _sha1(content), layout_path)
         self.routes[(location, self.storage_path(location, layout_path))] = Reply(200, info)
         self.routes[(location, self.file_path(location, layout_path))] = Reply(200, content)
+
+    def publish_folder(
+        self, location: str, children: list[str], layout_path: str = RESULTS_DIR
+    ) -> None:
+        """Serve the storage API answer for a folder; a child ending in ``/`` is a folder."""
+        info = _artifactory_json(_folder_info(location, children, layout_path)).encode()
+        self.routes[(location, self.storage_path(location, layout_path))] = Reply(200, info)
 
     def answer(self, request: Request) -> Reply:
         with self._lock:
@@ -370,6 +450,39 @@ def _rejection_message(credential_id: str) -> str:
         f"fetch_build_artifact: the Artifactory access token in credential '{credential_id}' "
         "needs renewal or lacks read permission on sw-tensorrt-llm-generic-local; an Artifactory "
         "access token for artifactory.nvidia.com is required."
+    )
+
+
+def _rejection_lines(
+    artifactory: FakeArtifactory, location: str, status: int, layout_path: str = RESULTS_DIR
+) -> list[str]:
+    """Return the lines that report a location's rejection of a request for ``layout_path``."""
+    host = artifactory.host(location)
+    if location == "urm":
+        return [
+            f"fetch_build_artifact: {host} rejected the anonymous request for {layout_path} "
+            f"(HTTP {status})."
+        ]
+    return [
+        f"fetch_build_artifact: {host} rejected the credentials for {layout_path} (HTTP {status}).",
+        _rejection_message(CREDENTIAL_ID),
+    ]
+
+
+def _listing(location: str, children: list[str] | None = None) -> list[str]:
+    """Return the lines that list the files among ``children``, by default ``RESULTS[location]``."""
+    names = RESULTS[location] if children is None else children
+    return [f"{location} {name}" for name in names if not name.endswith("/")]
+
+
+def _listed(primary: str, n: int, secondary: str, m: int, layout_path: str = RESULTS_DIR) -> str:
+    return f"fetch_build_artifact: listed {n} on {primary}, {m} on {secondary} path={layout_path}"
+
+
+def _listed_on_urm_alone(n: int, layout_path: str = RESULTS_DIR) -> str:
+    return (
+        f"fetch_build_artifact: listed {n} on urm, aws not asked while urm is the primary "
+        f"path={layout_path}"
     )
 
 
@@ -775,6 +888,67 @@ def test_persistent_checksum_mismatch_exits_4_without_fallback(helper: Helper) -
     assert result.sleeps == ["2", "4"]
 
 
+@pytest.mark.parametrize(
+    ("on_urm", "returncode"),
+    [(True, 0), (False, 2)],
+    ids=["urm-has-it", "urm-lacks-it"],
+)
+def test_file_deleted_after_its_lookup_is_absent_on_that_location(
+    helper: Helper, on_urm: bool, returncode: int
+) -> None:
+    """The lookup finds the file on aws, and the file is deleted there before its download."""
+    artifactory = helper.artifactory
+    artifactory.publish("aws", b"aws package")
+    if on_urm:
+        artifactory.publish("urm", b"urm package")
+    storage = ("aws", artifactory.storage_path("aws"))
+    stored = artifactory.routes[storage]
+    assert isinstance(stored, Reply)
+    artifactory.routes[storage] = _in_turn(stored, Reply(404))
+    del artifactory.routes[("aws", artifactory.file_path("aws"))]
+
+    result = helper.run(LEGACY_PATH, str(helper.dest))
+
+    assert result.returncode == returncode, result.stderr
+    assert artifactory.paths("aws") == [
+        artifactory.storage_path("aws"),
+        artifactory.file_path("aws"),
+        artifactory.storage_path("aws"),
+    ]
+    assert artifactory.paths("urm")[0] == artifactory.storage_path("urm")
+    assert result.sleeps == ["2"]
+    assert not helper.part.exists()
+    if on_urm:
+        assert helper.dest.read_bytes() == b"urm package"
+        assert _served_by("urm") in result.stderr.splitlines()
+    else:
+        assert not helper.dest.exists()
+
+
+def test_file_replaced_after_its_lookup_is_checked_against_its_new_sha1(helper: Helper) -> None:
+    """The lookup reports the SHA-1 of a file that is replaced before its download."""
+    artifactory = helper.artifactory
+    artifactory.publish("aws", b"new package")
+    storage = ("aws", artifactory.storage_path("aws"))
+    new_info = artifactory.routes[storage]
+    assert isinstance(new_info, Reply)
+    old_info = Reply(200, _storage_info("aws", b"old package", _sha1(b"old package")))
+    artifactory.routes[storage] = _in_turn(old_info, new_info)
+
+    result = helper.run(LEGACY_PATH, str(helper.dest))
+
+    assert result.returncode == 0, result.stderr
+    assert helper.dest.read_bytes() == b"new package"
+    assert _served_by("aws") in result.stderr.splitlines()
+    assert artifactory.paths("aws") == [
+        artifactory.storage_path("aws"),
+        artifactory.file_path("aws"),
+        artifactory.storage_path("aws"),
+        artifactory.file_path("aws"),
+    ]
+    assert result.sleeps == ["2"]
+
+
 def test_lookup_without_checksum_is_retried_then_exit_4(helper: Helper) -> None:
     artifactory = helper.artifactory
     artifactory.publish("aws", b"aws package")
@@ -939,6 +1113,396 @@ def test_properties_server_error_is_retried_then_exit_4(helper: Helper) -> None:
 
 
 # ---------------------------------------------------------------------------
+# --list
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("on_aws", "on_urm", "returncode"),
+    [(True, False, 0), (False, True, 0), (True, True, 0), (False, False, 2)],
+    ids=["primary-only", "secondary-only", "both", "neither"],
+)
+def test_list_prints_the_files_on_each_location(
+    helper: Helper, on_aws: bool, on_urm: bool, returncode: int
+) -> None:
+    artifactory = helper.artifactory
+    for location, has_folder in (("aws", on_aws), ("urm", on_urm)):
+        if has_folder:
+            artifactory.publish_folder(location, RESULTS[location])
+    aws_lines = _listing("aws") if on_aws else []
+    urm_lines = _listing("urm") if on_urm else []
+
+    result = helper.run("--list", f"sw-tensorrt-generic/{RESULTS_DIR}")
+
+    assert result.returncode == returncode, result.stderr
+    # The primary's files first, each location's in the storage API's order, and no folders.
+    assert result.stdout.splitlines() == aws_lines + urm_lines
+    absent = [f"fetch_build_artifact: neither aws nor urm has {RESULTS_DIR}."]
+    assert result.stderr.splitlines() == [
+        *(absent if returncode == 2 else []),
+        _listed("aws", len(aws_lines), "urm", len(urm_lines)),
+    ]
+    _assert_no_retry_signature(result.stderr)
+    assert [request.server for request in artifactory.requests] == ["aws", "urm"]
+    assert artifactory.paths("aws") == [artifactory.storage_path("aws", RESULTS_DIR)]
+    assert artifactory.paths("urm") == [artifactory.storage_path("urm", RESULTS_DIR)]
+    assert [request.authorization for request in artifactory.received("aws")] == [AUTHORIZATION]
+    assert [request.authorization for request in artifactory.received("urm")] == [None]
+    assert result.sleeps == []
+
+
+def test_list_prints_a_name_once_for_each_location_that_has_it(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["urm"])
+    artifactory.publish_folder("urm", RESULTS["urm"])
+
+    result = helper.run("--list", RESULTS_DIR)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == _listing("aws", RESULTS["urm"]) + _listing("urm")
+    assert result.stderr.splitlines() == [_listed("aws", 5, "urm", 5)]
+
+
+@pytest.mark.parametrize("children", [[], ["logs/"]], ids=["empty", "folders-only"])
+def test_list_folder_without_files_exits_0(helper: Helper, children: list[str]) -> None:
+    helper.artifactory.publish_folder("urm", children)
+
+    result = helper.run("--list", RESULTS_DIR)
+
+    # urm has the folder, so the listing is complete although it holds no file.
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [_listed("aws", 0, "urm", 0)]
+
+
+@pytest.mark.parametrize(
+    "directory_path",
+    [
+        f"sw-tensorrt-generic/{RESULTS_DIR}",
+        f"sw-tensorrt-generic-local/{RESULTS_DIR}",
+        RESULTS_DIR,
+        f"sw-tensorrt-generic/{RESULTS_DIR}/",
+        f"{RESULTS_DIR}/",
+    ],
+    ids=["legacy", "legacy-local", "layout", "legacy-trailing-slash", "layout-trailing-slash"],
+)
+def test_list_maps_the_directory_path(helper: Helper, directory_path: str) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["aws"])
+
+    result = helper.run("--list", directory_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == _listing("aws")
+    assert result.stderr.splitlines() == [_listed("aws", 4, "urm", 0)]
+    assert artifactory.paths("aws") == [artifactory.storage_path("aws", RESULTS_DIR)]
+    assert artifactory.paths("urm") == [artifactory.storage_path("urm", RESULTS_DIR)]
+
+
+# Layouts of a folder's storage API answer that the helper must read alike.
+JSON_LAYOUTS: dict[str, Callable[[dict[str, object]], str]] = {
+    "artifactory": _artifactory_json,
+    "compact": lambda info: json.dumps(info, separators=(",", ":")),
+    "tabs-and-crlf": lambda info: json.dumps(info, indent="\t").replace("\n", "\r\n"),
+    # Puts each child's "folder" before its "uri".
+    "sorted-keys": lambda info: json.dumps(info, indent=2, sort_keys=True),
+}
+
+
+@pytest.mark.parametrize("layout", list(JSON_LAYOUTS))
+def test_list_reads_any_json_layout(helper: Helper, layout: str) -> None:
+    artifactory = helper.artifactory
+    # JSON gives these characters a meaning, yet a name holds them unescaped.
+    children = ["results-A10 [1], {2}: retry.tar.gz", "logs/", "rerun_report.html"]
+    body = JSON_LAYOUTS[layout](_folder_info("aws", children))
+    artifactory.routes[("aws", artifactory.storage_path("aws", RESULTS_DIR))] = Reply(
+        200, body.encode()
+    )
+
+    result = helper.run("--list", RESULTS_DIR)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == _listing("aws", children)
+    assert result.stderr.splitlines() == [_listed("aws", 2, "urm", 0)]
+
+
+@pytest.mark.parametrize(
+    "directory_path",
+    [
+        "llm-artifacts",
+        "llm-artifacts/",
+        f"{RESULTS_DIR}//",
+        f"/{RESULTS_DIR}",
+        f"sw-tensorrt-llm-generic-local/{RESULTS_DIR}",
+        f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic/{RESULTS_DIR}",
+        "llm-artifacts/LLM/main/L0_MergeRequest_PR/1234/../1235/test-results",
+        f"{RESULTS_DIR}?list&deep=1",
+    ],
+)
+def test_list_unmappable_path_is_a_usage_error(helper: Helper, directory_path: str) -> None:
+    helper.artifactory.publish_folder("aws", RESULTS["aws"])
+
+    result = helper.run("--list", directory_path)
+
+    assert result.returncode == 64
+    assert f"not a directory path under llm-artifacts/: '{directory_path}'" in result.stderr
+    assert result.stdout == ""
+    assert helper.artifactory.requests == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--list",),
+        ("--list", RESULTS_DIR, "out"),
+        ("--list", "--exists", RESULTS_DIR),
+        ("--properties", "--list", RESULTS_DIR, "out"),
+    ],
+    ids=["no-path", "dest-file", "with-exists", "with-properties"],
+)
+def test_list_usage_errors_exit_64(helper: Helper, args: tuple[str, ...]) -> None:
+    helper.artifactory.publish_folder("aws", RESULTS["aws"])
+
+    result = helper.run(*args)
+
+    assert result.returncode == 64
+    assert LIST_SYNOPSIS in result.stderr
+    assert result.stdout == ""
+    assert helper.artifactory.requests == []
+
+
+def test_list_with_aws_primary_needs_a_netrc(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["aws"])
+    artifactory.publish_folder("urm", RESULTS["urm"])
+
+    result = helper.run("--list", RESULTS_DIR, ARTIFACTORY_NETRC=None)
+
+    assert result.returncode == 64
+    assert "ARTIFACTORY_NETRC is not set" in result.stderr
+    assert result.stdout == ""
+    assert artifactory.requests == []
+
+
+@pytest.mark.parametrize(
+    ("primary", "status"), [("aws", 401), ("aws", 403), ("urm", 401), ("urm", 403)]
+)
+def test_list_rejected_by_the_primary_exits_3_without_asking_the_secondary(
+    helper: Helper, primary: str, status: int
+) -> None:
+    artifactory = helper.artifactory
+    secondary = OTHER_LOCATION[primary]
+    artifactory.publish_folder(secondary, RESULTS[secondary])
+    folder = artifactory.storage_path(primary, RESULTS_DIR)
+    artifactory.routes[(primary, folder)] = Reply(status, b'{"errors": [{"status": %d}]}' % status)
+
+    result = helper.run("--list", RESULTS_DIR, LLM_ARTIFACTS_PRIMARY=primary)
+
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == _rejection_lines(artifactory, primary, status)
+    _assert_no_retry_signature(result.stderr)
+    assert artifactory.paths(primary) == [folder]
+    assert artifactory.paths(secondary) == []
+    assert result.sleeps == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_list_rejected_by_the_secondary_exits_4_with_the_primary_files(
+    helper: Helper, status: int
+) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["aws"])
+    folder = artifactory.storage_path("urm", RESULTS_DIR)
+    artifactory.routes[("urm", folder)] = Reply(status)
+
+    result = helper.run("--list", RESULTS_DIR)
+
+    assert result.returncode == 4
+    assert result.stdout.splitlines() == _listing("aws")
+    assert result.stderr.splitlines() == [
+        *_rejection_lines(artifactory, "urm", status),
+        _listed("aws", len(_listing("aws")), "urm", 0),
+    ]
+    assert artifactory.paths("urm") == [folder]
+    assert result.sleeps == []
+
+
+@pytest.mark.parametrize("on_aws", [True, False], ids=["primary-folder", "primary-absent"])
+def test_list_server_error_on_the_secondary_is_retried_then_exit_4(
+    helper: Helper, on_aws: bool
+) -> None:
+    artifactory = helper.artifactory
+    if on_aws:
+        artifactory.publish_folder("aws", RESULTS["aws"])
+    folder = artifactory.storage_path("urm", RESULTS_DIR)
+    artifactory.routes[("urm", folder)] = Reply(500)
+    aws_lines = _listing("aws") if on_aws else []
+
+    result = helper.run("--list", RESULTS_DIR)
+
+    # Without the folder on aws, the failure on urm still exits 4: it is not "absent".
+    assert result.returncode == 4
+    assert result.stdout.splitlines() == aws_lines
+    assert result.stderr.splitlines()[-1] == _listed("aws", len(aws_lines), "urm", 0)
+    _assert_no_credential_message(result.stderr)
+    assert artifactory.paths("urm") == [folder] * 3
+    assert result.sleeps == ["2", "4"]
+
+
+def test_list_transient_error_then_success(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["aws"])
+    artifactory.publish_folder("urm", RESULTS["urm"])
+    folder = artifactory.storage_path("aws", RESULTS_DIR)
+    listed = artifactory.routes[("aws", folder)]
+    assert isinstance(listed, Reply)
+    artifactory.routes[("aws", folder)] = _in_turn(Reply(503), listed)
+
+    result = helper.run("--list", RESULTS_DIR)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == _listing("aws") + _listing("urm")
+    assert result.stderr.splitlines()[-1] == _listed("aws", 4, "urm", 5)
+    assert artifactory.paths("aws") == [folder] * 2
+    assert result.sleeps == ["2"]
+
+
+@pytest.mark.parametrize(
+    "failure", ["http-500", "connection-refused", "answer-for-a-file", "truncated-answer"]
+)
+def test_list_failure_on_the_primary_still_lists_the_secondary(
+    helper: Helper, failure: str
+) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("urm", RESULTS["urm"])
+    folder = artifactory.storage_path("aws", RESULTS_DIR)
+    complete = _artifactory_json(_folder_info("aws", RESULTS["aws"]))
+    replies = {
+        "http-500": Reply(500),
+        # A file's answer has no "children".
+        "answer-for-a-file": Reply(200, _storage_info("aws", b"pkg", _sha1(b"pkg"), RESULTS_DIR)),
+        # Cut off after the last child, before the children array closes.
+        "truncated-answer": Reply(200, complete[: complete.index("} ]") + 1].encode()),
+    }
+    overrides = {}
+    if failure == "connection-refused":
+        closed = f"http://{HOSTS['aws']}:{_unused_port(HOSTS['aws'])}/artifactory/{REPOS['aws']}"
+        overrides["LLM_ARTIFACTS_AWS_URL"] = closed
+    else:
+        artifactory.routes[("aws", folder)] = replies[failure]
+
+    result = helper.run("--list", RESULTS_DIR, **overrides)
+
+    assert result.returncode == 4
+    assert result.stdout.splitlines() == _listing("urm")
+    assert result.stderr.splitlines()[-1] == _listed("aws", 0, "urm", 5)
+    _assert_no_credential_message(result.stderr)
+    assert artifactory.paths("aws") == ([] if failure == "connection-refused" else [folder] * 3)
+    assert artifactory.paths("urm") == [artifactory.storage_path("urm", RESULTS_DIR)]
+    assert result.sleeps == ["2", "4"]
+
+
+@pytest.mark.parametrize("aws", ["has-the-folder", "unreachable"])
+def test_list_with_urm_primary_lists_urm_alone(helper: Helper, aws: str) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("urm", RESULTS["urm"])
+    overrides = {"LLM_ARTIFACTS_PRIMARY": "urm"}
+    if aws == "has-the-folder":
+        artifactory.publish_folder("aws", RESULTS["aws"])
+    else:
+        # An outage of aws, which is what a rollback to urm is for.
+        closed = f"http://{HOSTS['aws']}:{_unused_port(HOSTS['aws'])}/artifactory/{REPOS['aws']}"
+        overrides["LLM_ARTIFACTS_AWS_URL"] = closed
+
+    result = helper.run("--list", RESULTS_DIR, **overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == _listing("urm")
+    assert result.stderr.splitlines() == [_listed_on_urm_alone(len(_listing("urm")))]
+    assert [request.server for request in artifactory.requests] == ["urm"]
+    assert [request.authorization for request in artifactory.received("urm")] == [None]
+    assert result.sleeps == []
+
+
+@pytest.mark.parametrize("netrc", ["unset", "empty", "missing-file", "directory"])
+def test_list_with_urm_primary_needs_no_netrc(helper: Helper, tmp_path: Path, netrc: str) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("urm", RESULTS["urm"])
+    value = {
+        "unset": None,
+        "empty": "",
+        "missing-file": str(tmp_path / "no-such-netrc"),
+        "directory": str(tmp_path),
+    }[netrc]
+
+    result = helper.run("--list", RESULTS_DIR, LLM_ARTIFACTS_PRIMARY="urm", ARTIFACTORY_NETRC=value)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == _listing("urm")
+    assert [request.server for request in artifactory.requests] == ["urm"]
+
+
+@pytest.mark.parametrize("children", [[], ["logs/"]], ids=["empty", "folders-only"])
+def test_list_with_urm_primary_and_no_files_exits_0(helper: Helper, children: list[str]) -> None:
+    helper.artifactory.publish_folder("urm", children)
+
+    result = helper.run("--list", RESULTS_DIR, LLM_ARTIFACTS_PRIMARY="urm")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [_listed_on_urm_alone(0)]
+    assert helper.artifactory.paths("aws") == []
+
+
+def test_list_with_urm_primary_lists_both_outside_test_results(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("urm", [COVERAGE_NAME], COVERAGE_DIR)
+    artifactory.publish_folder("aws", [COVERAGE_NAME], COVERAGE_DIR)
+
+    result = helper.run("--list", COVERAGE_DIR, LLM_ARTIFACTS_PRIMARY="urm")
+
+    # Only a run's test-results/ folder is listed on urm alone: urm need not hold anything else.
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [f"urm {COVERAGE_NAME}", f"aws {COVERAGE_NAME}"]
+    assert result.stderr.splitlines() == [_listed("urm", 1, "aws", 1, COVERAGE_DIR)]
+    assert [request.server for request in artifactory.requests] == ["urm", "aws"]
+
+
+def test_list_with_urm_primary_and_no_folder_on_urm_exits_2(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["aws"])
+
+    result = helper.run("--list", RESULTS_DIR, LLM_ARTIFACTS_PRIMARY="urm")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
+        f"fetch_build_artifact: urm does not have {RESULTS_DIR}.",
+        _listed_on_urm_alone(0),
+    ]
+    assert artifactory.paths("aws") == []
+    assert result.sleeps == []
+
+
+def test_list_with_urm_primary_server_error_is_retried_then_exit_4(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["aws"])
+    folder = artifactory.storage_path("urm", RESULTS_DIR)
+    artifactory.routes[("urm", folder)] = Reply(500)
+
+    result = helper.run("--list", RESULTS_DIR, LLM_ARTIFACTS_PRIMARY="urm")
+
+    assert result.returncode == 4
+    assert result.stdout == ""
+    assert result.stderr.splitlines()[-1] == _listed_on_urm_alone(0)
+    _assert_no_credential_message(result.stderr)
+    assert artifactory.paths("urm") == [folder] * 3
+    assert artifactory.paths("aws") == []
+    assert result.sleeps == ["2", "4"]
+
+
+# ---------------------------------------------------------------------------
 # LLM_ARTIFACTS_PRIMARY=urm (rollback)
 # ---------------------------------------------------------------------------
 
@@ -970,6 +1534,61 @@ def test_primary_urm_falls_back_to_aws(helper: Helper) -> None:
     assert [request.authorization for request in artifactory.received("aws")] == [AUTHORIZATION] * 2
 
 
+def test_primary_urm_falls_back_to_aws_for_a_coverage_archive(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish("aws", b"aws coverage", COVERAGE_FILE)
+
+    result = helper.run(COVERAGE_FILE, str(helper.dest), LLM_ARTIFACTS_PRIMARY="urm")
+
+    # Coverage archives go to the primary alone, so one made while aws was the primary is on aws.
+    assert result.returncode == 0, result.stderr
+    assert helper.dest.read_bytes() == b"aws coverage"
+    assert result.stderr.splitlines() == [_served_by("aws", COVERAGE_FILE)]
+
+
+@pytest.mark.parametrize("mode", ["download", "exists", "properties"])
+@pytest.mark.parametrize("aws", ["has-the-file", "unreachable"])
+def test_primary_urm_does_not_ask_aws_for_a_test_result(
+    helper: Helper, aws: str, mode: str
+) -> None:
+    artifactory = helper.artifactory
+    overrides = {"LLM_ARTIFACTS_PRIMARY": "urm"}
+    if aws == "has-the-file":
+        artifactory.publish("aws", b"aws archive", RESULT_FILE)
+    else:
+        # An outage of aws, which is what a rollback to urm is for.
+        closed = f"http://{HOSTS['aws']}:{_unused_port(HOSTS['aws'])}/artifactory/{REPOS['aws']}"
+        overrides["LLM_ARTIFACTS_AWS_URL"] = closed
+    args = {
+        "download": [f"sw-tensorrt-generic/{RESULT_FILE}", str(helper.dest)],
+        "exists": ["--exists", RESULT_FILE],
+        "properties": ["--properties", RESULT_FILE, str(helper.dest)],
+    }[mode]
+    absent = "has no properties for" if mode == "properties" else "does not have"
+
+    result = helper.run(*args, **overrides)
+
+    # A retried stage asks for earlier attempts' archives that may never have been published.
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
+        f"fetch_build_artifact: urm {absent} {RESULT_FILE}; "
+        "aws is not asked for test results while urm is the primary."
+    ]
+    assert [request.server for request in artifactory.requests] == ["urm"]
+    assert result.sleeps == []
+    assert not helper.dest.exists()
+
+
+def test_primary_urm_needs_no_netrc_for_an_absent_test_result(helper: Helper) -> None:
+    result = helper.run(
+        RESULT_FILE, str(helper.dest), LLM_ARTIFACTS_PRIMARY="urm", ARTIFACTORY_NETRC=None
+    )
+
+    assert result.returncode == 2
+    assert [request.server for request in helper.artifactory.requests] == ["urm"]
+
+
 def test_primary_urm_rejection_exits_3_without_fallback(helper: Helper) -> None:
     artifactory = helper.artifactory
     artifactory.publish("aws", b"aws package")
@@ -994,6 +1613,282 @@ def test_unknown_primary_is_a_usage_error(helper: Helper, primary: str) -> None:
     assert result.returncode == 64
     assert "LLM_ARTIFACTS_PRIMARY" in result.stderr
     assert helper.artifactory.requests == []
+
+
+# ---------------------------------------------------------------------------
+# --secondary-optional
+# ---------------------------------------------------------------------------
+
+# How the secondary fails: with an HTTP status, or "unreachable" when nothing listens on its port.
+SECONDARY_FAILURES = [500, 401, 403, "unreachable"]
+WITH_AND_WITHOUT_THE_FLAG = pytest.mark.parametrize(
+    "optional", [True, False], ids=["optional", "required"]
+)
+
+
+def _fail_urm(
+    artifactory: FakeArtifactory, failure: int | str, layout_path: str
+) -> tuple[dict[str, str], str]:
+    """Make urm fail for ``layout_path``.
+
+    Returns:
+        The environment overrides for the helper, and urm's host as the helper names it.
+    """
+    if failure == "unreachable":
+        closed = f"{HOSTS['urm']}:{_unused_port(HOSTS['urm'])}"
+        return {"LLM_ARTIFACTS_URM_URL": f"http://{closed}/artifactory/{REPOS['urm']}"}, closed
+    assert isinstance(failure, int)
+    artifactory.routes[("urm", artifactory.storage_path("urm", layout_path))] = Reply(failure)
+    return {}, artifactory.host("urm")
+
+
+def _urm_requests(artifactory: FakeArtifactory, failure: int | str, layout_path: str) -> list[str]:
+    """Return the requests that urm receives while it fails as ``_fail_urm`` arranges."""
+    attempts = {500: 3, 401: 1, 403: 1, "unreachable": 0}[failure]
+    return [artifactory.storage_path("urm", layout_path)] * attempts
+
+
+def _answer_not_required(host: str, secondary: str = "urm", layout_path: str = LAYOUT_PATH) -> str:
+    """Return the line that reports a failure of the secondary whose answer was optional."""
+    return (
+        f"fetch_build_artifact: the secondary, {secondary} ({host}), gave no answer for "
+        f"{layout_path}; its answer was not required."
+    )
+
+
+def _read_args(helper: Helper, mode: str, *, optional: bool) -> list[str]:
+    """Return the arguments that read ``LEGACY_PATH`` in ``mode``, "download" or "exists"."""
+    flags = ["--secondary-optional"] if optional else []
+    if mode == "exists":
+        return [*flags, "--exists", LEGACY_PATH]
+    return [*flags, LEGACY_PATH, str(helper.dest)]
+
+
+@WITH_AND_WITHOUT_THE_FLAG
+@pytest.mark.parametrize("mode", ["download", "exists"])
+def test_secondary_optional_absent_from_both_exits_2(
+    helper: Helper, mode: str, optional: bool
+) -> None:
+    artifactory = helper.artifactory
+
+    result = helper.run(*_read_args(helper, mode, optional=optional))
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
+        f"fetch_build_artifact: neither aws nor urm has {LAYOUT_PATH}."
+    ]
+    assert artifactory.paths("aws") == [artifactory.storage_path("aws")]
+    assert artifactory.paths("urm") == [artifactory.storage_path("urm")]
+    assert result.sleeps == []
+    assert not helper.dest.exists()
+
+
+@WITH_AND_WITHOUT_THE_FLAG
+@pytest.mark.parametrize("failure", SECONDARY_FAILURES)
+@pytest.mark.parametrize("mode", ["download", "exists"])
+def test_secondary_optional_failure_of_the_secondary_exits_5(
+    helper: Helper, mode: str, failure: int | str, optional: bool
+) -> None:
+    artifactory = helper.artifactory
+    overrides, urm_host = _fail_urm(artifactory, failure, LAYOUT_PATH)
+    refused = failure in (401, 403)
+
+    result = helper.run(*_read_args(helper, mode, optional=optional), **overrides)
+
+    assert result.returncode == (5 if optional else 4)
+    assert result.stdout == ""
+    lines = result.stderr.splitlines()
+    if refused:
+        # A refusal by the secondary is reported before the exit code is chosen.
+        assert lines[0] == _rejection_lines(artifactory, "urm", int(failure), LAYOUT_PATH)[0]
+    if optional:
+        assert lines[-1] == _answer_not_required(urm_host)
+    else:
+        assert "not required" not in result.stderr
+    # The flag changes the exit code only: urm is asked as often with it as without it.
+    assert artifactory.paths("aws") == [artifactory.storage_path("aws")]
+    assert artifactory.paths("urm") == _urm_requests(artifactory, failure, LAYOUT_PATH)
+    assert result.sleeps == ([] if refused else ["2", "4"])
+    assert not helper.dest.exists()
+    assert not helper.part.exists()
+
+
+@WITH_AND_WITHOUT_THE_FLAG
+def test_secondary_optional_failed_download_from_the_secondary_exits_5(
+    helper: Helper, optional: bool
+) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish("urm", b"urm package")
+    artifactory.routes[("urm", artifactory.file_path("urm"))] = Reply(502)
+
+    result = helper.run(*_read_args(helper, "download", optional=optional))
+
+    assert result.returncode == (5 if optional else 4)
+    if optional:
+        assert result.stderr.splitlines()[-1] == _answer_not_required(artifactory.host("urm"))
+    else:
+        assert "not required" not in result.stderr
+    assert artifactory.paths("urm").count(artifactory.file_path("urm")) == 3
+    assert result.sleeps == ["2", "4"]
+    assert not helper.dest.exists()
+    assert not helper.part.exists()
+
+
+@WITH_AND_WITHOUT_THE_FLAG
+@pytest.mark.parametrize(("status", "returncode"), [(500, 4), (401, 3), (403, 3)])
+@pytest.mark.parametrize("mode", ["download", "exists"])
+def test_secondary_optional_keeps_the_exit_code_of_a_primary_failure(
+    helper: Helper, mode: str, status: int, returncode: int, optional: bool
+) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish("urm", b"urm package")
+    lookup = artifactory.storage_path("aws")
+    artifactory.routes[("aws", lookup)] = Reply(status)
+
+    result = helper.run(*_read_args(helper, mode, optional=optional))
+
+    assert result.returncode == returncode
+    assert result.stdout == ""
+    assert "not required" not in result.stderr
+    assert artifactory.paths("aws") == [lookup] * (3 if returncode == 4 else 1)
+    assert artifactory.paths("urm") == []
+    assert not helper.dest.exists()
+
+
+def test_list_secondary_optional_lists_both_locations(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish_folder("aws", RESULTS["aws"])
+    artifactory.publish_folder("urm", RESULTS["urm"])
+
+    result = helper.run("--secondary-optional", "--list", RESULTS_DIR)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == _listing("aws") + _listing("urm")
+    assert result.stderr.splitlines() == [_listed("aws", 4, "urm", 5)]
+    assert [request.server for request in artifactory.requests] == ["aws", "urm"]
+
+
+@WITH_AND_WITHOUT_THE_FLAG
+@pytest.mark.parametrize("failure", SECONDARY_FAILURES)
+@pytest.mark.parametrize("on_aws", [True, False], ids=["primary-folder", "primary-absent"])
+def test_list_secondary_optional_failure_of_the_secondary_exits_5(
+    helper: Helper, on_aws: bool, failure: int | str, optional: bool
+) -> None:
+    artifactory = helper.artifactory
+    if on_aws:
+        artifactory.publish_folder("aws", RESULTS["aws"])
+    overrides, urm_host = _fail_urm(artifactory, failure, RESULTS_DIR)
+    aws_lines = _listing("aws") if on_aws else []
+    flags = ["--secondary-optional"] if optional else []
+
+    result = helper.run(*flags, "--list", RESULTS_DIR, **overrides)
+
+    # aws answered, with its files or with "no such folder"; only urm's answer is missing.
+    assert result.returncode == (5 if optional else 4)
+    assert result.stdout.splitlines() == aws_lines
+    lines = result.stderr.splitlines()
+    assert lines[-1] == _listed("aws", len(aws_lines), "urm", 0)
+    if optional:
+        assert lines[-2] == _answer_not_required(urm_host, layout_path=RESULTS_DIR)
+    else:
+        assert "not required" not in result.stderr
+    assert artifactory.paths("aws") == [artifactory.storage_path("aws", RESULTS_DIR)]
+    assert artifactory.paths("urm") == _urm_requests(artifactory, failure, RESULTS_DIR)
+    assert result.sleeps == ([] if failure in (401, 403) else ["2", "4"])
+
+
+@pytest.mark.parametrize("urm", ["lists", "fails"])
+@pytest.mark.parametrize(("status", "returncode"), [(500, 4), (401, 3), (403, 3)])
+def test_list_secondary_optional_keeps_the_exit_code_of_a_primary_failure(
+    helper: Helper, status: int, returncode: int, urm: str
+) -> None:
+    artifactory = helper.artifactory
+    artifactory.routes[("aws", artifactory.storage_path("aws", RESULTS_DIR))] = Reply(status)
+    if urm == "lists":
+        artifactory.publish_folder("urm", RESULTS["urm"])
+    else:
+        artifactory.routes[("urm", artifactory.storage_path("urm", RESULTS_DIR))] = Reply(500)
+
+    result = helper.run("--secondary-optional", "--list", RESULTS_DIR)
+
+    assert result.returncode == returncode
+    # A primary that rejects the request ends the listing; one that fails leaves urm's to print.
+    listed_on_urm = returncode == 4 and urm == "lists"
+    assert result.stdout.splitlines() == (_listing("urm") if listed_on_urm else [])
+    assert "not required" not in result.stderr
+    if returncode == 3:
+        assert artifactory.paths("urm") == []
+    else:
+        assert result.stderr.splitlines()[-1] == _listed(
+            "aws", 0, "urm", len(_listing("urm")) if listed_on_urm else 0
+        )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [("--properties", "--secondary-optional"), ("--secondary-optional", "--properties")],
+    ids=["properties-first", "flag-first"],
+)
+def test_secondary_optional_with_properties_is_a_usage_error(
+    helper: Helper, flags: tuple[str, ...]
+) -> None:
+    artifactory = helper.artifactory
+    artifactory.routes[("aws", artifactory.properties_path("aws"))] = Reply(200, PROPERTIES)
+
+    result = helper.run(*flags, LEGACY_PATH, str(helper.dest))
+
+    assert result.returncode == 64
+    assert "--properties and --secondary-optional cannot be combined." in result.stderr
+    assert SYNOPSIS in result.stderr
+    assert artifactory.requests == []
+    assert not helper.dest.exists()
+
+
+@pytest.mark.parametrize("case", ["download", "exists", "list", "failed-list"])
+def test_secondary_optional_changes_nothing_for_test_results_while_urm_is_primary(
+    helper: Helper, case: str
+) -> None:
+    artifactory = helper.artifactory
+    artifactory.publish("aws", b"aws archive", RESULT_FILE)
+    artifactory.publish_folder("aws", RESULTS["aws"])
+    if case == "list":
+        artifactory.publish_folder("urm", RESULTS["urm"])
+    elif case == "failed-list":
+        artifactory.routes[("urm", artifactory.storage_path("urm", RESULTS_DIR))] = Reply(500)
+    args = {
+        "download": [RESULT_FILE, str(helper.dest)],
+        "exists": ["--exists", RESULT_FILE],
+        "list": ["--list", RESULTS_DIR],
+        "failed-list": ["--list", RESULTS_DIR],
+    }[case]
+    returncode = {"download": 2, "exists": 2, "list": 0, "failed-list": 4}[case]
+
+    required = helper.run(*args, LLM_ARTIFACTS_PRIMARY="urm")
+    optional = helper.run("--secondary-optional", *args, LLM_ARTIFACTS_PRIMARY="urm")
+
+    # urm alone is asked about a run's test results, so there is no secondary whose answer could
+    # be optional.
+    assert required.returncode == returncode
+    assert optional == required
+    assert artifactory.paths("aws") == []
+
+
+def test_secondary_optional_applies_to_aws_as_the_secondary(helper: Helper) -> None:
+    artifactory = helper.artifactory
+    artifactory.routes[("aws", artifactory.storage_path("aws"))] = Reply(403)
+
+    result = helper.run(
+        "--secondary-optional", LEGACY_PATH, str(helper.dest), LLM_ARTIFACTS_PRIMARY="urm"
+    )
+
+    assert result.returncode == 5
+    assert result.stderr.splitlines() == [
+        *_rejection_lines(artifactory, "aws", 403, LAYOUT_PATH),
+        _answer_not_required(artifactory.host("aws"), "aws"),
+    ]
+    assert artifactory.paths("urm") == [artifactory.storage_path("urm")]
+    assert artifactory.paths("aws") == [artifactory.storage_path("aws")]
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1944,9 @@ def test_help(helper: Helper, flag: str) -> None:
 
     assert result.returncode == 0
     assert SYNOPSIS in result.stdout
+    assert LIST_SYNOPSIS in result.stdout
+    assert SECONDARY_OPTIONAL_SYNOPSIS in result.stdout
+    assert SECONDARY_OPTIONAL_LIST_SYNOPSIS in result.stdout
     assert helper.artifactory.requests == []
 
 
@@ -1089,7 +1987,13 @@ def test_destination_must_be_a_file_in_an_existing_directory(
 # ---------------------------------------------------------------------------
 
 # The helper's exit codes other than success, by the names that the helper defines for them.
-EXIT_CODES = {"FETCH_ABSENT": 2, "FETCH_REJECTED": 3, "FETCH_TRANSFER_FAILED": 4, "FETCH_USAGE": 64}
+EXIT_CODES = {
+    "FETCH_ABSENT": 2,
+    "FETCH_REJECTED": 3,
+    "FETCH_TRANSFER_FAILED": 4,
+    "FETCH_SECONDARY_FAILED": 5,
+    "FETCH_USAGE": 64,
+}
 
 
 @dataclass(frozen=True)
@@ -1171,7 +2075,26 @@ EXIT_CODE_READERS = [
         "jenkins/L0_Test.groovy",
         _GROOVY_DEFINITION,
         lambda text: _braced_block(text, "def boltedTarArtifactPath(")
-        + _braced_block(text, "def fetchBuildArtifact("),
+        + _braced_block(text, "def fetchBuildArtifact(")
+        + _braced_block(text, "def fetchOrUsePrefetched(")
+        + _braced_block(text, "def prefetchBuildArtifact("),
+    ),
+    # A retried stage attempt's read of the earlier attempts' test-result archives.
+    ExitCodeReader(
+        "jenkins/L0_Test.groovy",
+        _GROOVY_DEFINITION,
+        lambda text: _between(
+            text, "priorTags.each { priorTag ->", 'sh "cd ${priorDir} && tar -xzf ${tarName}"'
+        ),
+    ),
+    # Collect Test Result and the coverage step list and read a run's test results.
+    ExitCodeReader(
+        "jenkins/scripts/read_test_results.sh",
+        _SHELL_DEFINITION,
+        lambda text: "".join(
+            _braced_block(text, f"{function}() {{")
+            for function in ("list_results", "read_archive", "read_finals", "read_checkpoints")
+        ),
     ),
     # The Slurm job's download of the packaged build.
     ExitCodeReader(
@@ -1193,12 +2116,35 @@ EXIT_CODE_READERS = [
     ExitCodeReader(
         "jenkins/scripts/cbts/cbts/command/coverage/selection/artifact.py",
         _PYTHON_DEFINITION,
-        lambda text: _python_definitions(text, {"_HELPER_FAILURES", "_fetch_build_artifact"}),
+        lambda text: _python_definitions(
+            text,
+            {
+                "_HELPER_FAILURES",
+                "_helper_failure",
+                "_fetch_build_artifact",
+                "_coverage_archive_location",
+                "_download_coverage_archive",
+            },
+        ),
     ),
     ExitCodeReader(
         "scripts/get_wheel_from_package.py",
         _PYTHON_DEFINITION,
         lambda text: _python_definitions(text, {"download_package"}),
+    ),
+    # The BOLT profile store's reads: the bundle and the ref that latest.tar.gz points at.
+    ExitCodeReader(
+        "scripts/bolt/internal/artifactory.sh",
+        _SHELL_DEFINITION,
+        lambda text: _between(text, "store_read() {", 'case "${1:-}" in'),
+    ),
+    # The PLC job's lookup of an image build's image-tag map.
+    ExitCodeReader(
+        "jenkins/scripts/get_image_key_to_tag.py",
+        _PYTHON_DEFINITION,
+        lambda text: _python_definitions(
+            text, {"_HELPER_FAILURES", "_helper_failure", "_read_image_map"}
+        ),
     ),
 ]
 
@@ -1307,3 +2253,209 @@ def test_bare_number_check_passes_the_readers_named_forms(code: str) -> None:
 )
 def test_bare_number_check_ignores_digits_that_are_not_numbers(code: str) -> None:
     assert _bare_exit_codes(code, set(EXIT_CODES.values())) == []
+
+
+# ---------------------------------------------------------------------------
+# The targets of what the pipelines publish under llm-artifacts
+# ---------------------------------------------------------------------------
+
+AWS_FIRST = (
+    "The new location holds the required copy of every in-scope output and of everything under "
+    "test-results/, and urm gets a replica whose failed uploads are only logged. While urm is the "
+    "primary it is the one target. The shared library holds this rule (llmArtifactsTargets and "
+    "uploadToTargets of trtllm_utils, with tests of their own), and no pipeline file keeps a copy."
+)
+
+UPLOAD_TEST_RESULT = (
+    "def uploadTestResult(String filePattern, String directory, List targets, "
+    "boolean requiredFailureFails = true)"
+)
+
+
+def _has_line(text: str, line: str) -> bool:
+    return re.search(rf"^{re.escape(line)}$", text, re.M) is not None
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    ["jenkins/L0_Test.groovy", "jenkins/L0_MergeRequest.groovy", "jenkins/BuildDockerImage.groovy"],
+)
+def test_pipelines_publish_to_aws_first(pipeline: str) -> None:
+    text = (REPO_ROOT / pipeline).read_text()
+    assert "testResultTargets" not in text, f"{pipeline}: {AWS_FIRST}"
+    # The file defines neither the targets nor the upload to them, and lists no target itself.
+    for definition in ("def llmArtifactsTargets(", "def uploadToTargets("):
+        assert definition not in text, f"{pipeline}: {AWS_FIRST}"
+    assert "replica:" not in text, f"{pipeline}: {AWS_FIRST}"
+    # Every use of either one is the shared library's.
+    for name in ("llmArtifactsTargets", "uploadToTargets"):
+        calls = re.findall(rf"([\w.]*)\b{name}\(", text)
+        assert calls, f"{pipeline}: no call of {name}"
+        assert set(calls) == {"trtllm_utils."}, f"{pipeline}: {AWS_FIRST}"
+
+
+@pytest.mark.parametrize("pipeline", ["jenkins/L0_Test.groovy", "jenkins/L0_MergeRequest.groovy"])
+def test_pipelines_publish_test_results_through_the_targets(pipeline: str) -> None:
+    text = (REPO_ROOT / pipeline).read_text()
+    assert _has_line(text, UPLOAD_TEST_RESULT), f"{pipeline}: {AWS_FIRST}"
+    assert "trtllm_utils.uploadToTargets(" in _braced_block(text, "def uploadTestResult("), (
+        f"{pipeline}: {AWS_FIRST}"
+    )
+    # A failed upload to the required target stops before the replica unless a caller opts out.
+    for call in re.findall(r"uploadTestResult\(\"results-[^\n]*", text):
+        assert not call.rstrip(")").endswith("false"), f"{pipeline}: {AWS_FIRST}"
+
+
+# ---------------------------------------------------------------------------
+# The time limits of the pipelines' reads
+# ---------------------------------------------------------------------------
+
+OWN_TIME_LIMIT = (
+    "A read that runs out of its own time limit takes its fallback. The expiry of a timeout step "
+    "that encloses the read carries the same cause and must propagate, so the pipelines tell the "
+    "two apart by the time since the read entered its own timeout step, and a read that entered "
+    "none never counts as timed out."
+)
+
+# The reads that take a fallback when they run out of their own time limit, as the pipeline, the
+# start of the function, the variable that holds the time at which the read entered its timeout
+# step, and the variable that holds the limit in minutes.
+TIMED_READS = [
+    pytest.param(
+        "jenkins/L0_MergeRequest.groovy",
+        "def resolveBoltProfileRef(",
+        "lookupStartMs",
+        "lookupMinutes",
+        id="bolt-profile-pin",
+    ),
+    pytest.param(
+        "jenkins/L0_Test.groovy",
+        "def prefetchBuildArtifact(",
+        "startMs",
+        "timeoutMinutes",
+        id="prefetched-read",
+    ),
+    pytest.param(
+        "jenkins/L0_Test.groovy",
+        "def renderTestDB(",
+        "readStartMs",
+        "readMinutes",
+        id="cbts-test-db",
+    ),
+]
+
+
+def _code_lines(block: str) -> list[str]:
+    """The lines of Groovy code in ``block``, stripped, without blank and comment lines."""
+    lines = (line.strip() for line in block.splitlines())
+    return [line for line in lines if line and not line.startswith("//")]
+
+
+@pytest.mark.parametrize("pipeline", ["jenkins/L0_Test.groovy", "jenkins/L0_MergeRequest.groovy"])
+def test_pipelines_tell_their_own_time_limit_by_the_time_passed(pipeline: str) -> None:
+    text = (REPO_ROOT / pipeline).read_text()
+    check = "\n".join(
+        _code_lines(_braced_block(text, "def ownTimeoutExpired(e, startMs, int limitMinutes)"))
+    )
+
+    # Without a timeout step of the caller's own, and before that step's limit has passed, the
+    # answer is no, whatever interrupted the caller.
+    too_early = check.index(
+        "if (startMs == null || System.currentTimeMillis() - startMs < limitMinutes * 60000L) {"
+    )
+    no = check.index("return false", too_early)
+    # Only after that does the cause decide, which keeps an abort from counting as the time limit.
+    check.index("return e.causes.any { it.class.simpleName == 'ExceededTimeout' }", no)
+    assert check.count("return ") == 2, f"{pipeline}: {OWN_TIME_LIMIT}"
+
+
+@pytest.mark.parametrize(("pipeline", "function", "start", "limit"), TIMED_READS)
+def test_reads_take_their_fallback_only_for_their_own_time_limit(
+    pipeline: str, function: str, start: str, limit: str
+) -> None:
+    text = (REPO_ROOT / pipeline).read_text()
+    lines = _code_lines(_braced_block(text, function))
+    code = "\n".join(lines)
+    message = f"{function}: {OWN_TIME_LIMIT}"
+
+    # The read has one timeout step, and that step's limit has one value.
+    steps = [index for index, line in enumerate(lines) if re.search(r"\btimeout\(time: ", line)]
+    assert len(steps) == 1, message
+    (step,) = steps
+    entered = rf"(pipeline\.)?timeout\(time: {limit}, unit: 'MINUTES'\) \{{"
+    assert re.fullmatch(entered, lines[step]), message
+    assert len(re.findall(rf"\b{limit} = ", code)) == 1, message
+
+    # The time is null, which stands for no timeout step, from before the try block around the
+    # step until the line before the step.
+    blocks = [index for index in range(step) if lines[index] == "try {"]
+    assert blocks, message
+    assert lines.index(f"def {start} = null") < blocks[-1], message
+    assert lines[step - 1] == f"{start} = System.currentTimeMillis()", message
+    assert len(re.findall(rf"\b{start} = ", code)) == 2, message
+
+    # What interrupts the read counts as its time limit only by that time and that limit: the
+    # read does not look at the cause itself.
+    interrupted = code.index("FlowInterruptedException e) {", code.index(lines[step]))
+    assert code.count("ownTimeoutExpired(") == 1, message
+    assert "ExceededTimeout" not in code, message
+    assert ".causes" not in code, message
+
+    # The catch block starts with the decision, so the fallback is for the answer yes alone. On
+    # the answer no the read throws what interrupted it again: in the branch for no, or after a
+    # fallback that returns. The fallback opens no block of its own.
+    own = re.escape(f"ownTimeoutExpired(e, {start}, {limit})")
+    fallback = r"(?:(?!throw\b|\})[^\n]*(?<!\{)\n)"
+    thrown_again = (
+        rf"if \(!{own}\) \{{\nthrow e\n\}}\n"
+        rf"|if \({own}\) \{{\n{fallback}+\}} else \{{\nthrow e\n\}}\n"
+        rf"|if \({own}\) \{{\n{fallback}*return [^\n]*\n\}}\nthrow e\n"
+    )
+    decided_first = rf"FlowInterruptedException e\) \{{\n(?:{thrown_again})"
+    assert re.match(decided_first, code[interrupted:]), message
+
+
+def test_a_prefetched_read_without_a_time_limit_enters_no_timeout_step() -> None:
+    text = (REPO_ROOT / "jenkins/L0_Test.groovy").read_text()
+    lines = _code_lines(_braced_block(text, "def prefetchBuildArtifact("))
+
+    # Such a read notes no time, so nothing that interrupts it counts as its time limit.
+    step = lines.index("pipeline.timeout(time: timeoutMinutes, unit: 'MINUTES') {")
+    assert lines[step - 2 : step] == [
+        "if (timeoutMinutes > 0) {",
+        "startMs = System.currentTimeMillis()",
+    ], OWN_TIME_LIMIT
+
+
+def test_the_plc_lookup_of_the_image_tags_has_a_time_limit() -> None:
+    text = (REPO_ROOT / "jenkins/TensorRT_LLM_PLC.groovy").read_text()
+
+    # The lookup runs in a stage without a time limit, before the scanning stages start, and
+    # neither its query of Jenkins nor the read helper has an overall limit. The timeout command
+    # gives it one.
+    (minutes,) = re.findall(r"^IMAGE_KEY_TO_TAG_LOOKUP_MINUTES = (\d+)$", text, re.M)
+    assert int(minutes) > 0
+    read = _code_lines(_braced_block(text, "def readImageKeyToTag("))
+    (command,) = [index for index, line in enumerate(read) if "get_image_key_to_tag.py" in line]
+    assert read[command - 1 : command + 1] == [
+        "timeout --kill-after=30 ${IMAGE_KEY_TO_TAG_LOOKUP_MINUTES}m \\\\",
+        "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs} || {",
+    ]
+    # The step fails with the status that the timeout command ends with.
+    assert read[command + 1] == "status=\\$?"
+    assert 'exit "\\$status"' in read[command + 2 :]
+
+    # Running out of that limit is a failed step, which the lookup records for the scanning stages
+    # to report. An abort is not a failed lookup, and keeps propagating. A timeout step is absent:
+    # its expiry would be an interruption as well.
+    lookup = _code_lines(_braced_block(text, "def lookUpImageKeyToTag("))
+    interrupted = lookup.index("} catch (InterruptedException e) {")
+    assert lookup[interrupted - 1] == (
+        "imageKeyToTagLookup = [output: readImageKeyToTag(getImageScriptArgs())]"
+    )
+    assert lookup[interrupted + 1 : interrupted + 4] == [
+        "throw e",
+        "} catch (Exception e) {",
+        "imageKeyToTagLookup = [failure: e.toString()]",
+    ]
+    assert not re.search(r"\btimeout\(", "\n".join(read + lookup))
