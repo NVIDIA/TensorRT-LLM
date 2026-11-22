@@ -3,7 +3,9 @@
 """Opaque compiler boundaries for the static-FP8 H3 block's fused operations."""
 
 import torch
+import torch.nn.functional as F
 
+from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm.logger import logger
 
 from .kernels import gate_up_swiglu, projection_residual
@@ -95,6 +97,42 @@ def _gate_up_fake(activation, packed_weight, input_scale, weight_scale, output_s
     )
 
 
+@torch.library.custom_op("h3_fp8::gate_up_swiglu_bf16", mutates_args=(), device_types="cuda")
+def gate_up_bf16(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    unit_scale: torch.Tensor,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+) -> torch.Tensor:
+    """Fuse the original BF16 GateUp projection and plain SwiGLU."""
+    if (
+        activation.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not activation.is_contiguous()
+        or not weight.is_contiguous()
+        or activation.data_ptr() % 256
+        or weight.data_ptr() % 256
+    ):
+        return swiglu(
+            F.linear(activation, weight),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+    output = activation.new_empty((activation.shape[0], gate_up_swiglu.D_HALF))
+    gate_up_swiglu._get_compiled(activation.device.index, bf16=True)(
+        activation, weight, unit_scale, unit_scale, unit_scale, output
+    )
+    return output
+
+
+@gate_up_bf16.register_fake
+def _gate_up_bf16_fake(activation, weight, unit_scale, swiglu_limit, swiglu_alpha, swiglu_beta):
+    return activation.new_empty((activation.shape[0], gate_up_swiglu.D_HALF))
+
+
 @torch.library.custom_op("h3_fp8::down_gated_residual", mutates_args=(), device_types="cuda")
 def down(
     activation: torch.Tensor,
@@ -132,6 +170,29 @@ def _gated_residual(hidden, projected, modulation, indices, gate_column):
 
 @down.register_fake
 def _down_fake(activation, weight, input_scale, weight_scale, hidden, modulation, indices):
+    return torch.empty_like(hidden)
+
+
+@torch.library.custom_op("h3_fp8::bf16_down_gated_residual", mutates_args=(), device_types="cuda")
+def bf16_down(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    unit: torch.Tensor,
+    hidden: torch.Tensor,
+    modulation: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    gate_column = projection_residual.DOWN_GATE
+    if projection_residual.supports(activation, weight, hidden, modulation, indices, gate_column):
+        return projection_residual.run(
+            activation, weight, unit, unit, hidden, modulation, indices, gate_column
+        ).reshape_as(hidden)
+    projected = F.linear(activation, weight).reshape_as(hidden)
+    return _gated_residual(hidden, projected, modulation, indices, gate_column)
+
+
+@bf16_down.register_fake
+def _bf16_down_fake(activation, weight, unit, hidden, modulation, indices):
     return torch.empty_like(hidden)
 
 

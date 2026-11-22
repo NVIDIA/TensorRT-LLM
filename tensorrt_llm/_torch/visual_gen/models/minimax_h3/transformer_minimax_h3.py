@@ -778,7 +778,6 @@ class MiniMaxH3TransformerBlock(nn.Module):
         timestep: Optional[torch.Tensor],
         valid_seq_len: Optional[int],
     ) -> torch.Tensor:
-        hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
@@ -797,6 +796,12 @@ class MiniMaxH3TransformerBlock(nn.Module):
             4,
             3,
         )
+        return self._forward_mlp_residual(hidden_states, norm_hidden_states, mod, adaln_indices)
+
+    def _forward_mlp_residual(
+        self, hidden_states, norm_hidden_states, mod, adaln_indices
+    ) -> torch.Tensor:
+        hidden_size = hidden_states.shape[-1]
         ff_output = self.ff(
             norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
         ).reshape_as(norm_hidden_states)

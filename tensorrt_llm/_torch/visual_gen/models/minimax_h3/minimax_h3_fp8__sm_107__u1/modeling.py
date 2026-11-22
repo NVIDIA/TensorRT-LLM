@@ -13,8 +13,10 @@ the same FP8 attention; its residual stream is BF16 on both sides, as the fused 
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod
+from tensorrt_llm.logger import logger
 
 from ..minimax_h3_nvfp4__sm_107__u1_u4.kernels import fused_fp8_qk
 from ..minimax_h3_nvfp4__sm_107__u1_u4.modeling import ScenarioAttention, ScenarioTransformer
@@ -23,6 +25,8 @@ from . import ops
 from .conditioning import ConditioningCache
 from .kernels import gate_up_swiglu, projection_residual
 from .kernels.conversion import prepare
+
+_BF16_FFN_ROW_COUNTS = (37820, 38169)
 
 
 @torch.library.custom_op("h3_fp8::qk_norm_rope", mutates_args=())
@@ -164,6 +168,37 @@ class Fp8Block(MiniMaxH3TransformerBlock):
 
     attention_cls = Fp8Attention
     fp8_fused: bool = True
+    _bf16_ffn_enabled: bool = False
+
+    def _forward_mlp_residual(
+        self, hidden_states, norm_hidden_states, mod, adaln_indices
+    ) -> torch.Tensor:
+        if (
+            not self._bf16_ffn_enabled
+            or hidden_states.shape[0] != 1
+            or hidden_states.shape[1] not in _BF16_FFN_ROW_COUNTS
+            or not torch.compiler.is_compiling()
+        ):
+            return super()._forward_mlp_residual(
+                hidden_states, norm_hidden_states, mod, adaln_indices
+            )
+        ff_input = norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
+        activated = ops.gate_up_bf16(
+            ff_input,
+            self.ff.gate_up_proj.weight,
+            self._bf16_ffn_unit,
+            self.ff.swiglu_limit,
+            self.ff.swiglu_alpha,
+            self.ff.swiglu_beta,
+        )
+        return ops.bf16_down(
+            activated,
+            self.ff.down_proj.weight,
+            self._bf16_ffn_unit,
+            hidden_states,
+            mod,
+            adaln_indices,
+        )
 
     def _forward_fused_adaln(
         self,
@@ -357,6 +392,46 @@ class Fp8Transformer(ScenarioTransformer):
             projection_residual.compile_kernel(
                 device.index, 5376, width, gate, table_dtype, torch.int64
             )
+        bf16_ffn_blocks = []
+        for block in blocks:
+            if block.fp8_fused:
+                continue
+            gate_up, down = block.ff.gate_up_proj, block.ff.down_proj
+            if (
+                block._fused_adaln
+                and block.adaln_proj.linear.dtype == torch.bfloat16
+                and not block.ff.split_gate_up
+                and block.ff.activation == F.silu
+                and block.ff._is_plain_swiglu()
+                and block.ff.swiglu_limit in (None, float("inf"))
+                and all(
+                    linear.tp_size == 1
+                    and linear.weight.is_contiguous()
+                    and not linear.use_cute_dsl_bf16_gemm
+                    and not linear.use_custom_cublas_mm
+                    for linear in (gate_up, down)
+                )
+            ):
+                bf16_ffn_blocks.append(block)
+        if bf16_ffn_blocks:
+            try:
+                gate_up_swiglu._get_compiled(device.index, bf16=True)
+                projection_residual.compile_kernel(
+                    device.index,
+                    5376,
+                    14336,
+                    projection_residual.DOWN_GATE,
+                    torch.bfloat16,
+                    torch.int64,
+                    bf16=True,
+                )
+            except RuntimeError as error:
+                logger.warning(f"MiniMax-H3 is using the standard BF16 FFN: {error}")
+            else:
+                unit = torch.ones(1, dtype=torch.float32, device=device)
+                for block in bf16_ffn_blocks:
+                    block.register_buffer("_bf16_ffn_unit", unit, persistent=False)
+                    block._bf16_ffn_enabled = True
         for index, block in enumerate(fused):
             block.attn.qkv_proj.quant_method = Fp8QkvMethod()
             gate_up = block.ff.gate_up_proj
