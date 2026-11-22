@@ -164,6 +164,8 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
         "--ignore=unittest/_torch/attention/sparse/dsa "
         "--ignore unittest/_torch/attention/sparse/multi_gpu "
         '--ignore-glob="unittest/_torch/attention/sparse/msa/*" '
+        '--ignore-glob="*/parent_ignored" '
+        '--ignore-glob="*/test_*/*" '
         '--ignore-glob="*slow*"'
     )
     (test_db / "l0_b200.yml").write_text(
@@ -172,10 +174,25 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
             sort_keys=False,
         )
     )
+    (test_db / "l0_h100.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_h100": [
+                    {
+                        "condition": _CONDITION,
+                        "tests": ["unittest/_torch/attention/sparse/msa/test_proxy.py"],
+                    }
+                ],
+            },
+            sort_keys=False,
+        )
+    )
     index = YAMLIndex.load(test_db)
     for retained in (
         "unittest/_torch/attention/sparse/csa2/test_backend.py::test_foo",
         "unittest/_torch/attention/sparse/csa2/test_backend.py::test_slow",
+        "unittest/_torch/attention/sparse/test_cache.py::test_eviction",
     ):
         matches = index.find_matches_for_waive(retained)
         assert matches is not None and [(b.yaml_stem, lvl) for b, lvl in matches] == [
@@ -185,11 +202,19 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
     for excluded in (
         "unittest/_torch/attention/sparse/dsa/test_bar.py",
         "unittest/_torch/attention/sparse/multi_gpu/test_baz.py",
-        "unittest/_torch/attention/sparse/msa/test_proxy.py",
+        "unittest/_torch/attention/sparse/parent_ignored/deep/test_nested.py",
+        "unittest/_torch/attention/sparse/test_dir/test_inside.py",
         "unittest/_torch/attention/sparse/csa2/test_slow_ops.py::test_x",
     ):
         assert index.find_matches_for_waive(excluded) is None
         assert index.find_match_for_path(excluded) is None
+    # `msa/*` is excluded on l0_b200 for both test files and walked-up data files, selecting only l0_h100.
+    for msa_path in (
+        "unittest/_torch/attention/sparse/msa/test_proxy.py",
+        "unittest/_torch/attention/sparse/msa/config.yaml",
+    ):
+        path_matches = index.find_match_for_path(msa_path)
+        assert path_matches is not None and [b.yaml_stem for b, _ in path_matches] == ["l0_h100"]
 
 
 def test_waives_rule_resolves_per_block_across_file_and_directory_registrations(

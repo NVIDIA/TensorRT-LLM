@@ -4059,5 +4059,7 @@
    "test_unittests.py::test_unittests_v2[unittest/disaggregated/test_deepseek_v4_kv_transfer.py -k \"NVFP4\"]": 29.75,
    "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests -k \"not RemoteInPlaceOfDisk and not TestTeardownWithoutCudaContext\"]": 447.22,
    "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py -k \"TestTeardownWithoutCudaContext\"]": 18.77,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/dwdp]": 22.0
+   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/dwdp]": 22.0,
+   "examples/visual_gen/test_media_deps_install.py::test_visual_gen_deps_wheel_setup_restores_path_and_cleans_tempdir": 0.05,
+   "examples/visual_gen/test_media_deps_install.py::test_visual_gen_deps_timeout_falls_back_to_apt_without_probing_wheel": 0.05
 }

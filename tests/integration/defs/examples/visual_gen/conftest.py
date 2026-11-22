@@ -21,7 +21,12 @@ import tempfile
 import time
 
 import pytest
-from defs.trt_test_alternative import check_call, print_warning
+from defs.trt_test_alternative import check_call, check_output, print_warning
+
+
+def _check_output_new_session(*popenargs, **kwargs):
+    """Run check_output in its own session so timeouts terminate spawned child processes."""
+    return check_output(*popenargs, **kwargs)
 
 
 def install_ffmpeg_via_apt():
@@ -98,8 +103,11 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
                     ["-m", "pip", "install", "imageio-ffmpeg==0.8.1"],
                     timeout=240,
                 )
-                exe = llm_venv.run_output(
-                    "import imageio_ffmpeg\nprint(imageio_ffmpeg.get_ffmpeg_exe())"
+                exe = llm_venv.run_cmd(
+                    ["-c", "import imageio_ffmpeg\nprint(imageio_ffmpeg.get_ffmpeg_exe())"],
+                    caller=_check_output_new_session,
+                    print_script=False,
+                    timeout=60,
                 ).strip()
                 if exe and os.path.isfile(exe):
                     bin_dir = tempfile.mkdtemp(prefix="trtllm_ffmpeg_bin_")
@@ -108,7 +116,7 @@ def _visual_gen_deps(llm_venv, _auto_install_media_deps):
                         f"{bin_dir}{os.pathsep}{prev_path}" if prev_path else bin_dir
                     )
                     ffmpeg_available = shutil.which("ffmpeg") is not None
-            except (subprocess.SubprocessError, OSError, RuntimeError) as err:
+            except (subprocess.SubprocessError, OSError) as err:
                 print_warning(f"imageio-ffmpeg wheel setup failed, falling back to apt: {err}")
             if not ffmpeg_available:
                 install_ffmpeg_via_apt()

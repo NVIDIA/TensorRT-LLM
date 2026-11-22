@@ -170,7 +170,9 @@ def _entry_excludes_waive(entry: str, waive_id: str) -> bool:
         if not pat:
             continue
         if any(fnmatchcase(p, pat) for p in waive_paths) or (
-            pat.endswith("/*") and fnmatchcase(f"{waive_file}/_", pat)
+            not waive_file.endswith(".py")
+            and pat.endswith("/*")
+            and fnmatchcase(f"{waive_file}/_", pat)
         ):
             return True
     for m in _DESELECT_OPT_RE.finditer(norm_entry):
