@@ -2865,8 +2865,12 @@ def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
 
     executor.scheduler.schedule_request.assert_called_once()
     requests, inflight = executor.scheduler.schedule_request.call_args.args
-    assert requests == [held, healthy]
-    assert set(inflight) == ({9, held.request_id} if pp_size == 1 else {9})
+    assert requests == ([healthy] if pp_size == 1 else [held, healthy])
+    assert inflight is executor.inflight_req_ids
+    if pp_size == 1:
+        executor.scheduler.set_transfer_held_requests.assert_called_once_with([held])
+    else:
+        executor.scheduler.set_transfer_held_requests.assert_not_called()
     assert set(executor.inflight_req_ids) == {9}
 
 

@@ -10521,16 +10521,13 @@ class PyExecutor:
         inflight_request_ids = self.inflight_req_ids
         held_failures = self._held_transfer_failures()
         if held_failures and self.dist.pp_size == 1:
+            held_requests = [req for req, _ in held_failures.values()]
+            excluded_model_ids = cancelled_model_ids | {
+                req.py_request_id
+                for req in held_requests
+            }
             if self._is_kv_manager_v2:
-                inflight_request_ids = set(inflight_request_ids) | {
-                    req.request_id
-                    for req, _ in held_failures.values()
-                }
-            else:
-                excluded_model_ids = cancelled_model_ids | {
-                    req.py_request_id
-                    for req, _ in held_failures.values()
-                }
+                self.scheduler.set_transfer_held_requests(held_requests)
         scheduling_requests = [
             request for request in self.active_requests
             if request.py_request_id not in excluded_model_ids

@@ -777,6 +777,7 @@ class Sender(SenderBase):
         self._pre_cancelled_rids: dict[int, bool] = {}
         self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
         self._routed_cancels: set[int] = set()
+        self._quiescence_closed = False
         # unique_rid -> clear time, for sessions already cleared (completed, failed, cancelled or
         # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
         # parking it as an early generation-first request would leave the peer's receive
@@ -904,11 +905,23 @@ class Sender(SenderBase):
         now = time.monotonic()
         with self._sessions_lock:
             # Oldest first (see clear_session), so only expired entries are visited.
-            while self._retired_rids:
-                rid, ts = next(iter(self._retired_rids.items()))
+            expired = []
+            for rid, ts in self._retired_rids.items():
                 if now - ts <= self._RETIRED_SESSION_TTL_S:
                     break
+                expired.append(rid)
+            pending_rids = (
+                {rid for rid, _ in getattr(self, "_pending_session_quiescence", ())}
+                if expired
+                else set()
+            )
+            for rid in expired:
+                if rid in pending_rids:
+                    continue
                 del self._retired_rids[rid]
+                if rid in getattr(self, "_routed_cancels", ()):
+                    self._routed_cancels.discard(rid)
+                    self._pre_cancelled_rids.pop(rid, None)
         with self._peer_requests_lock:
             stale_rids = [
                 rid
@@ -985,7 +998,9 @@ class Sender(SenderBase):
                 with self._sessions_lock:
                     routed = unique_rid in getattr(self, "_routed_cancels", ())
                 if routed:
-                    tx_session.cancel_local(by_peer=cancelled_by_peer, report_unsubmitted_aux=False)
+                    tx_session.cancel_local(
+                        by_peer=cancelled_by_peer, report_unsubmitted_aux=False, routed=True
+                    )
                 else:
                     tx_session.cancel(by_peer=cancelled_by_peer)
                 with self._sessions_lock:
@@ -1292,16 +1307,27 @@ class Sender(SenderBase):
                 "NIXL sender rejected transfer before backend submission"
             ) from error
         if not owned:
-            # Finish each group before submitting the next so a later submission
-            # failure cannot abandon an earlier group's in-flight handle.
-            for index, member in enumerate(requests):
-                status = self._agent.submit_transfer_requests(member)
-                if index == 0 and on_submitted is not None:
-                    with disagg_diagnostics.suppress_diagnostic_errors():
-                        on_submitted()
-                if not status.wait():
-                    return False, getattr(status, "last_status_str", lambda: None)()
-            return True, None
+            with session.lock if session is not None else nullcontext():
+                if session is not None and (
+                    getattr(session, "_closed", False) is True
+                    or getattr(session, "_routed_cancelled", False) is True
+                ):
+                    raise _TransferNotSubmittedError("NIXL transfer session is closed or fenced")
+                # Reserve every group member until the worker can no longer write.
+                with task.lock:
+                    task._native_inflight += 1
+            try:
+                for index, member in enumerate(requests):
+                    status = self._agent.submit_transfer_requests(member)
+                    if index == 0 and on_submitted is not None:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            on_submitted()
+                    if not status.wait():
+                        return False, getattr(status, "last_status_str", lambda: None)()
+                return True, None
+            finally:
+                with task.lock:
+                    task._native_inflight -= 1
 
         group_status = (
             _TransferGroupStatus() if isinstance(request, _TransferRequestGroup) else None
@@ -1578,6 +1604,8 @@ class Sender(SenderBase):
                 should_abort = False
 
         if should_abort:
+            if getattr(session, "_routed_cancelled", False) is True:
+                return
             logger.warning(
                 f"_deliver_kv_to_agent: session {write_meta.unique_rid} already "
                 f"in {status.value} state; sending FAILED to receiver"
@@ -1677,6 +1705,8 @@ class Sender(SenderBase):
                     error = RuntimeError(detail)
                     task.fail(error)
             except _TransferNotSubmittedError as error:
+                if getattr(session, "_routed_cancelled", False) is True:
+                    return
                 # Backend admission failed, so local resources are safe to retire.
                 logger.error(
                     "KV transfer rejected before backend submission: "
@@ -1777,7 +1807,8 @@ class Sender(SenderBase):
             with session.lock:
                 peer = write_meta.peer_rank
                 if (
-                    peer in session._reported_aux_peer_ranks
+                    getattr(session, "_routed_cancelled", False) is True
+                    or peer in session._reported_aux_peer_ranks
                     or peer in session._direct_aux_started_peer_ranks
                 ):
                     return
@@ -1826,6 +1857,8 @@ class Sender(SenderBase):
                     agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
                     session.set_exception(f"aux transfer agent request failed: {last_status}")
             except _TransferNotSubmittedError as error:
+                if getattr(session, "_routed_cancelled", False) is True:
+                    return
                 logger.error(
                     "Aux transfer rejected before backend submission: "
                     f"unique_rid={write_meta.unique_rid} peer_rank={write_meta.peer_rank}: "
@@ -2298,7 +2331,7 @@ class Sender(SenderBase):
                 if session is not None
                 else self.ownership_enabled(context_first=routed)
             )
-            if routed:
+            if routed and not owned:
                 self._routed_cancels.add(unique_rid)
             if session is None or owned or routed:
                 self._pre_cancelled_rids.setdefault(unique_rid, True)
@@ -2306,8 +2339,10 @@ class Sender(SenderBase):
                 with self._peer_requests_lock:
                     unsubmitted = list(self._peer_requests.get(unique_rid, {}).values())
         if session is not None:
-            if owned or routed:
-                session.cancel_local(by_peer=True, report_unsubmitted_aux=owned)
+            if owned:
+                session.cancel_local(by_peer=True)
+            elif routed:
+                session.cancel_local(by_peer=True, report_unsubmitted_aux=False, routed=True)
             else:
                 session.cancel(by_peer=True)
         if routed:
@@ -2325,7 +2360,10 @@ class Sender(SenderBase):
         endpoint = self._registrar.get_peer_rank_info(instance_name, instance_rank).self_endpoint
         key = (unique_rid, instance_rank)
         with self._sessions_lock:
-            if self._shutdown_requested or key in self._pending_session_quiescence:
+            if (
+                getattr(self, "_quiescence_closed", False)
+                or key in self._pending_session_quiescence
+            ):
                 return
             marker = _SessionQuiescence(unique_rid, instance_rank, endpoint)
             self._pending_session_quiescence[key] = marker
@@ -2687,6 +2725,8 @@ class Sender(SenderBase):
             self._shutdown_requested = True
 
         self._messenger.stop()
+        with self._sessions_lock:
+            self._quiescence_closed = True
 
         for q in self._send_task_queues:
             q.put(None)
@@ -2729,6 +2769,8 @@ class Sender(SenderBase):
 class TxSession(TxSessionBase):
     cancelled_by_peer: bool = False
     """Only meaningful once the session is CANCELLED."""
+
+    _routed_cancelled: bool = False
 
     def __init__(
         self,
@@ -3052,6 +3094,8 @@ class TxSession(TxSessionBase):
             tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
             if any(getattr(task, "_native_inflight", 0) > 0 for task in tasks):
                 return False
+            if self._routed_cancelled:
+                return True
             return not any(task.status == TaskStatus.TRANSFERRING for task in tasks)
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
@@ -3062,6 +3106,7 @@ class TxSession(TxSessionBase):
     def _close_requires_drain(self) -> bool:
         return (
             getattr(self, "_enforce_physical_ownership", False)
+            or self._routed_cancelled
             or getattr(getattr(self, "_sender", None), "_recover_agent", None) is not None
         )
 
@@ -3088,12 +3133,15 @@ class TxSession(TxSessionBase):
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
         return True
 
-    def cancel_local(self, by_peer: bool = False, *, report_unsubmitted_aux: bool = True) -> bool:
+    def cancel_local(
+        self, by_peer: bool = False, *, report_unsubmitted_aux: bool = True, routed: bool = False
+    ) -> bool:
         aux_failures: list[RecvReqInfo] = []
         retirement = getattr(self, "_retirement", None)
         if retirement is not None:
             retirement.request_drain("peer cancellation" if by_peer else "cancellation")
         with self.lock:
+            self._routed_cancelled = getattr(self, "_routed_cancelled", False) or routed
             # A later cancellation must still notify peers after logical failure.
             # The logical arbiter preserves whichever outcome already committed.
             if self._terminal_status == SessionStatus.CANCELLED:
@@ -3114,10 +3162,10 @@ class TxSession(TxSessionBase):
                 and getattr(self._sender, "_recover_agent", None) is not None
             )
             for task in self.kv_tasks:
-                if task.status == TaskStatus.INIT or direct_recovery:
+                if task.status == TaskStatus.INIT or direct_recovery or routed:
                     task.fail(exc)
             if self.aux_task is not None and (
-                self.aux_task.status == TaskStatus.INIT or direct_recovery
+                self.aux_task.status == TaskStatus.INIT or direct_recovery or routed
             ):
                 self.aux_task.fail(exc)
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
@@ -4862,7 +4910,7 @@ class RxSession(RxSessionBase):
     def _terminal_aux_awaits_writers(self) -> bool:
         if self._aux_expected_writers == 0:
             return False
-        if self._terminal_status == SessionStatus.CANCELLED:
+        if self._terminal_status == SessionStatus.CANCELLED or self._legacy_quiesced_writers:
             tokens = self._kv_tasks[0]._kv_result_report_tokens
             if not tokens:
                 return len(self._aux_writer_reports) < self._aux_expected_writers
@@ -4919,8 +4967,7 @@ class RxSession(RxSessionBase):
             if self._closed or not self._cancel_notification_started or not self.has_failed():
                 return
             if not self._enforce_physical_ownership:
-                if self._terminal_status == SessionStatus.CANCELLED:
-                    self._legacy_quiesced_writers.add(peer_rank)
+                self._legacy_quiesced_writers.add(peer_rank)
                 return
             owners = [task._get_physical_owner() for task in self._kv_tasks]
             if self._aux_physical_owner is not None:
@@ -4974,7 +5021,16 @@ class RxSession(RxSessionBase):
             return True
         if self._writer_wait_expired:
             return False
-        if not any(task.reports_outstanding for task in self._kv_tasks):
+        if not any(
+            bool(
+                task._kv_result_report_tokens.keys()
+                - task._writer_reports.keys()
+                - self._legacy_quiesced_writers
+            )
+            if self._legacy_quiesced_writers and task._kv_result_report_tokens
+            else task.reports_outstanding
+            for task in self._kv_tasks
+        ):
             return False
         if self._timeout_s is None or self._timeout_s <= 0:
             return True

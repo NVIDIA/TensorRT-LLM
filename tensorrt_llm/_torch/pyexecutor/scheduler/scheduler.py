@@ -421,6 +421,9 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        pass
+
     def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
         """Requests whose KV pages a failed remote cache level took, which the
         executor must fail, with their error messages.
@@ -816,6 +819,9 @@ class MultimodalScheduler(RequestScheduler):
 
     def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
         return self.scheduler.take_lost_kv_requests()
+
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        self.scheduler.set_transfer_held_requests(requests)
 
     def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
         """Forward the local retirement probe to the wrapped scheduler.

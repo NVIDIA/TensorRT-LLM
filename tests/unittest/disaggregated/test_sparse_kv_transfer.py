@@ -225,7 +225,11 @@ def test_receiver_dispatches_host_and_device_pool_requests(
     receiver._enforce_physical_ownership = False
     receiver._get_sender_info = Mock(return_value=src)
     receiver._get_session = Mock(
-        return_value=Mock(_sender_endpoints=set(), _enforce_physical_ownership=False)
+        return_value=Mock(
+            _sender_endpoints=set(),
+            _enforce_physical_ownership=False,
+            _publication_lock=threading.Lock(),
+        )
     )
     receiver._request_sender_data = Mock()
     task = SimpleNamespace(

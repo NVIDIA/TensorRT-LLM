@@ -1593,7 +1593,8 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
 
 
 @pytest.mark.cpu_only
-def test_legacy_cancel_ack_outlives_parked_adp_routes_and_stays_rank_local() -> None:
+@pytest.mark.parametrize("failed", [False, True])
+def test_legacy_cancel_ack_outlives_parked_adp_routes_and_stays_rank_local(failed) -> None:
     rid = 97
     receiver = _ReceiverProbe()
     receiver._enforce_physical_ownership = False
@@ -1602,7 +1603,7 @@ def test_legacy_cancel_ack_outlives_parked_adp_routes_and_stays_rank_local() -> 
     rx.receive(_sole_piece())
     _publish_report_tokens(rx, ranks=(0, 1))
     rx._aux_expected_writers = 1
-    rx._kv_tasks[0].expected_transfers = 1
+    rx._kv_tasks[0].expected_transfers = 2 if failed else 1
 
     other_receiver = _ReceiverProbe()
     other_receiver._enforce_physical_ownership = False
@@ -1630,18 +1631,74 @@ def test_legacy_cancel_ack_outlives_parked_adp_routes_and_stays_rank_local() -> 
     dealer = Mock()
     dealer.send.side_effect = deliver
     sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
-    assert rx.cancel()
+    if failed:
+        rx.process_kv_agent_result(0, 0, True, AgentResult.FAILED, _KV_RESULT_REPORT_TOKEN)
+        rx.process_aux_agent_result(0, AgentResult.FAILED)
+        rx.notify_cancel()
+        assert rx.failed_receive_awaits_writers()
+    else:
+        assert rx.cancel()
     sender._handle_cancel_session([MessageType.CANCEL_SESSION, b"97", b"gen", b"0"])
     assert sender._send_session_quiesced(sender._send_task_queues[0].get_nowait())
     sender._get_or_connect_thread_dealer.assert_called_once_with("0")
     assert not other.committed_failure
-    assert not rx.resources_drained()
-
-    rx.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
-    assert not rx.resources_drained()
-    rx.process_aux_agent_result(0, AgentResult.SUCCESS)
+    if not failed:
+        assert not rx.resources_drained()
+        rx.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+        assert not rx.resources_drained()
+        rx.process_aux_agent_result(0, AgentResult.SUCCESS)
     assert rx.resources_drained()
-    assert not rx.committed_failure
+    assert not rx.failed_receive_awaits_writers()
+    assert rx.committed_failure is failed
+    assert not rx.kv_write_verified()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("aux", [False, True])
+def test_legacy_routed_cancel_drains_admitted_writes_and_fences_late_writes(aux) -> None:
+    rid = 107
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
+    )
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
+    params = DisaggregatedParams(disagg_request_id=rid)
+    session = transfer_mod.TxSession(rid, params, sender)
+    task = transfer_mod.SendTaskBase(params)
+    if aux:
+        session.aux_task = task
+    else:
+        session.kv_tasks.append(task)
+    task.status = transfer_mod.TaskStatus.TRANSFERRING
+    request = SimpleNamespace(op=transfer_mod.TransferOp.WRITE, remote_name="gen", dst_descs=[])
+    cancel = [MessageType.CANCEL_SESSION, b"107", b"gen", b"1"]
+
+    def wait_for_write():
+        sender._shutdown_requested = True
+        sender._handle_cancel_session(cancel)
+        marker = sender._send_task_queues[0].get_nowait()
+        assert not sender._send_session_quiesced(marker)
+        assert not session.close()
+        dealer.send.assert_not_called()
+        sender._send_task_queues[0].put(marker)
+        return True
+
+    sender._agent = Mock()
+    sender._agent.submit_transfer_requests.return_value.wait.side_effect = wait_for_write
+    assert sender._submit_transfer(task, 0, request, session=session) == (True, None)
+    assert sender._send_session_quiesced(sender._send_task_queues[0].get_nowait())
+    dealer.send.assert_called_once_with([MessageType.SESSION_QUIESCED, b"0", b"107"])
+
+    with pytest.raises(transfer_mod._TransferNotSubmittedError):
+        sender._submit_transfer(task, 1, request, session=session)
+    sender._agent.submit_transfer_requests.assert_called_once_with(request)
+    assert session.close()
+    sender._retired_rids[rid] -= sender._RETIRED_SESSION_TTL_S + 1
+    sender.sweep_stale_req_infos()
+    assert rid not in sender._routed_cancels
+    assert rid not in sender._pre_cancelled_rids
 
 
 @pytest.mark.cpu_only

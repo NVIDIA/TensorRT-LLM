@@ -429,6 +429,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Generation requests paused in place (GEN slot preemption).
         self._gen_paused_ids: frozenset[int] = frozenset()
+        self._transfer_held_requests: RequestList = []
         self._gen_resumed_ids: frozenset[int] = frozenset()
         self._gen_preemption_enabled = False
 
@@ -609,6 +610,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        held_requests, self._transfer_held_requests = self._transfer_held_requests, []
         self._sched_iter += 1
         self._reuse_probes.clear()
         # A level that failed since the last pass (e.g. in an eviction WRITE during prepare_resources) has already
@@ -625,7 +627,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
-        ) = self._schedule_loop(active_requests, inflight_request_ids)
+        ) = self._schedule_loop(
+            active_requests, inflight_request_ids, transfer_held_requests=held_requests
+        )
         # One that failed in this pass, e.g. in an eviction WRITE that the C++ retried past it, before the batch runs.
         self._raise_if_lockstep_remote_level_failed()
 
@@ -658,6 +662,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.remote_tail_phase = phase
         self._remote_tail_context_ids = context_request_ids
         self._remote_tail_generation_ids = generation_request_ids
+
+    def set_transfer_held_requests(self, requests: RequestList) -> None:
+        self._transfer_held_requests = requests
 
     def set_gen_paused_ids(
         self, request_ids: frozenset[int], resumed_ids: frozenset[int] = frozenset()
@@ -710,6 +717,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         inflight_request_ids,
         *,
         defer_remote_tail_context=False,
+        transfer_held_requests=(),
         prefix_waits=None,
     ):
         scheduled_ctx: RequestList = []
@@ -792,6 +800,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
         if self.peft_cache_manager is not None:
+            # Transfer-held requests still pin resident adapters but cannot contribute prefixes.
+            for req in transfer_held_requests:
+                if req.lora_task_id is not None and self.peft_cache_manager.is_task_cached_device(
+                    req.lora_task_id
+                ):
+                    budget.pre_claim_peft(req)
             for req in active_requests:
                 if req.state_value == self._gen_to_complete_state_value or (
                     self._gen_preemption_enabled
