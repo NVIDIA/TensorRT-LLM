@@ -118,6 +118,41 @@ def _e4m3x2_to_f32(pair):
 
 
 @triton.jit
+def _e2m1x4_to_e4m3x4(nibbles):
+    """The four E2M1 nibbles in the low 16 bits, element 0 lowest, as four E4M3 bytes (exact, the
+    lookup kernel's widening)."""
+    # lo/hi: E4M3 magnitudes of the E2M1 codes 0-7 (0, 0.5, 1, 1.5, 2, 3, 4, 6), picked by prmt.
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b32 lo, hi, sel, sign, bit, out;
+            mov.b32 lo, 0x3C383000;
+            mov.b32 hi, 0x4C484440;
+            and.b32 sel, $1, 0x7777;
+            prmt.b32 out, lo, hi, sel;
+            and.b32 sign, $1, 0x8;
+            shl.b32 sign, sign, 4;
+            and.b32 bit, $1, 0x80;
+            shl.b32 bit, bit, 8;
+            or.b32 sign, sign, bit;
+            and.b32 bit, $1, 0x800;
+            shl.b32 bit, bit, 12;
+            or.b32 sign, sign, bit;
+            and.b32 bit, $1, 0x8000;
+            shl.b32 bit, bit, 16;
+            or.b32 sign, sign, bit;
+            or.b32 $0, out, sign;
+        }
+        """,
+        constraints="=r,r",
+        args=[nibbles],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _bf16x2(a, b, scale):
     """BF16 bits of ``a * scale`` (low half) and ``b * scale`` (high half), as the lookup kernel."""
     lo = _mul_rn(a, scale).to(tl.bfloat16).to(tl.uint16, bitcast=True).to(tl.uint32)
@@ -247,9 +282,11 @@ def _owner_push_kernel(
     DIM: tl.constexpr,
     QB: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    MXFP4: tl.constexpr,
 ):
     """Rows ``(source rank, token, local head)`` in that order; ``weight_ptr``: int32 view of the
-    E4M3 rows (four values per word); ``gathered_ptr``: int64 ``[NR, NL, max_count, H]``
+    E4M3 rows (four values per word), or with ``MXFP4`` of the E2M1 rows (eight per word, widened
+    exactly to E4M3); ``gathered_ptr``: int64 ``[NR, NL, max_count, H]``
     bucket-local indices; ``counts_ptr``: int32 ``[NR]``; a pushed row lands at packet
     ``rows_base + (token * H + head) * DIM / 2`` of its source rank's buffer. The values are the
     lookup kernel's: E4M3 times ``2 ** (code - 127)`` (code 0 is ``2 ** -127``, 255 is NaN) in
@@ -280,8 +317,20 @@ def _owner_push_kernel(
         ).to(tl.int64)
         index += tl.load(offsets_ptr + local_head, mask=valid, other=0).to(tl.int64)
         gather = valid[:, None]
-        w = tl.load(weight_ptr + index[:, None] * WORDS + words[None, :], mask=gather, other=0)
-        w = w.to(tl.uint32, bitcast=True)
+        if MXFP4:
+            pairs = tl.load(
+                weight_ptr + index[:, None] * (WORDS // 2) + tl.arange(0, WORDS // 2)[None, :],
+                mask=gather,
+                other=0,
+            ).to(tl.uint32, bitcast=True)
+            # Each word's first four elements, then its last four: the E4M3 words in element order.
+            w = tl.reshape(
+                tl.join(_e2m1x4_to_e4m3x4(pairs & 0xFFFF), _e2m1x4_to_e4m3x4(pairs >> 16)),
+                (BLOCK_R, WORDS),
+            )
+        else:
+            w = tl.load(weight_ptr + index[:, None] * WORDS + words[None, :], mask=gather, other=0)
+            w = w.to(tl.uint32, bitcast=True)
         code = tl.load(
             scale_ptr + index[:, None] * BLOCKS + blocks[None, :], mask=gather, other=127
         ).to(tl.int32)
@@ -519,6 +568,7 @@ class EngramAdpExchange:
             DIM=self.dim,
             QB=table.block_size,
             BLOCK_R=_PUSH_ROWS,
+            MXFP4=table.mxfp4,
             num_warps=4,
         )
 

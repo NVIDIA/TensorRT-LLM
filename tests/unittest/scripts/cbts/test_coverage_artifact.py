@@ -34,7 +34,7 @@ from typing import Optional
 from unittest import mock
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.command.coverage.selection import artifact
@@ -128,74 +128,6 @@ class CoverageArtifactTest(unittest.TestCase):
                 "conflict",
             )
 
-    def test_resolve_pin_reuses_matching_artifactory_pin(self) -> None:
-        commit = "a" * 40
-        pin = {
-            "version": artifact.PIN_VERSION,
-            "pr_number": "18802",
-            "pr_head": "b" * 40,
-            "coverage_db_build": 42,
-            "coverage_db_commit": commit,
-        }
-        with (
-            mock.patch.object(artifact, "_get", return_value=(200, json.dumps(pin).encode())),
-            mock.patch.object(artifact, "select_tarball") as select_latest,
-        ):
-            plan = artifact.resolve_pin(
-                "unused.json",
-                "18802",
-                "b" * 40,
-                "pr-base",
-            )
-
-        self.assertEqual(
-            plan,
-            {
-                "status": "ready",
-                "build": 42,
-                "commit": commit,
-                "pin_upload_required": False,
-            },
-        )
-        select_latest.assert_not_called()
-
-    def test_resolve_pin_creates_file_for_jenkins_upload(self) -> None:
-        commit = "a" * 40
-        selection = {"build": 42, "commit": commit}
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            mock.patch.object(artifact, "_get", return_value=(404, None)),
-            mock.patch.object(artifact, "select_tarball", return_value=selection),
-        ):
-            pin_path = Path(temp_dir) / artifact.PIN_NAME
-            plan = artifact.resolve_pin(
-                str(pin_path),
-                "18802",
-                "b" * 40,
-                "pr-base",
-            )
-            pin = json.loads(pin_path.read_text())
-
-        self.assertEqual(pin["coverage_db_build"], 42)
-        self.assertEqual(pin["coverage_db_commit"], commit)
-        self.assertTrue(plan["pin_upload_required"])
-        self.assertEqual(plan["pin_path"], str(pin_path))
-        self.assertEqual(
-            plan["pin_target"],
-            f"{artifact.PIN_BASE}/18802/{'b' * 40}/",
-        )
-
-    def test_resolve_pin_declines_invalid_or_unavailable_pin(self) -> None:
-        with mock.patch.object(artifact, "_get", return_value=(200, b"{}")):
-            invalid = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
-        with mock.patch.object(artifact, "_get", return_value=(None, None)):
-            unavailable = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
-
-        self.assertEqual(invalid["status"], "declined")
-        self.assertIn("invalid coverage DB pin", invalid["decline_reason"])
-        self.assertEqual(unavailable["status"], "declined")
-        self.assertIn("pin query failed", unavailable["decline_reason"])
-
     def test_resolve_pin_cli_prints_upload_plan(self) -> None:
         plan = {
             "status": "ready",
@@ -280,9 +212,10 @@ class CoverageArtifactTest(unittest.TestCase):
         select_latest.assert_not_called()
 
 
-# build_info.txt and the coverage archives are read with jenkins/scripts/fetch_build_artifact.sh,
-# which applies the read rule and is tested in tests/unittest/scripts/test_fetch_build_artifact.py.
-# These tests check how artifact.py runs it and what it makes of each exit status.
+# build_info.txt, the coverage archives, and the pins are read with
+# jenkins/scripts/fetch_build_artifact.sh, which applies the read rule and is tested in
+# tests/unittest/scripts/test_fetch_build_artifact.py. These tests check how artifact.py runs it
+# and what it makes of each exit status.
 def _build_info_path(build: int) -> str:
     return f"{artifact.ARTIFACT_BASE}/{build}/{artifact.BUILD_INFO_NAME}"
 
@@ -311,6 +244,11 @@ _BUILD_INFO = f"commit={_COMMIT}\nbranch=main\ndate=2026-10-16 00:00:00 UTC\n"
 _ARTIFACT_PATH = _build_info_path(_BUILD)
 _LAYOUT_PATH = f"llm-artifacts/LLM/main/L0_PostMerge/{_BUILD}/{artifact.BUILD_INFO_NAME}"
 _X86_ARCHIVE, _SBSA_ARCHIVE = artifact.ARCH_TARBALL_NAMES
+_PR_NUMBER = "18802"
+_PR_HEAD = "b" * 40
+# The folder Jenkins uploads a new pin of the PR head to, and the read of the pin in it.
+_PIN_TARGET = f"{artifact.PIN_BASE}/{_PR_NUMBER}/{_PR_HEAD}/"
+_PIN_READ = (f"{_PIN_TARGET}{artifact.PIN_NAME}",)
 _CREDENTIAL_ID = "aws-artifactory-credentials"
 _HELPER_ENVIRONMENT = ("LLM_ARTIFACTS_PRIMARY", "ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
 _STUB_URL_BASE = "https://artifacts.example/artifactory"
@@ -927,56 +865,267 @@ def test_probe_stops_when_the_primary_location_rejects_a_read(
     assert helper_stub.reads == reads
 
 
-def test_resolve_pin_exits_1_when_the_primary_location_rejects_a_read(
-    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+_PIN = {
+    "version": artifact.PIN_VERSION,
+    "pr_number": _PR_NUMBER,
+    "pr_head": _PR_HEAD,
+    "coverage_db_build": 42,
+    "coverage_db_commit": _COMMIT,
+}
+
+
+@pytest.fixture
+def no_direct_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail a test in which artifact.py requests a URL itself: a pin is read with the helper."""
+
+    def get(url: str, headers: Optional[dict] = None) -> None:
+        raise AssertionError(f"{url} was requested without the read helper")
+
+    monkeypatch.setattr(artifact, "_get", get)
+
+
+def _hold_pin(helper_stub: _HelperStub, tmp_path: Path, content: bytes) -> None:
+    """Make `content` the pin that the helper downloads for the PR head."""
+    held = tmp_path / "held_pin.json"
+    held.write_bytes(content)
+    helper_stub.serves(*_PIN_READ, held)
+
+
+def _resolve_pin(pin_path: Path) -> dict:
+    return artifact.resolve_pin(str(pin_path), _PR_NUMBER, _PR_HEAD, "pr-base")
+
+
+def _declined_pin_plan(reason: str) -> dict:
+    return {
+        "status": "declined",
+        "compatibility": "unknown",
+        "decline_reason": f"coverage tier declined: {reason}",
+        "pin_upload_required": False,
+    }
+
+
+@pytest.mark.usefixtures("no_direct_requests")
+def test_resolve_pin_reuses_the_pin_read_through_the_helper(
+    helper_stub: _HelperStub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
-    helper_stub.exits_with(3)
-    _set_newest_build(monkeypatch, 3)
-    monkeypatch.setattr(artifact, "merge_base", lambda head: "c" * 40)
-    monkeypatch.setattr(artifact, "_get", lambda url, headers=None: (404, None))
+    _hold_pin(helper_stub, tmp_path, json.dumps(_PIN).encode())
+    select_latest = mock.Mock()
+    monkeypatch.setattr(artifact, "select_tarball", select_latest)
     pin_path = tmp_path / artifact.PIN_NAME
 
-    result = CliRunner().invoke(
+    plan = _resolve_pin(pin_path)
+
+    assert plan == {
+        "status": "ready",
+        "build": 42,
+        "commit": _COMMIT,
+        "pin_upload_required": False,
+    }
+    [call] = helper_stub.calls
+    artifact_path, dest = call["args"]
+    assert artifact_path == f"{artifact.PIN_BASE}/{_PR_NUMBER}/{_PR_HEAD}/{artifact.PIN_NAME}"
+    assert Path(dest).name == artifact.PIN_NAME
+    # A temporary file, removed once read; no pin is written for Jenkins to upload.
+    assert not Path(dest).parent.exists()
+    assert not pin_path.exists()
+    select_latest.assert_not_called()
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "helper stderr" in captured.err
+
+
+@pytest.mark.usefixtures("no_direct_requests")
+def test_resolve_pin_creates_file_for_jenkins_upload_when_neither_location_has_a_pin(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    helper_stub.exits_with(2, *_PIN_READ)
+    monkeypatch.setattr(
+        artifact, "select_tarball", lambda pr_base_commit: {"build": 42, "commit": _COMMIT}
+    )
+    pin_path = tmp_path / artifact.PIN_NAME
+
+    plan = _resolve_pin(pin_path)
+
+    assert json.loads(pin_path.read_text()) == _PIN
+    assert plan == {
+        "status": "ready",
+        "build": 42,
+        "commit": _COMMIT,
+        "pin_upload_required": True,
+        "pin_path": str(pin_path),
+        "pin_target": _PIN_TARGET,
+    }
+    assert helper_stub.reads == [_PIN_READ]
+
+
+@pytest.mark.usefixtures("no_direct_requests")
+@pytest.mark.parametrize(
+    "content",
+    (
+        b"",
+        b"{}",
+        b"not JSON",
+        b"\xff",
+        json.dumps({**_PIN, "pr_head": "c" * 40}).encode(),
+    ),
+    ids=("empty", "no-fields", "not-json", "not-utf-8", "another-head"),
+)
+def test_resolve_pin_declines_an_invalid_pin(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: bytes
+) -> None:
+    _hold_pin(helper_stub, tmp_path, content)
+    select_latest = mock.Mock()
+    monkeypatch.setattr(artifact, "select_tarball", select_latest)
+    pin_path = tmp_path / artifact.PIN_NAME
+
+    assert _resolve_pin(pin_path) == _declined_pin_plan("invalid coverage DB pin")
+
+    # The pin that the PR head has is not replaced.
+    assert helper_stub.reads == [_PIN_READ]
+    select_latest.assert_not_called()
+    assert not pin_path.exists()
+
+
+@pytest.mark.usefixtures("no_direct_requests")
+def test_resolve_pin_declines_when_the_pin_transfer_fails(
+    helper_stub: _HelperStub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    helper_stub.exits_with(4, *_PIN_READ)
+    select_latest = mock.Mock()
+    monkeypatch.setattr(artifact, "select_tarball", select_latest)
+    pin_path = tmp_path / artifact.PIN_NAME
+
+    assert _resolve_pin(pin_path) == _declined_pin_plan("coverage DB pin query failed")
+
+    # One call: the helper retries transient failures itself. Whether the PR head has a pin is
+    # unknown, so none is created.
+    assert helper_stub.reads == [_PIN_READ]
+    select_latest.assert_not_called()
+    assert not pin_path.exists()
+    errors = capfd.readouterr().err.splitlines()
+    assert any(
+        line.startswith("[artifact] ") and _PIN_READ[0] in line and "exit status 4" in line
+        for line in errors
+    )
+
+
+@pytest.mark.usefixtures("no_direct_requests")
+@pytest.mark.parametrize(
+    ("status", "error"),
+    (
+        (3, artifact.ArtifactAuthError),
+        (64, artifact.ArtifactError),
+        (127, artifact.ArtifactError),
+    ),
+    ids=("rejected", "usage-error", "other"),
+)
+def test_resolve_pin_raises_on_other_helper_failures(
+    helper_stub: _HelperStub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: int,
+    error: type[artifact.ArtifactError],
+) -> None:
+    helper_stub.exits_with(status, *_PIN_READ)
+    select_latest = mock.Mock()
+    monkeypatch.setattr(artifact, "select_tarball", select_latest)
+    pin_path = tmp_path / artifact.PIN_NAME
+
+    with pytest.raises(artifact.ArtifactError) as raised:
+        _resolve_pin(pin_path)
+
+    assert type(raised.value) is error
+    assert _PIN_READ[0] in str(raised.value)
+    assert f"exit status {status}" in str(raised.value)
+    assert helper_stub.reads == [_PIN_READ]
+    select_latest.assert_not_called()
+    assert not pin_path.exists()
+
+
+def _resolve_pin_on_the_command_line(pin_path: Path) -> Result:
+    """Run --resolve-pin as L0_MergeRequest does for a PR head."""
+    return CliRunner().invoke(
         artifact.main,
-        ["--resolve-pin", str(pin_path), "--pr-number", "18802", "--pr-head", "b" * 40],
+        ["--resolve-pin", str(pin_path), "--pr-number", _PR_NUMBER, "--pr-head", _PR_HEAD],
         catch_exceptions=False,
     )
+
+
+# The pin's read is the command's first helper call. When neither location has a pin, the probe
+# of the recent builds follows it.
+@pytest.mark.usefixtures("no_direct_requests")
+@pytest.mark.parametrize(
+    ("pin_status", "reads"),
+    (
+        (3, [_PIN_READ]),
+        (2, [_PIN_READ, _exists_read(3, _X86_ARCHIVE)]),
+    ),
+    ids=("pin", "coverage-archive"),
+)
+def test_resolve_pin_exits_1_when_the_primary_location_rejects_a_read(
+    helper_stub: _HelperStub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pin_status: int,
+    reads: list[tuple[str, ...]],
+) -> None:
+    helper_stub.exits_with(3)
+    helper_stub.exits_with(pin_status, *_PIN_READ)
+    _set_newest_build(monkeypatch, 3)
+    monkeypatch.setattr(artifact, "merge_base", lambda head: "c" * 40)
+    pin_path = tmp_path / artifact.PIN_NAME
+
+    result = _resolve_pin_on_the_command_line(pin_path)
 
     # L0_MergeRequest declines the coverage tier when the command prints no plan.
     assert result.exit_code == 1
     assert result.stdout == ""
-    assert len(helper_stub.calls) == 1
+    # Every later read would be rejected the same way.
+    assert helper_stub.reads == reads
     errors = [line for line in result.stderr.splitlines() if line.startswith("[artifact] ")]
-    assert any(
-        _archive_path(3, _X86_ARCHIVE) in line and "exit status 3" in line for line in errors
-    )
+    assert any(reads[-1][-1] in line and "exit status 3" in line for line in errors)
     assert not pin_path.exists()
 
 
+@pytest.mark.usefixtures("no_direct_requests")
+@pytest.mark.parametrize(
+    ("pin_status", "reads", "reason"),
+    (
+        (4, [_PIN_READ], "coverage DB pin query failed"),
+        (
+            2,
+            [_PIN_READ, *(_exists_read(build, _X86_ARCHIVE) for build in (3, 2, 1))],
+            "coverage DB could not be resolved",
+        ),
+    ),
+    ids=("pin", "coverage-archives"),
+)
 def test_resolve_pin_prints_a_declined_plan_when_every_transfer_fails(
-    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    helper_stub: _HelperStub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pin_status: int,
+    reads: list[tuple[str, ...]],
+    reason: str,
 ) -> None:
     helper_stub.exits_with(4)
+    helper_stub.exits_with(pin_status, *_PIN_READ)
     _set_newest_build(monkeypatch, 3)
     monkeypatch.setattr(artifact, "merge_base", lambda head: "c" * 40)
-    monkeypatch.setattr(artifact, "_get", lambda url, headers=None: (404, None))
     pin_path = tmp_path / artifact.PIN_NAME
 
-    result = CliRunner().invoke(
-        artifact.main,
-        ["--resolve-pin", str(pin_path), "--pr-number", "18802", "--pr-head", "b" * 40],
-        catch_exceptions=False,
-    )
+    result = _resolve_pin_on_the_command_line(pin_path)
 
     # L0_MergeRequest declines the coverage tier on this plan, as it does when the command exits 1.
     assert result.exit_code == 0
-    assert json.loads(result.stdout) == {
-        "status": "declined",
-        "compatibility": "unknown",
-        "decline_reason": "coverage tier declined: coverage DB could not be resolved",
-        "pin_upload_required": False,
-    }
-    assert len(helper_stub.calls) == 3
+    assert json.loads(result.stdout) == _declined_pin_plan(reason)
+    assert helper_stub.reads == reads
     assert not pin_path.exists()
 
 

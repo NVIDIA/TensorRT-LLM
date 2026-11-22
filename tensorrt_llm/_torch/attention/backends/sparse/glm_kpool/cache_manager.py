@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     _host_slots_to_device,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -52,6 +54,20 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
 from .params import glm_kpool_cache_row_dim
+
+
+def glm_kpool_index_state_dim(model_config: ModelConfig) -> int:
+    """BF16 values per token of a sparse layer's indexer cache row.
+
+    A built model whose kernels lay the row out differently declares the width in
+    ``model_config.extra_attrs["glm_kpool_index_state_dim"]``; otherwise the row is
+    :func:`glm_kpool_cache_row_dim` of the checkpoint's ``index_head_dim``.
+    """
+    declared = model_config.extra_attrs.get("glm_kpool_index_state_dim")
+    if declared is not None:
+        return int(declared)
+    config = unwrap_glm5_next_text_config(model_config.pretrained_config)
+    return glm_kpool_cache_row_dim(int(config.index_head_dim))
 
 
 class Glm5NextCacheManager(MambaHybridCacheManagerV2):
@@ -75,6 +91,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         sparse_layer_ids: Sequence[int] | None = None,
         index_state_dim: int = 0,
         kda_replay_num_spec: int | None = None,
+        kda_draft_records: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -85,7 +102,12 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 Defaults to every attention layer in ``layer_mask``: each GLM
                 attention layer, including appended MTP layers, is sparse.
             index_state_dim: BF16 width of one indexer cache row, see
-                :func:`glm_kpool_cache_row_dim`.
+                :func:`glm_kpool_index_state_dim`.
+            kda_draft_records: With the KDA replay caches, keep the records of
+                every draft of the last verify round (``kda_state_tok``) in
+                place of the k / g / v / beta caches, for a model whose verify
+                replays from them. The replay buffers then share the
+                recurrent-state slot.
         """
         # Set before super().__init__: the base _build_base_config calls
         # _extra_buffers_per_layer, which reads both of these.
@@ -109,6 +131,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
+        self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
         self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
@@ -124,7 +147,9 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             return None
         if num_spec is not None:
             self._kda_replay = KDAReplayState(
-                num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
+                num_spec,
+                stochastic_rounding=self._mamba_ssm_stochastic_rounding,
+                draft_records=self._requested_draft_records,
             )
             self._kda_replay.validate(self._state_layout)
             return self._kda_replay
@@ -133,11 +158,6 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
-
-    @override
-    def _managed_replay_state(self) -> None:
-        """``KDAReplayRegion`` declares, binds and indexes the KDA replay state."""
-        return None
 
     @override
     def _region_providers(self) -> Sequence[RegionProvider]:
@@ -161,6 +181,17 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return buffers
 
     @override
+    def page_table_spec(self) -> PageTableSpec:
+        """The KDA replay caches are generation-local and never move."""
+        spec = super().page_table_spec()
+        if self._kda_replay_region is None:
+            return spec
+        return replace(
+            spec,
+            untransferred_roles=spec.untransferred_roles | self._kda_replay_region.roles,
+        )
+
+    @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         roles = super().get_disagg_ignored_roles()
         if self._kda_replay_region is not None:
@@ -181,13 +212,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         super()._setup_model_state()
 
     @property
-    @override
     def replay_layer_group_id(self) -> int | None:
         region = self._kda_replay_region
         return region.group_id if region is not None else None
 
     @property
-    @override
     def cuda_replay_state_indices(self) -> torch.Tensor:
         region = self._kda_replay_region
         return (
@@ -196,7 +225,6 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             else self.cuda_state_indices
         )
 
-    @override
     def get_replay_state_indices(
         self, request_ids: list[int] | None = None
     ) -> torch.Tensor | list[int]:
@@ -363,7 +391,14 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
-        return KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
+        seed_bytes = KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
+        if kwargs.get("kda_draft_records", False):
+            # With the records, the replay state shares every recurrent-state slot
+            # (KDAReplayState.replay_shares_state_slot).
+            return seed_bytes + KDAReplayState.estimate_bytes_per_slot(
+                model_config, mapping, **kwargs
+            )
+        return seed_bytes
 
     @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
@@ -528,12 +563,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             sum(layer_mask), mapping, spec_config=spec_config, layer_mask=layer_mask
         )
         local_attention_layers = sum(attention_mask[layer] for layer in local_layers)
-        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         # All GLM full-attention layers, including MTP layers, use the sparse indexer.
         # Indexer pages remain BF16 even when latent KV is quantized.
         index_bytes_per_token = (
             local_attention_layers
-            * glm_kpool_cache_row_dim(int(config.index_head_dim))
+            * glm_kpool_index_state_dim(model_config)
             * torch.bfloat16.itemsize
         )
         state_config = kv_cache_config.mamba_state_config

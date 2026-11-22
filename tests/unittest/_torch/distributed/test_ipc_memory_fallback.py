@@ -115,6 +115,9 @@ class FakeCudart:
         self.allocated.discard(ptr)
         return (FakeCudaError.cudaSuccess,)
 
+    def cudaGetDevice(self):
+        return FakeCudaError.cudaSuccess, 0
+
     def cudaIpcGetMemHandle(self, ptr):
         handle = FakeIpcMemHandle()
         handle.reserved = b"\xab" * 64
@@ -183,6 +186,8 @@ def _run(mapping, cudart, dist, open_ipc=True):
     # Nothing for __del__ to release, so it never reaches the real CUDA runtime
     # with the fake pointers once the patches are gone.
     assert not ipc_memory.open_ipc
+    # Nothing is allocated, so the memory reports must not count it either.
+    assert id(ipc_memory) not in IpcMemory._live
     return ipc_memory
 
 
@@ -198,6 +203,12 @@ def test_ipc_ok(mapping):
         assert ipc_memory.local_ptr != 0
         assert all(ptr != 0 for ptr in ipc_memory.peer_ptrs)
         assert len(cudart.opened) == TP_SIZE - 1
+
+        assert IpcMemory._live[id(ipc_memory)] == (
+            0,
+            "IPC peer buffers",
+            _ipc_utils._ipc_aligned_size(1 << 20),
+        )
 
         # Release the fake buffers while the fake runtime is still in place.
         IpcMemory.close_ipc_memory(mapping, ipc_memory.peer_ptrs)

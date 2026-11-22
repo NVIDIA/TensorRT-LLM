@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     release_consumed_mm_items,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
@@ -1139,7 +1140,7 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently() -
     executor._disagg_coordinator = Mock()
     executor.gather_all_responses = False
     executor.dist = SimpleNamespace(rank=0)
-    executor.result_wait_queues = {}
+    executor._response_channel = ResponseChannel()
 
     executor._do_terminate_request(request)
 
@@ -1285,6 +1286,7 @@ def _make_v2_multimodal_scheduler(
     manager.enable_block_reuse = False
     manager.enable_joint_kv_cache_reuse = False
     manager._has_cp_helix = False
+    manager.max_beam_width = 1
     manager.kv_cache_map = {}
 
     def prepare_context(request):

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -125,7 +126,7 @@ __device__ __forceinline__ void g2sField(
     }
 }
 
-template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1>
+template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1, bool SCALAR_FIELD1 = false>
 __device__ __forceinline__ int g2sAllFields(
     HelixFieldInfo const* fieldInfo, int dataIndex, uint8_t* shmemBase, uint64_t* smemBar, int laneId)
 {
@@ -144,7 +145,7 @@ __device__ __forceinline__ int g2sAllFields(
         }
         else
         {
-            constexpr int kCopySize = sizeof(float2);
+            constexpr int kCopySize = SCALAR_FIELD1 ? sizeof(float) : sizeof(float2);
             int const field1Size = getFieldSize(fieldInfo[1]);
             for (int offset = laneId * kCopySize; offset < field1Size; offset += WARP_SIZE * kCopySize)
             {
@@ -181,7 +182,7 @@ __device__ __forceinline__ void s2gField(
     }
 }
 
-template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1>
+template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1, bool SCALAR_FIELD1 = false>
 __device__ __forceinline__ void s2gAllFields(
     HelixFieldInfo const* fieldInfo, int dataIndex, uint8_t* shmemBase, int laneId)
 {
@@ -201,12 +202,13 @@ __device__ __forceinline__ void s2gAllFields(
         }
         else
         {
-            constexpr int kCopySize = sizeof(float2);
+            constexpr int kCopySize = SCALAR_FIELD1 ? sizeof(float) : sizeof(float2);
             int const field1Size = getFieldSize(fieldInfo[1]);
             for (int fieldOffset = laneId * kCopySize; fieldOffset < field1Size; fieldOffset += WARP_SIZE * kCopySize)
             {
-                auto const* srcPtr = reinterpret_cast<float2 const*>(shmemBase + offset + fieldOffset);
-                auto* dstPtr = reinterpret_cast<float2*>(getPtr(fieldInfo[1], dataIndex) + fieldOffset);
+                using FieldValue = std::conditional_t<SCALAR_FIELD1, float, float2>;
+                auto const* srcPtr = reinterpret_cast<FieldValue const*>(shmemBase + offset + fieldOffset);
+                auto* dstPtr = reinterpret_cast<FieldValue*>(getPtr(fieldInfo[1], dataIndex) + fieldOffset);
                 *dstPtr = *srcPtr;
             }
             __syncwarp();
@@ -333,7 +335,7 @@ __host__ __device__ __forceinline__ int computeProtoTransferSize(HelixFieldInfo 
 // Main All-to-All Kernel
 // ============================================================================
 
-template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1>
+template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1, bool SCALAR_FIELD1 = false>
 __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 {
     extern __shared__ uint8_t allWarpShmem[];
@@ -410,7 +412,7 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             int dataIndex = entryIdx * params.cpSize + peerRank;
 
             // Load data from global to shared, then arrive on barrier
-            int loadedSize = g2sAllFields<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>(
+            int loadedSize = g2sAllFields<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1, SCALAR_FIELD1>(
                 params.sendFields, dataIndex, shmem, &allWarpSmemBar[group], laneId);
             uint64_t arriveState = mbarrier_arrive_expect_tx(&allWarpSmemBar[group], laneId == 0 ? loadedSize : 0);
 
@@ -454,11 +456,23 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
                     // Field 1 sits at getFieldSize(field 0), not at
                     // align_up(..., 16) as computeTotalUnpackedSize computes;
                     // they agree only because field 0 is 16-byte aligned.
-                    auto* stats = reinterpret_cast<float2*>(shmem + field0Size);
-                    int const statsCount = getFieldSize(params.sendFields[1]) / static_cast<int>(sizeof(float2));
-                    for (int i = 0; i < statsCount; ++i)
+                    if (params.lseStats)
                     {
-                        stats[i] = make_float2(-INFINITY, 0.F);
+                        auto* lse = reinterpret_cast<float*>(shmem + field0Size);
+                        int const count = getFieldSize(params.sendFields[1]) / static_cast<int>(sizeof(float));
+                        for (int i = 0; i < count; ++i)
+                        {
+                            lse[i] = -INFINITY;
+                        }
+                    }
+                    else
+                    {
+                        auto* stats = reinterpret_cast<float2*>(shmem + field0Size);
+                        int const count = getFieldSize(params.sendFields[1]) / static_cast<int>(sizeof(float2));
+                        for (int i = 0; i < count; ++i)
+                        {
+                            stats[i] = make_float2(-INFINITY, 0.F);
+                        }
                     }
                 }
                 __syncwarp();
@@ -550,7 +564,8 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             __syncwarp();
 
             // note: fields are already unpacked in shared memory
-            s2gAllFields<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>(params.recvFields, dataIndex, shmem, laneId);
+            s2gAllFields<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1, SCALAR_FIELD1>(
+                params.recvFields, dataIndex, shmem, laneId);
             // wait for data to be read from shared memory
             cp_async_bulk_wait_group_read<0>();
 
@@ -579,7 +594,7 @@ struct hash_cache_key
     }
 };
 
-template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1>
+template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1, bool SCALAR_FIELD1 = false>
 std::tuple<int, int, int> computeChannelAndGroupCount(int cpSize, HelixFieldInfo const* fields)
 {
     static std::unordered_map<std::tuple<int, int, int>, std::tuple<int, int, int>, hash_cache_key> cache;
@@ -611,7 +626,7 @@ std::tuple<int, int, int> computeChannelAndGroupCount(int cpSize, HelixFieldInfo
     // Set shared memory attribute if needed
     if (totalDynamicShmemSize > 48 * 1024)
     {
-        TLLM_CUDA_CHECK(cudaFuncSetAttribute(helixAllToAllKernel<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>,
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(helixAllToAllKernel<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1, SCALAR_FIELD1>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, totalDynamicShmemSize));
     }
 
@@ -635,14 +650,15 @@ std::tuple<int, int, int> computeChannelAndGroupCount(int cpSize, HelixFieldInfo
 // Host Launch Function
 // ============================================================================
 
-template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1>
+template <bool ALLOW_VARIABLE_FIELD1, bool USE_BULK_FIELD1, bool SCALAR_FIELD1 = false>
 void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t stream)
 {
     int maxChannelCount = computeHelixMaxChannelCount(params.cpSize);
     TLLM_CHECK_WITH_INFO(params.maxChannelCount == maxChannelCount,
         "maxChannelCount %d does not match computed maxChannelCount %d", params.maxChannelCount, maxChannelCount);
     auto [channelCount, groupCountPerCta, totalDynamicShmemSize]
-        = computeChannelAndGroupCount<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>(params.cpSize, params.sendFields);
+        = computeChannelAndGroupCount<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1, SCALAR_FIELD1>(
+            params.cpSize, params.sendFields);
     if (params.channelCount > 0)
     {
         channelCount = params.channelCount;
@@ -656,7 +672,7 @@ void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t str
     // and receiver)
     int ctaPerChannel = ceil_div(params.cpSize, groupCountPerCta);
 
-    auto* kernel_instance = &helixAllToAllKernel<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>;
+    auto* kernel_instance = &helixAllToAllKernel<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1, SCALAR_FIELD1>;
     cudaLaunchConfig_t config;
     config.gridDim = dim3(ctaPerChannel, channelCount, 2);
     config.blockDim = dim3(WARP_SIZE, groupCountPerCta);
@@ -721,6 +737,16 @@ void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableFi
         constexpr uintptr_t kBulkCopyAlignment = 16;
         constexpr uintptr_t kFallbackCopyAlignment = sizeof(float2);
         int const field1Size = getFieldSize(params.sendFields[1]);
+        if (params.lseStats
+            && (!isFieldAlignedForCopy(params.sendFields[1], kFallbackCopyAlignment)
+                || !isFieldAlignedForCopy(params.recvFields[1], kFallbackCopyAlignment)))
+        {
+            TLLM_CHECK_WITH_INFO(isFieldAlignedForCopy(params.sendFields[1], sizeof(float))
+                    && isFieldAlignedForCopy(params.recvFields[1], sizeof(float)),
+                "LSE field must contain aligned float32 values");
+            launchHelixAllToAllImpl<true, false, true>(params, stream);
+            return;
+        }
         TLLM_CHECK_WITH_INFO(field1Size % sizeof(float2) == 0, "Variable field 1 must contain whole float2 values");
         TLLM_CHECK_WITH_INFO(isFieldAlignedForCopy(params.sendFields[1], kFallbackCopyAlignment)
                 && isFieldAlignedForCopy(params.recvFields[1], kFallbackCopyAlignment),

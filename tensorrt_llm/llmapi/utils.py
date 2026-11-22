@@ -229,18 +229,46 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def split_hf_repo_subfolder(model: str) -> Tuple[str, Optional[str]]:
+    """Split ``owner/repo/sub/dir`` into the repo id and the subfolder.
+
+    A model that ships a component in a subfolder of its repository, such as a
+    speculative drafter, names it as ``owner/repo/<subfolder>``. Anything that
+    is not a relative path of at least three parts is returned unchanged.
+    """
+    parts = model.split("/")
+    if (len(parts) < 3 or model.startswith((".", "/")) or not all(parts)
+            or any(part in (".", "..") for part in parts)):
+        return model, None
+    return "/".join(parts[:2]), "/".join(parts[2:])
+
+
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
-    ignore_patterns = ["original/**/*"]
+    """Download a HuggingFace repo, or only ``<subfolder>`` of ``owner/repo/<subfolder>``.
+
+    Returns the local directory of the repo, or of the subfolder.
+    """
+    repo_id, subfolder = split_hf_repo_subfolder(model)
+    if subfolder is None:
+        download_kwargs = {"ignore_patterns": ["original/**/*"]}
+    else:
+        download_kwargs = {"allow_patterns": [f"{subfolder}/*"]}
     logger.info(f"Downloading model {model} from HuggingFace")
     with get_file_lock(model):
         hf_folder = snapshot_download(
-            model,
+            repo_id,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-            ignore_patterns=ignore_patterns,
             revision=revision,
-            tqdm_class=DisabledTqdm)
+            tqdm_class=DisabledTqdm,
+            **download_kwargs)
     logger.info(f"Finished downloading model {model} from HuggingFace")
-    return Path(hf_folder)
+    model_dir = Path(hf_folder)
+    if subfolder is not None:
+        model_dir = model_dir / subfolder
+        if not model_dir.is_dir():
+            raise FileNotFoundError(
+                f"HuggingFace repo {repo_id} has no subfolder {subfolder!r}.")
+    return model_dir
 
 
 def download_hf_partial(model: str,

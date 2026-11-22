@@ -58,6 +58,7 @@ MARKER_LIST_IN_TEST = [" TIMEOUT"]
 # AST validation defaults
 _DEFAULT_TEST_LISTS_DIR = "tests/integration/test_lists"
 _DEFAULT_TEST_BASE_DIR = "tests/integration/defs"
+_COLLECTION_TRACEBACK_DELAY_SECONDS = 15 * 60
 # Paths whose tests are generated dynamically — skip AST validation
 _EXCLUDED_PATH_PREFIXES = ("perf/", )
 
@@ -971,15 +972,19 @@ def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
 
 
 def _run_collection_pytest(llm_src: str, test_list: str) -> None:
-    """Run pytest --co with the collection bindings stub plugin."""
+    """Run stubbed pytest collection with a one-shot diagnostic traceback."""
     defs_dir = os.path.join(llm_src, "tests", "integration", "defs")
     with tempfile.TemporaryDirectory(
             prefix="trtllm-collection-models-root-") as models_root:
         subprocess.run(
             [
                 sys.executable,
-                "-m",
-                "pytest",
+                "-u",
+                "-c",
+                "import faulthandler, runpy; "
+                "faulthandler.dump_traceback_later("
+                f"{_COLLECTION_TRACEBACK_DELAY_SECONDS}, repeat=False, exit=False); "
+                "runpy.run_module('pytest', run_name='__main__')",
                 "-p",
                 "stubify_bindings",
                 f"--test-list={test_list}",

@@ -11,13 +11,17 @@ from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.speculative.dflash import (
     DFlashSpecMetadata,
-    DFlashWorker,
     dflash_allocated_ctx_limit,
     dflash_noise_block_embedding,
 )
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpecMetadata, SpecWorkerBase
 from tensorrt_llm.logger import logger
+
+
+def _tp_mode_name(module) -> Optional[str]:
+    """The name of a projection's tensor-parallel mode (``COLUMN``, ``ROW``), or None."""
+    return getattr(getattr(module, "tp_mode", None), "name", None)
 
 
 @functools.lru_cache(maxsize=None)
@@ -48,22 +52,25 @@ def capture_view(
         or spec_metadata.captured_hidden_states is None
     ):
         return None
-    i = spec_metadata._layer_to_idx.get(layer_id)
-    if i is None:
+    if not spec_metadata.is_layer_capture(layer_id):
         return None
+    # The capture buffer holds the captured layers in the order of the (sorted) layers_to_capture.
+    i = spec_metadata.layers_to_capture.index(layer_id)
     return spec_metadata.captured_hidden_states[
         :num_tokens, i * spec_metadata.hidden_size : (i + 1) * spec_metadata.hidden_size
     ]
 
 
-class KimiK3DFlashWorker(DFlashWorker):
+class KimiK3DSparkWorker(DSparkWorker):
     # Set by a Kimi K3 target running its decode kernels: decode steps then run the acceptance and the drafter's
-    # inputs as trtllm::k3_spec_accept, keep the target logits vocabulary-sharded and write the drafter's context
-    # K/V with trtllm::k3_ctx_kv.
+    # inputs as trtllm::k3_spec_accept, keep the target and draft logits vocabulary-sharded (the draft chain as
+    # trtllm::k3_markov) and write the drafter's context K/V with trtllm::k3_ctx_kv.
     k3_decode = False
     # The generation-step preparation below reads _ctx_block_tables, not the
     # rebased view, so every drafter slot numbers from 0.
     _ctx_reads_rebased_view = False
+    # Whether this step's block logits are the Kimi K3 decode path's vocabulary shard (see ``_draft_block_logits``).
+    _k3_sharded_block_logits = False
 
     def _mask_token_id(self, draft_model) -> int:
         """The drafter's mask token id, resolved once."""
@@ -112,9 +119,8 @@ class KimiK3DFlashWorker(DFlashWorker):
             or logits.shape[0] != num_gens * (K + 1)
         ):
             return False
-        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import (
-            op as accept_op,
-        )
+        # The kernel's support predicates and workspace: metadata reads; the kernel runs through the op.
+        from .kernels.k3_spec_accept import op as accept_op
 
         embed = draft_model.draft_model_full.model.embed_tokens
         return accept_op.supports(
@@ -217,31 +223,31 @@ class KimiK3DFlashWorker(DFlashWorker):
         """
         if not self.k3_decode:
             return None
-        from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import (
-            op as accept_op,
-        )
+        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
+
+        # The kernel's support predicates and workspace: metadata reads; the kernel runs through the op.
+        from .kernels.k3_spec_accept import op as accept_op
 
         mapping = self.mapping
         if getattr(self, "_k3_shard_head", None) is not lm_head:
             reason = self._k3_logits_shard_reason(lm_head)
-            if reason is None and MNNVLAllReduce.allreduce_mnnvl_workspaces.get(mapping) is None:
+            if reason is None and not mnnvl_workspace.has_shared_lamport_workspace(mapping):
                 # Not kept: re-checked on later steps, since the model's MNNVL workspace may not exist yet.
                 logger.info_once(
-                    "DFlash: the target logits are all-gathered (the TP all-reduces are not MNNVL)",
+                    "DSpark: the target logits are all-gathered (the TP all-reduces are not MNNVL)",
                     key="dflash_k3_logits_no_mnnvl",
                 )
                 return None
             if mapping is not None and mapping.tp_size > 1:
                 if reason is None:
                     logger.info(
-                        f"DFlash: decode-step target logits stay vocabulary-sharded ({lm_head.weight.shape[0]} "
+                        f"DSpark: decode-step target logits stay vocabulary-sharded ({lm_head.weight.shape[0]} "
                         f"columns per rank); trtllm::k3_spec_accept exchanges the row maxima, and a request's "
                         f"logits post-processors get them gathered"
                     )
                 else:
                     logger.info_once(
-                        f"DFlash: the target logits are all-gathered ({reason})", key=reason
+                        f"DSpark: the target logits are all-gathered ({reason})", key=reason
                     )
             self._k3_shard_head, self._k3_shard_ok = lm_head, reason is None
         if not self._k3_shard_ok:
@@ -270,10 +276,8 @@ class KimiK3DFlashWorker(DFlashWorker):
     def _k3_logits_shard_reason(self, lm_head):
         """Why the target logits cannot stay vocabulary-sharded under this configuration and head (None if they can,
         given an MNNVL workspace for the mapping, which ``_k3_logits_shard`` checks)."""
-        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import (
-            op as accept_op,
-        )
-        from tensorrt_llm._torch.modules.linear import TensorParallelMode
+        # The kernel's support predicates and workspace: metadata reads; the kernel runs through the op.
+        from .kernels.k3_spec_accept import op as accept_op
 
         mapping = self.mapping
         if mapping is None or mapping.tp_size <= 1:
@@ -281,7 +285,7 @@ class KimiK3DFlashWorker(DFlashWorker):
         if mapping.enable_attention_dp or mapping.has_cp() or mapping.has_pp():
             return "attention DP, CP or PP"
         if (
-            getattr(lm_head, "tp_mode", None) != TensorParallelMode.COLUMN
+            _tp_mode_name(lm_head) != "COLUMN"
             or not getattr(lm_head, "gather_output", False)
             or getattr(lm_head, "padding_size", 0) != 0
             or getattr(lm_head, "gather_output_sizes", None) is not None
@@ -348,8 +352,9 @@ class KimiK3DFlashWorker(DFlashWorker):
         ok = cache.get(n)
         if ok is not None:
             return ok
-        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import op as ctx_op
-        from tensorrt_llm._torch.models import modeling_dflash
+        # The kernel's support predicates and pool view: metadata reads; the kernel runs through the op.
+        from .kernels.k3_ctx_kv import op as ctx_op
+        from .ops.attention import k3_draft_rope
 
         reason = None
         if not (self._ctx_paged and self._ctx_block_tables is not None):
@@ -367,10 +372,7 @@ class KimiK3DFlashWorker(DFlashWorker):
                 reason = "K/V bias or context input norm"
             elif draft_model._k_norm_stacked is None or not draft_model._is_neox:
                 reason = "no k_norm or not NeoX RoPE"
-            elif (
-                modeling_dflash._flashinfer_rope is None
-                or draft_model._get_cos_sin_cache().shape[1] != 64
-            ):
+            elif not k3_draft_rope.available() or draft_model._get_cos_sin_cache().shape[1] != 64:
                 reason = "RoPE is not flashinfer's full-rotary fp32 cache"
             elif view is None or self._ctx_kv_buf[0].size(1) != 2:
                 reason = "the layers' pools are not K/V views of one allocation"
@@ -387,7 +389,7 @@ class KimiK3DFlashWorker(DFlashWorker):
                 self._k3_ctx_pool = view
         ok = reason is None
         if not ok:
-            logger.info(f"DFlash: context K/V on the Python path ({reason})")
+            logger.info(f"DSpark: context K/V on the Python path ({reason})")
         if not torch.cuda.is_current_stream_capturing():
             cache[n] = ok
         return ok
@@ -399,8 +401,10 @@ class KimiK3DFlashWorker(DFlashWorker):
         ``_ctx_len += num_accepted`` (clamped); returns the context length each request may advertise."""
         if self._k3_ctx_pool is None or self._k3_ctx_pool_bound != self._k3_ctx_pool_key():
             raise RuntimeError("k3_ctx_kv: the context pool was rebound after the path was chosen")
+        from .ops.attention.k3_ctx_kv import k3_ctx_kv
+
         flat, layer_off, page_stride, kv_stride, head_stride = self._k3_ctx_pool
-        return torch.ops.trtllm.k3_ctx_kv(
+        return k3_ctx_kv(
             projected.contiguous(),
             draft_model._fused_kv_weight,
             draft_model._k_norm_stacked,
@@ -424,19 +428,14 @@ class KimiK3DFlashWorker(DFlashWorker):
             draft_model._num_kv_heads,
         )
 
-    def _on_acceptance(
-        self, accepted_tokens, num_accepted_tokens, attn_metadata, spec_metadata
-    ) -> None:
-        """Called with this step's acceptance when ``k3_spec_accept`` produced it (a hook for drafter families)."""
-
     def _k3_accept(self, logits, attn_metadata, spec_metadata, draft_model, shard=None):
         """``trtllm::k3_spec_accept`` for a step ``_k3_accept_applies`` accepted: the acceptance, the block table,
         the KDA replay record, kv_lens + 1 and the drafter's inputs in one launch. ``shard``: the exchange
         workspace and first column when ``logits`` are this rank's vocabulary shard (``_k3_logits_shard``).
         Returns (accepted tokens, num accepted, {rewind, bonus, qpos, cpos, noise})."""
-        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import (
-            op as accept_op,
-        )
+        # The kernel's support predicates and workspace: metadata reads; the kernel runs through the op.
+        from .kernels.k3_spec_accept import op as accept_op
+        from .ops.spec.k3_spec_accept import k3_spec_accept
 
         num_gens = attn_metadata.num_seqs
         K = spec_metadata.runtime_draft_len
@@ -444,7 +443,7 @@ class KimiK3DFlashWorker(DFlashWorker):
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
         force = 0.0 if is_warmup else float(self.force_num_accepted_tokens)
         mode, _, _ = accept_op.force_mode(force, K)
-        if mode == accept_op._kernel_module().FORCE_FRAC:
+        if accept_op.force_draws_from_pool(mode):
             self._ensure_force_accept_rng_state(logits.device)
             pool, counter = self._force_accept_rng_pool, self._force_accept_rng_counter
         else:
@@ -457,7 +456,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             pool, counter = dummy_rng
         embed = draft_model.draft_model_full.model.embed_tokens
         assert self._batch_to_slot_buffer is not None
-        accepted, num_acc, rewind, bonus, qpos, cpos, noise = torch.ops.trtllm.k3_spec_accept(
+        accepted, num_acc, rewind, bonus, qpos, cpos, noise = k3_spec_accept(
             logits,
             spec_metadata.draft_tokens.reshape(num_gens, K),
             attn_metadata.draft_kv_cache_block_offsets,
@@ -523,7 +522,7 @@ class KimiK3DFlashWorker(DFlashWorker):
         if step_shard is not None:
             if step_shard[0] is not logits:
                 raise RuntimeError(
-                    "DFlash: the target logits are not the vocabulary shard target_logits returned"
+                    "DSpark: the target logits are not the vocabulary shard target_logits returned"
                 )
             shard = step_shard[1]
 
@@ -543,10 +542,24 @@ class KimiK3DFlashWorker(DFlashWorker):
 
         # Lazy init buffers and attach worker reference for prepare()
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        previous_ctx_len = self._ctx_len
         self._lazy_init_ctx_buffers(
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )
         spec_metadata._dflash_worker = self
+        if (
+            self._ctx_unified_cache
+            and self._ctx_len is not previous_ctx_len
+            and spec_metadata.request_ids
+        ):
+            # New buffers clear request slots; seed them before generation.
+            spec_metadata.prepare()
+        if (
+            self._ctx_unified_cache
+            and spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._reseed_warmup_generation_slots(spec_metadata)
         # A decode step of the supported mode runs the acceptance and the drafter's inputs as one kernel
         # (trtllm::k3_spec_accept), which also decodes the block table below.
         if shard is None:
@@ -559,7 +572,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             fused_accept = True
         else:
             raise RuntimeError(
-                "DFlash: the target logits are vocabulary-sharded, but the fused acceptance no longer applies"
+                "DSpark: the target logits are vocabulary-sharded, but the fused acceptance no longer applies"
             )
         # Before any store: prefill and decode both address pages through it.
         # Returning False here means an empty batch -- the missing-offsets case
@@ -698,18 +711,6 @@ class KimiK3DFlashWorker(DFlashWorker):
                     draft_model, gen_logits, inputs, spec_metadata
                 )
 
-                # DFlash 2: replace the independent per-position picks with one
-                # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "has_candidate_selector", False):
-                    gen_logits = self._apply_dflash2_selector(
-                        draft_model,
-                        gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["first_prev_tokens"],
-                        spec_metadata,
-                    )
-                    vocab_size = gen_logits.shape[-1]
-
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits,
                     spec_metadata,
@@ -831,9 +832,18 @@ class KimiK3DFlashWorker(DFlashWorker):
         attn_metadata: AttentionMetadata,
         spec_metadata,
     ) -> torch.Tensor:
-        """fp32 logits of the block positions over the full vocabulary (the TP lm_head all-gathers its
-        shards). A drafter family whose refinement and draft sampler reduce across ranks themselves may
-        return this rank's vocabulary shard instead."""
+        """This rank's bf16 shard of the block logits when ``k3_markov`` takes them (it converts them to fp32
+        exactly, as ``.float()`` would), from the drafter's logits processor's head kernel where it takes the rows,
+        else the head's own GEMM (``_k3_head_shard``); otherwise fp32 logits of the block positions over the full
+        vocabulary (the TP lm_head all-gathers its shards)."""
+        num_gens = gen_hidden_states.shape[0] // max(spec_metadata.runtime_draft_len, 1)
+        self._k3_sharded_block_logits = self._keep_draft_logits_sharded(
+            draft_model, spec_metadata, num_gens
+        )
+        if self._k3_sharded_block_logits:
+            return self._k3_head_shard(
+                draft_model.logits_processor, draft_model.lm_head, gen_hidden_states
+            )
         return draft_model.logits_processor(
             gen_hidden_states, draft_model.lm_head, attn_metadata, True
         )
@@ -1037,6 +1047,10 @@ class KimiK3DFlashWorker(DFlashWorker):
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )
+                if self._ctx_unified_cache:
+                    self._check_block_within_allocation(
+                        num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                    )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
@@ -1075,11 +1089,6 @@ class KimiK3DFlashWorker(DFlashWorker):
             ),
             "ctx_rows_start": self._ctx_rows_start(num_contexts, num_gens),
         }
-
-
-class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
-    # Whether this step's block logits are the Kimi K3 decode path's vocabulary shard (see ``_draft_block_logits``).
-    _k3_sharded_block_logits = False
 
     def _apply_dspark_markov_bias(
         self,
@@ -1141,11 +1150,10 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         """
         if not self.k3_decode:
             return False
-        from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_markov import (
-            op as k3_markov_op,
-        )
-        from tensorrt_llm._torch.modules.linear import TensorParallelMode
+        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
+
+        # The kernel's support predicates and workspace: metadata reads; the kernel runs through the op.
+        from .kernels.k3_markov import op as k3_markov_op
 
         mapping = self.mapping
         lm_head = getattr(draft_model, "lm_head", None)
@@ -1156,19 +1164,19 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             or mapping.tp_size <= 1
             or mapping.enable_attention_dp
             or spec_metadata.wants_advanced_draft_sampling
-            or getattr(lm_head, "tp_mode", None) != TensorParallelMode.COLUMN
+            or _tp_mode_name(lm_head) != "COLUMN"
             or not getattr(lm_head, "gather_output", False)
             or getattr(lm_head, "bias", None) is not None
             or lm_head.weight.dtype != torch.bfloat16
             or draft_model.markov_w1.dtype != torch.bfloat16
             or draft_model.markov_w2.dtype != torch.bfloat16
             or lm_head.weight.shape[0] * mapping.tp_size != draft_model.markov_w2.shape[0]
-            or MNNVLAllReduce.allreduce_mnnvl_workspaces.get(mapping) is None
+            or not mnnvl_workspace.has_shared_lamport_workspace(mapping)
         ):
             return False
         shard = lm_head.weight.shape[0]
         block = spec_metadata.runtime_draft_len
-        rank = k3_markov_op._kernel_module().MARKOV_RANK
+        rank = k3_markov_op.markov_rank()
         if (
             not 0 < block <= k3_markov_op.WORKSPACE_MAX_BLOCK
             or draft_model.markov_w1.dim() != 2
@@ -1184,28 +1192,6 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             )
             return False
         return True
-
-    def _draft_block_logits(
-        self,
-        draft_model,
-        gen_hidden_states: torch.Tensor,
-        attn_metadata,
-        spec_metadata,
-    ) -> torch.Tensor:
-        """This rank's bf16 shard of the block logits when ``k3_markov`` takes them (it converts them to fp32
-        exactly, as ``.float()`` would), from the drafter's logits processor's head kernel where it takes the rows,
-        else the head's own GEMM (``_k3_head_shard``); otherwise the base class' fp32 logits."""
-        num_gens = gen_hidden_states.shape[0] // max(spec_metadata.runtime_draft_len, 1)
-        self._k3_sharded_block_logits = self._keep_draft_logits_sharded(
-            draft_model, spec_metadata, num_gens
-        )
-        if self._k3_sharded_block_logits:
-            return self._k3_head_shard(
-                draft_model.logits_processor, draft_model.lm_head, gen_hidden_states
-            )
-        return super()._draft_block_logits(
-            draft_model, gen_hidden_states, attn_metadata, spec_metadata
-        )
 
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
         """The base acceptance; under ``k3_decode`` its outputs are kept for ``k3_markov``'s next_new_tokens."""
@@ -1238,9 +1224,9 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         ``sample_draft_tokens`` and its next_new_tokens (built from this step's acceptance) for
         ``_prepare_next_new_tokens``.
         """
-        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_markov import (
-            op as k3_markov_op,
-        )
+        # The kernel's support predicates and workspace: metadata reads; the kernel runs through the op.
+        from .kernels.k3_markov import op as k3_markov_op
+        from .ops.spec.k3_markov import k3_markov
 
         acceptance = getattr(self, "_k3_acceptance", None)
         if acceptance is None:
@@ -1260,8 +1246,8 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             and rewind.dtype == torch.int32
             and self._kv_rewind_bs - self._kv_rewind_nc == rewind.numel() <= num_gens
         )
-        corrected, tokens, next_new = k3_markov_op.markov_chain(
-            self.mapping,
+        workspace = k3_markov_op.markov_workspace(self.mapping)
+        corrected, tokens, next_new = k3_markov(
             gen_logits.contiguous(),
             first_prev_tokens.long(),
             draft_model.markov_w1,
@@ -1270,6 +1256,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             accepted_tokens,
             num_accepted_tokens[num_contexts : num_contexts + num_gens],
             spec_metadata.batch_indices_cuda[num_contexts : num_contexts + num_gens],
+            workspace,
             kv_lens=attn_metadata.kv_lens_cuda if fold else None,
             rewind=rewind if fold else None,
             rewind_first=self._kv_rewind_nc if fold else 0,
@@ -1290,6 +1277,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         draft_step=None,
         mapping_lm_head_tp=None,
         out=None,
+        vocab_sharded=None,
     ):
         """Greedy block drafts straight from ``k3_markov``.
 
@@ -1317,6 +1305,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             draft_step=draft_step,
             mapping_lm_head_tp=mapping_lm_head_tp,
             out=out,
+            vocab_sharded=vocab_sharded,
         )
 
     def _prepare_next_new_tokens(

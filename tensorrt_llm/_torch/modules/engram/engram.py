@@ -41,13 +41,16 @@ from torch import nn
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.host_staging import copy_host_to_device
-from tensorrt_llm._torch.kernels.blackwell.engram.decode_hash import compile_engram_decode_hash
+from tensorrt_llm._torch.kernels.blackwell.engram.decode_hash import (
+    compile_engram_decode_hash,
+    compile_engram_decode_refresh,
+)
 from tensorrt_llm._torch.kernels.blackwell.engram.lookup import (
     check_lookup_geometry,
     compile_engram_lookup,
     packed_row_bytes,
 )
-from tensorrt_llm._utils import CUASSERT, prefer_pinned
+from tensorrt_llm._utils import CUASSERT, is_blackwell_datacenter, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from ._host_memory import (
@@ -60,6 +63,10 @@ from ._host_memory import (
     node_gpu_numa_nodes,
 )
 from ._node_share import NodeShare
+from .functional import engram_history_scatter
+
+# Decode rows up to which one single-CTA launch scatters and hashes every layer (per-layer above).
+_DECODE_REFRESH_MAX_ROWS = 64
 
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
@@ -423,6 +430,10 @@ class EngramHashProvider:
                 [int(size) for size in ngram_head_sizes]
                 for ngram_head_sizes in hash_mapping.vocab_size_across_layers[layer_id]
             ]
+        self._moduli_keys = {
+            layer_id: tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id])
+            for layer_id in config.layer_ids
+        }
 
         self._device: Optional[torch.device] = None
 
@@ -433,6 +444,10 @@ class EngramHashProvider:
         self._cached_hashes: Optional[Dict[int, torch.Tensor]] = None
         self._cached_hashes_store: Dict[tuple, Dict[int, torch.Tensor]] = {}
         self._captured_shapes: set = set()
+        # Per shape: ``[layers, rows, heads]`` whose layer views are that shape's cached buffers.
+        self._cached_hash_stacks: Dict[tuple, torch.Tensor] = {}
+        self._multiplier_stack: Optional[torch.Tensor] = None
+        self._moduli_stack = tuple(self._moduli_keys[layer_id] for layer_id in config.layer_ids)
 
         # Per-request history of compressed token ids, so that an n-gram at a
         # decode step can reach the tokens that preceded it. Without this the
@@ -528,6 +543,8 @@ class EngramHashProvider:
         self._history[row_ids, position_ids] = compressed.to(torch.int32)
 
     def _consume_history_seeds(self, request_ids: list[int], rows: list[int]) -> None:
+        if not self._pending_history_seeds:
+            return
         slots, positions, raw, text_mask, consumed = [], [], [], [], []
         for request_id, row in zip(request_ids, rows, strict=True):
             seed = self._pending_history_seeds.get(request_id)
@@ -558,6 +575,12 @@ class EngramHashProvider:
         Recycled rows start with ``_DEAD`` cells so a completed request's tokens
         cannot enter another request's hash.
         """
+        history = self._history
+        if history is not None and history.device == device and history.shape[1] >= min_columns:
+            try:
+                return [self._history_row_of[request_id] for request_id in request_ids]
+            except KeyError:
+                pass
         rows = self._history.shape[0] if self._history is not None else 0
         columns = self._history.shape[1] if self._history is not None else 0
         num_required_rows = len(self._history_row_of) + len(
@@ -711,8 +734,8 @@ class EngramHashProvider:
         # A stable batch needs no per-step DMA or host-buffer reuse wait. The
         # immutable map only runs on its allocation stream; a changed key gets
         # a new allocation, so pending readers cannot observe an overwrite.
-        stream = torch.cuda.current_stream(device)
-        key = (device, stream.cuda_stream, tuple(rows), lengths)
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        key = (device, torch._C._cuda_getCurrentRawStream(index), tuple(rows), lengths)
         if self._decode_row_map is not None and self._decode_row_map[0] == key:
             return self._decode_row_map[1]
         row_map = self._upload_history_tensor(
@@ -736,9 +759,9 @@ class EngramHashProvider:
     ) -> dict[int, torch.Tensor] | None:
         # Incomplete host metadata keeps the general path. Capture already
         # returned its warmup buffers. Single-token unique rows fuse the
-        # scatter too; aliased rows and multi-token requests, whose tokens read
-        # each other's cells, retain Torch's scatter before any hash reads,
-        # including repeated CUDA graph dummy requests.
+        # scatter too. Multi-token requests, whose tokens read each other's
+        # cells, and repeated CUDA graph dummy requests scatter in one launch
+        # before any hash reads.
         if (
             not input_ids.is_cuda
             or input_ids.ndim != 1
@@ -784,47 +807,82 @@ class EngramHashProvider:
         ):
             return None
 
-        aliased_rows = len(set(request_ids)) != len(request_ids)
-        scatter_first = aliased_rows or len(request_ids) != input_ids.numel()
-        if scatter_first:
-            # Preserve the general path's compression and int32 index_put
-            # geometry/order. Repeated IDs may have different input tokens or
-            # positions: hashing each token's register value would bypass the
-            # shared history selected by that scatter. Equal-index writes keep
-            # PyTorch's existing unspecified winner rather than inventing one.
-            ids = input_ids.long().view(-1)
-            compressed = self._lookup_table[ids.clamp(0, self._lookup_table.shape[0] - 1)]
-            if token_mask is not None:
-                compressed = torch.where(
-                    token_mask.to(device=input_ids.device), compressed, self._DEAD
-                )
-            positions = position_ids.view(-1).long()
-
+        # Repeated IDs (CUDA graph padding) share one row; each distinct ID needs a row of its own.
+        unique_ids = len(set(request_ids))
+        scatter_first = unique_ids != len(request_ids) or len(request_ids) != input_ids.numel()
+        # Off SM100/SM103 repeated IDs keep the Torch scatter.
+        torch_scatter = unique_ids != len(request_ids) and not is_blackwell_datacenter()
         rows = self._reserve_history_rows(request_ids, max_seq_len, input_ids.device)
-        if not aliased_rows and len(set(rows)) != len(rows):
+        if len(set(rows)) != unique_ids:
             return None
         # Row assignment and seed consumption must happen even on a map hit:
         # a released request can immediately reuse the same physical row.
         self._consume_history_seeds(request_ids, rows)
         row_map = self._decode_history_rows(rows, lengths, input_ids.device)
-        if scatter_first:
-            self._history[row_map, positions] = compressed.to(torch.int32)
-        elif token_mask is not None:
+        if token_mask is not None:
             token_mask = token_mask.to(device=input_ids.device)
         if cached is None:
-            cached = {
-                layer_id: torch.empty(
-                    (num_output_tokens, num_heads), dtype=torch.long, device=input_ids.device
-                )
-                for layer_id in self.config.layer_ids
-            }
+            stack = torch.empty(
+                (len(self.config.layer_ids), num_output_tokens, num_heads),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            cached = {layer_id: stack[i] for i, layer_id in enumerate(self.config.layer_ids)}
             self._retain_hashes(shape_key, cached)
+            self._cached_hash_stacks[shape_key] = stack
+        stack = self._cached_hash_stacks.get(shape_key)
+        if (
+            is_blackwell_datacenter()
+            and scatter_first
+            and stack is not None
+            and num_output_tokens <= _DECODE_REFRESH_MAX_ROWS
+        ):
+            if self._multiplier_stack is None or self._multiplier_stack.device != input_ids.device:
+                self._multiplier_stack = torch.stack(
+                    [self._multipliers[layer_id] for layer_id in self.config.layer_ids]
+                ).to(input_ids.device)
+            compile_engram_decode_refresh(
+                self._moduli_stack,
+                self._pad_id,
+                self._DEAD,
+                token_mask is not None,
+                input_ids.dtype,
+                position_ids.dtype,
+            )(
+                input_ids.view(-1),
+                position_ids.view(-1),
+                row_map,
+                None if token_mask is None else token_mask.view(-1).view(torch.uint8),
+                self._lookup_table,
+                self._history,
+                self._multiplier_stack,
+                stack,
+                num_tokens,
+            )
+            self._cached_hashes = cached
+            return cached
+        if torch_scatter:
+            ids = input_ids.long().view(-1)
+            compressed = self._lookup_table[ids.clamp(0, self._lookup_table.shape[0] - 1)]
+            if token_mask is not None:
+                compressed = torch.where(token_mask, compressed, self._DEAD)
+            self._history[row_map, position_ids.view(-1).long()] = compressed.to(torch.int32)
+        elif scatter_first:
+            engram_history_scatter(
+                input_ids,
+                position_ids.view(-1),
+                row_map,
+                token_mask,
+                self._lookup_table,
+                self._history,
+                self._DEAD,
+            )
         mask = (
             None if scatter_first or token_mask is None else token_mask.view(-1).view(torch.uint8)
         )
         for index, layer_id in enumerate(self.config.layer_ids):
             compile_engram_decode_hash(
-                tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id]),
+                self._moduli_keys[layer_id],
                 self._pad_id,
                 self._DEAD,
                 index == 0 and not scatter_first,
@@ -1020,6 +1078,7 @@ class EngramHashProvider:
         """Retain a new shape's buffers, dropping the other shapes no captured graph reads."""
         for key in [k for k in self._cached_hashes_store if k not in self._captured_shapes]:
             del self._cached_hashes_store[key]
+            self._cached_hash_stacks.pop(key, None)
         self._cached_hashes_store[shape_key] = buffers
 
     def refresh_captured_hashes(
@@ -1609,7 +1668,8 @@ def _multi_processor_count(device_index: int) -> int:
 
 
 class ShardedFp8MultiHeadEmbedding(nn.Module):
-    """Sharded E4M3 n-gram rows with one E8M0 scale per ``block_size`` lanes.
+    """Sharded E4M3 (MXFP8) or, with ``mxfp4``, packed E2M1 (MXFP4) n-gram rows with one E8M0 scale
+    per ``block_size`` lanes; lookups return the same values and packed rows for both formats.
 
     With TP > 1 and ``num_heads % tp_size == 0``, each rank owns contiguous heads
     and their buckets. Lookup returns local heads for the caller's all-gather.
@@ -1632,11 +1692,12 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         tp_size: int = 1,
         tp_rank: int = 0,
         share_key: Optional[str] = None,
+        mxfp4: bool = False,
     ):
         super().__init__()
         if D % block_size != 0:
             raise ValueError(
-                f"Engram embedding dim {D} is not a multiple of the fp8 block size "
+                f"Engram embedding dim {D} is not a multiple of the block size "
                 f"{block_size}; the checkpoint stores one exponent per block, so a "
                 "partial trailing block has no scale to dequantize it with."
             )
@@ -1644,11 +1705,15 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
         self.block_size = block_size
+        self.mxfp4 = mxfp4
+        self._row_bytes = D // 2 if mxfp4 else D
+        self._weight_dtype = torch.uint8 if mxfp4 else torch.float8_e4m3fn
         self.dtype = dtype if dtype is not None else torch.bfloat16
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        # The HF loader fills pinned allocations in place; other loaders may replace them.
-        self._requires_standard_hf_loading = True
+        # Regular checkpoint loading fills pinned allocations in place; other loaders may
+        # replace them.
+        self._requires_regular_checkpoint_loading = True
         # Rebuild UVA views when host addresses change to avoid stale pointers.
         self._views: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._views_src: Optional[Tuple[int, int]] = None
@@ -1689,7 +1754,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         if share_key is not None:
             self._share_spec = (
                 f"{share_key} heads {self.num_heads} rows {self.num_embeddings} "
-                f"tp {tp_rank}/{tp_size} dim {D} block {block_size}"
+                f"tp {tp_rank}/{tp_size} dim {D} block {block_size} {'e2m1' if mxfp4 else 'e4m3'}"
             )
             digest = hashlib.blake2b(f"{os.getuid()} {self._share_spec}".encode(), digest_size=16)
             self._share_name = f"trtllm-engram-{digest.hexdigest()}"
@@ -1697,14 +1762,14 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         # Override the model's CUDA construction context for table storage.
         if not prefer_pinned():
             raise RuntimeError("Engram tables require the pinned-memory runtime policy")
-        weight_shape = (self.part_num_embeddings, D)
+        weight_shape = (self.part_num_embeddings, self._row_bytes)
         scale_shape = (self.part_num_embeddings, D // block_size)
         if share_key is None:
-            weight = _pinned_host_table(weight_shape, torch.float8_e4m3fn)
+            weight = _pinned_host_table(weight_shape, self._weight_dtype)
             scale = _pinned_host_table(scale_shape, torch.float8_e8m0fnu)
         else:
             # load_weights places a node-shared table once its owner is elected.
-            weight = torch.empty(weight_shape, dtype=torch.float8_e4m3fn, device="meta")
+            weight = torch.empty(weight_shape, dtype=self._weight_dtype, device="meta")
             scale = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
@@ -1862,16 +1927,14 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         self._views = self._views_src = None
 
     def _table_bytes(self) -> int:
-        return self.part_num_embeddings * (
-            self.embedding_dim + self.embedding_dim // self.block_size
-        )
+        return self.part_num_embeddings * (self._row_bytes + self.embedding_dim // self.block_size)
 
     def _table_views(self, host: object) -> Tuple[torch.Tensor, torch.Tensor]:
         """Weight rows, then scale rows, of one host mapping."""
         data = _host_bytes(host, self._table_bytes())
-        split = self.part_num_embeddings * self.embedding_dim
+        split = self.part_num_embeddings * self._row_bytes
         return (
-            data[:split].view(torch.float8_e4m3fn).view(self.part_num_embeddings, -1),
+            data[:split].view(self._weight_dtype).view(self.part_num_embeddings, -1),
             data[split:].view(torch.float8_e8m0fnu).view(self.part_num_embeddings, -1),
         )
 
@@ -1955,6 +2018,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             # head shards own every lookup and need no ownership mask.
             not self.shard_heads,
             self.dtype,
+            mxfp4=self.mxfp4,
         )(
             weight.view(torch.uint8),
             scale.view(torch.uint8),
@@ -2012,6 +2076,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             False,
             torch.uint8,
             packed=True,
+            mxfp4=self.mxfp4,
         )(
             weight.view(torch.uint8),
             scale.view(torch.uint8),

@@ -54,12 +54,8 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 
 // Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
 // primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
-// selects it. Reads fall back to the other location only when a file is absent.
-LLM_ARTIFACTS_LOCATIONS = [
-    aws: [root: "https://artifactory.nvidia.com/artifactory", repo: "sw-tensorrt-llm-generic-local"],
-    urm: [root: "https://urm.nvidia.com/artifactory", repo: "sw-tensorrt-generic"],
-]
-
+// selects it. Reads fall back to the other location only when a file is absent. The shared
+// library holds the locations and maps the legacy paths above to them (trtllm_utils.llmArtifacts*).
 def llmArtifactsPrimary()
 {
     def primary = env.LLM_ARTIFACTS_PRIMARY ?: "aws"
@@ -69,99 +65,29 @@ def llmArtifactsPrimary()
     return primary
 }
 
-def llmArtifactsLayoutPath(String legacyPath)
-{
-    def layoutPath = legacyPath.replaceFirst(/^sw-tensorrt-generic(-local)?\//, "")
-    if (!layoutPath.startsWith("llm-artifacts/")) {
-        error("Not an llm-artifacts path: ${legacyPath}")
-    }
-    return layoutPath
-}
-
-def llmArtifactsRepoPath(String location, String legacyPath)
-{
-    return "${LLM_ARTIFACTS_LOCATIONS[location].repo}/${llmArtifactsLayoutPath(legacyPath)}"
-}
-
-def llmArtifactsUrl(String location, String legacyPath)
-{
-    return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
-}
-
-// The host name of a location.
-def llmArtifactsHost(String location)
-{
-    return LLM_ARTIFACTS_LOCATIONS[location].root.replaceFirst(/^[a-z]+:\/\//, "").replaceFirst(/[:\/].*$/, "")
-}
-
-// The link to an output that people open in a browser. artifactory.nvidia.com answers a direct
-// link from a browser with a password prompt, so its links open the native browser, which signs
-// people in with the company sign-in; urm serves direct links.
-def llmArtifactsBrowseUrl(String location, String legacyPath)
-{
-    if (location == "aws") {
-        return "https://${llmArtifactsHost('aws')}/ui/native/${llmArtifactsRepoPath('aws', legacyPath)}"
-    }
-    return llmArtifactsUrl(location, legacyPath)
-}
-
 // Credential with which the read helper reads from artifactory.nvidia.com: the publishing
-// credential, the one the pipelines publish build artifacts and test results with.
-LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
+// credential, the one the pipelines publish build artifacts and test results with and that
+// trtllm_utils.writeArtifactoryNetrc puts in the helper's netrc.
+LLM_ARTIFACTS_CREDENTIALS_ID = trtllm_utils.llmArtifactsLocation("aws").credential
 
-// Writes a netrc for artifactory.nvidia.com with LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its
-// owner. The shell's printf builtin moves the secret from the bound variables into the file, so it
-// never appears on a command line or in the trace. Callers remove the file in a finally block.
-def writeArtifactoryNetrc(String netrcPath)
-{
-    withCredentials([usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
-            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
-        withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
-            sh(label: "Write Artifactory netrc", script: '''
-                set +x
-                umask 077
-                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
-            ''')
-        }
-    }
-}
-
-// Exit codes of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the
-// names the helper gives them. tests/unittest/scripts/test_fetch_build_artifact.py checks
-// that they match.
-FETCH_ABSENT = 2
-FETCH_REJECTED = 3
-FETCH_TRANSFER_FAILED = 4
-
-// readRunTestResults stops reading after this many reads in a row are rejected or fail in transfer.
-TEST_RESULT_READ_FAILURES_BEFORE_STOP = 3
-
-// Where test results go. While urm is in service, everything under test-results/ is published to
-// urm, the required copy, and replicated to aws whenever aws is the primary location; during a
-// rollback to urm there is no replica. rerun_reports/ and cbts-coverage/ go to the primary alone.
-// This function alone decides the targets of a test-results/ output: the locations in upload
-// order, where a failed upload to the required one fails a step as it always has, and a failed
-// upload to a replica marks only the stage unstable. jenkins/scripts/fetch_build_artifact.sh
-// relies on urm coming first: while urm is the primary, it asks urm alone about test results.
-def testResultTargets(String primary)
-{
-    if (primary == "aws") {
-        return [[location: "urm", replica: false], [location: "aws", replica: true]]
-    }
-    return [[location: "urm", replica: false]]
-}
+// The exit status of jenkins/scripts/read_test_results.sh when a listing failed or a name could
+// not be read.
+READ_INCOMPLETE = 1
+// The names of the archives under test-results/ that hold a stage attempt's results: its final
+// archive and its checkpoint. An extended regular expression, as read_test_results.sh takes it.
+TEST_RESULT_ARCHIVE_ERE = '^results-.*\\.tar\\.gz$'
 
 // The upload target of a folder of this run's outputs, such as "test-results", on a location.
 def testResultsDirTarget(String location, String directory)
 {
     if (location == "aws") {
-        return "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/${directory}/"
+        return "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/${directory}/"
     }
     return "${UPLOAD_PATH}/${directory}/"
 }
 
-// Marks the current stage UNSTABLE and leaves the build result alone, as every step that only
-// loses a copy or a read of test results does.
+// Marks the current stage UNSTABLE and leaves the build result alone, as the steps that fail to
+// read a run's test results do. A lost replica is only logged (see trtllm_utils.uploadToTargets).
 def markStageUnstable(String reason)
 {
     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
@@ -170,39 +96,10 @@ def markStageUnstable(String reason)
 }
 
 // Uploads filePattern to a folder of this run's outputs, such as "test-results", on each of
-// targets in order (see testResultTargets). The required target's upload fails the step when
-// requiredFailureFails, and then no replica is tried; otherwise its failure is logged. A replica's
-// failure is logged with the link to the required copy, when that upload succeeded, and marks the
-// stage unstable. Returns the locations that received the file.
+// targets (see trtllm_utils.uploadToTargets). Returns the locations that received the file.
 def uploadTestResult(String filePattern, String directory, List targets, boolean requiredFailureFails = true)
 {
-    def name = filePattern.tokenize("/")[-1]
-    def required = targets.find { !it.replica }
-    def uploaded = []
-    for (target in targets) {
-        try {
-            trtllm_utils.uploadArtifacts(filePattern, testResultsDirTarget(target.location, directory), target.location)
-            uploaded << target.location
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            if (!target.replica && requiredFailureFails) {
-                throw e
-            }
-            if (target.replica) {
-                def requiredCopy = "the ${required.location} upload failed too"
-                if (required.location in uploaded) {
-                    requiredCopy = "${required.location} copy: " +
-                        llmArtifactsUrl(required.location, "${UPLOAD_PATH}/${directory}/${name}")
-                }
-                echo "[test-results] replica upload of ${name} to ${llmArtifactsHost(target.location)} failed; ${requiredCopy}"
-                markStageUnstable("Replica upload of ${name} to ${llmArtifactsHost(target.location)} failed: ${e}")
-            } else {
-                echo "[test-results] upload of ${name} to ${target.location} failed (non-fatal): ${e}"
-            }
-        }
-    }
-    return uploaded
+    return trtllm_utils.uploadToTargets(filePattern, "${UPLOAD_PATH}/${directory}/", targets, requiredFailureFails)
 }
 
 // GitLab project id for TRT-LLM repo, used to set GitLab status. Only needed when triggering by timer or by hand.
@@ -558,7 +455,7 @@ boolean enableUpdateGitlabStatus =
     testFilter[TEST_BACKEND] == null
 
 
-def createKubernetesPodConfig(image, type, arch = "amd64")
+def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
 {
     def targetCould = "kubernetes-cpu"
     def selectors = """
@@ -662,7 +559,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "L0_MergeRequest", stage: stageName])
 }
 
 def echoNodeAndGpuInfo(pipeline, stageName)
@@ -787,7 +684,8 @@ def mergeWaiveList(pipeline, globalVars)
 
     // Get TOT waive list
     LLM_TOT_ROOT = "llm-tot"
-    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    // Post-merge runs set only gitlabBranch; GitHub PR runs leave it unset and use the bot's target_branch.
+    targetBranch = env.gitlabTargetBranch ?: (env.gitlabBranch ?: globalVars[TARGET_BRANCH])
     echo "Target branch: ${targetBranch}"
 
     def targetBranchTOTCommit = ""
@@ -836,9 +734,9 @@ def mergeWaiveList(pipeline, globalVars)
         """
         def primary = llmArtifactsPrimary()
         def waiveListTarget = primary == "aws" ?
-            "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/waive_list/" : "${UPLOAD_PATH}/waive_list/"
+            "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/waive_list/" : "${UPLOAD_PATH}/waive_list/"
         trtllm_utils.uploadArtifacts("waives*.txt", waiveListTarget, primary)
-        def waiveListUrl = llmArtifactsUrl(primary, "${UPLOAD_PATH}/waive_list/waives.txt")
+        def waiveListUrl = trtllm_utils.llmArtifactsUrl(primary, "${UPLOAD_PATH}/waive_list/waives.txt")
         echo "New merged test waive list: ${waiveListUrl}"
     } catch (InterruptedException e) {
         throw e
@@ -907,7 +805,7 @@ def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
 def preparation(pipeline, testFilter, globalVars)
 {
     image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
-    setupPipelineSpec = createKubernetesPodConfig(image, "package")
+    setupPipelineSpec = createKubernetesPodConfig(image, "package", "amd64", "Setup Environment")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         def targetBranchInfo = [:]
         stage("Setup Environment") {
@@ -946,9 +844,9 @@ def preparation(pipeline, testFilter, globalVars)
                 writeFile file: 'build_info.txt', text: buildInfo
                 def primary = llmArtifactsPrimary()
                 def buildInfoTarget = primary == "aws" ?
-                    "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/" : "${UPLOAD_PATH}/"
+                    "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/" : "${UPLOAD_PATH}/"
                 trtllm_utils.uploadArtifacts("build_info.txt", buildInfoTarget, primary)
-                def buildInfoUrl = llmArtifactsUrl(primary, "${UPLOAD_PATH}/build_info.txt")
+                def buildInfoUrl = trtllm_utils.llmArtifactsUrl(primary, "${UPLOAD_PATH}/build_info.txt")
                 pipeline.echo "Build info: ${buildInfoUrl}"
             } catch (InterruptedException e) {
                 throw e
@@ -1013,8 +911,10 @@ def launchReleaseCheck(pipeline, globalVars)
                     error "Release Check failed (warn-only): ${e.getMessage()}"
                 }
             } finally {
-                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
-                echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
+                def primary = llmArtifactsPrimary()
+                def scanLogDir = "${UPLOAD_PATH}/guardwords-scan-results/"
+                trtllm_utils.uploadToTargets("${LLM_ROOT}/scan.log", scanLogDir, trtllm_utils.llmArtifactsTargets(primary), true)
+                echo "Guardwords Scan Results: ${trtllm_utils.llmArtifactsBrowseUrl(primary, scanLogDir + 'scan.log')}"
             }
         }
 
@@ -1062,7 +962,7 @@ def launchReleaseCheck(pipeline, globalVars)
 
     def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"
     stageName = "Release-Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package", "amd64", stageName), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
@@ -1101,15 +1001,17 @@ def launchTestListCheck(pipeline, globalVars)
 {
     def key = "Check-Test-List"
     def image = globalVars["LLM_DOCKER_IMAGE"]
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package", "amd64", key), "trt-llm", {
         stage("[${key}] Run") {
-            echoNodeAndGpuInfo(pipeline, key)
-            sh "git config --global --add safe.directory \"*\""
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+            timeout(time: 30, unit: 'MINUTES') {
+                echoNodeAndGpuInfo(pipeline, key)
+                sh "git config --global --add safe.directory \"*\""
+                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
 
-            def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
-               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+                def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
+                sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
+                   "python3 -u ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+            }
         }
     })
 }
@@ -1618,7 +1520,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                 }
                 // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
                 sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${archiveFiles.join(' ')}"
-                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                trtllm_utils.uploadToTargets("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/",
+                    trtllm_utils.llmArtifactsTargets(llmArtifactsPrimary()), true)
+                // Set only once the required copy is published: the test stages read the archive
+                // by this path, in its legacy form, through the read helper.
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
             } catch (InterruptedException e) {
@@ -1707,23 +1612,25 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
                 pilotEligible, "PR identity unavailable for coverage DB pin")
         }
 
-        // artifact.py reads build_info.txt and the coverage archives with
+        // artifact.py reads the coverage DB pin, build_info.txt, and the coverage archives with
         // jenkins/scripts/fetch_build_artifact.sh, which looks in the primary location first and
         // authenticates to aws with this netrc. It holds the publishing credential, the one the
         // pipelines publish build artifacts and test results with.
         // When artifactory.nvidia.com is the primary location and rejects the credential, the
         // helper prints a message naming it, artifact.py exits 1, and the coverage tier declines
-        // like after any other failure; a rejection while it is the secondary counts as a failed
-        // read, and artifact.py skips that build.
+        // like after any other failure. A rejection while it is the secondary counts as a failed
+        // read: the tier declines when the read is the pin's, and artifact.py skips the build when
+        // the read is a build's.
         // While artifactory.nvidia.com is the primary location (the default) and is down or
-        // unreachable, every read there fails after the helper's retries. artifact.py skips each
-        // build whose read fails, so the coverage tier declines only after --resolve-pin has tried
-        // each recent build, or after --prepare has tried the pinned one. Setup Environment, which
-        // runs this before any build starts, waits for those reads; build_commit in artifact.py
-        // says how long each takes and what changes after a rollback to urm.
+        // unreachable, every read there fails after the helper's retries. --resolve-pin reads the
+        // pin first, so the coverage tier declines as soon as that one read has failed, before any
+        // build is tried. When the pin's read answers and a later read fails, artifact.py skips
+        // each build whose read fails. Setup Environment, which runs this before any build starts,
+        // waits for those reads; build_commit in artifact.py says how long each takes and what
+        // changes after a rollback to urm.
         def artifactsPrimary = llmArtifactsPrimary()
         artifactoryNetrc = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
-        writeArtifactoryNetrc(artifactoryNetrc)
+        trtllm_utils.writeArtifactoryNetrc(artifactoryNetrc)
         def artifactEnv = [
             "LLM_ARTIFACTS_PRIMARY=${artifactsPrimary}",
             "ARTIFACTORY_NETRC=${artifactoryNetrc}",
@@ -1767,8 +1674,8 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
 
         if (pinPlan.pin_upload_required) {
             try {
-                trtllm_utils.uploadArtifacts(
-                    "${LLM_ROOT}/${pinPlan.pin_path}", pinPlan.pin_target)
+                trtllm_utils.uploadToTargets("${LLM_ROOT}/${pinPlan.pin_path}", pinPlan.pin_target,
+                    trtllm_utils.llmArtifactsTargets(artifactsPrimary), true)
                 pipeline.echo("CBTS audit: pinned coverage DB build ${pinPlan.build} " +
                               "for PR head ${prHead}")
             } catch (InterruptedException e) {
@@ -2054,6 +1961,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
         "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
         "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
+        "tensorrt_llm/_torch/memory/monitor/ranks.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",
@@ -2233,110 +2141,61 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
-// Runs body with the read helper, jenkins/scripts/fetch_build_artifact.sh from the run's commit,
-// and passes it the helper's path. The helper reads from the primary location first and
-// authenticates to aws with a netrc that holds the publishing credential, the one the pipelines
-// publish test results with. The netrc exists only while body runs. A failure to set up the
-// helper, or of body, is logged and marks the stage unstable.
+// Runs body with the scripts that read a run's test results, from the run's commit:
+// jenkins/scripts/read_test_results.sh and the read helper it calls,
+// jenkins/scripts/fetch_build_artifact.sh. body gets both paths. The helper reads from the primary
+// location first and authenticates to aws with a netrc that holds the publishing credential, the
+// one the pipelines publish test results with. The netrc exists only while body runs. A failure
+// to set up the scripts, or of body, is logged and marks the stage unstable.
 def withTestResultsReader(Closure body)
 {
     def readerDir = "${pwd(tmp: true)}/test-results-reader-${UUID.randomUUID().toString()}"
     def netrcPath = "${readerDir}/artifactory-netrc"
     try {
-        // The alpine container has no git. The pod's jnlp container fetches the helper into the
+        // The alpine container has no git. The pod's jnlp container fetches the scripts into the
         // workspace's temporary directory, which both containers mount.
         container('jnlp') {
             trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/fetch_build_artifact.sh", readerDir)
+            trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/read_test_results.sh", readerDir)
         }
-        writeArtifactoryNetrc(netrcPath)
+        trtllm_utils.writeArtifactoryNetrc(netrcPath)
         withEnv([
             "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
             "ARTIFACTORY_NETRC=${netrcPath}",
             "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
         ]) {
-            body("${readerDir}/fetch_build_artifact.sh")
+            body("${readerDir}/read_test_results.sh", "${readerDir}/fetch_build_artifact.sh")
         }
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         markStageUnstable("Reading this run's test results failed: ${e}")
     } finally {
-        sh(label: "Remove the read helper and its netrc", script: "rm -rf '${readerDir}'")
+        sh(label: "Remove the test-results reader and its netrc", script: "rm -rf '${readerDir}'")
     }
 }
 
-// Reads this run's test results into the current directory with the read helper: lists
-// ${UPLOAD_PATH}/test-results on both locations, keeps the names that keep accepts, and reads each
-// name once by the read rule, which serves the primary's copy, and the secondary's when the
-// primary lacks it. While urm is the primary, the helper asks urm alone, for the listing and for
-// each read. Logs what each location holds and how many names it read, and marks the stage
-// unstable when a listing failed or a name could not be read. Stops reading after
-// TEST_RESULT_READ_FAILURES_BEFORE_STOP reads in a row were rejected or failed in transfer, since
-// the rest would only wait out the helper's retries.
-def readRunTestResults(String helper, Closure keep)
+// Reads this run's test results into the current directory with read_test_results.sh. The script
+// lists ${UPLOAD_PATH}/test-results and keeps the names that match nameEre and not excludeEre
+// (extended regular expressions; an empty excludeEre drops nothing). It reads every final archive,
+// and a stage attempt's checkpoint only where its final archive could not be read or is not a
+// valid archive. While aws is the primary, a failure on urm is only logged; while urm is the
+// primary, urm alone is asked. The script logs what each location holds and what it read. This
+// marks the stage unstable when the script reports that a listing failed, a name could not be
+// read, or a file it read is not a valid archive, and fails on any other status, which
+// withTestResultsReader turns into an unstable stage.
+def readRunTestResults(String reader, String helper, String nameEre, String excludeEre = "")
 {
-    def primary = llmArtifactsPrimary()
-    def secondary = primary == "aws" ? "urm" : "aws"
-    def workDir = "${pwd(tmp: true)}/test-results-read-${UUID.randomUUID().toString()}"
-    // writeFile runs as the agent's user, which may not be the user of this container's shell, so
-    // the agent creates the directory that both write into.
-    writeFile(file: "${workDir}/listing", text: "")
-    def listStatus = sh(label: "List this run's test results", returnStatus: true,
-        script: "bash '${helper}' --list '${UPLOAD_PATH}/test-results' > '${workDir}/listing'")
-    // Each line is "<location> <name>".
-    def entries = readFile("${workDir}/listing").readLines().findAll { it }
-    def kept = [(primary): [] as Set, (secondary): [] as Set]
-    def names = [] as Set
-    for (entry in entries) {
-        def separator = entry.indexOf(" ")
-        def location = separator > 0 ? entry.substring(0, separator) : ""
-        def name = separator > 0 ? entry.substring(separator + 1) : ""
-        if (kept.containsKey(location) && name && keep(name)) {
-            kept[location] << name
-            names << name
-        }
+    def command = "bash '${reader}' '${helper}' '${UPLOAD_PATH}/test-results' . '${nameEre}'"
+    if (excludeEre) {
+        command += " '${excludeEre}'"
     }
-    def read = []
-    if (names) {
-        writeFile(file: "${workDir}/names", text: names.join("\n") + "\n")
-        sh(label: "Read this run's test results", script: """
-            : > '${workDir}/read'
-            failures=0
-            while IFS= read -r name; do
-                if bash '${helper}' '${UPLOAD_PATH}/test-results/'"\$name" "\$name"; then
-                    printf '%s\\n' "\$name" >> '${workDir}/read'
-                    failures=0
-                else
-                    case \$? in
-                        ${FETCH_REJECTED}|${FETCH_TRANSFER_FAILED}) failures=\$((failures + 1)) ;;
-                        *) failures=0 ;;
-                    esac
-                    if [ "\$failures" -ge ${TEST_RESULT_READ_FAILURES_BEFORE_STOP} ]; then
-                        echo "[test-results] \$failures reads in a row failed; not reading the remaining names"
-                        break
-                    fi
-                fi
-            done < '${workDir}/names'
-        """)
-        read = readFile("${workDir}/read").readLines().findAll { it }
-    }
-    sh "rm -rf '${workDir}'"
-    if (primary == "urm") {
-        echo "[test-results] listed ${kept[primary].size()} on urm, aws not asked while urm is the primary; " +
-            "read ${read.size()} of ${names.size()}"
-    } else {
-        def onlyPrimary = kept[primary].findAll { !(it in kept[secondary]) }
-        def onlySecondary = kept[secondary].findAll { !(it in kept[primary]) }
-        echo "[test-results] listed ${kept[primary].size()} on ${primary} and ${kept[secondary].size()} on ${secondary}: " +
-            "${names.size()} names, ${onlyPrimary.size()} only on ${primary}, ${onlySecondary.size()} only on ${secondary}; " +
-            "read ${read.size()} of ${names.size()}"
-    }
-    if (!(listStatus in [0, FETCH_ABSENT])) {
-        markStageUnstable("Listing this run's test results failed (fetch_build_artifact.sh exited ${listStatus}, " +
-            "see its message above); some may be missing.")
-    } else if (read.size() < names.size()) {
-        markStageUnstable("Read ${read.size()} of ${names.size()} test-result archives; see the messages of " +
-            "fetch_build_artifact.sh above.")
+    def status = sh(label: "Read this run's test results", returnStatus: true, script: command)
+    if (status == READ_INCOMPLETE) {
+        markStageUnstable("Some of this run's test results could not be listed or read; see the messages of " +
+            "read_test_results.sh above.")
+    } else if (status != 0) {
+        error("read_test_results.sh exited ${status}; see its message above.")
     }
 }
 
@@ -2346,19 +2205,21 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
         return
     }
     // The results archives of SBSA stages; every other one is x86_64.
-    def sbsaArchive = /results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-.*\.tar\.gz/
+    def sbsaArchiveEre = '^results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-.*\\.tar\\.gz$'
     try {
         timeout(time: 15, unit: 'MINUTES') {
-            def podSpec = createKubernetesPodConfig("", "agent")
+            def podSpec = createKubernetesPodConfig("", "agent", "amd64", "Upload Single-GPU Coverage (${arch})")
             trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
                 stage("Upload Single-GPU Coverage (${arch})") {
                     sh "rm -rf cov && mkdir -p cov"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl bash python3 py3-pip")
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                    withTestResultsReader { helper ->
-                        readRunTestResults(helper, { name ->
-                            name ==~ /results-.*\.tar\.gz/ && (name ==~ sbsaArchive) == (arch == "SBSA")
-                        })
+                    withTestResultsReader { reader, helper ->
+                        if (arch == "SBSA") {
+                            readRunTestResults(reader, helper, sbsaArchiveEre)
+                        } else {
+                            readRunTestResults(reader, helper, TEST_RESULT_ARCHIVE_ERE, sbsaArchiveEre)
+                        }
                     }
                     sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
                     sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
@@ -2378,7 +2239,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                         trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz",
                             testResultsDirTarget(primary, "cbts-coverage"), primary)
                         echo "CBTS early coverage (${arch}): " +
-                            llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz")
+                            trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz")
                     } else {
                         echo "CBTS early coverage (${arch}): no data files found, skipping."
                     }
@@ -2402,7 +2263,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
 
 def collectTestResults(pipeline, testFilter, globalVars)
 {
-    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+    collectResultPodSpec = createKubernetesPodConfig("", "agent", "amd64", "Collect Test Result")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
         // 1. Serial: download tarballs, extract, and run junit
         stage ("Collect Test Result") {
@@ -2410,9 +2271,10 @@ def collectTestResults(pipeline, testFilter, globalVars)
 
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl bash")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
-            // Every stage attempt's final archive and leftover checkpoint.
-            withTestResultsReader { helper ->
-                readRunTestResults(helper, { name -> name ==~ /results-.*\.tar\.gz/ })
+            // Every stage attempt's final archive, and a leftover checkpoint only where its final
+            // archive could not be read or is not a valid archive.
+            withTestResultsReader { reader, helper ->
+                readRunTestResults(reader, helper, TEST_RESULT_ARCHIVE_ERE)
             }
             sh "ls -l | grep \"tar.gz\" || true"
 
@@ -2455,9 +2317,9 @@ def collectTestResults(pipeline, testFilter, globalVars)
                 if (fileExists("rerun/rerun_report.html")) {
                     try {
                         def primary = llmArtifactsPrimary()
-                        def uploaded = uploadTestResult("rerun/rerun_report.html", "test-results", testResultTargets(primary), false)
+                        def uploaded = uploadTestResult("rerun/rerun_report.html", "test-results", trtllm_utils.llmArtifactsTargets(primary), false)
                         if (primary in uploaded) {
-                            echo "Rerun report: ${llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/test-results/rerun_report.html")}"
+                            echo "Rerun report: ${trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/test-results/rerun_report.html")}"
                         }
                     } catch (Exception e) {
                         echo "Failed to upload rerun report: ${e.toString()}"
@@ -2505,7 +2367,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     def primary = llmArtifactsPrimary()
                     trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", testResultsDirTarget(primary, "cbts-coverage"), primary)
                     echo "CBTS coverage (touch DB + report): " +
-                        llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz")
+                        trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz")
                 } // Test coverage
             }
             catch (InterruptedException e)
@@ -2633,6 +2495,20 @@ def isBoltReleasePipeline()
     return (env.JOB_NAME ==~ /.*PostMerge.*/) || runMode == "nightly_release"
 }
 
+// Tells whether e, a FlowInterruptedException, is the expiry of the caller's own timeout step: one
+// of limitMinutes that the caller entered at startMs, a System.currentTimeMillis() value, or null
+// when it entered none. The expiry of a timeout step that encloses the caller's carries the same
+// cause, so the two are told apart by time: the caller's step cannot expire before its limit has
+// passed. From then on, an enclosing step that expires as well counts as the caller's; it still
+// fails the steps that run under it a minute after its own expiry.
+def ownTimeoutExpired(e, startMs, int limitMinutes)
+{
+    if (startMs == null || System.currentTimeMillis() - startMs < limitMinutes * 60000L) {
+        return false
+    }
+    return e.causes.any { it.class.simpleName == 'ExceededTimeout' }
+}
+
 // Pick the single BOLT profile bundle this pipeline will use, and pin it.
 //
 // Without a pin every consumer resolves `latest` independently, at whatever
@@ -2646,30 +2522,64 @@ def isBoltReleasePipeline()
 // drift is acceptable and its behaviour must not change), and returning "" leaves
 // every consumer on exactly today's path.
 //
-// Best-effort by design. A branch with nothing promoted, or a bundle too old to
-// carry the label, yields "" and the pipeline runs unpinned rather than failing
-// -- an unresolvable pin is a reason to keep the old behaviour, not to break the
-// build.
+// Best-effort by design. A branch with nothing promoted, a bundle too old to
+// carry the label, or a profile store that cannot be read in time yields "" and
+// the pipeline runs unpinned rather than failing -- an unresolvable pin is a
+// reason to keep the old behaviour, not to break the build.
 def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
 {
     if (!isBoltReleasePipeline()) {
         return ""
     }
     def ref = ""
+    // artifactory.sh reads the profile store through the read helper, which takes the location
+    // and the credential from the environment. The netrc exists only around the lookup.
+    def netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+    def refPath = "${pwd(tmp: true)}/bolt-profile-ref-${UUID.randomUUID().toString()}"
+    // The lookup's time limit, and the time at which its timeout step is entered.
+    def lookupMinutes = 5
+    def lookupStartMs = null
     try {
-        ref = sh(returnStdout: true, script: """
-            bash ${LLM_ROOT}/scripts/bolt/internal/artifactory.sh \
-                 resolve-latest ${branch} ${triple} 2>/dev/null || true
-        """).trim()
+        trtllm_utils.writeArtifactoryNetrc(netrcPath)
+        def status = null
+        withEnv([
+            "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
+            "ARTIFACTORY_NETRC=${netrcPath}",
+            "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+        ]) {
+            // The read helper has no overall time limit, and this runs before any job launches,
+            // so a stalled lookup would hold the entire pipeline rather than fall back to
+            // unpinned.
+            lookupStartMs = System.currentTimeMillis()
+            timeout(time: lookupMinutes, unit: 'MINUTES') {
+                status = sh(returnStatus: true, script: """
+                    bash ${LLM_ROOT}/scripts/bolt/internal/artifactory.sh \
+                         resolve-latest '${branch}' '${triple}' > '${refPath}'
+                """)
+            }
+        }
+        if (status != 0) {
+            echo "BOLT profile pin: the profile store could not be read (artifactory.sh exited ${status}, " +
+                "see its message above); running unpinned."
+            return ""
+        }
+        ref = readFile(refPath).trim()
+    } catch (FlowInterruptedException e) {
+        // The lookup's own time limit falls back to unpinned. An abort and the expiry of a timeout
+        // that encloses the lookup must keep propagating: swallowing one would turn a cancelled
+        // pipeline into an unpinned pipeline that carries on and launches every build job.
+        if (ownTimeoutExpired(e, lookupStartMs, lookupMinutes)) {
+            echo "BOLT profile pin: the lookup timed out after ${lookupMinutes} min; running unpinned."
+            return ""
+        }
+        throw e
     } catch (InterruptedException e) {
-        // Aborts and timeouts reach here as FlowInterruptedException, which
-        // extends InterruptedException. Letting the catch below swallow one
-        // would turn a cancelled pipeline into an unpinned pipeline that
-        // carries on and launches every build job.
         throw e
     } catch (Exception e) {
         echo "BOLT profile pin: resolve failed (${e.message}); running unpinned."
         return ""
+    } finally {
+        sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}' '${refPath}'")
     }
     if (!ref) {
         echo "BOLT profile pin: nothing promoted for ${branch}/${triple}; running unpinned."
@@ -2883,7 +2793,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // pod instead (same image used by preparation()'s mergeWaiveList.py call).
                         def cached
                         def packageImage = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
-                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package"), "trt-llm", {
+                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package", "amd64", "OSS-Compliance-Check"), "trt-llm", {
                             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                             cached = findCachedPLCSourceScanResult(env.gitlabCommit)
                         })

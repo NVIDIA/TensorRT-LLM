@@ -119,7 +119,9 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/PAGE_TABLE_SPEC_GUIDE.md` | The page table spec each KV cache manager states for disaggregated transfer and KV cache sharing — **read before changing a KV cache manager's roles, layer naming or page table spec** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager/RECURRENT_STATE_DEVELOPER_GUIDE.md` | Recurrent state (Mamba2, GDN, KDA): the state a model declares, how shared runtime code finds the declaration, and what a family provides to its cache manager — **read before adding a recurrent family or a check on a recurrent model or cache manager** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -153,7 +155,7 @@ Key files:
 
 - **Pre-commit modifies files in-place** — if hooks fail, files are already modified. Re-stage (`git add`) and commit again.
 - **Protected APIs exist** — changes to LLM API signatures will fail `tests/unittest/api_stability` tests. Get code owner review.
-- **Integration tests need GPUs + models** — always set `LLM_MODELS_ROOT` and ensure GPU access. Unit tests don't.
+- **Test hardware and model weights** — set `LLM_MODELS_ROOT` for tests that use model weights. Unit tests can also require GPUs; only `cpu_only`-marked unit tests run in the CPU-only stages.
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
@@ -184,6 +186,9 @@ The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub
 4. If the command fails due to missing authentication or the wrong GitHub host/account, report the failure and ask for the correct `GH_CONFIG_DIR`.
 
 ## CI / Testing
+
+Before adding or changing tests, CI registrations or waivers, read the shared
+[test guidance](tests/AGENTS.md) and the applicable scoped guides it links to.
 
 See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
@@ -231,34 +236,9 @@ and fallback resolution apply only to the test pass. `--no-path-module-filter`
 disables exclusions in both passes while preserving their separate search paths
 and shared diagnostics.
 
-New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
-`LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
-CI controls test concurrency through `parallel_run_ctest`. `google-tests`
-continues to build all C++ tests; component aggregate targets build migrated tests.
-C++ integration fixtures build the collected tests with incremental native targets.
-`cpp-tests-<directory>` targets (for example `cpp-tests-common` or
-`cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
-legacy and full-stack executables. OWNER aggregates are component subsets and
-are not interchangeable with these directory targets.
-The Linux Release source-build fixture reuses the installed CI library for the
-RNN formatter test. CI source and wheel use the same commit and image per
-architecture. Link/load errors fail the tests. Direct CMake builds use source
-libraries unless explicitly configured otherwise.
-`CONFIG_LINUX_X86_64_VANILLA` also builds `google-tests`
-and publishes the `cpp_test_bundle` CMake component as a separate
-`cpp-tests-<main-tar-name>` artifact. The main package does not include the test
-programs. Only `-CPP-` stages using this build configuration fetch and unpack
-the companion into `src/cpp/build`, including fat-image consumers. Build reuse
-requires both artifacts. Linux Release integration fixtures use this bundle
-directly, retaining CTest selection and retries. The two FMHA tests share a
-test-only library packaged next to their executables; other runtime libraries
-come from the matching installed wheel. Test artifacts keep symbols but omit
-BOLT's extra relocation records.
-CPP stages collect only `tests/integration/defs/cpp` and use the standard test
-environment setup. CTest discovers cases on the test node, so the build stage
-does not need a GPU. Without a bundle, or with
-an explicit `TRTLLM_BUILD_ROOT`, fixtures retain the incremental build path.
+Before changing C++ test sources, build targets, packaging or the integration
+fixtures under `tests/integration/defs/cpp/`, read the scoped
+[C++ test guidance](cpp/tests/AGENTS.md).
 
 ### Vendor source tools and promotion
 

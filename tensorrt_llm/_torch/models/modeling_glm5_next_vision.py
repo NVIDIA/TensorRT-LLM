@@ -95,6 +95,7 @@ from .multimodal_encoder_graph import (
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
+    from ..recurrent_state_spec import RecurrentStateSpec
 
 _VISION_WEIGHT_PREFIX = "model.visual"
 
@@ -762,12 +763,15 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     Requires the Transformers version specified in the deployment guide.
     """
 
+    supports_tokenization_cache = True
+
     def __init__(
         self,
         model_path: str,
         config: PretrainedConfig,
         tokenizer: Optional[AutoTokenizer] = None,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -783,6 +787,16 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self._tokenizer = (
             tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(model_path)
         )
+        # Text-only prompts are tokenized with add_special_tokens=True and the cache with False,
+        # so their ids match only if the tokenizer adds no special tokens (the GLM-5 tokenizer adds
+        # none: the chat template writes [gMASK]<sop>).
+        if enable_tokenization_cache and self._tokenizer.num_special_tokens_to_add() != 0:
+            logger.warning(
+                "enable_tokenization_cache is ignored: the tokenizer adds special tokens, so "
+                "cached ids would differ from the full tokenization's."
+            )
+            enable_tokenization_cache = False
+        self._init_tokenization_cache(enable_tokenization_cache, self._tokenizer)
         self._processor = None
         vision = config.vision_config
         self._merge_size = int(vision.spatial_merge_size)
@@ -936,7 +950,12 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         video_datas = mm_data.get("video") or None
         if not images and not video_datas:
             # Text-only fast path: identical to the tokenizer and no
-            # multimodal payload, so the tower is never touched.
+            # multimodal payload, so the tower is never touched. A prompt that
+            # extends a recent one tokenizes only its tail when the prefix
+            # tokenization cache is on (enable_tokenization_cache).
+            ids = self._encode_with_tokenization_cache(text_prompt or "", sampling_params)
+            if ids is not None:
+                return ids, None
             # A Python list straight from the tokenizer: a tensor round trip costs
             # milliseconds on long prompts.
             return self._tokenizer(text_prompt).input_ids, None
@@ -1080,6 +1099,18 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_preferred_transceiver_runtime(cls, pretrained_config=None) -> str:
         return Glm5NextForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the text decoder's declaration; it is built from the composite config too."""
+        return Glm5NextForCausalLM.get_recurrent_state_spec(
+            pretrained_config, quant_config=quant_config
+        )
 
     @property
     def mamba_metadata_cls(self):
