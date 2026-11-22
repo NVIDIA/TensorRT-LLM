@@ -68,6 +68,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
     gather_base_page_rows,
 )
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_CACHE_SALT_KEY
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     KVEventsConfig,
@@ -587,6 +588,10 @@ class _RetainedTurn:
 def _request_conversation_key(request: LlmRequest) -> tuple[str, int | None, str | None] | None:
     conversation_id = _request_conversation_id(request)
     if conversation_id is None:
+        return None
+    multimodal_data = getattr(request, "py_multimodal_data", None)
+    if isinstance(multimodal_data, dict) and MULTIMODAL_CACHE_SALT_KEY in multimodal_data:
+        # A cache salt of its own: no later turn can reuse this one.
         return None
     # Retention plans must use the same namespace as prefix reuse.
     return conversation_id, request.lora_task_id, request.cache_salt
