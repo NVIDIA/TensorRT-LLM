@@ -182,16 +182,16 @@ def test_step_pack_is_issued_at_the_declared_point(mode: str) -> None:
 
     prepared = engine._inputs.prepare_inputs.return_value
 
-    def prepare(*args, **kwargs):
+    def prepare(*args: object, **kwargs: object) -> PreparedInputs:
         assert pack.begin.call_count == int(mode != "disabled")
         pack.flush.assert_not_called()
         return prepared
 
-    def record_input_copy():
+    def record_input_copy() -> None:
         engine._inputs.prepare_inputs.assert_called_once()
         assert pack.flush.call_count == int(early)
 
-    def replay(*args, **kwargs):
+    def replay(*args: object, **kwargs: object) -> dict[str, object]:
         engine._inputs.record_input_copy.assert_called_once()
         assert pack.flush.call_count == int(early)
         return outputs

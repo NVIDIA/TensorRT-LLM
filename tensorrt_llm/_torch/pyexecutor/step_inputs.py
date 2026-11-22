@@ -476,9 +476,11 @@ def copy_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
 
 
 def copy_metadata_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-    """``copy_`` when the active open pack is issued right after the input preparation
-    (``StepInputPack.issue_after_prepare``), else ``dst.copy_(src, non_blocking=True)``. The same staging contract
-    as ``copy_`` applies at the call site."""
+    """Copy metadata, allowing an open early pack to defer the copy to the end of input preparation.
+
+    The same staging contract as ``copy_`` applies. Callers must allow the destination to be updated as
+    late as the end of preparation. With a replay pack or no open pack, this is a direct nonblocking copy.
+    """
     pack = _active.get()
     if pack is not None and pack.open and pack.issue_after_prepare:
         return copy_(dst, src)

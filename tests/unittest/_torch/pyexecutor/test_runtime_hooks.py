@@ -754,7 +754,9 @@ def test_executor_loop_cleanup_calls_at_shutdown_after_a_completed_loop(complete
 
 
 @pytest.mark.parametrize("events", ["none", "without", "with"])
-def test_the_overlap_loop_calls_the_events_optional_per_iteration_call(monkeypatch, events):
+def test_the_overlap_loop_calls_the_events_optional_per_iteration_call(
+    monkeypatch: pytest.MonkeyPatch, events: str
+) -> None:
     from tensorrt_llm._torch.pyexecutor import py_executor
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
@@ -796,7 +798,7 @@ def test_the_overlap_loop_calls_the_events_optional_per_iteration_call(monkeypat
     executor._can_queue.return_value = (False, False)
     batch = types.SimpleNamespace(paused_requests=[], encoder_requests=[])
 
-    def schedule(**_):
+    def schedule(**_: object) -> tuple[types.SimpleNamespace, None]:
         log.append(f"schedule {executor.iter_counter}")
         return batch, None
 
@@ -825,13 +827,13 @@ class _RecordingPack:
         self.issue_after_prepare = issue_after_prepare
         self.staged_copies = []
 
-    def stage(self, dst, src) -> bool:
+    def stage(self, dst: torch.Tensor, src: torch.Tensor) -> bool:
         self.staged_copies.append((dst, src))
         return True
 
 
 @pytest.fixture
-def not_capturing(monkeypatch):
+def not_capturing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
 
@@ -840,7 +842,9 @@ def not_capturing(monkeypatch):
     [(None, True), (False, True), (True, True), (True, False)],
     ids=["no_pack", "replay_pack", "early_pack", "packing_disabled_for_copy"],
 )
-def test_pool_shared_copy_without_skip_cache(issue_after_prepare, allow_pack, not_capturing):
+def test_pool_shared_copy_without_skip_cache(
+    issue_after_prepare: bool | None, allow_pack: bool, not_capturing: None
+) -> None:
     from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 
     dst, src = torch.zeros(3, dtype=torch.int32), torch.arange(1, 4, dtype=torch.int32)

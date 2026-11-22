@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 if TYPE_CHECKING:
     import torch
 
+    from .step_inputs import StepInputPack
+
 
 class SpecStepFold(Protocol):
     """Speculative step-input staging folded into the previous step's forward.
@@ -196,8 +198,8 @@ class DecodePrologue(Protocol):
 class ExecutorEvents(Protocol):
     """Points in the executor's life a model may act at.
 
-    Optional, so not a protocol member: ``on_iteration(iteration)``, called by the overlap executor loop at the top
-    of every iteration with its iteration counter (host bookkeeping only; must not raise).
+    An implementation may also provide ``on_iteration(iteration)``. The overlap executor loop
+    calls it before scheduling each iteration. The hook is for host bookkeeping and must not raise.
     """
 
     def after_warmup(self) -> None:
@@ -214,8 +216,8 @@ class ExecutorEvents(Protocol):
 class RuntimeHooks:
     """The step-loop hooks a model opts into. All off by default."""
 
-    # Pack a decode step's small host-to-device input copies into one upload and
-    # one scatter launch, issued just before the CUDA graph replay.
+    # Pack eligible host-to-device copies on decode graph replays. The stock pack
+    # issues before or inside replay. A model pack can issue after input preparation.
     pack_step_inputs: bool = False
     # Issue the step-input pack's host copies with one parallel scatter (a program per copy) instead of the
     # serial one-CTA scatter, when their destinations do not overlap (pack_step_inputs).
@@ -234,11 +236,12 @@ class RuntimeHooks:
     # ``op(window, epoch_or_None, max_desc)``. It writes the window's host copies, then its device copies, zeroes the
     # window's header and increments the epoch, which the default prologue does with two scatter launches and a fill.
     pack_prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None
-    # With pack_step_inputs: the model's own step-input pack, built once per engine as ``factory(device)`` in place
-    # of the stock one. It returns a ``step_inputs.StepInputPack`` subclass that implements ``begin`` / ``stage`` /
-    # ``flush`` / ``discard`` itself; the pack_parallel_scatter / pack_in_graph / pack_early_copy / pack_step_epoch /
-    # pack_prologue_op options then do not apply.
-    step_input_pack_factory: Optional[Callable[[torch.device], Any]] = None
+    # With pack_step_inputs, factory(device) supplies a StepInputPack once per engine.
+    # The factory owns its pack options. A subclass that skips the stock initializer
+    # must implement begin, stage, flush(in_graph=...) and discard. The runner also
+    # reads open, issue_after_prepare, parallel_scatter, in_graph, early_copy, epoch
+    # and prologue_op, and can call capture_prologue, quiesce_graph_window and on_graph_replay.
+    step_input_pack_factory: Optional[Callable[[torch.device], StepInputPack]] = None
     decode_prologue: Optional[DecodePrologue] = None
     executor_events: Optional[ExecutorEvents] = None
     # Skip host-to-device metadata copies whose values the destination already holds.

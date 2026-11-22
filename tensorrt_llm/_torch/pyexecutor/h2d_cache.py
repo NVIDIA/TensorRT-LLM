@@ -203,8 +203,9 @@ def copy_h2d_pool_shared(dst: torch.Tensor, src: torch.Tensor, pack: bool = Fals
 
     Every graph key's metadata takes its buffers from one pool, which hands the same block to each key that asks
     for the same buffer name, and the captured graphs write some of those blocks on the device at every replay. The
-    host shadow therefore does not describe the device contents, so such a copy is never skipped. ``pack``: as for
-    ``copy_h2d_if_changed``, the copy may join the open ``step_inputs`` pack when a cache is active.
+    host shadow therefore does not describe the device contents, so such a copy is never skipped. With ``pack=True``,
+    the copy may join the open pack with an active cache. Without a cache, only an open pack that issues after input
+    preparation can take the copy.
     """
     cache = _active.get()
     if cache is None:

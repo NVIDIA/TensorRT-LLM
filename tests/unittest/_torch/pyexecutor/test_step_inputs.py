@@ -493,7 +493,7 @@ def test_after_a_discarded_step_identical_values_are_sent_again(pack):
     assert dst.tolist() == [4, 5, 6]
 
 
-def test_a_metadata_upload_does_not_join_the_stock_pack(pack):
+def test_a_metadata_upload_does_not_join_the_stock_pack(pack: StepInputPack) -> None:
     """The stock pack is issued at the replay, so ``copy_metadata_`` copies directly into an open one."""
     dst = _zeros(3)
 
@@ -508,7 +508,7 @@ class _PackIssuedAfterPrepare(StepInputPack):
     issue_after_prepare = True
 
 
-def test_a_metadata_upload_joins_a_pack_issued_after_prepare():
+def test_a_metadata_upload_joins_a_pack_issued_after_prepare() -> None:
     step_pack = _PackIssuedAfterPrepare(_device())
     dst = _zeros(3)
 
