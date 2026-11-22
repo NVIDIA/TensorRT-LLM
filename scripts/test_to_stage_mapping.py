@@ -65,12 +65,13 @@ sys.path.insert(
         Path(__file__).resolve().parent.parent / 'jenkins' / 'scripts' /
         'cbts'))
 from cbts.blocks import block_matches_stage  # noqa: E402
-from cbts.blocks import (Stage, YAMLIndex, derive_mako_from_stage,
-                         normalize_test_id)
+from cbts.blocks import (TARGET_SHARD_SECONDS, Stage, YAMLIndex,
+                         derive_mako_from_stage, estimate_entries_duration,
+                         load_durations)
 
-# Target wall-time per pytest-split shard, and a safety ceiling against a
-# corrupted/stale .test_durations blowing up shard counts.
-_TARGET_SHARD_SECONDS = 2 * 60 * 60
+# Safety ceiling against a corrupted/stale .test_durations blowing up shard
+# counts. The per-shard target (TARGET_SHARD_SECONDS) and the duration
+# estimate come from cbts.blocks so CBTS and this script size alike.
 _DYNAMIC_SPLITS_CAP = 20
 
 
@@ -111,18 +112,6 @@ def _phase_of(spec_name: str) -> str:
     return 'post_merge' if 'Post-Merge' in spec_name else 'pre_merge'
 
 
-def _load_durations(durations_path):
-    """Load pytest-split `.test_durations` ({node_id: seconds}); {} if absent/unparsable."""
-    try:
-        with open(durations_path, 'r') as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {k: v for k, v in data.items() if isinstance(v, (int, float))}
-
-
 def _dynamic_split_counts(specs, yaml_index, durations):
     """Sizes every stage family from its actual (mako-filtered) test set."""
     if not durations:
@@ -153,26 +142,21 @@ def _dynamic_split_counts(specs, yaml_index, durations):
                 tests.update(block.tests)
         if not tests:
             continue
-        # block.tests holds raw YAML entries (e.g. `test_fmha.py::test_fmha
-        # TIMEOUT (180)` / `... ISOLATION`); .test_durations is keyed by bare
-        # pytest node ids (params included, directive suffixes stripped), so
-        # normalize before lookup or every such entry silently misses and
-        # falls back to `avg`.
-        normalized = [normalize_test_id(t) for t in tests]
-        unmatched = [t for t in normalized if t not in durations]
+        # Same estimator as CBTS split sizing: exact node id, else subtree
+        # sum, else the average (see cbts.blocks.estimate_entries_duration).
+        seconds, unmatched = estimate_entries_duration(sorted(tests), durations,
+                                                       avg)
         if unmatched:
             sys.stderr.write(
                 f"_dynamic_split_counts: {spec['name']}: "
-                f"{len(unmatched)}/{len(normalized)} test(s) "
-                f"({len(unmatched) / len(normalized):.0%}) not found in "
+                f"{unmatched}/{len(tests)} test(s) "
+                f"({unmatched / len(tests):.0%}) not found in "
                 f".test_durations; using the {avg:.0f}s average for those\n")
-        total_tests += len(normalized)
-        total_unmatched += len(unmatched)
-        seconds = sum(durations.get(t, avg) for t in normalized)
+        total_tests += len(tests)
+        total_unmatched += unmatched
         k = max(
             1,
-            min(math.ceil(seconds / _TARGET_SHARD_SECONDS),
-                _DYNAMIC_SPLITS_CAP))
+            min(math.ceil(seconds / TARGET_SHARD_SECONDS), _DYNAMIC_SPLITS_CAP))
         overrides[spec['name']] = k
     if total_tests:
         sys.stderr.write(
@@ -190,7 +174,8 @@ class StageQuery:
                  durations_path: str = None):
         self.test_map, self.yaml_stage_tests = self._parse_tests(test_db_dir)
         yaml_index = YAMLIndex.load(Path(test_db_dir))
-        durations = _load_durations(durations_path) if durations_path else {}
+        durations = load_durations(
+            Path(durations_path)) if durations_path else {}
         self.stage_to_yaml, self.yaml_to_stages = self._parse_stage_mapping(
             stage_config_path, yaml_index, durations)
         # Build dynamic backend mapping from discovered data
@@ -403,7 +388,7 @@ def main():
         with open(stage_config, 'r') as f:
             specs = json.load(f)['configs']
         yaml_index = YAMLIndex.load(Path(db_dir))
-        durations = _load_durations(durations_path)
+        durations = load_durations(Path(durations_path))
         overrides = _dynamic_split_counts(specs, yaml_index, durations)
         for spec in specs:
             k = overrides.get(spec['name'])

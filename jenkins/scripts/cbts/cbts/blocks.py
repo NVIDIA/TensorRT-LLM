@@ -647,12 +647,26 @@ def _avg_duration(durations: dict[str, float]) -> float:
     return (sum(durations.values()) / len(durations)) if durations else 1.0
 
 
-def _estimate_entries_seconds(entries: list[str], durations: dict[str, float], avg: float) -> float:
-    """Sum entries' wall-time: exact node-id, else subtree-sum (deduped), else avg."""
+def estimate_entries_duration(
+    entries: list[str], durations: dict[str, float], avg: float | None = None
+) -> tuple[float, int]:
+    """Estimate `entries`' wall-time as (seconds, unmatched_entry_count).
+
+    Per entry: exact node-id (with, then without, -k/-m options), else subtree-sum (deduped across entries), else
+    `avg` (counted as unmatched). Every split-sizing path goes through this so
+    they agree on what a YAML entry costs.
+    """
+    if avg is None:
+        avg = _avg_duration(durations)
     matched: set[str] = set()
     unknown = 0
     for entry in entries:
-        bare = _strip_pytest_options(normalize_test_id(entry))
+        normalized = normalize_test_id(entry)
+        # .test_durations can key an entry with its -k/-m options intact.
+        if normalized in durations:
+            matched.add(normalized)
+            continue
+        bare = _strip_pytest_options(normalized)
         if bare in durations:
             matched.add(bare)
             continue
@@ -662,7 +676,12 @@ def _estimate_entries_seconds(entries: list[str], durations: dict[str, float], a
             matched.update(subtree)
         else:
             unknown += 1
-    return sum(durations[nid] for nid in matched) + unknown * avg
+    return sum(durations[nid] for nid in matched) + unknown * avg, unknown
+
+
+def _estimate_entries_seconds(entries: list[str], durations: dict[str, float], avg: float) -> float:
+    """Sum entries' wall-time: exact node-id, else subtree-sum (deduped), else avg."""
+    return estimate_entries_duration(entries, durations, avg)[0]
 
 
 def compute_stage_split_counts(

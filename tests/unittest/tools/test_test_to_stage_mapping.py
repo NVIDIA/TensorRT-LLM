@@ -448,6 +448,71 @@ def test_dynamic_split_sizing_normalizes_directive_suffixes(tmp_path):
     ]
 
 
+def _dynamic_shards(tmp_path: Path, name: str, entries: list,
+                    durations: dict) -> list:
+    """Shard names StageQuery sizes for one single-family stage."""
+    (tmp_path / 'jenkins' / 'scripts').mkdir(parents=True)
+    config = tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json'
+    config.write_text(
+        json.dumps({
+            'configs': [{
+                'name': name,
+                'arch': 'x86',
+                'slurm': False,
+                'platform': 'x',
+                'testDB': 'l0_sizing',
+                'splits': 1  # hardcoded fallback; overridden by sizing
+            }]
+        }))
+    db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
+    db_dir.mkdir(parents=True)
+    (db_dir / 'l0_sizing.yml'
+     ).write_text('version: 0.0.1\nl0_sizing:\n- condition:\n    terms:\n'
+                  '      stage: pre_merge\n      backend: pytorch\n  tests:\n' +
+                  ''.join(f'  - {e}\n' for e in entries))
+    durations_path = tmp_path / 'tests' / 'integration' / 'defs' / '.test_durations'
+    durations_path.parent.mkdir(parents=True)
+    durations_path.write_text(json.dumps(durations))
+    query = StageQuery(str(config), str(db_dir), str(durations_path))
+    return sorted(s for s in query.stage_to_yaml if s.startswith(f'{name}-'))
+
+
+def test_dynamic_split_sizing_sums_subtree_durations(tmp_path):
+    """An entry absent from .test_durations is costed by its subtree.
+
+    CBTS sizing (cbts.blocks.estimate_entries_duration) falls back from an
+    exact node-id to the sum of the node ids under the entry's target, and
+    this script must size the same way. The file-level entry below has only
+    parametrized children in .test_durations: exact-only lookup would price
+    it at the global average (~3340s -> 1 shard) instead of its children.
+    """
+    shards = _dynamic_shards(
+        tmp_path, 'Subtree-PyTorch', ['unittest/test_sub.py -k "param"'], {
+            'unittest/test_sub.py::test_p[a]': 5000.0,
+            'unittest/test_sub.py::test_p[b]': 5000.0,
+            'unittest/unrelated.py::test_cheap': 10.0,
+        })
+    # 5000 + 5000 = 10000s -> ceil(10000 / 7200) = 2 shards.
+    assert shards == ['Subtree-PyTorch-1', 'Subtree-PyTorch-2']
+
+
+def test_dynamic_split_sizing_prefers_exact_key_with_options(tmp_path):
+    """A .test_durations key that keeps -k options wins over its subtree.
+
+    The exact key is the precise cost of the entry; stripping the options
+    first would drop to the cheaper subtree decoy under the bare node id.
+    """
+    entry = 'unittest/test_k.py::test_k -k "a"'
+    shards = _dynamic_shards(
+        tmp_path, 'ExactK-PyTorch', [entry], {
+            entry: 9000.0,
+            'unittest/test_k.py::test_k[zzz]': 100.0,
+            'unittest/unrelated.py::test_cheap': 10.0,
+        })
+    # 9000s -> ceil(9000 / 7200) = 2 shards (the 100s decoy would give 1).
+    assert shards == ['ExactK-PyTorch-1', 'ExactK-PyTorch-2']
+
+
 @pytest.mark.parametrize("direction",
                          ["test_to_stage", "stage_to_test", "roundtrip"])
 def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
