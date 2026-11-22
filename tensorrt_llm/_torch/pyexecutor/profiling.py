@@ -46,7 +46,7 @@ import time
 import uuid
 import weakref
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Callable, Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Mapping, Optional
 
 import torch
 
@@ -869,8 +869,11 @@ class PyExecutorProfileManager:
         self.metrics_logger = LoggerExposure(logger.info)
         self._metrics_log_rank_enabled = False
         self._kv_pool_log_enabled = load_kv_pool_log_enabled()
-        self._kv_pool_rank_snapshot = None
+        # (rank snapshot, per-pool utilization read together with that snapshot's KV stats)
+        self._kv_pool_sample = None
         self._kv_pool_gib_logged = False
+        if self._kv_pool_log_enabled:
+            self.metrics.rank_listener = self._sample_kv_pools
 
     @property
     def _executor(self) -> "PyExecutor":  # noqa: F821
@@ -889,29 +892,42 @@ class PyExecutorProfileManager:
             kv_pool_text = self._kv_pool_log_text(record) if self._kv_pool_log_enabled else ""
             self.metrics_logger.emit(record, kv_pool_text=kv_pool_text)
 
-    def _kv_pool_log_text(self, record: PerfMetricsRecord) -> str:
-        """Return per-pool KV cache fields on lines whose ``kv_cache_util`` was just read.
+    def _sample_kv_pools(self, snapshot: Mapping) -> None:
+        """Read per-pool KV cache utilization right after ``snapshot`` read the KV cache stats.
 
-        Each KV cache read makes a new rank snapshot: every ``ITER_LOG_KV_UTIL_REFRESH_ITERS``
-        loops in logger-only mode, or each measured iteration with iteration stats. The pool
-        counters are read only when a line carries a snapshot not seen before, so both fields
-        describe the same moment. Other lines, warmup (a temporary KV cache manager) and the
-        V1 manager read nothing.
+        The collector makes a rank snapshot whenever ``kv_cache_util`` is read: every
+        ``ITER_LOG_KV_UTIL_REFRESH_ITERS`` loops in logger-only mode, or each measured
+        iteration with iteration stats. Reading the pools at that point, rather than when the
+        line is printed, keeps both fields at the same moment even if pages are released in
+        between. Warmup (a temporary KV cache manager), the V1 manager and ranks that do not
+        print read nothing.
         """
-        snapshot = record.per_rank
-        if snapshot is self._kv_pool_rank_snapshot or "kvCacheStats" not in snapshot:
-            return ""
-        # Remembered even when skipped, so a warmup snapshot is not sampled after warmup.
-        self._kv_pool_rank_snapshot = snapshot
+        self._kv_pool_sample = None
         executor = self._executor
         manager = executor.kv_cache_manager
-        if manager is None or not executor._is_kv_manager_v2 or executor.is_warmup:
+        if (
+            "kvCacheStats" not in snapshot
+            or manager is None
+            or not executor._is_kv_manager_v2
+            or executor.is_warmup
+            or not executor.print_log
+            or not self._metrics_log_rank_enabled
+        ):
+            return
+        self._kv_pool_sample = (snapshot, manager.get_kv_cache_pool_utilization())
+
+    def _kv_pool_log_text(self, record: PerfMetricsRecord) -> str:
+        """Return the per-pool fields sampled with this line's KV snapshot, once per snapshot."""
+        sample = self._kv_pool_sample
+        if sample is None or sample[0] is not record.per_rank:
             return ""
+        self._kv_pool_sample = None
         gpu_pool_gib = None
         if not self._kv_pool_gib_logged:
             self._kv_pool_gib_logged = True
+            manager = self._executor.kv_cache_manager
             gpu_pool_gib = [size / 2**30 for size in manager.get_gpu_pool_bytes()]
-        return format_kv_pool_fields(manager.get_kv_cache_pool_utilization(), gpu_pool_gib)
+        return format_kv_pool_fields(sample[1], gpu_pool_gib)
 
     @contextmanager
     def profile_step(self):

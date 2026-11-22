@@ -93,9 +93,9 @@ def _loop(collector, read_kv_cache=None, kv_refresh_interval=16):
     )
 
 
-def _record():
-    """A loop record whose KV snapshot was read on this loop."""
-    return _loop(PerfMetricsCollector(), read_kv_cache=_kv_stats)
+def _record(profiler):
+    """A loop record whose KV snapshot was read on this loop by the profiler's collector."""
+    return _loop(profiler.metrics, read_kv_cache=_kv_stats)
 
 
 def test_pool_utilization_uses_tier_local_pools_without_iteration_stats():
@@ -158,7 +158,7 @@ def test_pool_fields_follow_the_kv_cache_util_refresh(monkeypatch):
     )
     executor = _executor(manager)  # The profile manager holds only a weakref.
     profiler, lines = _profiler(executor, True, monkeypatch)
-    collector = PerfMetricsCollector()
+    collector = profiler.metrics
     read_kv_cache = Mock(side_effect=_kv_stats)
     for _ in range(4):
         profiler.expose_metrics(_loop(collector, read_kv_cache, kv_refresh_interval=2))
@@ -173,8 +173,8 @@ def test_pool_fields_follow_the_kv_cache_util_refresh(monkeypatch):
         "currank_total_requests"
     ) in lines[0]
     assert "pool_gib" not in lines[2] and "kv_cache_gpu_pool_util = [0:0.900]" in lines[2]
-    # Two samples: GPU sizes once, then GPU and host utilization per sample.
-    assert manager._get_storage_statistics.call_args_list == [call(0), call(0), call(1)] + [
+    # Two samples read GPU and host utilization; the first printed line also reads GPU sizes.
+    assert manager._get_storage_statistics.call_args_list == [call(0), call(1), call(0)] + [
         call(0),
         call(1),
     ]
@@ -185,7 +185,7 @@ def test_iteration_stats_snapshots_trigger_one_sample_each(monkeypatch):
     manager = _manager([CacheTier.GPU_MEM], {0: [_capacity(100, 5, 5)]})
     executor = _executor(manager)
     profiler, lines = _profiler(executor, True, monkeypatch)
-    collector = PerfMetricsCollector()
+    collector = profiler.metrics
     collector.collect_rank({"kvCacheStats": {"maxNumBlocks": 100}}, capture_iter=0)
     profiler.expose_metrics(_loop(collector))
     profiler.expose_metrics(_loop(collector))
@@ -195,12 +195,25 @@ def test_iteration_stats_snapshots_trigger_one_sample_each(monkeypatch):
     assert "pool" not in lines[2]
 
 
+def test_pools_are_read_with_the_snapshot_not_at_print_time(monkeypatch):
+    # With iteration stats the rank snapshot is taken before the line is printed, and pages
+    # can be released in between (for example by deferred closes on an idle loop).
+    snapshots = {0: [_capacity(100, 5, 5)]}
+    manager = _manager([CacheTier.GPU_MEM], snapshots)
+    executor = _executor(manager)
+    profiler, lines = _profiler(executor, True, monkeypatch)
+    profiler.metrics.collect_rank({"kvCacheStats": {"maxNumBlocks": 100}}, capture_iter=0)
+    snapshots[0] = [_capacity(100, 100, 0)]
+    profiler.expose_metrics(_loop(profiler.metrics))
+    assert "kv_cache_gpu_pool_util = [0:0.900]" in lines[0]
+
+
 def test_warmup_snapshot_is_not_sampled_after_warmup(monkeypatch):
     manager = _manager([CacheTier.GPU_MEM], {0: [_capacity(100, 5, 5)]})
     executor = _executor(manager)
     executor.is_warmup = True
     profiler, lines = _profiler(executor, True, monkeypatch)
-    collector = PerfMetricsCollector()
+    collector = profiler.metrics
     profiler.expose_metrics(_loop(collector, _kv_stats))
     executor.is_warmup = False
     profiler.expose_metrics(_loop(collector, _kv_stats))
@@ -213,7 +226,7 @@ def test_disabled_and_legacy_paths_read_no_pools(monkeypatch, enabled, is_v2):
     manager = _manager([CacheTier.GPU_MEM], {0: [_capacity(100, 5, 5)]})
     executor = _executor(manager, is_v2=is_v2)
     profiler, lines = _profiler(executor, enabled, monkeypatch)
-    profiler.expose_metrics(_record())
+    profiler.expose_metrics(_record(profiler))
     assert len(lines) == 1 and "pool" not in lines[0]
     manager._get_storage_statistics.assert_not_called()
 
@@ -225,7 +238,7 @@ def test_non_logging_ranks_read_no_pools(monkeypatch, print_log, rank_enabled):
     executor.print_log = print_log
     profiler, lines = _profiler(executor, True, monkeypatch)
     profiler._metrics_log_rank_enabled = rank_enabled
-    profiler.expose_metrics(_record())
+    profiler.expose_metrics(_record(profiler))
     assert lines == []
     manager._get_storage_statistics.assert_not_called()
 
@@ -234,7 +247,7 @@ def test_pool_fields_stay_out_of_the_collected_record(monkeypatch):
     manager = _manager([CacheTier.GPU_MEM], {0: [_capacity(100, 5, 5)]})
     executor = _executor(manager)  # The profile manager holds only a weakref.
     profiler, lines = _profiler(executor, True, monkeypatch)
-    record = _record()
+    record = _record(profiler)
     profiler.expose_metrics(record)
     assert "pool_util" in lines[0]
     assert not any("pool" in key.lower() for key in record.iteration_view())
