@@ -97,6 +97,9 @@ from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm i
 )
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.dspark.worker import (
+    MistralLarge4DSparkWorker,
+)
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.activation.gelu_erf import gelu_erf
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.activation.tanh_softcap import (
     tanh_softcap,
@@ -196,7 +199,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
-from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.flash_mla import get_mla_metadata
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -1901,7 +1903,6 @@ class DraftModel(nn.Module):
     _kv_factor = 1
     _dspark_shift_label = True
     has_markov_head = True
-    has_recurrent_markov_head = True
 
     def __init__(self, shell, draft_config):
         super().__init__()
@@ -2415,9 +2416,8 @@ class ModelingV2MistralLarge4Nvfp4Sm103Tp(
                 modeling_v2_target=None,
             )
             self.draft_model = DraftModel(self, self.draft_config)
-            self.spec_worker = get_spec_worker(
+            self.spec_worker = MistralLarge4DSparkWorker(
                 self.spec_config,
-                model_config,
                 model_config.mapping,
                 use_separate_draft_kv_cache=True,
             )
