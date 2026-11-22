@@ -9,7 +9,7 @@ import contextlib
 import gc
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
@@ -355,32 +355,41 @@ class DecoderWarmup:
             # their rows in buffers of its own: free the ones the warmup forwards left on this thread.
             release_mma_staging_buffers()
 
-    def rehearse(self, resource_manager: ResourceManager) -> None:
-        """The autotuner warmup's forwards, run eagerly in the autotuner's build state
-        on whatever weights the model holds, inside the caller's KernelBuilder rehearsal.
+    def rehearse(
+        self,
+        resource_manager: ResourceManager,
+        shapes: Sequence[tuple[int, int]] | None = None,
+    ) -> list[tuple[int, int]]:
+        """The autotuner warmup's forwards, or the ``(num_tokens, num_gen_requests)``
+        ``shapes`` given, run eagerly in the autotuner's build state on whatever weights
+        the model holds, inside the caller's KernelBuilder rehearsal.
 
         They supply the largest shapes: each op the forwards reach sweeps its own shapes
         down from them, and an op that tunes queues the builds its tuning will time.
         Every rank calls it. Its requests are released and its workspaces freed.
+
+        Returns the shapes that every rank skipped for lack of KV cache space.
         """
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
         if kv_cache_manager is None or not self._context_warmups_supported:
-            return
+            return []
         if self.mapping.cp_size > 1 and self.mapping.cp_config.get("cp_type") != CpType.HELIX:
-            return
+            return []
         # Tuning queued here (TuningConfig.tune_in_rehearsal) splits across the ranks of
         # its tuning group as the warmup's does.
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         if self._config.enable_autotuner:
             # The MXFP8 methods dispatch as the autotuner warmup will tune them.
             _select_mxfp8_methods(self)
-        warmup_configs, _ = _autotuner_warmup_configs(
-            self, resource_manager, _autotuner_warmup_mode(self)
-        )
+        if shapes is None:
+            shapes, _ = _autotuner_warmup_configs(
+                self, resource_manager, _autotuner_warmup_mode(self)
+            )
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
 
+        skipped = []
         try:
             # force_eager: no torch.compile traces, whole-model or op-level. Window
             # requests come from plain memory, so the NCCL window pool grows only with
@@ -393,8 +402,9 @@ class DecoderWarmup:
                 self._graphs.no_cuda_graph(),
                 build_kernels(),
             ):
-                for num_tokens, num_gen_requests in warmup_configs:
-                    self._rehearse_batch(resource_manager, num_tokens, num_gen_requests)
+                for num_tokens, num_gen_requests in shapes:
+                    if not self._rehearse_batch(resource_manager, num_tokens, num_gen_requests):
+                        skipped.append((num_tokens, num_gen_requests))
         except BaseException:
             self._reset_moe_alltoall_state()
             raise
@@ -404,11 +414,13 @@ class DecoderWarmup:
             clear_memory_buffers()
             gc.collect()
             torch.cuda.empty_cache()
+        return skipped
 
     def _rehearse_batch(
         self, resource_manager: ResourceManager, num_tokens: int, num_gen_requests: int
-    ) -> None:
-        """One forward of the rehearsal, on a batch as the autotuner warmup builds it."""
+    ) -> bool:
+        """One forward of the rehearsal, on a batch as the autotuner warmup builds it.
+        Returns False when every rank skipped it for lack of KV cache space."""
         warmup_request = self._dummy_requests.create_warmup_request(
             resource_manager, num_tokens, num_gen_requests
         )
@@ -418,7 +430,7 @@ class DecoderWarmup:
                 num_tokens,
                 f"rehearsal, num_tokens={num_tokens}, num_gen_requests={num_gen_requests}",
             ):
-                return
+                return False
             with self._warmup_timer.phase(
                 f"rehearsal shape num_tokens={num_tokens}, num_gen_requests={num_gen_requests}",
                 record=False,
@@ -434,6 +446,7 @@ class DecoderWarmup:
                         runtime_draft_len=get_static_draft_len(self._config.spec_config),
                     )
                 torch.cuda.synchronize()
+        return True
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager

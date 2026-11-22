@@ -3,7 +3,7 @@
 
 import functools
 from collections import defaultdict
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -1088,14 +1088,19 @@ class ModelEngine:
         """True while the model holds the dummy weights of a deferred checkpoint load."""
         return self.model_loader is not None and self.model_loader.has_deferred_checkpoint
 
-    def rehearse(self, resource_manager: ResourceManager) -> None:
-        """Warmup forwards on the dummy weights, inside the caller's KernelBuilder
-        rehearsal, so the ops list their kernels; every rank calls it."""
+    def rehearse(
+        self,
+        resource_manager: ResourceManager,
+        shapes: Sequence[tuple[int, int]] | None = None,
+    ) -> list[tuple[int, int]]:
+        """Warmup forwards on the dummy weights (``DecoderWarmup.rehearse``), inside the
+        caller's KernelBuilder rehearsal, so the ops list their kernels; every rank calls
+        it. Returns the shapes every rank skipped for lack of KV cache space."""
         if not isinstance(self._runner, DecoderRunner):
-            return
+            return []
         self.set_warmup_purpose("rehearsal")
         with self.warmup_scope():
-            self._runner.rehearse(resource_manager)
+            return self._runner.rehearse(resource_manager, shapes)
 
     def load_deferred_checkpoint(self) -> None:
         """Load the checkpoint the model loader deferred, as a weight update does."""

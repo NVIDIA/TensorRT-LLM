@@ -2176,14 +2176,15 @@ class KvCacheCreator:
             self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
         self._kv_cache_config.max_tokens = max_tokens
 
-    def prepare_rehearsal(self) -> None:
+    def prepare_rehearsal(self, *, scale: int = 1) -> None:
         """Size the KV cache config for the KernelBuilder rehearsal's throwaway
-        managers from the rehearsal's own forwards, whether or not the capacity
-        estimation runs."""
+        managers for ``scale`` times the tokens of the rehearsal's own forwards,
+        whether or not the capacity estimation runs."""
         # build_managers then builds from this config instead of sizing for
         # serving (configure_kv_cache_capacity).
         self._skip_est = False
-        self._size_throwaway_kv_cache(self._get_token_num_for_rehearsal)
+        self._size_throwaway_kv_cache(
+            lambda: self._get_token_num_for_rehearsal() * scale)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.

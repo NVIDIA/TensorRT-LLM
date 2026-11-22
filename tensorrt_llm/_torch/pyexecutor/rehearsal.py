@@ -62,15 +62,55 @@ class Rehearsal:
         """Run the rehearsal's forwards on KV cache managers of its own, sized for them
         (``KvCacheCreator.prepare_rehearsal``), whether or not the capacity estimation runs.
 
+        A cache sized for the forwards' tokens can hold fewer: the allocator rounds every
+        pool up to its allocation granularity, which outweighs a small batch's pages where
+        recurrent state fills many small pools (Kimi-K3's Helix generation servers). The
+        shapes that every rank skipped for that run again on managers sized for
+        ``RETRY_TOKEN_SCALES`` times their tokens, in turn; the memory budget still caps them.
+
         The managers are shut down and their memory freed before it returns, so that the
         checkpoint loads with the memory it would have had; the timing it queued starts.
         ``kv_cache_creator`` is left as it was.
         """
+        skipped = self._rehearse_on_own_managers(model_engine, kv_cache_creator, scale=1)
+        for scale in self.RETRY_TOKEN_SCALES:
+            if not skipped:
+                break
+            logger.info(
+                f"[KernelBuilder] rehearsing {skipped} again, on a KV cache sized for {scale}x "
+                "their tokens: the allocator rounds every pool up, so the cache sized for them "
+                "holds less"
+            )
+            skipped = self._rehearse_on_own_managers(
+                model_engine, kv_cache_creator, scale=scale, shapes=skipped
+            )
+        if skipped:
+            logger.warning(
+                f"[KernelBuilder] the rehearsal skipped {skipped}: not enough KV cache space; "
+                "the warmup builds what they use"
+            )
+        RehearsalTuner.get().start()
+
+    # Token multiples a skipped shape's managers are sized for, in turn. Each round's managers
+    # are freed before the next one's are built.
+    RETRY_TOKEN_SCALES = (64, 512)
+
+    def _rehearse_on_own_managers(
+        self,
+        model_engine: ModelEngine,
+        kv_cache_creator: KvCacheCreator,
+        *,
+        scale: int,
+        shapes: list[tuple[int, int]] | None = None,
+    ) -> list[tuple[int, int]]:
+        """The rehearsal's forwards (``shapes``, else all of them) on throwaway managers sized
+        by ``KvCacheCreator.prepare_rehearsal(scale=scale)``; returns the shapes every rank
+        skipped for lack of KV cache space."""
         # The sizing changes the creator's KV cache config and rebinds the other fields it
         # changes: a copy with a config of its own leaves the original as it was.
         creator = copy.copy(kv_cache_creator)
         creator._kv_cache_config = kv_cache_creator._kv_cache_config.model_copy(deep=True)
-        creator.prepare_rehearsal()
+        creator.prepare_rehearsal(scale=scale)
         resources: dict = {}
         try:
             creator.build_managers(resources, estimating_kv_cache=True)
@@ -78,14 +118,13 @@ class Rehearsal:
             if spec_resource_manager is not None:
                 resources[ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
             with KernelBuilder.get().rehearsal():
-                model_engine.rehearse(ResourceManager(resources))
+                return model_engine.rehearse(ResourceManager(resources), shapes)
         finally:
             if ResourceManagerType.KV_CACHE_MANAGER in resources:
                 creator.teardown_managers(resources)
             resources.clear()
             gc.collect()
             torch.cuda.empty_cache()
-        RehearsalTuner.get().start()
 
     def join(self) -> None:
         """Wait for the rehearsal's builds and timing, merge the timing across the ranks, stop
