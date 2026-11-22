@@ -79,9 +79,10 @@ The following restrictions are enforced:
   engine initialization.
   Encoder work and embedding fusion run outside the captured body. Calls whose
   optional inputs or tensor layouts differ from capture run the body eagerly.
-- A multimodal model with `disable_mm_encoder` and no local encoder keeps the
-  text path: text batches replay the plain language model body, and batches
-  with multimodal inputs run eagerly.
+- A multimodal model that is itself a `DecoderModelForCausalLM`, or one with
+  `disable_mm_encoder` and no local encoder, keeps the text path: text batches
+  replay the plain language model body, and batches with multimodal inputs run
+  eagerly.
 - Speculative decoding is supported.
 - Context-logit requests run eagerly instead of replaying a breakable CUDA
   graph.
