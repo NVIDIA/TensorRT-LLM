@@ -218,9 +218,9 @@ def test_kv_events_config_recurrent_checkpoints_default_off() -> None:
     )
     try:
         assert manager.publish_recurrent_checkpoints is False
-        # No sink call is made when the option is off; a bogus id must not raise.
-        manager.set_recurrent_life_cycles([7])
-        manager.set_layer_group_kinds({0: "attention"})
+        assert manager.event_sink.publishes_recurrent_checkpoints is False
+        # No sink call is made while the gate is closed; an invalid id must not raise.
+        manager.set_recurrent_life_cycles([-1])
     finally:
         manager.shutdown()
     enabled = KVEventsConfig(
@@ -231,6 +231,10 @@ def test_kv_events_config_recurrent_checkpoints_default_off() -> None:
     )
     try:
         assert manager.publish_recurrent_checkpoints is True
+        # The gate is open, but no recurrent life cycle was declared yet.
+        assert manager.event_sink.publishes_recurrent_checkpoints is False
+        manager.set_publish_recurrent_checkpoints(False)
+        assert manager.publish_recurrent_checkpoints is False
     finally:
         manager.shutdown()
 

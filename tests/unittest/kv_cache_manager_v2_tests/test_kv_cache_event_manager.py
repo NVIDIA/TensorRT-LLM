@@ -22,7 +22,7 @@ import time
 import uuid
 from importlib.util import find_spec
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 from unittest.mock import Mock
 
 import msgspec
@@ -147,6 +147,8 @@ def real_block_factory():
             blocks.append(block)
             return block
 
+        # Tests that attach a page to an existing block need the owning manager.
+        make.manager = manager
         return make
 
     yield create
@@ -353,10 +355,13 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_i
         manager.shutdown()
 
 
-def test_native_streaming_sink_tags_recurrent_checkpoints(real_block_factory):
+def test_native_streaming_sink_tags_recurrent_checkpoints(
+    real_block_factory: Callable[..., Callable[..., Any]],
+) -> None:
     """Snapshots publish as tagged BlockStored under the attention block hash.
 
-    Evicting the snapshot alone withdraws only the tagged event.
+    Evicting the snapshot alone withdraws only the tagged event; restoring the attention
+    page re-advertises a surviving snapshot.
     """
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(
@@ -370,44 +375,53 @@ def test_native_streaming_sink_tags_recurrent_checkpoints(real_block_factory):
     event_sink = manager.event_sink
     manager.start()
     try:
-        # Life cycle 0 is the attention target; life cycle 1 stands in for the recurrent state.
+        # Life cycle 0 is the attention target. The test manager has no SSM layer, so life
+        # cycle 1 (a windowed attention group) stands in for the recurrent state by override.
         manager.set_layer_group_window_sizes({0: 128, 1: 64})
         manager.set_recurrent_life_cycles([1])
-        published = []
+        published: list[KVEventBatch] = []
         manager._publisher.publish = lambda batch: published.append(batch) or True
         make_block = real_block_factory(event_sink, num_life_cycles=2, tokens_per_block=2)
 
         first = make_block(_token_ids(1, 3), [2, 0])
-        second = make_block(_token_ids(3, 5), [2, 2], parent=first)
-        partial = make_block(_token_ids(5, 6), [1, 1], parent=second)
+        # Attention page only at store time; the snapshot is attached and announced later,
+        # as _commitBlock does.
+        second = make_block(_token_ids(3, 5), [2, 0], parent=first)
+        # A full attention block whose snapshot covers one of its two tokens: no checkpoint.
+        short_snapshot = make_block(_token_ids(5, 7), [2, 1], parent=second)
+        partial = make_block(_token_ids(7, 8), [1, 1], parent=short_snapshot)
 
         _add_streaming_stored_block(event_sink, first)
         _add_streaming_stored_block(event_sink, second)
-        # The snapshot is announced after the block, as _commitBlock does.
+        _add_streaming_stored_life_cycle(event_sink, second, 1)  # no page yet: nothing
+        _introspection.add_test_block_page(make_block.manager, second, 1, 2)
         _add_streaming_stored_life_cycle(event_sink, second, 1)
         _add_streaming_stored_life_cycle(event_sink, second, 1)  # idempotent
-        _add_streaming_stored_block(event_sink, partial)  # partial: nothing published
-        assert manager.stored_blocks == 2
+        _add_streaming_stored_block(event_sink, short_snapshot)
+        _add_streaming_stored_block(event_sink, partial)  # partial block: nothing published
+        assert manager.stored_blocks == 3
         assert manager.recurrent_checkpoints_stored == 1
+        assert manager.recurrent_checkpoints_suppressed == 1
         assert manager.non_target_life_cycles_ignored == 0
         manager.flush_iteration_events()
 
         first_hash = int.from_bytes(_block_key(first)[:8], byteorder="big", signed=True)
         second_hash = int.from_bytes(_block_key(second)[:8], byteorder="big", signed=True)
+        third_hash = int.from_bytes(_block_key(short_snapshot)[:8], byteorder="big", signed=True)
         assert len(published) == 1
         attention = [e for e in published[0].events if e.group_idx is None]
         checkpoints = [e for e in published[0].events if e.group_idx is not None]
-        assert len(attention) == 1
-        assert attention[0].block_hashes == [first_hash, second_hash]
-        assert attention[0].kv_cache_spec_kind is None
+        assert [e.block_hashes for e in attention] == [[first_hash, second_hash], [third_hash]]
+        assert all(e.kv_cache_spec_kind is None for e in attention)
         assert len(checkpoints) == 1
         assert checkpoints[0].block_hashes == [second_hash]
         assert checkpoints[0].parent_block_hash == first_hash
         assert checkpoints[0].token_ids == []
+        # group_idx is the recurrent life cycle's id, as buffered events report it.
         assert checkpoints[0].group_idx == 1
         assert checkpoints[0].kv_cache_spec_kind == "mamba"
         wire_batch = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]), type=KVEventBatch)
-        assert [e.kv_cache_spec_kind for e in wire_batch.events] == [None, "mamba"]
+        assert [e.kv_cache_spec_kind for e in wire_batch.events] == [None, "mamba", None]
 
         # Snapshot eviction alone: tagged removal, attention block stays.
         _add_streaming_removed_life_cycle(event_sink, second, 1)
@@ -420,22 +434,35 @@ def test_native_streaming_sink_tags_recurrent_checkpoints(real_block_factory):
         assert removed[0].group_idx == 1
         assert removed[0].kv_cache_spec_kind == "mamba"
 
-        # Re-announcing the snapshot publishes it again; removing the whole block withdraws both.
+        # Re-announcing the snapshot publishes it again. Removing the attention page alone
+        # withdraws the block and its checkpoint; restoring it re-advertises both.
         _add_streaming_stored_life_cycle(event_sink, second, 1)
-        _add_streaming_removed_block(event_sink, second)
+        _add_streaming_removed_life_cycle(event_sink, second, 0)
+        _add_streaming_stored_life_cycle(event_sink, second, 0)
         manager.flush_iteration_events()
         events = published[-1].events
-        assert [type(e).__name__ for e in events] == ["BlockStored", "BlockRemoved", "BlockRemoved"]
+        assert [type(e).__name__ for e in events] == [
+            "BlockStored",
+            "BlockRemoved",
+            "BlockRemoved",
+            "BlockStored",
+            "BlockStored",
+        ]
         assert events[0].group_idx == 1
-        assert {e.group_idx for e in events[1:]} == {1, None}
-        assert all(e.block_hashes == [second_hash] for e in events[1:])
+        assert {e.group_idx for e in events[1:3]} == {1, None}
+        assert all(e.block_hashes == [second_hash] for e in events[1:3])
+        assert [e.group_idx for e in events[3:]] == [None, 1]
+        assert events[4].block_hashes == [second_hash]
+        assert manager.recurrent_checkpoints_stored == 3
         assert manager.recurrent_checkpoints_removed == 2
         assert manager.removed_blocks == 1
     finally:
         manager.shutdown()
 
 
-def test_native_streaming_sink_recurrent_publishing_is_opt_in(real_block_factory):
+def test_native_streaming_sink_recurrent_publishing_is_opt_in(
+    real_block_factory: Callable[..., Callable[..., Any]],
+) -> None:
     """Without publish_recurrent_checkpoints a recurrent life cycle stays ignored."""
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
@@ -448,8 +475,10 @@ def test_native_streaming_sink_recurrent_publishing_is_opt_in(real_block_factory
     manager.start()
     try:
         manager.set_layer_group_window_sizes({0: 128, 1: 64})
-        manager.set_recurrent_life_cycles([1])
-        published = []
+        # The gate is closed, so the override is not forwarded: an invalid id must not raise.
+        manager.set_recurrent_life_cycles([-1])
+        assert event_sink.publishes_recurrent_checkpoints is False
+        published: list[KVEventBatch] = []
         manager._publisher.publish = lambda batch: published.append(batch) or True
         make_block = real_block_factory(event_sink, num_life_cycles=2, tokens_per_block=2)
         first = make_block(_token_ids(1, 3), [2, 2])
@@ -464,13 +493,18 @@ def test_native_streaming_sink_recurrent_publishing_is_opt_in(real_block_factory
         manager.shutdown()
 
 
-def test_native_streaming_sink_rejects_recurrent_target_overlap():
+def test_native_streaming_sink_rejects_recurrent_target_overlap() -> None:
     event_sink = StreamingEventSink(max_entries=8)
     event_sink.set_target_life_cycle(0)
     with pytest.raises(ValueError):
         event_sink.set_recurrent_life_cycles([0])
     with pytest.raises(ValueError):
         event_sink.set_recurrent_life_cycles([-1])
+    # Opting in without any recurrent life cycle publishes nothing.
+    event_sink.set_publish_recurrent_checkpoints(True)
+    assert event_sink.publishes_recurrent_checkpoints is False
+    event_sink.set_recurrent_life_cycles([1])
+    assert event_sink.publishes_recurrent_checkpoints is True
 
 
 @pytest.mark.parametrize(
@@ -1205,18 +1239,26 @@ def test_v2_kv_cache_event_manager_serializes_layer_group_id():
     ]
 
 
-def test_v2_kv_cache_event_manager_serializes_layer_group_kind():
+def test_v2_kv_cache_event_manager_serializes_layer_group_kind(
+    real_block_factory: Callable[..., Callable[..., Any]],
+) -> None:
+    """Kinds come from the manager's life cycle registry when the sink is installed."""
     event_manager = KVCacheEventManager(max_kv_event_entries=4, window_size=128)
-    event_manager.set_layer_group_kinds({0: "attention", 1: "mamba"})
+    # Life cycle 0 is full attention, life cycle 1 a sliding-window attention group.
+    real_block_factory(event_manager, num_life_cycles=2, tokens_per_block=2)
     event_manager.add_created_event([2, 3], [0, 1, 2])
 
     events = _flush_serialized_events(event_manager)
 
     assert [event["layer_group_id"] for event in events] == [0, 1, 2]
-    assert [event.get("layer_group_kind") for event in events] == ["attention", "mamba", None]
+    assert [event.get("layer_group_kind") for event in events] == [
+        "attention",
+        "sliding_window",
+        None,
+    ]
 
 
-def test_kv_cache_event_serializer_emits_layer_group_kind_when_present():
+def test_kv_cache_event_serializer_emits_layer_group_kind_when_present() -> None:
     """The serializer reports the kind of events that carry one and omits it otherwise."""
     tagged = SimpleNamespace(
         event_id=1,
@@ -1240,7 +1282,7 @@ def test_kv_cache_event_serializer_emits_layer_group_kind_when_present():
     assert "layer_group_kind" not in serialized[1]
 
 
-def test_v2_kv_cache_event_pickle_keeps_layer_group_kind():
+def test_v2_kv_cache_event_pickle_keeps_layer_group_kind() -> None:
     event = KVCacheEvent(4, KVCacheRemovedData(["abcd"]), 128, None, None, 1, "mamba")
     assert event.layer_group_kind == "mamba"
     assert pickle.loads(pickle.dumps(event)) == event

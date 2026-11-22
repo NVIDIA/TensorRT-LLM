@@ -574,6 +574,9 @@ class _StreamingEventSource:
     def set_target_life_cycle(self, life_cycle_id: int) -> None:
         self._event_sink.set_target_life_cycle(life_cycle_id)
 
+    def set_publish_recurrent_checkpoints(self, enabled: bool) -> None:
+        self._event_sink.set_publish_recurrent_checkpoints(enabled)
+
     def set_recurrent_life_cycles(self, life_cycle_ids: list[int]) -> None:
         self._event_sink.set_recurrent_life_cycles(list(life_cycle_ids))
 
@@ -581,10 +584,8 @@ class _StreamingEventSource:
         result: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
         for event in self._event_sink.drain_iteration_events():
             if isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockStoredData):
-                # Recurrent-state checkpoints carry a group index and kind; attention
-                # events leave both None so existing consumers see no change.
-                group_idx = getattr(event, "group_idx", None)
-                spec_kind = getattr(event, "kv_cache_spec_kind", None)
+                # Recurrent-state checkpoints carry the recurrent layer group's id and the kind
+                # "mamba"; attention events leave both None (and the keys off the wire).
                 mm_keys = (
                     [
                         [
@@ -609,8 +610,8 @@ class _StreamingEventSource:
                         lora_id=event.lora_id,
                         medium="GPU",
                         lora_name=None,
-                        group_idx=group_idx,
-                        kv_cache_spec_kind=spec_kind,
+                        group_idx=event.group_idx,
+                        kv_cache_spec_kind=event.kv_cache_spec_kind,
                         mm_keys=mm_keys,
                         trtllm_image_routing=(
                             ImageRoutingMetadata(
@@ -628,8 +629,8 @@ class _StreamingEventSource:
                     BlockRemoved(
                         block_hashes=list(event.block_hashes),
                         medium="GPU",
-                        group_idx=getattr(event, "group_idx", None),
-                        kv_cache_spec_kind=getattr(event, "kv_cache_spec_kind", None),
+                        group_idx=event.group_idx,
+                        kv_cache_spec_kind=event.kv_cache_spec_kind,
                     )
                 )
             elif isinstance(event, kv_cache_manager_v2_runtime.StreamingAllBlocksClearedData):
@@ -655,9 +656,11 @@ class StreamingKVCacheEventManager:
         self._rank = data_parallel_rank
         self._publisher = create_event_publisher(config, data_parallel_rank)
         self._max_window_size = max_window_size
-        self.publish_recurrent_checkpoints = bool(
-            getattr(config, "publish_recurrent_checkpoints", False)
-        )
+        self.publish_recurrent_checkpoints = config.publish_recurrent_checkpoints
+        if self.publish_recurrent_checkpoints:
+            # The sink derives the recurrent life cycles from the manager's registry when it
+            # is installed; this only opens the gate.
+            self._event_source.set_publish_recurrent_checkpoints(True)
         self._event_source = _StreamingEventSource(
             block_size=block_size,
             max_entries=max_entries,
@@ -690,11 +693,15 @@ class StreamingKVCacheEventManager:
 
     @property
     def recurrent_checkpoints_stored(self) -> int:
-        return getattr(self.event_sink.stats, "recurrent_checkpoints_stored", 0)
+        return self.event_sink.stats.recurrent_checkpoints_stored
 
     @property
     def recurrent_checkpoints_removed(self) -> int:
-        return getattr(self.event_sink.stats, "recurrent_checkpoints_removed", 0)
+        return self.event_sink.stats.recurrent_checkpoints_removed
+
+    @property
+    def recurrent_checkpoints_suppressed(self) -> int:
+        return self.event_sink.stats.recurrent_checkpoints_suppressed
 
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread."""
@@ -737,23 +744,22 @@ class StreamingKVCacheEventManager:
             f"window_size={self._max_window_size}"
         )
 
-    def set_layer_group_kinds(self, kinds: dict[int, str]) -> None:
-        """Accept the common manager notification; the wire format tags kinds per event."""
-        return
+    def set_publish_recurrent_checkpoints(self, enabled: bool) -> None:
+        """Open or close the gate for tagged recurrent-state checkpoint events.
+
+        The sink itself knows the recurrent life cycles (every non-PRIVATE SSM life cycle of the
+        manager it is installed in). Checkpoint events use the attention block's hash with
+        ``group_idx`` = that life cycle's id and ``kv_cache_spec_kind="mamba"``; attention
+        events stay untagged.
+        """
+        self.publish_recurrent_checkpoints = enabled
+        self._event_source.set_publish_recurrent_checkpoints(enabled)
 
     def set_recurrent_life_cycles(self, life_cycle_ids: list[int]) -> None:
-        """Publish the recurrent-state snapshots of these life cycles as tagged checkpoints.
-
-        Checkpoint events use the attention block's hash with ``group_idx`` (1-based over
-        ``life_cycle_ids``) and ``kv_cache_spec_kind="mamba"``; attention events stay untagged.
-        """
+        """Override the sink's recurrent life cycles (tests); a no-op while the gate is closed."""
         if not self.publish_recurrent_checkpoints or not life_cycle_ids:
             return
         self._event_source.set_recurrent_life_cycles(list(life_cycle_ids))
-        logger.info(
-            "Streaming KV events publish recurrent-state checkpoints for "
-            f"lifecycle_ids={list(life_cycle_ids)} as kv_cache_spec_kind=mamba"
-        )
 
     def add_created_event(
         self,
@@ -815,6 +821,7 @@ class StreamingKVCacheEventManager:
             f"dropped_events={stats.dropped_events} "
             f"recurrent_checkpoints_stored={self.recurrent_checkpoints_stored} "
             f"recurrent_checkpoints_removed={self.recurrent_checkpoints_removed} "
+            f"recurrent_checkpoints_suppressed={self.recurrent_checkpoints_suppressed} "
             f"enqueued_batches={self.enqueued_batches} "
             f"dropped_batches={self.dropped_batches}"
         )

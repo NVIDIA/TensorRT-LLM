@@ -685,14 +685,29 @@ kv_cache_config = KvCacheConfig(
 **Recurrent-state checkpoints (hybrid models, prototype).** A hybrid model (Mamba2, Gated
 DeltaNet or KDA layers next to attention) can resume a cached prefix only at a block that also
 holds a recurrent-state snapshot (see `mamba_state_config`). With
-`KVEventsConfig(publish_recurrent_checkpoints=True)` each such snapshot is published as an
-extra `BlockStored` carrying `group_idx` (1-based over the recurrent layer groups) and
+`KVEventsConfig(enable_kv_cache_events=True, publish_recurrent_checkpoints=True)` each such
+snapshot is published as an extra `BlockStored` carrying `group_idx` (the recurrent layer
+group's id, the same number buffered events report as `layer_group_id`) and
 `kv_cache_spec_kind="mamba"`, with an empty `token_ids` list and the same block hash as the
-attention block it sits on; evicting the snapshot publishes a `BlockRemoved` with the same tags.
-Attention events are unchanged, so consumers that ignore the tags behave as before. Only
-snapshots that cover a full block are published, so set `periodic_snapshot_interval` to a
-multiple of `tokens_per_block`. The buffered path reports the same information through the
-`layer_group_kind` field of every event (`attention`, `sliding_window` or `mamba`).
+attention block it sits on; evicting the snapshot publishes a `BlockRemoved` with the same tags
+while the attention block stays published. Attention events keep their format, but the stream
+as a whole changes: a consumer must index tagged events separately or drop them, since a tagged
+`BlockRemoved` names a still-cached attention block. Consumers that ignore the tags are
+compatible only while `publish_recurrent_checkpoints` is off (the default), in which case the
+recurrent life cycles are never mentioned, as before.
+
+Which snapshots become checkpoints: only snapshots that cover a whole block, that is snapshot
+points that are multiples of `tokens_per_block` (`periodic_snapshot_interval`, aligned
+`additional_snapshot_offsets_from_start`, block-aligned branch snapshots). Prompt-end snapshots,
+`additional_snapshot_offsets_from_end` and other mid-block snapshots sit on a partial block and
+are not published; they are counted in the `recurrent_checkpoints_suppressed` statistic of the
+shutdown summary. The `per_conversation` recipe therefore publishes no periodic checkpoints.
+Block reuse must be on. Replay regions of speculative decoding are PRIVATE life cycles and are
+never advertised as recurrent groups.
+
+On the buffered path the same option adds `stored`/`removed` events for the recurrent layer
+groups; every buffered event now carries `layer_group_kind` (`attention`, `sliding_window` or
+`mamba`) so consumers can filter by it. Without the option the buffered stream is unchanged.
 
 **Limitations.** Pipeline and context parallelism are unsupported. Buffered polling returns
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish

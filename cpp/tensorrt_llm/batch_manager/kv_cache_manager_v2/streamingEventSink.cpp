@@ -77,18 +77,44 @@ void StreamingEventSink::setRecurrentLifeCycles(std::vector<LifeCycleId> lifeCyc
         }
     }
     mRecurrentLifeCycles = std::move(lifeCycles);
+    mPublishRecurrentCheckpoints = true;
 }
 
-std::optional<int> StreamingEventSink::recurrentGroupIdx(LifeCycleId lifeCycle) const
+void StreamingEventSink::setPublishRecurrentCheckpoints(bool enabled)
 {
-    for (size_t i = 0; i < mRecurrentLifeCycles.size(); ++i)
+    std::lock_guard<std::mutex> lock(mMutex);
+    mPublishRecurrentCheckpoints = enabled;
+}
+
+void StreamingEventSink::declareLifeCycles(LifeCycleRegistry const& lifeCycles)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mRecurrentLifeCycles.clear();
+    for (auto const id : lifeCycles.ssmLifeCycleIds())
     {
-        if (mRecurrentLifeCycles[i] == lifeCycle)
+        // PRIVATE SSM life cycles (speculative-decoding replay regions) never store a block.
+        if (!isPrivateLifeCycle(lifeCycles[id]))
         {
-            return static_cast<int>(i) + 1;
+            mRecurrentLifeCycles.push_back(id);
         }
     }
-    return std::nullopt;
+}
+
+bool StreamingEventSink::publishesRecurrentCheckpoints() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return publishesRecurrentCheckpointsUnlocked();
+}
+
+bool StreamingEventSink::publishesRecurrentCheckpointsUnlocked() const
+{
+    return mPublishRecurrentCheckpoints && !mRecurrentLifeCycles.empty();
+}
+
+bool StreamingEventSink::isRecurrentLifeCycle(LifeCycleId lifeCycle) const
+{
+    return publishesRecurrentCheckpointsUnlocked()
+        && std::find(mRecurrentLifeCycles.begin(), mRecurrentLifeCycles.end(), lifeCycle) != mRecurrentLifeCycles.end();
 }
 
 std::vector<StreamingEventData> StreamingEventSink::drainIterationEvents()
@@ -110,16 +136,10 @@ void StreamingEventSink::addStoredBlock(Block const& block)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     addStoredBlockUnlocked(block);
-    // A block announced with its snapshots already attached (partial-block commits, re-attached
-    // orphans) carries its checkpoints in the same announcement.
-    for (size_t i = 0; i < mRecurrentLifeCycles.size(); ++i)
-    {
-        auto const lifeCycle = mRecurrentLifeCycles[i];
-        if (lifeCycle < block.storage.size() && block.getPage(lifeCycle) != nullptr)
-        {
-            addRecurrentCheckpointUnlocked(block, lifeCycle, static_cast<int>(i) + 1);
-        }
-    }
+    // A block announced with snapshots already attached (an orphan re-attached after its
+    // snapshot was taken, or a block whose snapshot survived a target-page eviction) carries
+    // its checkpoints in the same announcement.
+    addResidentCheckpointsUnlocked(block);
 }
 
 void StreamingEventSink::addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle)
@@ -132,11 +152,14 @@ void StreamingEventSink::addStoredLifeCycle(Block const& block, LifeCycleId life
     if (lifeCycle == *mTargetLifeCycle)
     {
         addStoredBlockUnlocked(block);
+        // Re-storing the attention page republishes the block; its surviving snapshots must
+        // come back with it, since the whole-block removal withdrew them.
+        addResidentCheckpointsUnlocked(block);
         return;
     }
-    if (auto const groupIdx = recurrentGroupIdx(lifeCycle))
+    if (isRecurrentLifeCycle(lifeCycle))
     {
-        addRecurrentCheckpointUnlocked(block, lifeCycle, *groupIdx);
+        addRecurrentCheckpointUnlocked(block, lifeCycle);
         return;
     }
     ++mStats.nonTargetLifeCyclesIgnored;
@@ -160,7 +183,7 @@ void StreamingEventSink::addRemovedLifeCycle(Digest const& blockKey, LifeCycleId
         addRemovedBlockUnlocked(blockKey);
         return;
     }
-    if (auto const groupIdx = recurrentGroupIdx(lifeCycle))
+    if (isRecurrentLifeCycle(lifeCycle))
     {
         // The snapshot page was evicted on its own; the attention block stays published.
         auto const stored = mStoredBlocks.find(blockKey);
@@ -168,14 +191,14 @@ void StreamingEventSink::addRemovedLifeCycle(Digest const& blockKey, LifeCycleId
         {
             return;
         }
-        auto& groups = stored->second.recurrentGroups;
-        auto const it = std::find(groups.begin(), groups.end(), *groupIdx);
+        auto& groups = stored->second.publishedCheckpointGroups;
+        auto const it = std::find(groups.begin(), groups.end(), lifeCycle.value());
         if (it == groups.end())
         {
             return;
         }
         groups.erase(it);
-        addRemovedHashUnlocked(stored->second.blockHash, *groupIdx);
+        addRemovedHashUnlocked(stored->second.blockHash, lifeCycle.value());
         ++mStats.recurrentCheckpointsRemoved;
         return;
     }
@@ -271,7 +294,22 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
     ++mStats.storedBlocks;
 }
 
-void StreamingEventSink::addRecurrentCheckpointUnlocked(Block const& block, LifeCycleId lifeCycle, int groupIdx)
+void StreamingEventSink::addResidentCheckpointsUnlocked(Block const& block)
+{
+    if (!publishesRecurrentCheckpointsUnlocked())
+    {
+        return;
+    }
+    for (auto const lifeCycle : mRecurrentLifeCycles)
+    {
+        if (lifeCycle < block.storage.size() && block.getPage(lifeCycle) != nullptr)
+        {
+            addRecurrentCheckpointUnlocked(block, lifeCycle);
+        }
+    }
+}
+
+void StreamingEventSink::addRecurrentCheckpointUnlocked(Block const& block, LifeCycleId lifeCycle)
 {
     // The checkpoint is keyed by the attention block's hash, so the block must already be
     // published; a partial block or an unpublished parent chain publishes no checkpoint either.
@@ -293,10 +331,11 @@ void StreamingEventSink::addRecurrentCheckpointUnlocked(Block const& block, Life
     // at that token depth, which the wire format cannot express: publish full-block snapshots only.
     if (!block.isFull() || page->numTokensInBlock < static_cast<int>(block.tokens.size()))
     {
-        ++mStats.partialBlocksSuppressed;
+        ++mStats.recurrentCheckpointsSuppressed;
         return;
     }
-    auto& groups = stored->second.recurrentGroups;
+    int const groupIdx = lifeCycle.value();
+    auto& groups = stored->second.publishedCheckpointGroups;
     if (std::find(groups.begin(), groups.end(), groupIdx) != groups.end())
     {
         return;
@@ -343,7 +382,7 @@ void StreamingEventSink::addRemovedBlockUnlocked(Digest const& blockKey)
         return;
     }
     int64_t const blockHash = stored->second.blockHash;
-    auto const groups = std::move(stored->second.recurrentGroups);
+    auto const groups = std::move(stored->second.publishedCheckpointGroups);
     mStoredBlocks.erase(stored);
     for (int const groupIdx : groups)
     {

@@ -204,26 +204,46 @@ TEST_F(ReplayCacheTest, ShrinkReleasesRetiredLocksBeforeVariantChanges)
 }
 
 // A hybrid model resumes a cached prefix only at a block that also holds a recurrent-state
-// snapshot. Both event sinks must therefore announce the SSM life cycle on the block the
-// snapshot lands on: the buffered manager as a stored event of that layer group, the streaming
-// sink as a BlockStored tagged group_idx/kind under the attention block's hash. Evicting the
-// snapshot alone must withdraw only the tagged event.
-TEST_F(ReplayCacheTest, RecurrentCheckpointsArePublishedUnderTheAttentionBlockHash)
+// snapshot. When the sink opts in, both event sinks announce the SSM life cycle on the block
+// the snapshot lands on: the buffered manager as a stored event of that layer group, the
+// streaming sink as a BlockStored tagged group_idx/kind under the attention block's hash.
+// Evicting the snapshot alone withdraws only the tagged event. Without the opt-in neither sink
+// mentions the SSM life cycle.
+namespace
 {
-    auto config = makeConfig();
+KVCacheManagerConfig makeHybridEventConfig()
+{
+    auto config = test::makeConfig();
     config.commitMinSnapshot = true;
     SsmLayerConfig ssm;
     ssm.layerId = 1;
     ssm.buffers.push_back(BufferConfig{"state", 4096, std::nullopt});
     config.layers.emplace_back(ssm);
+    return config;
+}
 
+// Evict the SSM snapshot page of `lifeCycle` alone; the attention pages stay installed.
+void evictSsmSnapshot(KvCacheManager& manager, LifeCycleId lifeCycle)
+{
+    auto& storage = manager.storage();
+    TypedVec<PoolGroupIndex, SlotCount> evictOne(storage.numPoolGroups(kHotLevel), 0);
+    evictOne[storage.getPoolGroupIndex(kHotLevel, lifeCycle)] = 1;
+    storage.forceEvict(kHotLevel, evictOne);
+}
+} // namespace
+
+TEST_F(ReplayCacheTest, RecurrentCheckpointsArePublishedUnderTheAttentionBlockHash)
+{
+    auto const config = makeHybridEventConfig();
     auto const streaming = std::make_shared<StreamingEventSink>(64);
+    streaming->setPublishRecurrentCheckpoints(true);
     auto manager = std::make_shared<KvCacheManager>(config, streaming);
     auto const attnLc = manager->getLayerGroupId(LayerId{0});
     ASSERT_EQ(manager->lifeCycles().ssmLifeCycleIds().size(), 1U);
     auto const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+    // The recurrent life cycles come from the registry the manager declared.
+    EXPECT_TRUE(streaming->publishesRecurrentCheckpoints());
     streaming->setTargetLifeCycle(attnLc);
-    streaming->setRecurrentLifeCycles({ssmLc});
 
     // Two full blocks committed at once: commit_min_snapshot snapshots the SSM state on the
     // block that ends at the last committed token only.
@@ -244,7 +264,8 @@ TEST_F(ReplayCacheTest, RecurrentCheckpointsArePublishedUnderTheAttentionBlockHa
         ASSERT_NE(stored, nullptr);
         if (stored->groupIdx.has_value())
         {
-            EXPECT_EQ(*stored->groupIdx, 1);
+            // The tag is the recurrent life cycle's id, as buffered events report it.
+            EXPECT_EQ(*stored->groupIdx, ssmLc.value());
             ASSERT_TRUE(stored->kvCacheSpecKind.has_value());
             EXPECT_EQ(*stored->kvCacheSpecKind, "mamba");
             EXPECT_TRUE(stored->tokenIds.empty());
@@ -267,49 +288,58 @@ TEST_F(ReplayCacheTest, RecurrentCheckpointsArePublishedUnderTheAttentionBlockHa
     EXPECT_EQ(stats.recurrentCheckpointsStored, 1);
     EXPECT_EQ(stats.nonTargetLifeCyclesIgnored, 0);
 
+    // Snapshot-only eviction while the attention block stays installed: exactly one tagged
+    // removal of the checkpoint hash, no attention removal, no reset marker.
+    first->close();
+    evictSsmSnapshot(*manager, ssmLc);
+    events = streaming->drainIterationEvents();
+    int taggedRemovals = 0;
+    for (auto const& event : events)
+    {
+        ASSERT_FALSE(std::holds_alternative<StreamingAllBlocksClearedData>(event));
+        auto const* removed = std::get_if<StreamingBlockRemovedData>(&event);
+        ASSERT_NE(removed, nullptr);
+        ASSERT_TRUE(removed->groupIdx.has_value());
+        EXPECT_EQ(*removed->groupIdx, ssmLc.value());
+        EXPECT_EQ(removed->blockHashes, checkpointHashes);
+        ++taggedRemovals;
+    }
+    EXPECT_EQ(taggedRemovals, 1);
+    stats = streaming->getStats();
+    EXPECT_EQ(stats.recurrentCheckpointsRemoved, 1);
+    EXPECT_EQ(stats.removedBlocks, 0);
+
     // A removal for a block the sink never published is ignored.
     streaming->addRemovedLifeCycle(Digest{}, ssmLc);
-    EXPECT_EQ(streaming->getStats().recurrentCheckpointsRemoved, 0);
-    first->close();
+    EXPECT_EQ(streaming->getStats().recurrentCheckpointsRemoved, 1);
+
+    // Shutdown clears the tree and announces the reset separately from any removals.
     manager->shutdown();
     events = streaming->drainIterationEvents();
-    bool sawTaggedRemoval = false;
     bool sawCleared = false;
     for (auto const& event : events)
     {
-        if (auto const* removed = std::get_if<StreamingBlockRemovedData>(&event))
-        {
-            if (removed->groupIdx.has_value())
-            {
-                sawTaggedRemoval = true;
-                EXPECT_EQ(*removed->groupIdx, 1);
-                EXPECT_EQ(removed->blockHashes, checkpointHashes);
-            }
-        }
-        else if (std::holds_alternative<StreamingAllBlocksClearedData>(event))
+        if (std::holds_alternative<StreamingAllBlocksClearedData>(event))
         {
             sawCleared = true;
         }
+        else if (auto const* removed = std::get_if<StreamingBlockRemovedData>(&event))
+        {
+            // The checkpoint was already withdrawn above; only attention removals may remain.
+            EXPECT_FALSE(removed->groupIdx.has_value());
+        }
     }
-    // Shutdown clears the tree: either the removals are published block by block (tagged
-    // removal included) or the reset marker invalidates everything at once.
-    EXPECT_TRUE(sawTaggedRemoval || sawCleared);
+    EXPECT_TRUE(sawCleared);
 }
 
-TEST_F(ReplayCacheTest, BufferedEventsAnnounceTheRecurrentLifeCycle)
+TEST_F(ReplayCacheTest, RecurrentCheckpointsStayUnpublishedWithoutTheOptIn)
 {
-    auto config = makeConfig();
-    config.commitMinSnapshot = true;
-    SsmLayerConfig ssm;
-    ssm.layerId = 1;
-    ssm.buffers.push_back(BufferConfig{"state", 4096, std::nullopt});
-    config.layers.emplace_back(ssm);
-
-    auto const buffered = std::make_shared<EventManager>(64, 4096);
-    auto manager = std::make_shared<KvCacheManager>(config, buffered);
-    auto const attnLc = manager->getLayerGroupId(LayerId{0});
+    auto const config = makeHybridEventConfig();
+    auto const streaming = std::make_shared<StreamingEventSink>(64);
+    auto manager = std::make_shared<KvCacheManager>(config, streaming);
     auto const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
-    buffered->setLayerGroupKinds({{attnLc.value(), "attention"}, {ssmLc.value(), "mamba"}});
+    streaming->setTargetLifeCycle(manager->getLayerGroupId(LayerId{0}));
+    EXPECT_FALSE(streaming->publishesRecurrentCheckpoints());
 
     auto const tokens = makeTokens(8);
     TokenSpan const tokenSpan{tokens.data(), static_cast<int>(tokens.size())};
@@ -317,39 +347,95 @@ TEST_F(ReplayCacheTest, BufferedEventsAnnounceTheRecurrentLifeCycle)
     ASSERT_TRUE(first->resume(mStream));
     ASSERT_TRUE(first->resize(8));
     first->commit(tokenSpan, true);
-    buffered->flushIterationEvents();
-    auto const events = buffered->getLatestEvents(0.0);
-
-    std::vector<EventBlockHash> attentionHashes;
-    std::vector<EventBlockHash> checkpointHashes;
-    for (auto const& event : events)
+    for (auto const& event : streaming->drainIterationEvents())
     {
-        auto const* stored = std::get_if<KVCacheStoredData>(&event.data);
-        if (stored == nullptr)
-        {
-            continue;
-        }
-        ASSERT_TRUE(event.layerGroupId.has_value());
-        ASSERT_TRUE(event.layerGroupKind.has_value());
-        for (auto const& block : stored->blocks)
-        {
-            if (*event.layerGroupId == ssmLc.value())
-            {
-                EXPECT_EQ(*event.layerGroupKind, "mamba");
-                checkpointHashes.push_back(block.blockHash);
-            }
-            else
-            {
-                EXPECT_EQ(*event.layerGroupKind, "attention");
-                attentionHashes.push_back(block.blockHash);
-            }
-        }
+        auto const* stored = std::get_if<StreamingBlockStoredData>(&event);
+        ASSERT_NE(stored, nullptr);
+        EXPECT_FALSE(stored->groupIdx.has_value());
     }
-    ASSERT_EQ(attentionHashes.size(), 2U);
-    ASSERT_EQ(checkpointHashes.size(), 1U);
-    EXPECT_EQ(checkpointHashes.front(), attentionHashes.back());
+    EXPECT_EQ(streaming->getStats().recurrentCheckpointsStored, 0);
+    EXPECT_EQ(streaming->getStats().nonTargetLifeCyclesIgnored, 0);
+
     first->close();
+    evictSsmSnapshot(*manager, ssmLc);
+    EXPECT_TRUE(streaming->drainIterationEvents().empty());
+    EXPECT_EQ(streaming->getStats().recurrentCheckpointsRemoved, 0);
     manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, BufferedEventsAnnounceTheRecurrentLifeCycleOnlyWithTheOptIn)
+{
+    auto const config = makeHybridEventConfig();
+    for (bool const withOptIn : {false, true})
+    {
+        SCOPED_TRACE(withOptIn);
+        auto const buffered = std::make_shared<EventManager>(64, 4096);
+        buffered->setPublishRecurrentCheckpoints(withOptIn);
+        auto manager = std::make_shared<KvCacheManager>(config, buffered);
+        auto const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+
+        auto const tokens = makeTokens(8);
+        TokenSpan const tokenSpan{tokens.data(), static_cast<int>(tokens.size())};
+        auto first = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(first->resume(mStream));
+        ASSERT_TRUE(first->resize(8));
+        first->commit(tokenSpan, true);
+        buffered->flushIterationEvents();
+        auto events = buffered->getLatestEvents(0.0);
+
+        std::vector<EventBlockHash> attentionHashes;
+        std::vector<EventBlockHash> checkpointHashes;
+        for (auto const& event : events)
+        {
+            auto const* stored = std::get_if<KVCacheStoredData>(&event.data);
+            if (stored == nullptr)
+            {
+                continue;
+            }
+            ASSERT_TRUE(event.layerGroupId.has_value());
+            ASSERT_TRUE(event.layerGroupKind.has_value());
+            for (auto const& block : stored->blocks)
+            {
+                if (*event.layerGroupId == ssmLc.value())
+                {
+                    EXPECT_EQ(*event.layerGroupKind, "mamba");
+                    checkpointHashes.push_back(block.blockHash);
+                }
+                else
+                {
+                    EXPECT_EQ(*event.layerGroupKind, "attention");
+                    attentionHashes.push_back(block.blockHash);
+                }
+            }
+        }
+        ASSERT_EQ(attentionHashes.size(), 2U);
+        ASSERT_EQ(checkpointHashes.size(), withOptIn ? 1U : 0U);
+        if (withOptIn)
+        {
+            EXPECT_EQ(checkpointHashes.front(), attentionHashes.back());
+        }
+
+        // Snapshot-only eviction: a removal of the SSM layer group only when opted in.
+        first->close();
+        evictSsmSnapshot(*manager, ssmLc);
+        buffered->flushIterationEvents();
+        events = buffered->getLatestEvents(0.0);
+        int ssmRemovals = 0;
+        for (auto const& event : events)
+        {
+            auto const* removed = std::get_if<KVCacheRemovedData>(&event.data);
+            if (removed == nullptr)
+            {
+                continue;
+            }
+            ASSERT_TRUE(event.layerGroupId.has_value());
+            EXPECT_EQ(*event.layerGroupId, ssmLc.value());
+            EXPECT_EQ(removed->blockHashes, checkpointHashes);
+            ++ssmRemovals;
+        }
+        EXPECT_EQ(ssmRemovals, withOptIn ? 1 : 0);
+        manager->shutdown();
+    }
 }
 
 TEST_F(ReplayCacheTest, SsmSnapshotLocksDoNotUseAttentionPageIndices)

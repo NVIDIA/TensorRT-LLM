@@ -128,10 +128,29 @@ void EventManager::setLayerGroupWindowSizes(std::map<int, int> windowSizes)
     mWindowSizeByLayerGroup = std::move(windowSizes);
 }
 
-void EventManager::setLayerGroupKinds(std::map<int, std::string> kinds)
+void EventManager::declareLifeCycles(LifeCycleRegistry const& lifeCycles)
 {
     std::lock_guard<std::mutex> lock(mMutex);
-    mKindByLayerGroup = std::move(kinds);
+    mKindByLayerGroup.clear();
+    for (LifeCycleId id{0}; id < lifeCycles.size(); ++id)
+    {
+        if (auto const kind = eventLifeCycleKind(lifeCycles[id]))
+        {
+            mKindByLayerGroup.emplace(id.value(), std::string(*kind));
+        }
+    }
+}
+
+void EventManager::setPublishRecurrentCheckpoints(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mPublishRecurrentCheckpoints = enabled;
+}
+
+bool EventManager::publishesRecurrentCheckpoints() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mMaxKvEventEntries > 0 && mPublishRecurrentCheckpoints;
 }
 
 void EventManager::addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId)

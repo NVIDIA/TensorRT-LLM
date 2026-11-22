@@ -402,6 +402,21 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"teacache_thresh": 0.1}}, False),
         (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_config": {"kv_events_config": {"publish_recurrent_checkpoints": True}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"kv_cache_config": {"kv_events_config": {"publish_recurrent_checkpoints": "yes"}}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"kv_cache_config": {"kv_events_config": {"publish_recurrent_checkpoints": True}}},
+            True,
+        ),
+        (
             generator.VISUAL_GEN_SCHEMA,
             {
                 "attention_config": {

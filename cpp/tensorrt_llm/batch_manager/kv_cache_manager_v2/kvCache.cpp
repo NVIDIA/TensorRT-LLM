@@ -1650,9 +1650,13 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, 
     }
     if (commitSsm)
     {
+        // Announced only when the sink opted in: the default event stream never mentions the
+        // recurrent-state life cycles.
+        bool const announceSsm = treeBlock->eventSink && treeBlock->eventSink->publishesRecurrentCheckpoints();
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
         {
-            if (_snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending))
+            if (_snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending)
+                && announceSsm)
             {
                 attachedLcs.push_back(lcId);
             }
@@ -1662,16 +1666,14 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, 
     {
         if (isNew)
         {
-            // Announced after the snapshots above, so the recurrent-state life cycles that
-            // landed on this block are part of the announcement.
             treeBlock->eventSink->addStoredBlock(*treeBlock);
         }
         else
         {
             // The block was already announced, so report just the life cycles this snapshot
-            // added (attention pages and recurrent-state snapshots alike). The event manager
-            // itself drops the ones whose page does not span the whole block: the payload
-            // carries the block's full token list and cannot express a shorter valid prefix.
+            // added. The event manager itself drops the ones whose page does not span the
+            // whole block: the payload carries the block's full token list and cannot
+            // express a shorter valid prefix.
             for (auto lcIdx : attachedLcs)
             {
                 treeBlock->eventSink->addStoredLifeCycle(*treeBlock, lcIdx);
@@ -2653,16 +2655,17 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm, b
 
     if (didCommit && commitSsm)
     {
+        // The block itself was announced before the snapshot existed (addStoredBlock above only
+        // sees the pages present at that time). When the sink opted in to recurrent checkpoints,
+        // the snapshot is announced here so that the SSM life cycle enters the sink's stored set,
+        // its later eviction is reported, and consumers can tell at which blocks a hybrid model
+        // can resume a cached prefix. Without the opt-in the stream is as before.
+        bool const announceSsm = newBlock->eventSink && newBlock->eventSink->publishesRecurrentCheckpoints();
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
         {
             bool const attached = _snapshotSsmToTreeBlock(
                 newBlock, lcId, start + static_cast<int>(tokenBlock.size()), moveSsm, ssmFromPending);
-            // The block itself was announced before the snapshot existed (addStoredBlock above
-            // only sees the pages present at that time), so the recurrent-state checkpoint is
-            // announced here. Without it the SSM life cycle never enters the event manager's
-            // stored set and its later eviction is dropped, and consumers cannot tell at which
-            // blocks a hybrid model can resume a cached prefix.
-            if (attached && newBlock->eventSink)
+            if (attached && announceSsm)
             {
                 newBlock->eventSink->addStoredLifeCycle(*newBlock, lcId);
             }

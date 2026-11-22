@@ -1255,7 +1255,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("non_target_life_cycles_ignored", &kv::StreamingEventStats::nonTargetLifeCyclesIgnored)
         .def_ro("dropped_events", &kv::StreamingEventStats::droppedEvents)
         .def_ro("recurrent_checkpoints_stored", &kv::StreamingEventStats::recurrentCheckpointsStored)
-        .def_ro("recurrent_checkpoints_removed", &kv::StreamingEventStats::recurrentCheckpointsRemoved);
+        .def_ro("recurrent_checkpoints_removed", &kv::StreamingEventStats::recurrentCheckpointsRemoved)
+        .def_ro("recurrent_checkpoints_suppressed", &kv::StreamingEventStats::recurrentCheckpointsSuppressed);
 
     nb::class_<kv::StreamingEventSink, kv::EventSink>(m, "StreamingEventSink")
         .def(nb::init<int, std::optional<int>>(), nb::arg("max_entries") = 50'000,
@@ -1265,6 +1266,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::StreamingEventSink& self, int lifeCycleId)
             { self.setTargetLifeCycle(kv::LifeCycleId{lifeCycleId}); },
             nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>())
+        .def("set_publish_recurrent_checkpoints", &kv::StreamingEventSink::setPublishRecurrentCheckpoints,
+            nb::arg("enabled"), nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("publishes_recurrent_checkpoints", &kv::StreamingEventSink::publishesRecurrentCheckpoints,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "set_recurrent_life_cycles",
             [](kv::StreamingEventSink& self, std::vector<int> const& lifeCycleIds)
@@ -1306,7 +1311,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_group_ids") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("set_layer_group_window_sizes", &kv::EventManager::setLayerGroupWindowSizes, nb::arg("window_sizes"),
             nb::call_guard<nb::gil_scoped_release>())
-        .def("set_layer_group_kinds", &kv::EventManager::setLayerGroupKinds, nb::arg("kinds"),
+        .def("set_publish_recurrent_checkpoints", &kv::EventManager::setPublishRecurrentCheckpoints, nb::arg("enabled"),
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "add_stored_event",
@@ -2541,6 +2546,33 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("tokens"), nb::arg("coverage_per_lc"), nb::arg("parent").none() = nb::none(),
         nb::arg("reuse_scope").none() = nb::none(), nb::keep_alive<0, 1>(), nb::keep_alive<0, 4>());
+    mIntrospection.def(
+        "add_test_block_page",
+        [](kv::KvCacheManager& manager, EventManagerTestBlock& block, int lifeCycleId, int coverage)
+        {
+            kv::LifeCycleId const lifeCycle{lifeCycleId};
+            if (lifeCycle.value() < 0 || lifeCycle >= manager.lifeCycles().size())
+            {
+                throw std::invalid_argument("add_test_block_page: unknown life cycle");
+            }
+            if (coverage <= 0 || coverage > static_cast<int>(block.block->tokens.size()))
+            {
+                throw std::invalid_argument("add_test_block_page: coverage must be within the block");
+            }
+            if (block.block->storage[lifeCycle] != nullptr)
+            {
+                throw std::invalid_argument("add_test_block_page: the block already has a page for this life cycle");
+            }
+            kv::TypedVec<kv::LifeCycleId, kv::SlotCount> counts(manager.lifeCycles().size(), 0);
+            counts[lifeCycle] = 1;
+            auto slots = manager.storage().newGpuSlots(counts);
+            auto page = kv::makeShared<kv::CommittedPage>(
+                &manager.storage(), block.block, lifeCycle, kv::kHotLevel, coverage, kv::kPriorityDefault);
+            page->setSlot(slots[lifeCycle].front());
+            block.block->storage[lifeCycle] = page.get();
+            block.pages.push_back(std::move(page));
+        },
+        nb::arg("manager"), nb::arg("block"), nb::arg("life_cycle_id"), nb::arg("coverage"));
     mIntrospection.def(
         "reattach_test_block",
         [](kv::KvCacheManager& manager, EventManagerTestBlock& block, nb::object parentObject,
