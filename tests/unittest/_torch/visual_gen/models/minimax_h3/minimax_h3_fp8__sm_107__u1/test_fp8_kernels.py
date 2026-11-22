@@ -368,6 +368,66 @@ def test_bf16_attention_projection_rejects_a_reshape_that_changes_rows(scenario)
         )
 
 
+@pytest.mark.parametrize("projection", ("down", "attention"))
+def test_bf16_projection_rejects_fp8_operands(scenario, projection):
+    ops = scenario[0]
+    tensors = _inputs(2, rows=1)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    fp8 = torch.float8_e4m3fn
+    if projection == "down":
+        activation = torch.empty((2, UP), device="cuda", dtype=fp8)
+        weight = torch.empty((D, UP), device="cuda", dtype=fp8)
+        operation = ops.bf16_down
+        args = (
+            activation,
+            weight,
+            unit,
+            tensors["hidden"],
+            tensors["modulation"],
+            tensors["indices"],
+        )
+    else:
+        activation = torch.empty((1, 2, QK), device="cuda", dtype=fp8)
+        weight = torch.empty((D, QK), device="cuda", dtype=fp8)
+        operation = ops.bf16_attention_projection
+        args = (
+            activation,
+            weight,
+            unit,
+            tensors["hidden"],
+            tensors["norm_weight"],
+            tensors["modulation"],
+            tensors["indices"],
+            EPS,
+        )
+    with pytest.raises(ValueError, match="BF16 projection requires BF16 activation and weight"):
+        operation(*args)
+
+
+def test_fp8_down_does_not_use_a_bf16_compiled_kernel(scenario, monkeypatch):
+    ops, _, _, projection_residual = scenario
+    hidden = _inputs(2, rows=1)
+    activation = torch.empty((2, UP), device="cuda", dtype=BF16)
+    weight = torch.empty((D, UP), device="cuda", dtype=BF16)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    def expected_fallback(*_):
+        raise ValueError("Reached the existing scaled GEMM fallback")
+
+    monkeypatch.setattr(projection_residual, "supports", lambda *_: True)
+    monkeypatch.setattr(ops, "_cublas_scaled_mm", expected_fallback)
+    with pytest.raises(ValueError, match="Reached the existing scaled GEMM fallback"):
+        ops.down(
+            activation,
+            weight,
+            unit,
+            unit,
+            hidden["hidden"],
+            hidden["modulation"],
+            hidden["indices"],
+        )
+
+
 @pytest.mark.parametrize("length", (300, 4097))
 @pytest.mark.parametrize("case", ("misaligned_hidden", "int32_indices", "fp32_modulation"))
 def test_down_outside_the_kernel_contract_takes_the_unfused_path(
