@@ -1809,7 +1809,8 @@ class ModelLoader:
         holds them (MoE load balancer, pinned host copies), the module tree is
         the Modeling V1 one the refit hooks cover, and every module of it can
         reload its weights. And only for a model whose dummy weights build
-        what its checkpoint load builds, where its runner rehearses.
+        what its checkpoint load builds, where its runner rehearses, outside
+        a Helix rank of a disaggregated generation server.
         """
         if not (self.llm_args.load_format == LoadFormat.AUTO
                 and checkpoint_loader.checkpoint_format != CheckpointFormat.MX
@@ -1821,6 +1822,15 @@ class ModelLoader:
                 getattr(module, "supports_weight_reload", True) and not getattr(
                     module, "_requires_regular_checkpoint_loading", False)
                 for module in model.modules()):
+            return False
+        from ._util import is_disagg_enabled
+
+        # A Helix rank of a disaggregated generation server warms up on short
+        # generation shapes only, whose kernels take about as long to build
+        # in the warmup as the rehearsal's own forward takes: it loads its
+        # checkpoint directly.
+        if self.mapping.has_cp_helix() and is_disagg_enabled(
+                self.llm_args.cache_transceiver_config):
             return False
         return (KernelBuilder.get().rehearse
                 and getattr(model, "rehearses_on_dummy_weights", False)

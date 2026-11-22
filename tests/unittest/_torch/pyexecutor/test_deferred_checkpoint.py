@@ -14,7 +14,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     fill_rehearsal_values,
     runner_rehearses,
 )
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import LoadFormat, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -120,6 +120,37 @@ def test_only_a_decoder_runner_with_context_warmups_rehearses():
     assert not runner_rehearses(model(is_generation=False), args())
     assert not runner_rehearses(model(), args(encode_only=True))
     assert not runner_rehearses(model(), args(mm_encoder_only=True))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "helix, disaggregated, defers",
+    [(False, True, True), (True, False, True), (True, True, False)],
+    ids=["disaggregated", "aggregated_helix", "disaggregated_helix"],
+)
+def test_a_helix_rank_of_a_disaggregated_generation_server_loads_directly(
+    monkeypatch, helix, disaggregated, defers
+):
+    from types import SimpleNamespace
+
+    class Model(torch.nn.Module):
+        rehearses_on_dummy_weights = True
+        model_config = SimpleNamespace(is_generation=True, is_encoder_decoder=False)
+
+    monkeypatch.setattr(KernelBuilder, "_instance", KernelBuilder(enabled=True, rehearse=True))
+    loader = object.__new__(ModelLoader)
+    loader.mapping = SimpleNamespace(has_cp_helix=lambda: helix)
+    loader.llm_args = SimpleNamespace(
+        load_format=LoadFormat.AUTO,
+        encode_only=False,
+        mm_encoder_only=False,
+        cache_transceiver_config=SimpleNamespace(backend="NIXL") if disaggregated else None,
+    )
+    loader.model_weights_memory_tag = None
+    can_defer = loader._can_defer_checkpoint(
+        Model(), SimpleNamespace(checkpoint_format="HF"), is_meta_init=True, moe_load_balancer=None
+    )
+    assert can_defer is defers
 
 
 @pytest.mark.cpu_only
