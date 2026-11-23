@@ -50,6 +50,12 @@ _RECEIVE_STATES = (
     LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
 )
 
+_MODEL_IDLE_GEN_STATES = (
+    *_RECEIVE_STATES,
+    LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    LlmRequestState.DISAGG_TRANS_ERROR,
+)
+
 
 def is_gen_only_no_context_benchmark() -> bool:
     """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
@@ -617,6 +623,12 @@ class DisaggTransferCoordinator:
         requests = {
             rid: client for _, active_ids, _, _ in peers for rid, client in active_ids.items()
         }
+        if self.supports_group_receive_cancellation and not all_cancel_ids.isdisjoint(
+            requests.values()
+        ):
+            # One rank may see the abort first. All peers must re-enter the
+            # receive vote, even if they previously agreed to skip idle polls.
+            self._transceiver.wake_gen_cancellation_poll()
         all_active_clients = set(requests.values()) | set().union(*(set(peer[3]) for peer in peers))
         complete = {
             client
@@ -1300,12 +1312,7 @@ class DisaggTransferCoordinator:
             The logical disposition. CANCELLED permits a cancellation response;
             retained destinations still pass defer_gen_termination before release.
         """
-        if not request.is_generation_only_request or request.state not in (
-            LlmRequestState.DISAGG_GENERATION_INIT,
-            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
-            LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
-            LlmRequestState.DISAGG_TRANS_ERROR,
-        ):
+        if not request.is_generation_only_request or request.state not in _MODEL_IDLE_GEN_STATES:
             return ReceiveCancellation.NOT_HANDLED
         pending = self._unpublished_gen_receives.get(request.py_request_id)
         prior_failure = prior_failure or request.py_kv_transfer_timed_out
@@ -1343,6 +1350,29 @@ class DisaggTransferCoordinator:
         if not self.request_cancellation(request):
             self._retiring_gen_receives[request.py_request_id] = request
         return outcome
+
+    def retain_fatal_gen_receive(self, request: LlmRequest) -> None:
+        """Keep a model-idle GEN replica in the receive vote after fatal error delivery."""
+        if not (
+            self.supports_group_receive_cancellation
+            and getattr(request, "is_generation_only_request", False)
+            and request.state in _MODEL_IDLE_GEN_STATES
+            and self._transceiver.supports_idle_request_cancellation(request) is True
+        ):
+            return
+        request_id = request.py_request_id
+        if (
+            request.state == LlmRequestState.DISAGG_GENERATION_INIT
+            and request_id not in self._unpublished_gen_receives
+        ):
+            # A deferred admission may still have its CUDA fence in the cache manager.
+            ready = self._take_receive_fences([request]).get(request_id)
+            if ready is not None:
+                self._unpublished_gen_receives[request_id] = (request, ready)
+        # A locally empty replica still owes a vote until all accessors on its
+        # peers settle. A refused fence handoff needs the same retry owner.
+        if not self.request_cancellation(request, failed=True):
+            self._retiring_gen_receives[request_id] = request
 
     def defer_gen_termination(self, request: LlmRequest) -> bool:
         """Retain a cancelled destination after its terminal response is published.
@@ -1798,6 +1828,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         self, request: LlmRequest, *, prior_failure: bool = False
     ) -> ReceiveCancellation:
         return ReceiveCancellation.NOT_HANDLED
+
+    def retain_fatal_gen_receive(self, request: LlmRequest) -> None:
+        return None
 
     def defer_gen_termination(self, request: LlmRequest) -> bool:
         return False

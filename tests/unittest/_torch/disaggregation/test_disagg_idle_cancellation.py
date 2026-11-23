@@ -57,6 +57,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
@@ -70,11 +71,13 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SchedulerOutput,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import FinishReason, RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -1873,6 +1876,74 @@ def test_cancelled_receive_shutdown_preserves_roots_until_fence_settles(
     worker._retirement_watchdog.stop()
 
 
+@pytest.mark.parametrize("stage", ["pending", "failed", "deferred-admission"])
+def test_fatal_gen_error_keeps_both_ranks_polling_before_shutdown(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Physical retirement survives the final error response, including on a vote-only rank."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    engines = [executor.__wrapped__(monkeypatch) for _ in range(2)]
+    requests = [_request(1), _request(1)]
+    for rank, (engine, request) in enumerate(zip(engines, requests)):
+        _enable_context_first(engine, request)
+        engine.active_requests = [request]
+        dist = group.rank(rank)
+        dist.mapping = Mapping(world_size=2, rank=rank, tp_size=2)
+        engine.dist = engine.disagg._dist = dist
+        transceiver = engine.kv_cache_transceiver
+        transceiver._dist = dist
+        transceiver._mapping = dist.mapping
+        transceiver._gen_need_sync = True
+        transceiver._gen_allgather = dist.tp_allgather
+        transceiver._init_gen_idle_poll(True)
+
+    ready = Mock(spec=["query"])
+    ready.query.return_value = False
+    first = engines[0].disagg
+    if stage == "deferred-admission":
+        # Resource preparation deferred publication; the cache manager still owns the fence.
+        first._kv_cache_manager = SimpleNamespace(take_disagg_receive_ready=lambda req: ready)
+    else:
+        requests[0].state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        first._unpublished_gen_receives[1] = (requests[0], ready)
+        assert (
+            first.cancel_gen_logically(requests[0], prior_failure=stage == "failed")
+            is ReceiveCancellation.PENDING
+        )
+        if stage == "failed":
+            # The first poll informs the empty peer; the second commits both votes.
+            for _ in range(2):
+                group.run(lambda rank: engines[rank].disagg.poll_gen_transfers())
+            for engine in engines:
+                record = engine.kv_cache_transceiver._cancelled_gen_receives[1]
+                assert record.outcome is ReceiveCancellation.FAILED
+
+    for engine in engines:
+        engine._fatal_error = RuntimeError("fatal model error")
+        engine._handle_errors("fatal model error", charge_budget=False)
+        assert not engine.active_requests
+        assert not engine.should_stop_processing
+        engine.resource_manager.free_resources.assert_not_called()
+    group.run(lambda rank: engines[rank].disagg.poll_gen_transfers())
+    for engine in engines:
+        record = engine.kv_cache_transceiver._cancelled_gen_receives[1]
+        assert record.outcome is ReceiveCancellation.FAILED
+        assert not engine.should_stop_processing
+        engine.resource_manager.free_resources.assert_not_called()
+    (response,) = engines[0]._response_channel.responses[1]
+    assert response.error_msg == "fatal model error"
+
+    ready.query.return_value = True
+    group.run(lambda rank: engines[rank].disagg.poll_gen_transfers())
+    for engine, request in zip(engines, requests):
+        assert engine.should_stop_processing
+        assert not engine.kv_cache_transceiver._cancelled_gen_receives
+        assert request.py_kv_receive_cancel_outcome is ReceiveCancellation.FAILED
+        engine.resource_manager.free_resources.assert_called_once_with(request)
+        engine.kv_cache_transceiver.prepare_shutdown()
+    assert engines[0]._response_channel.responses[1] == [response]
+
+
 @pytest.mark.parametrize("context_first", [False, True], ids=["fp4-bridge", "bf16-context-first"])
 @pytest.mark.parametrize("shutdown", [False, True])
 @pytest.mark.parametrize("published", [False, True], ids=["unpublished-fence", "published-session"])
@@ -2987,6 +3058,85 @@ def test_context_first_post_batch_cancel_releases_a_prior_failure_vote(
     executor.resource_manager.free_resources.assert_called_once_with(request)
 
 
+@pytest.mark.parametrize("context_first", [False, True], ids=["fp4-post-batch", "bf16-idle"])
+def test_failed_receive_pages_remain_visible_to_scheduler(
+    executor: PyExecutor, context_first: bool
+) -> None:
+    """A writer draining after logical failure can release KV; a page-free vote cannot."""
+    request, blocked = _request(1), _request(2)
+    blocked.state = LlmRequestState.GENERATION_IN_PROGRESS
+    executor.active_requests = [request, blocked]
+    executor._fatal_error = None
+    manager = Mock(
+        spec=KVCacheManagerV2,
+        enable_joint_kv_cache_reuse=False,
+        enable_block_reuse=False,
+        can_share_inflight_prefix=False,
+        tokens_per_block=16,
+        _has_cp_helix=False,
+        inforward_snapshot_rows=0,
+        has_cache_tier_below_gpu=False,
+        kv_connector_manager=None,
+    )
+    manager.has_pending_preemption.return_value = False
+    manager.is_request_active.side_effect = {1, 2}.__contains__
+    executor.kv_cache_transceiver._kv_cache_manager = manager
+    scheduler = KVCacheV2Scheduler(
+        max_batch_size=1,
+        max_num_tokens=16,
+        kv_cache_manager=manager,
+        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        enable_prefix_aware_scheduling=False,
+    )
+    scheduler.set_retiring_gen_receives_probe(executor._has_scheduler_held_gen_receives)
+    scheduler._DEADLOCK_STALL_ITERS = 1
+
+    def stalled_pass() -> None:
+        scheduler._detect_deadlock(executor.active_requests, set(), [], set(), made_progress=False)
+
+    if context_first:
+        _enable_context_first(executor, request)
+    session, _ = _published_receive(executor, request)
+    if not context_first:
+        session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    session.process_kv_agent_result(0, 0, True, AgentResult.IN_DOUBT, _KV_RESULT_REPORT_TOKEN)
+    _abort(executor, request)
+    if context_first:
+        executor._cancel_waiting_disagg_requests([])
+        executor.disagg.reap_gen_receives(0)
+        executor._cancel_waiting_disagg_requests([])
+    else:
+        executor._handle_canceled_requests()
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert executor.canceled_req_ids == [1]
+    assert not session.resources_drained()
+    stalled_pass()
+    assert scheduler._stalled_schedules == 0
+    executor.resource_manager.free_resources.assert_not_called()
+
+    session.process_kv_agent_result(
+        0, 0, True, AgentResult.FAILED_QUIESCED, _KV_RESULT_REPORT_TOKEN
+    )
+    executor.disagg.reap_gen_receives(0)
+    if context_first:
+        executor._cancel_waiting_disagg_requests([])
+    else:
+        executor._handle_canceled_requests()
+    executor.disagg.reap_gen_receives(0)
+    executor._flush_pending_transfer_responses()
+    (response,) = executor.await_responses(timeout=timedelta(0))
+    assert response.error_msg is not None
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert executor.active_requests == [blocked]
+
+    if context_first:
+        vote_only = _request(3)
+        _enable_context_first(executor, vote_only)
+        assert executor.disagg.cancel_gen_logically(vote_only) is ReceiveCancellation.PENDING
+    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        stalled_pass()
+
+
 @pytest.mark.parametrize("stopped", [False, True], ids=["shutting-down", "stopped"])
 def test_context_first_failed_fence_handoff_contains_without_release(
     executor: PyExecutor, stopped: bool
@@ -3042,8 +3192,15 @@ def test_context_first_failed_fence_handoff_contains_without_release(
         executor._sweep_transfer_held_failures()
         assert transceiver._cancelled_gen_receives[1].unhanded_ready is ready
         assert executor.await_responses(timeout=timedelta(0)) == []
+        executor._fatal_error = RuntimeError("fatal model error")
+        executor._handle_errors("fatal model error", charge_budget=False)
+        executor.disagg.poll_gen_transfers()
+        assert not executor.active_requests
+        assert not executor.should_stop_processing
+        assert executor.disagg._unpublished_gen_receives == {1: (destination, ready)}
+        assert transceiver._cancelled_gen_receives[1].unhanded_ready is ready
         executor.resource_manager.free_resources.assert_not_called()
-        with pytest.raises(RuntimeError, match="await group retirement"):
+        with pytest.raises(RuntimeError, match=r"1 cancelled GEN receives?.*transfer IDs: \[1\]"):
             transceiver.shutdown()
         assert transceiver._recv_reqs == {1: destination}
         containment.assert_called_once_with(watchdog.fatal)
@@ -3207,6 +3364,34 @@ def test_taking_peer_cancel_intents_detaches_the_previous_poll(executor: PyExecu
     tc._progress_cancelled_gen_receives([{23: ReceiveCancellationVote(False, False)}])
     assert first == {17: True}
     assert tc.take_receive_cancellation_intents() == {23: False}
+
+
+def test_one_sided_abort_wakes_the_agreed_idle_tp_receive_poll(monkeypatch: pytest.MonkeyPatch):
+    """A peer with no local cancel record must still join both physical votes."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    engines = [executor.__wrapped__(monkeypatch) for _ in range(2)]
+    for rank, engine in enumerate(engines):
+        request = _request(1)
+        _enable_context_first(engine, request)
+        engine.active_requests = [request]
+        dist = group.rank(rank)
+        dist.mapping = Mapping(world_size=2, rank=rank, tp_size=2)
+        engine.dist = engine.disagg._dist = dist
+        tc = engine.kv_cache_transceiver
+        tc._dist, tc._mapping = dist, dist.mapping
+        tc._gen_need_sync = True
+        tc._gen_allgather = dist.tp_allgather
+        tc._init_gen_idle_poll(True)
+    group.run(lambda rank: engines[rank].disagg.reap_gen_receives())
+    assert all(engine.kv_cache_transceiver._gen_idle_agreed for engine in engines)
+    _abort(engines[0], engines[0].active_requests[0])
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    for _ in range(2):
+        group.run(lambda rank: engines[rank].disagg.reap_gen_receives())
+    for engine in engines:
+        assert (
+            engine.active_requests[0].py_kv_receive_cancel_outcome is ReceiveCancellation.CANCELLED
+        )
 
 
 def test_post_poll_alignment_uses_this_iterations_global_cancel_ids(

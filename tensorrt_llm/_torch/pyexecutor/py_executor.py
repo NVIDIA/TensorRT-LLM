@@ -1358,7 +1358,7 @@ class PyExecutor:
                 self.async_transfer_manager)
         if hasattr(self.scheduler, "set_retiring_gen_receives_probe"):
             self.scheduler.set_retiring_gen_receives_probe(
-                lambda: self.disagg.has_local_retiring_gen_receives)
+                self._has_scheduler_held_gen_receives)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -6336,6 +6336,12 @@ class PyExecutor:
                 # Fail all active and waiting requests on every rank so every
                 # client receives an error instead of hanging.
                 self._handle_errors(error_msg, requests=self.active_requests)
+                if (self.is_shutdown
+                        and self.disagg.supports_group_receive_cancellation
+                        and self.disagg.has_retiring_gen_receives):
+                    # Return no model work while the usual receive poll drains
+                    # the failed destinations before the worker exits.
+                    return ScheduledRequests(), iter_stats
                 return None, None
 
         if self._packed_sync_enabled:
@@ -12738,9 +12744,8 @@ class PyExecutor:
             logger.error(
                 f"Fatal error detected, initiating shutdown: {error_msg}")
             requests = None
-            # Failures parked for in-flight transfers no longer wait: the
-            # executor exits instead of reusing their blocks, and they must
-            # be failed with everything else.
+            # Publish parked failures with everything else. Group-owned GEN
+            # receives still pass through physical retirement below.
             self._held_transfer_failures().clear()
 
             # Drain waiting_queue so that queued-but-not-yet-activated
@@ -12816,6 +12821,8 @@ class PyExecutor:
                     "whose KV blocks a transfer still owns")
         for request in failed_requests:
             req_id = request.py_request_id
+            if is_fatal:
+                self.disagg.retain_fatal_gen_receive(request)
             request.state = LlmRequestState.GENERATION_COMPLETE
             # A context request failing before its first chunk completed has
             # written no KV. Tag it so the V1 KV-cache release skips the
@@ -13359,6 +13366,13 @@ class PyExecutor:
         if removed:
             self._flush_pending_transfer_responses()
         return [req for req in new_requests if id(req) not in removed]
+
+    def _has_scheduler_held_gen_receives(self) -> bool:
+        """Include failed receives still holding KV, even outside the scheduler's input."""
+        transceiver = self.kv_cache_transceiver
+        return (self.disagg.has_local_retiring_gen_receives
+                or (transceiver is not None
+                    and transceiver.has_cancelling_gen_pages() is True))
 
     def _try_cancel_request(self, request: LlmRequest) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.

@@ -19,7 +19,7 @@ import traceback
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from itertools import chain
+from itertools import chain, islice
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
@@ -827,7 +827,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # bounded drain before that refusal, not only in worker.prepare_shutdown().
         self._transfer_worker.request_shutdown()
         if self._cancelled_gen_receives:
-            raise RuntimeError("Cancelled GEN receives still await group retirement")
+            records = self._cancelled_gen_receives
+            raise RuntimeError(
+                f"{len(records)} cancelled GEN receives still await group retirement; "
+                f"sample transfer IDs: {list(islice(records, 8))}"
+            )
         for rid in list(getattr(self, "_cancelled_receive_fences", {})):
             if not self._retire_cancelled_receive_fence(rid):
                 raise RuntimeError(f"Unpublished receive {rid} still owns destination memory")
@@ -1444,6 +1448,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             or rid in self._recv_sessions
             or rid in getattr(self, "_cancelled_receive_fences", {})
             or rid in self._cancelled_gen_receives
+        )
+
+    def has_cancelling_gen_pages(self) -> bool:
+        """Look up cancelled destinations independently of their executor state.
+
+        A TP vote can exist before local allocation; only an allocated
+        destination can explain a local scheduler stall.
+        """
+        return any(
+            self._kv_cache_manager.is_request_active(req.py_request_id)
+            for rid, req in self._recv_reqs.items()
+            if rid in self._cancelled_gen_receives
+            or req.py_kv_receive_cancel_disposition is not None
         )
 
     def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
@@ -2239,6 +2256,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         intents = self._receive_cancellation_intents
         self._receive_cancellation_intents = {}
         return intents
+
+    def wake_gen_cancellation_poll(self) -> None:
+        self._gen_idle_agreed = False
 
     def _supports_group_receive_cancellation(self, req: Optional[LlmRequest]) -> bool:
         """Check this binding's qualified request shape without widening it."""

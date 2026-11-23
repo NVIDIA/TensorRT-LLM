@@ -311,6 +311,10 @@ class KvCacheTransceiver(ABC):
         """Whether the send session closed before its final slice."""
         return False
 
+    def has_cancelling_gen_pages(self) -> bool:
+        """Whether a receive cancellation still holds a rank-local KV allocation."""
+        return False
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         """Return whether this runtime consumes the C++ CacheTransBuffer budget."""
@@ -480,6 +484,9 @@ class KvCacheTransceiver(ABC):
             cancellation vote, including any unpublished readiness fence it owns.
         """
         return {}
+
+    def wake_gen_cancellation_poll(self) -> None:
+        """Resume receive-status polling on every rank after a shared cancellation vote."""
 
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
