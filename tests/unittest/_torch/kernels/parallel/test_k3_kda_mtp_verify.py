@@ -20,8 +20,9 @@ the CuTe DSL op as the reference:
 
 - MXFP8 scales are replicated and at most one exponent step apart on a few blocks, and codes are at most one step apart
   on a few elements.
-- The state is within two BF16 ulps, with few differing elements and no magnitude bias (round to nearest even). The
-  replay caches likewise.
+- The state is within two BF16 ulps (plus a small absolute allowance near zero, where the two ops' sums cancel
+  differently), with few differing elements and no magnitude bias (round to nearest even). The BF16 replay caches
+  likewise.
 - The conv windows are bit-identical.
 - Every other byte of the in-place buffers is untouched: slots outside the batch, the padding between slots and the
   poisoned guard bytes around each buffer.
@@ -88,10 +89,14 @@ CODE_FRAC, CODE_FLOOR = 0.01, 128
 FAR_FRAC, FAR_FLOOR = 0.0015, 16
 BLOCK_ERR, OUT_L2 = 0.3, 0.01
 STATE_SOFT_FRAC, STATE_DIFF_FRAC, STATE_BIAS = 0.001, 0.02, 1e-4
-CACHE_TOL = {
-    "k_cache": (2e-2, 4e-3),
-    "v_cache": (2e-2, 4e-3),
-    "beta_cache": (2e-2, 4e-3),
+# State and BF16 replay caches: two BF16 ulps (relative 2^-6) plus an absolute allowance near zero, where the two ops'
+# sums cancel differently: about 4x the largest such difference (1.7e-5 in the state, 2e-8 in the k cache). Over
+# chained rounds the state carries that rounding over, up to 4.5e-4 near zero.
+STATE_ATOL, STATE_CHAIN_ATOL = 2.0**-14, 5e-4
+CACHE_TOL = {  # (atol, rtol)
+    "k_cache": (2.0**-24, 2.0**-6),
+    "v_cache": (2.0**-24, 2.0**-6),
+    "beta_cache": (2.0**-24, 2.0**-6),
     "g_cache": (1e-5, 1e-5),
 }
 CACHE_DIFF_FRAC, CACHE_BIAS = 0.01, 1e-4
@@ -434,13 +439,15 @@ def _check_mutated(ref, cu, case, num_real=None, strict=True):
         if name.startswith("cs_"):
             assert torch.equal(a, b), f"{name}: conv windows must be bit-identical"
         elif name == "recurrent_state":
-            # Two BF16 ulps also bound the rounding that chained rounds carry over (strict=False).
-            assert not bool((err > 2.0**-6 * b.abs() + 5e-4).any()), (
-                "state off by more than two BF16 ulps"
+            # Two BF16 ulps (STATE_CHAIN_ATOL near zero) also bound the rounding that chained rounds carry over
+            # (strict=False).
+            atol = STATE_ATOL if strict else STATE_CHAIN_ATOL
+            assert not bool((err > 2.0**-6 * b.abs() + atol).any()), (
+                f"state off by more than two BF16 ulps + {atol:.1e}"
             )
             if not strict:
                 continue
-            soft = (err > 2.0**-7 * b.abs() + 5e-4).double().mean().item()
+            soft = (err > 2.0**-7 * b.abs() + STATE_ATOL).double().mean().item()
             diff, bias = _rne_stats(b, a)
             assert soft <= STATE_SOFT_FRAC, f"{soft:.2e} of the state beyond one ulp"
             assert diff <= STATE_DIFF_FRAC, f"{diff:.2e} of the state differs"
@@ -711,18 +718,24 @@ def test_eligibility_policy(monkeypatch):
     assert reason(96, 3, replay_state_indices=None) == "layout"
 
 
-@pytest.mark.parametrize("heads,num_spec", [(96, 3), (12, 3), (12, 5)])
-def test_dispatch_routes_only_eligible_calls(heads, num_spec):
+# The FP32 state is main's default (mamba_ssm_cache_dtype unset): those calls stay on the CuTe DSL kernels.
+@pytest.mark.parametrize(
+    "heads,num_spec,state_dtype",
+    [(96, 3, BF16), (96, 3, torch.float32), (12, 3, BF16), (12, 5, BF16)],
+)
+def test_dispatch_routes_only_eligible_calls(heads, num_spec, state_dtype):
     kk = _dispatch_module()
     dispatch = kk.KDAKernelDispatch()
     if dispatch.verify_kernel_path != "optimized":
         pytest.skip("optimized verify path unavailable")
     assert dispatch._cuda_verify
     base = _case(heads, num_spec, 16, seed=21)
+    state = base["recurrent_state"]
+    base["recurrent_state"] = _in_place(state.to(state_dtype), state.stride())
     via_dispatch = _clone(base)
     out, scale = dispatch.mtp_verify(mxfp8_output=True, **_dispatch_kwargs(via_dispatch))
     direct = _clone(base)
-    routed = (heads, num_spec) in kk._CUDA_VERIFY_ROUTES
+    routed = (heads, num_spec) in kk._CUDA_VERIFY_ROUTES and state_dtype == BF16
     expected = _run_cuda(direct) if routed else _reference(direct)
     torch.cuda.synchronize()
     offsets = _scale_offsets(16 * (num_spec + 1), heads).flatten()
