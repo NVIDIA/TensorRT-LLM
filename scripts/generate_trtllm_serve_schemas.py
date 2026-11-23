@@ -253,6 +253,13 @@ def _cross_field_rules(definitions: dict) -> None:
             ),
         ]
     )
+    # BlockReuseConfig.validate_drop_extended_turns_policy().
+    definitions["BlockReuseConfig"].setdefault("allOf", []).append(
+        when(
+            _is_set_to("drop_extended_turns", {"const": True}),
+            _is_set_to("policy", {"const": "per_conversation"}),
+        )
+    )
     # AttentionDpConfig.validate_attention_dp_config().
     home_wait = _is_set_to("kv_cache_routing_home_wait_rounds", {"type": "integer"})
     definitions["AttentionDpConfig"].setdefault("allOf", []).extend(

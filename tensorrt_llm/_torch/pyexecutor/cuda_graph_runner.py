@@ -31,7 +31,8 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import decode_stream_priority, make_weak_ref, piecewise_cuda_graph
-from . import step_inputs
+from . import device_copy, step_inputs
+from .device_copy import CopySite
 from .llm_request import LlmRequest, get_draft_token_length
 from .replay_inputs import stage_replay_inputs
 from .resource_manager import (BaseResourceManager, NoFreeSlotsError,
@@ -363,6 +364,9 @@ class CUDAGraphRunner:
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         # Graphs captured with a step-input pack's prologue, and that pack (step_inputs.capture_prologue).
         self._step_input_prologue_keys: Dict[KeyType, Any] = {}
+        # Graphs captured with a copier's in-graph final flush prologue, and that copier
+        # (device_copy.capture_prologue).
+        self._prologue_copiers: Dict[KeyType, Any] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
@@ -1429,6 +1433,10 @@ class CUDAGraphRunner:
                                  step_inputs.capture_prologue())
                 if prologue_pack is not None:
                     self._step_input_prologue_keys[key] = prologue_pack
+                prologue_copier = (None if self._pre_replay_hooks else
+                                   device_copy.capture_prologue())
+                if prologue_copier is not None:
+                    self._prologue_copiers[key] = prologue_copier
                 output = forward_fn(capture_inputs)
             if len(HOSTFUNC_USER_DATA_HANDLES) > num_hostfuncs:
                 self._hostfunc_graph_keys.add(key)
@@ -1442,6 +1450,16 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
         return graph_output
+
+    @staticmethod
+    def _copy_static_input(site: CopySite, dst: torch.Tensor,
+                           src: torch.Tensor) -> None:
+        """Copy a step input into a graph's static input: through ``site`` when the model
+        declares a copy plan (an active copier), else through the step-input pack."""
+        if device_copy.current() is not None:
+            device_copy.copy(site, dst, src)
+        else:
+            step_inputs.copy_(dst, src)
 
     def replay(
         self,
@@ -1498,9 +1516,11 @@ class CUDAGraphRunner:
                     static_tensors["position_ids"])
             hook_positions = self._pre_replay_position_ids[..., :seqlen]
         # One launch copies the ids and positions and writes the hooks' positions,
-        # unless an open step-input pack still defers copies into its sources.
+        # unless an open step-input pack or copy-plan pack still defers copies into
+        # their sources.
         staged = (self.config.stage_decode_inputs and copy_input_ids
                   and not self.config.use_mrope and not step_inputs.is_open()
+                  and not device_copy.is_open()
                   and tuple(position_ids.shape) == (1, seqlen)
                   and stage_replay_inputs(
                       static_input_ids, input_ids,
@@ -1508,7 +1528,8 @@ class CUDAGraphRunner:
                       hook_positions, None if hook_positions is None else
                       position_id_offsets[:seqlen]))
         if copy_input_ids and not staged:
-            step_inputs.copy_(static_input_ids, input_ids)
+            self._copy_static_input(CopySite.GRAPH_INPUT_IDS, static_input_ids,
+                                    input_ids)
 
         if self.config.use_mrope:
             expected_position_ids_shape = (3, 1, seqlen)
@@ -1559,7 +1580,8 @@ class CUDAGraphRunner:
             static_position_ids = static_tensors["position_ids"][:, :seqlen]
             if (not prestaged and not staged and position_ids.data_ptr()
                     != static_position_ids.data_ptr()):
-                step_inputs.copy_(static_position_ids, position_ids)
+                self._copy_static_input(CopySite.GRAPH_POSITION_IDS,
+                                        static_position_ids, position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -1593,6 +1615,13 @@ class CUDAGraphRunner:
         if prologue_pack is not None and not captured_pack_active:
             # Replayed outside the pack's context: nothing filled its window.
             prologue_pack.quiesce_graph_window()
+        # The same for the copy plan's merged copies (a model that declares a plan).
+        prologue_copier = self._prologue_copiers.get(key)
+        captured_copier_active = (prologue_copier is not None
+                                  and device_copy.is_active(prologue_copier))
+        device_copy.flush(in_graph=captured_copier_active)
+        if prologue_copier is not None and not captured_copier_active:
+            prologue_copier.quiesce_graph_window()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if hook_positions is not None:
@@ -1609,6 +1638,8 @@ class CUDAGraphRunner:
         finally:
             if prologue_pack is not None:
                 prologue_pack.on_graph_replay()
+            if prologue_copier is not None:
+                prologue_copier.on_graph_replay()
         if key in self._hostfunc_graph_keys:
             record_hostfunc_graph_replay()
         output_ref = self.graph_outputs[key]
@@ -2219,6 +2250,7 @@ class CUDAGraphRunner:
         self._hostfunc_graph_keys.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
+        self._prologue_copiers.clear()
         self.reset_padding_dummies()
         del self.memory_pool
         self.memory_pool = None

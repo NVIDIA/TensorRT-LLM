@@ -70,6 +70,11 @@ DEFAULT_MAX_PARALLEL_TASKS = 9
 DEFAULT_MAX_PARALLEL_CHECKS = 8
 #: How many times a task the run's infrastructure failed starts again on its own.
 INFRA_RETRIES = 1
+#: An attempt the task's environment ended is left uncounted while the task has fewer than
+#: this many uncounted attempts (``not_started_attempts``); past that it is a worker run.
+ENVIRONMENT_RETRIES = 10
+#: How a BLOCKED worker's report names the site as its cause (``tasks._blocked_report``).
+_BLOCKED_ON_ENVIRONMENT = re.compile(r"(?:^|; )blocked_reason environment\b")
 #: A state write that fails with one of these waits for room instead of ending the run.
 STORAGE_FULL = frozenset({errno.EDQUOT, errno.ENOSPC})
 #: How long a task thread waiting on its soft dependencies sleeps between looks,
@@ -194,6 +199,18 @@ def _not_the_task(decision: str) -> bool:
     The worker's turn raised, or its finished branch could not be integrated.
     """
     return decision.startswith("raised ") or decision == "INTEGRATION_FAILED"
+
+
+def _on_environment(decision: str, note: str) -> bool:
+    """A run its environment ended, not its work.
+
+    The worker's turn failed on the agent CLI's transport or state, the
+    provider or the network (:data:`ENVIRONMENT_FAILURE`), or the worker
+    blocked on the site: ``blocked_reason: environment``.
+    """
+    if decision.startswith("raised "):
+        return bool(ENVIRONMENT_FAILURE.search(f"{decision}\n{note}"))
+    return decision == "BLOCKED" and bool(_BLOCKED_ON_ENVIRONMENT.search(note))
 
 
 class ChecksRaised(Exception):
@@ -321,8 +338,9 @@ class GraphOrchestrator:
         self.retries: dict[str, int] = {
             str(k): int(v) for k, v in (saved.get("retries") or {}).items()
         }
-        #: Per task, the attempts whose worktree could not be prepared: no worker ran,
-        #: so they keep their numbers but do not count against ``graph.MAX_ATTEMPTS``.
+        #: Per task, the attempts that were not its try: no worker ran (its worktree could
+        #: not be prepared) or its environment ended the run (:func:`_on_environment`). They
+        #: keep their numbers but do not count against ``graph.MAX_ATTEMPTS``.
         self.not_started_attempts: dict[str, list[int]] = {
             str(k): sorted({int(n) for n in v})
             for k, v in (saved.get("not_started_attempts") or {}).items()
@@ -1098,7 +1116,11 @@ class GraphOrchestrator:
                 if decision in FINISHED and not failed
                 else "failed"
             )
-            if decision.startswith(f"raised {TaskNotStarted.__name__}:"):
+            on_environment = (
+                _on_environment(decision, note)
+                and len(self.not_started_attempts.get(task.id, ())) < ENVIRONMENT_RETRIES
+            )
+            if on_environment or decision.startswith(f"raised {TaskNotStarted.__name__}:"):
                 unstarted = self.not_started_attempts.setdefault(task.id, [])
                 if task.attempts not in unstarted:
                     unstarted.append(task.attempts)
@@ -1120,6 +1142,11 @@ class GraphOrchestrator:
                 # A MACRO hands its work on to its constituents: split, not failed.
                 task.status = "split" if decision == "MACRO" else "failed"
                 said = f"task {task.id} ({task.kind}) ended {decision or 'with no decision'}"
+                if on_environment:
+                    said += (
+                        ", on the run's environment rather than its work: this attempt is not "
+                        "counted in its worker runs"
+                    )
                 if task.kind in INTEGRATED_KINDS and self.s.landed(task):
                     self._landings[task.id] = (time.time(), task.attempts)
                     self._receipts_landed[task.id] = task.attempts

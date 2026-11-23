@@ -394,6 +394,8 @@ public:
         // request's content diverges from the tree, independent of page
         // residency. Equal to numLookupTokens when there is no fork.
         int numReusableTokensBeforePruning;
+        // Coalesced half-open ranges of valid OPTIONAL endpoints.
+        TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>> optionalEndpointRanges;
     };
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
@@ -401,7 +403,7 @@ public:
     // allocating/copying (the hot path). Callers holding a std::vector pass toSpan(vec).
     // backoff: tokens trimmed off the tail of the match (see KVCacheManagerConfig::reuseMatchBackoff).
     ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
-        bool enablePartialMatch = false, int backoff = 0) const;
+        bool enablePartialMatch = false, int backoff = 0, bool collectOptionalMatches = false) const;
 
     // Detach all cached blocks. ~Block() releases pages when the last owner drops a block.
     void clear();
@@ -438,8 +440,8 @@ public:
 
 private:
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
-    std::vector<MatchResult> matchTokenPath(
-        ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
+    std::vector<MatchResult> matchTokenPath(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest,
+        bool enablePartialMatch, TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>>* optionalEndpointRanges) const;
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
     // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
