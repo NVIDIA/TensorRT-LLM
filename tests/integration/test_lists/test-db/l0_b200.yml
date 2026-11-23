@@ -594,8 +594,8 @@ l0_b200:
   # These cases track performance in OpenSearch and perform comparison there:
   # each median is uploaded at session end, and the upload pipeline checks it
   # against OpenSearch history. They also compare each median with
-  # baselines_b200.json (2x factor); exceeding it prints a REGRESSION DETECTED
-  # line and fails the test.
+  # baselines_b200.json (2x factor), but that check only prints a
+  # REGRESSION DETECTED line and never fails the test.
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
   - perf/host_perf/test_module_sampler.py::test_sampler_update_greedy[greedy_bs8]

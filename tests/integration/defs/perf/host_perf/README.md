@@ -53,10 +53,11 @@ Requires: GPU access (1 GPU), `LLM_MODELS_ROOT` set to model weights directory.
 ## Layer 2: Module Tests
 > **Post-merge only.** The Layer 2 module benchmarks run in the post-merge block of
 > `l0_b200.yml` (`DGX_B200-PyTorch-Post-Merge` stages), not on pre-merge. Their
-> medians are uploaded to OpenSearch for history tracking. `check_regression()`
-> compares each median against `baselines_b200.json` (2x factor); if it is exceeded,
-> it prints a `REGRESSION DETECTED` line and fails the test. Layer 1 (E2E,
-> `test_perf_sanity.py`) remains the pre-merge host-perf signal.
+> medians are uploaded to OpenSearch for history tracking. They are not a merge
+> gate: `check_regression()` only prints a `REGRESSION DETECTED` line, and no stage
+> fails on it. The Layer 1 DeepSeek-V3-Lite E2E case was retired from pre-merge in
+> #22874 and is not listed in any L0 test-db list, so no host-perf benchmark runs
+> pre-merge.
 
 ### Scheduler (`test_module_scheduler.py`)
 
