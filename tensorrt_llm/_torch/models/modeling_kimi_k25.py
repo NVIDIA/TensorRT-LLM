@@ -244,6 +244,38 @@ def _decode_video_to_chunks(
     return chunks, "".join(prompts)
 
 
+def _moon_patch_token_grid(
+    width: int, height: int, patch_size: int, merge_size: int, patch_limit: int, side_limit: int
+) -> tuple[int, int]:
+    """Spatial token grid after Moon-Patch resize and padding."""
+    patches = max(1, width // patch_size) * max(1, height // patch_size)
+    max_side = side_limit * patch_size
+    scale = min(1.0, math.sqrt(patch_limit / patches), max_side / width, max_side / height)
+    new_w = min(max(1, int(width * scale)), max_side)
+    new_h = min(max(1, int(height * scale)), max_side)
+    factor = merge_size * patch_size
+    return (new_h + factor - 1) // factor, (new_w + factor - 1) // factor
+
+
+def _moon_patch_chunk_tokens(chunk: list[np.ndarray] | np.ndarray, cfg: dict[str, Any]) -> int:
+    patch_limit = cfg["in_patch_limit_each_frame"]
+    if patch_limit is None:
+        patch_limit = cfg["in_patch_limit"]
+    if cfg["in_patch_limit_video"] is not None:
+        patch_limit = min(patch_limit, round(cfg["in_patch_limit_video"] / len(chunk)))
+
+    height, width = chunk[0].shape[:2]
+    merge_size = cfg["merge_kernel_size"]
+    side_limit = cfg["patch_limit_on_one_side"]
+    grid = _moon_patch_token_grid(
+        width, height, cfg["patch_size"], merge_size, patch_limit, side_limit
+    )
+    if cfg["fixed_output_tokens"] is not None:
+        return cfg["fixed_output_tokens"]
+    assert max(grid) * merge_size <= side_limit, "Padded video grid exceeds patch_limit_on_one_side"
+    return math.prod(grid)
+
+
 def _to_pil_image(image: Image.Image | torch.Tensor | np.ndarray) -> Image.Image:
     if isinstance(image, np.ndarray):
         return Image.fromarray(image)
@@ -1185,44 +1217,49 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         else:
             merge_k = int(merge_kernel_size)
 
-        w, h = image.size
-        factor = merge_k * patch_size
-        in_patch_limit = 16384
-        patch_limit_on_one_side = 512
-        s1 = math.sqrt(in_patch_limit / (max(1.0, w // patch_size) * max(1.0, h // patch_size)))
-        s2 = patch_limit_on_one_side * patch_size / w
-        s3 = patch_limit_on_one_side * patch_size / h
-        scale = min(1.0, s1, s2, s3)
-        new_w = min(max(1, int(w * scale)), patch_limit_on_one_side * patch_size)
-        new_h = min(max(1, int(h * scale)), patch_limit_on_one_side * patch_size)
-        pad_w = (factor - new_w % factor) % factor
-        pad_h = (factor - new_h % factor) % factor
-        token_w = (new_w + pad_w) // factor
-        token_h = (new_h + pad_h) // factor
-        return token_h * token_w
+        width, height = image.size
+        return math.prod(_moon_patch_token_grid(width, height, patch_size, merge_k, 16384, 512))
 
     def get_num_tokens_per_video(self, *, video: List, **kwargs) -> int:
-        """Calculate total tokens for a video (list of PIL frames).
+        """Calculate total tokens for a decoded video.
 
         Each temporal chunk of ``temporal_merge_kernel_size`` frames produces
         tokens based on the spatial dimensions of the first frame.  The total
         is the sum across all chunks.
 
         Args:
-            video: List of PIL Image frames.
+            video: Decoded video frames.
 
         Returns:
             Total visual tokens for the entire video.
         """
         image_processor = getattr(self._processor, "image_processor", None)
-        temporal_k = 4
-        if image_processor is not None:
-            media_proc_cfg = getattr(image_processor, "media_proc_cfg", {})
-            temporal_k = media_proc_cfg.get("temporal_merge_kernel_size", 4)
+        cfg = getattr(image_processor, "media_proc_cfg", {})
+        temporal_k = cfg.get("temporal_merge_kernel_size", 4)
+        processor_cls = type(image_processor)
+        native_sizing = (
+            processor_cls.__name__ == "KimiK25VisionProcessor"
+            and processor_cls.__module__.rsplit(".", 1)[-1] == "kimi_k25_vision_processing"
+            and cfg.get("config_type")
+            == "media_proc.processors.moonvit.MoonViTMediaProcessorConfig"
+            and "get_resize_config" not in vars(image_processor)
+            and "media_tokens_calculator" not in vars(image_processor)
+        )
 
         total_tokens = 0
         for i in range(0, len(video), temporal_k):
-            chunk = [_to_pil_image(frame) for frame in video[i : i + temporal_k]]
+            chunk = video[i : i + temporal_k]
+            if native_sizing and all(
+                isinstance(frame, np.ndarray)
+                and frame.dtype == np.uint8
+                and frame.ndim == 3
+                and 0 not in frame.shape
+                and frame.shape[-1] == 3
+                for frame in chunk
+            ):
+                total_tokens += _moon_patch_chunk_tokens(chunk, cfg)
+                continue
+            chunk = [_to_pil_image(frame) for frame in chunk]
             # Each chunk is treated as a video_chunk; token count depends
             # on the spatial dims of the first frame.
             if image_processor is not None and hasattr(image_processor, "media_tokens_calculator"):
