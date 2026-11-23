@@ -390,6 +390,16 @@ def qk_kernel(
                         "evict_last",
                     )
             cute.arch.sync_warp()
+        else:
+            # a tile past the valid length of its batch element writes no codes; the encode kernel reads the
+            # provisional scales of every tile, so those of this one are zero, not the stale or uninitialized
+            # scratch of the workspace
+            pbase = prov_p + ((Int64(side) * Int64(BH) + Int64(bh)) * Int64(T) + Int64(tile)) * 3072
+            if tid < 192:
+                store_vector(
+                    gptr(Uint32, pbase + Int64(tid) * 16, 16),
+                    (Uint32(0), Uint32(0), Uint32(0), Uint32(0)),
+                )
     for i in cutlass.range_constexpr(6):
         mv = warp_max(gm[i])
         if lane == 0:

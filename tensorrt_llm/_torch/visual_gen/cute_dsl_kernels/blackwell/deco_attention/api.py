@@ -93,9 +93,15 @@ def _kernel(pv, rank):
     return family, pv
 
 
+# The kernels move q, k, v and out through TMA descriptors and vector stores built on 256-byte aligned base addresses,
+# the alignment of every allocation and of the workspace.
+TENSOR_ALIGNMENT = 256
+
+
 def _check(shape, device, **tensors):
     """Check that the caller's tensors (name=tensor) are contiguous BF16 tensors of one shape [B, S, H, HEAD_DIM]
-    (shape, or that of the first tensor for None) on one device (device, or that of the first tensor); return both."""
+    (shape, or that of the first tensor for None) without an empty dimension, on one device (device, or that of the
+    first tensor), at 256-byte aligned addresses; return both."""
     for name, x in tensors.items():
         if (
             not torch.is_tensor(x)
@@ -108,6 +114,15 @@ def _check(shape, device, **tensors):
             raise ValueError(
                 f"{name} must be a contiguous BF16 tensor of shape "
                 f"{list(shape) if shape else '[B, S, H, %d]' % HEAD_DIM}"
+            )
+        if x.numel() == 0:
+            raise ValueError(
+                f"{name} has an empty dimension; a sample without tokens is given by valid_seq_lens"
+            )
+        if x.data_ptr() % TENSOR_ALIGNMENT:
+            raise ValueError(
+                f"{name} must start at a {TENSOR_ALIGNMENT}-byte aligned address, as every allocation does: a view "
+                f"into one at an offset that is not a multiple of {TENSOR_ALIGNMENT // 2} elements is not taken"
             )
         if device is not None and x.device != device:
             raise ValueError(f"{name} is on {x.device}, not on {device}")
@@ -126,7 +141,8 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
     """Run the preparation: write the operands of the attention into the workspace and return them (views into it).
 
     Args:
-        q, k, v: BF16 [B, S, H, 128], contiguous, on one device.
+        q, k, v: BF16 [B, S, H, 128], contiguous, on one device, at 256-byte aligned addresses (as every allocation
+            and every view at an offset of a multiple of 128 elements is).
         workspace: uint8 [>= workspace_size(B, S, H, device, pv, rank)] on that device, 256-byte aligned, any content.
         rows: int32 [m] on that device, not empty: the tokens the compensation basis is estimated on.
             * None is the default draw, sample_rows(seq_len, device, rank=rank); a packed multimodal sequence passes
@@ -186,7 +202,8 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
 
 
 def attention(operands, out):
-    """Run the attention on operands of prepare: fill and return out, contiguous BF16 [B, S, H, 128] on their device."""
+    """Run the attention on operands of prepare: fill and return out, contiguous BF16 [B, S, H, 128] on their device at
+    a 256-byte aligned address."""
     if not isinstance(operands, Operands):
         raise ValueError("operands is not a result of prepare")
     device = next(iter(operands.buffers.values())).device

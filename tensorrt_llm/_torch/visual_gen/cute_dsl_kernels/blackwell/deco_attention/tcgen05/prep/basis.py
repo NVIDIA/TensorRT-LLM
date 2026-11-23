@@ -14,8 +14,7 @@
 # limitations under the License.
 """Compensation basis of the DeCo preparation: the clear launch and the eigensolver launch.
 
-* The clear launch (one CTA) zeroes the per-call words of gmax, in which the later launches accumulate their maxima
-  and count their CTAs.
+* The clear launch (one CTA) zeroes the per-call words of gmax, in which the later launches accumulate their maxima.
 * The eigensolver launch (one 288-thread CTA per (batch, head)) accumulates the Gram matrices of the sampled q and k
   rows (the tokens of the argument rows, in 256-row chunks) with tcgen05 MMAs and normalizes each by its trace.
 * It writes the eigenvectors V of the `rank` largest eigenvalues (32 or 64) of Gq0 / tr + Gk0 / tr of the unrotated
@@ -27,8 +26,7 @@
 
 Per-call words of gmax (float32, cleared by the clear launch):
     0..2, 3..5  maxima of the three scale groups of Q' and of K' (head channels, first and second compensation half)
-    6           maximum of |V - mean| of the V pass
-    8           count of the V pass's CTAs that have added their maximum (7 and 9 are not used)
+    6           maximum of |V - mean| of the V scan (7 is not used)
 """
 
 import cutlass
@@ -54,9 +52,9 @@ from ..tmem import ld_tmem_f32_x32_wait, tc_commit, tc_mma
 from ..valid_len import valid_len
 
 EIG_THREADS = 288  # eigensolver CTA: eight row warps and the pivot warp
-# Per-call words of gmax (module docstring): count; first Q' and K' maximum, V maximum, count of the V pass's CTAs
-GMAX_WORDS = 10
-GMAX_Q, GMAX_K, GMAX_V, GMAX_V_CTAS = 0, 3, 6, 8
+# Per-call words of gmax (module docstring): count; first Q' and K' maximum, V maximum
+GMAX_WORDS = 8
+GMAX_Q, GMAX_K, GMAX_V = 0, 3, 6
 
 
 # ---------------------------------------------------------------- clear launch

@@ -32,6 +32,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass import Int64
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.common import OperandMajorMode
 
@@ -131,7 +132,7 @@ class QkK96:
         h_r = 1
         q_layout = cute.make_layout(
             (s, d, ((h_r, h), b)),
-            stride=(h * ROW_ELEMS, 1, ((ROW_ELEMS, ROW_ELEMS), s * h * ROW_ELEMS)),
+            stride=(h * ROW_ELEMS, 1, ((ROW_ELEMS, ROW_ELEMS), Int64(s) * h * ROW_ELEMS)),
         )
         q = cute.make_tensor(q_ptr, q_layout)
         k = cute.make_tensor(k_ptr, q_layout)
@@ -567,7 +568,7 @@ class QkK64(QkK96):
         h_r = 1
         layout = cute.make_layout(
             (s, ROW_ELEMS, ((h_r, h), b)),
-            stride=(h * ROW_ELEMS, 1, ((ROW_ELEMS, ROW_ELEMS), s * h * ROW_ELEMS)),
+            stride=(h * ROW_ELEMS, 1, ((ROW_ELEMS, ROW_ELEMS), Int64(s) * h * ROW_ELEMS)),
         )
         atom = blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.K).layout
         q_sf = cute.make_tensor(

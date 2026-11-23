@@ -50,6 +50,11 @@ QK_SCALE_ATOMS = qk_scale_atoms(DEFAULT_RANK)
 # tile exceeds it by more than T binades
 RESCALE_THRESHOLD = 4.0
 E4M3_MAX = 448.0  # the largest finite E4M3 value
+# the V scale is a power of two at or above the largest deviation from the block means over the code range; the block
+# means are stored divided by that scale too, so the deviation maximum also takes |mean| times this factor, which
+# keeps the scaled mean of a block of large equal values (deviation zero) below 2^102 in FP32, with room for the block
+# sums of P (at most 128 keys at the P prescale) that the means MMA multiplies it by
+V_MEAN_HEADROOM = 2.0**-90
 # f32 subnormal ulps per log2 unit of the exp2 landing: the landed bits are the f16 pattern of 2^t
 SUBNORMAL_ULPS = 1024
 # log2(e) / sqrt(HEAD_DIM), the score prescale folded into Q': the scores arrive in the log2 units the kernels

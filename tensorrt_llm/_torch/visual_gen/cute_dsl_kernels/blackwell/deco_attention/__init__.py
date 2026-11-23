@@ -15,7 +15,15 @@
 """DeCo-Attention kernels in CuTe DSL: NVFP4 QK with FP8 PV on B200, GB300 and Rubin, NVFP4 QK with NVFP4 PV or FP8
 PV on RTX PRO 6000 (README.md)."""
 
-from .api import attention, prepare, pv_formats, ranks, workspace_size
+from .api import TENSOR_ALIGNMENT, attention, prepare, pv_formats, ranks, workspace_size
 from .inputs import sample_rows
 
-__all__ = ["attention", "prepare", "pv_formats", "ranks", "sample_rows", "workspace_size"]
+__all__ = [
+    "TENSOR_ALIGNMENT",
+    "attention",
+    "prepare",
+    "pv_formats",
+    "ranks",
+    "sample_rows",
+    "workspace_size",
+]

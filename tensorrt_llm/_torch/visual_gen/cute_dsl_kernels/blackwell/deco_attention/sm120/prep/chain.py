@@ -65,7 +65,8 @@ def scratch(B, S, H, nsm):
     """Return the scratch of a chain at this shape on a device of nsm SMs, name -> (dtype, shape).
 
     * ut, vmax, gmax, prov: the bases U^T, the V-scan slots, the group maxima, the provisional block scales.
-    * Only done, the two counters of the basis launch (V-scan barrier, V-pass tile counter), must be zero at its start.
+    * Only done, the four words of the basis launch (V-scan tiles published, V-pass tile counter, V-scan tile claim
+      counter, V-scan maximum), must be zero at its start.
     """
     nspare, _, nqk_cta, _, _, _ = _grids(B, S, H, nsm)
     BH, T = B * H, (S + 127) // 128
@@ -74,7 +75,7 @@ def scratch(B, S, H, nsm):
         "vmax": (torch.float32, (nspare,)),
         "gmax": (torch.float32, (nqk_cta * 8,)),
         "prov": (torch.bfloat16, (2 * BH * T * 1536,)),
-        "done": (torch.int32, (2,)),
+        "done": (torch.int32, (4,)),
     }
 
 
@@ -97,7 +98,8 @@ def run(
     nsm = num_sms(dev)
     nspare, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta = _grids(B, S, H, nsm)
     # the V pass shares the basis launch when the eigenproblems take at most a quarter of the SMs and the grid of the
-    # launch has at most as many CTAs as the device has SMs
+    # launch has at most as many CTAs as the device has SMs (its scan claims tiles from a counter and waits for
+    # tiles, not for CTAs, so the form is correct for any residency; the limit keeps the pass on free SMs)
     fn = _compile(host, cache, dev, 4 * B * H <= nsm and B * H + nspare <= nsm, lens is not None)
     fn(
         q.data_ptr(),

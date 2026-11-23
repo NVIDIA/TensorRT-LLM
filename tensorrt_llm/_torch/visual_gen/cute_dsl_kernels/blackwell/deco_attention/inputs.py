@@ -58,7 +58,11 @@ def sample_rows(s, device="cuda", token_tags=None, rank=DEFAULT_RANK):
     """
     device = _indexed(device)
     if token_tags is None:
-        return _sample_rows(s, device, rank)
+        rows, drawn = _sample_rows(s, device, rank)
+        # A capture cannot wait on an outside event; the eager call before it did.
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream(device).wait_event(drawn)
+        return rows
     _not_under_capture(device, "sampled rows of a tagged sequence")
     tags = torch.as_tensor(token_tags, device=device).reshape(-1)[:s]
     gen = torch.Generator(device=device).manual_seed(0)
@@ -74,9 +78,12 @@ def sample_rows(s, device="cuda", token_tags=None, rank=DEFAULT_RANK):
 
 @functools.cache
 def _sample_rows(s, device, rank):
+    """Return the cached default draw and the event of its completion on the stream that drew it, which the streams
+    of later callers wait on."""
     _not_under_capture(device, f"sampled rows of sequence length {s}")
     perm = torch.randperm(s, device=device, generator=torch.Generator(device=device).manual_seed(0))
-    return perm[: sample_count(s, rank)].to(torch.int32).contiguous()
+    rows = perm[: sample_count(s, rank)].to(torch.int32).contiguous()
+    return rows, torch.cuda.current_stream(device).record_event()
 
 
 @functools.cache

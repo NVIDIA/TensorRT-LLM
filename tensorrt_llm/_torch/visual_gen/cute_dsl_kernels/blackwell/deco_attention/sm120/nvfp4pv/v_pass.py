@@ -31,7 +31,7 @@ from ...common.dsl import FPRoundingMode, SaturationMode, cvt_f32x2_to_f8x2
 from ...common.expmath import RN, bf16x2, pow2_ceil, u2f
 from ...common.mem import gptr, load_vector, sptr, store_vector
 from ...common.ptx import f32x8_to_e2m1x8
-from ...constants import E4M3_MAX
+from ...constants import E4M3_MAX, V_MEAN_HEADROOM
 from ..prep.basis import (
     DONE_TILES,
     EIG_THREADS,
@@ -43,9 +43,12 @@ from ..prep.basis import (
     bf16_f32,
     group16,
     key_count,
+    next_scan_tiles,
     next_tile,
+    publish_scan,
     row_addr,
     scan_max,
+    scan_max_word,
     stage_rows,
     store_slot,
 )
@@ -134,7 +137,11 @@ def _fold(sums, vmx, vmn, fc, any_, mx):
     """mx raised to max|v - vbar| over the 8 channels, vbar = BF16(sums / fc); any_: the lane has keys (None: all)."""
     for c in range(8):
         mb = u2f(bf16x2(cute.math.div(sums[c], fc, rounding=RN), Float32(0.0)) << Uint32(16))
-        d = cute.arch.fmax(vmx[c] - mb, mb - vmn[c])
+        # the deviation, or |mean| times the headroom that keeps the scaled mean finite
+        d = cute.arch.fmax(
+            cute.arch.fmax(vmx[c] - mb, mb - vmn[c]),
+            cute.arch.fmax(mb, -mb) * Float32(V_MEAN_HEADROOM),
+        )
         mx = cute.arch.fmax(
             mx, d if any_ is None else Float32(cutlass.select_(any_ != 0, d, Float32(0.0)))
         )
@@ -144,30 +151,31 @@ def _fold(sums, vmx, vmn, fc, any_, mx):
 @cute.jit
 def _vscan(
     v_p: Int64,
-    vmax_p: Int64,
+    done_p: Int64,
     S: Int32,
     H: Int32,
     T: Int32,
-    lo: Int32,
-    hi: Int32,
-    slot: Int32,
+    ntiles: Int32,
     tid: Int32,
     sb: Int32,
     lens_p,
 ):
-    """max|v - vbar| (vbar = BF16 16-key means) over the 128-key tiles [lo, hi) (flat over (batch, head, tile)); four
-    tiles at a time, thread = (16-key group, 8-channel chunk). Writes slot `slot`. lens_p: None, or the global
-    address of the valid prefix lengths: the keys of a batch element then end at its length."""
+    """max|v - vbar| (vbar = BF16 16-key means) over the 128-key tiles that the claim counter of the done buffer hands
+    out (flat over (batch, head, tile)), four tiles at a time; thread = (16-key group, 8-channel chunk). lens_p:
+    None, or the global address of the valid prefix lengths: the keys of a batch element then end at its length.
+    The CTA's maximum and its tile count go to the done buffer (publish_scan)."""
     u = tid & 127
     grp = u >> 4
     cc = u & 15
     sub4 = tid >> 7
     rstride = Int64(H) * 256
     mx = Float32(0.0)
-    for t4 in cutlass.range(lo, hi, 4, unroll=1):
+    scanned = Int32(0)
+    t4 = next_scan_tiles(sb, done_p, tid)
+    while t4 < ntiles:
         tile = t4 + sub4
-        tv = Int32(tile < hi)
-        tile = cutlass.min(tile, hi - 1)
+        tv = Int32(tile < ntiles)
+        tile = cutlass.min(tile, ntiles - 1)
         bh = tile // T
         tt = tile - bh * T
         bb = bh // H
@@ -181,7 +189,9 @@ def _vscan(
         if live:
             sums, vmx, vmn = group16(base, rstride, cnt)
             mx = _fold(sums, vmx, vmn, Float32(cutlass.max(cnt, 1)), Int32(cnt > 0), mx)
-    store_slot(mx, tid, sb, vmax_p, slot)
+        scanned = scanned + cutlass.min(Int32(4), ntiles - t4)
+        t4 = next_scan_tiles(sb, done_p, tid)
+    publish_scan(mx, scanned, tid, sb, done_p)
 
 
 @cute.jit
@@ -224,7 +234,6 @@ def _vscan_gs(
 @cute.jit
 def _vpass(
     v_p: Int64,
-    vmax_p: Int64,
     v4_p: Int64,
     v4sf_p: Int64,
     vmean_p: Int64,
@@ -235,7 +244,6 @@ def _vpass(
     T: Int32,
     ntiles: Int32,
     pid: Int32,
-    nspare: Int32,
     tid: Int32,
     sb: Int32,
     lens_p,
@@ -244,9 +252,9 @@ def _vpass(
     CTA, thread = (16-key group, 4-channel quad); V' codes / scales transposed through smem ([c&3][quad][64 B] /
     [c][8 B]). lens_p: None, or the global address of the valid prefix lengths: the keys of a batch element then end
     at its length (zero codes from there on), and a tile without a valid key is left as it is."""
-    # the tensor scale from all scan slots (written by this launch's scan CTAs: cop "cg"; red was the scan's)
+    # the tensor scale from the maximum of this launch's scan CTAs
     red = sb + SM_RED
-    v4s = tensor_scale(scan_max(vmax_p, nspare, tid, red, "cg", EIG_THREADS, True))
+    v4s = tensor_scale(scan_max_word(done_p))
     if pid == 0 and tid == 0:
         cute.arch.store(gptr(Float32, v4s_p), v4s)
     i4 = cute.math.rcp(v4s)
@@ -358,10 +366,9 @@ def basis_kernel(
         nspare,
         FUSED,
         lambda cta, tid, sb: _vscan_gs(v_p, vmax_p, B, S, H, cta, nspare, tid, sb, lens_p),
-        lambda lo, hi, slot, tid, sb: _vscan(v_p, vmax_p, S, H, T, lo, hi, slot, tid, sb, lens_p),
+        lambda ntiles, tid, sb: _vscan(v_p, done_p, S, H, T, ntiles, tid, sb, lens_p),
         lambda ntiles, pid, tid, sb: _vpass(
             v_p,
-            vmax_p,
             v4_p,
             v4sf_p,
             vmean_p,
@@ -372,7 +379,6 @@ def basis_kernel(
             T,
             ntiles,
             pid,
-            nspare,
             tid,
             sb,
             lens_p,

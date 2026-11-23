@@ -16,6 +16,7 @@
 
 import functools
 import math
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
@@ -73,6 +74,12 @@ def gmem_ptr(dtype, t, align=ALIGN):
 def current_stream(device):
     """Return the current PyTorch stream of `device` as a driver stream: every launch goes there."""
     return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
+
+def pdl_enabled():
+    """Return whether the launches use programmatic dependent launch: TRTLLM_ENABLE_PDL, on unless set to 0, read
+    at every call as the kernels of TensorRT-LLM read it."""
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 @functools.cache

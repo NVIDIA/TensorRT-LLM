@@ -19,8 +19,9 @@
 * One CTA per (batch, head) eigenproblem: Gram of the sampled q, k tokens, Householder tridiagonalization, multisection
   bisection of the top 32 eigenvalues, inverse iteration, MGS, back transform, U^T = (Hd^T V / sqrt(128))^T in BF16.
 * The other CTAs scan V for the range of what the kernel's PV format casts (the maxima that set its tensor scale).
-  When the launch has room for it (FUSED), they then run the kernel's V pass on the tiles a counter hands out, joined
-  by the eigensolver CTAs as basis_cta describes; the V pass is a launch of its own otherwise.
+  When the launch has room for it (FUSED), they scan the tiles a counter hands out and then run the kernel's V pass
+  on the tiles another counter hands out, joined by the eigensolver CTAs as basis_cta describes; the V pass is a
+  launch of its own otherwise.
 * The scan and the pass are those of the kernel package (<kernel package>/v_pass.py), whose basis kernel is basis_cta
   with them; the helpers both V passes share are here (bf16_f32, group16, stage_rows).
 """
@@ -855,7 +856,13 @@ def _eig(
 # counter in the counters of the launch (the scan counter is first)
 VIN_BYTES = 32768
 RED_TILE = 192
+# the words of the done buffer (zero at the start of a call): the V-scan tiles published, the V-pass tile counter, the
+# V-scan tile claim counter, the bits of the V-scan maximum (a non-negative float orders as its unsigned bits)
+DONE_SCAN = 0
 DONE_TILES = 4
+DONE_CLAIM = 8
+DONE_MAX = 12
+RED_SCAN = 200  # the smem word that shows a CTA's claimed scan tiles
 
 
 @cute.jit
@@ -885,6 +892,55 @@ def scan_max(
     for wi in cutlass.range_constexpr(NT // 32):
         c = cute.arch.fmax(c, cute.arch.load(sptr(Float32, red + wi * 4), Float32))
     return c
+
+
+@cute.jit
+def next_scan_tiles(sb: Int32, done_p: Int64, tid: Int32):
+    """Return the first of the next four scan tiles of a fused scan CTA: thread 0 takes them from the claim counter,
+    the CTA's smem word RED_SCAN shows them."""
+    cute.arch.sync_threads()  # the CTA is done with the word's last value
+    if tid == 0:
+        cute.arch.store(
+            sptr(Uint32, sb + SM_RED + RED_SCAN),
+            cute.arch.atomic_add(
+                gptr(Uint32, done_p + DONE_CLAIM), Uint32(4), sem="relaxed", scope="gpu"
+            ),
+        )
+    cute.arch.sync_threads()
+    return Int32(cute.arch.load(sptr(Uint32, sb + SM_RED + RED_SCAN), Uint32))
+
+
+@cute.jit
+def publish_scan(mx: Float32, scanned: Int32, tid: Int32, sb: Int32, done_p: Int64):
+    """Fold the CTA's max|v - vbar| (mx: the thread's part) into the maximum word of the done buffer, then count the
+    CTA's scanned tiles as published; the V pass waits for all tiles and reads the maximum after them."""
+    mx = warp_max(mx)
+    red = sb + SM_RED
+    if (tid & 31) == 0:
+        cute.arch.store(sptr(Float32, red + (tid >> 5) * 4), mx)
+    cute.arch.sync_threads()
+    if tid == 0:
+        c2 = Float32(0.0)
+        for wi in cutlass.range_constexpr(EIG_THREADS // 32):
+            c2 = cute.arch.fmax(c2, cute.arch.load(sptr(Float32, red + wi * 4), Float32))
+        cute.arch.red(
+            gptr(Uint32, done_p + DONE_MAX),
+            f2u(c2),
+            op="max",
+            dtype="u32",
+            sem="relaxed",
+            scope="gpu",
+        )
+        cute.arch.fence_acq_rel_gpu()
+        cute.arch.atomic_add(
+            gptr(Uint32, done_p + DONE_SCAN), Uint32(scanned), sem="release", scope="gpu"
+        )
+
+
+@cute.jit
+def scan_max_word(done_p: Int64):
+    """Return the maximum of a fused scan, after the wait of basis_cta."""
+    return u2f(cute.arch.load(gptr(Uint32, done_p + DONE_MAX), Uint32, sem="acquire", scope="gpu"))
 
 
 @cute.jit
@@ -1008,9 +1064,9 @@ def basis_cta(
     rows_mode=None,
 ):
     """The CTA of a basis launch (grid BH + nspare, EIG_THREADS threads): the CTAs below BH solve one eigenproblem
-    each, the nspare others scan V with the scan of the kernel's PV format (FUSED: vscan(lo, hi, slot, tid, sb) over
-    a range of tiles each, then its V pass vpass(ntiles, pid, tid, sb); otherwise vscan_gs(cta, tid, sb), grid-stride
-    over all of V). sb: the CTA's shared memory. lens_p, rows_mode: the lengths arguments of _eig."""
+    each, the nspare others scan V with the scan of the kernel's PV format (FUSED: vscan(ntiles, tid, sb) over the
+    tiles a counter hands out, then its V pass vpass(ntiles, pid, tid, sb); otherwise vscan_gs(cta, tid, sb),
+    grid-stride over all of V). sb: the CTA's shared memory. lens_p, rows_mode: the lengths arguments of _eig."""
     tid, _, _ = cute.arch.thread_idx()
     pid, _, _ = cute.arch.block_idx()
     smem = SmemAllocator()
@@ -1023,22 +1079,21 @@ def basis_cta(
     elif cutlass.const_expr(not FUSED):
         vscan_gs(pid - BH, tid, sb)
     else:
-        slot = pid - BH
-        lo = (slot * ntiles) // nspare
-        hi = ((slot + 1) * ntiles) // nspare
-        vscan(lo, hi, slot, tid, sb)
-        if tid == 0:
-            cute.arch.fence_acq_rel_gpu()
-            cute.arch.atomic_add(gptr(Uint32, done_p), Uint32(1), sem="release", scope="gpu")
+        vscan(ntiles, tid, sb)
     if cutlass.const_expr(FUSED):
-        # The scan CTAs wait for each other, then take V tiles; an eigensolver CTA joins them when it is done and the
-        # scan has finished (the host takes this form only for a grid of at most as many CTAs as the device has SMs).
-        # Nothing ever waits on an eigensolver CTA.
+        # The V pass needs the maximum of the whole scan. The scan CTAs claim their tiles from a counter and publish
+        # the tiles they finished, so the wait is for tiles, every one of which a running CTA holds: a CTA that is not
+        # scheduled yet claims nothing, and no CTA waits on it. An eigensolver CTA joins the V pass when it is done
+        # and the scan has finished; nothing ever waits on an eigensolver CTA.
         if tid == 0:
-            seen = cute.arch.load(gptr(Uint32, done_p), Uint32, sem="acquire", scope="gpu")
-            while seen < Uint32(nspare):
+            seen = cute.arch.load(
+                gptr(Uint32, done_p + DONE_SCAN), Uint32, sem="acquire", scope="gpu"
+            )
+            while seen < Uint32(ntiles):
                 nanosleep(Int32(200))
-                seen = cute.arch.load(gptr(Uint32, done_p), Uint32, sem="acquire", scope="gpu")
+                seen = cute.arch.load(
+                    gptr(Uint32, done_p + DONE_SCAN), Uint32, sem="acquire", scope="gpu"
+                )
             cute.arch.fence_acq_rel_gpu()
         cute.arch.sync_threads()
         vpass(ntiles, pid, tid, sb)

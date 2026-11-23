@@ -26,7 +26,7 @@ import cutlass
 import torch
 from cutlass.cute.typing import Int32, Int64
 
-from ...runtime import compiled, current_stream, gmem_ptr, num_sms
+from ...runtime import compiled, current_stream, gmem_ptr, num_sms, pdl_enabled
 from .kernel import PingPongAttention
 
 
@@ -143,6 +143,7 @@ def run(buffers, o, rank, lens=None):
             ws,
         )
 
+    pdl = pdl_enabled()
     if n_full > 0:
         args = make_args()
         # CTA pairs share K/V when both always work on the same head: an even number of 256-row blocks per head,
@@ -153,12 +154,12 @@ def run(buffers, o, rank, lens=None):
             else 1
         )
         _get_compiled(
-            args, dev, sm_count, rank, cluster_m, split=False, pdl=True, lens=lens is not None
+            args, dev, sm_count, rank, cluster_m, split=False, pdl=pdl, lens=lens is not None
         )(*args)
     if "split_flags" in buffers:
         # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM)
         ws = (buffers["split_o"], buffers["split_ml"], buffers["split_flags"])
         args = make_args(n_parts, ws)
         _get_compiled(
-            args, dev, sm_count, rank, 1, split=True, pdl=n_full > 0, lens=lens is not None
+            args, dev, sm_count, rank, 1, split=True, pdl=pdl and n_full > 0, lens=lens is not None
         )(*args)

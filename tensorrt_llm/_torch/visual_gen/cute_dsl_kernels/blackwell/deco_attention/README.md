@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # DeCo-Attention kernels
 
 Attention kernels of DeCo-Attention in CuTe DSL, with their preparation. A call computes `softmax(q k^T / sqrt(128)) v`
@@ -26,6 +29,7 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention import attention, prepare, workspace_size
 
+q, k, v = (torch.randn(1, 4096, 8, 128, dtype=torch.bfloat16, device="cuda") for _ in range(3))
 size = workspace_size(batch=1, seq_len=4096, heads=8)       # pv=None: the family's default kernel; rank=32
 workspace = torch.empty(size, dtype=torch.uint8, device="cuda")
 out = torch.empty_like(q)
@@ -44,7 +48,8 @@ attention(operands, out)                   # BF16 [B, S, H, 128] out
 
 `workspace_size` and `prepare` raise `ValueError` for a PV format or rank that the GPU does not offer.
 
-- **Tensors.** `q`, `k`, `v` and `out` are contiguous BF16 tensors of one shape on one device.
+- **Tensors.** `q`, `k`, `v` and `out` are contiguous BF16 tensors of one shape on one device, at 256-byte aligned
+  addresses: every allocation is, and a view into one at an offset of a multiple of 128 elements.
 - **Workspace.** The caller owns it: a one-dimensional `uint8` tensor on the device of `q`, of at least
   `workspace_size(...)` bytes, at an address that is a multiple of 256. Its content does not matter. The functions
   keep nothing between calls and a call writes every byte it reads, so one buffer serves calls of any shape that
@@ -72,7 +77,7 @@ graph.replay()     # after writing new data into q, k, v
 ## Valid lengths
 
 ```python
-lens = torch.tensor([4096, 3000], dtype=torch.int32, device="cuda")     # one valid prefix length per batch element
+lens = torch.tensor([3000], dtype=torch.int32, device="cuda")     # one valid prefix length per batch element
 attention(prepare(q, k, v, workspace, valid_seq_lens=lens), out)
 ```
 
@@ -99,7 +104,9 @@ one block-scaled NVFP4 product over 192 channels (256 at r = 64).
 The attention runs the online softmax over tiles of 128 keys. It forms P without an exponential instruction: a fused
 multiply-add puts the scaled score on the subnormal grid of FP32, and a hardware conversion rounds it to E4M3 or
 E2M1. The running maximum of a row moves, and the output is rescaled, only when a tile exceeds it by more than 4
-binades. V smoothing subtracts from V its means over blocks of keys before the cast and adds them back weighted by
+binades. The E4M3 codes of P hold weights down to 2^-14 of the row's anchor; a smaller weight rounds to zero and
+leaves the row sum with it, so a row whose mass lies in thousands of keys that far below its maximum loses that
+mass. V smoothing subtracts from V its means over blocks of keys before the cast and adds them back weighted by
 the block sums of P.
 
 ## Layout

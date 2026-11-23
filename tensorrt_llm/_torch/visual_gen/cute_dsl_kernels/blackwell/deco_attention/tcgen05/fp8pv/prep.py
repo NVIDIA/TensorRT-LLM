@@ -19,12 +19,14 @@ part of the buffers of the call (scratch). Nothing reads a device value back, so
 
     clear launch        zeroes the per-call words of gmax                                    basis.clear_kernel
     eigensolver launch  one CTA per (batch, head): the compensation basis U of Q' and K'     basis.eig_kernel
-    V pass              E4M3 V minus its 128-key means (v8, v_mean), beside the eigensolver  v_pass.v_kernel
+    V scan              128-key means of V (v_mean) and their largest deviation, beside the   v_pass.v_scan_kernel
+                        eigensolver
+    V encode            E4M3 V minus its means (v8) and the scaled means (v_mean)            v_pass.v_encode_kernel
     Q/K pass            Hadamard rotation, NVFP4 codes and compensation channels (q4, k4)    qk_pass.qk_kernel
     encode launch       UE4M3 scale factors (q_sf, k_sf), score_scale and v8_scale           encode.encode_kernel
 
 The first three are chained by programmatic dependent launch: the eigensolver waits for the clear launch, and the V
-pass starts beside the eigensolver CTAs and ends with a wait for them, so the plain launches after it see the basis.
+scan starts beside the eigensolver CTAs and ends with a wait for them, so the plain launches after it see the basis.
 """
 
 import cuda.bindings.driver as cuda
@@ -37,12 +39,20 @@ from cutlass.cute.runtime import from_dlpack
 
 from ...constants import HEAD_DIM, qk_scale_atoms
 from ...inputs import hadamard
-from ...runtime import num_sms
+from ...runtime import num_sms, pdl_enabled
 from ..prep.basis import EIG_THREADS, GMAX_WORDS, clear_kernel, eig_kernel, eig_kernel_lens
 from ..prep.encode import encode_kernel, encode_threads
 from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel, qk_kernel_lens
 from .softmax import MIN_SCORE_LOG2
-from .v_pass import V_BLOCK, V_CTAS_PER_SM, V_THREADS, v_kernel, v_kernel_lens
+from .v_pass import (
+    V_BLOCK,
+    V_CTAS_PER_SM,
+    V_THREADS,
+    v_encode_kernel,
+    v_encode_kernel_lens,
+    v_scan_kernel,
+    v_scan_kernel_lens,
+)
 
 
 def _gemm_view(t):
@@ -52,8 +62,9 @@ def _gemm_view(t):
     )
 
 
-def _launch_chain(inputs, operands, scratch, sizes, grids, stream, rank, lens):
-    """Issue the launches of the chain; lens: None, or (the valid prefix lengths [B], rows per sample, mapped rows)."""
+def _launch_chain(inputs, operands, scratch, sizes, grids, stream, rank, lens, pdl):
+    """Issue the launches of the chain; lens: None, or (the valid prefix lengths [B], rows per sample, mapped rows);
+    pdl: the V scan and the eigensolver launch as programmatic dependents of the launch before them."""
     q, k, v, rows, hadamard = inputs
     q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale = operands
     gmax, uT, q_sfv, k_sfv = scratch
@@ -63,19 +74,24 @@ def _launch_chain(inputs, operands, scratch, sizes, grids, stream, rank, lens):
     clear_kernel(gmax).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     if lens is None:
         eig = eig_kernel(q, k, rows, hadamard, uT, S, H, NQK, NCQ, rank)
-        vp = v_kernel(v, v8, v_mean, gmax, S, H, NB, v_units)
+        vs = v_scan_kernel(v, v_mean, gmax, S, H, NB, v_units)
+        ve = v_encode_kernel(v, v8, v_mean, gmax, S, H, NB, v_units)
     else:
         eig = eig_kernel_lens(
             q, k, rows, hadamard, uT, lens[0], S, H, NQK, NCQ, rank, lens[1], lens[2]
         )
-        vp = v_kernel_lens(v, v8, v_mean, gmax, lens[0], S, H, NB, v_units)
-    eig.launch(grid=(BH, 1, 1), block=(EIG_THREADS, 1, 1), use_pdl=True, stream=stream)
-    vp.launch(
+        vs = v_scan_kernel_lens(v, v_mean, gmax, lens[0], S, H, NB, v_units)
+        ve = v_encode_kernel_lens(v, v8, v_mean, gmax, lens[0], S, H, NB, v_units)
+    eig.launch(grid=(BH, 1, 1), block=(EIG_THREADS, 1, 1), use_pdl=pdl, stream=stream)
+    vs.launch(
         grid=(v_grid, 1, 1),
         block=(V_THREADS, 1, 1),
         min_blocks_per_mp=V_CTAS_PER_SM,
-        use_pdl=True,
+        use_pdl=pdl,
         stream=stream,
+    )
+    ve.launch(
+        grid=(v_grid, 1, 1), block=(V_THREADS, 1, 1), min_blocks_per_mp=V_CTAS_PER_SM, stream=stream
     )
     tiled_mma = sm100_utils.make_trivial_tiled_mma(
         BFloat16,
@@ -106,7 +122,7 @@ def _launch_chain(inputs, operands, scratch, sizes, grids, stream, rank, lens):
     ).launch(grid=(egrid, 1, 1), block=(encode_threads(rank), 1, 1), stream=stream)
 
 
-def _make_host(rank, rows_per_sample=None, map_rows=False):
+def _make_host(rank, rows_per_sample=None, map_rows=False, pdl=True):
     """Return the host function that launches the chain of compensation rank `rank` on its `stream` argument.
 
     * The score prescale log2(e) / sqrt(128) is folded into Q' (QPRE), so the multiplier of the raw scores in log2
@@ -115,6 +131,7 @@ def _make_host(rank, rows_per_sample=None, map_rows=False):
     * rows_per_sample: None for a call whose batch elements are all full; otherwise the host function takes the
       valid prefix lengths [B] after the buffers, with rows [B, NQK] (True) or [NQK] (False). map_rows: the
       eigensolver maps the rows into each valid prefix (the default draw).
+    * pdl: the launches of the chain follow each other as programmatic dependents.
     """
     if rows_per_sample is None:
 
@@ -159,6 +176,7 @@ def _make_host(rank, rows_per_sample=None, map_rows=False):
                 stream,
                 rank,
                 None,
+                pdl,
             )
 
         return deco_host
@@ -205,6 +223,7 @@ def _make_host(rank, rows_per_sample=None, map_rows=False):
             stream,
             rank,
             (lens, rows_per_sample, map_rows),
+            pdl,
         )
 
     return deco_host_lens
@@ -271,7 +290,7 @@ def run(q, k, v, rows, buffers, rank, lens=None, map_rows=False):
     dev = q.device
     nsm = num_sms(dev)
     BH = B * H
-    # The V pass runs beside the eigensolver CTAs, V_CTAS_PER_SM per SM. A pass of at most V_SMALL_PASS_BYTES per
+    # The V scan runs beside the eigensolver CTAs, V_CTAS_PER_SM per SM. A pass of at most V_SMALL_PASS_BYTES per
     # free SM is launched on the SMs that the eigensolver launch leaves free; a larger one on every SM.
     free = max(nsm - BH, V_SMALL_PASS_MIN_SMS)
     v_sms = free if BH < nsm and B * S * H * 16 * 40 <= V_SMALL_PASS_BYTES * free else nsm
@@ -284,12 +303,14 @@ def run(q, k, v, rows, buffers, rank, lens=None, map_rows=False):
     if lens is not None:
         tensors += (lens,)
     sizes = (S, H, NQK, (NQK + 255) // 256, BH, NB, v_units, v_grid, ntiles, qgrid, egrid)
-    key = (dev.index, rank, rows_per_sample, lens is not None and map_rows)
+    map_rows = lens is not None and map_rows
+    pdl = pdl_enabled()
+    key = (dev.index, rank, rows_per_sample, map_rows, pdl)
     fn = _hosts.get(key)
     if fn is None:
         cargs = [_ffi_tensor(t) for t in tensors] + [Int32(x) for x in sizes]
         cargs.append(cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True))
         fn = _hosts[key] = cute.compile(
-            _make_host(rank, rows_per_sample, key[3]), *cargs, options="--enable-tvm-ffi"
+            _make_host(rank, rows_per_sample, map_rows, pdl), *cargs, options="--enable-tvm-ffi"
         )
     fn(*tensors, *sizes)

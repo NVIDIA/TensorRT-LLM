@@ -16,7 +16,10 @@
 
 * Every block of V_BLOCK keys of a (batch, head) loses its mean (rounded to BF16) before the E4M3 cast, so the cast
   spends its range on the variation inside a block; a BF16 MMA of the attention over the block sums of P adds it back.
-* The launch is a programmatic dependent of the eigensolver launch and runs beside it.
+* Two launches of one grid over the same chunks per thread: the scan writes the BF16 means and folds the largest
+  deviation from them into gmax, the encode reads that maximum and writes the codes and the scaled means. The scan is
+  a programmatic dependent of the eigensolver launch and runs beside it; the encode follows both in stream order. No
+  CTA waits for another CTA of its grid, so neither launch needs its whole grid resident.
 """
 
 import cutlass
@@ -24,26 +27,22 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import Float32, Int32, Int64, Uint32
 
-from ...common.dsl import nanosleep
 from ...common.expmath import bf16x2, e4m3x4, f2u, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
-from ..prep.basis import GMAX_V, GMAX_V_CTAS
+from ...constants import V_MEAN_HEADROOM
+from ..prep.basis import GMAX_V
 from ..valid_len import valid_len
 
 V_BLOCK = 128  # keys per mean: one 128-key tile of the attention
 V_THREADS = 256
-# CTAs per SM that the launch requests (min_blocks_per_mp); the grid is sized so that all its CTAs run at once, which
-# the grid-wide maximum requires
+# CTAs per SM that the launches request (min_blocks_per_mp) and that size their grid
 V_CTAS_PER_SM = 4
 
 
 @cute.jit
-def _grid_inv8(
-    x: Float32, maxima: Int32, gb: Int64, tidx: Int32, lane: Int32, warp: Int32, gdim: Int32
-):
-    """1 / the power-of-two E4M3 scale of the grid-wide maximum of x, for a grid of 256-thread CTAs that all run at
-    once (V_CTAS_PER_SM): the warp maxima meet in maxima (shared memory), thread 0 folds the CTA's into word GMAX_V of
-    gmax (gb), counts the CTA in word GMAX_V_CTAS and polls the count until every CTA has added its maximum."""
+def _grid_max(x: Float32, maxima: Int32, gb: Int64, tidx: Int32, lane: Int32, warp: Int32):
+    """Fold the CTA's maximum of x into word GMAX_V of gmax (gb): the warp maxima meet in maxima (shared memory), thread
+    0 reduces them and adds the result with an atomic maximum."""
     wm = warp_max(x)
     if lane == 0:
         cute.arch.store(sptr(Float32, maxima + warp * 4), wm)
@@ -58,28 +57,14 @@ def _grid_inv8(
         word = gb + Int64(4 * GMAX_V)
         bits = f2u(block_max)
         cute.arch.red(gptr(Uint32, word), bits, op="max", dtype="u32", sem="relaxed", scope="gpu")
-        # the release part of the add orders this thread's max update before it; the acquiring loads of the poll
-        # observe every CTA's maximum before the cast begins
-        seen = cute.arch.atomic_add(
-            gptr(Uint32, gb + Int64(4 * GMAX_V_CTAS)), Uint32(1), sem="acq_rel", scope="gpu"
-        ) + Uint32(1)
-        while seen < Uint32(gdim):
-            nanosleep(256)
-            seen = cute.arch.load(
-                gptr(Uint32, gb + Int64(4 * GMAX_V_CTAS)), Uint32, sem="acquire", scope="gpu"
-            )
-    cute.arch.sync_threads()
-    vmax = u2f(
-        cute.arch.load(gptr(Uint32, gb + Int64(4 * GMAX_V)), Uint32, sem="acquire", scope="gpu")
-    )
-    return Float32(1.0) / pow2_ceil_448(vmax)
 
 
 @cute.jit
-def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
-    """E4M3 V minus its BF16 means of every V_BLOCK keys, in two passes over the same 16-byte chunks per thread. lens:
-    None, or the global address of the valid prefix lengths: the valid keys of a block are then those below the
-    length of its batch element, the keys after them get zero codes and a block without valid keys a zero mean."""
+def _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, lens):
+    """The scan: per chunk (8 channels of a head) of every block the sum, minimum and maximum over the block's valid
+    keys, the BF16 mean mu into v_mean (row = block) and max(max - mu, mu - min) into the grid's maximum (_grid_max).
+    lens: None, or the global address of the valid prefix lengths: the valid keys of a block are then those below the
+    length of its batch element, and a block without valid keys gets a zero mean."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
@@ -89,7 +74,6 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
     maxima_p = smem.allocate_array(Float32, V_THREADS // 32, byte_alignment=16)
     maxima = Int32(maxima_p.toint())
     vb = Int64(v.iterator.toint())
-    ob = Int64(v8.iterator.toint())
     mb = Int64(v_mean.iterator.toint())
     gb = Int64(gmax.iterator.toint())
     nblk = (S + Int32(V_BLOCK - 1)) // Int32(V_BLOCK)
@@ -97,8 +81,6 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
     row_bytes = Int64(H) * Int64(256)
     acc = Float32(0.0)
 
-    # pass 1: per chunk (8 channels of a head) the sum, minimum and maximum over the block's valid keys, the BF16
-    # mean mu into v_mean (row = block) and max(max - mu, mu - min) into the grid's maximum (_grid_inv8)
     u = bidx
     while u < nunits:
         b = u // nblk
@@ -146,15 +128,35 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
                 acc = cute.arch.fmax(
                     acc, cute.arch.fmax(maxs[2 * e + 1] - mhi, mhi - mins[2 * e + 1])
                 )
+                # the scaled means stay finite (V_MEAN_HEADROOM)
+                acc = cute.arch.fmax(acc, cute.arch.fmax(mlo, -mlo) * Float32(V_MEAN_HEADROOM))
+                acc = cute.arch.fmax(acc, cute.arch.fmax(mhi, -mhi) * Float32(V_MEAN_HEADROOM))
             mrow = (Int64(b) * Int64(H) + Int64(hh)) * Int64(NB) + Int64(j)
             store_vector(gptr(Uint32, mb + mrow * Int64(256) + Int64(cg) * Int64(16), 16), words)
             q = q + Int32(V_THREADS)
         u = u + gdim
 
-    inv8 = _grid_inv8(acc, maxima, gb, tidx, lane, warp, gdim)
+    _grid_max(acc, maxima, gb, tidx, lane, warp)
+    # every thread waits before the grid retires, so the next plain launch cannot race the eigensolver grid
+    cute.arch.griddepcontrol_wait()
 
-    # pass 2: v8 = E4M3((V - mu) / s), s the power-of-two scale of that maximum (the encode launch's v8_scale), and
-    # v_mean = mu / s (exact)
+
+@cute.jit
+def _v_encode_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
+    """The encode: v8 = E4M3((V - mu) / s), s the power-of-two scale of the maximum of the scan (the encode launch's
+    v8_scale), and v_mean = mu / s (exact). lens: as for _v_scan_body; the keys from the length on get zero codes."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    gdim, _, _ = cute.arch.grid_dim()
+    vb = Int64(v.iterator.toint())
+    ob = Int64(v8.iterator.toint())
+    mb = Int64(v_mean.iterator.toint())
+    gb = Int64(gmax.iterator.toint())
+    nblk = (S + Int32(V_BLOCK - 1)) // Int32(V_BLOCK)
+    nchunk = H * Int32(16)
+    row_bytes = Int64(H) * Int64(256)
+    inv8 = Float32(1.0) / pow2_ceil_448(load_invariant(Float32, gb + Int64(4 * GMAX_V)))
+
     u = bidx
     while u < nunits:
         b = u // nblk
@@ -170,7 +172,6 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
             cg = q & 15
             mrow = (Int64(b) * Int64(H) + Int64(hh)) * Int64(NB) + Int64(j)
             maddr = mb + mrow * Int64(256) + Int64(cg) * Int64(16)
-            # this thread's own pass-1 write: a coherent load
             mw = load_vector(gptr(Uint32, maddr, 16), 4)
             mu = []
             for e in cutlass.range_constexpr(4):
@@ -207,12 +208,38 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
             q = q + Int32(V_THREADS)
         u = u + gdim
 
-    # every thread waits before the grid retires, so the next plain launch cannot race the eigensolver grid
-    cute.arch.griddepcontrol_wait()
+
+@cute.kernel
+def v_scan_kernel(
+    v: cute.Tensor,
+    v_mean: cute.Tensor,
+    gmax: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    nunits: Int32,
+):
+    """The scan (_v_scan_body) of a call whose batch elements are all full."""
+    _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, None)
 
 
 @cute.kernel
-def v_kernel(
+def v_scan_kernel_lens(
+    v: cute.Tensor,
+    v_mean: cute.Tensor,
+    gmax: cute.Tensor,
+    lens: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    nunits: Int32,
+):
+    """The scan (_v_scan_body) of a call with valid prefix lengths lens [B] (int32)."""
+    _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, Int64(lens.iterator.toint()))
+
+
+@cute.kernel
+def v_encode_kernel(
     v: cute.Tensor,
     v8: cute.Tensor,
     v_mean: cute.Tensor,
@@ -222,12 +249,12 @@ def v_kernel(
     NB: Int32,
     nunits: Int32,
 ):
-    """The V pass (_v_body) of a call whose batch elements are all full."""
-    _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, None)
+    """The encode (_v_encode_body) of a call whose batch elements are all full."""
+    _v_encode_body(v, v8, v_mean, gmax, S, H, NB, nunits, None)
 
 
 @cute.kernel
-def v_kernel_lens(
+def v_encode_kernel_lens(
     v: cute.Tensor,
     v8: cute.Tensor,
     v_mean: cute.Tensor,
@@ -238,5 +265,5 @@ def v_kernel_lens(
     NB: Int32,
     nunits: Int32,
 ):
-    """The V pass (_v_body) of a call with valid prefix lengths lens [B] (int32)."""
-    _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, Int64(lens.iterator.toint()))
+    """The encode (_v_encode_body) of a call with valid prefix lengths lens [B] (int32)."""
+    _v_encode_body(v, v8, v_mean, gmax, S, H, NB, nunits, Int64(lens.iterator.toint()))

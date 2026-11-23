@@ -271,13 +271,13 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         # V: [B, S, H, 128] -> (dv, s, ((h_r, h), b))
         v_layout = cute.make_layout(
             (dv, s, ((h_r, h), b)),
-            stride=(1, dv * h, ((0, dv), s * h * dv)),
+            stride=(1, dv * h, ((0, dv), Int64(s) * h * dv)),
         )
         v = cute.make_tensor(v_ptr, v_layout)
         # O: [B, S, H, 128] -> (s, dv, ((h_r, h), b))
         o_layout = cute.make_layout(
             (s, dv, ((h_r, h), b)),
-            stride=(dv * h, 1, ((dv, dv), s * h * dv)),
+            stride=(dv * h, 1, ((dv, dv), Int64(s) * h * dv)),
         )
         o = cute.make_tensor(o_ptr, o_layout)
 
@@ -818,20 +818,19 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             n_kv_tiles=n_kv_tiles,
         )
 
-        # One role per warp, each with its register budget. The idle warp only hands its registers to the softmax
-        # warpgroups.
-        if warp_idx == self.idle_warp_id:
+        # The four role warps form one warpgroup, which hands its registers to the softmax warpgroups with one
+        # setmaxnreg that all its warps execute (the instruction is warpgroup-uniform). The idle warp does nothing
+        # else, save the zero rows of a padded call.
+        if warp_idx >= self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+        if warp_idx == self.idle_warp_id:
             if cutlass.const_expr(self.lens):
                 self.zero_rows(tile_sched_params, lens_addr, o_addr, seqlen_k, tidx)
         if warp_idx == self.load_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self._run_load_warp(st)
         if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self._run_mma_warp(st)
         if warp_idx == self.store_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.store_warp(
                 mO_qdl,
                 tma_atom_o,

@@ -173,7 +173,11 @@ class SoftmaxRole:
                     score_scale * (old_row_max - row_max_safe), fastmath=True
                 )
             cute.arch.mbarrier_wait(o_done_ptr, o_phase ^ 1)
+            # the accumulator is read after the wait, and the block-sum columns it stores are read again below:
+            # the fence orders the TMEM loads after the wait, the store wait the later loads after the stores
+            tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
             self.rescale_o(pv_thr_mma, tOtOi, acc_scale)
+            cute.arch.fence_view_async_tmem_store()
             # the row sum to the new anchor (no block sums wait in the A operand across a rescale: a batch's sums
             # are read after this step's rescale, and its means MMA completes before the next step's)
             row_sum = row_sum * acc_scale

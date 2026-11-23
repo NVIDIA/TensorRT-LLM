@@ -262,6 +262,48 @@ def test_deco_forward_matches_sdpa(
     assert torch.equal(attn.forward(q, k, v), out)
 
 
+def test_deco_kernel_api_takes_aligned_tensors_only(require_deco_kernels) -> None:
+    """The kernels move q, k, v and out through TMA descriptors and vector stores that assume
+    256-byte aligned base addresses: a view into an allocation at an offset of 128 elements is
+    served, one at an offset of one or of eight elements is rejected."""
+    device = require_deco_kernels()
+    shape = (1, 256, 2, HEAD_DIM)
+    q, k, v = _random_qkv(*shape[:3], device)
+    expected = _kernels(q, k, v)
+    backing = torch.empty(q.numel() + 128, dtype=torch.bfloat16, device=device)
+
+    aligned = backing[128:].view(shape)
+    aligned.copy_(q)
+    assert torch.equal(_kernels(aligned, k, v), expected)
+    out = backing[128:].view(shape)
+    num_bytes = deco_attention.workspace_size(*shape[:3], device, "fp8")
+    workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    assert torch.equal(
+        deco_attention.attention(deco_attention.prepare(q, k, v, workspace, "fp8"), out), expected
+    )
+
+    for offset in (1, 8):
+        misaligned = backing[offset : offset + q.numel()].view(shape)
+        assert misaligned.is_contiguous()
+        with pytest.raises(ValueError, match="aligned"):
+            deco_attention.prepare(misaligned, k, v, workspace, "fp8")
+        with pytest.raises(ValueError, match="aligned"):
+            deco_attention.attention(deco_attention.prepare(q, k, v, workspace, "fp8"), misaligned)
+
+
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_deco_constant_v_comes_back_as_the_constant(require_deco_kernels, v_dtype: str) -> None:
+    """A V of one large value in every row has block means of that value and deviations of
+    zero; the smoothed V keeps its scaled means finite, and the output is the constant."""
+    device = require_deco_kernels(v_dtype)
+    q, k, _ = _random_qkv(1, 512, 2, device, q_scale=4.0)
+    for value in (2.0**30, -(2.0**32)):
+        v = torch.full_like(q, value)
+        out = _kernels(q, k, v, v_dtype)
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out, v, rtol=2e-2, atol=0)
+
+
 def test_deco_layers_share_one_workspace(require_deco_kernels) -> None:
     """The layers of a model component share one workspace, which grows to the largest call and
     holds nothing a later call depends on; slices of a fused QKV projection give the result of
@@ -488,6 +530,34 @@ def test_deco_prefix_mask_attends_the_prefix(require_deco_kernels, v_dtype: str)
     assert not out[0].any()
     assert torch.equal(out[1, :num_tokens], prefix[1])
     assert not out[1, num_tokens:].any()
+
+
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_deco_skipped_tile_leaves_zero_scales(require_deco_kernels, v_dtype: str) -> None:
+    """On SM120 the Q/K pass skips the tiles past the valid length and the encode pass reads the
+    provisional scales of every tile: a skipped tile holds zero scales, also on a workspace that
+    a longer call wrote before, and the output of the valid tile is that of a fresh workspace."""
+    device = require_deco_kernels(v_dtype)
+    if deco_attention.target.kernel_family() != "sm120":
+        pytest.skip("The provisional scales of the Q/K pass are an SM120 kernel detail.")
+    seq_len, num_heads = 256, 1
+    q, k, v = _random_qkv(1, seq_len, num_heads, device, q_scale=4.0)
+    num_bytes = deco_attention.workspace_size(1, seq_len, num_heads, device, v_dtype)
+    workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    lens = torch.tensor([128], dtype=torch.int32, device=device)
+
+    deco_attention.attention(
+        deco_attention.prepare(q, k, v, workspace, v_dtype), torch.empty_like(q)
+    )
+    operands = deco_attention.prepare(q, k, v, workspace, v_dtype, valid_seq_lens=lens)
+    out = deco_attention.attention(operands, torch.empty_like(q))
+
+    prov = operands.buffers["prov"].reshape(-1).view(torch.uint8)
+    tiles = seq_len // 128
+    for side in range(2):
+        skipped = (side * tiles + 1) * 3072
+        assert not prov[skipped : skipped + 3072].any()
+    assert torch.equal(out, _kernels(q, k, v, v_dtype, valid_seq_lens=lens))
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
