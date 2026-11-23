@@ -89,12 +89,14 @@ from ...lora import LoraParamBuilder
 from ...multimodal import MultimodalItemScheduler
 from ..common import (
     apply_position_id_offset,
+    get_adp_token_counts,
     get_all_rank_num_tokens,
     get_position_id_offset,
     get_top_level_model,
     pad_input_tokens,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
+    set_adp_token_counts,
     ship_multimodal_indices,
     token_model_inputs,
 )
@@ -661,7 +663,7 @@ class DecoderInputPreparer:
                 ),
                 gathered.T.tolist(),
             )
-        counts = attn_metadata.get_adp_token_counts()
+        counts = get_adp_token_counts(attn_metadata)
         if self.mapping.has_cp_helix():
             counts = [math.ceil(count / self.mapping.cp_size) for count in counts]
         runner = self.cuda_graph_runner
@@ -687,7 +689,7 @@ class DecoderInputPreparer:
                     f"CUDA graph {replay_key}"
                 )
             cols = [[value] * self.mapping.tp_size for value in (*counts, *spec_counts)]
-        return (attn_metadata.set_adp_token_counts(cols[: len(counts)]), cols[len(counts) :])
+        return (set_adp_token_counts(attn_metadata, cols[: len(counts)]), cols[len(counts) :])
 
     def record_cached_kv_tokens_per_req(
         self,
@@ -3066,15 +3068,14 @@ class DecoderInputPreparer:
         attn_metadata.locality_domain_num_ctx_tokens = per_locality_domain_ctx_tokens
         attn_metadata.locality_domain_num_gen_tokens = per_locality_domain_gen_tokens
 
-
     def _backend_step_inputs(
         self, attn_metadata: TrtllmCoreMetadata, scheduled_requests: ScheduledRequests
     ) -> Any:
         """The step inputs that only the attention backend of this metadata reads, or None."""
         from tensorrt_llm._torch.attention.metadata.base import UnsupportedMetadataConfiguration
-        from tensorrt_llm._torch.attention.metadata.csa2 import CSA2CoreMetadata, CSA2StepInputs
+        from tensorrt_llm._torch.attention.metadata.csa2 import CSA2Metadata, CSA2StepInputs
 
-        if not isinstance(attn_metadata, CSA2CoreMetadata):
+        if attn_metadata.get_metadata(CSA2Metadata) is None:
             return None
         if any(
             getattr(request, "py_csa2_remote_tail_mode", None) is not None
@@ -3148,6 +3149,10 @@ class DecoderInputPreparer:
         )
         attn_metadata.padded_num_tokens = None
         attn_metadata.prepare_all(inputs)
+        # The draft layers of a linear chain read a second set of metadata.
+        draft_attn_metadata = getattr(attn_metadata, "draft", None)
+        if draft_attn_metadata is not None and spec is not None and spec.runtime_draft_len > 0:
+            draft_attn_metadata.prepare_all(inputs)
         host.num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
         host.remote_tail_modes = set()
 

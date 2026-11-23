@@ -158,10 +158,14 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.batch_inputs import BatchInputs
     from tensorrt_llm._torch.attention.metadata.chunked_prefill import ChunkedPrefillMetadata
     from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
-    from tensorrt_llm._torch.attention.metadata.csa2 import CSA2CoreMetadata, CSA2Metadata
-    from tensorrt_llm._torch.attention.metadata.deepseek_v4 import DeepseekV4Metadata
+    from tensorrt_llm._torch.attention.metadata.csa2 import CSA2DraftMetadata, CSA2Metadata
+    from tensorrt_llm._torch.attention.metadata.deepseek_v4 import (
+        DeepseekV4DraftMetadata,
+        DeepseekV4Metadata,
+    )
     from tensorrt_llm._torch.attention.metadata.draft import (
         EmbeddedDSparkDraftMetadata,
+        LinearDraftLengthsMetadata,
         LinearDraftMetadata,
         SharedKVCacheLinearDraftMetadata,
         SharedKVCacheStandaloneDSparkDraftMetadata,
@@ -202,7 +206,7 @@ def build_feature_attention_metadata(
 
     # CSA2 attends over its own staged selections and reads no MLA context tables.
     model_is_mla = is_mla(model_config.pretrained_config) and not is_csa2
-    metadata_types = [CSA2CoreMetadata if is_csa2 else TrtllmCoreMetadata, SpecDecodingMetadata]
+    metadata_types = [TrtllmCoreMetadata, SpecDecodingMetadata]
     enable_context_mla_with_cached_kv = model_is_mla and (
         attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
     )
@@ -210,7 +214,7 @@ def build_feature_attention_metadata(
         metadata_types.append(MlaContextMetadata)
         if attention_runtime_features.chunked_prefill:
             metadata_types.append(ChunkedPrefillMetadata)
-    # A sparse algorithm's metadata stands in for the dense one.
+    # The metadata of a sparse algorithm stands in for the dense one or requires it.
     if is_deepseek_v4:
         metadata_types.append(DeepseekV4Metadata)
     elif is_csa2:
@@ -234,6 +238,12 @@ def build_feature_attention_metadata(
                 if has_separate_draft_cache
                 else SharedKVCacheLinearDraftMetadata
             )
+            # What the draft set holds that changes from one draft step to the next.
+            metadata_types.append(LinearDraftLengthsMetadata)
+            if is_deepseek_v4:
+                metadata_types.append(DeepseekV4DraftMetadata)
+            elif is_csa2:
+                metadata_types.append(CSA2DraftMetadata)
         elif spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target:
             metadata_types.append(EmbeddedDSparkDraftMetadata)
         elif spec_dec_mode.is_dspark():

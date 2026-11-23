@@ -25,6 +25,33 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
 
 
+def get_adp_token_counts(attn_metadata: AttentionMetadata) -> list[int]:
+    """This rank's token counts of the attention-DP count exchange."""
+    request_state = _csa2_request_state(attn_metadata)
+    if request_state is not None:
+        return request_state.get_replay_adp_token_counts()
+    return attn_metadata.get_adp_token_counts()
+
+
+def set_adp_token_counts(attn_metadata: AttentionMetadata, counts: list[list[int]]) -> list[int]:
+    """Save the exchanged counts of every rank and return the input-stage counts."""
+    request_state = _csa2_request_state(attn_metadata)
+    if request_state is not None:
+        return request_state.set_replay_adp_token_counts(counts)
+    return attn_metadata.set_adp_token_counts(counts)
+
+
+def _csa2_request_state(attn_metadata: AttentionMetadata) -> Any:
+    """The CSA2 request state of the feature-split metadata, whose decoder replay
+    takes part in the count exchange; None for any other metadata."""
+    from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
+    from tensorrt_llm._torch.attention.metadata.csa2 import CSA2Metadata
+
+    if isinstance(attn_metadata, TrtllmCoreMetadata):
+        return attn_metadata.get_metadata(CSA2Metadata)
+    return None
+
+
 def get_all_rank_num_tokens(
     attn_metadata: AttentionMetadata,
     *,
@@ -34,7 +61,7 @@ def get_all_rank_num_tokens(
 ) -> list[int] | None:
     if enable_attention_dp:
         assert dist is not None, "attention DP requires a distributed communicator"
-        counts = attn_metadata.get_adp_token_counts()
+        counts = get_adp_token_counts(attn_metadata)
         if mapping.has_cp_helix():
             # With CP, attention uses reduce-scatter to divide tokens
             # among CP ranks. Report the post-RS token count.
@@ -45,7 +72,7 @@ def get_all_rank_num_tokens(
             gathered = dist.tp_cp_allgather_int64(counts)
         else:
             gathered = dist.tp_allgather_int64(counts)
-        return attn_metadata.set_adp_token_counts(gathered.T.tolist())
+        return set_adp_token_counts(attn_metadata, gathered.T.tolist())
     return None
 
 

@@ -24,8 +24,9 @@ import torch
 from ..backends.sparse.csa2.decoder_replay import apply_decoder_swa_floor
 from ..backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from ..backends.sparse.csa2.params import CSA2MetadataParams
-from .base import _Registry
+from .base import Metadata, _Registry
 from .core import TrtllmCoreMetadata
+from .draft import DraftMetadata, LinearDraftLengthsMetadata
 from .sparse import SparseMetadata
 
 if TYPE_CHECKING:
@@ -42,68 +43,6 @@ class CSA2StepInputs:
     context_requests: Sequence[Any] = ()
     # Whether a context chunk may keep only the final window of its history.
     allow_final_window: bool = True
-
-
-class CSA2CoreMetadata(TrtllmCoreMetadata):
-    """The core of the CSA2 attention backend.
-
-    The CSA2 cache manager publishes the sliding-window page tables it
-    converts while the block offsets are copied, and the CSA2 request state
-    reuses them. A step is therefore prepared inside the manager's publication
-    scope, which this core opens around the whole set.
-    """
-
-    # CSA2 attends over its own staged selections; the MLA context tables of
-    # the dense path are not built.
-    enable_context_mla_with_cached_kv = False
-
-    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
-        super().__init__(registry, config)
-        # The sliding-window tables published while this step is prepared.
-        self.swa_publication = None
-
-    def create_cuda_graph_metadata(self, *args, **kwargs) -> "CSA2CoreMetadata":
-        graph_core = super().create_cuda_graph_metadata(*args, **kwargs)
-        if graph_core is not self:
-            self.get_metadata(CSA2Metadata).share_state_with(graph_core.get_metadata(CSA2Metadata))
-        return graph_core
-
-    def prepare_all(self, inputs: "BatchInputs") -> None:
-        if not inputs.stage_host:
-            super().prepare_all(inputs)
-            return
-        with self.kv_cache_manager._swa_publication_scope() as publication:
-            self.swa_publication = publication
-            try:
-                super().prepare_all(inputs)
-            finally:
-                self.swa_publication = None
-
-    def get_adp_token_counts(self) -> List[int]:
-        """Input rows, decoder rows, and whether this rank's replay plan must run."""
-        plan = self.decoder_replay_plan
-        input_tokens = self.padded_num_tokens or self.num_tokens
-        decoder_tokens = (
-            plan.num_replay_tokens if plan and plan.replays_local_tokens else input_tokens
-        )
-        return [input_tokens, decoder_tokens, int(plan is not None and plan.updates_local_metadata)]
-
-    def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
-        """Keep or drop the replay plan by one decision every attention-DP rank shares."""
-        input_counts, decoder_counts, required = counts
-        plan = self.decoder_replay_plan
-        if plan is None:
-            if any(required):
-                raise ValueError(
-                    "An attention-DP peer enters the decoder replay but this rank has no "
-                    "replay plan; the decoder-half collectives would diverge"
-                )
-            return input_counts
-        plan.saved_all_rank_num_tokens = input_counts
-        plan.replay_all_rank_num_tokens = decoder_counts
-        if not any(required) and input_counts == decoder_counts:
-            self.decoder_replay_plan = None
-        return input_counts
 
 
 # What CSA2TrtllmMetadata defines that the request state does not take over:
@@ -127,21 +66,29 @@ _NOT_TAKEN = frozenset(
 )
 
 
-class CSA2Metadata(SparseMetadata):
+class CSA2Metadata(Metadata):
     """The CSA2 request state: page tables, slots, indexer plans and routing.
 
     Its logic is CSA2TrtllmMetadata's, taken over method by method; the
     lengths and the cache layout it reads resolve to the core. The query
     tiles the attention kernel runs on stay CSA2TrtllmMetadata objects.
+
+    The CSA2 cache manager publishes the sliding-window page tables it
+    converts while the core copies the block offsets, and this request state
+    reuses them. The manager's publication scope therefore stays open between
+    steps: each prepare consumes what the core published and opens the next.
     """
 
-    requires = (CSA2CoreMetadata,)
+    requires = (TrtllmCoreMetadata, SparseMetadata)
 
     def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
         super().__init__(registry, config)
         params = config.sparse_metadata_params
         if not isinstance(params, CSA2MetadataParams):
             raise ValueError("CSA2 sparse attention metadata params are not set")
+        # CSA2 attends over its own staged selections; the MLA context tables
+        # of the dense path are not built.
+        self.enable_context_mla_with_cached_kv = False
         self.indexer_max_chunk_size = params.indexer_max_chunk_size
         self.indexer_q_split_threshold = params.q_split_threshold
         self.decoder_replay_plan = None
@@ -156,9 +103,12 @@ class CSA2Metadata(SparseMetadata):
         self._csa2_ready_for_kv_update = False
         # The step's description while the decoder layers run on replayed rows.
         self._csa2_step_before_replay = None
+        # The encoder layers' publications between the two halves of entering the replay.
+        self._csa2_replay_carry = None
+        config.kv_cache_manager.open_swa_publication()
 
-    def share_state_with(self, graph_metadata: "CSA2Metadata") -> None:
-        """Start the metadata of a CUDA graph batch size from this request state.
+    def init_cuda_graph_metadata(self, graph_metadata: "CSA2Metadata") -> None:
+        """Start the request state of a CUDA graph batch size from this one.
 
         The graph metadata of every batch size then share the buffer banks,
         query tiles and indexer arenas created here, as they reserve graph
@@ -186,24 +136,54 @@ class CSA2Metadata(SparseMetadata):
             # The whole request state is prepared here; nothing is left to
             # the first CSA2 layer.
             self._csa2_pending_prepare = None
-            self.prepare_csa2(swa_publication=self.swa_publication)
+            manager = self.kv_cache_manager
+            self.prepare_csa2(swa_publication=manager.swa_publication_token)
+            manager.open_swa_publication()
         if self._csa2_ready_for_kv_update:
             self._refresh_live_endpoints()
 
-    def enter_decoder_replay(self, plan: "DecoderReplayPlan", first_layer: Optional[int]) -> None:
-        """Re-describe the step for the decoder layers, which run on the replayed rows.
+    def get_replay_adp_token_counts(self) -> List[int]:
+        """Input rows, decoder rows, and whether this rank's replay plan must run."""
+        plan = self.decoder_replay_plan
+        input_tokens = self.padded_num_tokens or self.num_tokens
+        decoder_tokens = (
+            plan.num_replay_tokens if plan and plan.replays_local_tokens else input_tokens
+        )
+        return [input_tokens, decoder_tokens, int(plan is not None and plan.updates_local_metadata)]
+
+    def set_replay_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
+        """Keep or drop the replay plan by one decision every attention-DP rank shares."""
+        input_counts, decoder_counts, required = counts
+        plan = self.decoder_replay_plan
+        if plan is None:
+            if any(required):
+                raise ValueError(
+                    "An attention-DP peer enters the decoder replay but this rank has no "
+                    "replay plan; the decoder-half collectives would diverge"
+                )
+            return input_counts
+        plan.saved_all_rank_num_tokens = input_counts
+        plan.replay_all_rank_num_tokens = decoder_counts
+        if not any(required) and input_counts == decoder_counts:
+            self.decoder_replay_plan = None
+        return input_counts
+
+    def begin_decoder_replay(
+        self, plan: "DecoderReplayPlan", first_layer: Optional[int]
+    ) -> Optional["BatchInputs"]:
+        """Describe the step again for the decoder layers, which run on the replayed rows.
 
         Called inside the forward, between the encoder and the decoder layers.
-        The replayed rows are a second description of the same step, so the
-        whole set is prepared again with it; what the encoder layers published
-        for the decoder is carried across, narrowed to the replayed rows.
+        The replayed rows are a second description of the same step. It is
+        returned for the caller to prepare the whole set with, before
+        ``carry_into_decoder_replay``; None when nothing is prepared again.
         ``exit_decoder_replay`` restores the step's rows.
         """
         if plan.replay_all_rank_num_tokens is not None:
             self.all_rank_num_tokens = plan.replay_all_rank_num_tokens
         if not plan.updates_local_metadata:
-            return
-        core = self.get_metadata(CSA2CoreMetadata)
+            return None
+        core = self.get_metadata(TrtllmCoreMetadata)
         step = core.inputs
         self._csa2_step_before_replay = step
         saved_indices = dict(self.csa2_indices)
@@ -223,24 +203,32 @@ class CSA2Metadata(SparseMetadata):
             self.reset_routing()
             self.csa2_precomputed_kv_layers = precomputed
             self.csa2_replay_query_rows = plan.rows
-            return
+            return None
         if first_layer is not None:
             self.set_decoder_query_boundary(first_layer)
         padding = step.padding
         if padding is not None and plan.replay_all_rank_num_tokens is not None:
             padding = replace(padding, all_rank_num_tokens=plan.replay_all_rank_num_tokens)
+        self._csa2_replay_carry = (saved_indices, saved_candidates, saved_last_layer, precomputed)
         # The step's device corrections of the KV lengths stay in the
         # description, so the replayed rows keep their live endpoints.
-        core.prepare_all(
-            replace(
-                step,
-                seq_lens=plan.replay_seq_lens,
-                prompt_lens=plan.replay_prompt_lens,
-                padding=padding,
-                backend_inputs=None,
-                stage_host=True,
-            )
+        return replace(
+            step,
+            seq_lens=plan.replay_seq_lens,
+            prompt_lens=plan.replay_prompt_lens,
+            padding=padding,
+            backend_inputs=None,
+            stage_host=True,
         )
+
+    def carry_into_decoder_replay(self, plan: "DecoderReplayPlan") -> None:
+        """Carry what the encoder layers published for the decoder across the boundary.
+
+        Called once the set is prepared with the replayed rows; the
+        publications are narrowed to those rows.
+        """
+        saved_indices, saved_candidates, saved_last_layer, precomputed = self._csa2_replay_carry
+        self._csa2_replay_carry = None
         self.csa2_precomputed_kv_layers = precomputed
         self.csa2_replay_query_rows = plan.rows
         for layer, indices in saved_indices.items():
@@ -260,7 +248,7 @@ class CSA2Metadata(SparseMetadata):
         )
 
     def exit_decoder_replay(self, plan: "DecoderReplayPlan") -> None:
-        """Restore the rows of the step ``enter_decoder_replay`` re-described.
+        """Restore the rows of the step ``begin_decoder_replay`` described again.
 
         Only the host description is restored. The device buffers keep the
         replay values: the next step prepares them again.
@@ -269,7 +257,7 @@ class CSA2Metadata(SparseMetadata):
             self.all_rank_num_tokens = plan.saved_all_rank_num_tokens
         if not plan.updates_local_metadata:
             return
-        core = self.get_metadata(CSA2CoreMetadata)
+        core = self.get_metadata(TrtllmCoreMetadata)
         num_cached = self.kv_cache_params.num_cached_tokens_per_seq
         num_cached[: len(plan.saved_num_cached)] = plan.saved_num_cached
         self.prompt_lens = plan.saved_prompt_lens
@@ -298,3 +286,18 @@ def _take_over_request_state() -> None:
 
 
 _take_over_request_state()
+
+
+class CSA2DraftMetadata(DraftMetadata):
+    """The CSA2 request state in the draft steps of a linear chain.
+
+    Before each draft step it resolves the positions and owner slots of the
+    draft set again, from the KV lengths the step runs with.
+    """
+
+    requires = (LinearDraftLengthsMetadata, CSA2Metadata)
+
+    def begin_draft_step(self, step: int) -> None:
+        request_state = self.draft.get_metadata(CSA2Metadata)
+        if request_state._csa2_ready_for_kv_update:
+            request_state._refresh_live_endpoints()

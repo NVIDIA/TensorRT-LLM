@@ -76,18 +76,34 @@ class _Registry:
 
     def add(self, metadata: "Metadata") -> None:
         self.ordered.append(metadata)
-        for cls in type(metadata).__mro__:
-            if cls is Metadata:
-                break
-            self.by_type.setdefault(cls, metadata)
+        mro = type(metadata).__mro__
+        classes = mro[: mro.index(Metadata)]
+        # A base several attached metadata derive from is the interface of
+        # that family: each of them may define its names, and a read of one
+        # resolves to the first.
+        family_names = {
+            name
+            for cls in classes
+            if self.by_type.get(cls, metadata) is not metadata
+            for name in vars(cls)
+        }
+        for cls in classes:
+            if self.by_type.setdefault(cls, metadata) is not metadata:
+                continue
             for name in vars(cls):
-                if name[0] != "_" and name not in _BASE_NAMES:
+                if name[0] != "_" and name not in _BASE_NAMES and name not in family_names:
                     self.claim(name, metadata)
 
-    def claim(self, name: str, metadata: "Metadata") -> "Metadata":
-        """The owner of field ``name``: ``metadata`` unless another holds it."""
+    def claim(self, name: str, metadata: "Metadata", fills: bool = False) -> "Metadata":
+        """The owner of field ``name``: ``metadata`` unless another holds it.
+
+        With ``fills``, ``metadata`` assigns the field rather than defining
+        it, which it may do to a field of a metadata it requires.
+        """
         owner = self.field_owners.setdefault(name, metadata)
-        if owner is not metadata and not self.sealed:
+        if owner is metadata or self.sealed:
+            return owner
+        if not (fills and _requires(type(metadata), type(owner))):
             raise TypeError(
                 f"attention metadata field {name!r} is defined by both "
                 f"{type(owner).__name__} and {type(metadata).__name__}; "
@@ -112,8 +128,8 @@ class Metadata:
     """One attention feature's metadata.
 
     A subclass owns its fields, creates them in ``__init__`` and fills them in
-    ``prepare``; it has no other entry point. ``requires`` names the metadata
-    it depends on; they are constructed and prepared first.
+    ``prepare``. ``requires`` names the metadata it depends on; they are
+    constructed and prepared first.
 
     The public fields of every attached metadata read and assign through any
     of them: ``metadata.field`` reaches the metadata that owns ``field``. A
@@ -149,7 +165,7 @@ class Metadata:
 
     def __setattr__(self, name: str, value) -> None:
         if name[0] != "_":
-            owner = self._registry.claim(name, self)
+            owner = self._registry.claim(name, self, fills=True)
             if owner is not self:
                 object.__setattr__(owner, name, value)
                 return
@@ -166,6 +182,13 @@ class Metadata:
         """Prepare every attached metadata for one step, dependencies first."""
         for metadata in self._registry.ordered:
             metadata.prepare(inputs)
+
+    def init_cuda_graph_metadata(self, graph_metadata: "Metadata") -> None:
+        """Set up graph_metadata, this metadata's counterpart of a CUDA graph batch size.
+
+        Called once on every attached metadata by the core's
+        create_cuda_graph_metadata, after the graph metadata are constructed.
+        """
 
     def attached_types(self) -> List[Type["Metadata"]]:
         """The concrete types attached alongside this metadata, in prepare order."""
@@ -225,6 +248,14 @@ def build_metadata(metadata_types: Sequence[Type[Metadata]], inputs: "BatchInput
     # Dependencies first; the sort is stable, so equals keep construction order.
     registry.ordered.sort(key=_depth)
     return registry.by_type[metadata_types[0]]
+
+
+def _requires(metadata_type: Type[Metadata], required_type: Type[Metadata]) -> bool:
+    """Whether ``metadata_type`` requires ``required_type``, directly or through others."""
+    return any(
+        issubclass(required_type, required) or _requires(required, required_type)
+        for required in metadata_type.requires
+    )
 
 
 def _depth(metadata: Metadata) -> int:

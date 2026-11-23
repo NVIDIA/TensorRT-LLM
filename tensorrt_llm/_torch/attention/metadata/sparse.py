@@ -29,8 +29,9 @@ if TYPE_CHECKING:
 class SparseMetadata(Metadata):
     """What the attention ops read about sparse attention, whatever the model.
 
-    Attached as is, it describes a dense model: no layer selects KV rows. A
-    sparse algorithm derives from it and fills the fields.
+    Attached alone, it describes a dense model: no layer selects KV rows. The
+    metadata of a sparse algorithm requires it or derives from it, and fills
+    the fields.
     """
 
     requires = (TrtllmCoreMetadata,)

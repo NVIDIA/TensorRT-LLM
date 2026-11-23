@@ -222,7 +222,7 @@ def _swa_is_reused(metadata: "CSA2TrtllmMetadata") -> bool:
 
 
 def _feature_split_request_state(metadata):
-    """The CSA2 request state of the feature-split metadata, which re-describes the step itself."""
+    """The CSA2 request state of the feature-split metadata, or None on the old metadata."""
     # Imported here: the feature-split metadata import this module.
     from ....metadata.base import Metadata
     from ....metadata.csa2 import CSA2Metadata
@@ -238,7 +238,10 @@ def enter_decoder_replay(
     """Rebuild query views and carry encoder publications across the boundary."""
     request_state = _feature_split_request_state(metadata)
     if request_state is not None:
-        request_state.enter_decoder_replay(plan, first_layer)
+        replay_step = request_state.begin_decoder_replay(plan, first_layer)
+        if replay_step is not None:
+            metadata.prepare_all(replay_step)
+            request_state.carry_into_decoder_replay(plan)
         return
     if plan.replay_all_rank_num_tokens is not None:
         metadata.all_rank_num_tokens = plan.replay_all_rank_num_tokens

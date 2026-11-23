@@ -1001,9 +1001,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # TrtllmAttentionMetadata, and sparse metadata all derive from it.
                 draft_scope.callback(_reset_mtp_index_share, attn_metadata)
             if draft_metadata is not None:
-                draft_metadata.begin_draft_loop(num_accepted_tokens)
-                draft_scope.callback(draft_metadata.end_draft_loop)
-                draft_metadata.begin_draft_step(0)
+                draft_metadata.begin_draft_loop_all(num_accepted_tokens)
+                draft_scope.callback(draft_metadata.end_draft_loop_all)
+                draft_metadata.begin_draft_step_all(0)
                 draft_attn_metadata = draft_metadata.draft
                 # The attention custom ops resolve the metadata from the
                 # model's extra attributes, not from their arguments.
@@ -1334,9 +1334,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
                 # Update attn_metadata for the next iteration.
                 if draft_metadata is not None:
-                    draft_metadata.end_draft_step(i)
+                    draft_metadata.end_draft_step_all(i)
                     if i + 1 < runtime_draft_len:
-                        draft_metadata.begin_draft_step(i + 1)
+                        draft_metadata.begin_draft_step_all(i + 1)
                 elif i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     if step0 is None:  # else: done by the step-0 epilogue

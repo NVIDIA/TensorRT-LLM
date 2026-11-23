@@ -29,7 +29,7 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_num_sms, get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
-from .base import UnsupportedMetadataConfiguration, _Registry
+from .base import Metadata, UnsupportedMetadataConfiguration, _Registry
 from .core import TrtllmCoreMetadata
 from .mla_context import MlaContextMetadata
 from .sparse import SparseMetadata
@@ -50,8 +50,8 @@ def _fused_dsa_metadata_enabled() -> bool:
     return os.environ.get("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0") == "0"
 
 
-class DSAMetadata(SparseMetadata):
-    """Base of DeepSeek-V4's sparse metadata: the indexer's buffers and state.
+class DSAMetadata(Metadata):
+    """The indexer's buffers and state of DeepSeek-V4's sparse attention.
 
     It holds what the indexer and the top-k index conversion read: the indexer
     K-cache tables and slot mappings, the MQA-logits schedules, the per-token
@@ -59,7 +59,7 @@ class DSAMetadata(SparseMetadata):
     ``DeepseekV4Metadata`` prepares it as part of its step.
     """
 
-    requires = (TrtllmCoreMetadata, MlaContextMetadata)
+    requires = (TrtllmCoreMetadata, MlaContextMetadata, SparseMetadata)
 
     # Ragged verification, mixed-precision KV, sparse KV offload and MTP index
     # sharing are not carried.
@@ -343,7 +343,7 @@ class DSAMetadata(SparseMetadata):
 
     # Step preparation, called by the subclass in its own order.
 
-    def _prepare_req_idx_per_token(self) -> None:
+    def prepare_req_idx_per_token(self) -> None:
         core = self._core
         num_tokens = core.num_tokens
         self.host_req_idx_per_token[:num_tokens] = torch.repeat_interleave(
@@ -353,7 +353,7 @@ class DSAMetadata(SparseMetadata):
             self.host_req_idx_per_token[:num_tokens], non_blocking=True
         )
 
-    def _prepare_dsl_split(self, kv_lens: torch.Tensor) -> None:
+    def prepare_dsl_split(self, kv_lens: torch.Tensor) -> None:
         """Decide the DSL paged MQA-logits atom split and fill its row lengths."""
         from ..backends.sparse.dsa.indexer import _atom_ctx_offsets, _pick_dsl_split
 
@@ -418,7 +418,7 @@ class DSAMetadata(SparseMetadata):
 
     # Device derivation.
 
-    def _derive_from_lengths(self) -> None:
+    def derive_from_lengths(self) -> None:
         """Derive, on the device, what the indexer and the index conversion read
         from the core's current lengths."""
         from ..backends.sparse.dsa.indexer import _compute_slot_mappings

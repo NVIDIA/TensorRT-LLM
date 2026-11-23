@@ -23,7 +23,9 @@ import torch
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, prefer_pinned
 
-from .base import UnsupportedMetadataConfiguration, _Registry
+from .base import Metadata, UnsupportedMetadataConfiguration, _Registry
+from .core import TrtllmCoreMetadata
+from .draft import DraftMetadata, LinearDraftLengthsMetadata
 from .dsa import DSAMetadata
 
 if TYPE_CHECKING:
@@ -32,7 +34,7 @@ if TYPE_CHECKING:
 _SUPPORTED_COMPRESS_RATIOS = frozenset({1, 4, 128})
 
 
-class DeepseekV4Metadata(DSAMetadata):
+class DeepseekV4Metadata(Metadata):
     """DeepSeek-V4's sparse MLA state, per compress ratio of the cache's layers.
 
     Every layer reads a sliding window (SWA) of the latest tokens. A layer of
@@ -42,6 +44,8 @@ class DeepseekV4Metadata(DSAMetadata):
     row counts the attention kernels read, and the compressor's lengths and
     positions.
     """
+
+    requires = (TrtllmCoreMetadata, DSAMetadata)
 
     def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
         from ..backends.sparse.deepseek_v4.params import (
@@ -191,13 +195,13 @@ class DeepseekV4Metadata(DSAMetadata):
     def prepare(self, inputs: "BatchInputs") -> None:
         if inputs.stage_host:
             self._stage_host(inputs)
-        self._derive()
+        self.derive()
 
     def _stage_host(self, inputs: "BatchInputs") -> None:
         """Copy this batch's page tables and host lengths to the device."""
         from ..backends.sparse.dsa.indexer import Indexer
 
-        core = self._core
+        core = self.get_metadata(TrtllmCoreMetadata)
         manager = core.kv_cache_manager
         request_ids = core.request_ids
         num_contexts = core.num_contexts
@@ -211,7 +215,7 @@ class DeepseekV4Metadata(DSAMetadata):
         )
         kv_lens = self.cached_token_lens_cpu[:num_seqs] + core.seq_lens
 
-        self._prepare_req_idx_per_token()
+        self.prepare_req_idx_per_token()
         # The core already had the manager compute the sliding-window tables.
         manager.copy_batch_sliding_block_tables(
             self.sliding_block_tables, request_ids, num_contexts, num_seqs
@@ -239,7 +243,7 @@ class DeepseekV4Metadata(DSAMetadata):
             # Columns past a sequence's blocks hold -1. Padded CUDA graph
             # slots still compute addresses from them, so map them to block 0.
             self.indexer_k_cache_block_offsets.clamp_(min=0)
-            self._prepare_dsl_split(kv_lens)
+            self.prepare_dsl_split(kv_lens)
             Indexer.prepare(metadata=core)
 
         # Context compressed-row counts as host ints, so that no device
@@ -253,7 +257,7 @@ class DeepseekV4Metadata(DSAMetadata):
                 self._ctx_output_sizes[ratio] = int(new_rows[:num_contexts].sum())
                 self.max_ctx_compressed_tokens[ratio] = int(new_rows[:num_contexts].max())
 
-    def _derive(self) -> None:
+    def derive(self) -> None:
         """Derive the device state from the core's current lengths."""
         # The compiled helpers live with the old metadata class, so both
         # metadata paths share one compiled graph each.
@@ -261,8 +265,8 @@ class DeepseekV4Metadata(DSAMetadata):
             DeepseekV4TrtllmAttentionMetadata as helpers,
         )
 
-        core = self._core
-        self._derive_from_lengths()
+        core = self.get_metadata(TrtllmCoreMetadata)
+        self.derive_from_lengths()
         num_seqs = core.num_seqs
         num_tokens = core.num_tokens
         num_contexts = core.num_contexts
@@ -351,3 +355,16 @@ class DeepseekV4Metadata(DSAMetadata):
             self.sparse_mla_swa_lens,
             self.sparse_mla_extra_lens,
         )
+
+
+class DeepseekV4DraftMetadata(DraftMetadata):
+    """DeepSeek-V4's sparse MLA state in the draft steps of a linear chain.
+
+    Before each draft step it derives the sparse state of the draft set again,
+    from the rows and lengths the step runs with.
+    """
+
+    requires = (LinearDraftLengthsMetadata, DeepseekV4Metadata)
+
+    def begin_draft_step(self, step: int) -> None:
+        self.draft.get_metadata(DeepseekV4Metadata).derive()

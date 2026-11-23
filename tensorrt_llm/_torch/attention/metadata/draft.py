@@ -17,12 +17,11 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from .base import Metadata, UnsupportedMetadataConfiguration, _Registry, build_metadata
-from .batch_inputs import DraftStepInputs
 from .core import TrtllmCoreMetadata
 
 if TYPE_CHECKING:
@@ -30,33 +29,16 @@ if TYPE_CHECKING:
 
 
 class DraftMetadata(Metadata):
-    """Base of the draft modes of one-model speculative decoding.
+    """Base of what the draft loop of one-model speculative decoding reads.
 
-    A subclass is one draft mode. It
-    holds what the draft forwards read from the attention metadata; the
-    target's metadata are never modified by the loop. The spec worker calls
-    the four hooks around the loop.
-
-    draft is the core of the metadata the draft layers receive as
-    attn_metadata, for a mode whose draft layers run the attention backend;
-    such a mode builds it over the draft KV cache and prepares it in
-    begin_draft_step. It stays None for a mode that drafts outside the
-    attention backend.
+    The spec worker calls four hooks around the loop, each through its
+    ``_all`` form, which calls that hook on every attached draft metadata,
+    dependencies first. A hook updates what its own metadata is responsible
+    for and calls no other hook. The target's metadata are never modified by
+    the loop.
     """
 
     requires = (TrtllmCoreMetadata,)
-    # Constructed after the other metadata, whose types a draft set copies.
-    builds_metadata = True
-
-    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
-        super().__init__(registry, config)
-        self.draft: Optional[TrtllmCoreMetadata] = None
-        self._target_inputs: Optional["BatchInputs"] = None
-        self._num_accepted: Optional[torch.Tensor] = None
-
-    def prepare(self, inputs: "BatchInputs") -> None:
-        # The target's latest layout, also after a device-only prepare.
-        self._target_inputs = inputs
 
     def begin_draft_loop(self, num_accepted: torch.Tensor) -> None:
         """Before the first draft forward, once the acceptance result is known.
@@ -64,16 +46,9 @@ class DraftMetadata(Metadata):
         num_accepted holds, on the device, the tokens each request
         accepted in the target step, [num_seqs].
         """
-        self._num_accepted = num_accepted
 
     def begin_draft_step(self, step: int) -> None:
-        """Before draft forward step: prepare the draft metadata for it.
-
-        A mode with a draft set implements this. It describes the step as a
-        BatchInputs derived from the target step, with stage_host=False, and
-        must then call self.draft.prepare_all(inputs): nothing else prepares
-        the draft set for the step.
-        """
+        """Before draft forward step."""
 
     def end_draft_step(self, step: int) -> None:
         """After draft forward step and its sampling."""
@@ -81,33 +56,63 @@ class DraftMetadata(Metadata):
     def end_draft_loop(self) -> None:
         """After the last draft forward."""
 
+    def begin_draft_loop_all(self, num_accepted: torch.Tensor) -> None:
+        """Call begin_draft_loop on every attached draft metadata."""
+        for metadata in self._attached_draft_metadata():
+            metadata.begin_draft_loop(num_accepted)
+
+    def begin_draft_step_all(self, step: int) -> None:
+        """Call begin_draft_step on every attached draft metadata."""
+        for metadata in self._attached_draft_metadata():
+            metadata.begin_draft_step(step)
+
+    def end_draft_step_all(self, step: int) -> None:
+        """Call end_draft_step on every attached draft metadata, in reverse order."""
+        for metadata in reversed(self._attached_draft_metadata()):
+            metadata.end_draft_step(step)
+
+    def end_draft_loop_all(self) -> None:
+        """Call end_draft_loop on every attached draft metadata, in reverse order."""
+        for metadata in reversed(self._attached_draft_metadata()):
+            metadata.end_draft_loop()
+
+    def _attached_draft_metadata(self) -> List["DraftMetadata"]:
+        return [
+            metadata for metadata in self._registry.ordered if isinstance(metadata, DraftMetadata)
+        ]
+
+
+def _build_draft_set(metadata: DraftMetadata, config: "BatchInputs") -> TrtllmCoreMetadata:
+    """The types attached alongside metadata, built from config: the core first."""
+    draft_types = [
+        metadata_type
+        for metadata_type in metadata.attached_types()
+        if not issubclass(metadata_type, DraftMetadata)
+    ]
+    draft_types.sort(key=lambda metadata_type: not issubclass(metadata_type, TrtllmCoreMetadata))
+    return build_metadata(draft_types, config)
+
 
 class LinearDraftMetadata(DraftMetadata):
-    """A linear draft chain over a separate draft KV cache (Eagle3 / MTP-Eagle).
+    """The metadata of a linear draft chain over a separate draft KV cache (Eagle3 / MTP-Eagle).
 
-    The draft layers run the attention backend on a second set of metadata:
-    the target's types, built over the draft KV cache. Step 0 runs the target
-    step's rows. Each later step runs one token per sequence, every row as a
-    generation row. Each step is prepared on the device only, so the loop can
-    run inside a captured CUDA graph.
+    The draft layers run the attention backend on a second set of metadata,
+    draft: the target's types, built over the draft KV cache. The engine
+    prepares it with each target step that drafts; the other draft metadata
+    update it in place for each draft step.
     """
+
+    # Constructed after the other metadata, whose types the draft set copies.
+    builds_metadata = True
 
     def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
         super().__init__(registry, config)
         draft_manager = config.draft_kv_cache_manager
         if draft_manager is None or draft_manager is config.kv_cache_manager:
             raise ValueError("LinearDraftMetadata requires a separate draft KV cache")
-        # The draft set has the target's types, its core first.
-        draft_types = [
-            metadata_type
-            for metadata_type in self.attached_types()
-            if not issubclass(metadata_type, DraftMetadata)
-        ]
-        draft_types.sort(
-            key=lambda metadata_type: not issubclass(metadata_type, TrtllmCoreMetadata)
-        )
-        self.draft = build_metadata(
-            draft_types,
+        # The core of the metadata the draft layers receive as attn_metadata.
+        self.draft = _build_draft_set(
+            self,
             dataclasses.replace(
                 config,
                 kv_cache_manager=draft_manager,
@@ -115,93 +120,46 @@ class LinearDraftMetadata(DraftMetadata):
                 buffer_name_prefix="draft_",
             ),
         )
-        num_rows = config.max_num_sequences
-        # KV-length offsets of the steps after the first: the target step's
-        # own offsets plus the rewind to the accepted tokens.
-        self.rewind_kv_lens_offsets = self.get_buffer(
-            (num_rows,), torch.int, "rewind_kv_lens_offsets"
-        )
-        self._one_token_per_seq = torch.ones((num_rows,), dtype=torch.int)
-
-    def prepare(self, inputs: "BatchInputs") -> None:
-        super().prepare(inputs)
-        if not inputs.stage_host:
-            return
-        if inputs.spec is not None and inputs.spec.runtime_draft_len > 0:
-            self.draft.prepare_all(inputs)
-
-    def begin_draft_loop(self, num_accepted: torch.Tensor) -> None:
-        super().begin_draft_loop(num_accepted)
-        target = self._target_inputs
-        if target.spec.num_extend_ctx_requests > 0:
-            raise UnsupportedMetadataConfiguration("a draft loop after extend-context rows")
-        num_seqs = target.num_seqs
-        num_contexts = target.num_contexts
-        core = self.get_metadata(TrtllmCoreMetadata)
-        rewind = self.rewind_kv_lens_offsets
-        # A context request appends its first draft token. A generation
-        # request keeps its accepted tokens and appends one.
-        rewind[:num_contexts] = 1
-        rewind[num_contexts:num_seqs] = (
-            num_accepted[num_contexts:num_seqs] - core.base_seq_lens_cuda[num_contexts:num_seqs] + 1
-        )
-        if target.kv_lens_offsets is not None:
-            rewind[num_contexts:num_seqs] += target.kv_lens_offsets[: num_seqs - num_contexts]
-
-    def begin_draft_step(self, step: int) -> None:
-        target = self._target_inputs
-        spec = dataclasses.replace(
-            target.spec, draft=DraftStepInputs(step=step, num_accepted=self._num_accepted)
-        )
-        if step == 0:
-            inputs = dataclasses.replace(target, spec=spec, stage_host=False)
-        else:
-            inputs = dataclasses.replace(
-                target,
-                seq_lens=self._one_token_per_seq[: target.num_seqs],
-                num_contexts=0,
-                spec=spec,
-                kv_lens_offsets=self.rewind_kv_lens_offsets,
-                kv_lens_offset_delta=step - 1,
-                stage_host=False,
-            )
-        self.draft.prepare_all(inputs)
 
 
 class SharedKVCacheLinearDraftMetadata(DraftMetadata):
-    """A linear draft chain over the target's KV cache (Eagle3 / MTP-Eagle).
+    """The metadata of a linear draft chain over the target's KV cache (Eagle3 / MTP-Eagle).
 
     The draft layers are extra layers of the target's KV cache. They run the
-    attention backend on a second set of metadata: the target's types, built
-    over that same cache with lengths of their own, so the draft steps leave
-    the target's metadata untouched. Step 0 runs the target step's rows. Each
-    later step runs one token per sequence, every row as a generation row.
-    Each step is prepared on the device only, so the loop can run inside a
-    captured CUDA graph.
+    attention backend on a second set of metadata, draft: the target's types,
+    built over that same cache with lengths of their own, so the draft steps
+    leave the target's metadata untouched. The engine prepares it with each
+    target step that drafts; the other draft metadata update it in place for
+    each draft step.
     """
+
+    # Constructed after the other metadata, whose types the draft set copies.
+    builds_metadata = True
 
     def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
         super().__init__(registry, config)
         draft_manager = config.draft_kv_cache_manager
         if draft_manager is not None and draft_manager is not config.kv_cache_manager:
             raise ValueError("SharedKVCacheLinearDraftMetadata requires a shared draft KV cache")
-        # The draft set has the target's types, its core first.
-        draft_types = [
-            metadata_type
-            for metadata_type in self.attached_types()
-            if not issubclass(metadata_type, DraftMetadata)
-        ]
-        draft_types.sort(
-            key=lambda metadata_type: not issubclass(metadata_type, TrtllmCoreMetadata)
+        # The core of the metadata the draft layers receive as attn_metadata.
+        self.draft = _build_draft_set(
+            self,
+            dataclasses.replace(config, draft_kv_cache_manager=None, buffer_name_prefix="draft_"),
         )
-        self.draft = build_metadata(
-            draft_types,
-            dataclasses.replace(
-                config,
-                draft_kv_cache_manager=None,
-                buffer_name_prefix="draft_",
-            ),
-        )
+
+
+class LinearDraftLengthsMetadata(DraftMetadata):
+    """Rows and lengths of the draft steps of a linear chain.
+
+    Step 0 runs the target step's rows. Each later step runs one token per
+    sequence, every row as a generation row, over a KV cache rewound to the
+    accepted tokens. Before each step this metadata writes those rows and
+    lengths into the core of the draft set, on the device only, so the loop
+    can run inside a captured CUDA graph.
+    """
+
+    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
+        super().__init__(registry, config)
         num_rows = config.max_num_sequences
         # KV-length offsets of the steps after the first: the target step's
         # own offsets plus the rewind to the accepted tokens.
@@ -209,16 +167,13 @@ class SharedKVCacheLinearDraftMetadata(DraftMetadata):
             (num_rows,), torch.int, "rewind_kv_lens_offsets"
         )
         self._one_token_per_seq = torch.ones((num_rows,), dtype=torch.int)
+        self._target_inputs: Optional["BatchInputs"] = None
 
     def prepare(self, inputs: "BatchInputs") -> None:
-        super().prepare(inputs)
-        if not inputs.stage_host:
-            return
-        if inputs.spec is not None and inputs.spec.runtime_draft_len > 0:
-            self.draft.prepare_all(inputs)
+        # The target's latest layout, also after a device-only prepare.
+        self._target_inputs = inputs
 
     def begin_draft_loop(self, num_accepted: torch.Tensor) -> None:
-        super().begin_draft_loop(num_accepted)
         target = self._target_inputs
         if target.spec.num_extend_ctx_requests > 0:
             raise UnsupportedMetadataConfiguration("a draft loop after extend-context rows")
@@ -237,22 +192,29 @@ class SharedKVCacheLinearDraftMetadata(DraftMetadata):
 
     def begin_draft_step(self, step: int) -> None:
         target = self._target_inputs
-        spec = dataclasses.replace(
-            target.spec, draft=DraftStepInputs(step=step, num_accepted=self._num_accepted)
-        )
+        draft = self.draft
+        num_seqs = target.num_seqs
         if step == 0:
-            inputs = dataclasses.replace(target, spec=spec, stage_host=False)
+            num_contexts = target.num_contexts
+            draft._set_rows(target.seq_lens, num_contexts)
+            draft.seq_lens_cuda.copy_(draft.base_seq_lens_cuda[:num_seqs])
         else:
-            inputs = dataclasses.replace(
-                target,
-                seq_lens=self._one_token_per_seq[: target.num_seqs],
-                num_contexts=0,
-                spec=spec,
-                kv_lens_offsets=self.rewind_kv_lens_offsets,
-                kv_lens_offset_delta=step - 1,
-                stage_host=False,
-            )
-        self.draft.prepare_all(inputs)
+            num_contexts = 0
+            draft._set_rows(self._one_token_per_seq[:num_seqs], num_contexts)
+            draft.seq_lens_cuda.fill_(1)
+        draft.invalidate_step_caches()
+        # Recomputed from the staged lengths at every step, so nothing accumulates.
+        kv_lens_cuda = draft.kv_lens_cuda[:num_seqs]
+        kv_lens_cuda.copy_(draft.base_kv_lens_cuda[:num_seqs])
+        if step == 0:
+            if target.kv_lens_offsets is not None and num_seqs > num_contexts:
+                kv_lens_cuda[num_contexts:] += target.kv_lens_offsets[: num_seqs - num_contexts]
+        else:
+            kv_lens_cuda += self.rewind_kv_lens_offsets[:num_seqs]
+            if step > 1:
+                kv_lens_cuda += step - 1
+        draft.host_request_types[:num_contexts].fill_(0)
+        draft.host_request_types[num_contexts:num_seqs].fill_(1)
 
 
 class EmbeddedDSparkDraftMetadata(DraftMetadata):
@@ -287,7 +249,6 @@ class StandaloneDSparkDraftMetadata(DraftMetadata):
         )
 
     def prepare(self, inputs: "BatchInputs") -> None:
-        super().prepare(inputs)
         if not inputs.stage_host:
             return
         self.config.draft_kv_cache_manager.copy_batch_block_offsets(

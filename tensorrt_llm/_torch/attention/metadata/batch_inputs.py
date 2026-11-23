@@ -44,16 +44,6 @@ class TokenPadding:
 
 
 @dataclass(frozen=True)
-class DraftStepInputs:
-    """One step of the one-model draft loop."""
-
-    step: int
-    # Tokens each request accepted in the target step: device tensor at a
-    # fixed address, [num_seqs].
-    num_accepted: torch.Tensor
-
-
-@dataclass(frozen=True)
 class SpecStepInputs:
     """Speculative decoding state of the step."""
 
@@ -70,8 +60,6 @@ class SpecStepInputs:
     tokens_per_gen_step: int = 1
     # Generation requests that run as the trailing context rows of the step.
     num_extend_ctx_requests: int = 0
-    # Set only on a draft step.
-    draft: Optional[DraftStepInputs] = None
 
 
 @dataclass(frozen=True)
@@ -99,9 +87,8 @@ class BatchInputs:
     backend_inputs: Any = None
     # Device-side correction of the KV lengths: a device tensor added to the
     # extend rows when the step has any, otherwise to the generation rows
-    # (indexed from 0 over those rows), plus a host scalar.
+    # (indexed from 0 over those rows).
     kv_lens_offsets: Optional[torch.Tensor] = None
-    kv_lens_offset_delta: int = 0
     # Whether prepare copies this step's host values into the device buffers.
     # False inside a forward (possibly inside a captured CUDA graph): prepare
     # then only derives on the device, from the buffers staged before.
@@ -137,7 +124,3 @@ class BatchInputs:
     @property
     def num_seqs(self) -> int:
         return int(self.seq_lens.shape[0])
-
-    @property
-    def draft(self) -> Optional[DraftStepInputs]:
-        return self.spec.draft if self.spec is not None else None

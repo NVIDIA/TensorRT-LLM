@@ -261,10 +261,7 @@ class TrtllmCoreMetadata(Metadata):
 
     def prepare(self, inputs: "BatchInputs") -> None:
         self.inputs = inputs
-        self.context_plan = None
-        self._mla_scheduler_buffers_valid = False
-        self._mla_ctx_cu_seqlens_valid = False
-        self._cute_dsl_mla_split_plan_key = None
+        self.invalidate_step_caches()
         self.trtllm_gen_jit_warmup = inputs.trtllm_gen_jit_warmup
         self.num_chunked_ctx_requests = (
             inputs.spec.num_extend_ctx_requests if inputs.spec is not None else 0
@@ -277,6 +274,13 @@ class TrtllmCoreMetadata(Metadata):
         if inputs.stage_host:
             self._stage_host(inputs)
         self._derive_lengths(inputs)
+
+    def invalidate_step_caches(self) -> None:
+        """Drop what the layers cached from the step's rows and lengths."""
+        self.context_plan = None
+        self._mla_scheduler_buffers_valid = False
+        self._mla_ctx_cu_seqlens_valid = False
+        self._cute_dsl_mla_split_plan_key = None
 
     def _stage_host(self, inputs: "BatchInputs") -> None:
         """Copy the step's host values into the device buffers."""
@@ -330,13 +334,7 @@ class TrtllmCoreMetadata(Metadata):
         """Derive this step's device lengths from the staged ones."""
         num_seqs = self.num_seqs
         num_contexts = self.num_contexts
-        draft = inputs.draft
-        seq_lens_cuda = self._seq_lens_cuda[:num_seqs]
-        if draft is not None and draft.step > 0:
-            # Later draft steps run one token per sequence.
-            seq_lens_cuda.fill_(1)
-        else:
-            seq_lens_cuda.copy_(self.base_seq_lens_cuda[:num_seqs])
+        self._seq_lens_cuda[:num_seqs].copy_(self.base_seq_lens_cuda[:num_seqs])
         kv_lens_cuda = self.kv_lens_cuda[:num_seqs]
         kv_lens_cuda.copy_(self.base_kv_lens_cuda[:num_seqs])
         num_extend = self.num_chunked_ctx_requests
@@ -348,8 +346,6 @@ class TrtllmCoreMetadata(Metadata):
         num_offset_rows = offset_rows.stop - offset_rows.start
         if inputs.kv_lens_offsets is not None and num_offset_rows > 0:
             kv_lens_cuda[offset_rows] += inputs.kv_lens_offsets[:num_offset_rows]
-        if inputs.kv_lens_offset_delta and num_offset_rows > 0:
-            kv_lens_cuda[offset_rows] += inputs.kv_lens_offset_delta
         self.host_request_types[:num_contexts].fill_(0)
         self.host_request_types[num_contexts:num_seqs].fill_(1)
         self.kv_lens_cuda_runtime = kv_lens_cuda
@@ -423,12 +419,16 @@ class TrtllmCoreMetadata(Metadata):
             dataclasses.replace(self.config, is_cuda_graph=True, cuda_graph_buffers=buffers),
         )
         assert isinstance(graph_metadata, TrtllmCoreMetadata)
-        graph_metadata.workspace = self.workspace
-        graph_metadata.cuda_graph_workspace = self.cuda_graph_workspace
+        for metadata in self._registry.ordered:
+            metadata.init_cuda_graph_metadata(graph_metadata.get_metadata(type(metadata)))
         graph_metadata._set_rows(
             torch.ones((max_batch_size,), dtype=torch.int) * (1 + max_draft_tokens), 0
         )
         return graph_metadata
+
+    def init_cuda_graph_metadata(self, graph_metadata: "TrtllmCoreMetadata") -> None:
+        graph_metadata.workspace = self.workspace
+        graph_metadata.cuda_graph_workspace = self.cuda_graph_workspace
 
     def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
         """The decode path of this backend does not depend on the KV regime."""
