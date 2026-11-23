@@ -15,13 +15,13 @@ In a 901-frame Cosmos3 generation run on one B200, decoding video latents into p
 - [Prior Art](#prior-art)
 - [Methodology](#methodology)
 - [Results](#results)
-- [Discussion](#discussion)
+- [Numerical accuracy of Winograd and Fourier convolution](#numerical-accuracy-of-winograd-and-fourier-convolution)
 - [Conclusions](#conclusions)
 - [Availability and data](#availability-and-data)
 
 ## Motivation and decoder architecture
 
-### Generation and decoder costs
+### Decoding cost in Cosmos3 video generation
 
 The transformer produces compressed video tensors called latents. The VAE decoder turns them into pixels. Reducing the number of denoising steps speeds up the transformer, but each frame still needs decoding. With two denoising steps per chunk (a group of frames processed together), decoding took 10.5 of the 26.6 seconds spent generating a 901-frame video on one B200.
 
@@ -43,7 +43,7 @@ The transformer produces compressed video tensors called latents. The VAE decode
 
 Convolutions account for about 46% of the reconstructed decoder time. The rest goes to normalization, activation, additions, upsampling, and copies. Winograd filtering targets the convolution time. Kernel fusion saves memory traffic between operations that read and write the same feature maps.
 
-### The decoder we are optimizing
+### Wan VAE decoder architecture
 
 The baseline is TensorRT-LLM's Wan 2.2 VAE in BF16, called **BF16 Wan VAE** here. Its decoder expands the latent representation through upsampling blocks. Spatial dimensions grow while channel counts decrease, so successive convolutions have different compute and memory costs. Residual blocks add a computed update to their input. Normalization and activation surround the convolutions with additional tensor reads and writes.
 
@@ -94,9 +94,9 @@ Choosing one of [cuDNN's Winograd convolution algorithms](https://docs.nvidia.co
 
 WinoVAE addresses the two parts of the profile together. First, it fuses the operations around convolution and removes repeated work in upsampling, causal initialization, and encoder downsampling. Second, it replaces suitable convolutions with spatial and temporal Winograd transforms followed by batched GEMMs. Finally, it partitions the feature maps across GPUs and fuses border communication into the kernels that already produce those maps.
 
-The implementation keeps BF16 model inputs and outputs. Its Winograd operands and products use FP16 storage, with optimized spatial interpolation points. The coefficient construction and precision choices are described below. The [Results](#coefficient-and-precision-comparisons) compare their errors, and the [Error analysis](#error-analysis) explains how rounding propagates through the transforms.
+The implementation keeps BF16 model inputs and outputs. Its Winograd operands and products use FP16 storage, with optimized spatial interpolation points. The coefficient construction and precision choices are described below. The [Results](#single-convolution-error-with-fp16-and-bf16-intermediates) compare their errors, and the [reconstruction error analysis](#rounding-error-in-winograd-reconstruction) explains how rounding propagates through the transforms.
 
-### Remove memory passes around convolution
+### Fusion of normalization, activation, and residual addition
 
 Memory traffic also arises between convolutions. Bias addition, residual addition, normalization, and activation need many of the same tensor values. Executing each as a separate pass repeatedly writes and rereads an intermediate. WinoVAE combines compatible operations and writes directly into the buffer required by the next convolution.
 
@@ -112,7 +112,7 @@ Memory traffic also arises between convolutions. Bias addition, residual additio
 
 Normalization reduces across channels in FP32. The fused path also applies the affine transformation and SiLU. Its output can include the convolution's temporal transform or be placed beside the causal history, avoiding a separate concatenation of the full input window.
 
-### Fold upsampling into a 2 × 2 convolution
+### Phase-specific 2 × 2 filters for nearest-neighbor upsampling
 
 Nearest-neighbor 2× upsampling repeats each source pixel in a 2 × 2 block. A subsequent 3 × 3 convolution reads only four distinct input values. Instead of multiplying each copy separately, WinoVAE sums the weights that multiply the same value. The resulting 2 × 2 filter operates on the original low-resolution input.
 
@@ -130,7 +130,7 @@ The grouping depends on whether the output row and column are even or odd. These
 
 This replaces nine products per output and channel pair with four, approaching a 2.25× arithmetic reduction on large images. The padded low-resolution convolution computes some unused border values, so the implementation's reduction is slightly smaller. It also avoids materializing the repeated input at four times the spatial size. Preparing the weight sums once preserves the convolution in exact arithmetic but changes floating-point rounding.
 
-### Remove copies from encoder downsampling
+### Fused padding and shortcut averaging in the encoder
 
 The encoder maps pixels into latents by reducing spatial dimensions. A downsampling block processes its input through residual blocks and strided convolutions, then adds an averaged shortcut. Two intermediate layouts in that computation require full tensor copies in the reference implementation.
 
@@ -181,9 +181,9 @@ y_{c,t,i,j}=z_{c,t,i,j}+b_c+A(r)_{c,t,i,j}.
 \qquad (5)
 $$
 
-Other reduction factors use their corresponding groups, including the reference's leading temporal zeros when needed. The optimization preserves the grouping and averaging operation while removing the rearrangement buffer and separate addition passes. The measured encoder improvement appears in [Results](#gb200-decoder-timing-and-fusion-savings).
+Other reduction factors use their corresponding groups, including the reference's leading temporal zeros when needed. The optimization preserves the grouping and averaging operation while removing the rearrangement buffer and separate addition passes. The measured encoder improvement appears in [Results](#gb200-decoder-speedup-and-fusion-measurements).
 
-### Avoid temporal work for the first frame
+### First-frame convolution with zero temporal history
 
 A causal 3 × 3 × 3 convolution can be written as three spatial convolutions. Split its weights into temporal slices $W_0$, $W_1$, and $W_2$, each containing a 3 × 3 spatial filter for every input/output-channel pair. Then
 
@@ -217,9 +217,9 @@ $$
 
 WinoVAE evaluates <a href="#eq-first-frame">Eq. 7</a> by selecting the current-frame weight slice $W_2$ and running a 2D convolution with the original spatial padding and bias. It avoids assembling a three-frame input and executing the two zero-valued temporal contributions. This is a threefold reduction in convolution products for that output, before accounting for kernel overhead.
 
-For an image-only decode, this first-frame case applies throughout the decoder. In a video, later frames need their history and use the full temporal computation. A one-frame chunk with nonzero history still needs all three temporal contributions. The image and video gains are measured separately in [Results](#gb200-decoder-timing-and-fusion-savings).
+For an image-only decode, this first-frame case applies throughout the decoder. In a video, later frames need their history and use the full temporal computation. A one-frame chunk with nonzero history still needs all three temporal contributions. The image and video gains are measured separately in [Results](#gb200-decoder-speedup-and-fusion-measurements).
 
-### Reduce convolution arithmetic with Winograd
+### Winograd minimal filtering
 
 The example below is Winograd's $F(2,3)$ minimal-filtering algorithm, reproduced in [Lavin and Gray, *Fast Algorithms for Convolutional Neural Networks*, Section 4.1, Eq. (5)](https://arxiv.org/pdf/1509.09308#page=2).
 
@@ -263,7 +263,7 @@ In $F(m,r)$, $m$ is the number of outputs and $r$ the filter length. The constru
 
 *Figure 6. The four stages of the one-dimensional construction. The fixed matrices B, G, and A implement input transformation, filter transformation, and reconstruction. Filter preparation runs once at weight loading. Input and output transforms run per tile on ordinary GPU execution units. With multiple channels, the product stage can use batched GEMMs on Tensor Cores. Each product index identifies one transform coordinate.*
 
-#### Mapping channels and tiles to GEMMs
+#### Batched GEMMs across Winograd tiles
 
 With multiple input channels, each $m_i$ becomes a sum of products over channels. We can evaluate the same coordinate $i$ for many tiles in one GEMM. Put each tile's transformed input channels in a row of $V_i$, and the transformed filters in $U_i$:
 
@@ -318,7 +318,7 @@ For a 360 × 640 feature frame with 256 input and output channels, spatial F2 pr
 
 The same idea applies along time. Temporal F4 combines four current frames and two history frames into six spatial-convolution problems, replacing twelve direct temporal contributions. Combined with spatial F4, the product count is $6\times36/(4\times16)=3.375$ per output and input/output-channel pair, compared with 27 for direct 3D convolution. This eightfold arithmetic reduction applies to that convolution. A complete decoder still includes transforms and other layers, and some levels have too few frames available to use temporal F4.
 
-### Interpolation and transform coefficients
+### Winograd transforms from polynomial interpolation
 
 The transform coefficients come from polynomial arithmetic. To see the construction, take an auxiliary two-element sequence $a=[a_0,a_1]$ and the three filter coefficients $g=[g_0,g_1,g_2]$, and write
 
@@ -368,17 +368,17 @@ This example maps two sequence elements to four full-convolution coefficients. T
 
 For one-dimensional $F(m,r)$, the polynomial product has $m+r-1$ coefficients, so the construction needs that many independent values: four for $F(2,3)$, six for $F(4,3)$. Applying the six-point construction along both spatial axes gives the 36 coordinates of spatial F4. Other valid point sets give the same convolution in exact arithmetic, but change the transform coefficients, intermediate magnitudes, and cancellation during reconstruction. That changes how much rounding error reaches the output. [Barabasz et al.](https://arxiv.org/abs/1803.10986) analyze this floating-point behavior.
 
-### Choosing coefficients and intermediate precision
+### Interpolation points and FP16 intermediate storage
 
 Model precision and intermediate precision are separate choices. WinoVAE keeps BF16 model inputs and outputs but stores transformed intermediates in FP16. Both formats occupy 16 bits. FP16 spends three more bits on the fraction, giving roughly eightfold finer spacing in its normal range, in exchange for a narrower exponent range.
 
-We searched for points that reduce rounding sensitivity across the input, filter, and output transforms together. A continuous numerical search found a low-error set. A separate fraction grid found the nearby set $0,\pm3/2,\pm5/8,\infty$, which WinoVAE uses for spatial F4. The search does not prove global optimality. The [measurement notes](../media/tech_blog31/measurement_notes.md#precision-study) give the sensitivity objective and search procedure. The [coefficient and precision comparisons](#coefficient-and-precision-comparisons) report the measured errors.
+We searched for points that reduce rounding sensitivity across the input, filter, and output transforms together. A continuous numerical search found a low-error set. A separate fraction grid found the nearby set $0,\pm3/2,\pm5/8,\infty$, which WinoVAE uses for spatial F4. The search does not prove global optimality. The [measurement notes](../media/tech_blog31/measurement_notes.md#precision-study) give the sensitivity objective and search procedure. The [single-convolution simulations](#single-convolution-error-with-fp16-and-bf16-intermediates) report the measured errors.
 
 The temporal $F(4,3)$ transform uses a different set: $0,1,-1,2,-1/2,\infty$. Its transformed inputs, weights, and products also use FP16 storage. The point search and isolated error measurements in Table 7 apply only to spatial F4.
 
 We also evaluated larger spatial tiles with balanced transform ranges. That balancing rescales input and filter coordinates by powers of two and compensates in the output transform. It prevents some underflow and subnormal precision loss, but cannot add fraction bits.
 
-### Account for transforms and workspace
+### Winograd arithmetic and workspace per output pixel
 
 The next obstacle is data movement. A direct cuDNN implicit-GEMM kernel computes a matrix multiplication using convolution patches assembled on demand, without storing the expanded input matrix. A Winograd implementation that materializes transformed inputs V and products M pays for those buffers as well as the transforms.
 
@@ -404,13 +404,13 @@ For equal channel counts $C$, direct spatial convolution takes $18C^2$ FLOPs per
 
 The V and M buffers occupy $4C(m+2)^2/m^2$ bytes per output pixel. That is 16 KiB for F2 and 9 KiB for F4 at 1024 channels, or 16 and 9 bytes per channel. Reading and writing both buffers doubles those bytes before cache effects: 32 KiB and 18 KiB per pixel. Original inputs, outputs, weights, and library workspace are outside this count. A fused kernel can avoid an intermediate round trip if it retains those values on chip.
 
-### Choose convolution implementations for different layers
+### Convolution kernel selection by layer shape
 
 GEMM work grows with $C_{\mathrm{in}}C_{\mathrm{out}}$, while intermediate traffic grows with the individual channel counts. At high channel counts, reducing GEMM work can save more time than the transforms add. Later, when the feature maps are larger and channel counts smaller, eliminating memory passes becomes more important.
 
 The two-dimensional paths apply Winograd along both height and width: $F(2\times2,3\times3)$ uses cuBLAS batched GEMMs, while $F(4\times4,3\times3)$ uses specialized Blackwell kernels in this comparison. The final 256-output-channel level uses a different decomposition: one-dimensional $F(2,3)$ along width, with direct filtering along height. This fused kernel keeps intermediates on chip and applies the output transform to accumulated GEMM sums held in Blackwell's Tensor Memory, an on-chip store for Tensor Core accumulators.
 
-### Partition the decoder across GPUs
+### Spatial sharding and halo exchange
 
 After reducing work within one GPU, spatial partitioning distributes the remaining work. WinoVAE divides each feature frame into strips and assigns each strip to one GPU. Each GPU retains all channels and temporal history for its strip, keeping channel normalization and purely temporal convolutions local.
 
@@ -446,7 +446,7 @@ Alternating between two buffers protects transformed frames still being consumed
 
 The convolution sweep measures how kernel choice depends on layer shape. Full VAE and generation timings also include the work between convolutions. Hardware, weights, and timing procedures are recorded for each experiment in the [measurement notes](../media/tech_blog31/measurement_notes.md).
 
-### Convolution speedup over cuDNN and kernel assignment
+### Layer benchmarks against cuDNN
 
 <a id="figure-12"></a>
 
@@ -473,7 +473,7 @@ WinoVAE selects among these paths using the channel count and the temporal frame
 | Next up block: 512 channels | 4 | Temporal F4 + spatial F4 |
 | Final residual level: 256 output channels | 4 | Temporal F4 + fused width F2. Direct height filtering |
 
-### Complete encoder and decoder performance
+### Encoder and decoder latency on B300 and H200
 
 Figures 13 and 14 time complete encoder and decoder calls, including attention, causal history, and output assembly. Each panel compares implementations on the same GPU for image, video, or streaming inputs.
 
@@ -501,7 +501,7 @@ For the 189-frame 720p workload, B300 decode falls from 4618.1 to 1268.5 ms (**3
 
 On one **H200**, the same 189-frame 720p workload fell from **7.65 to 2.61 seconds (2.93×)** for decode and from **2.44 to 0.92 seconds (2.65×)** for encode. Here the Winograd GEMMs run through cuBLAS.
 
-### GB200 decoder timing and fusion savings
+### GB200 decoder speedup and fusion measurements
 
 On one GB200, the complete 189-frame 720p decode fell from 5959.3 ms with BF16 Wan VAE to 1614.7 ms with WinoVAE, a **3.69× speedup**.
 
@@ -534,7 +534,7 @@ Isolated gains do not add reliably: removing a kernel changes cache use, clocks,
 
 On a GB200 720p encode, the padding copy accounted for about 70 ms and the shortcut rearrangement plus averaging for about 100 ms. Removing these passes together with block-exit Winograd combines and deferred biases reduced encoding from **921 to 741 ms (20%)**. That measurement covers the group, so it cannot assign the full 180 ms saving to either copy alone.
 
-### Accuracy with trained weights
+### Encoder and decoder accuracy against FP32 Diffusers
 
 Accuracy is tested separately with trained Cosmos3-Nano VAE weights and a real 121-frame clip resized from 832 × 480 to 1280 × 720. The Wan VAE implementation in Hugging Face Diffusers, evaluated in FP32, is the numerical reference. Every implementation receives the same input. Decode latents come from the reference's encoding, so differences in encoding cannot change the decoder's test input. Diffusers in BF16 provides an additional baseline for rounding error. Relative-L2 error is the norm of the output difference divided by the reference-output norm.
 
@@ -550,7 +550,7 @@ Accuracy is tested separately with trained Cosmos3-Nano VAE weights and a real 1
 
 For this checkpoint and input, WinoVAE remains near the existing BF16 implementations' error scale. Establishing broader perceptual quality requires evaluation across videos.
 
-### Peak memory and frame buffers
+### Frame-buffer capacity and peak memory
 
 The transformed tensors in Figure 10 are only part of the memory footprint. WinoVAE also reserves frame buffers to reuse storage across chunks. `frame_buffer_chunks` controls their capacity: smaller buffers wrap more often and need more history copies, but reduce peak allocated memory.
 
@@ -566,9 +566,9 @@ The transformed tensors in Figure 10 are only part of the memory footprint. Wino
 
 Reducing capacity from four chunks to one saves 1.52 GiB at a measured latency cost of 0.8%. The spatial Winograd workspace remains allocated at every frame-buffer capacity.
 
-### Comparison with the existing dynamic NVFP4 decoder
+### WinoVAE and dynamic NVFP4 decoder performance
 
-TensorRT-LLM already provides a direct [NVFP4 Wan VAE path](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/models/wan/vae_loader.py). We compare WinoVAE with that implementation here. Quantizing Winograd products is a separate experiment in the [Discussion](#discussion).
+TensorRT-LLM already provides a direct [NVFP4 Wan VAE path](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/models/wan/vae_loader.py). We compare WinoVAE with that implementation here. The [single-convolution experiments](#nvfp4-quantization-of-winograd-operands) measure the error introduced by quantizing transformed operands.
 
 On one B300, WinoVAE decoded the 121-frame 720p clip in **797 ms versus 2327 ms for dynamic NVFP4**, a **2.92× speedup**. Relative-L2 error was **0.288% versus 2.530%**, with higher first-call peak allocation: **17.73 versus 13.49 GiB**.
 
@@ -591,7 +591,7 @@ The 480p result shows the same trade-off: about 2.9× faster decoding and lower 
 
 The memory figures include lazy initialization, such as packing NVFP4 weights, and any autotuning allocations made during that first call. The NVFP4 implementation retains BF16 weights alongside cached packed weights and quantizes BF16 activations into additional buffers. These measurements do not establish steady-state memory use or include CUDA-graph capture.
 
-### Generation time and eager execution
+### End-to-end generation latency on B300
 
 On one B300, WinoVAE reduced generation time for 901 frames at 832 × 480 from **20.5 to 16.5 seconds** with Cosmos3-Nano-Sim-Bimanual. The decoder’s contribution fell from 5.84 to 2.72 seconds. This run used eager execution, which launches VAE kernels individually. Figure 15 times a decoder alone under CUDA-graph replay. The B300 integration started with some decoder kernels already fused. Figure 1 used the original BF16 decoder on a B200.
 
@@ -601,7 +601,7 @@ CUDA graphs avoid repeated CPU launch overhead, but the main video workloads wer
 
 The same integration also tested two execution arrangements. Overlapping decode with the transformer on a side stream of one GPU took 21.0 seconds for BF16 Wan VAE and 16.9 seconds for WinoVAE, slightly slower than sequential execution for both. With decode on a second GPU, generation took 15.2 and 14.2 seconds respectively. Once decode was hidden, faster conditioning-frame encoding supplied most of the remaining saving. These complete-generation timings use a different execution setup from the isolated CUDA-graph decoder measurements.
 
-### Communication overhead at a fixed GPU count
+### Halo exchange latency on four GB200 GPUs
 
 <a id="figure-16"></a>
 
@@ -615,7 +615,7 @@ The same integration also tested two execution arrangements. Overlapping decode 
 
 Fused GPUDirect P2P reduces 720p decode from 460.3 to 420.6 ms (8.6%) and 480p decode from 183.5 to 150.7 ms (17.9%). Encoding also improves: 147.7 to 144.1 ms (2.4%) at 720p and 49.2 to 45.0 ms (8.5%) at 480p. Fusion removes packing and unpacking while leaving convolution arithmetic unchanged. Its effect on total latency depends on how much time each workload spends in those copies and launches. Figure 16 shows width partitioning. The measurement notes also record results for height partitioning. Kernel count falls from about 16,400 to 12,000 per 720p decode. The lower launch and copy overhead matters increasingly as the frame is split across more GPUs: each GPU's convolution work shrinks, while a width split leaves the halo's height and channel count unchanged.
 
-### Strong scaling and uneven partitions
+### Strong scaling with width sharding
 
 <a id="figure-17"></a>
 
@@ -654,9 +654,9 @@ A separate B300 experiment measures strong scaling with NCCL halo exchange. With
 
 Eight GPUs give a 3.63× decode speedup and a 5.32× encode speedup. Communication and synchronization remain as each GPU receives less convolution work, limiting scaling efficiency. Fused GPUDirect P2P addresses one recurring part of that overhead, as the fixed-GPU-count comparison above shows.
 
-### Coefficient and precision comparisons
+### Single-convolution error with FP16 and BF16 intermediates
 
-Table 7 compares the spatial-F4 point sets and intermediate storage formats described in [Methodology](#choosing-coefficients-and-intermediate-precision). These simulations measure rounding error in a single convolution, separately from the trained-model accuracy measurements above.
+Table 7 compares the spatial-F4 point sets and intermediate storage formats described in [Methodology](#interpolation-points-and-fp16-intermediate-storage). These simulations measure rounding error in a single convolution, separately from the trained-model accuracy measurements above.
 
 <a id="table-7"></a>
 
@@ -672,11 +672,11 @@ The implemented fractions retain nearly all the accuracy benefit of the continuo
 
 Larger tiles increase the numerical difficulty. In separate simulations, F6 reached about 0.73% FP16 storage error and optimized F8 about 4.0%, even after balancing the transform ranges. F4 provided a more useful combination of arithmetic reduction and accuracy for this implementation.
 
-## Discussion
+## Numerical accuracy of Winograd and Fourier convolution
 
 The complete-model measurements put the chosen FP16 Winograd paths near the BF16 reference error scale for the tested inputs. Numerical experiments explain why other tile sizes and storage formats can behave differently, and what limits further reductions in arithmetic.
 
-### Error analysis
+### Rounding error in Winograd reconstruction
 
 The four-product construction in <a href="#eq-winograd-f23">Eq. 9</a> is exact, but its terms can be much larger than the final output. Large intermediate values may cancel during reconstruction while their rounding errors remain. FP32 accumulation cannot recover bits already lost when the GEMM operands were stored.
 
@@ -691,7 +691,7 @@ $$
 
 In <a href="#eq-reconstruction-error">Eq. 14</a>, $\Delta Y_{\mathrm{out}}$ represents rounding in reconstruction itself. Errors introduced in V, U, or stored M pass through the output transform. Cancellation can make the exact output small without making the independently rounded errors small. Point optimization must account for the input, filter, and output transforms together. The size of the GEMM operands alone does not determine output error.
 
-### Quantizing the Winograd products
+### NVFP4 quantization of Winograd operands
 
 Combining NVFP4 with Winograd is a separate numerical problem. If $Q_4$ is NVFP4 quantization, $d$ an input tile, and $B$ the Winograd input-transform matrix, then $Q_4(B^TdB)\ne B^TQ_4(d)B$. Winograd quantizes transformed operands, and reconstruction can amplify their errors.
 
@@ -699,11 +699,9 @@ Combining NVFP4 with Winograd is a separate numerical problem. If $Q_4$ is NVFP4
 
 These results concern the tested quantization recipes, not every possible NVFP4 Winograd implementation. Reconstruction-aware calibration remains untested. The [measurement notes](../media/tech_blog31/measurement_notes.md#channel-sorting-and-scale-search) describe the channel-grouping experiments and their arithmetic assumptions.
 
-### Fourier-domain convolution
+### Tiled Fourier convolution
 
 Fourier convolution evaluates the channel products in the frequency domain. An inverse transform reconstructs the pixels. Because the Fourier basis is orthogonal, the inverse transform scales errors of equal norm equally, whichever frequencies contain them. That property matters when the products come from quantized operands. The tile construction and NVFP4 results below are our experiments. For the underlying FFT convolution method, see [Mathieu et al., *Fast Training of Convolutional Networks through FFTs*](https://arxiv.org/abs/1312.5851).
-
-#### Transform, multiply, and reconstruct
 
 Consider a 6 × 6 input tile $d_c[u,v]$ and a 3 × 3 filter $g_{oc}[r,s]$, where $c$ and $o$ index input and output channels. The valid output is 4 × 4. For each frequency $k,l=0,\ldots,5$, compute
 
@@ -731,7 +729,7 @@ $$
 
 Retain only $p,q=0,1,2,3$. Substituting <a href="#eq-fourier-forward">Eq. 15</a> into <a href="#eq-fourier-inverse">Eq. 16</a> selects the input positions $(p+r,q+s)$ modulo 6. These indices never wrap in the retained region, so the result is exactly the valid 3 × 3 convolution. Adjacent input tiles overlap by two pixels and produce disjoint output tiles.
 
-#### Real GEMMs and the product count
+#### Conjugate symmetry and the real GEMM count
 
 Real inputs and filters have conjugate-symmetric spectra: the coefficient at $(-k\bmod6,-l\bmod6)$ is the complex conjugate of the coefficient at $(k,l)$. Four frequencies, with both indices in $\{0,3\}$, are self-conjugate and have zero imaginary part. The remaining 32 frequencies form 16 pairs. Only one member of each pair needs to be computed.
 
@@ -749,7 +747,7 @@ $$
 
 Counting the four real frequencies and the 16 complex pairs gives $4+16\times4=68$ real channel dot products per 4 × 4 output tile, compared with 144 for direct convolution and 36 for spatial F4. We label this configuration **Fourier68** in Figure 19 and Table 8. The count excludes transforms and the additions in <a href="#eq-fourier-real-gemms">Eq. 17</a>.
 
-#### Why reconstruction behaves differently
+#### Error bound for inverse Fourier reconstruction
 
 The Fourier basis is orthogonal. Let $\Delta S$ contain errors in all 36 combined frequency products, including both members of every conjugate pair, and let $\Delta z$ be the error after the full 6 × 6 inverse transform. With the normalization in <a href="#eq-fourier-inverse">Eq. 16</a>, Parseval's identity gives
 
@@ -765,6 +763,8 @@ $$
 The squared norms in <a href="#eq-fourier-error">Eq. 18</a> sum squared magnitudes over the tile. Cropping to the valid output cannot increase that sum. The factor $1/36$ reflects the transform normalization: with a unitary normalization, the full inverse transform preserves squared error. Unlike reconstruction through a poorly conditioned transform, it does not amplify some frequency-error directions more than others.
 
 This bound starts from the combined product error $\Delta S$ and assumes exact reconstruction. Quantizing the operands still changes those products, channel sums can still cancel, and a small true output can still have a large relative error. Finite-precision transforms and reconstruction introduce additional rounding.
+
+### NVFP4 error by convolution algorithm
 
 Figure 19 compares these decompositions on matched synthetic spatial 3 × 3 convolutions. This experiment measures error in one convolution, separately from the whole-decoder results in Table 5. Both operands are quantized to NVFP4, while transforms, accumulation, and reconstruction use FP64. For the Fourier construction, the quantized operands are the real matrices in <a href="#eq-fourier-real-gemms">Eq. 17</a>.
 
