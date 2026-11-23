@@ -35,6 +35,18 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 
+@pytest.mark.cpu_only
+def test_flashinfer_rejects_swa_scratch_before_buffer_allocation() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = True
+    metadata = object.__new__(FlashInferAttentionMetadata)
+    metadata.kv_cache_manager = manager
+    with pytest.raises(
+            ValueError,
+            match="FlashInfer attention does not support SWA scratch reuse"):
+        metadata.__post_init__()
+
+
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
 
     def __init__(self, *args, **kwargs):
