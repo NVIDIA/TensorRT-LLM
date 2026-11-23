@@ -286,7 +286,28 @@ class TelemetryGroup(click.Group):
 
     def invoke(self, ctx: click.Context) -> Any:
         usage.set_lifecycle_phase("config_validation")
-        return super().invoke(ctx)
+        try:
+            return super().invoke(ctx)
+        except (KeyboardInterrupt, click.Abort) as exc:
+            if _contains_keyboard_interrupt(exc):
+                usage.record_observed_signal(signal.SIGINT)
+            raise
+        except click.ClickException as exc:
+            if not llm_initialized():
+                usage.record_startup_error_category(classify_startup_error(exc).category)
+            raise
+
+    def make_context(self, *args: Any, **kwargs: Any) -> click.Context:
+        try:
+            return super().make_context(*args, **kwargs)
+        except click.ClickException as exc:
+            # Click's standalone exit can discard the exception chain.
+            if not llm_initialized():
+                usage.record_startup_error_category(classify_startup_error(exc).category)
+            raise
+        except KeyboardInterrupt:
+            usage.record_observed_signal(signal.SIGINT)
+            raise
 
     def resolve_command(self, ctx: click.Context, args: list[str]) -> tuple:
         """Resolve which Click CLI subcommand was used to start TRT-LLM."""

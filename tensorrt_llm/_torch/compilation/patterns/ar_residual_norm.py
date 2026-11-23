@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from operator import getitem
@@ -8,14 +8,13 @@ import torch
 from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
                                              KeywordArg, Match,
                                              MultiOutputPattern,
-                                             PatternMatcherPass, fwd_only,
-                                             register_replacement)
+                                             PatternMatcherPass)
 
 from tensorrt_llm.mapping import Mapping
 
 from ...custom_ops.torch_custom_ops import BufferKind
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
-from . import MATCHER_SUBSYSTEM, _make_pattern_example_inputs
+from . import MATCHER_SUBSYSTEM, _register_pattern_replacement
 
 aten = torch.ops.aten
 
@@ -79,17 +78,6 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass, mapping: Mapping,
     ar_residual_norm_pattern = MultiOutputPattern(
         [_torch_rms_norm_default, add_Tensor])
 
-    def empty_pattern(
-        input: torch.Tensor,
-        workspace: torch.LongTensor,
-        residual: torch.Tensor,
-        strategy: int,
-        norm_weight: torch.nn.Parameter,
-        eps: float,
-        trigger_completion_at_end: bool,
-    ):
-        return
-
     def target_pattern(
         input: torch.Tensor,
         workspace: torch.LongTensor,
@@ -123,15 +111,10 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass, mapping: Mapping,
 
         return True
 
-    register_replacement(
-        empty_pattern,
-        target_pattern,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=ar_residual_norm_pattern,
-        extra_check=extra_check,
-    )
+    _register_pattern_replacement(ar_residual_norm_pattern,
+                                  target_pattern,
+                                  custom_pass,
+                                  extra_check=extra_check)
 
 
 def check_f16_bf16_input(match, input_node) -> bool:
@@ -188,18 +171,6 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
     pattern_without_scale = MultiOutputPattern(
         [getitem_0, getitem_1, getitem_2])  # norm_out, residual_out, quant_out
 
-    def empty_pattern(
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        gamma: torch.Tensor,
-        workspace: torch.LongTensor,
-        strategy: int,
-        eps: float,
-        scale: torch.Tensor,
-        trigger_completion_at_end: bool,
-    ):
-        return
-
     def target_pattern(
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -241,25 +212,15 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
         input_node, strategy_node, static_quantize_e4m3_per_tensor_default,
         False)
 
-    register_replacement(
-        empty_pattern,
-        target_pattern,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=pattern_with_scale,
-        extra_check=extra_check_with_scale,
-    )
+    _register_pattern_replacement(pattern_with_scale,
+                                  target_pattern,
+                                  custom_pass,
+                                  extra_check=extra_check_with_scale)
 
-    register_replacement(
-        empty_pattern,
-        target_pattern_without_scale,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=pattern_without_scale,
-        extra_check=extra_check_without_scale,
-    )
+    _register_pattern_replacement(pattern_without_scale,
+                                  target_pattern_without_scale,
+                                  custom_pass,
+                                  extra_check=extra_check_without_scale)
 
 
 def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
@@ -295,18 +256,6 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
         [getitem_1, getitem_2, getitem_3])  # residual_out, quant_out, scale
     pattern_without_scale = MultiOutputPattern([getitem_1, getitem_2
                                                 ])  # residual_out, quant_out
-
-    def empty_pattern(
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        gamma: torch.Tensor,
-        workspace: torch.LongTensor,
-        strategy: int,
-        eps: float,
-        scale: torch.Tensor,
-        trigger_completion_at_end: bool,
-    ):
-        return
 
     def target_pattern(
         input: torch.Tensor,
@@ -347,25 +296,15 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
         input_node, strategy_node, static_quantize_e4m3_per_tensor_default,
         False)
 
-    register_replacement(
-        empty_pattern,
-        target_pattern,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=pattern_with_scale,
-        extra_check=extra_check_with_scale,
-    )
+    _register_pattern_replacement(pattern_with_scale,
+                                  target_pattern,
+                                  custom_pass,
+                                  extra_check=extra_check_with_scale)
 
-    register_replacement(
-        empty_pattern,
-        target_pattern_without_scale,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=pattern_without_scale,
-        extra_check=extra_check_without_scale,
-    )
+    _register_pattern_replacement(pattern_without_scale,
+                                  target_pattern_without_scale,
+                                  custom_pass,
+                                  extra_check=extra_check_without_scale)
 
 
 def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
@@ -397,18 +336,6 @@ def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
     getitem_3 = CallFunction(getitem, fp4_quant_default, 1)
     pattern = MultiOutputPattern([getitem_0, getitem_1, getitem_2, getitem_3])
 
-    def empty_pattern(
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        gamma: torch.Tensor,
-        workspace: torch.LongTensor,
-        strategy: int,
-        eps: float,
-        scale: torch.Tensor,
-        trigger_completion_at_end: bool,
-    ):
-        return
-
     def target_pattern(
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -430,15 +357,10 @@ def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
         return check_f16_bf16_input(
             match, input_node) and check_non_ub_strategy(match, strategy_node)
 
-    register_replacement(
-        empty_pattern,
-        target_pattern,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=pattern,
-        extra_check=extra_check,
-    )
+    _register_pattern_replacement(pattern,
+                                  target_pattern,
+                                  custom_pass,
+                                  extra_check=extra_check)
 
 
 def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
@@ -470,18 +392,6 @@ def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
     getitem_3 = CallFunction(getitem, fp4_quant_default, 1)
     pattern = MultiOutputPattern([getitem_1, getitem_2, getitem_3])
 
-    def empty_pattern(
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        gamma: torch.Tensor,
-        workspace: torch.LongTensor,
-        strategy: int,
-        eps: float,
-        scale: torch.Tensor,
-        trigger_completion_at_end: bool,
-    ):
-        return
-
     def target_pattern(
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -502,15 +412,10 @@ def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
         return check_f16_bf16_input(
             match, input_node) and check_non_ub_strategy(match, strategy_node)
 
-    register_replacement(
-        empty_pattern,
-        target_pattern,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=pattern,
-        extra_check=extra_check,
-    )
+    _register_pattern_replacement(pattern,
+                                  target_pattern,
+                                  custom_pass,
+                                  extra_check=extra_check)
 
 
 def register_ub_patterns(custom_passes: List[PatternMatcherPass],
@@ -528,16 +433,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                                                 Ignored(), mapping.tp_group,
                                                 strategy, fusion,
                                                 KeywordArg('eps'), Ignored())
-
-        def empty_convert_supported_ar_to_ub(
-            input: torch.Tensor,
-            residual_in: torch.Tensor,
-            gamma: torch.Tensor,
-            scale: Optional[torch.Tensor],
-            fusion_op: int,
-            eps: float,
-        ):
-            return
 
         def target_convert_supported_ar_to_ub(
             input: torch.Tensor,
@@ -573,15 +468,11 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
             return True
 
-        register_replacement(
-            empty_convert_supported_ar_to_ub,
+        _register_pattern_replacement(
+            trtllm_allreduce_default,
             target_convert_supported_ar_to_ub,
-            _make_pattern_example_inputs(empty_convert_supported_ar_to_ub),
-            fwd_only,
             custom_pass,
-            search_fn_pattern=trtllm_allreduce_default,
-            extra_check=extra_check_convert_supported_ar_to_ub,
-        )
+            extra_check=extra_check_convert_supported_ar_to_ub)
 
     def register_ub_prologue_patterns(custom_pass: PatternMatcherPass):
 
@@ -595,17 +486,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 mapping.tp_group)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_cublas_scaled_mm_default)
-
-            def empty_scaled_mm_prologue_pattern(
-                mm0_a: torch.Tensor,
-                mm0_b: torch.Tensor,
-                mm0_a_scale: torch.Tensor,
-                mm0_b_scale: torch.Tensor,
-                mm0_bias: Optional[torch.Tensor],
-                mm_dtype: torch.dtype,
-                output_buffer_kind: int,
-            ):
-                return
 
             def target_scaled_mm_prologue_pattern(
                 mm0_a: torch.Tensor,
@@ -623,14 +503,9 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
             # No extra check needed as the output dtype of scaled_mm has been verified when
             # ub_copy is inserted.
-            register_replacement(
-                empty_scaled_mm_prologue_pattern,
-                target_scaled_mm_prologue_pattern,
-                _make_pattern_example_inputs(empty_scaled_mm_prologue_pattern),
-                fwd_only,
-                custom_pass,
-                search_fn_pattern=ub_copy,
-            )
+            _register_pattern_replacement(ub_copy,
+                                          target_scaled_mm_prologue_pattern,
+                                          custom_pass)
 
         def register_nvfp4_gemm_prologue(custom_pass: PatternMatcherPass):
             act_fp4_key = KeywordArg('act_fp4')
@@ -647,18 +522,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 output_buffer_kind_key, allowed_backends_key, mapping.tp_group)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
-
-            def empty_nvfp4_gemm_prologue_pattern(
-                act_fp4: torch.Tensor,
-                weight: torch.Tensor,
-                act_sf: torch.Tensor,
-                weight_scale: torch.Tensor,
-                alpha: torch.Tensor,
-                output_dtype: torch.dtype,
-                output_buffer_kind: int,
-                allowed_backends: str,
-            ):
-                return
 
             def target_nvfp4_gemm_prologue_pattern(
                 act_fp4: torch.Tensor,
@@ -685,19 +548,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             ub_copy_with_bias = CallFunction(
                 torch.ops.trtllm.copy_to_userbuffers,
                 trtllm_nvfp4_gemm_with_bias_default)
-
-            def empty_nvfp4_gemm_bias_prologue_pattern(
-                act_fp4: torch.Tensor,
-                weight: torch.Tensor,
-                act_sf: torch.Tensor,
-                weight_scale: torch.Tensor,
-                alpha: torch.Tensor,
-                output_dtype: torch.dtype,
-                output_buffer_kind: int,
-                allowed_backends: str,
-                bias: Optional[torch.Tensor],
-            ):
-                return
 
             def target_nvfp4_gemm_bias_prologue_pattern(
                 act_fp4: torch.Tensor,
@@ -735,37 +585,21 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
                 return True
 
-            register_replacement(
-                empty_nvfp4_gemm_prologue_pattern,
-                target_nvfp4_gemm_prologue_pattern,
-                _make_pattern_example_inputs(empty_nvfp4_gemm_prologue_pattern),
-                fwd_only,
-                custom_pass,
-                search_fn_pattern=ub_copy,
-                extra_check=extra_check,
-            )
-            register_replacement(
-                empty_nvfp4_gemm_bias_prologue_pattern,
+            _register_pattern_replacement(ub_copy,
+                                          target_nvfp4_gemm_prologue_pattern,
+                                          custom_pass,
+                                          extra_check=extra_check)
+            _register_pattern_replacement(
+                ub_copy_with_bias,
                 target_nvfp4_gemm_bias_prologue_pattern,
-                _make_pattern_example_inputs(
-                    empty_nvfp4_gemm_bias_prologue_pattern),
-                fwd_only,
                 custom_pass,
-                search_fn_pattern=ub_copy_with_bias,
-                extra_check=extra_check,
-            )
+                extra_check=extra_check)
 
         def register_mm_prologue(custom_pass: PatternMatcherPass):
             aten_mm_default = CallFunction(aten.mm.default, KeywordArg('mm0_a'),
                                            KeywordArg('mm0_b'))
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    aten_mm_default)
-
-            def empty_mm_prologue_pattern(
-                mm0_a: torch.Tensor,
-                mm0_b: torch.Tensor,
-            ):
-                return
 
             def target_mm_prologue_pattern(
                 mm0_a: torch.Tensor,
@@ -776,14 +610,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
             # No extra check needed as the output dtype of mm has been verified when
             # ub_copy is inserted.
-            register_replacement(
-                empty_mm_prologue_pattern,
-                target_mm_prologue_pattern,
-                _make_pattern_example_inputs(empty_mm_prologue_pattern),
-                fwd_only,
-                custom_pass,
-                search_fn_pattern=ub_copy,
-            )
+            _register_pattern_replacement(ub_copy, target_mm_prologue_pattern,
+                                          custom_pass)
 
         def register_add_prologue(custom_pass: PatternMatcherPass):
             aten_add_default = CallFunction(aten.add.Tensor,
@@ -791,12 +619,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                                             KeywordArg('add_b'))
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    aten_add_default)
-
-            def empty_add_prologue_pattern(
-                add_a: torch.Tensor,
-                add_b: torch.Tensor,
-            ):
-                return
 
             def target_add_prologue_pattern(
                 add_a: torch.Tensor,
@@ -807,14 +629,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
             # No extra check needed as the output dtype of add has been verified when
             # ub_copy is inserted.
-            register_replacement(
-                empty_add_prologue_pattern,
-                target_add_prologue_pattern,
-                _make_pattern_example_inputs(empty_add_prologue_pattern),
-                fwd_only,
-                custom_pass,
-                search_fn_pattern=ub_copy,
-            )
+            _register_pattern_replacement(ub_copy, target_add_prologue_pattern,
+                                          custom_pass)
 
         register_scaled_mm_prologue(custom_pass)
         register_nvfp4_gemm_prologue(custom_pass)
@@ -832,16 +648,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             int(AllReduceStrategy.UB), KeywordArg("fusion_op"),
             KeywordArg("eps"), Ignored())
 
-        def empty_finalize_pattern(
-            input: torch.Tensor,
-            sharded_residual: torch.Tensor,
-            gamma: torch.Tensor,
-            scale: Optional[torch.Tensor],
-            fusion_op: int,
-            eps: float,
-        ):
-            return
-
         def target_finalize_pattern(
             input: torch.Tensor,
             sharded_residual: torch.Tensor,
@@ -856,14 +662,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 int(AllReduceStrategy.UB), fusion_op, eps, False)
             return all_reduce_output
 
-        register_replacement(
-            empty_finalize_pattern,
-            target_finalize_pattern,
-            _make_pattern_example_inputs(empty_finalize_pattern),
-            fwd_only,
-            custom_pass,
-            search_fn_pattern=trtllm_allreduce_default,
-        )
+        _register_pattern_replacement(trtllm_allreduce_default,
+                                      target_finalize_pattern, custom_pass)
 
     def insert_copy_for_graph_output(custom_pass: PatternMatcherPass):
         trtllm_allreduce_default = CallFunction(
@@ -871,16 +671,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             KeywordArg("residual"), KeywordArg("gamma"), KeywordArg("scale"),
             None, None, mapping.tp_group, int(AllReduceStrategy.UB),
             KeywordArg("fusion_op"), KeywordArg("eps"), Ignored())
-
-        def empty_copy_for_graph_output_pattern(
-            input: torch.Tensor,
-            residual: torch.Tensor,
-            gamma: torch.Tensor,
-            scale: Optional[torch.Tensor],
-            fusion_op: int,
-            eps: float,
-        ):
-            return
 
         def target_copy_for_graph_output_pattern(
             input: torch.Tensor,
@@ -914,15 +704,10 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                             return True
             return False
 
-        register_replacement(
-            empty_copy_for_graph_output_pattern,
-            target_copy_for_graph_output_pattern,
-            _make_pattern_example_inputs(empty_copy_for_graph_output_pattern),
-            fwd_only,
-            custom_pass,
-            search_fn_pattern=trtllm_allreduce_default,
-            extra_check=extra_check,
-        )
+        _register_pattern_replacement(trtllm_allreduce_default,
+                                      target_copy_for_graph_output_pattern,
+                                      custom_pass,
+                                      extra_check=extra_check)
 
     _append_named_pass(
         custom_passes,

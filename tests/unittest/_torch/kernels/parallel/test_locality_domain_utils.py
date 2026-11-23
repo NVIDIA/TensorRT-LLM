@@ -119,89 +119,99 @@ class TestLocalityDomainComputeTopology:
 
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
     def test_cluster_occupancy_cache_keeps_topology_scaling_dynamic(self, monkeypatch):
-        from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+        with monkeypatch.context() as scoped_patch:
+            from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
-        hardware_queries = []
-        current_locality_domain = None
+            hardware_queries = []
+            current_locality_domain = None
 
-        class FakeHardwareInfo:
-            def __init__(self, device_id):
-                self.device_id = device_id
+            class FakeHardwareInfo:
+                def __init__(self, device_id):
+                    self.device_id = device_id
 
-            def get_max_active_clusters(self, cluster_size):
-                hardware_queries.append((self.device_id, cluster_size))
-                return 106
+                def get_max_active_clusters(self, cluster_size):
+                    hardware_queries.append((self.device_id, cluster_size))
+                    return 106
 
-        occupancy_cache = cute_dsl_custom_ops._get_full_device_max_active_clusters
-        occupancy_cache.cache_clear()
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
-        monkeypatch.setattr(cute_dsl_custom_ops.cutlass.utils, "HardwareInfo", FakeHardwareInfo)
-        monkeypatch.setattr(
-            cute_dsl_custom_ops, "get_current_locality_domain", lambda: current_locality_domain
-        )
-        monkeypatch.setattr(
-            cute_dsl_custom_ops,
-            "node_local_max_active_clusters",
-            lambda full_device_limit: full_device_limit * 100 // 212,
-        )
-
-        try:
-            assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 106
-            assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 106
-            current_locality_domain = 0
-            assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 50
-            assert hardware_queries == [(3, 2)]
-        finally:
+            occupancy_cache = cute_dsl_custom_ops._get_full_device_max_active_clusters
             occupancy_cache.cache_clear()
+            scoped_patch.setattr(torch.cuda, "current_device", lambda: 3)
+            scoped_patch.setattr(
+                cute_dsl_custom_ops.cutlass.utils, "HardwareInfo", FakeHardwareInfo
+            )
+            scoped_patch.setattr(
+                cute_dsl_custom_ops, "get_current_locality_domain", lambda: current_locality_domain
+            )
+            scoped_patch.setattr(
+                cute_dsl_custom_ops,
+                "node_local_max_active_clusters",
+                lambda full_device_limit: full_device_limit * 100 // 212,
+            )
+
+            try:
+                assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 106
+                assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 106
+                current_locality_domain = 0
+                assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 50
+                assert hardware_queries == [(3, 2)]
+            finally:
+                occupancy_cache.cache_clear()
 
     @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
     def test_cluster_occupancy_cache_is_scoped_by_device_and_cluster(self, monkeypatch):
-        from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+        with monkeypatch.context() as scoped_patch:
+            from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
-        hardware_queries = []
-        current_device = 0
+            hardware_queries = []
+            current_device = 0
 
-        class FakeHardwareInfo:
-            def __init__(self, device_id):
-                self.device_id = device_id
+            class FakeHardwareInfo:
+                def __init__(self, device_id):
+                    self.device_id = device_id
 
-            def get_max_active_clusters(self, cluster_size):
-                hardware_queries.append((self.device_id, cluster_size))
-                return 100 + self.device_id + cluster_size
+                def get_max_active_clusters(self, cluster_size):
+                    hardware_queries.append((self.device_id, cluster_size))
+                    return 100 + self.device_id + cluster_size
 
-        occupancy_cache = cute_dsl_custom_ops._get_full_device_max_active_clusters
-        occupancy_cache.cache_clear()
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: current_device)
-        monkeypatch.setattr(cute_dsl_custom_ops.cutlass.utils, "HardwareInfo", FakeHardwareInfo)
-        monkeypatch.setattr(cute_dsl_custom_ops, "get_current_locality_domain", lambda: None)
-
-        try:
-            assert cute_dsl_custom_ops.get_max_activate_clusters(1) == 101
-            assert cute_dsl_custom_ops.get_max_activate_clusters(1) == 101
-            assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 102
-            current_device = 1
-            assert cute_dsl_custom_ops.get_max_activate_clusters(1) == 102
-            assert hardware_queries == [(0, 1), (0, 2), (1, 1)]
-        finally:
+            occupancy_cache = cute_dsl_custom_ops._get_full_device_max_active_clusters
             occupancy_cache.cache_clear()
+            scoped_patch.setattr(torch.cuda, "current_device", lambda: current_device)
+            scoped_patch.setattr(
+                cute_dsl_custom_ops.cutlass.utils, "HardwareInfo", FakeHardwareInfo
+            )
+            scoped_patch.setattr(cute_dsl_custom_ops, "get_current_locality_domain", lambda: None)
+
+            try:
+                assert cute_dsl_custom_ops.get_max_activate_clusters(1) == 101
+                assert cute_dsl_custom_ops.get_max_activate_clusters(1) == 101
+                assert cute_dsl_custom_ops.get_max_activate_clusters(2) == 102
+                current_device = 1
+                assert cute_dsl_custom_ops.get_max_activate_clusters(1) == 102
+                assert hardware_queries == [(0, 1), (0, 2), (1, 1)]
+            finally:
+                occupancy_cache.cache_clear()
 
     def test_compute_sm_counts_are_read_from_current_device_cache(self, monkeypatch):
-        class Manager:
-            compute_sm_counts = {(3, 0): (100, 212)}
+        with monkeypatch.context() as scoped_patch:
 
-            @staticmethod
-            def is_initialized(device_id):
-                return device_id == 3
+            class Manager:
+                compute_sm_counts = {(3, 0): (100, 212)}
 
-        monkeypatch.setattr(locality_domain_utils, "get_locality_domain_resource_manager", Manager)
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
-        monkeypatch.setattr(
-            locality_domain_utils,
-            "initialize_locality_domain_resources",
-            lambda: pytest.fail("cached topology unexpectedly reinitialized resources"),
-        )
+                @staticmethod
+                def is_initialized(device_id):
+                    return device_id == 3
 
-        assert get_locality_domain_compute_sm_counts(0) == (100, 212)
+            scoped_patch.setattr(
+                locality_domain_utils, "get_locality_domain_resource_manager", Manager
+            )
+            scoped_patch.setattr(torch.cuda, "current_device", lambda: 3)
+            scoped_patch.setattr(
+                locality_domain_utils,
+                "initialize_locality_domain_resources",
+                lambda: pytest.fail("cached topology unexpectedly reinitialized resources"),
+            )
+
+            assert get_locality_domain_compute_sm_counts(0) == (100, 212)
 
     @pytest.mark.parametrize(
         ("locality_domain_id", "sm_counts", "max_active_full_device", "expected"),

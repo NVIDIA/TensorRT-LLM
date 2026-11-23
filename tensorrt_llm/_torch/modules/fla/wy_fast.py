@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/wy_fast.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/wy_fast.py
 # -*- coding: utf-8 -*-
@@ -51,59 +53,66 @@ def recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T, ), (H, ), (i_t * BT, ),
-                               (BT, ), (0, ))
-    p_g = tl.make_block_ptr(g + (bos * H + i_h), (T, ), (H, ), (i_t * BT, ),
-                            (BT, ), (0, ))
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-                            (i_t * BT, 0), (BT, BT), (1, 0))
-    b_beta = tl.load(p_beta, boundary_check=(0, ))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0, )))
+    p_beta_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+    p_beta = (beta + bos * H + i_h) + p_beta_offsets_0.to(tl.int64) * (H)
+    p_beta_mask_0 = (p_beta_offsets_0 >= 0) & (p_beta_offsets_0 < (T))
+    p_g_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+    p_g = (g + (bos * H + i_h)) + p_g_offsets_0.to(tl.int64) * (H)
+    p_g_mask_0 = (p_g_offsets_0 >= 0) & (p_g_offsets_0 < (T))
+    p_A_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+    p_A_offsets_1 = (0) + tl.arange(0, BT)
+    p_A = (A + (bos * H + i_h) * BT) + p_A_offsets_0[:, None].to(
+        tl.int64) * (H * BT) + p_A_offsets_1[None, :].to(tl.int64) * (1)
+    p_A_mask_0 = (p_A_offsets_0 >= 0) & (p_A_offsets_0 < (T))
+    p_A_mask_1 = (p_A_offsets_1 >= 0) & (p_A_offsets_1 < (BT))
+    b_beta = tl.load(p_beta, mask=p_beta_mask_0, other=0)
+    b_A = tl.load(p_A, mask=p_A_mask_0[:, None] & p_A_mask_1[None, :], other=0)
+    b_g = tl.exp(tl.load(p_g, mask=p_g_mask_0, other=0))
 
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        p_u = tl.make_block_ptr(
-            u + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        p_v_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_v_offsets_1 = (i_v * BV) + tl.arange(0, BV)
+        p_v = (v + (bos * H + i_h) * V) + p_v_offsets_0[:, None].to(
+            tl.int64) * (H * V) + p_v_offsets_1[None, :].to(tl.int64) * (1)
+        p_v_mask_0 = (p_v_offsets_0 >= 0) & (p_v_offsets_0 < (T))
+        p_v_mask_1 = (p_v_offsets_1 >= 0) & (p_v_offsets_1 < (V))
+        p_u_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_u_offsets_1 = (i_v * BV) + tl.arange(0, BV)
+        p_u = (u + (bos * H + i_h) * V) + p_u_offsets_0[:, None].to(
+            tl.int64) * (H * V) + p_u_offsets_1[None, :].to(tl.int64) * (1)
+        p_u_mask_0 = (p_u_offsets_0 >= 0) & (p_u_offsets_0 < (T))
+        p_u_mask_1 = (p_u_offsets_1 >= 0) & (p_u_offsets_1 < (V))
+        b_v = tl.load(p_v,
+                      mask=p_v_mask_0[:, None] & p_v_mask_1[None, :],
+                      other=0)
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_u,
+                 b_u.to(p_u.dtype.element_ty),
+                 mask=p_u_mask_0[:, None] & p_u_mask_1[None, :])
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_w = tl.make_block_ptr(
-            w + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        p_k_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_k_offsets_1 = (i_k * BK) + tl.arange(0, BK)
+        p_k = (k + (bos * Hg + i_h //
+                    (H // Hg)) * K) + p_k_offsets_0[:, None].to(tl.int64) * (
+                        Hg * K) + p_k_offsets_1[None, :].to(tl.int64) * (1)
+        p_k_mask_0 = (p_k_offsets_0 >= 0) & (p_k_offsets_0 < (T))
+        p_k_mask_1 = (p_k_offsets_1 >= 0) & (p_k_offsets_1 < (K))
+        p_w_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_w_offsets_1 = (i_k * BK) + tl.arange(0, BK)
+        p_w = (w + (bos * H + i_h) * K) + p_w_offsets_0[:, None].to(
+            tl.int64) * (H * K) + p_w_offsets_1[None, :].to(tl.int64) * (1)
+        p_w_mask_0 = (p_w_offsets_0 >= 0) & (p_w_offsets_0 < (T))
+        p_w_mask_1 = (p_w_offsets_1 >= 0) & (p_w_offsets_1 < (K))
+        b_k = tl.load(p_k,
+                      mask=p_k_mask_0[:, None] & p_k_mask_1[None, :],
+                      other=0)
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_A, b_kb)
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_w,
+                 b_w.to(p_w.dtype.element_ty),
+                 mask=p_w_mask_0[:, None] & p_w_mask_1[None, :])
 
 
 def recompute_w_u_fwd(

@@ -153,6 +153,11 @@ def terminal_mocks():
         patch.object(_telemetry.usage, "record_observed_signal") as record_signal,
         patch.object(_telemetry.usage, "report_exit") as report_exit,
     ):
+
+        def record_observed_signal(signal_number):
+            observed_signal.return_value = signal_number
+
+        record_signal.side_effect = record_observed_signal
         yield SimpleNamespace(
             apply_config=apply_config,
             set_phase=set_phase,
@@ -384,15 +389,25 @@ class TestTelemetryGroup:
         config = terminal_mocks.apply_config.call_args.args[0]
         assert config.disabled is True
 
-    def test_keyboard_interrupt_reports_signal(self, terminal_mocks):
+    @pytest.mark.parametrize("during_parsing", [False, True])
+    def test_keyboard_interrupt_reports_signal(self, terminal_mocks, during_parsing):
         """Click's wrapped KeyboardInterrupt retains a SIGINT classification."""
 
         def interrupt():
             raise KeyboardInterrupt
 
         cli = _make_cli(interrupt)
+        args = ["run"]
+        if during_parsing:
+
+            def interrupt_option(ctx, param, value):
+                if value:
+                    interrupt()
+
+            cli = click.option("--interrupt", is_flag=True, callback=interrupt_option)(cli)
+            args.insert(0, "--interrupt")
         with pytest.raises(SystemExit):
-            cli.main(args=["run"], prog_name="test-cli")
+            cli.main(args=args, prog_name="test-cli")
 
         outcome = terminal_mocks.report_exit.call_args.args[0]
         assert outcome.signal_number == 2

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/utils/cumsum.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/cumsum.py
 # -*- coding: utf-8 -*-
@@ -50,24 +52,28 @@ def chunk_local_cumsum_scalar_kernel(
         bos, eos = i_b * T, i_b * T + T
 
     if HEAD_FIRST:
-        p_s = tl.make_block_ptr(s + bos * H + i_h * T, (T, ), (1, ),
-                                (i_t * BT, ), (BT, ), (0, ))
-        p_o = tl.make_block_ptr(o + bos * H + i_h * T, (T, ), (1, ),
-                                (i_t * BT, ), (BT, ), (0, ))
+        p_s_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_s = (s + bos * H + i_h * T) + p_s_offsets_0.to(tl.int64) * (1)
+        p_s_mask_0 = (p_s_offsets_0 >= 0) & (p_s_offsets_0 < (T))
+        p_o_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_o = (o + bos * H + i_h * T) + p_o_offsets_0.to(tl.int64) * (1)
+        p_o_mask_0 = (p_o_offsets_0 >= 0) & (p_o_offsets_0 < (T))
     else:
-        p_s = tl.make_block_ptr(s + bos * H + i_h, (T, ), (H, ), (i_t * BT, ),
-                                (BT, ), (0, ))
-        p_o = tl.make_block_ptr(o + bos * H + i_h, (T, ), (H, ), (i_t * BT, ),
-                                (BT, ), (0, ))
+        p_s_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_s = (s + bos * H + i_h) + p_s_offsets_0.to(tl.int64) * (H)
+        p_s_mask_0 = (p_s_offsets_0 >= 0) & (p_s_offsets_0 < (T))
+        p_o_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_o = (o + bos * H + i_h) + p_o_offsets_0.to(tl.int64) * (H)
+        p_o_mask_0 = (p_o_offsets_0 >= 0) & (p_o_offsets_0 < (T))
     # [BT]
-    b_s = tl.load(p_s, boundary_check=(0, )).to(tl.float32)
+    b_s = tl.load(p_s, mask=p_s_mask_0, other=0).to(tl.float32)
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
         b_o = -b_o + b_z[None] + b_s
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, ))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=p_o_mask_0)
 
 
 @triton.heuristics({
@@ -117,45 +123,40 @@ def chunk_local_cumsum_vector_kernel(
         m_s = tl.where(o_i[:, None] >= o_i[None, :], 1.0, 0.0)
 
     if HEAD_FIRST:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
+        p_s_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_s_offsets_1 = (i_s * BS) + tl.arange(0, BS)
+        p_s = (s + (bos * H + i_h * T) * S) + p_s_offsets_0[:, None].to(
+            tl.int64) * (S) + p_s_offsets_1[None, :].to(tl.int64) * (1)
+        p_s_mask_0 = (p_s_offsets_0 >= 0) & (p_s_offsets_0 < (T))
+        p_s_mask_1 = (p_s_offsets_1 >= 0) & (p_s_offsets_1 < (S))
+        p_o_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_o_offsets_1 = (i_s * BS) + tl.arange(0, BS)
+        p_o = (o + (bos * H + i_h * T) * S) + p_o_offsets_0[:, None].to(
+            tl.int64) * (S) + p_o_offsets_1[None, :].to(tl.int64) * (1)
+        p_o_mask_0 = (p_o_offsets_0 >= 0) & (p_o_offsets_0 < (T))
+        p_o_mask_1 = (p_o_offsets_1 >= 0) & (p_o_offsets_1 < (S))
     else:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
+        p_s_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_s_offsets_1 = (i_s * BS) + tl.arange(0, BS)
+        p_s = (s + (bos * H + i_h) * S) + p_s_offsets_0[:, None].to(
+            tl.int64) * (H * S) + p_s_offsets_1[None, :].to(tl.int64) * (1)
+        p_s_mask_0 = (p_s_offsets_0 >= 0) & (p_s_offsets_0 < (T))
+        p_s_mask_1 = (p_s_offsets_1 >= 0) & (p_s_offsets_1 < (S))
+        p_o_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+        p_o_offsets_1 = (i_s * BS) + tl.arange(0, BS)
+        p_o = (o + (bos * H + i_h) * S) + p_o_offsets_0[:, None].to(
+            tl.int64) * (H * S) + p_o_offsets_1[None, :].to(tl.int64) * (1)
+        p_o_mask_0 = (p_o_offsets_0 >= 0) & (p_o_offsets_0 < (T))
+        p_o_mask_1 = (p_o_offsets_1 >= 0) & (p_o_offsets_1 < (S))
     # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+    b_s = tl.load(p_s, mask=p_s_mask_0[:, None] & p_s_mask_1[None, :],
+                  other=0).to(tl.float32)
     b_o = tl.dot(m_s, b_s, allow_tf32=False)
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_o,
+             b_o.to(p_o.dtype.element_ty),
+             mask=p_o_mask_0[:, None] & p_o_mask_1[None, :])
 
 
 def chunk_local_cumsum_scalar(

@@ -36,7 +36,7 @@ requests>=2.32.4,<3
 boto3
 einops
 # Reference implementation for KDA kernel parity tests.
-flash-linear-attention==0.5.2
+flash-linear-attention==0.6.0
 lpips
 graphviz
 pyrefly==1.4.0

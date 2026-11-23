@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/l2norm.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/l2norm.py
 # -*- coding: utf-8 -*-
@@ -62,12 +64,25 @@ def l2norm_fwd_kernel(
     BD: tl.constexpr,
 ):
     i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    p_x_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+    p_x_offsets_1 = (0) + tl.arange(0, BD)
+    p_x = (x) + p_x_offsets_0[:, None].to(
+        tl.int64) * (D) + p_x_offsets_1[None, :].to(tl.int64) * (1)
+    p_x_mask_0 = (p_x_offsets_0 >= 0) & (p_x_offsets_0 < (T))
+    p_x_mask_1 = (p_x_offsets_1 >= 0) & (p_x_offsets_1 < (D))
+    b_x = tl.load(p_x, mask=p_x_mask_0[:, None] & p_x_mask_1[None, :],
+                  other=0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    p_y_offsets_0 = (i_t * BT) + tl.arange(0, BT)
+    p_y_offsets_1 = (0) + tl.arange(0, BD)
+    p_y = (y) + p_y_offsets_0[:, None].to(
+        tl.int64) * (D) + p_y_offsets_1[None, :].to(tl.int64) * (1)
+    p_y_mask_0 = (p_y_offsets_0 >= 0) & (p_y_offsets_0 < (T))
+    p_y_mask_1 = (p_y_offsets_1 >= 0) & (p_y_offsets_1 < (D))
+    tl.store(p_y,
+             b_y.to(p_y.dtype.element_ty),
+             mask=p_y_mask_0[:, None] & p_y_mask_1[None, :])
 
 
 def l2norm_fwd(x: torch.Tensor,

@@ -1,13 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from operator import getitem
 
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, KeywordArg,
                                              Match, MultiOutputPattern,
-                                             PatternMatcherPass, fwd_only,
-                                             register_replacement)
+                                             PatternMatcherPass)
 
-from . import _make_pattern_example_inputs
+from . import _register_pattern_replacement
 
 aten = torch.ops.aten
 
@@ -25,14 +27,6 @@ def register_add_norm(custom_pass: PatternMatcherPass):
         KeywordArg("eps"),
         _users=MULTIPLE)
     add_norm_pattern = MultiOutputPattern([flashinfer_norm_default, add_Tensor])
-
-    def empty_pattern(
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        norm_weight: torch.nn.Parameter,
-        eps: float,
-    ):
-        return
 
     def target_pattern(
         input: torch.Tensor,
@@ -62,15 +56,10 @@ def register_add_norm(custom_pass: PatternMatcherPass):
 
         return True
 
-    register_replacement(
-        empty_pattern,
-        target_pattern,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=add_norm_pattern,
-        extra_check=extra_check,
-    )
+    _register_pattern_replacement(add_norm_pattern,
+                                  target_pattern,
+                                  custom_pass,
+                                  extra_check=extra_check)
 
 
 def register_add_norm_quant(custom_pass: PatternMatcherPass):
@@ -94,15 +83,6 @@ def register_add_norm_quant(custom_pass: PatternMatcherPass):
 
     quant_out = CallFunction(getitem, static_quantize, 0, _users=1)
     add_norm_quant_pattern = MultiOutputPattern([quant_out, residual_out])
-
-    def empty_pattern(
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        norm_weight: torch.nn.Parameter,
-        scale: torch.Tensor,
-        eps: float,
-    ):
-        return
 
     def target_pattern(
         input: torch.Tensor,
@@ -136,12 +116,7 @@ def register_add_norm_quant(custom_pass: PatternMatcherPass):
 
         return True
 
-    register_replacement(
-        empty_pattern,
-        target_pattern,
-        _make_pattern_example_inputs(empty_pattern),
-        fwd_only,
-        custom_pass,
-        search_fn_pattern=add_norm_quant_pattern,
-        extra_check=extra_check,
-    )
+    _register_pattern_replacement(add_norm_quant_pattern,
+                                  target_pattern,
+                                  custom_pass,
+                                  extra_check=extra_check)
