@@ -218,8 +218,12 @@ async def test_llm_manager_cancels_in_flight_requests_on_failure():
 
     start = asyncio.get_running_loop().time()
     manager.run()
+    # asyncio.wait does not cancel the worker on timeout, so the failure must
+    # wake the idle worker by itself.
+    done, _ = await asyncio.wait({manager._backend_task}, timeout=10)
+    assert done, "A failed request did not wake the idle worker."
     with pytest.raises(ValueError, match="simulated request failure"):
-        await asyncio.wait_for(manager._backend_task, timeout=10)
+        manager._backend_task.result()
     elapsed = asyncio.get_running_loop().time() - start
 
     # Without cancellation the worker would block on the 30s requests.
@@ -416,7 +420,7 @@ async def test_llm_manager_duration_not_exceeded():
 
 
 @pytest.mark.asyncio
-async def test_llm_manager_idle_worker_waits_instead_of_polling():
+async def test_llm_manager_idle_worker_waits_instead_of_polling() -> None:
     """An idle worker waits for a request or a stop instead of polling the inbox."""
     mock_llm = MagicMock(spec=LLM)
     mock_llm.args = MagicMock()
@@ -430,7 +434,7 @@ async def test_llm_manager_idle_worker_waits_instead_of_polling():
     mock_output.id = 1
     mock_output.decoding_iter = 1
 
-    async def mock_aresult():
+    async def mock_aresult() -> MagicMock:
         return mock_output
 
     mock_output.aresult = mock_aresult
