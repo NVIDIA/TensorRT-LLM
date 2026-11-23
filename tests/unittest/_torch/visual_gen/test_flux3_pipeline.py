@@ -1073,6 +1073,18 @@ def test_run_warmup_covers_two_text_windows_for_text_to_image_and_a_matching_edi
 
 
 @pytest.mark.cpu_only
+def test_run_warmup_skips_the_edit_when_ulysses_cannot_split_its_reference():
+    # A 2048 x 2432 warmup refits its gray reference to 16263 tokens, which 2 ranks cannot split.
+    mapping = SimpleNamespace(seq_size=2, cfg_size=1)
+    pipeline = cpu_pipeline(Flux3Pipeline, config_stub(visual_gen_mapping=mapping))
+    pipeline.forward = MagicMock()
+    pipeline._run_warmup(2048, 2432, 1, 1)
+    assert pipeline.forward.call_count == len(WARMUP_TEXT_WINDOWS)
+    assert all(call.kwargs["image"] is None for call in pipeline.forward.call_args_list)
+    assert pipeline._warmup_reference_keys == set()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "seq_size, kwargs, message",
     [
