@@ -1647,16 +1647,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 token_ids_list.append(token_ids)
 
             try:
-                # Validate every input's length up front so an oversize item fails
-                # the whole request before any item is enqueued — otherwise gather()
-                # cancels the awaiters but their already-queued inputs still run
-                # encode() (wasted GPU work).
-                for token_ids in token_ids_list:
-                    self.encode_batcher.validate_input(token_ids)
-                results = await asyncio.gather(*[
-                    self.encode_batcher.submit(token_ids)
-                    for token_ids in token_ids_list
-                ])
+                results = await self.encode_batcher.submit_many(token_ids_list)
             except InputTooLongError as e:
                 return self.create_error_response(
                     str(e), status_code=HTTPStatus.BAD_REQUEST)

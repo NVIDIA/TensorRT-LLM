@@ -171,6 +171,7 @@ if(NIXL_ROOT)
     # End-to-end transport over real RDMA (gather -> RDMA write -> scatter +
     # credit recycling), byte-exact.
     add_bounce_reactor_test(bounceTransportTest bounceTransportTest.cpp)
+    target_link_libraries(bounceTransportTest PRIVATE CUDA::cuda_driver)
 
     # Boundary, failure-path, and concurrency tests.
     add_bounce_reactor_test(bounceTransportFailureTest

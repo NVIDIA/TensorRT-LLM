@@ -24,6 +24,7 @@
 #include <array>
 #include <cassert>
 #include <cuda_runtime.h>
+#include <limits>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -196,6 +197,82 @@ void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITenso
 
     copyBatchBlockOffsetsToDeviceKernel<<<gridDim, blockDim, 0, stream>>>(srcPtr, dstPtr, srcMaxNumSequences,
         dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr, indexScalesPtr, kvOffsetPtr);
+}
+
+// Build per-layer K/V page tables for the active batch. Each thread owns one
+// (pool, row, block) entry of the base table: it reads that entry once and
+// writes it to every K/V lane stored in the pool, applying the lane's scale
+// and offset and preserving BAD_PAGE_INDEX. The input may be pinned host
+// memory, where every read crosses the host link, so an entry must not be
+// re-read per lane. Only the first maxBlocks columns of each row are written.
+__global__ void copyPerLayerBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ input,
+    SizeType32* __restrict__ output, SizeType32 const* __restrict__ copyIndex,
+    SizeType32 const* __restrict__ converters, SizeType32 const* __restrict__ poolLaneOffsets,
+    SizeType32 const* __restrict__ poolLanes, int64_t sourceRows, int64_t outputRows, int64_t tableWidth,
+    int64_t numSeqs, int64_t maxBlocks)
+{
+    auto const index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= numSeqs * maxBlocks)
+    {
+        return;
+    }
+    auto const row = index / maxBlocks;
+    auto const block = index % maxBlocks;
+    auto const pool = static_cast<int64_t>(blockIdx.y);
+    auto const base = input[(pool * sourceRows + copyIndex[row]) * 2 * tableWidth + block];
+    for (auto i = poolLaneOffsets[pool]; i < poolLaneOffsets[pool + 1]; ++i)
+    {
+        auto const lane = poolLanes[i];
+        auto const scale = converters[lane * 3 + 1];
+        auto const offset = converters[lane * 3 + 2];
+        auto const layer = static_cast<int64_t>(lane / 2);
+        auto const role = lane % 2;
+        output[((layer * outputRows + row) * 2 + role) * tableWidth + block]
+            = base == BAD_PAGE_INDEX ? BAD_PAGE_INDEX : base * scale + offset;
+    }
+}
+
+void copyPerLayerBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& converters, ITensor const& poolLaneOffsets, ITensor const& poolLanes, SizeType32 maxBlocks,
+    CUstream stream)
+{
+    constexpr int64_t kThreads = 256;
+    auto const& sourceShape = input.getShape();
+    auto const& outputShape = output.getShape();
+    auto const& converterShape = converters.getShape();
+    auto const& copyIndexShape = copyIndex.getShape();
+    TLLM_CHECK_WITH_INFO(
+        sourceShape.nbDims == 4 && outputShape.nbDims == 4 && sourceShape.d[2] == 2 && outputShape.d[2] == 2,
+        "input and output must be [tables, rows, 2, blocks]");
+    TLLM_CHECK_WITH_INFO(sourceShape.d[3] == outputShape.d[3], "input and output block widths must match");
+    TLLM_CHECK_WITH_INFO(converterShape.nbDims == 3 && converterShape.d[0] == outputShape.d[0]
+            && converterShape.d[1] == 2 && converterShape.d[2] == 3,
+        "converters must be [output tables, 2, 3]");
+    auto const numPools = sourceShape.d[0];
+    TLLM_CHECK_WITH_INFO(poolLaneOffsets.getShape().nbDims == 1 && poolLaneOffsets.getShape().d[0] == numPools + 1,
+        "pool_lane_offsets must hold one entry per input pool plus one");
+    TLLM_CHECK_WITH_INFO(poolLanes.getShape().nbDims == 1 && poolLanes.getShape().d[0] == outputShape.d[0] * 2,
+        "pool_lanes must list every output K/V lane once");
+    TLLM_CHECK_WITH_INFO(maxBlocks >= 0 && maxBlocks <= sourceShape.d[3], "max_blocks %d exceeds the table width %ld",
+        maxBlocks, static_cast<long>(sourceShape.d[3]));
+    TLLM_CHECK_WITH_INFO(copyIndexShape.nbDims == 1, "copy_index must be one-dimensional");
+    auto const numSeqs = static_cast<int64_t>(copyIndexShape.d[0]);
+    TLLM_CHECK_WITH_INFO(numSeqs <= outputShape.d[1], "output must have at least one row per copy_index entry");
+    auto const count = numSeqs * maxBlocks;
+    if (count == 0 || numPools == 0)
+    {
+        return;
+    }
+    auto const numCtas = (count + kThreads - 1) / kThreads;
+    TLLM_CHECK_WITH_INFO(numCtas <= std::numeric_limits<int32_t>::max() && numPools <= 65535,
+        "Per-layer page-table copy exceeds the CUDA grid limits");
+    dim3 const grid(static_cast<uint32_t>(numCtas), static_cast<uint32_t>(numPools));
+    copyPerLayerBlockOffsetsToDeviceKernel<<<grid, kThreads, 0, stream>>>(input.getBufferPtr<SizeType32 const>(),
+        output.getBufferPtr<SizeType32>(), copyIndex.getBufferPtr<SizeType32 const>(),
+        converters.getBufferPtr<SizeType32 const>(), poolLaneOffsets.getBufferPtr<SizeType32 const>(),
+        poolLanes.getBufferPtr<SizeType32 const>(), sourceShape.d[1], outputShape.d[1], sourceShape.d[3], numSeqs,
+        maxBlocks);
+    TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
