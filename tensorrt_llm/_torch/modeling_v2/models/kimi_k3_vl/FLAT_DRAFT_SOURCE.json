@@ -227,7 +227,8 @@
   },
   "kernels": {
     "kernels/k3r_spec/vocab_parallel.py": "_local_argmax_kernel, _local_sample_kernel, _reduce_pairs_kernel (target selection); markov_tokens_v3 -> kernels/dspark_markov_greedy.py DSparkMarkovGreedyKernel",
-    "kernels/k3r_spec/spec_tail_kernels_ull.py": "_ctx_positions_kernel, _select_accept_kernel, _dflash_gen_prepare_kernel, _noise_embedding_kernel, _store_mla_context_kernel (POOL_FP8: to_draft_fp8 of the BF16 latents), _next_new_tokens_rewind_kernel, _fused_strict_accept_kernel",
+    "kernels/k3r_spec/spec_tail_kernels.py": "_ctx_positions_kernel, _select_accept_kernel, _noise_embedding_kernel, _store_mla_context_kernel (POOL_FP8: to_draft_fp8 of the BF16 latents), _next_new_tokens_rewind_kernel, _fused_strict_accept_kernel (shared by both entry modules)",
+    "kernels/k3r_spec/spec_tail_kernels_ull.py": "_dflash_gen_prepare_kernel (unified draft cache position offsets)",
     "kernels/k3r_spec/dspark_draft3.py": "_qhead_kernel (draft_qhead: inverse q_a RMS, block RoPE, latent RMSNorm, owner-masked FP8 block store, W_UK absorption, FP8 query); fold_rmsnorm_weight (host, once per layer)",
     "kernels/k3r_spec/dspark_ull2.py": "draft_helix_tail -> kernels/k3_helix_tail.py K3HelixTailKernel via mla.K3HelixTail",
     "kernels/k3r_gemm/low_m_bf16_splitk.py": "SplitKDenseGemmKernel (draft_gemm: ctx_latent, q_kv_a, q_b (folded weight, strided q_a rows), gate_up, lm_head)",

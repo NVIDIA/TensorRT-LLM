@@ -384,8 +384,10 @@
     "from ...kimi_k3_nvfp4__sm_107__helix16_moetp16ep1.features import active as _features -> from ...ops.common.k3_ull_features import active as _features",
     "from tensorrt_llm._torch.modules.linear import TensorParallelMode -> from ...common.parallel import TensorParallelMode"
    ],
-   "local_edits": [],
-   "sha256": "4ccc8de0975494e35598235b89b1cd3b752617f939589e6b251feeb933b02715",
+   "local_edits": [
+    "Reuse matching kernels and launchers from the existing family spec tail. Keep the ULL block-table, history-offset, feature selection and vocabulary collective behavior."
+   ],
+   "sha256": "1402da43f9f97e0a22022137a09e80bbda91163b06fcab17152499df35d2c471",
    "target_path": "kernels/spec/spec_tail_kernels.py"
   },
   "kernels/k3r_spec/vocab_parallel.py": {
