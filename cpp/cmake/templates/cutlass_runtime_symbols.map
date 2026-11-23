@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-/* ClusterLauncher receives kernel entry points registered with this library's
- * static CUDA runtime. Its inline helpers must not be interposed by another
- * shared library's copies, which use a different runtime instance.
+/* CUTLASS launch and occupancy helpers receive kernel entry points registered
+ * with this library's static CUDA runtime. They must not be interposed by
+ * another shared library's copies, which use a different runtime instance.
  */
 {
     local:
         _ZN7cutlass15ClusterLauncher*;
+        _ZN7cutlass18KernelHardwareInfo*;
 };
