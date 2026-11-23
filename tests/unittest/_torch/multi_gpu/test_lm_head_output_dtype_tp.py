@@ -52,6 +52,7 @@ def _check_bounded_context(lm_head: LMHead, hidden: torch.Tensor, rank: int) -> 
             context_chunk_size=length,
             context_current_position=0,
             py_prompt_len=length,
+            orig_prompt_len=length,
             py_return_context_logits=full or k is not None,
             py_context_logits_explicit=full,
             py_prompt_logprobs=k,
