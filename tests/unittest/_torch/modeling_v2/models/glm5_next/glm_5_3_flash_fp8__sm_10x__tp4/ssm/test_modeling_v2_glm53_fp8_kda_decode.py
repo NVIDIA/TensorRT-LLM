@@ -29,7 +29,9 @@ from _validating import (  # noqa: E402,F401 -- fixture by name
     validating,
 )
 
-pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
+pytestmark = pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="certified on sm_100 and sm_103"
+)
 
 #: GLM-5.3-Flash's KDA at TP4: 64 heads over 4 ranks, K = V = 128, conv width 4.
 HEADS, HEAD_DIM, WIDTH = 16, 128, 4

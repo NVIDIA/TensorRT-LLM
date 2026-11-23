@@ -21,7 +21,7 @@ the split-K partials travel by ``st.async`` into each receiving CTA's own mbarri
 Neither changes a value or the merge order.
 
 Geometry: 16 query heads per KV head, two KV heads per rank (TP2), head_dim 128, page 128, top-k 16. The kernel
-is ``torch.ops.trtllm.minimax_m3_sm107_tp2_sparse_decode_lc``, called through this target's ``m3_sparse_decode_lc``
+is ``family_ops().minimax_m3_sm107_tp2_sparse_decode_lc``, called through this target's ``m3_sparse_decode_lc``
 entry.
 """
 

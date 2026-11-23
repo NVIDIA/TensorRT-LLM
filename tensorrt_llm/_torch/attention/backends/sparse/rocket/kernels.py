@@ -375,9 +375,11 @@ def rocket_update_kt_cache_gen_kernel(
     if block_offset_in_seq >= max_kt_blocks_per_seq:
         return
 
+    # KVCacheManagerV2 page indices are scaled slot indices; int64 keeps the
+    # element offsets below from overflowing for large pools.
     block_idx = tl.load(
         kt_cache_block_offsets_ptr + batch_idx * max_kt_blocks_per_seq + block_offset_in_seq
-    )
+    ).to(tl.int64)
     token_idx_in_block = last_kt_token_idx % tokens_per_block
 
     cache_base = (
@@ -531,7 +533,7 @@ def rocket_update_kt_cache_ctx_kernel(
         block_offset_addrs = batch_idx * max_kt_blocks_per_seq + block_offsets_in_seq
         block_indices = tl.load(
             kt_cache_block_offsets_ptr + block_offset_addrs, mask=valid_block_mask, other=0
-        )
+        ).to(tl.int64)
 
         tokens_in_block = kt_offsets % tokens_per_block
 
@@ -677,7 +679,7 @@ def rocket_paged_kt_cache_bmm_kernel(
 
         block_indices = tl.load(
             kt_cache_block_offsets_ptr + block_offsets, mask=kt_token_mask, other=0
-        )
+        ).to(tl.int64)
         token_indices_in_block = kt_token_indices % tokens_per_block
 
         cache_bases = (

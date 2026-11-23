@@ -211,7 +211,9 @@ def _publish_neutral_standalone_partial(
 
 
 @cute.jit
-def _persistent_work_tile_is_inactive(cfg, cache_seqs, cu_seqlens_q, work_tile):
+def _persistent_work_tile_is_inactive(
+    cfg, cache_seqs, cu_seqlens_q, work_tile, cp_rank=0
+):
     """Return whether a persistent physical Q tile has no runtime rows."""
 
     cta_idx_q, _, batch_head_idx = work_tile.tile_idx
@@ -223,6 +225,7 @@ def _persistent_work_tile_is_inactive(cfg, cache_seqs, cu_seqlens_q, work_tile):
         batch_idx,
         cta_idx_q,
         Int32(0),
+        cp_rank=cp_rank,
     )
 
 
@@ -234,6 +237,7 @@ class ThroughputLatencyMlaStaticWorkQueue(WorkQueue):
     batch_size: object = None
     cache_seqs: object = None
     cu_seqlens_q: object = None
+    cp_rank: object = 0
     enable_runtime_skip: cutlass.Constexpr[bool] = False
 
     def __init__(
@@ -265,6 +269,7 @@ class ThroughputLatencyMlaStaticWorkQueue(WorkQueue):
             self.cache_seqs,
             self.cu_seqlens_q,
             work_tile,
+            self.cp_rank,
         )
 
     @cute.jit
@@ -319,6 +324,7 @@ class ThroughputLatencyMlaClcWorkQueue(WorkQueue):
     cfg: cutlass.Constexpr[MlaConfig] = None
     cache_seqs: object = None
     cu_seqlens_q: object = None
+    cp_rank: object = 0
     enable_runtime_skip: cutlass.Constexpr[bool] = False
 
     def __init__(
@@ -367,6 +373,7 @@ class ThroughputLatencyMlaClcWorkQueue(WorkQueue):
             self.cache_seqs,
             self.cu_seqlens_q,
             work_tile,
+            self.cp_rank,
         )
 
 
@@ -481,6 +488,7 @@ def build_throughput_latency_mla_task_manager(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    cp_rank: Int32 = 0,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -539,6 +547,7 @@ def build_throughput_latency_mla_task_manager(
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            cp_rank=cp_rank,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,
@@ -767,6 +776,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s0 = TmemSResource(
         cfg=cfg,
+        cp_rank=cp_rank,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
@@ -782,6 +792,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s1 = TmemSResource(
         cfg=cfg,
+        cp_rank=cp_rank,
         pipeline_config=tmem_s1_cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
@@ -1163,7 +1174,10 @@ def build_throughput_latency_mla_task_manager(
             tasks.append(idle)
     for task in tasks:
         task.runtime_split_kv = requested_splits
+        task.cp_rank = cp_rank
     for resource in deps:
+        if hasattr(resource, "cp_rank"):
+            resource.cp_rank = cp_rank
         if hasattr(resource, "runtime_split_kv"):
             resource.runtime_split_kv = requested_splits
     task_manager = TaskManager(
@@ -1201,6 +1215,7 @@ def _make_single_kv_pipe_task_graph(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    cp_rank: Int32 = 0,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -1414,6 +1429,7 @@ def _make_single_kv_pipe_task_graph(
         smem_page_offsets.nv_target = smem_kv
     tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(
         cfg=cfg,
+        cp_rank=cp_rank,
         page_offsets=page_offsets,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
@@ -1719,7 +1735,10 @@ def _make_single_kv_pipe_task_graph(
 
     for task in tasks:
         task.runtime_split_kv = requested_splits
+        task.cp_rank = cp_rank
     for resource in deps:
+        if hasattr(resource, "cp_rank"):
+            resource.cp_rank = cp_rank
         if hasattr(resource, "runtime_split_kv"):
             resource.runtime_split_kv = requested_splits
     task_manager = TaskManager(
@@ -1771,6 +1790,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         reduction_policy_splits: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        cp_world: int = 1,
+        cp_interleave_size: int = 1,
+        zero_empty_rows: bool = True,
         sparse_profile=None,
         finalize_output: bool = False,
         softmax_rescale_threshold_log2: float = 0.0,
@@ -1810,6 +1832,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.split_kv_capacity = split_kv_capacity
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
+        self.cp_world = cp_world
+        self.cp_interleave_size = cp_interleave_size
+        self.zero_empty_rows = zero_empty_rows
         self.sparse_profile = sparse_profile
         self.kv_cache_format = kv_cache_format
         self.extra_kv_cache_format = extra_kv_cache_format
@@ -1961,6 +1986,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.acc_dtype,
             self.lse_dtype,
             self.runtime_split_kv,
+            self.zero_empty_rows,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
             self.parallel_reduction_elements_per_slice,
@@ -2004,6 +2030,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cfg,
             kv_cache_format=self.kv_cache_format,
             extra_kv_cache_format=self.extra_kv_cache_format,
+        )
+        cfg = dataclass_replace(
+            cfg, cp_world=self.cp_world, cp_interleave_size=self.cp_interleave_size
         )
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
@@ -2131,6 +2160,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
+        cp_rank: Int32 = 0,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self.runtime_config(max_q_len)
@@ -2482,6 +2512,19 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
             softmax_scale_operand = softmax_scale * LOG2_E
 
+        if cutlass.const_expr(self.cp_world > 1 and self.zero_empty_rows):
+            from ..helpers.context_parallel import initialize_empty_rows
+
+            initialize_empty_rows(
+                o,
+                lse,
+                cache_seqs,
+                cu_seqlens_q,
+                cp_rank,
+                cfg,
+                Int32(cfg.logical_seq_len_q),
+                stream,
+            )
         self.dense_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -2508,6 +2551,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             q_latent,
             requested_splits=requested_splits,
             max_q_len=max_q_len,
+            cp_rank=cp_rank,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2555,6 +2599,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     output_quant_args,
                     requested_splits=requested_splits,
                     max_q_len=max_q_len,
+                    cp_rank=cp_rank,
                 )
                 if cutlass.const_expr(topology.cluster_size == 1):
                     parallel_reducer.launch(
@@ -2601,6 +2646,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cutlass.Int32(reduction_ctas),
                 requested_splits=requested_splits,
                 max_q_len=max_q_len,
+                cp_rank=cp_rank,
             ).launch(
                 grid=reduction_grid,
                 block=[reduction_threads, 1, 1],
@@ -2638,6 +2684,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         q_nope_tensor: cute.Tensor = None,
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
+        cp_rank: Int32 = 0,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
@@ -2751,12 +2798,18 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     cta_idx_q,
                     cta_idx_kv,
                     requested_splits=requested_splits,
+                    cp_rank=cp_rank,
                 )
                 split_tile_is_active = cute.arch.make_warp_uniform(split_tile_is_active)
             # An empty request publishes neither O/LSE nor split scratch.
             # Cluster peers agree on this batch-owned predicate.
             query_tile_is_active = query_tile_is_active & (
-                runtime_request_publishes(cfg, cache_seqs, batch_idx)
+                runtime_request_publishes(
+                    cfg,
+                    cache_seqs,
+                    batch_idx,
+                    cp_rank=cp_rank,
+                )
             )
             run_task_graph = query_tile_is_active and split_tile_is_active
         if cutlass.const_expr(tile_sched_params is not None):
@@ -2810,6 +2863,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            cp_rank=cp_rank,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,
@@ -2951,6 +3005,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         num_reduction_ctas: cutlass.Int32,
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
+        cp_rank: Int32 = 0,
     ):
         """Dispatch the throughput-latency split-KV reduction body."""
         cfg = self.runtime_config(max_q_len)
@@ -2965,6 +3020,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cfg,
             num_reduction_ctas,
             requested_splits=requested_splits,
+            cp_rank=cp_rank,
         )
 
     @cute.kernel
@@ -2980,6 +3036,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         output_quant_args=None,
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
+        cp_rank: Int32 = 0,
     ):
         """Dispatch the automatically selected parallel standalone reducer."""
 
@@ -3002,4 +3059,5 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.output_quant,
             output_quant_args,
             requested_splits=requested_splits,
+            cp_rank=cp_rank,
         )

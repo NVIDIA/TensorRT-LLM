@@ -96,7 +96,7 @@ class MlaContextPrologue(OpWrapper):
     columns are ``kpool_update``'s.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # GLM-5.3-Flash: q_lora 1536, kv_lora 512, an indexer key of 128 (the indexer GEMM output
     # is [k | gate | 32 head weights], 288 wide), RMSNorm eps 1e-5, key LayerNorm eps 1e-6,
     # 32-token blocks of an FP8 latent cache. Every rank writes every context row of a step,

@@ -107,6 +107,7 @@ def executor() -> PyExecutor:
     engine._terminate_request = Mock(side_effect=AssertionError("unactivated request teardown"))
     engine.resource_manager = Mock(spec=["free_resources"])
     engine.sampler = Mock(spec=["release_request"])
+    engine._num_embeddings = 1234
     return engine
 
 

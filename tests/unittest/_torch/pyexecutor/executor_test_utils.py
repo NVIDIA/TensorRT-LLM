@@ -22,6 +22,7 @@ def make_partial_executor(**attrs: Any) -> PyExecutor:
         dist=SimpleNamespace(rank=0, tp_size=1, pp_size=1, world_size=1),
         enable_attention_dp=False,
         model_engine=None,
+        _num_embeddings=None,
         draft_model_engine=None,
         sampler=Mock(),
         resource_manager=Mock(),

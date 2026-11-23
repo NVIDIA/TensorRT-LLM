@@ -21,13 +21,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from cosmos3_fixtures import bare_resolver
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
-from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
-    Cosmos3OmniMoTPipeline,
-    _transfer_flow_shift,
-)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     Cosmos3SamplingPolicy,
     SamplingSchedule,
@@ -379,7 +377,9 @@ def _policy(*, native_flow_schedule: bool = False) -> tuple[Cosmos3SamplingPolic
 
 def _distilled_policy() -> Cosmos3SamplingPolicy:
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_CONFIG)
-    return Cosmos3SamplingPolicy.from_scheduler(scheduler)
+    return Cosmos3SamplingPolicy.from_scheduler(
+        scheduler, fixed_sigmas=tuple(DISTILLED_CONFIG["fixed_step_sampler_config"]["t_list"])
+    )
 
 
 def _resolve(policy, *, sigma_grid=None, flow_shift=None, mode_flow_shift=1.0, mode_karras=None):
@@ -787,6 +787,7 @@ def _bare_pipeline(policy, base) -> Cosmos3OmniMoTPipeline:
     pipeline._base_scheduler = base
     pipeline._scheduler_cache = {}
     pipeline.family = QWEN3_RECIPE.name
+    pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=1.0)
     pipeline._device = torch.device("cpu")
     pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
     return pipeline
@@ -925,6 +926,16 @@ class TestRequestPath:
         assert {key[2] for key in pipeline._scheduler_cache} == {"video", "audio", "action"}
         assert {key[0] for key in pipeline._scheduler_cache} == {"native"}
 
+    def test_native_checkpoint_without_a_shift_keeps_its_linear_grid(self):
+        policy, base = _policy(native_flow_schedule=True)
+        pipeline = _request_pipeline(policy, base)
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
+        assert pipeline.resolver.flow_shift() is None
+        with pytest.raises(_StopAfterTokenize):
+            _forward(pipeline)
+        assert pipeline.scheduler.config.use_karras_sigmas is False
+        assert float(pipeline.scheduler.config.flow_shift) == policy.checkpoint_flow_shift
+
     def test_v2v_honors_an_explicit_grid(self):
         policy, base = _policy()
         pipeline = _request_pipeline(policy, base)
@@ -979,7 +990,7 @@ class TestTransferRequestPath:
         policy, base = _policy()
         pipeline = self._pipeline(policy, base, captured)
         preset = _transfer_config()
-        assert not preset.flow_shift_explicit
+        assert preset.flow_shift is None
         _forward(
             pipeline,
             video=_V2V_FIXTURE_MP4.read_bytes(),
@@ -987,8 +998,7 @@ class TestTransferRequestPath:
             sigma_grid="karras",
         )
         assert captured["schedule"].grid == "karras"
-        explicit = _transfer_config(flow_shift=preset.flow_shift)
-        assert explicit.flow_shift_explicit
+        explicit = _transfer_config(flow_shift=10.0)
         with pytest.raises(ValueError, match="no effect"):
             _forward(
                 pipeline,
@@ -1016,7 +1026,7 @@ class TestTransferRequestPath:
         pipeline = self._pipeline(policy, base, captured)
         _forward(pipeline, video=_V2V_FIXTURE_MP4.read_bytes(), transfer_config=_transfer_config())
         assert captured["schedule"].grid == "diffusers"
-        assert captured["schedule"].flow_shift == _transfer_flow_shift(_transfer_config())
+        assert captured["schedule"].flow_shift == 10.0
         assert not captured["schedule"].flow_shift_explicit
 
     @pytest.mark.parametrize(

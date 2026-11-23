@@ -23,7 +23,9 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <c10/cuda/CUDAGuard.h>
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <gtest/gtest.h>
 #include <mutex>
 #include <nccl.h>
@@ -98,6 +100,12 @@ public:
     {
         std::lock_guard<std::mutex> lock(allocator.mMutex);
         allocator.mLoggedFallbackWarnings.erase(comm);
+    }
+
+    //! Holds the allocator's main lock, as a window allocation or registration in progress does.
+    static std::unique_lock<std::mutex> holdAllocatorLock(NCCLWindowAllocator& allocator)
+    {
+        return std::unique_lock<std::mutex>(allocator.mMutex);
     }
 
     static void suppressLifecycleWarningAssertions(NCCLWindowAllocator& allocator, bool suppress)
@@ -211,6 +219,21 @@ TEST(NCCLWindowAllocatorWarningTest, FallbackWarningsAreLatchedIndependentlyPerC
     nccl_util::NCCLWindowAllocatorTestAccess::clearFallbackWarnings(allocator, comm);
 #else
     GTEST_SKIP() << "NCCL window buffers are not compiled in";
+#endif
+}
+
+TEST(NCCLWindowAllocatorUsageTest, UsageIsReadWithoutWaitingForAnAllocationInProgress)
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto lock = nccl_util::NCCLWindowAllocatorTestAccess::holdAllocatorLock(allocator);
+    auto reading = std::async(std::launch::async, [&allocator] { return allocator.getDeviceUsage(0); });
+    bool const returned = reading.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    lock.unlock();
+    reading.wait();
+    EXPECT_TRUE(returned) << "getDeviceUsage waited for the allocator lock";
+#else
+    GTEST_SKIP() << "NCCL window buffers need NCCL 2.28";
 #endif
 }
 
@@ -547,6 +570,35 @@ TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
 
     nccl_util::ScopedNCCLWindowBuffer const scopedBuffer(testComm, kBufferSize * 2, stream.get());
     EXPECT_TRUE(scopedBuffer.getBuffer().isValid());
+}
+
+TEST_F(NCCLWindowAllocatorTest, DeviceUsageFollowsTheBufferPool)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int device = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    auto const before = allocator.getDeviceUsage(device);
+    auto testComm = createWindowComm(*mComm, 0, mRank);
+    size_t constexpr kBufferSize = 256 * 1024;
+
+    auto buffer = allocator.requestBuffer(*testComm, kBufferSize);
+    ASSERT_TRUE(buffer.isValid());
+    auto const held = allocator.getDeviceUsage(device);
+    EXPECT_EQ(held.bufferCount, before.bufferCount + 1);
+    EXPECT_EQ(held.totalBytes, before.totalBytes + kBufferSize);
+    EXPECT_EQ(held.inUseBytes, before.inUseBytes + kBufferSize);
+
+    allocator.releaseBuffer(*testComm, buffer.ptr);
+    auto const pooled = allocator.getDeviceUsage(device);
+    EXPECT_EQ(pooled.bufferCount, before.bufferCount + 1);
+    EXPECT_EQ(pooled.totalBytes, before.totalBytes + kBufferSize);
+    EXPECT_EQ(pooled.inUseBytes, before.inUseBytes);
+
+    testComm.reset();
+    auto const after = allocator.getDeviceUsage(device);
+    EXPECT_EQ(after.bufferCount, before.bufferCount);
+    EXPECT_EQ(after.totalBytes, before.totalBytes);
+    EXPECT_EQ(after.inUseBytes, before.inUseBytes);
 }
 
 TEST_F(NCCLWindowAllocatorTest, BufferReuse)
