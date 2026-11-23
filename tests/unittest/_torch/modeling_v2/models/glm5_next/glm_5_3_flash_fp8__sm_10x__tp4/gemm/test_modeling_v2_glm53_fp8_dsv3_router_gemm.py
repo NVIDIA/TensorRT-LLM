@@ -29,7 +29,7 @@ from _validating import (  # noqa: E402,F401 — path above; fixture by name
 )
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() != 100, reason="dsv3_router_gemm is certified on sm_100"
+    get_sm_version() not in (100, 103), reason="dsv3_router_gemm is certified on sm_100 and sm_103"
 )
 
 DEV = "cuda"

@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -1370,6 +1371,17 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         if self._kda_replay_region is not None:
             buffers += self._kda_replay_region.shared_buffers(global_layer_id)
         return buffers
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """The KDA replay caches are generation-local and never move."""
+        spec = super().page_table_spec()
+        if self._kda_replay_region is None:
+            return spec
+        return replace(
+            spec,
+            untransferred_roles=spec.untransferred_roles | self._kda_replay_region.roles,
+        )
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:

@@ -69,6 +69,13 @@ from .rotary_embedding import RotaryEmbedding
 _MIN_STRIDED_KV_EXPAND_TOKENS = 4096
 
 
+def _check_mla_merge_format(is_lse: bool | None, partition_is_lse: bool) -> bool:
+    """Keep the first partition's normalizer encoding for the entire accumulation."""
+    if is_lse is not None and is_lse != partition_is_lse:
+        raise RuntimeError("MLA chunked-prefill normalizer format changed between partitions.")
+    return partition_is_lse if is_lse is None else is_lse
+
+
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
     """Drop CUDA-graph padding by slicing hidden_states to num_tokens rows.
 
@@ -300,7 +307,9 @@ def _run_mla_chunked_prefill_partitions(
     forward_args, loop_idx, cached_kv_tokens)`` attends it and returns its
     output. ``loop_idx`` and ``cached_kv_tokens``, the tokens the partition
     read back, are None for the current chunk. Every partition's output and
-    softmax statistics are merged into ``output``, which is returned.
+    softmax statistics are merged into ``output``, which is returned. The
+    attention op tags the format of the statistics it wrote on
+    ``forward_args``, and every partition has to write the same one.
     """
     chunked_loop_num = attn_metadata.chunked_loop_num
     # Per query token and head: the softmax statistics the merge combines.
@@ -310,6 +319,7 @@ def _run_mla_chunked_prefill_partitions(
         device=q.device,
     )
     mla.temp_softmax_stats_tensor = torch.empty_like(mla.softmax_stats_tensor)
+    is_lse = None
     attn_output = output
     temp_attn_output = q.new_empty(
         (q.size(0), mla.num_context_heads * mla.v_head_dim),
@@ -358,15 +368,17 @@ def _run_mla_chunked_prefill_partitions(
         chunked_compressed_kv = None
         chunked_k_pe = None
 
+        forward_args = make_partition_forward_args(PredefinedAttentionMask.FULL)
         temp_attn_output = run_partition(
             chunked_k,
             chunked_v,
-            make_partition_forward_args(PredefinedAttentionMask.FULL),
+            forward_args,
             loop_idx,
             total_chunked_tokens,
         )
         chunked_k = None
         chunked_v = None
+        is_lse = _check_mla_merge_format(is_lse, forward_args.softmax_stats_is_lse)
         trtllm_attention.merge_attention_for_mla(
             attn_output,
             temp_attn_output,
@@ -374,19 +386,16 @@ def _run_mla_chunked_prefill_partitions(
             mla.temp_softmax_stats_tensor,
             attn_metadata.merge_op_tensor[loop_idx],
             attn_metadata,
+            is_lse=is_lse,
         )
 
     # Last, the KV of the current chunk itself.
     current_k, current_v = expand_kv(compressed_kv, current_k_pe)
-    temp_attn_output = run_partition(
-        current_k,
-        current_v,
-        make_partition_forward_args(PredefinedAttentionMask.CAUSAL),
-        None,
-        None,
-    )
+    forward_args = make_partition_forward_args(PredefinedAttentionMask.CAUSAL)
+    temp_attn_output = run_partition(current_k, current_v, forward_args, None, None)
     current_k = None
     current_v = None
+    is_lse = _check_mla_merge_format(is_lse, forward_args.softmax_stats_is_lse)
     trtllm_attention.merge_attention_for_mla(
         attn_output,
         temp_attn_output,
@@ -394,6 +403,7 @@ def _run_mla_chunked_prefill_partitions(
         mla.temp_softmax_stats_tensor,
         attn_metadata.merge_op_tensor[chunked_loop_num],
         attn_metadata,
+        is_lse=is_lse,
     )
     return attn_output
 
@@ -1028,34 +1038,30 @@ class MLA(nn.Module):
                 (q.shape[0], self.num_heads_tp, 2), device=q.device, dtype=torch.float32
             )
             kwargs["softmax_stats_tensor"] = softmax_stats
+            forward_args = AttentionForwardArgs(**kwargs)
             partial_o = attn_backend.forward(
                 q,
                 k,
                 v,
                 attn_metadata,
-                forward_args=AttentionForwardArgs(**kwargs),
+                forward_args=forward_args,
             )
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            # helix_kv_bounds is non-None only on TrtllmAttentionMetadata,
-            # where _helix_spec_tokens_valid is a declared field.
-            if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
-                # Speculative verify groups: KV ownership is per-TOKEN. A rank
-                # owning only the tail page of a group has zero visible KV for
-                # the group's leading tokens while its per-sequence kv_len is
-                # nonzero, so the per-sequence mask above misses those rows.
-                # Their decode rows are fully masked with a finite sentinel,
-                # making partial_o an average over (possibly uninitialized)
-                # pool values; the combine multiplies by corr = 0 and
-                # 0 * NaN would poison the token on every CP rank — sanitize
-                # by the per-token bound instead.
-                zero_kv_mask = helix_kv_bounds[: partial_o.shape[0]] == 0
+            positions = getattr(attn_metadata, "helix_position_offsets", None)
+            if positions is not None:
+                # Under cyclic prefix ownership, a rank has no visible KV
+                # before its first page. Corrected positions give this mask
+                # per query, including groups crossing that page boundary.
+                first_owned_position = (
+                    self.mapping.cp_rank * attn_metadata.kv_cache_manager.tokens_per_block
+                )
+                zero_kv_mask = positions[: partial_o.shape[0]] < first_owned_position
             else:
                 # MLA processes only the generation token slice here, so build
-                # the mask from [num_contexts, num_seqs). Skip this expansion
-                # when the more precise per-token bounds above are valid.
+                # the mask from [num_contexts, num_seqs) for metadata without
+                # the per-token global positions.
                 zero_kv_mask = _helix_zero_kv_mask(
                     attn_metadata,
                     partial_o.shape[0],
@@ -1068,7 +1074,7 @@ class MLA(nn.Module):
                 value_dim = self.v_head_dim
             return _helix_post_process(
                 partial_o,
-                softmax_stats,
+                forward_args.softmax_stats,
                 self.mapping,
                 self.num_heads_tp_cp,
                 value_dim,
@@ -1076,6 +1082,7 @@ class MLA(nn.Module):
                 self.ln_events,
                 zero_kv_mask=zero_kv_mask,
                 is_cuda_graph=attn_metadata.is_cuda_graph,
+                is_lse=forward_args.softmax_stats_is_lse,
             )
         else:
             attn_output = attn_backend.forward(

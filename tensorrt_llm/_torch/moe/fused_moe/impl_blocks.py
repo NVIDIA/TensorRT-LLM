@@ -236,7 +236,11 @@ class MoEWeightOwnerMixin:
 
     def pre_reload_weights(self):
         """
-        Prepare tensors for weight reloading by reverting them to their original creation shape.
+        Prepare tensors for weight reloading.
+
+        The quant method decides how: most re-create each tensor in its original creation
+        shape, while some keep tensors they can update in place (for example
+        ``BF16TRTLLMGenFusedMoEMethod`` keeps its kernel-layout experts).
         """
         assert hasattr(self.quant_method, "pre_reload_weights"), (
             "pre_reload_weights is not supported for this quant method"

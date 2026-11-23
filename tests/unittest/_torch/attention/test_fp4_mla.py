@@ -50,6 +50,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     KVCacheParams,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.kimi_k3_cache_policy import (
@@ -532,6 +533,9 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     )
     metadata.helix_local_slots = torch.full_like(metadata.helix_position_offsets, untouched)
     metadata.helix_kv_bounds = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_global_kv_lens = torch.full(
+        (num_seqs + 2,), untouched, dtype=torch.int32, device="cuda"
+    )
     metadata.kv_lens_cuda = torch.full((num_seqs + 3,), untouched, dtype=torch.int32, device="cuda")
 
     metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
@@ -550,10 +554,15 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
         metadata.kv_lens_cuda[1 : 1 + num_seqs],
         expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
     )
+    torch.testing.assert_close(
+        metadata.helix_global_kv_lens[:num_seqs],
+        positions.view(num_seqs, tokens_per_seq)[:, -1] + 1,
+    )
     assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
     assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
     assert metadata.kv_lens_cuda[0].item() == untouched
     assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
+    assert (metadata.helix_global_kv_lens[num_seqs:] == untouched).all()
     # Any group of the sequence that this rank does not own writes no slot.
     assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
 
@@ -744,6 +753,116 @@ def test_kimi_k3_default_fp8_kv_layers_keep_an_nvfp4_mla_layer_per_stage(
     assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=mapping) == frozenset(
         expected
     )
+
+
+@pytest.mark.parametrize("chunked_loop_num", [0, 2])
+def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
+    monkeypatch: pytest.MonkeyPatch, chunked_loop_num: int
+) -> None:
+    import tensorrt_llm._torch.attention.mla as mla_module
+
+    monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
+    tokens, cached, heads, nope, rope, rank, v_dim = 4, 6, 2, 8, 4, 16, 8
+    calls = []
+    expected_is_lse = chunked_loop_num > 0
+    change_format = False
+
+    def load_chunked_kv_cache_for_mla(**kwargs):
+        calls.append(("load", kwargs["num_ctx_cached_tokens"]))
+        num = kwargs["num_ctx_cached_tokens"]
+        return torch.zeros(num, rank), torch.zeros(num, rope)
+
+    def forward_partition(q, k, v, metadata, forward_args, *, kv_lens_cuda, kv_lens_cpu):
+        calls.append(("partition", forward_args.attention_mask, k.shape[0], int(kv_lens_cpu[0])))
+        assert forward_args.attention_input_type == AttentionInputType.context_only
+        assert forward_args.latent_cache is None
+        assert k.shape == (k.shape[0], heads * (nope + rope))
+        assert v.shape == (k.shape[0], heads * v_dim)
+        forward_args.softmax_stats_is_lse = (
+            not expected_is_lse
+            if change_format and forward_args.attention_mask == PredefinedAttentionMask.CAUSAL
+            else expected_is_lse
+        )
+        partition_keys.append(k)
+        return forward_args.output
+
+    def merge(merged, temp, stats, temp_stats, merge_op, metadata, *, is_lse=False):
+        assert is_lse == expected_is_lse
+        calls.append(("merge", merge_op))
+
+    partition_keys = []
+    mha = SimpleNamespace(
+        append_fp4_mla_context_cache=lambda q, latent, metadata: calls.append(("append",)),
+        load_chunked_kv_cache_for_mla=load_chunked_kv_cache_for_mla,
+        forward_fp4_mla_context_partition=forward_partition,
+        merge_attention_for_mla=merge,
+    )
+    module = SimpleNamespace(
+        mha=mha,
+        out_scale=None,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=rope,
+        qk_nope_head_dim=nope,
+        qk_head_dim=nope + rope,
+        num_heads_tp=heads,
+        num_context_heads=heads,
+        v_head_dim=v_dim,
+        _project_context_kv=lambda x: torch.zeros(x.shape[0], heads * (nope + v_dim)),
+    )
+    metadata = SimpleNamespace(
+        num_ctx_tokens=tokens,
+        num_contexts=1,
+        chunked_loop_num=chunked_loop_num,
+        cu_chunked_seq_len=[torch.tensor([0, cached])] * chunked_loop_num,
+        host_cu_chunked_seq_len=torch.tensor([[0, cached]] * max(chunked_loop_num, 1)),
+        chunked_global_offset=[torch.zeros(1)] * chunked_loop_num,
+        max_chunk_len_per_loop=[cached] * chunked_loop_num,
+        chunked_seq_len=[torch.tensor([cached])] * chunked_loop_num,
+        host_chunked_seq_len=[torch.tensor([cached])] * chunked_loop_num,
+        prompt_lens_cuda_runtime=torch.tensor([tokens]),
+        prompt_lens_cpu_runtime=torch.tensor([tokens]),
+        merge_op_tensor=[f"op{i}" for i in range(chunked_loop_num + 1)],
+        runtime_features=SimpleNamespace(chunked_prefill_buffer_batch_size=1),
+    )
+    q = torch.zeros(tokens, heads * (nope + rope))
+    latent = torch.randn(tokens, 1, rank + rope)
+    output = torch.empty(tokens, heads * v_dim)
+
+    result = MLA.forward_context_with_chunked_prefill_fp4(
+        module, q, torch.zeros(tokens, rank), latent, metadata, output
+    )
+
+    assert result is output
+    # The chunk is appended to the FP4 cache once, before any partition.
+    assert calls[0] == ("append",)
+    expected = []
+    for loop_idx in range(chunked_loop_num):
+        expected += [
+            ("load", cached),
+            ("partition", PredefinedAttentionMask.FULL, cached, cached),
+            ("merge", f"op{loop_idx}"),
+        ]
+    expected += [
+        ("partition", PredefinedAttentionMask.CAUSAL, tokens, tokens),
+        ("merge", f"op{chunked_loop_num}"),
+    ]
+    assert calls[1:] == expected
+    # The current chunk attends with the RoPE part of its own latent cache.
+    current_k = partition_keys[-1].view(tokens, heads, nope + rope)
+    for head in range(heads):
+        torch.testing.assert_close(current_k[:, head, nope:], latent[:, 0, rank:])
+
+    if chunked_loop_num:
+        calls.clear()
+        change_format = True
+        with pytest.raises(RuntimeError, match="normalizer format changed between partitions"):
+            MLA.forward_context_with_chunked_prefill_fp4(
+                module, q, torch.zeros(tokens, rank), latent, metadata, output
+            )
+        # The causal partition must not reach merge after a format change.
+        assert [call for call in calls if call[0] == "merge"] == [
+            ("merge", f"op{i}") for i in range(chunked_loop_num)
+        ]
 
 
 def test_fp4_mla_disagg_import_skips_hybrid_linear_attention_layers(monkeypatch) -> None:

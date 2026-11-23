@@ -312,6 +312,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_position_offsets: Optional[torch.Tensor] = None
     helix_position_offsets_cpu: Optional[torch.Tensor] = None
 
+    # Generation-relative logical KV totals, including the current query group.
+    # Unlike kv_lens_cuda, these lengths are global rather than rank-local.
+    helix_global_kv_lens: Optional[torch.Tensor] = None
+    helix_global_kv_lens_cpu: Optional[torch.Tensor] = None
+
     # Whether the current rank is inactive for helix parallelism.
     # In helix parallelism, only the active rank appends KV cache for the query token
     # and attends to the previously cached tokens as well as the query token. Inactive
@@ -756,6 +761,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
+            self.helix_global_kv_lens = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="helix_global_kv_lens",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_global_kv_lens_cpu = torch.empty_like(
+                self.helix_global_kv_lens,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
             self.helix_is_inactive_rank = self.get_empty(
                 buffers,
                 (self.max_num_sequences, ),
@@ -1007,6 +1024,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_owned_new_tokens_cpu[:batch_size].copy_(
                 torch.tensor(helix_owned_new_tokens, dtype=torch.int))
             self._helix_spec_tokens_valid = True
+        elif (helix_position_offsets is not None
+              and helix_is_inactive_rank is not None
+              and len(helix_position_offsets) == len(helix_is_inactive_rank)
+              and self.helix_global_kv_lens is not None):
+            # Ordinary generation has one exact host-packed position per
+            # request. Speculative totals instead come from the corrected
+            # device positions in recompute_helix_spec_buffers().
+            num_generations = len(helix_position_offsets)
+            torch.add(self.helix_position_offsets_cpu[:num_generations],
+                      1,
+                      out=self.helix_global_kv_lens_cpu[:num_generations])
+            self.helix_global_kv_lens[:num_generations].copy_(
+                self.helix_global_kv_lens_cpu[:num_generations],
+                non_blocking=True)
 
     def _prepare_helix_context_slots(
             self, cached_token_lens: Optional[torch.Tensor]) -> None:
@@ -1070,6 +1101,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
           * helix_position_offsets / helix_local_slots / helix_kv_bounds are
             GENERATION-RELATIVE -- the packing loops only append for extend
             and generation rows, so token 0 is the first generation token.
+            helix_global_kv_lens is likewise generation-relative, one per
+            request rather than one per token.
           * kv_lens_cuda is BATCH-indexed, hence the num_contexts offset on
             the write below.
         """
@@ -1100,7 +1133,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             tokens_per_seq=tokens_per_gen_seq,
             tokens_per_block=self.kv_cache_manager.tokens_per_block,
             cp_size=self.mapping.cp_size,
-            cp_rank=self.mapping.cp_rank)
+            cp_rank=self.mapping.cp_rank,
+            global_kv_lens=(self.helix_global_kv_lens[:num_gen_seqs]
+                            if self.helix_global_kv_lens is not None else None))
 
     def build_locality_domain_block_offsets(
         self,
@@ -3874,6 +3909,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        forward_args.softmax_stats_is_lse = False
         has_variable_window_starts = (forward_args.variable_window_token_starts
                                       is not None)
         has_variable_window_ends = forward_args.variable_window_token_ends is not None
@@ -4912,10 +4948,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         temp_softmax_stats: torch.Tensor,
         merge_op: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
+        is_lse: bool = False,
     ) -> None:
+        """Merge a partition using one fixed normalizer format for both inputs."""
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-
         torch.ops.trtllm.merge_chunked_attention_for_mla(
             merged_attn,
             temp_attn,
@@ -4927,6 +4964,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             merge_op,
             self.num_heads,
             self.mla_params.v_head_dim,
+            is_lse=is_lse,
         )
 
     def sparse_kv_predict(

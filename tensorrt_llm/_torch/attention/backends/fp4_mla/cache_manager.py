@@ -4,7 +4,8 @@
 
 import math
 import os
-from typing import TYPE_CHECKING, Iterable, Optional
+from dataclasses import replace
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 import torch
 
@@ -12,6 +13,12 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
+    ByHead,
+    PageTableSpec,
+    RingSlots,
+    layer_groups,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -288,6 +295,58 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
     @property
     def blocks_in_primary_pool(self) -> int:
         return self.fp4_mla_layout.blocks_in_primary_pool
+
+    def page_table_spec(self) -> PageTableSpec:
+        """Latents token-major by head, as the FP4 MLA kernels write them, and the policy's other
+        roles and layer names (``_fp4_mla_page_table_spec``). The cache is K-only: any other role
+        it registers is a latent cache too."""
+        spec = KVCacheManagerV2.page_table_spec(self)
+        return self._fp4_mla_page_table_spec(
+            replace(spec, role_layouts={}, default_layout=ByHead(token_major=True, total=1)),
+            recurrent=lambda layer: False,
+        )
+
+    def _fp4_mla_page_table_spec(
+        self, spec: PageTableSpec, recurrent: Callable[[int], bool]
+    ) -> PageTableSpec:
+        """``spec`` with the MLA roles and layer names laid over it.
+
+        K and K block scales are token-major by their one latent head, which every rank holds
+        whole. The high-precision tail is a ring of BF16 latent tokens alike on every rank,
+        sized by this worker's speculative rewind, so a context and a generation worker may size
+        it differently. V scales and packed V derive from K and K scales; the generation worker
+        rebuilds them locally in rebuild_disagg_imported_cache. A model layer's cache and its
+        high-precision tail are two internal layers, global layers ``2 * m`` and ``2 * m + 1``
+        of model layer ``m``; an appended draft layer and a layer ``recurrent`` names take
+        ``2 * m``, so every name stays distinct and alike under any pipeline split. The tail's
+        window keeps the rewind beyond the tokens attention reads, and the lifecycles of the FP8
+        fallback and appended draft layers a window past ``max_seq_len``
+        (``retention_margins``)."""
+        layout = self.fp4_mla_layout
+        layer_ids = {}
+        for layers in layer_groups(self):
+            for internal in layers:
+                if recurrent(internal):
+                    global_layer = 2 * int(self.pp_layers[internal])
+                else:
+                    global_layer = layout._fp4_mla_disagg_global_layer_id(internal)
+                    if global_layer is None:
+                        raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal}.")
+                layer_ids[internal] = (global_layer, global_layer // 2)
+        return replace(
+            spec,
+            role_layouts={
+                **spec.role_layouts,
+                Role.KEY: ByHead(token_major=True, total=1),
+                Role.KEY_BLOCK_SCALE: ByHead(token_major=True, total=1),
+                Role.MLA_HP_TAIL: RingSlots(layout._fp4_mla_hp_pool_size, dtype="bfloat16"),
+            },
+            derived_roles=spec.derived_roles | {Role.MLA_V_SCALE, Role.MLA_V_PACKED},
+            retention_margins=True,
+            layer_ids=layer_ids,
+        )
+
+    extend_page_table_spec = _fp4_mla_page_table_spec
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         return {Role.ALL: MapperKind.NHD, **self.DISAGG_ROLE_MAPPER_KINDS}
