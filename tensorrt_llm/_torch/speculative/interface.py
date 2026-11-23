@@ -38,7 +38,8 @@ from ..distributed import AllReduceStrategy
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..modules.bf16_draft_head import BF16DraftHead, build_bf16_draft_head
 from ..modules.logits_processor import LogitsProcessor
-from ..pyexecutor import step_inputs
+from ..pyexecutor import device_copy, step_inputs
+from ..pyexecutor.device_copy import CopySite
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
@@ -699,11 +700,17 @@ def one_model_sampling_mode(requests, spec_metadata: "SpecMetadata") -> int:
 
 def _upload_host_values(dst: torch.Tensor,
                         values: np.ndarray,
-                        pack: bool = False) -> None:
-    """Copy ``values`` into the head of ``dst`` without blocking; ``pack`` lets the copy move to the open
-    step-input pack's flush (a plain copy when no pack is open)."""
+                        pack: bool = False,
+                        site: Optional[CopySite] = None) -> None:
+    """Copy ``values`` into the head of ``dst`` without blocking.
+
+    With ``site``, a model that declares a copy plan (an active copier) may merge the copy. Otherwise ``pack`` lets the
+    copy move to the open step-input pack's flush (a plain copy when no pack is open).
+    """
     src = maybe_pin_memory(torch.from_numpy(values))
-    if pack:
+    if site is not None and device_copy.current() is not None:
+        device_copy.copy(site, dst[:len(values)], src)
+    elif pack:
         step_inputs.copy_(dst[:len(values)], src)
     else:
         dst[:len(values)].copy_(src, non_blocking=True)
@@ -1213,10 +1220,14 @@ class SpecMetadata:
 
         # The forward is the first reader of these buffers.
         pack = self.pack_rng_uploads
-        _upload_host_values(self.request_seeds, request_seeds, pack)
-        _upload_host_values(self.request_offsets, request_offsets, pack)
-        _upload_host_values(self.seeds, flat_seeds, pack)
-        _upload_host_values(self.offsets, flat_offsets, pack)
+        _upload_host_values(self.request_seeds, request_seeds, pack,
+                            CopySite.SPEC_RNG_REQUEST_SEEDS)
+        _upload_host_values(self.request_offsets, request_offsets, pack,
+                            CopySite.SPEC_RNG_REQUEST_OFFSETS)
+        _upload_host_values(self.seeds, flat_seeds, pack,
+                            CopySite.SPEC_RNG_SEEDS)
+        _upload_host_values(self.offsets, flat_offsets, pack,
+                            CopySite.SPEC_RNG_OFFSETS)
 
     def prepare_rejection_sampling_buffers(self):
         """

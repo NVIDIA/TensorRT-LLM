@@ -52,8 +52,9 @@ from tensorrt_llm.quantization.mode import QuantMode
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...locality_domain.runtime import LocalityDomainRuntime
-from ...pyexecutor import h2d_cache, step_inputs
+from ...pyexecutor import device_copy, h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.device_copy import CopySite
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -1426,7 +1427,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            # The model declares a copy plan, which owns the engine's copies. Never
+            # skipped: CUDA graph metadata of every graph key takes this buffer from
+            # one pool, so no host record proves its device contents.
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs])
+        elif not self._upload_to_device(
                 "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
                 self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
             copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
@@ -1486,7 +1494,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_KV_LENS,
+                             self.kv_lens_cuda[:self.num_seqs],
+                             maybe_pin_memory(kv_lens[:self.num_seqs]))
+        elif not self._upload_to_device(
                 "kv_lens", self.kv_lens_cuda[:self.num_seqs],
                 kv_lens[:self.num_seqs], step_inputs.is_open()):
             step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
@@ -1837,7 +1849,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        else:
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens
