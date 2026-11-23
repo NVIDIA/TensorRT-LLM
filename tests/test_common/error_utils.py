@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import os
 import re
+from collections.abc import Iterable
 
 ERROR_KEYWORDS = [
     "RuntimeError",
@@ -59,21 +61,64 @@ SLURM_LOG_TAIL_LINES = 200  # Number of lines to print from slurm job logs
 ERROR_CONTEXT_LINES = 100  # Number of lines to print before and after error line
 
 
+def _error_lines(lines: Iterable[str], first_line_idx: int = 1) -> list[tuple[int, str]]:
+    """(line number, line) of each line with an error keyword that is not benign."""
+    error_lines = []
+    for line_idx, line in enumerate(lines, start=first_line_idx):
+        if is_benign_line(line):
+            continue
+        for keyword in ERROR_KEYWORDS:
+            if keyword in line:
+                error_lines.append((line_idx, line.strip()))
+                break  # Only add line once even if multiple keywords match
+    return error_lines
+
+
 def check_error(file_path: str) -> list[tuple[int, str]]:
     if not os.path.exists(file_path):
         return []
 
-    error_lines = []
     with open(file_path, "r", errors="replace") as f:
-        for line_idx, line in enumerate(f, start=1):
-            if is_benign_line(line):
-                continue
-            for keyword in ERROR_KEYWORDS:
-                if keyword in line:
-                    error_lines.append((line_idx, line.strip()))
-                    break  # Only add line once even if multiple keywords match
+        return _error_lines(f)
 
-    return error_lines
+
+class LogScanner:
+    """Scans growing logs for error keywords, reading only what a log gained since its last scan.
+
+    Reading a whole log at every poll makes each poll cost the size of the log, and on Lustre the
+    reader's locks hold up the writer on another node: the srun that collects the ranks' stdout,
+    and with it every rank whose stdout pipe is full. A log that shrank is scanned from its start.
+    """
+
+    def __init__(self) -> None:
+        # log -> (bytes scanned, lines scanned): only complete lines count as scanned.
+        self._scanned: dict[str, tuple[int, int]] = {}
+
+    def scan(self, file_path: str) -> list[tuple[int, str]]:
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            return []
+        offset, num_lines = self._scanned.get(file_path, (0, 0))
+        if size < offset:
+            offset, num_lines = 0, 0
+        with open(file_path, "rb") as f:
+            f.seek(offset)
+            data = f.read(size - offset)
+        # A last line without its newline is checked now, and read again once it is complete.
+        complete = data.rfind(b"\n") + 1
+        lines = _text_lines(data[:complete])
+        error_lines = _error_lines(lines, num_lines + 1)
+        if complete < len(data):
+            error_lines += _error_lines(_text_lines(data[complete:]), num_lines + len(lines) + 1)
+        self._scanned[file_path] = (offset + complete, num_lines + len(lines))
+        return error_lines
+
+
+def _text_lines(data: bytes) -> list[str]:
+    """``data``'s lines as reading the file in text mode splits and decodes them."""
+    with io.TextIOWrapper(io.BytesIO(data), errors="replace") as text:
+        return list(text)
 
 
 def report_error(

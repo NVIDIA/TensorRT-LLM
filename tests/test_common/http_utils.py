@@ -7,7 +7,7 @@ import time
 
 import requests
 
-from test_common.error_utils import check_error, report_error
+from test_common.error_utils import LogScanner, report_error
 
 
 def _fail_with_server_logs(message: str, check_files: list[str] | None):
@@ -62,12 +62,14 @@ def wait_for_endpoint_ready(
       - ``server_proc`` or an ``additional_server_procs`` entry exited ->
         no point polling when a required server is dead;
       - an error keyword appears in a ``check_files`` log (scanned every
-        ``check_interval`` seconds; time-based rather than iteration-based);
+        ``check_interval`` seconds; time-based rather than iteration-based;
+        each scan reads only what a log gained since the last one);
       - ``timeout`` elapses without the endpoint becoming ready.
     """
     start = time.monotonic()
     next_file_check = start + check_interval
     missing_warned: set[str] = set()
+    log_scanner = LogScanner()
     while time.monotonic() - start < timeout:
         fail_if_proc_died(server_proc, "Server process (before becoming ready)", check_files)
         for additional_proc, what in additional_server_procs or []:
@@ -84,7 +86,7 @@ def wait_for_endpoint_ready(
                             "(yet?); cannot scan it for errors"
                         )
                     continue
-                error_lines = check_error(check_file)
+                error_lines = log_scanner.scan(check_file)
                 if error_lines:
                     error_lines_str = ", ".join(
                         [f"line {line_idx}: {line_str}" for line_idx, line_str in error_lines]
