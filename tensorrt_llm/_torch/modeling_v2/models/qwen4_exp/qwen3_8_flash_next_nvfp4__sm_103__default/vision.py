@@ -602,6 +602,11 @@ def validate_request(tower, request) -> None:
     data = request.py_multimodal_data
     if not data:
         return
+    if data.get("multimodal_embedding") is not None:
+        raise ValueError(
+            "This target requires image or video pixels to run the vision tower "
+            "and cannot consume precomputed embeddings."
+        )
     grids = {}
     for modality, (pixel_key, grid_key) in MEDIA_KEYS.items():
         media = data.get(modality)

@@ -593,11 +593,10 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(
-        self,
-        mm_embeddings: torch.Tensor,
-        mm_embedding_lengths: List[int],
-        mm_embedding_metadata: list[dict[str, list[int]]]
-        | None = None) -> None:
+            self,
+            mm_embeddings: torch.Tensor,
+            mm_embedding_lengths: List[int],
+            mm_embedding_metadata: list[dict[str, Any]] | None = None) -> None:
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:

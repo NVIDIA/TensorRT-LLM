@@ -47,6 +47,12 @@ class VisionNormalization(NamedTuple):
     compute_dtype: torch.dtype | None = None
 
 
+def is_uint8_rgb_frame(frame: Any) -> bool:
+    return ((isinstance(frame, Image.Image) and frame.mode == "RGB")
+            or (isinstance(frame, np.ndarray) and frame.dtype == np.uint8
+                and frame.ndim == 3 and frame.shape[-1] == 3))
+
+
 def vision_normalization_from_processor(
         frames: list[Any], processor: Any,
         out_dtype: torch.dtype) -> VisionNormalization | None:
@@ -60,10 +66,7 @@ def vision_normalization_from_processor(
         return None
     if not (processor.do_rescale or processor.do_normalize):
         return None
-    rgb_frames = frames and all(
-        (isinstance(frame, Image.Image) and frame.mode == "RGB") or
-        (isinstance(frame, np.ndarray) and frame.dtype == np.uint8
-         and frame.ndim == 3 and frame.shape[-1] == 3) for frame in frames)
+    rgb_frames = frames and all(is_uint8_rgb_frame(frame) for frame in frames)
     if not rgb_frames:
         return None
     return VisionNormalization(

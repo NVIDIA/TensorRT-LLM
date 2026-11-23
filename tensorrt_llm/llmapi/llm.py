@@ -360,6 +360,9 @@ class PreprocessedInputs:
     prompt_token_ids: List[int]
     multimodal_params: Optional[MultimodalParams] = None
     encoder_input_token_ids: Optional[List[int]] = None
+    # True for a standalone encode of media items with no prompt. The prompt
+    # is synthetic, so `generate_async` exports no layout or mRoPE for it.
+    mm_items_only: bool = False
 
 
 class BaseLLM:
@@ -885,10 +888,14 @@ class BaseLLM:
             sampling_params.max_tokens = 1
             self._configure_bart_decoder_prefix(sampling_params)
 
+        mm_items_only = self._is_mm_items_only(inputs)
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             multimodal_params = inputs.multimodal_params
+            self._check_mm_output_length(multimodal_params,
+                                         len(prompt_token_ids), sampling_params,
+                                         disaggregated_params)
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(
@@ -912,7 +919,8 @@ class BaseLLM:
             disaggregated_params = replace(disaggregated_params,
                                            multimodal_input_layout=None)
 
-        if (self.args.mm_encoder_only
+        # An item-only encode exports no layout: its prompt is synthetic.
+        if (self.args.mm_encoder_only and not mm_items_only
                 and multimodal_params is not None and isinstance(
                     self.input_processor, BaseMultimodalInputProcessor)):
             encoder_layout = self.input_processor.get_disagg_prefill_inputs(
@@ -951,6 +959,12 @@ class BaseLLM:
             priority=priority,
             kv_hints=kv_hints,
         )
+        result.mm_items_only = mm_items_only
+        if (self.args.mm_encoder_only and getattr(
+                self.input_processor, "supports_mm_item_handoff", False)):
+            # A raw digest describes the source, including its UUID, but not
+            # the processor settings that produced these particular rows.
+            result._multimodal_hashes = None
 
         if sampling_params.return_perf_metrics:
             result.metrics_dict.update(
@@ -961,6 +975,37 @@ class BaseLLM:
             prompt,
             self.tokenizer,
             post_processor_hook=self._post_processor_hook)
+
+    def _is_mm_items_only(self, inputs: Any) -> bool:
+        """Whether this is a standalone encode of media items with no prompt."""
+        if isinstance(inputs, PreprocessedInputs):
+            return inputs.mm_items_only
+        return (isinstance(inputs, dict) and inputs.get("prompt") is None
+                and inputs.get("prompt_token_ids") is None
+                and bool(inputs.get("multi_modal_data"))
+                and self.args.mm_encoder_only)
+
+    def _check_mm_output_length(
+        self,
+        params: Optional[MultimodalParams],
+        prompt_len: int,
+        sampling_params: SamplingParams,
+        disaggregated_params: Optional[DisaggregatedParams],
+    ) -> None:
+        if params is None or not params.multimodal_data:
+            return
+        limit = params.multimodal_data.get("mrope_max_output_tokens")
+        if limit is None or (disaggregated_params is not None
+                             and disaggregated_params.request_type
+                             == "context_only"):
+            return
+        requested = sampling_params.max_tokens
+        max_seq_len = getattr(self.args, "max_seq_len", None)
+        if max_seq_len is not None:
+            requested = min(requested, max_seq_len - prompt_len)
+        if requested > limit:
+            raise ValueError(
+                f"Video mRoPE positions allow at most {limit} output tokens")
 
     def _preprocess(
         self,
@@ -977,6 +1022,7 @@ class BaseLLM:
         Returns:
             `(prompt_token_ids, prompt, multimodal_params, encoder_input_token_ids)`
         """
+        mm_items_only = self._is_mm_items_only(inputs)
         if isinstance(inputs, dict):
             inputs = self._copy_prompt_inputs(inputs)
             if "encoder_inputs" in inputs:
@@ -991,6 +1037,19 @@ class BaseLLM:
                 raise ValueError(
                     "decoder_input_token_ids is not supported. Pass decoder "
                     "token IDs as inputs.")
+            if mm_items_only:
+                # Encode items with no prompt: use one placeholder per item.
+                inputs["multi_modal_data"] = {
+                    modality: items if isinstance(items, list) else [items]
+                    for modality, items in inputs["multi_modal_data"].items()
+                    if items is not None
+                    and not (isinstance(items, list) and not items)
+                }
+                inputs["prompt"] = cast(
+                    BaseMultimodalInputProcessor,
+                    self.input_processor).get_mm_items_prompt(
+                        inputs["multi_modal_data"], inputs.get("mm_item_order"),
+                        inputs.get("mm_processor_kwargs"))
 
         if inputs is None or (isinstance(inputs, dict)
                               and "prompt" not in inputs
@@ -1027,16 +1086,33 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            layout_kwargs = {}
-            if disaggregated_params.multimodal_input_layout is not None:
-                layout_kwargs[
-                    "encoder_inputs"] = disaggregated_params.multimodal_input_layout
-            prompt_token_ids, multimodal_params = (
-                self.input_processor.build_disagg_prefill_multimodal_inputs(
-                    inputs,
-                    mm_handles,
-                    mm_hashes=disaggregated_params.multimodal_hashes,
-                    **layout_kwargs))
+            if (getattr(self.input_processor, "supports_mm_item_handoff", False)
+                    and disaggregated_params.multimodal_input_layout is None
+                    and disaggregated_params.mrope_position_ids_handle is None):
+                # Items from an encode without the real prompt: build the
+                # prompt and its positions from the item metadata.
+                prompt_token_ids, multimodal_params = (
+                    self.input_processor.build_mm_item_prefill_inputs(
+                        inputs,
+                        mm_handles,
+                        sampling_params,
+                        mm_hashes=disaggregated_params.multimodal_hashes))
+                self._check_mm_output_length(multimodal_params,
+                                             len(prompt_token_ids),
+                                             sampling_params,
+                                             disaggregated_params)
+                multimodal_params.to_handle("multimodal_data")
+            else:
+                layout_kwargs = {}
+                if disaggregated_params.multimodal_input_layout is not None:
+                    layout_kwargs[
+                        "encoder_inputs"] = disaggregated_params.multimodal_input_layout
+                prompt_token_ids, multimodal_params = (
+                    self.input_processor.build_disagg_prefill_multimodal_inputs(
+                        inputs,
+                        mm_handles,
+                        mm_hashes=disaggregated_params.multimodal_hashes,
+                        **layout_kwargs))
             if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
@@ -1142,10 +1218,16 @@ class BaseLLM:
                 if not multimodal_params.has_content():
                     multimodal_params = None
                 else:
+                    self._check_mm_output_length(multimodal_params,
+                                                 len(prompt_token_ids),
+                                                 sampling_params,
+                                                 disaggregated_params)
                     # Convert to shared tensor handle to reduce IPC overhead
                     multimodal_params.to_handle("multimodal_data")
-                    if (disaggregated_params is not None) and (
-                            "mrope_config"
+                    # An item-only encode has a synthetic prompt, so its
+                    # mRoPE stays out of the caller's disaggregated params.
+                    if (disaggregated_params is not None and not mm_items_only
+                            and "mrope_config"
                             in multimodal_params.multimodal_data):
                         # Propagate mRoPE handles during context-only P -> D so decode-only
                         # can rebuild mrope_config without raw multimodal inputs.
@@ -1224,6 +1306,7 @@ class BaseLLM:
             prompt_token_ids=prompt_token_ids,
             multimodal_params=multimodal_params,
             encoder_input_token_ids=encoder_input_token_ids,
+            mm_items_only=self._is_mm_items_only(inputs),
         )
 
     @set_api_status("prototype")

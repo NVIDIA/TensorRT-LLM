@@ -21,7 +21,7 @@ from tensorrt_llm.llmapi import tracing
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import DisaggregatedParams, random_multimodal_hashes
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..logger import logger
@@ -233,6 +233,9 @@ class GenerationResultBase:
         self.postproc_params = postproc_params
         self._error_msg: Optional[str] = None
         self._disaggregated_params = None
+        # Set by the LLM API for a standalone encode of media items with no
+        # prompt: the result then exports no mRoPE of the synthetic prompt.
+        self.mm_items_only = False
         self.decoding_iter = 0
         self.cached_tokens = 0
         self.ctx_computed_tokens = 0
@@ -781,11 +784,21 @@ class GenerationResultBase:
                             None)) is not None:
                 if self._disaggregated_params is not None:
                     self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
-                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
+                    self._disaggregated_params.multimodal_hashes = (
+                        self._multimodal_hashes
+                        or random_multimodal_hashes(len(mm_embedding_handles)))
                 else:
                     self._disaggregated_params = DisaggregatedParams(
                         multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes)
+                # Keep each item's hash with its metadata, so an item cached
+                # by the caller can be sent to prefill with its hash.
+                for handle, mm_hash in zip(
+                        mm_embedding_handles,
+                        self._disaggregated_params.multimodal_hashes):
+                    handle["metadata"] = {
+                        **handle.get("metadata", {}), "multimodal_hash": mm_hash
+                    }
 
             # Handle mrope handles for both:
             # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
@@ -793,10 +806,17 @@ class GenerationResultBase:
             #    were already computed in encode phase, but mrope still needs forwarding)
             if (getattr(response_result, "mrope_position_ids_handle", None)
                     is not None and self.disaggregated_params is not None):
-                self._disaggregated_params.mrope_position_ids_handle = (
-                    response_result.mrope_position_ids_handle)
-                self._disaggregated_params.mrope_position_deltas_handle = (
-                    response_result.mrope_position_deltas_handle)
+                ids = response_result.mrope_position_ids_handle
+                deltas = response_result.mrope_position_deltas_handle
+                if self.mm_items_only:
+                    # No consumer will open the synthetic prompt's handles.
+                    from .._torch.shared_tensor import SharedTensorContainer
+
+                    SharedTensorContainer.release_dict(ids)
+                    SharedTensorContainer.release_dict(deltas)
+                else:
+                    self._disaggregated_params.mrope_position_ids_handle = ids
+                    self._disaggregated_params.mrope_position_deltas_handle = deltas
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
