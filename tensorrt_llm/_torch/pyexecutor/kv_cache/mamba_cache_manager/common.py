@@ -265,6 +265,15 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     _supports_additional_snapshot_offsets = False
 
     @property
+    def commits_every_generation_step(self) -> bool:
+        """Whether every generation step, drafts or not, needs ``update_mamba_states``.
+
+        A family state that verifies one-token steps too returns True; the
+        speculative workers then commit their draft-free steps after sampling.
+        """
+        return False
+
+    @property
     def cuda_state_indices(self) -> torch.Tensor:
         return self._state_indices_buffer.tensor
 

@@ -1548,11 +1548,12 @@ class KvCacheCreator:
                 and _uses_gdn_mtp_replay(self._model_engine.model)):
             # Cost the GDN replay region of the state the manager will select.
             extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
+        from ..modules.kimi_kda.cache_manager import uses_kda_mtp_replay
         if (not is_draft and self._speculative_config is not None
                 and isinstance(manager_cls, type)
                 and issubclass(manager_cls, MambaHybridCacheManagerV2)
                 and self._model_engine is not None
-                and _uses_kda_mtp_replay(self._model_engine.model)):
+                and uses_kda_mtp_replay(self._model_engine.model)):
             # Cost the KDA replay region of the state the manager will select.
             extra_kwargs = dict(extra_kwargs, kda_mtp_replay=True)
         cost = CacheCost.from_raw(
@@ -4728,31 +4729,6 @@ def _uses_gdn_mtp_replay(model: torch.nn.Module) -> bool:
         for layer in layers)
 
 
-def _uses_kda_mtp_replay(model: torch.nn.Module) -> bool:
-    """Whether ``model``'s KDA layers can verify drafts with the KDA MTP replay kernels.
-
-    They must be the PyTorch KDA mixer with a 4-tap convolution and the -5
-    gate lower bound the kernels fold in. A modeling_v2 target runs its own
-    KDA verify and speculative step, so it keeps the fused verify, as does any
-    model when ``TRTLLM_USE_KDA_MTP_REPLAY=0``.
-    """
-    from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
-    from ..utils import is_kda_mtp_replay_enabled
-    if not isinstance(model,
-                      torch.nn.Module) or not is_kda_mtp_replay_enabled():
-        return False
-    if getattr(getattr(model, "model_config", None), "modeling_v2_target",
-               None) is not None:
-        return False
-    layers = [
-        module for module in model.modules()
-        if isinstance(module, KimiKDALinearAttention)
-    ]
-    return bool(layers) and all(
-        layer.conv_size == 4 and layer.gate_lower_bound == -5.0
-        for layer in layers)
-
-
 def _create_kv_cache_manager(
         model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
@@ -5025,10 +5001,11 @@ def _create_kv_cache_manager(
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and getattr(backbone, "kda_draft_records", False)):
             kda_extra_kwargs["kda_draft_records"] = True
+        from ..modules.kimi_kda.cache_manager import uses_kda_mtp_replay
         if (spec_config is not None
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and model_engine is not None
-                and _uses_kda_mtp_replay(model_engine.model)):
+                and uses_kda_mtp_replay(model_engine.model)):
             kda_extra_kwargs["kda_mtp_replay"] = True
         if (not is_glm5_next and issubclass(kv_cache_manager_cls,
                                             MambaHybridCacheManagerV2)):

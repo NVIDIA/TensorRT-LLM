@@ -180,6 +180,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return isinstance(self._kda_replay, KDAMtpReplayState)
 
     @property
+    @override
     def commits_every_generation_step(self) -> bool:
         """Whether every generation step, drafts or not, needs ``update_mamba_states``.
 

@@ -131,12 +131,13 @@ slots.
 |---|---|
 | Life cycle | `REQUEST`, `NEVER` |
 | Layers | The local KDA layers |
-| Planes | `replay_layout()`: the convolution replay windows and k/g/v/beta caches per layer, plus the accepted-draft count on the first local KDA layer |
+| Planes | `replay_layout()`. The fused verify (`KDAReplayState`): the convolution replay windows and k/g/v/beta caches per layer, plus the accepted-draft count on the first local KDA layer. The KDA MTP replay (`KDAMtpReplayState`): the K, U and cumulative-G histories per layer (`[heads, 16 + tokens per step, head_dim]`; K and U in BF16, G in FP32), plus the accepted history length in the same count row |
 | Fixed slot count | `KDAReplayState.replay_slot_count()`: `ceil(IndexMapper capacity / max_util_for_resume)`. The IndexMapper capacity bounds the living caches, active and suspended, reserved dummies included. KDA models run at beam width 1. |
 
 Kimi K3 and GLM5Next exclude replay buffers through `get_disagg_ignored_roles()`. The
 disaggregation extractor uses that hook to select transferable views. The generation worker
-seeds replay from the transferred recurrent state after the transfer completes.
+seeds replay from the transferred recurrent state after the transfer completes; the KDA MTP
+replay only clears the history length, because the transferred checkpoints are current.
 
 Replay state follows its request through suspend and resume; the physical slot can move. The
 provider uploads each request's replay slot; the KDA manager exposes it through

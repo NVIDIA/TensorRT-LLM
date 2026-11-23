@@ -40,6 +40,7 @@ from ..modules.bf16_draft_head import BF16DraftHead, build_bf16_draft_head
 from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor import device_copy, step_inputs
 from ..pyexecutor.device_copy import CopySite
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
@@ -2523,7 +2524,8 @@ class SpecWorkerBase(nn.Module, ABC):
         # Replay states verify every generation step, so its token is
         # committed after sampling even without drafts.
         kv_cache_manager = attn_metadata.kv_cache_manager
-        if (getattr(kv_cache_manager, "commits_every_generation_step", False)
+        if (isinstance(kv_cache_manager, MambaHybridCacheManager)
+                and kv_cache_manager.commits_every_generation_step
                 and batch_size > num_contexts):
             kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,

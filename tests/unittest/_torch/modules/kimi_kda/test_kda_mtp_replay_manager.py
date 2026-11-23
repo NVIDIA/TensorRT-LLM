@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManager,
     kda_mtp_replay_unsupported_reason,
+    uses_kda_mtp_replay,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaAcceptanceBatch
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
@@ -170,7 +171,6 @@ def test_packed_qkv_rows_views_only_one_projection():
 
 def test_kimi_factory_passes_kda_mtp_replay_for_the_pytorch_mixer(monkeypatch):
     from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
-    from tensorrt_llm._torch.pyexecutor import _util
 
     def mixer(conv_size, gate_lower_bound):
         layer = KimiKDALinearAttention.__new__(KimiKDALinearAttention)
@@ -180,20 +180,20 @@ def test_kimi_factory_passes_kda_mtp_replay_for_the_pytorch_mixer(monkeypatch):
         return layer
 
     model = torch.nn.ModuleList([mixer(4, -5.0), mixer(4, -5.0)])
-    assert _util._uses_kda_mtp_replay(model)
-    assert not _util._uses_kda_mtp_replay(torch.nn.ModuleList([mixer(4, -5.0), mixer(3, -5.0)]))
-    assert not _util._uses_kda_mtp_replay(torch.nn.ModuleList([mixer(4, None)]))
-    assert not _util._uses_kda_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)]))
-    assert not _util._uses_kda_mtp_replay(SimpleNamespace(model=SimpleNamespace()))
+    assert uses_kda_mtp_replay(model)
+    assert not uses_kda_mtp_replay(torch.nn.ModuleList([mixer(4, -5.0), mixer(3, -5.0)]))
+    assert not uses_kda_mtp_replay(torch.nn.ModuleList([mixer(4, None)]))
+    assert not uses_kda_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)]))
+    assert not uses_kda_mtp_replay(SimpleNamespace(model=SimpleNamespace()))
     # TRTLLM_USE_KDA_MTP_REPLAY=0 keeps the fused verify.
     monkeypatch.setenv("TRTLLM_USE_KDA_MTP_REPLAY", "0")
-    assert not _util._uses_kda_mtp_replay(model)
+    assert not uses_kda_mtp_replay(model)
     monkeypatch.delenv("TRTLLM_USE_KDA_MTP_REPLAY")
     # A modeling_v2 target runs its own KDA verify and speculative step.
     model.model_config = SimpleNamespace(modeling_v2_target=object)
-    assert not _util._uses_kda_mtp_replay(model)
+    assert not uses_kda_mtp_replay(model)
     model.model_config = SimpleNamespace(modeling_v2_target=None)
-    assert _util._uses_kda_mtp_replay(model)
+    assert uses_kda_mtp_replay(model)
 
 
 def _manager(manager_cls=KimiK3HybridCacheManager, num_spec=2, **kwargs):
@@ -699,17 +699,36 @@ def test_kda_mtp_replay_history_follows_a_suspended_request(slot_taken):
         assert torch.equal(got, want), f"verify round {round_idx}"
 
 
-@pytest.mark.parametrize("commits", [True, False], ids=["replay_state", "other_state"])
+@pytest.mark.parametrize(
+    "commits", [True, False, "not_a_mamba_manager"], ids=["replay_state", "other_state", "other"]
+)
 @pytest.mark.parametrize("num_contexts", [0, 1, 3])
 def test_skip_drafting_commits_replay_states(commits, num_contexts):
-    """A step without drafts still commits its generation tokens to a replay state."""
+    """A step without drafts still commits its generation tokens to a replay state.
+
+    Only a recurrent-state manager is asked; another object with the same
+    attribute is not.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        MambaHybridCacheManagerV2,
+    )
     from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
     calls = []
-    manager = SimpleNamespace(
-        commits_every_generation_step=commits,
-        update_mamba_states=lambda **kwargs: calls.append(kwargs),
-    )
+
+    class ReplayManager(MambaHybridCacheManagerV2):
+        commits_every_generation_step = commits is True
+
+        def update_mamba_states(self, **kwargs):
+            calls.append(kwargs)
+
+    if commits == "not_a_mamba_manager":
+        manager = SimpleNamespace(
+            commits_every_generation_step=True,
+            update_mamba_states=lambda **kwargs: calls.append(kwargs),
+        )
+    else:
+        manager = object.__new__(ReplayManager)
     worker = SimpleNamespace(
         _execute_guided_decoder_if_present=lambda logits: None,
         _sample_tokens_for_batch=lambda logits, spec_metadata, nc, bs: torch.tensor(
@@ -729,7 +748,7 @@ def test_skip_drafting_commits_replay_states(commits, num_contexts):
     )
 
     assert out["new_tokens"][:, 0].tolist() == [5, 6, 7]
-    if not commits or num_contexts == 3:
+    if commits is not True or num_contexts == 3:
         assert calls == []
         return
     (call,) = calls

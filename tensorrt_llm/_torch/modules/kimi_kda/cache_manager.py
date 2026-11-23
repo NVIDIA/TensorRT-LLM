@@ -1363,6 +1363,29 @@ def kda_mtp_replay_unsupported_reason(
     return None
 
 
+def uses_kda_mtp_replay(model: torch.nn.Module) -> bool:
+    """Whether ``model``'s KDA layers can verify drafts with the KDA MTP replay kernels.
+
+    They must be the PyTorch KDA mixer with a 4-tap convolution and the -5
+    gate lower bound the kernels fold in. A modeling_v2 target runs its own
+    KDA verify and speculative step, so it keeps the fused verify, as does any
+    model when ``TRTLLM_USE_KDA_MTP_REPLAY=0``. The cache manager applies the
+    configuration gates (``kda_mtp_replay_unsupported_reason``).
+    """
+    from tensorrt_llm._torch.utils import is_kda_mtp_replay_enabled
+
+    from .kimi_kda_mixer import KimiKDALinearAttention
+
+    if not isinstance(model, torch.nn.Module) or not is_kda_mtp_replay_enabled():
+        return False
+    if getattr(getattr(model, "model_config", None), "modeling_v2_target", None) is not None:
+        return False
+    layers = [module for module in model.modules() if isinstance(module, KimiKDALinearAttention)]
+    return bool(layers) and all(
+        layer.conv_size == 4 and layer.gate_lower_bound == -5.0 for layer in layers
+    )
+
+
 def create_kda_replay_state(
     num_spec: int,
     layout: MambaStateLayout,
@@ -1757,6 +1780,7 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         return isinstance(self._kda_replay, KDAMtpReplayState)
 
     @property
+    @override
     def commits_every_generation_step(self) -> bool:
         """Whether every generation step, drafts or not, needs ``update_mamba_states``.
 
@@ -2254,6 +2278,7 @@ def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):
 
 
 __all__ = [
+    "KDA_MTP_REPLAY_HISTORY_SIZE",
     "KDAIntermediateLayerCache",
     "KDAIntermediateState",
     "KDAMtpReplayLayerCache",
@@ -2265,7 +2290,9 @@ __all__ = [
     "create_kda_replay_state",
     "get_kda_replay_num_spec",
     "get_kimi_cache_params",
+    "kda_mtp_replay_unsupported_reason",
     "resolve_kimi_ssm_cache_dtype",
     "select_kda_replay_state",
+    "uses_kda_mtp_replay",
     "validate_kimi_state_cache_dtype",
 ]
