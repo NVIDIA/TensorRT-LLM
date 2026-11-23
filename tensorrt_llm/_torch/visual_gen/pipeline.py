@@ -269,7 +269,7 @@ class SessionCapabilities(StrictBaseModel):
 
 
 @dataclass
-class AdvanceOutcome:
+class AdvanceResult:
     """The return type of ``advance`` and ``open_session``.
 
     The pipeline ran one unit of work on the session's state and wrote its
@@ -683,7 +683,7 @@ class BasePipeline(nn.Module):
 
     def open_session(
         self, req: "DiffusionRequest", initial_slot: Optional["DeliverySlot"]
-    ) -> Tuple[object, AdvanceOutcome]:
+    ) -> Tuple[object, AdvanceResult]:
         """All expensive and allocating work for a session: prompt encode,
         conditioning, cache open, graph warmup, whole-clip denoise if that is the
         model. Returns the session state, an object of the pipeline's choosing that
@@ -705,9 +705,7 @@ class BasePipeline(nn.Module):
         anything the input's ``validator`` accepted."""
         del state, name, value
 
-    def advance(
-        self, state: object, inputs: Dict[str, Any], slot: "DeliverySlot"
-    ) -> AdvanceOutcome:
+    def advance(self, state: object, inputs: Dict[str, Any], slot: "DeliverySlot") -> AdvanceResult:
         """One unit of work. ``inputs`` holds one value per queued input and the
         current value of every live input. Write each produced stream into
         ``slot[name].view(shape, dtype)`` and return those views in ``written``.

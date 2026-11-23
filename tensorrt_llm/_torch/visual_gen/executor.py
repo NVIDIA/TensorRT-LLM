@@ -47,7 +47,7 @@ from tensorrt_llm._torch.visual_gen.batching import (
 )
 from tensorrt_llm._torch.visual_gen.memory_monitor import WorkerMemoryMonitor
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import AdvanceOutcome
+from tensorrt_llm._torch.visual_gen.pipeline import AdvanceResult
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.session_protocol import (
     AdmissionFailure,
@@ -942,7 +942,7 @@ class DiffusionExecutor:
 
     def _open_pipeline(
         self, req: DiffusionRequest, slot: Optional[DeliverySlot]
-    ) -> Tuple[Any, AdvanceOutcome]:
+    ) -> Tuple[Any, AdvanceResult]:
         """The pipeline's part of opening, on every rank: its open call, then the
         completion barrier. Returns the pipeline state and the open's outcome.
         Raises what the pipeline
@@ -973,7 +973,7 @@ class DiffusionExecutor:
         inputs: Dict[str, object],
         slot: Optional[DeliverySlot],
         what: str,
-    ) -> AdvanceOutcome:
+    ) -> AdvanceResult:
         """The pipeline's part of one step, on every rank: its advance call, then
         the completion barrier. Raises what the pipeline raised, or
         ``RuntimeError`` when another rank failed. With peers a failure here ends
@@ -1001,7 +1001,7 @@ class DiffusionExecutor:
         except Exception as e:
             logger.error(f"Worker {self.device_id}: {what}: close failed: {e}")
 
-    def _finalize_advance(self, outcome: Optional[AdvanceOutcome]) -> bool:
+    def _finalize_advance(self, outcome: Optional[AdvanceResult]) -> bool:
         """Wait for this rank's writes, then agree with every rank whether the
         advance succeeded; ``None`` is this rank's pipeline call having raised.
         Returns whether every rank succeeded. With several ranks a failed rank
@@ -1142,6 +1142,14 @@ class DiffusionExecutor:
                 self.response_queue.put(message)
             else:
                 pool.release(initial_index)
+                if not outcome.done:
+                    self.response_queue.put(
+                        session.terminal_result(
+                            error="open produced no stream for the declared initial result "
+                            "and is not done"
+                        )
+                    )
+                    return session, pool, pipeline_state
         if outcome.done or session.complete():  # done at open, or declared with length 0
             self.response_queue.put(session.terminal_result())
         return session, pool, pipeline_state

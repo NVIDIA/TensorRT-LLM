@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.pipeline import (
-    AdvanceOutcome,
+    AdvanceResult,
     SessionCapabilities,
     SessionInputSpec,
     SessionStreamSpec,
@@ -240,7 +240,7 @@ def test_client_map_sees_the_worker_write_without_a_copy():
 
 
 def test_outcome_defaults():
-    outcome = AdvanceOutcome()
+    outcome = AdvanceResult()
     assert outcome.event is None and not outcome.done
 
 

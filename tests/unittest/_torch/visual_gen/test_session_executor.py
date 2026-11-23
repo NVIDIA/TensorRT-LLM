@@ -45,7 +45,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     _SessionExit,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import (
-    AdvanceOutcome,
+    AdvanceResult,
     SessionCapabilities,
     SessionInputSpec,
     SessionStreamSpec,
@@ -128,7 +128,7 @@ class CountingPipeline:
             view = initial_slot["video"].view((1, 1, H, W, 3), torch.uint8)
             view.fill_(255)
             written["video"] = view
-        return state, AdvanceOutcome(written=written)
+        return state, AdvanceResult(written=written)
 
     def validate_input(self, state, name, value):
         pass
@@ -151,7 +151,7 @@ class CountingPipeline:
             view[..., 2] = camera
             written["video"] = view
         done = self.length is not None and state.count >= self.length
-        return AdvanceOutcome(done=done, written=written)
+        return AdvanceResult(done=done, written=written)
 
     def close_session(self, state):
         self.closed += 1
@@ -631,6 +631,22 @@ def test_advance_refuses_while_the_initial_result_is_unread(harness):
                 s.advance(1)
 
 
+class NoInitialResultPipeline(CountingPipeline):
+    """Declares an initial result and does not write it."""
+
+    def open_session(self, req, initial_slot):
+        state, _ = super().open_session(req, initial_slot)
+        return state, AdvanceResult()
+
+
+def test_missing_declared_initial_result_ends_the_session_with_an_error(harness):
+    with harness(NoInitialResultPipeline(initial=True)) as h:
+        with h.open() as s:
+            with s.results() as results:
+                terminal = next(results)
+            assert terminal.done and "initial result" in terminal.error
+
+
 def test_close_discards_queued_inputs_and_second_session_opens(harness):
     pipe = CountingPipeline(initial=False)
     with harness(pipe) as h:
@@ -812,7 +828,7 @@ class CollectivePipeline(CountingPipeline):
 
     def open_session(self, req, initial_slot):
         self._collective("open")
-        return SimpleNamespace(count=0), self._outcome("open", AdvanceOutcome())
+        return SimpleNamespace(count=0), self._outcome("open", AdvanceResult())
 
     def advance(self, state, inputs, slot):
         self._collective("advance")
