@@ -1698,6 +1698,16 @@ def write_warmup_time(
             os.remove(tmp_path)
 
 
+def remove_warmup_time(test_output_dir: str, server_name: str, server_idx: int) -> None:
+    """Remove the warmup time an earlier attempt saved.
+
+    A retry reuses test_output_dir, and must never upload the previous attempt's value.
+    """
+    path = _warmup_time_path(test_output_dir, server_name, server_idx)
+    if os.path.exists(path):
+        os.remove(path)
+
+
 def record_warmup_time(
     test_output_dir: str, server_name: str, server_idx: int, warmup_time: float
 ) -> None:
@@ -1786,10 +1796,7 @@ class WarmupTimeRecorder:
         server_name: str,
         server_idx: int,
     ):
-        # A retry reuses test_output_dir; never upload the previous attempt's value.
-        stale_path = _warmup_time_path(test_output_dir, server_name, server_idx)
-        if os.path.exists(stale_path):
-            os.remove(stale_path)
+        remove_warmup_time(test_output_dir, server_name, server_idx)
         self._stop_event = threading.Event()
 
         def record() -> None:
@@ -1954,6 +1961,7 @@ def run_cold_warmup(
     log_path = os.path.join(test_output_dir, f"trtllm-serve.{server_name}.{server_idx}.log")
     if os.path.exists(addr_path):
         os.remove(addr_path)
+    remove_warmup_time(test_output_dir, server_name, server_idx)
     if num_frontends > 1:
         port = reserve_multi_frontend_port(host)
         cmd = add_host_port_to_cmd(server_cmd, host, port)
@@ -3332,6 +3340,7 @@ class AggrTestCmds(NamedTuple):
             server_addr_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.addr")
             if os.path.exists(server_addr_path):
                 os.remove(server_addr_path)
+            remove_warmup_time(self.test_output_dir, AGGREGATE_SERVER_NAME, server_idx)
             num_frontends = 1
             if server_idx < len(self.server_configs):
                 num_frontends = (
