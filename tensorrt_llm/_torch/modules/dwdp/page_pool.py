@@ -49,6 +49,16 @@ from .vmm import (
     unmap_va,
 )
 
+#: Bytes of page handles whose release raised, over every pool this process
+#: has released. Such memory may still be mapped, and the pool that held it
+#: is gone, so the count lives here rather than on the pool.
+_unreleased_bytes = 0
+
+
+def unreleased_page_bytes() -> int:
+    """Bytes of DWDP page handles that failed to release in this process."""
+    return _unreleased_bytes
+
 
 class PagePool:
     """Pool of per-page local handles for the remote prefetch slots.
@@ -84,6 +94,7 @@ class PagePool:
         "_slot_pages",
         "_page_handles",
         "_released",
+        "_num_release_failures",
     )
 
     # Default pool page multiplier: each pool handle = 8 * granularity.
@@ -111,6 +122,7 @@ class PagePool:
                 ``DEFAULT_PAGE_SIZE_MULTIPLIER * granularity`` (16MB on GB200).
         """
         self._device_id = device_id
+        self._num_release_failures = 0
 
         if granularity is None:
             self._granularity = get_allocation_granularity(device_id)
@@ -213,15 +225,40 @@ class PagePool:
         return len(self._page_handles)
 
     def num_pages(self, slot: int) -> int:
-        """Get number of pages in a slot.
+        """Get the number of pages a slot is configured to hold.
+
+        This is a configuration value, not a measure of occupancy: it keeps
+        its value after :meth:`release` has handed every page back to the
+        driver. Use :meth:`held_pages` for what the pool currently holds.
 
         Args:
             slot: Prefetch slot index.
 
         Returns:
-            Number of pages in the slot.
+            Number of pages the slot is configured for; unchanged by :meth:`release`.
         """
         return self._slot_pages[slot]
+
+    def held_pages(self, slot: int) -> int:
+        """Pages whose handles the pool currently owns.
+
+        Drops to zero once :meth:`release` runs, which makes this the figure
+        to use for physical occupancy. :meth:`num_pages` would still report
+        a full pool at that point.
+
+        A handle whose release raised is dropped from this count; its bytes
+        are added to :func:`unreleased_page_bytes`, since the memory may still
+        be resident.
+
+        Args:
+            slot: Prefetch slot index.
+
+        Returns:
+            Number of page handles currently held.
+        """
+        if slot < 0 or slot >= len(self._page_handles):
+            raise IndexError(f"Invalid slot {slot}, must be in [0, {len(self._page_handles)})")
+        return len(self._page_handles[slot])
 
     def slot_size(self, slot: int) -> int:
         """Get the size of a slot in bytes.
@@ -338,16 +375,24 @@ class PagePool:
 
         self._released = True
 
+        global _unreleased_bytes
         for slot_idx, handles in enumerate(self._page_handles):
             for page_idx, handle in enumerate(handles):
                 try:
                     release_handle(handle)
                 except Exception as e:
+                    self._num_release_failures += 1
+                    _unreleased_bytes += self._page_size
                     logger.warning(
                         f"[PagePool] Failed to release page {page_idx} in slot {slot_idx}: {e}"
                     )
 
         self._page_handles = [[] for _ in self._slot_pages]
+        if self._num_release_failures:
+            logger.warning(
+                f"[PagePool] {self._num_release_failures} page handle(s) failed to "
+                "release; that memory may still be resident"
+            )
         logger.debug("[PagePool] Released all page handles")
 
     def __del__(self):

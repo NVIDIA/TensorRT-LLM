@@ -9,7 +9,10 @@ What a target runs is in its constants (``K3Sm107Constants``) and the family's l
 * ``routing.py``, which reads the deployment's environment as the workers see it to decline a
   deployment the targets do not serve (``TRTLLM_ENABLE_PDL`` off);
 * the MXFP4 sm100 targets and their kernels (``kernels/k3_*``), which predate the rule; those
-  kernels may read only the engine-wide switches (PDL, forced MNNVL all-reduce).
+  kernels may read only the engine-wide switches (PDL, forced MNNVL all-reduce);
+* the two family modules only the MXFP4 sm100 targets use for it: ``environment.py`` (the
+  targets' own switches, which also predate the rule) and ``ops/attention/flashinfer_mla_decode.py``
+  (the engine-wide PDL switch).
 """
 
 import re
@@ -28,6 +31,7 @@ _EXEMPT_TARGETS = {
 }
 ENGINE_WIDE = {"TRTLLM_ENABLE_PDL", "TRTLLM_FORCE_MNNVL_AR"}
 _ROUTING = Path("routing.py")
+_SM100_ONLY = {Path("environment.py"), Path("ops/attention/flashinfer_mla_decode.py")}
 
 _READ = re.compile(r"\b(?:os\.environ|os\.getenv|getenv)\b")
 _LITERAL = re.compile(
@@ -44,6 +48,8 @@ def _reads():
     for path in sorted(_FAMILY_DIR.rglob("*.py")):
         rel = path.relative_to(_FAMILY_DIR)
         if rel.parts[0] in _EXEMPT_TARGETS or "__pycache__" in rel.parts or rel == _ROUTING:
+            continue
+        if rel in _SM100_ONLY:
             continue
         for number, line in enumerate(path.read_text().splitlines(), 1):
             if _READ.search(line) or "get_env_enable_pdl" in line:

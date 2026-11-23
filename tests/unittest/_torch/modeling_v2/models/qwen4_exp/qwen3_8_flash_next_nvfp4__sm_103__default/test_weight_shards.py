@@ -529,8 +529,10 @@ def test_mtp_quantization_respects_exclusions(configs, expert_override: QuantAlg
 def test_load_unscaled_bf16_ngram_table(
     stored, checkpoint, monkeypatch, host_offload: bool
 ) -> None:
-    """Load unscaled BF16 shards through the real model and loader, with a unit scale."""
+    """Load unscaled BF16 shards through the real model and loader, with a unit scale. `rank`:
+    the meta weights have no rows for `node`'s table identity to read."""
     monkeypatch.setenv(target_modeling._PLE_HOST_OFFLOAD_ENV, "1" if host_offload else "0")
+    monkeypatch.setenv(target_modeling._ple_host.PLE_HOST_TABLE_ENV, target_modeling._ple_host.RANK)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 3))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *args, **kwargs: None)

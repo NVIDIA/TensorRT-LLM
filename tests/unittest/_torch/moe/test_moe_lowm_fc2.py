@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The decode-sized CuTe DSL FC2 (decode_moe CUTE_FC2) after the FC1-only trtllm-gen runner vs the runner's own FC2
-cubin: bit-identical un-finalized outputs (gemm2 rows, expert weights, expanded -> permuted index)."""
+cubin: bit-identical un-finalized outputs (gemm2 rows, expert weights, expanded -> permuted index), on the runner's
+routing or a route kernel's tables, eager and replayed in a CUDA graph."""
 
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -226,10 +227,16 @@ def test_fc2_cubin_options_match_the_cubin_names():
     "m,shape",
     [(m, _ALL_LOCAL) for m in (1, 6, 8, 16)]
     + [(m, _ALL_LOCAL._replace(num_experts=192, local=192)) for m in (1, 6, 8, 16)]
+    # 768 columns: the 512-column K tiles of some FC2 cubins end in a zero-filled tail the kernel re-applies.
+    + [(6, _ALL_LOCAL._replace(inter=768))]
     + [(m, s) for s in (_EP_LOCAL, _EP_REMOTE) for m in (56, 77, 112, 126)],
 )
 def test_fc1_only_then_cute_fc2_is_bitwise(m, shape, kind):
-    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import fc1_only_args, run_cute_fc2
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import (
+        fc1_only_args,
+        fc2_cubin_tile_k,
+        run_cute_fc2,
+    )
 
     runner = _runner()
     ids, w, ins = _inputs(m, shape, kind)
@@ -239,7 +246,12 @@ def test_fc1_only_then_cute_fc2_is_bitwise(m, shape, kind):
     for tactic in _bitwise_tactics(runner, m, shape):
         common = _common(shape, ins, ids, w, list(tactic))
         ref = runner.run_moe(*common)
-        got = run_cute_fc2(runner.run_moe_fc1(*fc1_only_args(common)), fc2_args, None)
+        got = run_cute_fc2(
+            runner.run_moe_fc1(*fc1_only_args(common)),
+            fc2_args,
+            None,
+            cubin_tile_k=fc2_cubin_tile_k(runner, 0, tactic),
+        )
         torch.cuda.synchronize()
         _assert_same_expert_rows(got, ref)
 
@@ -391,3 +403,137 @@ def test_both_fp4_ops_trace_through_the_one_fake():
         assert out.shape == (4, 128) and out.dtype == torch.bfloat16, op
     assert G.fp4_block_scale_moe_runner._abstract_fn is G._fp4_block_scale_moe_fake
     assert G.fp4_block_scale_moe_decode_runner._abstract_fn is G._fp4_block_scale_moe_fake
+
+
+# DeepSeek-V4.1-Flash with EP2: 384 experts (192 per EP rank), top-6, hidden 5120, routed scale 2.5; 576 (TP4) or
+# 1152 (TP2) intermediate columns per rank.
+_DSV41_EP_RANK = _Shape(384, 192, 5120, 576, 6, 6)
+_DSV41_ROUTED_SCALE = 2.5
+
+
+def _dsv41_inputs(num_tokens, shape, local_offset, seed):
+    """FP4BlockScaleMoERunner inputs of a DeepSeek-V4.1 EP rank, routed as DeepSeek-V4.1 routes, and its tables."""
+    from tensorrt_llm._torch.moe.kernels.blackwell.dsv4_route_quant import (
+        ROUTING_TABLE_TILES,
+        can_build_routing_tables,
+        dsv4_route_nvfp4_quant,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    e, inter, hidden = shape.local, shape.inter, shape.hidden
+
+    def randn(*size, scale=1.0):
+        return torch.randn(*size, device="cuda", generator=generator) * scale
+
+    def packed(*size):
+        return torch.randint(0, 256, size, dtype=torch.uint8, device="cuda", generator=generator)
+
+    def scales(*size):  # E4M3 in [0.25, 2]
+        codes = torch.randint(
+            0x28, 0x41, size, dtype=torch.uint8, device="cuda", generator=generator
+        )
+        return codes.view(torch.float8_e4m3fn)
+
+    logits, bias, x = (
+        randn(num_tokens, shape.num_experts, scale=4),
+        randn(shape.num_experts, scale=0.5),
+        randn(num_tokens, hidden),
+    )
+    global_scale = torch.tensor([448.0 * 6.0 / 20.0], device="cuda")
+    with_tables = can_build_routing_tables(num_tokens, e, shape.num_experts)
+    ids, weights, x_fp4, x_sf, tables = dsv4_route_nvfp4_quant(
+        logits,
+        bias,
+        x.bfloat16(),
+        global_scale,
+        shape.top_k,
+        _DSV41_ROUTED_SCALE,
+        torch.bfloat16,
+        with_routing_tables=with_tables,
+        local_experts=(local_offset, e) if with_tables else None,
+        one_cluster=True,
+    )
+    alpha2 = torch.rand(e, device="cuda", generator=generator) * 1e-3 + 1e-4
+    one = torch.full((e,), 1e-4, device="cuda")
+    inputs = [
+        None, None, x_fp4, x_sf.flatten().view(torch.float8_e4m3fn),
+        packed(e, 2 * inter, hidden // 2), scales(e, 2 * inter, hidden // 16),
+        None, None, None, torch.full((e,), 1e5, device="cuda"),
+        packed(e, hidden, inter // 2), scales(e, hidden, inter // 16),
+        None, one, one, alpha2, weights, ids,
+    ]  # fmt: skip
+    table_kwargs = (
+        dict(routing_tables=tables, routing_tiles=ROUTING_TABLE_TILES) if with_tables else {}
+    )
+    return inputs, table_kwargs
+
+
+def _assert_same_table_rows(got, ref, table_kwargs, num_tokens, top_k):
+    """Same expert row per (token, k), each through its run's permutation: row 0 of the routing table its tile ran on
+    (an empty [0, tile] placeholder names it), else the one it returns; routes to the other EP rank have none."""
+
+    def rows(outputs):
+        permutation = outputs[2]
+        if permutation.numel() == 0:
+            tiles = table_kwargs["routing_tiles"]
+            permutation = table_kwargs["routing_tables"][tiles.index(permutation.shape[1]), 0]
+        permutation = permutation.flatten()[: num_tokens * top_k]
+        valid = permutation >= 0
+        return valid, outputs[0][permutation[valid].long()]
+
+    valid, got_rows = rows(got)
+    want_valid, want_rows = rows(ref)
+    assert torch.equal(valid, want_valid) and int(valid.sum()) > 0
+    assert torch.equal(got_rows.view(torch.int16), want_rows.view(torch.int16))
+
+
+@pytest.mark.parametrize("num_tokens,inter,local_offset", [(6, 576, 0)])
+@torch.inference_mode()
+def test_cute_fc2_opt_in_matches_the_fc2_cubin(num_tokens, inter, local_offset, monkeypatch):
+    """A model that declares ``MoEDecodeOptions.cute_fc2_rows`` (DeepSeek-V4.1): FP4BlockScaleMoERunner calls on the
+    one-cluster route kernel's tables run the CuTe FC2 after the FC1-only entry, bit for bit the FC2 cubin, eager and
+    replayed in a CUDA graph on new activations and routes written into the captured inputs."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+    from tensorrt_llm._torch.models.modeling_deepseekv41 import _MOE_CUTE_FC2_ROWS
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
+
+    shape = _DSV41_EP_RANK._replace(inter=inter)
+    inputs, table_kwargs = _dsv41_inputs(
+        num_tokens, shape, local_offset, seed=num_tokens + local_offset
+    )
+
+    def runner(cute_fc2_rows):
+        return FP4BlockScaleMoERunner(
+            shape.num_experts, shape.top_k, None, None, inter, local_offset, shape.local,
+            _DSV41_ROUTED_SCALE, 1, False, 0, cute_fc2_rows=cute_fc2_rows,
+        )  # fmt: skip
+
+    cute, cubin = runner(_MOE_CUTE_FC2_ROWS), runner(0)
+    calls = []
+    run_cute_fc2 = decode_moe.run_cute_fc2
+    monkeypatch.setattr(
+        decode_moe, "run_cute_fc2", lambda *a, **kw: calls.append(1) or run_cute_fc2(*a, **kw)
+    )
+    for tactic in _bitwise_tactics(cute.get_runner(), num_tokens, shape)[:3]:
+        tactic = list(tactic)
+        expected = cubin.forward(inputs, tactic=tactic, **table_kwargs)
+        assert not calls
+        got = cute.forward(inputs, tactic=tactic, **table_kwargs)
+        assert len(calls) == 1
+        _assert_same_table_rows(got, expected, table_kwargs, num_tokens, shape.top_k)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = cute.forward(inputs, tactic=tactic, **table_kwargs)
+        new_inputs, new_tables = _dsv41_inputs(
+            num_tokens, shape, local_offset, seed=100 + num_tokens
+        )
+        for dst, src in zip(inputs, new_inputs):
+            if dst is not None and dst.data_ptr() != src.data_ptr():
+                dst.copy_(src)
+        if table_kwargs:
+            table_kwargs["routing_tables"].copy_(new_tables["routing_tables"])
+        graph.replay()
+        expected = cubin.forward(inputs, tactic=tactic, **table_kwargs)
+        _assert_same_table_rows(captured, expected, table_kwargs, num_tokens, shape.top_k)
+        calls.clear()

@@ -1,109 +1,88 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # C++ Tests
 
-This document explains how to build and run the C++ tests, and the included [resources](resources).
+Native test sources live in `unit_tests/`. The pytest wrappers in
+[`tests/integration/defs/cpp`](../../tests/integration/defs/cpp/) select CTest
+groups or native executables and prepare resources required by those tests.
+Read the [C++ test guidance](AGENTS.md) before changing targets or build behavior.
 
-## Pytest Scripts
+## Run through pytest
 
-The unit tests can be launched via the Pytest script in [test_unit_tests.py](../../tests/integration/defs/cpp/test_unit_tests.py). These do not require engines to be built. The Pytest script will also build TRT-LLM.
-
-The Pytest script in [test_multi_gpu.py](../../tests/integration/defs/cpp/test_multi_gpu.py) builds TRT-LLM, builds engines, and generates expected outputs and executes the end-to-end multi-device C++ tests all in one go.
-
-To get an overview of the tests and their parameterization, call:
+Use a supported build environment with the matching TensorRT-LLM wheel and test
+dependencies installed. Run these commands from the repository root to inspect
+the available wrapper cases:
 
 ```bash
 pytest tests/integration/defs/cpp/test_unit_tests.py --collect-only
 pytest tests/integration/defs/cpp/test_multi_gpu.py --collect-only
 ```
 
-All tests take the number of the CUDA architecture of the GPU you wish to use as a parameter e.g. 90 for Hopper.
+The build fixtures first try the prebuilt C++ test bundle. If no applicable
+bundle is available, they configure and build selected native targets. See
+[CI bundle and source-build fallback](AGENTS.md#ci-bundle-and-source-build-fallback)
+for bundle rules, supported fallback fixtures, and target selection.
+The multi-GPU wrappers also use this bundle-first fixture.
 
-It is possible to choose individual unit tests or multi-device tests.
-Example calls could look like this:
+Choose a collected case for your hardware and required GPU count. For example,
+on a suitable SM90 system:
 
 ```bash
-export LLM_MODELS_ROOT="/path/to/model_cache"
-
-pytest tests/integration/defs/cpp/test_unit_tests.py::test_unit_tests[runtime-90]
-
-pytest tests/integration/defs/cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-mpi_kvcache-90]
+pytest 'tests/integration/defs/cpp/test_unit_tests.py::test_unit_tests[runtime-90]'
+pytest 'tests/integration/defs/cpp/test_multi_gpu.py::test_mpi_utils[90]'
 ```
 
-## Manual steps
+The MPI example uses four ranks. Runtime and batch-manager wrapper groups also
+prepare LoRA test weights through the `lora_setup` fixture. Running native
+executables directly does not perform that preparation.
 
-### Compile
+## Build from source and run directly
 
-From the top-level directory call:
+From the repository root, build and install the wheel, then build the tests.
+Replace `90` with the CUDA architecture needed by your tests:
 
 ```bash
 CPP_BUILD_DIR=cpp/build
-python3 scripts/build_wheel.py -a "80;86" --build_dir ${CPP_BUILD_DIR}
+python3 scripts/build_wheel.py -a "90" --build_dir "${CPP_BUILD_DIR}"
 pip install -r requirements-dev.txt
 pip install build/tensorrt_llm*.whl
-cd $CPP_BUILD_DIR && make -j$(nproc) google-tests
+cmake --build "${CPP_BUILD_DIR}" --target google-tests --parallel "$(nproc)"
 ```
 
-Single tests can be executed from `CPP_BUILD_DIR/tests`, e.g.
+`google-tests` builds all enabled native tests. To build a directory subset, use
+its recursive target, for example `cpp-tests-common`. Component targets such as
+`common-tests` cover migrated tests for that owner and are not interchangeable
+with directory targets.
+
+Run a built executable or its matching CTest directory:
 
 ```bash
-./$CPP_BUILD_DIR/tests/allocatorTest
+./${CPP_BUILD_DIR}/tests/unit_tests/common/optionalRefTest
+ctest --test-dir "${CPP_BUILD_DIR}/tests/unit_tests/common" --output-on-failure --output-junit "cpp-test-report.xml"
 ```
 
-### End-to-end tests
-
-`trtGptModelRealDecoderTest` and `executorTest` require pre-built TensorRT engines, which are loaded in the tests. They also require data files which are stored in [cpp/tests/resources/data](resources/data).
-
-#### Build engines
-
-[Scripts](resources/scripts) are provided that download the GPT2 and GPT-J models from Huggingface and convert them to TensorRT engines.
-The weights and built engines are stored under [cpp/tests/resources/models](resources/models).
-To build the engines from the top-level directory:
+After building all enabled tests and preparing their required resources, run
+the full CTest tree with:
 
 ```bash
-PYTHONPATH=examples/models/core/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gpt_engines.py
-PYTHONPATH=examples/models/core/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
-PYTHONPATH=examples/medusa:$PYTHONPATH python3 cpp/tests/resources/scripts/build_medusa_engines.py
-PYTHONPATH=examples/eagle:$PYTHONPATH python3 cpp/tests/resources/scripts/build_eagle_engines.py
-PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/build_redrafter_engines.py
+ctest --test-dir "${CPP_BUILD_DIR}" --output-on-failure --output-junit "cpp-test-report.xml"
 ```
 
-It is possible to build engines with tensor and pipeline parallelism for LLaMA using 4 GPUs.
-
-```bash
-PYTHONPATH=examples/models/core/llama python3 cpp/tests/resources/scripts/build_llama_engines.py --only_multi_gpu
-```
-
-#### Generate expected output
-
-End-to-end tests read inputs and expected outputs from Numpy files located at [cpp/tests/resources/data](resources/data). The expected outputs can be generated using [scripts](resources/scripts) which employ the Python runtime to run the built engines:
-
-```bash
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_medusa_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_eagle_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_redrafter_output.py
-```
-
-#### Generate data with tensor and pipeline parallelism
-
-It is possible to generate tensor and pipeline parallelism data for LLaMA using 4 GPUs. To generate results from the top-level directory:
-
-```bash
-PYTHONPATH=examples mpirun -n 4 python3 cpp/tests/resources/scripts/generate_expected_llama_output.py --only_multi_gpu
-```
-
-#### Run test
-
-After building the engines and generating the expected output execute the tests
-
-```bash
-./$CPP_BUILD_DIR/tests/batch_manager/trtGptModelRealDecoderTest
-```
-
-### Run all tests with ctest
-
-To run all tests and produce an xml report, call
-
-```bash
-./$CPP_BUILD_DIR/ctest --output-on-failure --output-junit "cpp-test-report.xml"
-```
+Avoid scanning a CTest directory whose executables were only partially built.
+For a single-target build, run that executable directly, as the compression and
+FMHA head-104 wrappers do.

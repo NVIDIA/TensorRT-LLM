@@ -355,7 +355,7 @@ def expected_call(layer, step):
 
 def check_decode_one_shot():
     """use_decode_one_shot raises every stock MNNVL all-reduce's ceiling; the check then restores the stock one, so
-    the built-in reference keeps main's choice."""
+    the built-in reference keeps the stock ceiling."""
     modules = [
         m
         for layer in LAYERS_BUILT.values()
@@ -515,8 +515,8 @@ def _tail_chain(
     producer, consumer, x, bank, step, pending, defer, consumer_core, producer_core, capture=None
 ):
     """The producer layer (its MoE handing ``pending`` on with ``defer``, else adding its reduced tail), then the
-    consumer layer (with ``capture``, a tapped layer). Returns the consumer's attention input, its returned prefix
-    sum, its MoE input and the bank."""
+    consumer layer (with ``capture``, a tapped layer of the target with speculative decoding). Returns the consumer's
+    attention input, its returned prefix sum, its MoE input and the bank."""
     _attention(producer).core = producer_core
     _attention(consumer).core = consumer_core
     producer.block_sparse_moe.pending = pending
@@ -536,9 +536,9 @@ def _tail_chain(
         bank,
         snapshots,
         SimpleNamespace(),
-        capture=capture,
         step=step,
         pending_moe_partial=partial,
+        **({} if capture is None else {"capture": capture}),
     )
     return (
         _attention(consumer).last_input,

@@ -1331,6 +1331,7 @@ def _make_v2_multimodal_scheduler(
     manager.enable_block_reuse = False
     manager.enable_joint_kv_cache_reuse = False
     manager._has_cp_helix = False
+    manager.max_beam_width = 1
     manager.kv_cache_map = {}
 
     def prepare_context(request):

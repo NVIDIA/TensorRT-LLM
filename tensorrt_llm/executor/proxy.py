@@ -39,6 +39,7 @@ from tensorrt_llm._startup_errors import (StartupErrorInfo,
                                           wrap_worker_startup_error)
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.llm_request import release_undelivered_response
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
@@ -74,8 +75,10 @@ __all__ = [
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
+# get_memory_report() is answered by rank-0, which in the memory monitor's
+# full mode gathers the other ranks' reports over its own communicator.
 _MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
-    {"get_memory_status", "sleep", "wakeup"})
+    {"get_memory_report", "get_memory_status", "sleep", "wakeup"})
 
 
 def _check_collective_rpc_guard(
@@ -909,6 +912,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             # late responses instead of crashing with a KeyError.
             result = self._results.get(client_id)
             if result is None:
+                release_undelivered_response(res)
                 return
             queue = result.queue
             if isinstance(queue, _SyncQueue):
