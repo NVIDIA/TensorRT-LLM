@@ -1320,6 +1320,28 @@ class BaseWorker(GenerationExecutor):
 
         return startup_metrics
 
+    def get_engine_config(self) -> dict:
+        """Return resolved model and KV-cache dtype metadata from the runtime."""
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_config = getattr(getattr(model_engine, "model", None),
+                               "model_config", None)
+        if model_config is None:
+            return {}
+
+        from .._utils import torch_dtype_to_str
+        dtype = model_config.torch_dtype
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        if dtype is None and pretrained_config is not None:
+            dtype = pretrained_config.get_text_config().torch_dtype
+        quant_config = getattr(model_config, "quant_config", None)
+        kv_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+        quant_algo = getattr(quant_config, "quant_algo", None)
+        return {
+            "dtype": None if dtype is None else torch_dtype_to_str(dtype),
+            "kv_cache_dtype": None if kv_algo is None else str(kv_algo),
+            "quantization": None if quant_algo is None else str(quant_algo),
+        }
+
     def start_profile(self,
                       output_dir: Optional[str] = None,
                       num_steps: Optional[int] = None,

@@ -35,12 +35,14 @@ from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.tuning import heuristics
 from tensorrt_llm.bench.tuning import utils as tuning_utils
 from tensorrt_llm.bench.tuning.dataclasses import NemotronHybridConfig
+from tensorrt_llm.bench.tuning.settings import load_runtime_model_config
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
     DatasetFormatError,
     create_dataset_from_stream,
     initialize_tokenizer,
 )
+from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -257,6 +259,71 @@ def test_format_startup_metrics() -> None:
     assert ReportUtility._format_startup_metrics({}) == ""
 
 
+@pytest.mark.parametrize(
+    ("torch_dtype", "kv_algo", "quant_algo", "expected"),
+    [
+        (
+            torch.bfloat16,
+            QuantAlgo.NVFP4,
+            QuantAlgo.FP8_BLOCK_SCALES,
+            {
+                "dtype": "bfloat16",
+                "kv_cache_dtype": "NVFP4",
+                "quantization": "FP8_BLOCK_SCALES",
+            },
+        ),
+        (
+            torch.float16,
+            None,
+            None,
+            {"dtype": "float16", "kv_cache_dtype": None, "quantization": None},
+        ),
+    ],
+)
+def test_report_engine_config_from_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    torch_dtype: torch.dtype,
+    kv_algo: QuantAlgo | None,
+    quant_algo: QuantAlgo | None,
+    expected: dict[str, str | None],
+) -> None:
+    monkeypatch.setattr(ReportUtility, "_query_gpu_info", lambda _self: None)
+
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker.engine = SimpleNamespace(
+        model_engine=SimpleNamespace(
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    torch_dtype=torch_dtype,
+                    quant_config=SimpleNamespace(
+                        kv_cache_quant_algo=kv_algo, quant_algo=quant_algo
+                    ),
+                )
+            )
+        )
+    )
+
+    keeper = StatsKeeper()
+    keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
+    lengths = PercentileStats.from_iterable([8])
+    rt_cfg = _benchmark_runtime_config("pytorch")
+    rt_cfg.model = "nonexistent/checkpoint"
+    rt_cfg.mapping["world_size"] = 1
+    report = ReportUtility(
+        keeper,
+        DatasetMetadata(
+            isl_stats=lengths, osl_stats=lengths, seq_len_stats=lengths, num_requests=1
+        ),
+        rt_cfg,
+        mock.MagicMock(),
+        {},
+        engine_config=worker.get_engine_config(),
+    )
+    engine = report.get_statistics_dict()["engine"]
+    assert {k: engine[k] for k in expected} == expected
+
+
 def test_empty_stream_raises_dataset_format_error():
     tokenizer = _FakeTokenizer()
     empty_stream = io.StringIO("")
@@ -365,7 +432,6 @@ def _perf_item(rid, num_out, decoding_iteration):
     )
 
 
-@pytest.mark.parametrize("caller", ["sizing", "reporting"])
 @pytest.mark.parametrize(
     ("mode", "attention_dp", "autotune", "moe_option", "expected"),
     [
@@ -378,8 +444,9 @@ def _perf_item(rid, num_out, decoding_iteration):
     ],
 )
 def test_bench_kv_cache_quant_uses_modeling_v2_target(
-    tmp_path, monkeypatch, caller, mode, attention_dp, autotune, moe_option, expected
+    tmp_path, monkeypatch, mode, attention_dp, autotune, moe_option, expected
 ):
+    """Automatic sizing uses the same target and effective KV dtype as the engine."""
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modeling_v2 import _router_index
     from tensorrt_llm._torch.pyexecutor import model_loader
@@ -415,7 +482,6 @@ def test_bench_kv_cache_quant_uses_modeling_v2_target(
 
     monkeypatch.setattr(ModelConfig, "from_pretrained", load_config)
     monkeypatch.setattr(general, "load_runtime_model_config", load_config)
-    monkeypatch.setattr(tuning_settings, "load_runtime_model_config", load_config)
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     monkeypatch.setattr(
         _router_index, "registered_routes", lambda: {"BenchTestArchitecture": route}
@@ -448,26 +514,11 @@ def test_bench_kv_cache_quant_uses_modeling_v2_target(
         "extra_llm_api_options": yaml_options,
     }
     cli_keys = {"tensor_parallel_size", "moe_expert_parallel_size"}
-    if caller == "sizing":
-        monkeypatch.setattr(general, "get_model_config", mock.Mock())
-        size = mock.Mock(return_value=(8, 128))
-        monkeypatch.setattr(general, "get_benchmark_engine_settings", size)
-        general.get_settings(params, metadata, "model", checkpoint, explicit_cli_keys=cli_keys)
-        actual = size.call_args.args[1].kv_cache_quant_algo
-    else:
-        params.update(max_batch_size=8, max_num_tokens=128)
-        settings = general.get_settings(params, metadata, "model", checkpoint)
-        runtime = RuntimeConfig(
-            **settings,
-            model="model",
-            extra_llm_api_options=str(yaml_options),
-            explicit_cli_keys=cli_keys,
-        )
-        keeper = StatsKeeper()
-        keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
-        report = ReportUtility(keeper, metadata, runtime, mock.Mock(), runtime.get_llm_args())
-        monkeypatch.setattr(report, "_query_gpu_info", lambda: {})
-        actual = report.get_statistics_dict()["engine"]["kv_cache_dtype"]
+    monkeypatch.setattr(general, "get_model_config", mock.Mock())
+    size = mock.Mock(return_value=(8, 128))
+    monkeypatch.setattr(general, "get_benchmark_engine_settings", size)
+    general.get_settings(params, metadata, "model", checkpoint, explicit_cli_keys=cli_keys)
+    actual = size.call_args.args[1].kv_cache_quant_algo
     assert actual == expected
     assert "MEGAMOE_TACTIC_AUTOTUNE" not in os.environ
 
@@ -887,7 +938,16 @@ def _fp8_mistral_native_checkpoint(path, *, hf_config):
 
 
 def _engine_report(checkpoint, checkpoint_format):
-    """Return the engine section of the report of a one-request run on `checkpoint`."""
+    """Return the engine section of the report for a worker loaded from `checkpoint`."""
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker.engine = SimpleNamespace(
+        model_engine=SimpleNamespace(
+            model=SimpleNamespace(
+                model_config=load_runtime_model_config(checkpoint, checkpoint_format)
+            )
+        )
+    )
     keeper = StatsKeeper()
     keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
     stats = PercentileStats.from_iterable([8])
@@ -902,7 +962,14 @@ def _engine_report(checkpoint, checkpoint_format):
         }
     )
     llm_args = {"kv_cache_config": {"dtype": "auto"}, "checkpoint_format": checkpoint_format}
-    report = ReportUtility(keeper, metadata, runtime_config, mock.Mock(), llm_args)
+    report = ReportUtility(
+        keeper,
+        metadata,
+        runtime_config,
+        mock.Mock(),
+        llm_args,
+        engine_config=worker.get_engine_config(),
+    )
     with mock.patch.object(ReportUtility, "_query_gpu_info", return_value=None):
         return report.get_statistics_dict()["engine"]
 

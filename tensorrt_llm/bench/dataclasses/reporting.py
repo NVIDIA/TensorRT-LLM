@@ -30,7 +30,6 @@ from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
-from tensorrt_llm.bench.tuning.settings import resolve_benchmark_kv_cache_quant
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
@@ -302,7 +301,8 @@ class ReportUtility:
                  logger: Logger,
                  kwargs: Dict[str, Any],
                  streaming: bool = False,
-                 startup_metrics: Optional[Dict[str, Any]] = None) -> None:
+                 startup_metrics: Optional[Dict[str, Any]] = None,
+                 engine_config: Optional[Dict[str, Any]] = None) -> None:
         """Initialize the ReportingController.
 
         Args:
@@ -313,6 +313,8 @@ class ReportUtility:
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
             startup_metrics (Dict[str, Any], optional): Metrics captured while
                 initializing the model.
+            engine_config (Dict[str, Any], optional): Resolved model and
+                KV-cache dtype metadata from the runtime.
         """
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
@@ -324,6 +326,7 @@ class ReportUtility:
             self.rt_cfg.settings_config.max_batch_size)
         self.streaming = streaming
         self.startup_metrics = startup_metrics
+        self.engine_config = engine_config
 
     def _query_gpu_info(self) -> Dict[str, Any]:
         """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
@@ -452,10 +455,8 @@ class ReportUtility:
         # Retrieve KV cache information.
         kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
         if isinstance(kv_cache_config, KvCacheConfig):
-            kv_cache_dtype = kv_cache_config.dtype
             kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
         elif isinstance(kv_cache_config, dict):
-            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
             kv_cache_mem_percent = kv_cache_config.get(
                 "free_gpu_memory_fraction")
         else:
@@ -466,29 +467,12 @@ class ReportUtility:
             if kv_cache_mem_percent is not None else None
 
         # Engine/Backend details
-        from tensorrt_llm._utils import torch_dtype_to_str
-        from tensorrt_llm.bench.tuning.settings import load_runtime_model_config
-
-        # Read the configuration in the checkpoint format the LLM loaded.
-        model = self.rt_cfg.model_path or self.rt_cfg.model
-        model_config = load_runtime_model_config(
-            model, self.kwargs.get("checkpoint_format"))
-
-        model_config = resolve_benchmark_kv_cache_quant(model_config, model,
-                                                        kv_cache_dtype,
-                                                        self.kwargs)
-
+        engine_config = self.engine_config or {}
         stats_dict["engine"] |= {
-            "backend":
-            "Pytorch",
-            "dtype":
-            torch_dtype_to_str(
-                model_config.torch_dtype or
-                model_config.pretrained_config.get_text_config().torch_dtype),
-            "kv_cache_dtype":
-            model_config.quant_config.kv_cache_quant_algo,
-            "quantization":
-            model_config.quant_config.quant_algo
+            "backend": "Pytorch",
+            "dtype": engine_config.get("dtype"),
+            "kv_cache_dtype": engine_config.get("kv_cache_dtype"),
+            "quantization": engine_config.get("quantization"),
         }
 
         # World and runtime info
