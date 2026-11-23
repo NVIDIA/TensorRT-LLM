@@ -3,6 +3,8 @@
 """A Reindex layer's decode candidate logits and mapped Top-K in one launch (``reindex_select.py``) select
 exactly what DeepGEMM's paged sparse MQA logits followed by ``select_mapped_consumer_topk_`` select."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
@@ -27,6 +29,38 @@ from .test_indexer import (
 )
 
 NBLK, SB, TOP_K = 2048, 8, 512
+
+
+def test_cluster_limit_is_cached_per_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.kernels.blackwell.top_k import single_pass_multi_cta_radix_topk_cluster
+
+    cluster = single_pass_multi_cta_radix_topk_cluster
+    queried = []
+    devices = iter((0, 1, 0))
+    limits = (16, 8)
+
+    def query(kernel, config):
+        queried.append(kernel)
+        return limits[kernel]
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: next(devices))
+    monkeypatch.setattr(
+        cluster,
+        "HardwareInfo",
+        lambda device_id: SimpleNamespace(
+            _get_device_function=lambda: device_id, _checkCudaErrors=lambda value: value
+        ),
+    )
+    monkeypatch.setattr(cluster.driver, "cuFuncSetAttribute", lambda *args: None)
+    monkeypatch.setattr(cluster.driver, "cuOccupancyMaxPotentialClusterSize", query)
+    cache = cluster._query_max_cluster_size_for_device
+    cache.cache_clear()
+    try:
+        assert [cluster._query_max_cluster_size() for _ in range(3)] == [16, 8, 16]
+        assert queried == [0, 1]
+    finally:
+        cache.cache_clear()
 
 
 @skip_pre_blackwell
@@ -147,6 +181,14 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
     assert torch.equal(plain, expected)
     assert torch.equal(fused, expected)
     assert int((plain >= 0).sum()) == tokens * TOP_K
+
+    previous = expected
+    q.neg_()
+    graph.replay()
+    expected = forward(False)
+    assert not torch.equal(expected, previous)
+    assert torch.equal(plain, expected)
+    assert torch.equal(fused, expected)
 
     # The same shape must take the two-launch path where even an 8-CTA cluster cannot fit.
     calls.clear()

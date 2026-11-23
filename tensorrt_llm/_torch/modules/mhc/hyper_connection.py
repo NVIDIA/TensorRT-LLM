@@ -278,7 +278,11 @@ class mHC(nn.Module):
 
     @torch.no_grad()
     def _prepare_fma_weight(self) -> torch.Tensor:
-        """Prepare the weight in the native small-row mixer's precision."""
+        """Keep the SM107 small-row FMA mixer in FP32 and alias contiguous weights.
+
+        Larger SM107 row buckets can still use the TF32 DeepGEMM path. The FMA
+        mixer on SM100/SM103 uses TF32-rounded weights to match its GEMM reference.
+        """
         if get_sm_version() == 107:
             return self.fn.detach().contiguous()
         from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_fma as fma

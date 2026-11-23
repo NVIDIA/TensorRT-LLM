@@ -903,7 +903,7 @@ class CSA2Indexer(Indexer):
             and mapping.tp_size == 8
             and not mapping.enable_attention_dp
             and 0 < logits.shape[0] <= 16
-            and logits.shape[1] > 131072
+            and paged_finalize_sorts(logits.shape[1])
             and output_indices.shape[1] == 512
         )
 

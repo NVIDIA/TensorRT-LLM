@@ -16,6 +16,7 @@ import random
 import sys
 import traceback
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -194,25 +195,40 @@ def _fabric_supported() -> bool:
     return platform.machine().lower() in ("aarch64", "arm64") and MnnvlMemory.supports_mnnvl()
 
 
+def _run_packed_ipc(tp_size: int, fabric: bool) -> bool:
+    from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
+
+    compile_kernel = markov._compiled
+
+    def compile_packed(*args, packed: bool):
+        return compile_kernel(*args, packed=True)
+
+    with patch.object(markov, "_compiled", compile_packed):
+        return _run(tp_size, fabric)
+
+
 _SM107 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
 _TP_SIZE = 8 if _SM107 else 4
 
 
-def test_markov_exchange_uses_only_nonempty_vocabulary_slices(monkeypatch):
+def test_markov_exchange_uses_only_nonempty_vocabulary_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
 
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=128),
+        lambda device: SimpleNamespace(multi_processor_count=(128, 148)[device]),
     )
     num_ctas = markov._num_ctas.__wrapped__
     assert num_ctas(17, 0) == 17
     assert num_ctas(128 * 256, 0) == 128
     assert num_ctas(128 * 256 + 1, 0) == 0
+    assert num_ctas(16160, 1) == 147
 
 
-def test_sm107_markov_requires_tp8(monkeypatch):
+def test_sm107_markov_requires_tp8(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
@@ -234,9 +250,7 @@ def test_sm107_markov_requires_tp8(monkeypatch):
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="requires TP4 on SM100/SM103 or TP8 on SM107",
 )
-@pytest.mark.parametrize(
-    "fabric", [True] if _SM107 else [False, True], ids=lambda x: "fabric" if x else "ipc"
-)
+@pytest.mark.parametrize("fabric", [False, True], ids=["ipc", "fabric"])
 @pytest.mark.parametrize("mpi_pool_executor", [_TP_SIZE], indirect=True)
 def test_dspark_markov_chain_matches_reference(mpi_pool_executor, fabric):
     if fabric and not _fabric_supported():
@@ -245,3 +259,15 @@ def test_dspark_markov_chain_matches_reference(mpi_pool_executor, fabric):
     results = mpi_pool_executor.map(_run, *zip(*[(tp_size, fabric)] * tp_size))
     for r in results:
         assert r is True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 4
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="requires TP4 on SM100/SM103 to exercise the packed exchange in multi-GPU CI",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_packed_markov_exchange_matches_reference_over_ipc(mpi_pool_executor) -> None:
+    results = mpi_pool_executor.map(_run_packed_ipc, [4] * 4, [False] * 4)
+    assert all(results)

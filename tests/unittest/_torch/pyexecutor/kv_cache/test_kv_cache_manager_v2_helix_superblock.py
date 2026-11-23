@@ -486,6 +486,7 @@ def _failing_gen_scheduler(
     sched = SimpleNamespace(
         has_cp_helix=True,
         enable_recompute_pause=enable_recompute_pause,
+        _single_beam=False,
         kv_cache_manager=SimpleNamespace(
             try_allocate_generation=lambda req: False,
             is_request_active=lambda request_id: True,

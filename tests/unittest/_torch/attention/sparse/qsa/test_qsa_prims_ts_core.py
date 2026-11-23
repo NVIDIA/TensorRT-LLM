@@ -3,10 +3,12 @@
 
 import itertools
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import qsa_sparse_gqa_reference
 from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
@@ -305,6 +307,82 @@ def test_route_offsets_follow_layout_changes_without_replanning() -> None:
         assert torch.equal(out, ref)
 
 
+def test_repeat_runs_skip_wrapper_validation() -> None:
+    _requires_prims_ts()
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+    )
+    cases = [_make_case([36, 92], seed=60 + i) for i in range(2)]
+    # 192 rows need a larger workspace, which drops every plan.
+    larger = _make_case([40, 100], seed=70)
+    # One K/V cache for every call, so the cases share a plan key.
+    k_cache, v_cache, block_table = cases[0][1], cases[0][2], cases[0][3]
+    pages = k_cache.shape[0]
+
+    def run(
+        case: tuple,
+        positions_dtype: torch.dtype = torch.int32,
+        k: torch.Tensor = k_cache,
+        v: torch.Tensor = v_cache,
+    ) -> torch.Tensor:
+        q, _, _, _, block_ids, request_indices, positions, _, _ = case
+        return prims_ts_sparse_gqa(
+            q,
+            k,
+            v,
+            block_table,
+            block_ids,
+            request_indices,
+            positions.to(positions_dtype),
+            **kwargs,
+        )
+
+    validated = []
+    fail_next = []
+    wrapper_cls = fi_metadata.QTokenKvBlockSparsePagedTSWrapper
+    original = wrapper_cls.run
+
+    def recorded(self, *args, validate: bool = True, **kw) -> torch.Tensor:
+        validated.append(validate)
+        result = original(self, *args, validate=validate, **kw)
+        if fail_next:
+            fail_next.pop()
+            raise RuntimeError("injected launch failure")
+        return result
+
+    wrapper_cls.run = recorded
+    try:
+        core = prims_ts_core._PrimsTSSparseCore()
+        with mock.patch.object(prims_ts_core, "_CORE", core):
+            run(cases[0])
+            run(cases[1])
+            run(larger)
+            run(cases[0])
+            run(cases[0], torch.int64)
+            run(cases[0], torch.int64)
+            # Same storage with a new page geometry changes the ABI and is rejected.
+            with pytest.raises((ValueError, RuntimeError)):
+                run(
+                    cases[0],
+                    k=k_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
+                    v=v_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
+                )
+            fail_next.append(True)
+            with pytest.raises(RuntimeError, match="injected"):
+                run(cases[0])
+            run(cases[0])
+            run(cases[0])
+    finally:
+        wrapper_cls.run = original
+    torch.cuda.synchronize()
+    # Validate once per plan and ABI: a repeat skips, a new plan key, a plan
+    # rebuilt after workspace growth, a changed ABI, a rejected binding and a
+    # failed launch each validate again.
+    assert validated == [True, False, True, True, True, False, True, True, True, False]
+
+
 def test_auto_gates_small_decode_batches() -> None:
     _requires_prims_ts()
     from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
@@ -334,8 +412,10 @@ def test_auto_gates_small_decode_batches() -> None:
     assert core("auto", 2, True) == "prims_ts"
     assert core("auto", 1, False) == "prims_ts"
     assert core("prims_ts", 1, True) == "prims_ts"
+    # Rubin keeps decode on Triton; other parts take PrimTS from 32 rows.
+    decode_wins = torch.cuda.get_device_capability(device) != (10, 7)
     assert not indexer("auto", 31, True)
-    assert indexer("auto", 32, True)
+    assert indexer("auto", 32, True) == decode_wins
     assert indexer("auto", 1, False)
     assert indexer("prims_ts", 1, True)
     assert not indexer("triton", 4096, False)
@@ -527,6 +607,18 @@ def test_decode_rows_derive_requests_from_seq_lens() -> None:
     with pytest.raises(ValueError, match="seq_lens"):
         prims_ts_sparse_gqa(
             q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+        )
+    with pytest.raises(ValueError, match="seq_lens"):
+        prims_ts_sparse_gqa(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            block_ids,
+            request_indices,
+            positions,
+            seq_lens=seq_lens,
+            **{**kwargs, "is_decode": False},
         )
 
 

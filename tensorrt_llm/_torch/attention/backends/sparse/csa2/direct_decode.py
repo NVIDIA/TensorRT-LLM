@@ -27,13 +27,9 @@ as a separate ``mla_rope_inplace`` launch does. An index-source layer can export
 its mapped main selections resolve to, which a later
 launch over the same selections, owner and visible lengths attends unmapped.
 
-Work that does not depend on the launch preceding this one on the stream happens before the
-programmatic dependent wait: the query and the SWA slots when ``inputs_ready`` promises they
-were final before that launch started, and the main rows (slots, page-table mapping, payload)
-when ``main_ready`` promises they are final when this launch starts; with both, the whole main
-part runs before the wait and only the SWA rows the preceding cache write may have produced are
-left after it. With ``main_ready`` alone the main rows are loaded before the wait and decoded
-after it, and the launch releases its own dependents only after the wait.
+The kernel can resolve ready slots and copy the ready query before the programmatic dependent
+wait. The head-as-M variant also computes the main attention part early when both readiness
+flags are set. The keys-as-M variant decodes and attends all cache rows after the wait.
 
 For TP8 on SM107 with a 128-token SWA window and zero or 512 main keys, the key rows form the
 MMA's M dimension and the query heads form its N dimension. Each CTA computes one softmax
@@ -41,6 +37,7 @@ over its keys and sends its partial outputs with ``st.async``.
 """
 
 import functools
+from typing import Any
 
 import torch
 
@@ -148,7 +145,8 @@ def _keys_as_m_smem_layout(keys: int) -> dict:
     red = pad_up(p + 8 * prow, 16)
     fac = red + 2 * 8 * 8 * 4
     recv = pad_up(fac + 8 * 9 * 4, 128)
-    block = 4 * 32 * 16 + 8 * 8
+    ml_off = 4 * 32 * 16
+    block = ml_off + 8 * 8
     # Two mbarriers: the partial outputs', then the (max, sum) pairs'.
     mbar = recv + 8 * block
     total_bytes = mbar + 16
@@ -162,7 +160,7 @@ def _keys_as_m_smem_layout(keys: int) -> dict:
         "fac": fac,
         "recv": recv,
         "block": block,
-        "ml_off": 0,
+        "ml_off": ml_off,
         "out": 0,
         "mbar": mbar,
         "bulk": False,
@@ -183,11 +181,7 @@ def _uses_keys_as_m(q_heads: int, swa_width: int, main_width: int, device_index:
     )
 
 
-# 58% (132 KB) shared-memory carveout: the keys-as-M CTA starts beside the projection GEMMs' CTAs.
-_ROOM_CARVEOUT = 58
-
-
-def _set_smem_carveout(compiled, percent: int) -> None:
+def _set_smem_carveout(compiled: Any, percent: int) -> None:
     """Set the preferred shared-memory carveout of every kernel of a compiled CuTe DSL function on
     the current device (the DSL's launch option does not reach the loaded kernels)."""
     import cuda.bindings.driver as cuda
@@ -838,7 +832,7 @@ def _kernel_type():
         )
         return floats(out, 4, loc, ip)
 
-    # ------------------------------------------------------- keys-as-M attention (v2)
+    # ------------------------------------------------------- keys-as-M attention
 
     @dsl_user_op
     def ldmatrix_x2(addr: Int32, *, loc=None, ip=None):
@@ -1000,9 +994,8 @@ def _kernel_type():
 
         CTA ``rank`` of a row's cluster owns main columns ``[rank * main_keys, ...)`` (key rows
         ``0 .. main_keys``) and SWA columns ``[rank * swa_keys, ...)`` (key rows after them). The
-        two ranges are attended as separate parts and merged in registers, so with ``main_ready``
-        and ``inputs_ready`` the whole main part runs before the dependent wait and only the SWA
-        rows this layer's cache write may have produced are left for after it.
+        head-as-M kernel attends those ranges separately and merges them in registers. When
+        both readiness flags are set, it computes the main part before the dependent wait.
         """
 
         def __init__(
@@ -1024,7 +1017,6 @@ def _kernel_type():
             bulk_exchange: bool = False,
             export_slots: bool = False,
             keys_as_m: bool = False,
-            main_prewait: bool = False,
         ):
             self.q_heads = q_heads or heads
             self.heads = heads
@@ -1046,8 +1038,6 @@ def _kernel_type():
             self.keys_as_m = keys_as_m
             # The main part runs before the dependent wait when its rows and the query are final.
             self.pre_main = self.main_ready and inputs_ready and not keys_as_m
-            # Main rows final but the query not: they are loaded before the dependent wait.
-            self.main_prewait = main_prewait and use_pdl and self.main_ready and not self.pre_main
             self.use_pdl = use_pdl
             self.q_rope = q_rope
             self.export_slots = export_slots and mapped and main_width > 0
@@ -1642,7 +1632,7 @@ def _kernel_type():
                     mbar_init_expect(mbar_addr, 8 * (block - 64))
                     mbar_init_expect(mbar_addr + 8, 8 * 64)
                 cluster_arrive_relaxed()
-            if const_expr(self.use_pdl and not self.main_prewait):
+            if const_expr(self.use_pdl):
                 griddepcontrol_launch_dependents()
 
             q_heads: cutlass.Constexpr = self.q_heads
@@ -1670,9 +1660,6 @@ def _kernel_type():
                             * Int64(64 * 4)
                             + Int64(4 * tidx)
                         )
-            # Main rows resolved before the dependent wait: the coefficients load right after them.
-            rope_early: cutlass.Constexpr = self.pre_main or self.main_prewait
-            late_rope: cutlass.Constexpr = self.keys_as_m and self.q_rope
             if const_expr(q_heads < heads and not self.keys_as_m):
                 # Padding heads: a zero query row (their outputs are not stored).
                 if tidx >= q_heads:
@@ -1733,34 +1720,6 @@ def _kernel_type():
                     sKind,
                     slots_out,
                 )
-            if const_expr(late_rope and rope_early):
-                if tidx < 64:
-                    rope_v = ld_global_f32(
-                        Int64(q_cos_sin.toint()) + Int64(rope_pos) * (64 * 4) + Int64(4 * tidx)
-                    )
-            # main_prewait: the main rows are loaded before the dependent wait and decoded after it.
-            m_rows: cutlass.Constexpr = ceil_div(main_keys, 8) if self.main_prewait else 1
-            m_data = cute.make_rmem_tensor(cute.make_layout((m_rows, 4), stride=(4, 1)), Int32)
-            m_scale = cute.make_rmem_tensor(cute.make_layout((m_rows,)), Int32)
-            m_kinds = cute.make_rmem_tensor(cute.make_layout((m_rows,)), Int32)
-            if const_expr(self.main_prewait):
-                cute.arch.sync_threads()
-                self._load_rows(
-                    warp,
-                    lane,
-                    swa,
-                    main,
-                    swa_stride,
-                    main_stride,
-                    sSlot,
-                    sKind,
-                    0,
-                    main_keys,
-                    6,
-                    m_data,
-                    m_scale,
-                    m_kinds,
-                )
             if const_expr(self.pre_main):
                 cute.arch.sync_threads()
                 self._decode_rows(
@@ -1777,8 +1736,6 @@ def _kernel_type():
                     main_keys,
                     6,
                 )
-                if const_expr(self.keys_as_m):
-                    self._store_coefs(tidx, sSink, sRope, sink_v, rope_v)
                 cp_async_wait_all()
                 cute.arch.sync_threads()
                 if const_expr(self.q_rope):
@@ -1803,9 +1760,6 @@ def _kernel_type():
 
             if const_expr(self.use_pdl):
                 griddepcontrol_wait()
-            if const_expr(self.main_prewait):
-                # Started under its producers: the next projection launches once they completed.
-                griddepcontrol_launch_dependents()
 
             # ---- after it: this layer's cache rows (and anything not promised ready) ----
             if const_expr(not self.inputs_ready):
@@ -1840,39 +1794,13 @@ def _kernel_type():
                         sKind,
                         slots_out,
                     )
-            if const_expr(late_rope and not rope_early):
+            if const_expr(self.keys_as_m and self.q_rope):
                 if tidx < 64:
                     rope_v = ld_global_f32(
                         Int64(q_cos_sin.toint()) + Int64(rope_pos) * (64 * 4) + Int64(4 * tidx)
                     )
             cute.arch.sync_threads()
-            if const_expr(self.main_prewait):
-                # This layer's SWA rows go out first; the main rows decode while they are in flight.
-                s_rows: cutlass.Constexpr = ceil_div(swa_keys, 8)
-                s_data = cute.make_rmem_tensor(cute.make_layout((s_rows, 4), stride=(4, 1)), Int32)
-                s_scale = cute.make_rmem_tensor(cute.make_layout((s_rows,)), Int32)
-                s_kinds = cute.make_rmem_tensor(cute.make_layout((s_rows,)), Int32)
-                self._load_rows(
-                    warp,
-                    lane,
-                    swa,
-                    main,
-                    swa_stride,
-                    main_stride,
-                    sSlot,
-                    sKind,
-                    main_keys,
-                    swa_keys,
-                    5,
-                    s_data,
-                    s_scale,
-                    s_kinds,
-                )
-                self._store_rows(warp, lane, k_addr, 0, main_keys, 6, m_data, m_scale, m_kinds)
-                self._store_rows(
-                    warp, lane, k_addr, main_keys, swa_keys, 5, s_data, s_scale, s_kinds
-                )
-            elif const_expr(self.pre_main):
+            if const_expr(self.pre_main):
                 self._decode_rows(
                     warp,
                     lane,
@@ -1902,7 +1830,7 @@ def _kernel_type():
                     keys,
                     7,
                 )
-            if const_expr(self.keys_as_m and not self.pre_main):
+            if const_expr(self.keys_as_m):
                 self._store_coefs(tidx, sSink, sRope, sink_v, rope_v)
             cp_async_wait_all()
             cute.arch.sync_threads()
@@ -2137,6 +2065,7 @@ def _kernel_type():
             lay = self.layout
             prow: cutlass.Constexpr = lay["prow"]
             block: cutlass.Constexpr = lay["block"]
+            ml_off: cutlass.Constexpr = lay["ml_off"]
             p_addr = base + lay["p"]
             red_max = base + lay["red"]
             red_sum = red_max + 8 * 8 * 4
@@ -2253,7 +2182,7 @@ def _kernel_type():
                     hl = hl + ld_shared_f32(red_sum + (w * 8 + tidx) * 4)
                 for dest in cutlass.range_constexpr(8):
                     st_async_f32x2(
-                        mapa(send + 4 * 32 * 16 + tidx * 8, dest), mapa(mbar + 8, dest), hm, hl
+                        mapa(send + ml_off + tidx * 8, dest), mapa(mbar + 8, dest), hm, hl
                     )
             # ---- O^T for channels 64w .. 64w + 63 over every key row, to their owner (rank w) ----
             oc = cute.make_rmem_tensor(cute.make_layout((4, 4), stride=(4, 1)), Float32)
@@ -2307,7 +2236,7 @@ def _kernel_type():
                 fh = tidx // 8
                 fs_src = tidx % 8
                 sink_h = sSink[fh]
-                rm, rl = ld_shared_f32x2(recv_addr + fs_src * block + 4 * 32 * 16 + fh * 8)
+                rm, rl = ld_shared_f32x2(recv_addr + fs_src * block + ml_off + fh * 8)
                 top = cute.arch.fmax(sink_h, rm)
                 for mask in (1, 2, 4):
                     top = shfl_max(top, mask)
@@ -2452,9 +2381,9 @@ def direct_sparse_decode(
     logical positions mapped in-kernel when ``main_mapping = (page_table, page_size,
     max_positions, requests, visible)`` is given (CSA2's owner page-table rules). ``sink [H]``
     FP32 logits, ``scale`` the softmax scale. Returns BF16 ``[T, H, 512]`` (``output`` if given).
-    ``inputs_ready``: the query and SWA slots are final before this launch's PDL wait.
-    ``main_ready``: the main selections, their mapping metadata and the main KV rows are final
-    before that wait. The two readiness promises are independent.
+    ``inputs_ready`` means the query and SWA slots were final before the preceding launch started.
+    ``main_ready`` makes the same promise for the main selections, their mapping metadata and
+    the main KV rows.
 
     ``query_rope = (positions, cos_sin)``: ``q`` is the projected query before its interleaved RoPE
     (int32 positions ``[T]``, FP32 table of 32 cos then 32 sin per position), rotated in the
@@ -2563,7 +2492,6 @@ def direct_sparse_decode(
         raise ValueError("CSA2 direct decode slot export needs mapped main rows and int64 [T, Wm]")
     use_pdl = get_env_enable_pdl()
     keys_as_m = _uses_keys_as_m(q_heads, swa_width, main_width, q.device.index)
-    main_prewait = keys_as_m and bool(main_ready) and not inputs_ready
     config = (
         heads,
         swa_width,
@@ -2582,7 +2510,6 @@ def direct_sparse_decode(
         bool(bulk_exchange),
         slots_out is not None,
         keys_as_m,
-        main_prewait,
     )
     key = (q.device.index, *config)
     swa_index_type = cutlass.Int64 if swa_index64 else cutlass.Int32
@@ -2629,7 +2556,9 @@ def direct_sparse_decode(
         kernel = _kernel_type()(*config)
         compiled = cute.compile(kernel, *args)
         if keys_as_m:
-            _set_smem_carveout(compiled, _ROOM_CARVEOUT)
+            from tensorrt_llm._torch.kernels.blackwell.utils import SM107_DECODE_SMEM_CARVEOUT
+
+            _set_smem_carveout(compiled, SM107_DECODE_SMEM_CARVEOUT)
         _COMPILED[key] = compiled
     compiled(*args)
     return output

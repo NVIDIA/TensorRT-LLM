@@ -26,7 +26,7 @@ import yaml
 from tensorrt_llm.executor.request import LoRARequest
 
 from ..lora_test_utils import qwen3_lora_adapter
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 

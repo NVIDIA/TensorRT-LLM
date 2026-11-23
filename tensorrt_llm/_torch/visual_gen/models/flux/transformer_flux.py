@@ -193,9 +193,16 @@ class CombinedTimestepTextProjEmbeddings(nn.Module):
         timestep: torch.Tensor,
         pooled_projection: torch.Tensor,
     ) -> torch.Tensor:
+        return self.combine(timestep, *self.embed_conditions(pooled_projection))
+
+    def embed_conditions(self, pooled_projection: torch.Tensor) -> Tuple[torch.Tensor]:
+        """Step-invariant part: the pooled-text projection."""
+        return (self.text_embedder(pooled_projection),)
+
+    def combine(self, timestep: torch.Tensor, pooled_projections: torch.Tensor) -> torch.Tensor:
+        """Add the timestep embedding to the embed_conditions() output."""
         timesteps_proj = self.time_proj(timestep)
-        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))
-        pooled_projections = self.text_embedder(pooled_projection)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projections.dtype))
         return timesteps_emb + pooled_projections
 
 
@@ -225,16 +232,26 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
         guidance: torch.Tensor,
         pooled_projection: torch.Tensor,
     ) -> torch.Tensor:
-        timesteps_proj = self.time_proj(timestep)
-        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))
+        return self.combine(timestep, *self.embed_conditions(pooled_projection, guidance))
 
+    def embed_conditions(
+        self, pooled_projection: torch.Tensor, guidance: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Step-invariant parts: the guidance embedding and the pooled-text projection."""
         guidance_proj = self.time_proj(guidance)
         guidance_emb = self.guidance_embedder(guidance_proj.to(dtype=pooled_projection.dtype))
+        return guidance_emb, self.text_embedder(pooled_projection)
 
-        time_guidance_emb = timesteps_emb + guidance_emb
-        pooled_projections = self.text_embedder(pooled_projection)
-
-        return time_guidance_emb + pooled_projections
+    def combine(
+        self,
+        timestep: torch.Tensor,
+        guidance_emb: torch.Tensor,
+        pooled_projections: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the timestep embedding to the embed_conditions() outputs."""
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projections.dtype))
+        return timesteps_emb + guidance_emb + pooled_projections
 
 
 # Inductor's fused GELU kernel introduces per-element numerical drift in BF16
@@ -694,6 +711,8 @@ class FluxTransformer2DModel(BaseDiffusionModel):
 
         # Position embeddings
         self.pos_embed = FluxPosEmbed(theta=theta_rope, axes_dim=list(axes_dims_rope))
+        # Step-invariant embeddings of the current request (see _step_invariant_embeddings).
+        self._step_invariant_cache = None
 
         # Time + text embeddings
         if guidance_embeds:
@@ -864,33 +883,20 @@ class FluxTransformer2DModel(BaseDiffusionModel):
 
         # Scale timestep (FLUX convention: multiply by 1000)
         timestep = timestep.to(hidden_states.dtype) * 1000
-        if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
 
-        # Compute timestep + guidance + text embedding
-        if self.config.guidance_embeds and guidance is not None:
-            temb = self.time_text_embed(timestep, guidance, pooled_projections)
-        else:
-            temb = self.time_text_embed(timestep, pooled_projections)
+        # Text, guidance and RoPE embeddings: the same on every denoise step of a request.
+        encoder_hidden_states, image_rotary_emb, conditions = self._step_invariant_embeddings(
+            encoder_hidden_states,
+            pooled_projections,
+            guidance,
+            txt_ids,
+            img_ids,
+            hidden_states.dtype,
+        )
+        temb = self.time_text_embed.combine(timestep, *conditions)
 
-        # Embed text
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-
-        # Handle 3D IDs (batch dimension) - deprecated format
-        if txt_ids.ndim == 3:
-            txt_ids = txt_ids[0]
-        if img_ids.ndim == 3:
-            img_ids = img_ids[0]
-
-        # Shard sequences and position IDs before RoPE (no-op when sharder is inactive).
-        img_ids = self.sharder.shard(img_ids, dim=0)
-        txt_ids = self.sharder.shard(txt_ids, dim=0)
+        # Shard image tokens (no-op when sharder is inactive).
         hidden_states = self.sharder.shard(hidden_states, dim=1)
-        encoder_hidden_states = self.sharder.shard(encoder_hidden_states, dim=1)
-
-        # Compute RoPE embeddings (from potentially sharded IDs)
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        image_rotary_emb = self.pos_embed(ids)
 
         # Dual-stream blocks
         for block in self.transformer_blocks:
@@ -923,6 +929,55 @@ class FluxTransformer2DModel(BaseDiffusionModel):
             return (output,)
 
         return {"sample": output}
+
+    def _step_invariant_embeddings(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        pooled_projections: torch.Tensor,
+        guidance: Optional[torch.Tensor],
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, ...]]:
+        """Text, guidance and RoPE embeddings, computed once per request.
+
+        The pipeline passes the same, unmodified tensors on every denoise step, so the result
+        is reused while the inputs are the same tensor objects. Not cached during CUDA graph
+        capture, where the graph must compute them itself.
+        """
+        inputs = (encoder_hidden_states, pooled_projections, guidance, txt_ids, img_ids)
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        cache = self._step_invariant_cache
+        if not capturing and cache is not None and all(a is b for a, b in zip(cache[0], inputs)):
+            return cache[1]
+
+        if guidance is not None:
+            guidance = guidance.to(dtype) * 1000
+        if self.config.guidance_embeds and guidance is not None:
+            conditions = self.time_text_embed.embed_conditions(pooled_projections, guidance)
+        else:
+            conditions = self.time_text_embed.embed_conditions(pooled_projections)
+
+        # Handle 3D IDs (batch dimension) - deprecated format
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+
+        # Shard text tokens and position IDs before RoPE (no-op when sharder is inactive).
+        encoder_hidden_states = self.sharder.shard(
+            self.context_embedder(encoder_hidden_states), dim=1
+        )
+        ids = torch.cat(
+            (self.sharder.shard(txt_ids, dim=0), self.sharder.shard(img_ids, dim=0)), dim=0
+        )
+        image_rotary_emb = self.pos_embed(ids)
+
+        outputs = (encoder_hidden_states, image_rotary_emb, conditions)
+        if not capturing:
+            # Holding the inputs keeps their identities from being reused by new tensors.
+            self._step_invariant_cache = (inputs, outputs)
+        return outputs
 
     def load_weights(self, weights: dict) -> None:
         """Load weights into the transformer.

@@ -73,6 +73,7 @@ def executor(clock):
         _latest_prev_device_step_time_ms=5.0,
         enable_attention_dp=False,
         dist=SimpleNamespace(rank=0, pp_size=1, tp_size=1),
+        _fmha_step_stats_enabled=False,
         perf_manager=SimpleNamespace(take_encoder_gpu_times_ms=Mock(return_value=[])),
         control_requests=[],
         _stats_has_pending_work=False,
@@ -563,6 +564,7 @@ def _attention_dp_rank(rank, clock):
         enable_attention_dp=True,
         dist=SimpleNamespace(rank=rank, pp_size=1, tp_size=2),
         perf_manager=SimpleNamespace(take_encoder_gpu_times_ms=lambda: []),
+        _fmha_step_stats_enabled=False,
         control_requests=[],
         _stats_has_pending_work=False,
         _adp_iter_stats=ADPIterStatsBuffer(),
@@ -726,7 +728,9 @@ def _fetch_stub(**overrides):
         dist=SimpleNamespace(rank=0, pp_size=1),
         disagg=SimpleNamespace(has_retiring_gen_receives=False),
         canceled_req_ids=set(),
+        kv_cache_transceiver=None,
         _has_pending_connector_transfers=lambda: False,
+        _has_pending_context_retirement=lambda: False,
         _idle_kv_transfer_poll_timeout=lambda: None,
         _stats_has_pending_work=False,
         _has_pending_iteration_stats_work=lambda: False,
@@ -781,7 +785,7 @@ def test_idle_fetch_requires_all_ranks_to_drain(
 
     queue = _WaitingQueue([object()] if waiting else [])
     stub = _fetch_stub(
-        control_requests=[object()] if control else [],
+        control_requests=[SimpleNamespace(control_requires_drain=True)] if control else [],
         disagg=SimpleNamespace(has_retiring_gen_receives=retiring),
         _has_pending_connector_transfers=lambda: pending,
         _stats_has_pending_work=stats_busy,

@@ -18,7 +18,7 @@ import copy
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, cast
 
@@ -335,6 +335,9 @@ _ENGRAM_CONTEXT_SCHEDULE = {1: (0, None), 14: (6, 32)}
 _ENGRAM_PRECOMPUTE_MAX_ROWS = 64
 # Batches with fewer tokens on the busiest rank, decode included, keep the model-stream path.
 _ENGRAM_CONTEXT_MIN_TOKENS = 256
+# MoE calls of up to this many rows (decode sizes, where the 8-row FC2 cubin tiles run in rounds) take the CuTe DSL
+# FC2 (MoEDecodeOptions.cute_fc2_rows).
+_MOE_CUTE_FC2_ROWS = 16
 
 
 @dataclass(frozen=True)
@@ -1556,20 +1559,24 @@ class DeepseekV41Model(DeepseekV4Model):
     _prologue_stream: torch.cuda.Stream | None = None
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
+        # Its NVFP4 MoEs run the FC2 of small un-finalized calls as the CuTe DSL kernel and route decode
+        # steps in one cluster.
         mapping = model_config.mapping
-        if (
-            get_sm_version() == 107
-            and mapping.tp_size == 8
+        sm107_moe = (
+            mapping.tp_size == 8
             and mapping.moe_tp_size == 4
             and mapping.moe_ep_size == 2
             and not mapping.enable_attention_dp
-        ):
-            from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-            if IS_CUTLASS_DSL_AVAILABLE:
-                model_config.extra_attrs[MOE_DECODE_OPTIONS] = MoEDecodeOptions(
-                    tuning=True, fp4_persistent_engine=False
-                )
+        )
+        model_config.extra_attrs[MOE_DECODE_OPTIONS] = replace(
+            MoEDecodeOptions.of(model_config.extra_attrs),
+            cute_fc2_rows=0 if get_sm_version() == 107 and not sm107_moe else _MOE_CUTE_FC2_ROWS,
+            one_cluster_route=True,
+        )
+        # Batch-1 attention-TP workers split each MoE call's experts over the two EP ranks.
+        model_config.extra_attrs["moe_dynamic_ep"] = True
+        # The router logits come as K-chunk partials from 12 rows per rank (SM100/SM103).
+        model_config.extra_attrs["moe_router_partials_small_m"] = True
         super().__init__(model_config, *args, **kwargs)
         self._decoder_replay_observed = False
         self._decoder_replay_reuse_warning_emitted = False
@@ -3951,11 +3958,12 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         contexts = [
             request for request in scheduled_requests.context_requests if not request.is_dummy
         ]
-        contexts.extend(
-            request
-            for request in scheduled_requests.generation_requests
-            if not request.is_dummy and request.py_request_id in promoted_context_request_ids
-        )
+        if promoted_context_request_ids:
+            contexts.extend(
+                request
+                for request in scheduled_requests.generation_requests
+                if not request.is_dummy and request.py_request_id in promoted_context_request_ids
+            )
         if not contexts:
             return
         lookback = provider.config.max_ngram_size - 1

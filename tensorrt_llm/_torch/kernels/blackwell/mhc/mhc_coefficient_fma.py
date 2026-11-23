@@ -19,7 +19,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import SmemAllocator
 
-from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+from ..utils import (
+    SM107_DECODE_SMEM_CARVEOUT,
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
 
 Int32, Int64, Uint32, Float32 = cutlass.Int32, cutlass.Int64, cutlass.Uint32, cutlass.Float32
 
@@ -310,8 +315,7 @@ class MhcCoefficientFmaKernel:
             block=[32 * WARPS, 1, 1],
             stream=stream,
             use_pdl=self.use_pdl,
-            # 58%: the direct decode's carveout, so its CTAs share the SMs this kernel holds early.
-            preferred_smem_carveout=58,
+            preferred_smem_carveout=SM107_DECODE_SMEM_CARVEOUT,
         )
 
     @cute.kernel

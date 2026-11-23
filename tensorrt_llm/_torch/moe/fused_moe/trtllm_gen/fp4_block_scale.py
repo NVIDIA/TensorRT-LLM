@@ -186,11 +186,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         meta at that point, so a snapshot would carry no values.
         """
         super().cache_derived_state()
-        if (
-            self.decode_tuning
-            and self.decode_fp4_persistent_engine
-            and self.decode_engine_state is None
-        ):
+        if self.decode_tuning and self.decode_engine_state is None:
             from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
 
             self.decode_engine_state = new_state(self.w3_w1_weight.device)
@@ -210,11 +206,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         """Where the model declares the decode kernels (``decode_tuning``) of a pre-routed native call, the decode MoE
         engine (``decode_moe.ENGINE``) sizes a persistent grid it can shrink by up to
         ``decode_moe.ENGINE_SPARE_SMS`` SMs; 0 otherwise (the cubins' grids are fixed)."""
-        if not (
-            self.decode_tuning
-            and self.decode_fp4_persistent_engine
-            and self.supports_prerouted_routing
-        ):
+        if not (self.decode_tuning and self.supports_prerouted_routing):
             return 0
         from .decode_moe import ENGINE_SPARE_SMS
 
@@ -255,6 +247,13 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         output1_scale_scalar = get_data_or_none(self, "fc31_scale_c")
         output1_scale_gate_scalar = get_data_or_none(self, "fc31_alpha")
         output2_scale_scalar = get_data_or_none(self, "fc2_alpha")
+        # Dynamic EP: the weights hold every expert; calls without tables run the static range.
+        local_offset, local_count = self.slot_start, self.expert_size_per_partition
+        dynamic_ep = getattr(self, "dynamic_ep", None)
+        dynamic_kwargs = {}
+        if dynamic_ep is not None:
+            local_offset, local_count = dynamic_ep[0], dynamic_ep[1]
+            dynamic_kwargs = {"dynamic_experts": self.expert_size_per_partition}
 
         outputs = self.op_backend.run_fp4_block_scale_moe(
             k.router_logits,
@@ -278,8 +277,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             k.n_group,
             k.topk_group,
             intermediate_size_per_partition_padded,
-            self.slot_start,
-            self.expert_size_per_partition,
+            local_offset,
+            local_count,
             k.routed_scaling_factor,
             self.routing_method.routing_method_type,
             do_finalize=k.do_finalize,
@@ -301,6 +300,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             decode_early_release_rows=self.decode_early_release_rows,
             decode_spare_sms=self._concurrent_sm_reserve,
             routing_tables=ctx.routing_tables,
+            cute_fc2_rows=self.cute_fc2_rows,
+            **dynamic_kwargs,
         )
 
         if not k.do_finalize:

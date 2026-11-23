@@ -69,7 +69,7 @@ from defs.deepseek_v41_serving import model_kwargs as serving_model_kwargs
 # Configuration and checkpoint topology
 
 
-def test_engram_consumer_pair_schedule_at_row_limit():
+def test_engram_consumer_pair_schedule_at_row_limit() -> None:
     gather = Mock()
     gather.supports_pair.return_value = True
     layer = SimpleNamespace(engram=SimpleNamespace(_ll_allgather=gather))
@@ -88,7 +88,7 @@ def test_engram_consumer_pair_schedule_at_row_limit():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires two CUDA streams")
-def test_engram_wkv_pair_joins_projection_once(monkeypatch):
+def test_engram_wkv_pair_joins_projection_once(monkeypatch: pytest.MonkeyPatch) -> None:
     consumer, producer = torch.cuda.current_stream(), torch.cuda.Stream()
     published = torch.arange(16, device="cuda", dtype=torch.float32).reshape(2, 8)
     producer.wait_stream(consumer)
@@ -2231,6 +2231,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
             _config=SimpleNamespace(enable_attention_dp=True),
             mapping=metadata.mapping,
             dist=SimpleNamespace(tp_cp_allgather_int64=gather),
+            cuda_graph_runner=None,
         )
         spec = SimpleNamespace(
             dp_num_tokens=lambda: 6, seq_lens=[6], num_generations=1, runtime_draft_len=3

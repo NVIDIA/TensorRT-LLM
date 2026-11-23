@@ -176,23 +176,23 @@ def test_graph_replay_follows_new_inputs(rows: int, heads: int) -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
-    reason="main pre-wait loads require the SM107 eight-head kernel",
+    reason="requires the SM107 eight-head kernel",
 )
 @torch.inference_mode()
-def test_main_ready_waits_for_swa_indices(monkeypatch):
+def test_waits_for_swa_indices(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
     case = _case(1, 8, 128, 512, mapped=True)
     swa_indices = case[2]
     published = swa_indices.clone()
     swa_indices.fill_(-1)
-    stale = _run(case, inputs_ready=False, main_ready=True)
+    stale = _run(case)
     late_copy(published, swa_indices, 1_000)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         late_copy(published, swa_indices, 2_000_000)
-        output = _run(case, inputs_ready=False, main_ready=True)
+        output = _run(case)
     swa_indices.fill_(-1)
     graph.replay()
     torch.cuda.synchronize()

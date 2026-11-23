@@ -30,6 +30,7 @@ from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.dwdp import get_global_dwdp_manager
@@ -2253,6 +2254,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.spec_worker.enable_vocab_parallel_argmax(self.lm_head,
                                                       key_exchange)
 
+    @property
+    def spec_samples_sharded_temperature(self) -> bool:
+        """Whether the spec worker draws the target tokens of temperature-only
+        batches on the LM head's vocab shard, so the engine captures the
+        temperature-only CUDA graph variant for it. A model that replaces the
+        plain logits processor keeps the gathered logits (the worker checks
+        the processor per step), so it captures no variant it would not use.
+        Configuration only: identical on every TP rank."""
+        return (self.spec_worker is not None
+                and self.spec_worker.samples_sharded_temperature
+                and type(self.logits_processor) is LogitsProcessor)
+
     def setup_aliases(self) -> None:
         if (self.draft_model is not None
                 and getattr(self.draft_model, "shares_target_kv_cache", False)):
@@ -2294,7 +2307,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata: SpecMetadata) -> Tuple[torch.Tensor, bool]:
         """The target logits the worker verifies, and whether they are this rank's vocabulary
         columns, which the worker samples without the head's gather."""
-        rows = hidden_states[spec_metadata.gather_ids]
+        gather_ids = spec_metadata.gather_ids
+        if (spec_metadata.skip_verify_row_gather
+                and attn_metadata.num_contexts == 0
+                and gather_ids.shape[0] == hidden_states.shape[0]):
+            # A generation-only step gathers every row in order.
+            rows = hidden_states
+        else:
+            rows = hidden_states[gather_ids]
         worker = self.spec_worker
         vocab_sharded = worker.takes_vocab_sharded_target_logits(
             attn_metadata, spec_metadata)

@@ -236,7 +236,9 @@ def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
     width = 132096
     rows, top_k = 2, 512
     layout = CSA2Layout((1,), (0,), (0,), index_topk=top_k)
-    indexer = CSA2Indexer(layout, 0, 8, 128, CSA2Params(enable_heuristic_topk=True))
+    indexer = CSA2Indexer(
+        layout, 0, 8, 128, CSA2Params(enable_heuristic_topk=True, use_cute_dsl_topk=False)
+    )
     assert indexer.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
     metadata = CSA2TrtllmMetadata(max_num_requests=rows, max_num_tokens=rows)
     metadata.mapping = Mapping(world_size=8, tp_size=8, rank=0)
@@ -250,12 +252,15 @@ def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
     output = torch.empty(rows, top_k, device="cuda", dtype=torch.int32)
     select = indexer.select_prepared_scores
 
+    selection_captures = []
+
     def checked_select(*args, **kwargs):
         assert kwargs["gvr_r_cap"] == 4
         assert not kwargs["gvr_pdl"]
         assert kwargs["gvr_finalize"] is not None
         result = select(*args, **kwargs)
         assert kwargs["gvr_finalize"]["done"], "the cluster launch must finalize its own output"
+        selection_captures.append(torch.cuda.is_current_stream_capturing())
         return result
 
     monkeypatch.setattr(indexer, "select_prepared_scores", checked_select)
@@ -268,6 +273,7 @@ def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+    assert selection_captures == [False, True]
 
     columns = torch.arange(width, device="cuda")
 

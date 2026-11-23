@@ -92,6 +92,12 @@ def _flashinfer_path(spec) -> str:
     return "cp" if cp else "chunked"
 
 
+def _certified_path(spec) -> str:
+    """The pipeline the cell recorded for this GPU (FlashInfer picks it by SM count)."""
+    path = spec["fi_path"]
+    return path if isinstance(path, str) else path[torch.cuda.get_device_capability()]
+
+
 def _check(result):
     err, *value = result
     assert err == cuda_drv.CUresult.CUDA_SUCCESS, err
@@ -336,7 +342,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
             f"{_stats('o', o, ref[0])}; {_stats('state', got_pool, ref[2])}"
         )
         if "fi_path" in cell.spec:
-            assert path == cell.spec["fi_path"], (path, fallback)
+            assert path == _certified_path(cell.spec), (path, fallback)
         if output is not None:
             assert o.data_ptr() == output.data_ptr(), "output= must be written in place"
         if tail_before is not None:

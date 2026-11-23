@@ -27,6 +27,12 @@ class EncoderReplay:
     global_end: int
     start: int
     consumed: bool = False
+    # A warm checkpoint permits Encoder reads before the first recomputed query.
+    swa_read_floor: int | None = None
+
+    @property
+    def restores_checkpoint(self) -> bool:
+        return self.swa_read_floor is not None
 
     @property
     def num_tokens(self) -> int:

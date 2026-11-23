@@ -813,15 +813,18 @@ def test_decode_graph_query_projections_match_unfused(monkeypatch, rows, lowm_qk
         )
 
 
-def test_sm107_query_mma_options_at_decode_boundary(monkeypatch):
+def test_sm107_query_mma_options_at_decode_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import module
 
     monkeypatch.setattr(module, "get_sm_version", lambda: 107)
     for shape in ((1792, 5120), (4096, 1280)):
         weight = torch.empty(shape, device="meta")
+        assert module._lowm_query_mma_options(weight, 0) is None
         assert module._lowm_query_mma_options(weight, 8) == (True, False)
         assert module._lowm_query_mma_options(weight, 9) is None
     assert module._lowm_query_mma_options(torch.empty((8192, 1280), device="meta"), 8) is None
+    monkeypatch.setattr(module, "get_sm_version", lambda: 103)
+    assert module._lowm_query_mma_options(torch.empty((4096, 1280), device="meta"), 8) is None
 
 
 @skip_pre_blackwell
