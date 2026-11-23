@@ -1993,6 +1993,12 @@ def _register_fake():
                   if mode != 0 else x.new_empty(0, dtype=torch.float8_e4m3fn))
         return x_out, normed
 
+    @torch.library.register_fake("trtllm::dit_ada_modulate")
+    def _(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor,
+          rows_per_batch: int) -> torch.Tensor:
+        """Fake: bf16 output shaped like x."""
+        return torch.empty_like(x)
+
     @torch.library.register_fake("trtllm::fmha_dense_fp8")
     def _(
         q: torch.Tensor,
@@ -2004,6 +2010,7 @@ def _register_fake():
         scale_out: torch.Tensor,
         fp16_softmax: bool,
         out_dtype: torch.dtype,
+        skip_correction_threshold: float = 0.0,
     ):
         return q.new_empty(q.shape, dtype=out_dtype)
 

@@ -21,6 +21,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -32,6 +34,8 @@ enum class ResidualNormMode : int
     kResidualOnly = 0, //!< xOut = x + gate * (y + yBias); no normalization
     kLayerNorm = 1,    //!< LayerNorm with affine weight / bias [hidden]
     kAdaLayerNorm = 2, //!< LayerNorm (no affine) * (1 + scale[b]) + shift[b], scale / shift [batch, hidden]
+    kRmsNorm = 3,      //!< weight * bf16(x * rsqrt(mean(x^2) + eps)), weight [hidden], no bias; the product is
+                       //!< exact (one bf16 rounding) only when the weight holds bf16 values in fp32
 };
 
 struct ResidualNormQuantParams
@@ -61,13 +65,31 @@ struct ResidualNormQuantParams
 };
 
 //! Gated residual update and LayerNorm / AdaLN + static per-tensor FP8 quantization of each row,
-//! in one pass (diffusion transformer blocks). The residual rounds y + y_bias to bf16 and then
+//! in one pass (diffusion transformer blocks). The residual rounds y + yBias to bf16 and then
 //! computes x + gate * y with separately rounded multiply and add; the normalized value is rounded
 //! to bf16 before the FP8 multiply.
 void launchResidualNormQuant(ResidualNormQuantParams const& params, cudaStream_t stream);
 
 //! Whether launchResidualNormQuant has a kernel for this hidden size: a multiple of 1024 up to 8192.
 bool residualNormQuantSupportsHidden(int hidden);
+
+//! Arguments of launchAdaModulate.
+struct AdaModulateParams
+{
+    void const* x = nullptr;      //!< bf16 [rows, hidden] input.
+    void* out = nullptr;          //!< bf16 [rows, hidden] output.
+    float const* scale = nullptr; //!< fp32 [batch, hidden] AdaLN scale.
+    float const* shift = nullptr; //!< fp32 [batch, hidden] AdaLN shift.
+    int64_t rows = 0;             //!< Rows of x.
+    int hidden = 0;               //!< Row width, a multiple of 8.
+    int64_t rowsPerBatch = 0;     //!< Rows that share one batch entry of scale / shift.
+};
+
+//! out = bf16(x * (1 + scale[b]) + shift[b]) per element, rounded like the eager bf16 * fp32
+//! multiply, fp32 add and bf16 cast: 1 + scale, the product and the sum each round to fp32 (no
+//! FMA), then the result rounds to bf16. hidden must be a multiple of 8 and every pointer
+//! 16-byte aligned.
+void launchAdaModulate(AdaModulateParams const& params, cudaStream_t stream);
 
 } // namespace kernels
 

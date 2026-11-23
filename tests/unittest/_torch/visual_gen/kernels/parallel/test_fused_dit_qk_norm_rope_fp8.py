@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Wan FP8 kernels: trtllm::fused_dit_qk_norm_rope_fp8 and trtllm::dit_v_amax against the bf16
-fused op, and trtllm::fused_residual_norm_quant against a torch reference with the same rounding
-order."""
+fused op, trtllm::fused_residual_norm_quant against a torch reference with the same rounding order
+and against its one-row kernel, and trtllm::dit_ada_modulate against the eager ops."""
 
 import math
 
@@ -11,7 +11,7 @@ import torch
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm  # noqa: F401  -- triggers libth_common.so load (registers trtllm ops)
-from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import ResidualNormMode as RNM
+from tensorrt_llm._torch.visual_gen.modules.residual_norm_quant import ResidualNormMode as RNM
 
 pytestmark = skip_pre_hopper
 
@@ -102,6 +102,24 @@ def test_matches_bf16_op_per_head_cos(interleave):
     _assert_fp8_close(q8, _quant(q_ref, QK_MUL))
     _assert_fp8_close(k8, _quant(k_ref, QK_MUL))
     _assert_fp8_close(v8, _quant(v_ref, 1.0 / v_descale))
+
+
+@pytest.mark.parametrize("interleave", [False, True])
+@pytest.mark.parametrize("num_heads", [4, 10, 24, 32, 40, 64])
+def test_shared_cos_kernels_match_general_kernel(interleave, num_heads):
+    """The shared-cos kernels (register-staged from 32 heads, shared-memory reading below) give
+    the general kernel's results bit for bit."""
+    batch, seq = 2, 1560
+    qkv, q_w, k_w, cos, sin = _inputs(batch * seq, num_heads, seq, seed=num_heads)
+    v_amax = _v_amax(qkv, num_heads).reshape(1)
+    shared = _run(qkv, num_heads, q_w, k_w, cos, sin, interleave, v_amax)
+
+    def per_head(t):
+        return t.repeat(batch, 1)[:, None, :].expand(-1, num_heads, -1).contiguous()
+
+    general = _run(qkv, num_heads, q_w, k_w, per_head(cos), per_head(sin), interleave, v_amax)
+    for a, b in zip(shared, general):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
 def test_given_v_amax_sets_v_scale():
@@ -306,3 +324,149 @@ def test_residual_norm_quant_fake_under_compile():
     compiled = torch.compile(fn, fullgraph=True)(t["x"], t["y"])
     for a, b in zip(compiled, eager):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _bitwise(a, b):
+    assert a.dtype == b.dtype and a.shape == b.shape
+    assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@pytest.mark.parametrize("hidden", [1024, 2048, 3072, 4096, 5120])
+@pytest.mark.parametrize("batch,seq", [(1, 1), (1, 4001), (2, 777)])
+@pytest.mark.parametrize("mode", [1, 2])
+def test_residual_norm_quant_persistent_variants_match_one_row_kernel(hidden, batch, seq, mode):
+    """The normalizing variants without y or with a gate run the persistent kernel.
+
+    Each is compared with the one-row-per-block kernel on inputs that give the same math there:
+    y = 0 for the variants without y, and gate = 1 against the ungated variant.
+    """
+    t = _rnq_inputs(batch, seq, hidden, seed=hidden + seq + mode)
+    weight, bias = (t["ln_weight"], t["ln_bias"]) if mode == 1 else (t["scale"], t["shift"])
+    inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda")
+
+    _, normed = _rnq_run(t["x"], None, None, None, mode, weight, bias, inv_scale, seq)
+    _, normed_ref = _rnq_run(
+        t["x"], torch.zeros_like(t["x"]), None, None, mode, weight, bias, inv_scale, seq
+    )
+    _bitwise(normed, normed_ref)
+
+    ones = torch.ones_like(t["gate"])
+    for y_bias in (t["y_bias"], None):
+        x_out, normed = _rnq_run(t["x"], t["y"], y_bias, ones, mode, weight, bias, inv_scale, seq)
+        x_ref, normed_ref = _rnq_run(
+            t["x"], t["y"], y_bias, None, mode, weight, bias, inv_scale, seq
+        )
+        _bitwise(x_out, x_ref)
+        _bitwise(normed, normed_ref)
+
+
+@pytest.mark.parametrize("hidden", [3072, 5120])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_residual_norm_quant_residual_in_the_norm_pass_matches_separate_passes(hidden, batch):
+    """Gated residual + AdaLN in one call equals the residual pass followed by the AdaLN pass."""
+    seq = 1560
+    t = _rnq_inputs(batch, seq, hidden, seed=11)
+    inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda")
+    x_out, normed = _rnq_run(
+        t["x"], t["y"], t["y_bias"], t["gate"], 2, t["scale"], t["shift"], inv_scale, seq
+    )
+    x_ref, _ = _rnq_run(t["x"], t["y"], t["y_bias"], t["gate"], 0, None, None, None, seq)
+    _, normed_ref = _rnq_run(x_ref, None, None, None, 2, t["scale"], t["shift"], inv_scale, seq)
+    _bitwise(x_out, x_ref)
+    _bitwise(normed, normed_ref)
+
+
+def _modulate_eager(x, scale, shift):
+    return (x * (1 + scale[:, None, :]) + shift[:, None, :]).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("hidden", [1536, 3072, 5120])
+@pytest.mark.parametrize("batch,seq", [(1, 1), (1, 3333), (2, 1560)])
+def test_ada_modulate_matches_eager(hidden, batch, seq):
+    t = _rnq_inputs(batch, seq, hidden, seed=hidden + seq)
+    out = torch.ops.trtllm.dit_ada_modulate(t["x"], t["scale"], t["shift"], seq)
+    _bitwise(out, _modulate_eager(t["x"], t["scale"], t["shift"]))
+
+
+def test_ada_modulate_empty_input():
+    """No rows: an empty output, whatever the modulation rows."""
+    t = _rnq_inputs(2, 16, 3072, seed=4)
+    out = torch.ops.trtllm.dit_ada_modulate(t["x"][:, :0], t["scale"], t["shift"], 16)
+    assert out.shape == (2, 0, 3072) and out.dtype == torch.bfloat16
+
+
+def test_ada_modulate_rejects_bad_inputs():
+    t = _rnq_inputs(2, 16, 3072, seed=3)
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        torch.ops.trtllm.dit_ada_modulate(
+            t["x"][..., :3068].contiguous(), t["scale"], t["shift"], 16
+        )
+    with pytest.raises(RuntimeError, match="rows_per_batch"):
+        torch.ops.trtllm.dit_ada_modulate(t["x"], t["scale"], t["shift"], 7)
+    with pytest.raises(RuntimeError, match="float32"):
+        torch.ops.trtllm.dit_ada_modulate(t["x"], t["scale"].bfloat16(), t["shift"], 16)
+
+
+def test_ada_modulate_fake_under_compile():
+    t = _rnq_inputs(2, 64, 3072, seed=9)
+
+    def fn(x):
+        return torch.ops.trtllm.dit_ada_modulate(x, t["scale"], t["shift"], 64)
+
+    _bitwise(torch.compile(fn, fullgraph=True)(t["x"]), fn(t["x"]))
+
+
+def _rms_reference(x, weight_bf16, inv_scale):
+    """RMSNormTPAware (fp32 statistics, bf16 x * rsqrt, bf16 weight product), then FP8 quant."""
+    xf = x.float()
+    n = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS)).bfloat16()
+    y = (weight_bf16 * n).float()
+    return (y * inv_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3)
+
+
+@pytest.mark.parametrize("hidden", [3072, 5120])
+@pytest.mark.parametrize("rows", [1, 777])
+def test_residual_norm_quant_rms_norm_matches_reference(hidden, rows):
+    t = _rnq_inputs(1, rows, hidden, seed=hidden + rows)
+    weight = t["ln_weight"].bfloat16()
+    inv_scale = torch.tensor([E4M3_MAX / 40.0], device="cuda")
+    _, normed = _rnq_run(t["x"], None, None, None, 3, weight.float(), None, inv_scale, rows)
+    ref = _rms_reference(t["x"], weight, inv_scale.item())
+    # rsqrt and the mean round differently from torch; codes agree up to one e4m3 step.
+    torch.testing.assert_close(normed.float(), ref.float(), rtol=0.125, atol=2**-6)
+    assert (normed.view(torch.uint8) == ref.view(torch.uint8)).float().mean() > 0.995
+
+
+@pytest.mark.parametrize("hidden", [3072, 5120])
+def test_residual_norm_quant_rms_norm_static_scale_bound_never_saturates(hidden):
+    """The static Q scale of the FP8 cross-attention, sqrt(hidden) * max|weight| (plus a rounding
+    margin) mapped to 448, covers the worst case: all of a row's energy in one element."""
+    g = torch.Generator(device="cuda").manual_seed(3)
+    weight = (1.0 + 0.5 * torch.randn(hidden, device="cuda", generator=g)).bfloat16()
+    bound = hidden**0.5 * weight.float().abs().max() * (1.0 + 2.0**-7)
+    inv_scale = (E4M3_MAX / bound).reshape(1)
+    x = torch.zeros(hidden, hidden, device="cuda", dtype=torch.bfloat16)
+    x.diagonal().copy_(torch.randn(hidden, device="cuda", generator=g).abs() + 0.5)
+    x[1::2] *= -1
+    _, normed = _rnq_run(x[None], None, None, None, 3, weight.float(), None, inv_scale, hidden)
+    peak = normed.float().abs().amax(-1).squeeze(0)
+    expected = (hidden**0.5 * weight.float().abs() * inv_scale).clamp(max=E4M3_MAX)
+    # Each row's one-hot value lands at its unsaturated code; the largest stays within e4m3.
+    assert peak.max().item() <= E4M3_MAX
+    torch.testing.assert_close(peak, expected, rtol=0.07, atol=0)
+
+
+def test_residual_norm_quant_rms_norm_rejects_bias():
+    t = _rnq_inputs(1, 8, 3072)
+    with pytest.raises(RuntimeError, match="mode 3"):
+        _rnq_run(
+            t["x"],
+            None,
+            None,
+            None,
+            3,
+            t["ln_weight"],
+            t["ln_bias"],
+            torch.ones(1, device="cuda"),
+            8,
+        )

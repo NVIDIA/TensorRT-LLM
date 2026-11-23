@@ -62,6 +62,8 @@ float const* fp32Rows(
 // mode 0: x_out = x + gate * (y + y_bias), no normalized output.
 // mode 1: LayerNorm(x_out or x) with affine weight / bias [hidden], quantized with inv_out_scale.
 // mode 2: LayerNorm(x_out or x) * (1 + weight[b]) + bias[b] with weight / bias [batch, hidden].
+// mode 3: RMSNorm, weight * bf16((x_out or x) * rsqrt(mean(x^2) + eps)) rounded to bf16, with weight [hidden]
+//   holding bf16 values in fp32 and no bias.
 // gate is [batch, hidden]; batch b covers rows [b * rows_per_batch, (b + 1) * rows_per_batch).
 // Returns (x_out, normed); x_out is empty without y and normed is empty in mode 0.
 std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor const& x,
@@ -71,7 +73,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
     c10::optional<torch::Tensor> const& inv_out_scale)
 {
     int64_t const rows_per_batch = rows_per_batch_sym.guard_int(__FILE__, __LINE__);
-    TORCH_CHECK(mode >= 0 && mode <= 2, "fused_residual_norm_quant: mode must be 0, 1 or 2");
+    TORCH_CHECK(mode >= 0 && mode <= 3, "fused_residual_norm_quant: mode must be 0, 1, 2 or 3");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
     checkContiguousAligned(x, "x", x.device());
     TORCH_CHECK(x.dim() >= 1 && x.size(-1) > 0, "fused_residual_norm_quant: x must have a non-empty last dimension");
@@ -108,8 +110,9 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
     int64_t const modRows = mode == 2 ? batch : 1;
     if (normalizes)
     {
-        TORCH_CHECK(weight.has_value() && bias.has_value() && inv_out_scale.has_value(),
-            "modes 1 and 2 need weight, bias and inv_out_scale");
+        bool const rms = mode == 3;
+        TORCH_CHECK(weight.has_value() && inv_out_scale.has_value() && bias.has_value() != rms,
+            "modes 1 and 2 need weight, bias and inv_out_scale; mode 3 needs weight and inv_out_scale and no bias");
         p.weight = fp32Rows(weight, modRows, hidden, "weight", x.device());
         p.bias = fp32Rows(bias, modRows, hidden, "bias", x.device());
         TORCH_CHECK(inv_out_scale->scalar_type() == torch::kFloat32 && inv_out_scale->numel() == 1,
@@ -138,6 +141,41 @@ bool fused_residual_norm_quant_supported(int64_t hidden)
     return tk::residualNormQuantSupportsHidden(static_cast<int>(hidden));
 }
 
+// AdaLN modulation of x [rows, hidden] (bf16) with scale / shift [batch, hidden] (fp32):
+// bf16(x * (1 + scale[b]) + shift[b]), each operation rounded like the eager ops, where batch b
+// covers rows [b * rows_per_batch, (b + 1) * rows_per_batch).
+torch::Tensor dit_ada_modulate(
+    torch::Tensor const& x, torch::Tensor const& scale, torch::Tensor const& shift, c10::SymInt rows_per_batch_sym)
+{
+    int64_t const rows_per_batch = rows_per_batch_sym.guard_int(__FILE__, __LINE__);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(x.dim() >= 1, "dit_ada_modulate: x must have a hidden dimension");
+    checkContiguousAligned(x, "x", x.device());
+    int64_t const hidden = x.size(-1);
+    TORCH_CHECK(hidden > 0 && hidden % 8 == 0, "dit_ada_modulate: hidden (", hidden, ") must be a multiple of 8");
+    int64_t const rows = x.numel() / hidden;
+    if (rows == 0)
+    {
+        return torch::empty_like(x);
+    }
+    TORCH_CHECK(rows_per_batch > 0 && rows % rows_per_batch == 0, "rows_per_batch (", rows_per_batch,
+        ") must evenly divide the rows (", rows, ")");
+    int64_t const batch = rows / rows_per_batch;
+
+    c10::cuda::CUDAGuard const deviceGuard(x.device());
+    tk::AdaModulateParams p;
+    p.x = x.data_ptr();
+    p.scale = fp32Rows(scale, batch, hidden, "scale", x.device());
+    p.shift = fp32Rows(shift, batch, hidden, "shift", x.device());
+    auto out = torch::empty_like(x);
+    p.out = out.data_ptr();
+    p.rows = rows;
+    p.hidden = static_cast<int>(hidden);
+    p.rowsPerBatch = rows_per_batch;
+    tk::launchAdaModulate(p, at::cuda::getCurrentCUDAStream(x.get_device()));
+    return out;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -148,11 +186,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fused_residual_norm_quant(Tensor x, Tensor? y, Tensor? y_bias, Tensor? gate, int mode, Tensor? weight, "
         "Tensor? bias, SymInt rows_per_batch, float eps, Tensor? inv_out_scale) -> (Tensor, Tensor)");
     m.def("fused_residual_norm_quant_supported(int hidden) -> bool");
+    m.def("dit_ada_modulate(Tensor x, Tensor scale, Tensor shift, SymInt rows_per_batch) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fused_residual_norm_quant", &tensorrt_llm::torch_ext::fused_residual_norm_quant);
+    m.impl("dit_ada_modulate", &tensorrt_llm::torch_ext::dit_ada_modulate);
 }
 
 // No tensor arguments, so dispatch cannot pick a backend from the inputs.
