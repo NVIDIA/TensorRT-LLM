@@ -41,6 +41,7 @@ def server(model_name: str, backend: str, num_postprocess_workers: int):
     # Smaller batch size reduces chance of OOM, because test parametrization results
     # in several concurrently live engines.
     args.extend(["--max_batch_size", "128"])
+    args.extend(["--max_num_tokens", "1024"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
@@ -60,6 +61,7 @@ def server_with_beam_search(model_name: str, backend: str,
     # Smaller batch size reduces chance of OOM, because test parametrization results
     # in several concurrently live engines.
     args.extend(["--max_batch_size", "128"])
+    args.extend(["--max_num_tokens", "1024"])
     args.extend(["--max_beam_width", "2"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
