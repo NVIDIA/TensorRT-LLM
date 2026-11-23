@@ -60,9 +60,13 @@ from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .fmha.fallback import FallbackFmha
+from .fmha.fmha_v2 import FmhaV2Fmha
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
 from .fmha.registry import is_fmha_lib_enabled
+from .fmha.trtllm_gen import TrtllmGenFmha
+from .fmha.xqa import XqaFmha
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
@@ -419,6 +423,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
+
+    @property
+    def helix_spec_tokens_valid(self) -> bool:
+        return self._helix_spec_tokens_valid
+
+    @property
+    def uses_trtllm_gen_only_page_size(self) -> bool:
+        """Whether the KV page size is one only the trtllm-gen kernels outside the native op read."""
+        return self.tokens_per_block in getattr(
+            self.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
 
     @property
     def effective_workspace(self) -> Optional[torch.Tensor]:
@@ -3315,7 +3329,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
         self.kv_cache_dtype = kv_cache_dtype
-        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
+        self.use_fp8_ds_mla: bool = kv_cache_dtype == "fp8_ds_mla"
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
@@ -3407,6 +3421,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self._context_plan_counter_rows = 0
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
+
+    @property
+    def uses_dsa_sparse_mla(self) -> bool:
+        return getattr(self.sparse_params, "algorithm",
+                       None) in ("deepseek_v4", "dsa")
 
     @property
     def uses_fp4_mla_attention(self) -> bool:
@@ -3823,6 +3842,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
 
+    def _has_fmha_lib(self, fmha_cls: type) -> bool:
+        """Whether this layer enables ``fmha_cls``, alone or in the native fallback group."""
+        return any(
+            isinstance(fmha, (fmha_cls, FallbackFmha))
+            for fmha in self._fmha_manager.fmha_libs)
+
     def _is_nvfp4_output_kernel_available(
         self,
         *,
@@ -3848,6 +3873,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.quant_mode,
             use_paged_context_fmha,
             is_mla_enable,
+            self._has_fmha_lib(TrtllmGenFmha),
+            self._has_fmha_lib(FmhaV2Fmha),
+            self._has_fmha_lib(XqaFmha),
         )
 
     def out_head_size(self, is_gen_only: bool) -> int:
@@ -3886,6 +3914,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.attention_chunk_size,
             metadata.kv_cache_manager is not None,
             metadata.use_paged_context_fmha,
+            self._has_fmha_lib(TrtllmGenFmha),
+            self._has_fmha_lib(FmhaV2Fmha),
         )
 
     def create_output(self, q, *, is_quantize_output: bool,
@@ -4304,6 +4334,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                             "The per-tensor FP8 attention recipe needs the PrimTS "
                             "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
                             "enabled or does not support this request.")
+                    if (metadata.num_contexts > 0
+                            and metadata.use_paged_context_fmha
+                            and metadata.uses_trtllm_gen_only_page_size):
+                        raise RuntimeError(
+                            "No TRT-LLM attention FMHA library serves paged prefill "
+                            f"with {metadata.tokens_per_block}-token KV pages. Enable "
+                            "flashinfer_trtllm_gen in TLLM_FMHA_LIBS, use a supported "
+                            "TRTLLM-Gen configuration or disable chunked prefill, KV "
+                            "reuse and speculative decoding.")
                     raise RuntimeError(
                         "No TRT-LLM attention FMHA library supports this request."
                     )

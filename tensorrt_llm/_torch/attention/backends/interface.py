@@ -1230,6 +1230,8 @@ class AttentionForwardArgs:
             return int(AttentionMaskType.causal)
         if self.attention_mask == PredefinedAttentionMask.FULL:
             return int(AttentionMaskType.padding)
+        if self.attention_mask == CustomAttentionMask.CUSTOM:
+            return int(AttentionMaskType.custom_mask)
         raise ValueError(
             f"Unexpected attention mask type: {self.attention_mask!r}")
 

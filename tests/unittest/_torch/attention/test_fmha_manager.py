@@ -706,6 +706,65 @@ def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> N
     assert events.count(("support", "fallback", None)) == 1
 
 
+def test_xqa_perf_gain_follows_xqa_after_a_library_is_prepended() -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    xqa = FakeFmha(attn, "xqa", events)
+    xqa.has_perf_gain = lambda *_args: True
+    manager.fmha_libs = [xqa]
+    manager._xqa = xqa
+    manager.fmha_libs.insert(
+        0, FakeFmha(attn, "prepended", events, support_predicate=lambda _args: False)
+    )
+    metadata = _make_metadata(num_contexts=0, num_generations=1)
+    metadata.beam_width = 1
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        for _ in range(2):
+            assert (
+                manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args) is xqa
+            )
+
+
+@pytest.mark.parametrize(
+    "later_names, has_perf_gain, expected",
+    [
+        # Default order: XQA yields to MMHA without a gain.
+        (("fmha_v2", "mmha", "unfused"), True, "xqa"),
+        (("fmha_v2", "mmha", "unfused"), False, "mmha"),
+        # TLLM_FMHA_LIBS=-mmha: nothing later serves generation, so XQA keeps the call.
+        (("fmha_v2", "unfused"), False, "xqa"),
+        # TLLM_FMHA_LIBS=-fmha_v2.
+        (("mmha", "unfused"), False, "mmha"),
+    ],
+)
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_xqa_without_perf_gain_yields_only_to_a_later_serving_library(
+    later_names: tuple[str, ...], has_perf_gain: bool, expected: str, use_cache: bool
+) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    generation = {None, FmhaPhase.GENERATION}
+    xqa = FakePhasedFmha(attn, generation, "xqa", events)
+    xqa.has_perf_gain = lambda *_args: has_perf_gain
+    libs = {"xqa": xqa}
+    for name in later_names:
+        libs[name] = FakePhasedFmha(
+            attn, generation if name == "mmha" else {FmhaPhase.CONTEXT}, name, events
+        )
+    manager.fmha_libs = list(libs.values())
+    manager._xqa = xqa
+    metadata = _make_metadata(num_contexts=0, num_generations=1)
+    metadata.beam_width = 1
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=use_cache):
+        for _ in range(2):
+            selected = manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args)
+            assert selected is libs[expected]
+
+
 def test_fmha_cache_tracks_lora_output_representation() -> None:
     for lora_first in (True, False):
         events: list[tuple] = []

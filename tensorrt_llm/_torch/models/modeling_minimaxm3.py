@@ -40,7 +40,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
-from ..attention.backends.fmha.fallback import FallbackFmha
+from ..attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from ..attention.backends.fmha.registry import get_enabled_fmha_lib_classes
@@ -1305,9 +1305,10 @@ class MiniMaxM3Attention(Attention):
         enabled_libs = get_enabled_fmha_lib_classes()
         if FlashInferTrtllmGenFmha not in enabled_libs:
             return
-        if FallbackFmha in enabled_libs and enabled_libs.index(FallbackFmha) < enabled_libs.index(
-            FlashInferTrtllmGenFmha
-        ):
+        first_native = next(
+            (index for index, lib in enumerate(enabled_libs) if lib in NATIVE_FMHA_LIBS), None
+        )
+        if first_native is not None and first_native < enabled_libs.index(FlashInferTrtllmGenFmha):
             # A fallback-first policy cannot serve P128 cached prefill safely.
             return
         if not FlashInferTrtllmGenFmha.is_environment_available():
