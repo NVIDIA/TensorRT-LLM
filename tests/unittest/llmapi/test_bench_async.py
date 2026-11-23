@@ -15,6 +15,7 @@
 
 import asyncio
 import itertools
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -413,6 +414,55 @@ async def test_llm_manager_duration_not_exceeded():
     assert manager._inbox.empty()
 
     await manager.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration", [None, 5])
+async def test_llm_manager_idle_worker_does_not_spin(duration):
+    """The worker sleeps while the requests it dispatched are in flight.
+
+    A worker that polls the empty inbox keeps the event loop thread busy for
+    the whole run, holding the GIL that the response-delivery thread needs.
+    """
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
+    mock_output.finished = True
+    mock_output.id = 1
+    mock_output.decoding_iter = 1
+
+    request_latency = 0.5
+
+    async def mock_aresult():
+        await asyncio.sleep(request_latency)
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    outbox = asyncio.Queue()
+    manager = LlmManager(
+        llm=mock_llm, outbox=outbox, streaming=False, concurrency=1, duration=duration
+    )
+    req = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=10)
+    await manager.enqueue(req, SamplingParams(), PostprocParams())
+
+    manager.run()
+    cpu_start = time.thread_time()
+    await asyncio.wait_for(outbox.get(), timeout=10)
+    cpu_used = time.thread_time() - cpu_start
+    await manager.stop()
+
+    # A polling worker spends most of the request latency on the CPU.
+    assert cpu_used < request_latency / 10, (
+        f"The event loop used {cpu_used:.3f}s of CPU while the only request "
+        f"waited {request_latency}s for its response."
+    )
 
 
 @pytest.mark.asyncio

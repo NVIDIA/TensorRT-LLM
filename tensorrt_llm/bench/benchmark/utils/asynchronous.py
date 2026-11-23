@@ -60,6 +60,9 @@ class LlmManager:
         self._outbox = outbox
 
         self._stop = asyncio.Event()
+        # Set when the idle worker has something to act on: a request was
+        # enqueued, a request failed, or a stop was requested.
+        self._worker_wakeup = asyncio.Event()
         self._running = asyncio.Event()
         self._tasks: Set[asyncio.Task] = set()
         self._task_errors: List[BaseException] = []
@@ -81,6 +84,27 @@ class LlmManager:
         """Return whether the duration limit has elapsed since the first request."""
         return (self.duration is not None and self.start_time is not None
                 and time.perf_counter() - self.start_time >= self.duration)
+
+    async def _wait_for_worker_wakeup(self) -> None:
+        """Wait until the idle worker has something to act on.
+
+        Returns once a request is enqueued, a request fails, a stop is requested
+        or the duration limit elapses. The worker must not poll instead: a loop
+        that never sleeps keeps the event loop thread holding the GIL, which the
+        thread that delivers responses to the event loop also needs.
+        """
+        self._worker_wakeup.clear()
+        timeout = None
+        if self.duration is not None:
+            # The first request sets start_time; until then the deadline is at
+            # least one full duration away.
+            start_time = (self.start_time if self.start_time is not None else
+                          time.perf_counter())
+            timeout = max(0.0, start_time + self.duration - time.perf_counter())
+        try:
+            await asyncio.wait_for(self._worker_wakeup.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
@@ -252,6 +276,7 @@ class LlmManager:
         error = task.exception()
         if error is not None:
             self._task_errors.append(error)
+            self._worker_wakeup.set()
 
     async def worker(self) -> None:
         """Worker task that pulls requests from inbox and processes them."""
@@ -280,7 +305,7 @@ class LlmManager:
                     request, sampling_params, post_proc_params = self._inbox.get_nowait(
                     )
                 except asyncio.QueueEmpty:
-                    await asyncio.sleep(0)  # yield to concurrent tasks
+                    await self._wait_for_worker_wakeup()
                     continue
                 task = asyncio.create_task(
                     self.process_request(request,
@@ -374,6 +399,7 @@ class LlmManager:
     async def stop(self) -> None:
         logger.info("Stopping LLM backend.")
         self._stop.set()
+        self._worker_wakeup.set()
         if self._iteration_log_task:
             try:
                 await asyncio.wait_for(self._iteration_log_task,
@@ -400,6 +426,7 @@ class LlmManager:
                       sampling_params: SamplingParams,
                       post_proc_params: PostprocParams) -> None:
         await self._inbox.put((request, sampling_params, post_proc_params))
+        self._worker_wakeup.set()
 
 
 @asynccontextmanager
