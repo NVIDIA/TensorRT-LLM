@@ -11,13 +11,17 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.messenger import FrameSigner, ZMQMessenger
+from tensorrt_llm._torch.disaggregation.native.messenger import (
+    FrameAuthenticationError,
+    FrameSigner,
+    ZMQMessenger,
+)
 from tensorrt_llm._torch.disaggregation.native.rank_info import NATIVE_TRANSFER_PROTOCOL_VERSION
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    _NATIVE_CTL_AUTH_CONTEXT,
     RankInfoAuthenticationError,
     RankInfoServer,
     Receiver,
-    _derive_native_auth_key,
     _make_native_frame_signer,
     _make_rank_info_auth_key,
 )
@@ -31,10 +35,23 @@ _RECEIVER_ENDPOINT = "tcp://127.0.0.1:40100"
 
 
 def test_derived_keys_are_distinct_per_use() -> None:
-    rank_info = _derive_native_auth_key(_MASTER_KEY, b"rank-info")
-    control = _derive_native_auth_key(_MASTER_KEY, b"control-plane")
-    assert len({_MASTER_KEY, rank_info, control}) == 3
-    assert rank_info != _derive_native_auth_key(_OTHER_MASTER_KEY, b"rank-info")
+    rank_info_key = _make_rank_info_auth_key(_MASTER_KEY)
+    assert rank_info_key != _MASTER_KEY
+    assert rank_info_key != _make_rank_info_auth_key(_OTHER_MASTER_KEY)
+    # The frame signer uses neither the RankInfo key nor the configured key.
+    message = [b"KV_AGENT_RESULT"] + _make_native_frame_signer(_MASTER_KEY).sign(
+        [b"KV_AGENT_RESULT"],
+        sender_id=b"a",
+        recipient_id=b"b",
+        flow=FrameSigner.FLOW_TO_ROUTER,
+        seq=1,
+        stream_id=bytes(FrameSigner.STREAM_ID_SIZE),
+    )
+    for key in (rank_info_key, _MASTER_KEY):
+        with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
+            FrameSigner(key, _NATIVE_CTL_AUTH_CONTEXT).verify(
+                message, recipient_id=b"b", flow=FrameSigner.FLOW_TO_ROUTER
+            )
 
 
 def test_frame_signer_only_when_key_configured() -> None:
