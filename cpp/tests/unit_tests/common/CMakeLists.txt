@@ -147,3 +147,20 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;common;host")
+
+if(ENABLE_MULTI_DEVICE AND BUILD_PYT)
+  add_tllm_gtest(
+    getCommLegacyConfigTest
+    OWNER
+    common
+    SOURCES
+    getCommLegacyConfigTest.cpp
+    FULL_STACK
+    LINK_LIBRARIES
+    pg_utils
+    ${TORCH_LIBRARIES}
+    ${Python3_LIBRARIES}
+    LABELS
+    "unit;common;full-stack;gpu")
+  target_compile_definitions(getCommLegacyConfigTest PRIVATE BUILD_PYT)
+endif()

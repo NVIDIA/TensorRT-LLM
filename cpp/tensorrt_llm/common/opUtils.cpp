@@ -113,6 +113,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group, int minCtas)
 {
+#if NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0)
+    TLLM_CHECK_WITH_INFO(minCtas == 0, "getComm: minCtas requires NCCL >= 2.29");
+#endif
     auto const hostPg = useMPI() ? nullptr : pg_utils::get_world_pg();
     TLLM_CHECK_WITH_INFO(useMPI() || hostPg != nullptr, "Host process group is not initialized");
     auto const rank = useMPI() ? COMM_SESSION.getRank() : hostPg->getRank();
