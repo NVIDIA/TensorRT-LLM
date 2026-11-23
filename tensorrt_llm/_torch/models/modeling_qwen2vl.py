@@ -453,6 +453,19 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     item_grids[modality] = [{
                         grid_key: grid
                     } for grid in modality_data[grid_key].tolist()]
+                    # A video also needs its timing for its prompt text and
+                    # mRoPE positions: Qwen2.5-VL second_per_grid_ts, and the
+                    # Qwen3-VL timestamp of each frame group.
+                    for key in ("second_per_grid_ts", "video_timestamps"):
+                        values = modality_data.get(key)
+                        if values is None:
+                            continue
+                        if isinstance(values, torch.Tensor):
+                            values = values.tolist()
+                        for item, value in zip(item_grids[modality],
+                                               values,
+                                               strict=True):
+                            item[key] = value
             if item_grids:
                 # Each item's grid, in prompt order. The standalone encoder
                 # returns it with the item's embedding: a prefill worker that
@@ -1432,6 +1445,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 "video_grid_thw":
                 processed_inputs.get('video_grid_thw')
             }
+            # Per-video timing, kept so each video's prompt text and mRoPE
+            # can be rebuilt from its own metadata.
+            for key in ("second_per_grid_ts", "video_timestamps"):
+                if processed_inputs.get(key) is not None:
+                    multimodal_data["video"][key] = processed_inputs[key]
 
         for modality, normalization in processed_inputs.get(
                 "vision_normalization", {}).items():
@@ -2341,6 +2359,7 @@ def _qwen_vision_input_partitions(
         pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
         grid_key: _QWEN_VISION_BATCHED_FIELD,
         "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+        "video_timestamps": _QWEN_VISION_BATCHED_FIELD,
     }
 
 

@@ -1241,6 +1241,35 @@ def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
     _assert_rows_hold_item_grids(embedding.cpu(), lengths, expected)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("model", "key", "values", "expected"),
+    [
+        ("qwen2.5", "second_per_grid_ts", torch.tensor([0.5, 1.0]), [0.5, 1.0]),
+        ("qwen3", "video_timestamps", [[0.25, 1.25], [0.5]], [[0.25, 1.25], [0.5]]),
+    ],
+)
+def test_qwen_vl_processor_puts_video_timing_on_item_metadata(model, key, values, expected):
+    """Each video's item metadata also holds its timing, next to its grid, in prompt order."""
+    # A video, an image, then a second video.
+    prompt = [11, 14, 13, 11, 12, 13, 11, 14, 13]
+    data = {
+        "image": {"pixel_values": torch.zeros(24, 4), "image_grid_thw": torch.tensor([[1, 4, 6]])},
+        "video": {
+            "pixel_values_videos": torch.zeros(48, 4),
+            "video_grid_thw": torch.tensor([[2, 4, 4], [1, 4, 4]]),
+            key: values,
+        },
+    }
+    processor, _ = _make_qwen_vl_embedding_processor(model, prompt)
+    processor.get_mm_item_metadata(prompt, data)
+    assert data["multimodal_embedding_metadata"] == [
+        {"video_grid_thw": [2, 4, 4], key: expected[0]},
+        {"image_grid_thw": [1, 4, 6]},
+        {"video_grid_thw": [1, 4, 4], key: expected[1]},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Item handoff: the encoder takes media items with no prompt, and prefill
 # builds its inputs from the per-item results.
@@ -2880,3 +2909,36 @@ def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
             Qwen2VLModel,
             MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_qwen_vl_item_metadata_rebuilds_video_prompt_text(model):
+    """An encoded video's metadata holds its timing, so its prompt text can be rebuilt.
+
+    Qwen3-VL puts a "<t seconds>" timestamp before each frame group; Qwen2.5-VL
+    uses the seconds per grid step for mRoPE positions.
+    """
+    processor, _ = _make_qwen_vl_hf_processor(model)
+    request = _qwen_vl_request(["wide", "video"], text=None)
+    request["prompt"] = processor.get_mm_items_prompt(
+        request["multi_modal_data"], request["mm_item_order"]
+    )
+    ids, extra = create_input_processor_with_hash(processor)(request, SamplingParams())
+    data = extra["multimodal_data"]
+    image, video = data["multimodal_embedding_metadata"]
+
+    t, h, w = image["image_grid_thw"]
+    text = "<|vision_start|>" + "<|image_pad|>" * (t * h * w // 4) + "<|vision_end|>"
+    t, h, w = video["video_grid_thw"]
+    frame = "<|vision_start|>" + "<|video_pad|>" * (h * w // 4) + "<|vision_end|>"
+    if model == "qwen3":
+        assert set(video) == {"video_grid_thw", "video_timestamps"}
+        assert len(video["video_timestamps"]) == t
+        for seconds in video["video_timestamps"]:
+            text += f"<{seconds:.1f} seconds>{frame}"
+    else:
+        assert set(video) == {"video_grid_thw", "second_per_grid_ts"}
+        assert video["second_per_grid_ts"] > 0
+        text += frame.replace("<|video_pad|>", "<|video_pad|>" * t)
+    assert ids == processor.tokenizer(text).input_ids

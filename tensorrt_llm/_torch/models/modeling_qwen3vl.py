@@ -458,6 +458,11 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             video_metadata=video_metadata,
             **proc_kwargs,
         )
+        # The HF Qwen3-VL processor writes a timestamp per frame group into the prompt.
+        add_timestamps = videos is not None and hasattr(self.processor, "_calculate_timestamps")
+        if add_timestamps:
+            # Keep the sampled-frame metadata to get each video's timestamps.
+            processor_kwargs["return_metadata"] = True
         processed = self.processor(**processor_kwargs)
         if normalization:
             if any(
@@ -471,8 +476,20 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 # the device lookup table cannot be applied. Rerun it with the host settings.
                 processor_kwargs["do_rescale"] = host_do_rescale
                 processor_kwargs.pop("do_normalize")
-                return self.processor(**processor_kwargs)
-            processed["vision_normalization"] = normalization
+                processed = self.processor(**processor_kwargs)
+            else:
+                processed["vision_normalization"] = normalization
+        sampled_videos = processed.pop("video_metadata", None)
+        if add_timestamps and sampled_videos is not None:
+            # The timestamp of each frame group, as the HF processor puts it in
+            # the prompt ("<t seconds>"). A prefill worker rebuilds the text from it.
+            temporal_patch_size = self.processor.video_processor.temporal_patch_size
+            processed["video_timestamps"] = [
+                self.processor._calculate_timestamps(
+                    list(video.frames_indices), video.fps, temporal_patch_size
+                )
+                for video in sampled_videos
+            ]
         return processed
 
     def _get_vision_normalization(
