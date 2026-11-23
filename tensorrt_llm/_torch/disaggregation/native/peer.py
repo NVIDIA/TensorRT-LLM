@@ -229,7 +229,6 @@ class PeerRegistrar:
         # trusted on any other field. Raises ValueError naming both versions.
         validate_protocol_version(peer_ri)
         self.validate_bounded_replay_compatible(peer_ri)
-        self.validate_draft_layers_compatible(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 
