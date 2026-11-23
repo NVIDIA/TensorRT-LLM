@@ -32,6 +32,7 @@ from tensorrt_llm._torch.memory.monitor import names as monitor_names
 from tensorrt_llm._torch.memory.monitor import startup as monitor_startup
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
+from tensorrt_llm._torch.utils import helix_local_len
 from tensorrt_llm._utils import (get_size_in_bytes, prefer_pinned,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
@@ -1281,8 +1282,8 @@ class KVCacheManager(BaseResourceManager):
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
-                    decode_block_id = (req.py_decoding_iter -
-                                       1) // self.tokens_per_block
+                    decode_block_id = req.py_helix_decode_group_index // self.tokens_per_block
+                    req.py_helix_decode_group_index += 1
                     if decode_block_id % self.mapping.cp_size == self.mapping.cp_rank:
                         req.py_helix_is_inactive_rank = False
                         req.seqlen_this_rank_cp += 1
@@ -1592,20 +1593,16 @@ class KVCacheManager(BaseResourceManager):
                     req.prompt_len = token_num - 1
                     req.py_prompt_len = req.prompt_len
                     if self.mapping.has_cp_helix():
-                        if self.mapping.cp_size - 1 == self.mapping.cp_rank:
-                            req.py_helix_is_inactive_rank = False
-                            req.prompt_len = token_num - 1
-                            req.py_prompt_len = req.prompt_len
-                            req.seqlen_this_rank_cp = req.prompt_len
-                            req.total_input_len_cp = token_num * self.mapping.cp_size - 1
-                            req.py_decoding_iter = 1
-                        else:
-                            req.py_helix_is_inactive_rank = True
-                            req.prompt_len = token_num
-                            req.py_prompt_len = req.prompt_len
-                            req.seqlen_this_rank_cp = req.prompt_len
-                            req.total_input_len_cp = token_num * self.mapping.cp_size - 1
-                            req.py_decoding_iter = 1
+                        req.total_input_len_cp = token_num - 1
+                        req.prompt_len = helix_local_len(
+                            req.total_input_len_cp, self.tokens_per_block,
+                            self.mapping.cp_size, self.mapping.cp_rank)
+                        req.py_prompt_len = req.prompt_len
+                        req.py_helix_is_inactive_rank = self.mapping.cp_rank != 0
+                        req.seqlen_this_rank_cp = req.prompt_len + (
+                            not req.py_helix_is_inactive_rank)
+                        req.py_decoding_iter = 1
+                        req.py_helix_decode_group_index = 1
                     req.py_draft_tokens = [1] * max_num_draft_tokens
                     for _ in range(_kv_draft):
                         self.impl.add_token(req.request_id)

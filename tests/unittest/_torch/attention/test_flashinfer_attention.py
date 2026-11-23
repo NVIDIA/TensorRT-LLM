@@ -7,12 +7,16 @@ import unittest
 from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 from unittest import mock
 
 import pytest
 import torch
+from _torch.pyexecutor.engine.runners.decoder.utils import (decoder_config,
+                                                            input_preparer)
+from _torch.pyexecutor.engine_test_utils import DummyModel
 from parameterized import parameterized
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends import (FlashInferAttention,
@@ -21,18 +25,983 @@ from tensorrt_llm._torch.attention.backends import \
     flashinfer as flashinfer_backend
 from tensorrt_llm._torch.attention.backends.flashinfer import (
     FlashInferWrappers, PlanParams)
-from tensorrt_llm._torch.attention.backends.interface import \
-    PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs, PredefinedAttentionMask)
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor import resource_manager
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import \
+    DummyRequestFactory
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import \
+    DecoderInputBuffers
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import \
+    RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.request_utils import merge_helix_requests
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
+from tensorrt_llm._torch.pyexecutor.scheduler import (BindCapacityScheduler,
+                                                      BindMicroBatchScheduler,
+                                                      ScheduledRequests,
+                                                      SimpleScheduler)
+from tensorrt_llm._torch.utils import helix_local_len, model_extra_attrs
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.bindings.executor import SamplingConfig
+from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+
+@dataclass(kw_only=True, frozen=True)
+class _HelixCase:
+    rank: int
+    position: int
+    capture_graph: bool = False
+    cached_tokens: Optional[int] = None
+    query_length: int = 1
+    kv_layout: Literal["HND", "NHD"] = "HND"
+    empty_cache: bool = False
+    speculative: bool = False
+    batch_size: int = 1
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("scenario", [
+    pytest.param(_HelixCase(rank=0, position=64), id="active"),
+    pytest.param(_HelixCase(rank=1, position=64), id="inactive"),
+    pytest.param(_HelixCase(rank=1, position=0), id="empty"),
+    pytest.param(_HelixCase(rank=0, position=64, capture_graph=True),
+                 id="replay-active"),
+    pytest.param(_HelixCase(
+        rank=1, position=127, capture_graph=True, cached_tokens=31),
+                 id="replay-owner-transition"),
+    pytest.param(_HelixCase(rank=0, position=64, kv_layout="NHD", batch_size=2),
+                 id="nhd-strided"),
+    pytest.param(_HelixCase(rank=1, position=0, empty_cache=True),
+                 id="no-pages"),
+    pytest.param(_HelixCase(rank=0, position=31, query_length=3),
+                 id="grouped-query-unsupported"),
+    pytest.param(_HelixCase(rank=0, position=64, speculative=True),
+                 id="speculative-single-query-unsupported"),
+])
+@torch.inference_mode()
+def test_helix_generation_statistics(scenario: _HelixCase) -> None:
+    rank, position = scenario.rank, scenario.position
+    capture_graph, cached_tokens = scenario.capture_graph, scenario.cached_tokens
+    query_length, kv_layout = scenario.query_length, scenario.kv_layout
+    batch_size = scenario.batch_size
+    num_rows = batch_size * query_length
+    request_ids = list(range(batch_size))
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    num_heads, num_kv_heads, head_dim, page_size = 4, 2, 128, 32
+    mapping = Mapping(world_size=2,
+                      cp_size=2,
+                      rank=rank,
+                      cp_config={"cp_type": CpType.HELIX})
+    manager = KVCacheManagerV2(
+        KvCacheConfig(max_tokens=256,
+                      enable_block_reuse=False,
+                      host_cache_size=0),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=page_size,
+        max_seq_len=256,
+        max_batch_size=batch_size,
+        mapping=mapping,
+        dtype=tensorrt_llm.bindings.DataType.BF16,
+        spec_config=(MTPDecodingConfig(max_draft_len=max(query_length - 1, 1))
+                     if query_length > 1 or scenario.speculative else None),
+    )
+    try:
+        cache_tokens = (0 if scenario.empty_cache else
+                        (1 if position == 0 else 128))
+        requests = manager.add_dummy_requests(request_ids,
+                                              [cache_tokens] * batch_size,
+                                              is_gen=not scenario.empty_cache)
+        assert requests is not None
+        cache = manager.get_buffers(0, kv_layout=kv_layout)
+        if kv_layout == "NHD":
+            cache = cache.transpose(2, 3)
+        cache.normal_(std=0.25, generator=generator)
+        page_ids = manager.get_batch_cache_indices(request_ids)
+        qkv = torch.randn((num_rows, (num_heads + 2 * num_kv_heads) * head_dim),
+                          device="cuda",
+                          dtype=torch.bfloat16,
+                          generator=generator)
+        query, key, value = qkv.split([
+            num_heads * head_dim, num_kv_heads * head_dim,
+            num_kv_heads * head_dim
+        ],
+                                      dim=-1)
+        if batch_size > 1:
+            assert not key.is_contiguous()
+            assert not value.is_contiguous()
+            assert not torch.equal(key[0], key[1])
+            assert not torch.equal(value[0], value[1])
+        expected_cache = cache.clone()
+        local_before = helix_local_len(position, page_size, 2, rank)
+        if cached_tokens is not None:
+            local_before = cached_tokens
+        positions = list(range(position, position + query_length))
+        ownership = [(token_position // page_size) % 2 == rank
+                     for token_position in positions]
+        visible_lengths = []
+        for request_index, request_pages in enumerate(page_ids):
+            count = local_before
+            for token_index, owns_token in enumerate(ownership):
+                row = request_index * query_length + token_index
+                if owns_token:
+                    page = request_pages[count // page_size]
+                    slot = count % page_size
+                    expected_cache[page, 0, :, slot].copy_(key[row].view(
+                        num_kv_heads, head_dim))
+                    expected_cache[page, 1, :, slot].copy_(value[row].view(
+                        num_kv_heads, head_dim))
+                    count += 1
+                visible_lengths.append(count)
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.full((batch_size, ), query_length,
+                                dtype=torch.int32),
+            num_contexts=0,
+            request_ids=request_ids,
+            max_num_requests=batch_size,
+            max_num_tokens=num_rows,
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[local_before] * batch_size),
+            mapping=mapping,
+            kv_layout=kv_layout,
+        )
+        if capture_graph:
+            metadata = metadata.create_cuda_graph_metadata(batch_size)
+        metadata.update_helix_param(
+            [position] * batch_size, [not any(ownership)] * batch_size,
+            helix_owned_new_tokens=([0] *
+                                    batch_size if query_length > 1 else None))
+        with model_extra_attrs({}):
+            if query_length > 1 or scenario.speculative:
+                with pytest.raises(NotImplementedError,
+                                   match="single-token queries"):
+                    metadata.prepare()
+                return
+            metadata.prepare()
+        if scenario.empty_cache:
+            assert torch.all(metadata.positions < 0)
+        attention = FlashInferAttention(layer_idx=0,
+                                        num_heads=num_heads,
+                                        head_dim=head_dim,
+                                        num_kv_heads=num_kv_heads)
+        statistics = torch.full((num_rows, num_heads, 2),
+                                float("nan"),
+                                device="cuda")
+        forward_args = AttentionForwardArgs(softmax_stats_tensor=statistics)
+        output = attention.forward(query,
+                                   key,
+                                   value,
+                                   metadata,
+                                   forward_args=forward_args)
+        if capture_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = attention.forward(query,
+                                           key,
+                                           value,
+                                           metadata,
+                                           forward_args=forward_args)
+            query.add_(0.125)
+            next_position = position + query_length
+            owns_next = (next_position // page_size) % 2 == rank
+            count = local_before + sum(ownership)
+            metadata.kv_cache_params.num_cached_tokens_per_seq = [count
+                                                                  ] * batch_size
+            metadata.update_helix_param([next_position] * batch_size,
+                                        [not owns_next] * batch_size)
+            with model_extra_attrs({}):
+                metadata.prepare()
+            if owns_next:
+                for request_index, request_pages in enumerate(page_ids):
+                    page = request_pages[count // page_size]
+                    slot = count % page_size
+                    expected_cache[page, 0, :,
+                                   slot].copy_(key[request_index].view(
+                                       num_kv_heads, head_dim))
+                    expected_cache[page, 1, :,
+                                   slot].copy_(value[request_index].view(
+                                       num_kv_heads, head_dim))
+                count += 1
+            visible_lengths = [count] * batch_size
+            graph.replay()
+
+        torch.testing.assert_close(cache.view(torch.uint8),
+                                   expected_cache.view(torch.uint8),
+                                   atol=0,
+                                   rtol=0)
+        expected_outputs = []
+        expected_normalizers = []
+        for token_index, visible in enumerate(visible_lengths):
+            request_pages = page_ids[token_index // query_length]
+            if visible:
+                keys = torch.cat([
+                    expected_cache[page, 0].transpose(0, 1)
+                    for page in request_pages
+                ])[:visible].float()
+                values = torch.cat([
+                    expected_cache[page, 1].transpose(0, 1)
+                    for page in request_pages
+                ])[:visible].float()
+                keys = keys.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                values = values.repeat_interleave(num_heads // num_kv_heads,
+                                                  dim=1)
+                token_query = query[token_index].view(1, num_heads,
+                                                      head_dim).float()
+                scores = torch.einsum("qhd,khd->qhk", token_query,
+                                      keys) * head_dim**-0.5
+                expected_outputs.append(
+                    torch.einsum("qhk,khd->qhd", scores.softmax(-1),
+                                 values).reshape(1, -1))
+                expected_normalizers.append(scores.logsumexp(-1))
+            else:
+                expected_outputs.append(
+                    torch.zeros((1, num_heads * head_dim), device="cuda"))
+                expected_normalizers.append(
+                    torch.full((1, num_heads), float("-inf"), device="cuda"))
+        expected_output = torch.cat(expected_outputs)
+        expected_lse = torch.cat(expected_normalizers)
+        torch.testing.assert_close(output.float(),
+                                   expected_output,
+                                   atol=1e-2,
+                                   rtol=1e-2)
+        actual_lse = statistics[..., 0] + statistics[..., 1].log()
+        torch.testing.assert_close(actual_lse,
+                                   expected_lse,
+                                   atol=1e-4,
+                                   rtol=1e-4)
+        assert {
+            wrappers.decode_wrapper._backend
+            for wrappers in metadata._plan_params_to_wrappers.values()
+        } == {"fa2"}
+    finally:
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "window_size,capture_graph,manager_version,page_size", [
+        pytest.param(32, False, 2, 32, id="v2-eager"),
+        pytest.param(47, True, 2, 32, id="v2-replay"),
+        pytest.param(32, True, 1, 32, id="v1-prompt-decode-replay"),
+        pytest.param(4, True, 2, 1, id="short-row-mask-replay"),
+    ])
+@torch.inference_mode()
+def test_helix_global_window(window_size: int, capture_graph: bool,
+                             manager_version: int, page_size: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    num_heads, num_kv_heads, head_dim = 4, 2, 128
+    query_shift = 0.0 if page_size == 1 else 0.125
+    positions = ([32, 63, 78] if manager_version == 1 else [7] *
+                 32 if page_size == 1 else [63, 96])
+    prompt_lens = [32, 32, 47] if manager_version == 1 else [0] * len(positions)
+    batch_size = len(positions)
+    query = torch.randn((batch_size, num_heads * head_dim),
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                        generator=generator)
+    if not capture_graph or page_size == 1:
+        query.zero_()
+    keys = torch.randn((batch_size, 128, num_kv_heads, head_dim),
+                       dtype=torch.bfloat16,
+                       device="cuda",
+                       generator=generator) * 0.25
+    values = torch.randn_like(keys)
+    partials = []
+    normalizers = []
+    full_partials = []
+    full_normalizers = []
+    for rank in range(2):
+        mapping = Mapping(world_size=2,
+                          cp_size=2,
+                          rank=rank,
+                          cp_config={"cp_type": CpType.HELIX})
+        manager_class = KVCacheManager if manager_version == 1 else KVCacheManagerV2
+        manager = manager_class(
+            KvCacheConfig(max_tokens=max(1024, 128 * batch_size),
+                          enable_block_reuse=False,
+                          host_cache_size=0),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=256,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+        try:
+
+            def owns_token(request_index: int, token_position: int) -> bool:
+                if manager_version == 1 and token_position >= prompt_lens[
+                        request_index]:
+                    token_position -= prompt_lens[request_index]
+                return (token_position // page_size) % 2 == rank
+
+            generation_requests = manager.add_dummy_requests(list(
+                range(batch_size)), [128] * batch_size,
+                                                             is_gen=True)
+            assert generation_requests is not None
+            cache = manager.get_buffers(0, kv_layout="HND")
+            cache.zero_()
+            page_ids = manager.get_batch_cache_indices(list(range(batch_size)))
+            for request_index, position in enumerate(positions):
+                local_index = 0
+                for global_index in range(position):
+                    if not owns_token(request_index, global_index):
+                        continue
+                    page = page_ids[request_index][local_index // page_size]
+                    slot = local_index % page_size
+                    cache[page, 0, :, slot].copy_(keys[request_index,
+                                                       global_index])
+                    cache[page, 1, :, slot].copy_(values[request_index,
+                                                         global_index])
+                    local_index += 1
+            local_before = [
+                sum(
+                    owns_token(request_index, token_position)
+                    for token_position in range(position))
+                for request_index, position in enumerate(positions)
+            ]
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.ones(batch_size, dtype=torch.int32),
+                num_contexts=0,
+                request_ids=list(range(batch_size)),
+                max_num_requests=batch_size,
+                max_num_tokens=batch_size,
+                kv_cache_manager=manager,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=local_before),
+                mapping=mapping,
+            )
+            if capture_graph:
+                metadata = metadata.create_cuda_graph_metadata(batch_size)
+            scheduled_requests = ScheduledRequests()
+            scheduled_requests.context_requests_last_chunk = []
+            scheduled_requests.generation_requests = generation_requests
+            preparer = None
+            if manager_version == 1:
+                config = decoder_config(max_batch_size=batch_size,
+                                        max_num_tokens=128,
+                                        max_seq_len=256,
+                                        dtype=torch.bfloat16,
+                                        attention_backend=FlashInferAttention,
+                                        disable_overlap_scheduler=True)
+                preparer = input_preparer(
+                    config,
+                    model=DummyModel(torch.bfloat16),
+                    mapping=mapping,
+                    buffers=DecoderInputBuffers.for_config(config, False))
+                for request_index, request in enumerate(generation_requests):
+                    request.total_input_len_cp = prompt_lens[request_index]
+                    request.prompt_len = sum(
+                        owns_token(request_index, token_position)
+                        for token_position in range(prompt_lens[request_index]))
+                    request.py_prompt_len = request.prompt_len
+                    request.py_seq_slot = request_index
+                    request.py_batch_idx = None
+
+            def prepare_metadata(step_positions: list[int]) -> None:
+                local_before = [
+                    sum(
+                        owns_token(request_index, token_position)
+                        for token_position in range(position))
+                    for request_index, position in enumerate(step_positions)
+                ]
+                inactive = [
+                    not owns_token(request_index, position)
+                    for request_index, position in enumerate(step_positions)
+                ]
+                with model_extra_attrs({}):
+                    if preparer is not None:
+                        for request_index, request in enumerate(
+                                generation_requests):
+                            request.py_decoding_iter = (
+                                step_positions[request_index] -
+                                prompt_lens[request_index] + 1)
+                            request.py_helix_is_inactive_rank = inactive[
+                                request_index]
+                            request.seqlen_this_rank_cp = (
+                                local_before[request_index] +
+                                (not inactive[request_index]))
+                        preparer.prepare_inputs(
+                            scheduled_requests=scheduled_requests,
+                            kv_cache_manager=manager,
+                            attn_metadata=metadata,
+                            enable_spec_decode=False,
+                            runtime_draft_len=0,
+                            is_dummy=False,
+                            maybe_graph=capture_graph)
+                    else:
+                        metadata.kv_cache_params.num_cached_tokens_per_seq = local_before
+                        metadata.update_helix_param(step_positions, inactive)
+                        metadata.prepare()
+
+            prepare_metadata(positions)
+            attention = FlashInferAttention(layer_idx=0,
+                                            num_heads=num_heads,
+                                            num_kv_heads=num_kv_heads,
+                                            head_dim=head_dim)
+            rank_query = query.clone()
+            key = torch.stack([
+                keys[index, position]
+                for index, position in enumerate(positions)
+            ])
+            value = torch.stack([
+                values[index, position]
+                for index, position in enumerate(positions)
+            ])
+            statistics = torch.empty((batch_size, num_heads, 2), device="cuda")
+            forward_args = AttentionForwardArgs(
+                attention_window_size=window_size,
+                softmax_stats_tensor=statistics)
+            output = attention.forward(rank_query,
+                                       key,
+                                       value,
+                                       metadata,
+                                       forward_args=forward_args)
+            final_positions = positions
+            if capture_graph:
+                full_attention = FlashInferAttention(layer_idx=0,
+                                                     num_heads=num_heads,
+                                                     num_kv_heads=num_kv_heads,
+                                                     head_dim=head_dim)
+                full_statistics = torch.empty_like(statistics)
+                full_args = AttentionForwardArgs(
+                    softmax_stats_tensor=full_statistics)
+                full_output = full_attention.forward(rank_query,
+                                                     key,
+                                                     value,
+                                                     metadata,
+                                                     forward_args=full_args)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = attention.forward(rank_query,
+                                               key,
+                                               value,
+                                               metadata,
+                                               forward_args=forward_args)
+                    full_output = full_attention.forward(rank_query,
+                                                         key,
+                                                         value,
+                                                         metadata,
+                                                         forward_args=full_args)
+                final_positions = [position + 1 for position in positions]
+                rank_query.add_(query_shift)
+                key.copy_(
+                    torch.stack([
+                        keys[index, position]
+                        for index, position in enumerate(final_positions)
+                    ]))
+                value.copy_(
+                    torch.stack([
+                        values[index, position]
+                        for index, position in enumerate(final_positions)
+                    ]))
+                prepare_metadata(final_positions)
+                graph.replay()
+                full_partials.append(
+                    full_output.view(batch_size, num_heads,
+                                     head_dim).float().clone())
+                full_normalizers.append((full_statistics[..., 0] +
+                                         full_statistics[..., 1].log()).clone())
+            partials.append(
+                output.view(batch_size, num_heads, head_dim).float().clone())
+            normalizers.append(
+                (statistics[..., 0] + statistics[..., 1].log()).clone())
+        finally:
+            manager.shutdown()
+    weights = torch.stack(normalizers).softmax(dim=0)
+    combined = (torch.stack(partials) * weights[..., None]).sum(dim=0)
+    final_query = query.float().view(batch_size, num_heads, head_dim)
+    if capture_graph:
+        final_query = (query + query_shift).float().view(
+            batch_size, num_heads, head_dim)
+    for request_index, position in enumerate(final_positions):
+        start = max(0, position + 1 - window_size)
+        full_keys = keys[request_index,
+                         start:position + 1].float().repeat_interleave(2, dim=1)
+        full_values = values[request_index, start:position +
+                             1].float().repeat_interleave(2, dim=1)
+        scores = torch.einsum("hd,khd->hk", final_query[request_index],
+                              full_keys) * head_dim**-0.5
+        expected = torch.einsum("hk,khd->hd", scores.softmax(-1), full_values)
+        torch.testing.assert_close(combined[request_index],
+                                   expected,
+                                   atol=5e-3,
+                                   rtol=5e-3)
+        torch.testing.assert_close(
+            torch.stack(normalizers)[:, request_index].logsumexp(0),
+            scores.logsumexp(-1),
+            atol=1e-4,
+            rtol=1e-4)
+        if capture_graph:
+            all_keys = keys[request_index, :position +
+                            1].float().repeat_interleave(2, dim=1)
+            all_values = values[request_index, :position +
+                                1].float().repeat_interleave(2, dim=1)
+            all_scores = torch.einsum("hd,khd->hk", final_query[request_index],
+                                      all_keys) * head_dim**-0.5
+            expected_full = torch.einsum("hk,khd->hd", all_scores.softmax(-1),
+                                         all_values)
+            full_weights = torch.stack(full_normalizers)[:,
+                                                         request_index].softmax(
+                                                             dim=0)
+            combined_full = (torch.stack(full_partials)[:, request_index] *
+                             full_weights[..., None]).sum(dim=0)
+            torch.testing.assert_close(combined_full,
+                                       expected_full,
+                                       atol=5e-3,
+                                       rtol=5e-3)
+            torch.testing.assert_close(
+                torch.stack(full_normalizers)[:, request_index].logsumexp(0),
+                all_scores.logsumexp(-1),
+                atol=1e-4,
+                rtol=1e-4)
+    if window_size == 32 and manager_version == 2:
+        assert torch.isneginf(normalizers[0][0]).all()
+        assert torch.count_nonzero(partials[0][0]) == 0
+
+
+@skip_pre_blackwell
+@torch.inference_mode()
+def test_helix_multibeam_generation_rejected() -> None:
+    beam_width, num_heads, head_dim, page_size = 2, 2, 128, 32
+    mapping = Mapping(world_size=2,
+                      cp_size=2,
+                      rank=0,
+                      cp_config={"cp_type": CpType.HELIX})
+    manager = KVCacheManager(
+        KvCacheConfig(max_tokens=1024,
+                      enable_block_reuse=False,
+                      host_cache_size=0),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+        tokens_per_block=page_size,
+        max_seq_len=256,
+        max_batch_size=1,
+        max_beam_width=beam_width,
+        mapping=mapping,
+        dtype=tensorrt_llm.bindings.DataType.BF16)
+    try:
+        requests = merge_helix_requests([
+            RequestQueueItem(
+                0,
+                tensorrt_llm.bindings.executor.Request(
+                    input_token_ids=[1] * 64,
+                    max_tokens=2,
+                    sampling_config=SamplingConfig(beam_width=beam_width)))
+        ],
+                                        cp_rank=0,
+                                        cp_size=2,
+                                        tokens_per_block=page_size,
+                                        exclude_last_generation_logits=False)
+        assert len(requests) == 1
+        generation_request = requests[0]
+        assert generation_request.py_beam_width == beam_width
+        batch = ScheduledRequests()
+        batch.reset_context_requests(requests)
+        manager.prepare_resources(batch)
+        generation_request.context_current_position = generation_request.prompt_len
+        generation_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        for beam_index in range(beam_width):
+            generation_request.add_new_token(beam_index + 1, beam_index)
+        generation_request.py_decoding_iter += 1
+        generation_request.py_seq_slot = 0
+        batch.reset_context_requests([])
+        batch.generation_requests = requests
+        manager.prepare_resources(batch)
+        cache = manager.get_buffers(0, kv_layout="HND")
+        cache.fill_(0.25)
+        expected_cache = cache.clone()
+        config = decoder_config(max_batch_size=1,
+                                max_beam_width=beam_width,
+                                max_num_tokens=128,
+                                max_seq_len=256,
+                                dtype=torch.bfloat16,
+                                attention_backend=FlashInferAttention)
+        preparer = input_preparer(config,
+                                  model=DummyModel(torch.bfloat16),
+                                  mapping=mapping,
+                                  buffers=DecoderInputBuffers.for_config(
+                                      config, False))
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.ones(beam_width, dtype=torch.int32),
+            num_contexts=0,
+            request_ids=[0],
+            max_num_requests=beam_width,
+            max_num_tokens=beam_width,
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(use_cache=True),
+            mapping=mapping)
+        with model_extra_attrs({}), pytest.raises(NotImplementedError,
+                                                  match="beam width one"):
+            preparer.prepare_inputs(scheduled_requests=batch,
+                                    kv_cache_manager=manager,
+                                    attn_metadata=metadata,
+                                    enable_spec_decode=False,
+                                    runtime_draft_len=0,
+                                    is_dummy=False)
+        assert metadata.request_ids == [0]
+        assert metadata.seq_lens.tolist() == [1, 1]
+        torch.testing.assert_close(cache, expected_cache, atol=0, rtol=0)
+    finally:
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
+@torch.inference_mode()
+def test_helix_v1_scheduled_window(overlap: bool) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(321)
+    prompt_lens = [64, 79]
+    batch_size, num_steps = len(prompt_lens), 65
+    num_heads, num_kv_heads, head_dim, page_size, window_size = 4, 2, 128, 32, 32
+    keys = torch.randn((batch_size, 160, num_kv_heads, head_dim),
+                       device="cuda",
+                       dtype=torch.bfloat16,
+                       generator=generator) * 0.25
+    values = torch.randn(keys.shape,
+                         device="cuda",
+                         dtype=torch.bfloat16,
+                         generator=generator)
+    queries = torch.zeros((num_steps, batch_size, num_heads, head_dim),
+                          device="cuda",
+                          dtype=torch.bfloat16)
+    checkpoints = (31, 32, 63, 64)
+    partials = defaultdict(list)
+    normalizers = defaultdict(list)
+    for rank in range(2):
+        mapping = Mapping(world_size=2,
+                          cp_size=2,
+                          rank=rank,
+                          cp_config={"cp_type": CpType.HELIX})
+        manager = KVCacheManager(
+            KvCacheConfig(max_tokens=1024,
+                          enable_block_reuse=False,
+                          host_cache_size=0),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=256,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.BF16)
+        try:
+            requests = merge_helix_requests(
+                [
+                    RequestQueueItem(
+                        index,
+                        tensorrt_llm.bindings.executor.Request(
+                            input_token_ids=[1] * prompt_len,
+                            max_tokens=num_steps + 1))
+                    for index, prompt_len in enumerate(prompt_lens)
+                ],
+                cp_rank=rank,
+                cp_size=2,
+                tokens_per_block=page_size,
+                exclude_last_generation_logits=False)
+            scheduler = SimpleScheduler(
+                BindCapacityScheduler(batch_size, manager.impl, None),
+                BindMicroBatchScheduler(batch_size, max_num_tokens=128))
+
+            def schedule() -> ScheduledRequests:
+                inflight = ReqIdsSet()
+                result = scheduler.schedule_request(requests, inflight)
+                assert not result.paused_requests
+                batch = ScheduledRequests()
+                batch.reset_context_requests(result.context_requests)
+                batch.generation_requests = result.generation_requests
+                return batch
+
+            manager.prepare_resources(schedule())
+            cache = manager.get_buffers(0, kv_layout="HND")
+            cache.zero_()
+            page_ids = manager.get_batch_cache_indices(list(range(batch_size)))
+            for request_index, request in enumerate(requests):
+                assert request.py_position_ids is not None
+                for local_index, global_index in enumerate(
+                        request.py_position_ids):
+                    page = page_ids[request_index][local_index // page_size]
+                    slot = local_index % page_size
+                    cache[page, 0, :, slot].copy_(keys[request_index,
+                                                       global_index])
+                    cache[page, 1, :, slot].copy_(values[request_index,
+                                                         global_index])
+                request.context_current_position = request.prompt_len
+                request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                request.add_new_token(1, 0)
+                request.py_decoding_iter += 1
+                request.py_seq_slot = request_index
+            config = decoder_config(max_batch_size=batch_size,
+                                    max_num_tokens=128,
+                                    max_seq_len=256,
+                                    dtype=torch.bfloat16,
+                                    attention_backend=FlashInferAttention,
+                                    disable_overlap_scheduler=not overlap)
+            preparer = input_preparer(config,
+                                      model=DummyModel(torch.bfloat16),
+                                      mapping=mapping,
+                                      buffers=DecoderInputBuffers.for_config(
+                                          config, False))
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.ones(batch_size, dtype=torch.int32),
+                num_contexts=0,
+                request_ids=list(range(batch_size)),
+                max_num_requests=batch_size,
+                max_num_tokens=batch_size,
+                kv_cache_manager=manager,
+                kv_cache_params=KVCacheParams(use_cache=True),
+                mapping=mapping).create_cuda_graph_metadata(batch_size)
+            attention = FlashInferAttention(layer_idx=0,
+                                            num_heads=num_heads,
+                                            num_kv_heads=num_kv_heads,
+                                            head_dim=head_dim)
+            query = torch.empty((batch_size, num_heads * head_dim),
+                                dtype=torch.bfloat16,
+                                device="cuda")
+            key = torch.empty((batch_size, num_kv_heads, head_dim),
+                              dtype=torch.bfloat16,
+                              device="cuda")
+            value = torch.empty_like(key)
+            statistics = torch.empty((batch_size, num_heads, 2), device="cuda")
+            forward_args = AttentionForwardArgs(
+                attention_window_size=window_size,
+                softmax_stats_tensor=statistics)
+            sampled_tokens = SampleStateTensors(new_tokens=torch.ones(
+                (1, batch_size, 1), dtype=torch.int32, device="cuda"))
+            graph = torch.cuda.CUDAGraph()
+            output = None
+            for step in range(num_steps):
+                batch = schedule()
+                assert len(batch.generation_requests) == batch_size
+                manager.prepare_resources(batch)
+                with model_extra_attrs({}):
+                    prepared = preparer.prepare_inputs(
+                        scheduled_requests=batch,
+                        kv_cache_manager=manager,
+                        attn_metadata=metadata,
+                        new_tensors_device=sampled_tokens
+                        if overlap and step > 0 else None,
+                        enable_spec_decode=False,
+                        runtime_draft_len=0,
+                        is_dummy=False,
+                        maybe_graph=True)
+                assert prepared.kwargs["input_ids"].flatten().tolist(
+                ) == [1] * batch_size
+                assert prepared.kwargs["position_ids"].flatten().tolist() == [
+                    prompt_len + step for prompt_len in prompt_lens
+                ]
+                query.copy_(queries[step].flatten(1))
+                key.copy_(
+                    torch.stack([
+                        keys[index, prompt_len + step]
+                        for index, prompt_len in enumerate(prompt_lens)
+                    ]))
+                value.copy_(
+                    torch.stack([
+                        values[index, prompt_len + step]
+                        for index, prompt_len in enumerate(prompt_lens)
+                    ]))
+                if step == 0:
+                    attention.forward(query,
+                                      key,
+                                      value,
+                                      metadata,
+                                      forward_args=forward_args)
+                    with torch.cuda.graph(graph):
+                        output = attention.forward(query,
+                                                   key,
+                                                   value,
+                                                   metadata,
+                                                   forward_args=forward_args)
+                else:
+                    graph.replay()
+                if step in checkpoints:
+                    assert output is not None
+                    partials[step].append(
+                        output.view(batch_size, num_heads,
+                                    head_dim).float().clone())
+                    normalizers[step].append(
+                        (statistics[..., 0] + statistics[..., 1].log()).clone())
+                if not overlap or step > 0:
+                    for request in requests:
+                        request.add_new_token(1, 0)
+                        request.py_decoding_iter += 1
+                manager.update_resources(batch)
+        finally:
+            manager.shutdown()
+    for step in checkpoints:
+        for request_index, prompt_len in enumerate(prompt_lens):
+            position = prompt_len + step
+            begin = position - window_size + 1
+            reference_keys = keys[request_index, begin:position +
+                                  1].float().repeat_interleave(2, dim=1)
+            reference_values = values[request_index, begin:position +
+                                      1].float().repeat_interleave(2, dim=1)
+            scores = torch.einsum("hd,thd->ht", queries[step,
+                                                        request_index].float(),
+                                  reference_keys) / head_dim**0.5
+            expected = torch.einsum("ht,thd->hd", scores.softmax(-1),
+                                    reference_values)
+            rank_lse = torch.stack(normalizers[step])[:, request_index]
+            combined = (torch.stack(partials[step])[:, request_index] *
+                        rank_lse.softmax(0)[..., None]).sum(0)
+            torch.testing.assert_close(combined, expected, atol=5e-3, rtol=5e-3)
+            torch.testing.assert_close(rank_lse.logsumexp(0),
+                                       scores.logsumexp(-1),
+                                       atol=1e-4,
+                                       rtol=1e-4)
+
+
+@skip_pre_blackwell
+@torch.inference_mode()
+def test_helix_v1_unmodified_warmup_window(
+        request: pytest.FixtureRequest) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(456)
+    batch_size, num_heads, num_kv_heads, head_dim, page_size = 2, 4, 2, 128, 32
+    for rank in range(2):
+        mapping = Mapping(world_size=2,
+                          cp_size=2,
+                          rank=rank,
+                          cp_config={"cp_type": CpType.HELIX})
+        manager = KVCacheManager(
+            KvCacheConfig(max_tokens=1024,
+                          enable_block_reuse=False,
+                          host_cache_size=0),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=256,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.BF16)
+        request.addfinalizer(manager.shutdown)
+        resources = resource_manager.ResourceManager(
+            {resource_manager.ResourceManagerType.KV_CACHE_MANAGER: manager})
+        config = decoder_config(max_batch_size=batch_size,
+                                max_num_tokens=128,
+                                max_seq_len=256,
+                                dtype=torch.bfloat16,
+                                attention_backend=FlashInferAttention)
+        model = DummyModel(torch.bfloat16)
+        factory = DummyRequestFactory(
+            config=config,
+            model=model,
+            get_runtime_tokens_per_gen_step=lambda draft_len: 1 + draft_len,
+            release_request_state=None)
+        with factory.release_batch_context(
+                factory.create_cuda_graph_warmup_request(resources,
+                                                         batch_size=batch_size,
+                                                         draft_len=0),
+                resources) as batch:
+            try:
+                assert batch is not None
+                requests = batch.generation_requests
+                assert [len(request.get_tokens(0))
+                        for request in requests] == [255, 2]
+                for dummy in requests:
+                    assert dummy.py_prompt_len == helix_local_len(
+                        dummy.total_input_len_cp, page_size, 2, rank)
+                    assert dummy.seqlen_this_rank_cp == dummy.py_prompt_len + (
+                        rank == 0)
+                    assert dummy.py_helix_is_inactive_rank == (rank != 0)
+                    assert dummy.seqlen_this_rank_cp <= len(
+                        manager.get_cache_indices(dummy)) * page_size
+                cache = manager.get_buffers(0, kv_layout="HND")
+                cache.zero_()
+                metadata = FlashInferAttentionMetadata(
+                    seq_lens=torch.ones(batch_size, dtype=torch.int32),
+                    num_contexts=0,
+                    request_ids=[request.py_request_id for request in requests],
+                    max_num_requests=batch_size,
+                    max_num_tokens=batch_size,
+                    kv_cache_manager=manager,
+                    kv_cache_params=KVCacheParams(use_cache=True),
+                    mapping=mapping).create_cuda_graph_metadata(batch_size)
+                preparer = input_preparer(
+                    config,
+                    model=model,
+                    mapping=mapping,
+                    buffers=DecoderInputBuffers.for_config(config, False))
+                with model_extra_attrs({}):
+                    preparer.prepare_inputs(scheduled_requests=batch,
+                                            kv_cache_manager=manager,
+                                            attn_metadata=metadata,
+                                            enable_spec_decode=False,
+                                            runtime_draft_len=0,
+                                            is_dummy=True,
+                                            maybe_graph=True)
+                query = torch.randn((batch_size, num_heads * head_dim),
+                                    device="cuda",
+                                    dtype=torch.bfloat16,
+                                    generator=generator)
+                key = torch.zeros((batch_size, num_kv_heads, head_dim),
+                                  device="cuda",
+                                  dtype=torch.bfloat16)
+                value = torch.zeros_like(key)
+                statistics = torch.empty((batch_size, num_heads, 2),
+                                         device="cuda")
+                attention = FlashInferAttention(layer_idx=0,
+                                                num_heads=num_heads,
+                                                num_kv_heads=num_kv_heads,
+                                                head_dim=head_dim)
+                args = AttentionForwardArgs(attention_window_size=16,
+                                            softmax_stats_tensor=statistics)
+                attention.forward(query,
+                                  key,
+                                  value,
+                                  metadata,
+                                  forward_args=args)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = attention.forward(query,
+                                               key,
+                                               value,
+                                               metadata,
+                                               forward_args=args)
+                graph.replay()
+                assert torch.count_nonzero(output) == 0
+                actual_lse = statistics[..., 0] + statistics[..., 1].log()
+                expected_lengths = []
+                for dummy in requests:
+                    position = dummy.total_input_len_cp
+                    owned = sum(
+                        (token // page_size) % 2 == rank
+                        for token in range(max(0, position -
+                                               15), position)) + (rank == 0)
+                    expected_lengths.append(owned)
+                expected_lse = torch.tensor(expected_lengths,
+                                            device="cuda").float().log()
+                torch.testing.assert_close(actual_lse,
+                                           expected_lse[:, None].expand(
+                                               -1, num_heads),
+                                           atol=1e-4,
+                                           rtol=1e-4)
+            finally:
+                torch.cuda.synchronize()
 
 
 @pytest.mark.cpu_only

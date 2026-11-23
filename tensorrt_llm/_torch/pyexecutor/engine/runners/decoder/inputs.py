@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -98,6 +99,9 @@ from ..common import (
 )
 from ..interface import PreparedInputs
 from .config import DecoderRunnerConfig
+
+if IS_FLASHINFER_AVAILABLE:
+    from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttentionMetadata
 from .locality_domain import (
     locality_domain_forkjoin_enabled,
     locality_domain_row_splits,
@@ -2852,6 +2856,16 @@ class DecoderInputPreparer:
                     host.lists.helix_owned_new_tokens if helix_spec_active else None
                 ),
             )
+            if (
+                IS_FLASHINFER_AVAILABLE
+                and isinstance(attn_metadata, FlashInferAttentionMetadata)
+                and isinstance(kv_cache_manager, KVCacheManager)
+            ):
+                attn_metadata.helix_global_prompt_lens = [
+                    request.total_input_len_cp
+                    for request in host.lists.generation_requests
+                    for _ in range(request.py_beam_width)
+                ]
 
         # Attention sizes its generation rows by the static draft ceiling
         # unless told the step's window, which both the confidence scheduler

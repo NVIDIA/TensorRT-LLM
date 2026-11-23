@@ -17,6 +17,7 @@ import pickle
 import sys
 import weakref
 from dataclasses import dataclass
+from functools import partial
 
 import _torch.attention.multi_gpu.helix_test_utils as helix_utils
 import cloudpickle
@@ -46,7 +47,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
-from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm._torch.utils import model_extra_attrs, torch_compiling
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -151,6 +152,8 @@ def _run_attention_distributed(
     mapping: Mapping,
     test_params: tuple,
     ref_output: torch.Tensor,
+    attn_backend: str = "TRTLLM",
+    compile_attention: bool = False,
 ):
     input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params = test_params
     position_ids_gen = torch.full(
@@ -158,7 +161,7 @@ def _run_attention_distributed(
     )
 
     extra_attrs = dict()
-    config = ModelConfig(mapping=mapping)
+    config = ModelConfig(mapping=mapping, attn_backend=attn_backend)
     config.extra_attrs = extra_attrs
     attn = Attention(
         hidden_size=scenario.hidden_size,
@@ -183,6 +186,7 @@ def _run_attention_distributed(
         cache_type=CACHE_TYPE_SELF,
         num_kv_heads=scenario.num_kv_heads,
         head_dim=scenario.head_dim,
+        attn_backend=attn_backend,
     )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     ctx_len_per_gpu = scenario.ctx_len // world_size
@@ -205,15 +209,31 @@ def _run_attention_distributed(
     # Single generation step.
     for req_id in range(scenario.batch):
         assert kv_cache_manager.kv_cache_map[req_id].capacity >= (ctx_len_per_gpu + 1) * world_size
-    helix_is_inactive_rank = [rank != world_size - 1] * scenario.batch
+    owner_rank = (
+        (scenario.ctx_len // scenario.kv_cache_tokens_per_block) % world_size
+        if compile_attention
+        else world_size - 1
+    )
+    helix_is_inactive_rank = [rank != owner_rank] * scenario.batch
     attn_metadata = create_helix_gen_metadata(
-        scenario.batch, ctx_len_per_gpu, kv_cache_manager, helix_is_inactive_rank, position_ids_gen
+        scenario.batch,
+        ctx_len_per_gpu,
+        kv_cache_manager,
+        helix_is_inactive_rank,
+        position_ids_gen,
+        attn_backend=attn_backend,
     )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     # The o_proj all-reduce returns NCCL-window tensors, whose leases must be released by a
     # scope rather than a tensor destructor. The clone outlives the scope for the accuracy check.
     with model_extra_attrs(extra_attrs), nccl_window_tensor_scope(input_gen):
-        output = attn(position_ids_gen, input_gen, attn_metadata).clone()
+        if compile_attention:
+            with torch_compiling(True):
+                attn(position_ids_gen, input_gen, attn_metadata)
+                compiled_attention = torch.compile(attn, backend="eager", fullgraph=True)
+                output = compiled_attention(position_ids_gen, input_gen, attn_metadata).clone()
+        else:
+            output = attn(position_ids_gen, input_gen, attn_metadata).clone()
     print(f"Rank {rank} {world_size}-GPU: result: {output[0, :8]} / {output[-1, -8:]}")
 
     kv_cache_manager.shutdown()
@@ -222,13 +242,15 @@ def _run_attention_distributed(
     )
 
 
-@torch.inference_mode
+@torch.inference_mode()
 def _full_test_multi_gpu(
     rank: int,
     world_size: int,
     scenario: Scenario,
     use_nccl_for_alltoall: bool = False,
     fifo_version: int = 2,
+    attn_backend: str = "TRTLLM",
+    compile_attention: bool = False,
 ):
     rope_config = RopeConfig(
         hidden_size=scenario.hidden_size,
@@ -279,7 +301,7 @@ def _full_test_multi_gpu(
 
     # Up to this point, all ranks should have the same tensors because the seed
     # is the same. Now we run the reference Attention on rank 0.
-    if rank == 0:
+    if rank == 0 or compile_attention:
         ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = setup_kv_and_metadata(
             scenario,
@@ -332,8 +354,9 @@ def _full_test_multi_gpu(
         },
     )
     # Broadcast reference output from rank 0 to all ranks.
-    ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
-    ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
+    if not compile_attention:
+        ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
+        ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
 
     test_params = (
         input_ctx,
@@ -342,7 +365,16 @@ def _full_test_multi_gpu(
         weights,
         pos_embd_params,
     )
-    return _run_attention_distributed(rank, world_size, scenario, mapping, test_params, ref_output)
+    return _run_attention_distributed(
+        rank,
+        world_size,
+        scenario,
+        mapping,
+        test_params,
+        ref_output,
+        attn_backend,
+        compile_attention,
+    )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
@@ -354,3 +386,14 @@ def test_mha_helix_distributed(
     comms_medium: str,
 ):
     run_helix_test(_full_test_multi_gpu, scenario, comms_medium)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
+@pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+def test_mha_helix_compiled_attention(attn_backend: str) -> None:
+    run_helix_test(
+        partial(_full_test_multi_gpu, attn_backend=attn_backend, compile_attention=True),
+        Scenario(batch=2, ctx_len=64),
+        "nccl",
+    )

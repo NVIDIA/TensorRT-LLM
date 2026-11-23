@@ -41,8 +41,12 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ...memory_buffer_utils import Buffers
 from ...metadata import KVCacheParams
+from ...pyexecutor.device_copy import CopySiteEnum, Direction
+from ...pyexecutor.device_copy import copy as copy_to_device
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
+from ...utils import (get_global_attrs, get_model_extra_attrs, helix_local_len,
+                      torch_multi_arange)
+from ..kernels.helix_kv_cache import append_helix_kv_cache
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
@@ -67,6 +71,12 @@ _FORCE_RAGGED_FA2 = False
 """Used for testing."""
 
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
+
+
+class _FlashInferCopySite(CopySiteEnum):
+    HELIX_RUNTIME = ("flashinfer.helix_runtime", Direction.H2D)
+    HELIX_WINDOW_MASK = ("flashinfer.helix_window_mask", Direction.H2D)
+
 
 # XQA workspace: the first 8 MiB are multi-block semaphores, which must start zeroed and which the
 # kernel returns to zero; the rest is multi-block partial-result scratch.
@@ -309,6 +319,9 @@ class FlashInferWrappers:
     prefill_wrapper: Optional[
         flashinfer.BatchPrefillWithPagedKVCacheWrapper] = None
     ragged_prefill_wrapper: Optional[_RaggedPrefillWrapper] = None
+    helix_lse: Optional[torch.Tensor] = field(default=None, repr=False)
+    helix_window_wrapper: Optional[
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper] = None
     # Persistent trtllm-gen decode block tables, built on the host by
     # _build_decode_block_tables().  The device buffer must keep a stable
     # address across steps so graph-captured decode kernels keep reading
@@ -350,6 +363,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _page_table_check_budget = _PAGE_TABLE_CHECK_REPORTS
 
     workspace_buffer: Optional[torch.Tensor] = None
+    helix_global_prompt_lens: Optional[list[int]] = None
+    _helix_positions_host: Optional[list[int]] = field(init=False,
+                                                       default=None,
+                                                       repr=False)
+    _helix_inactive_host: Optional[list[bool]] = field(init=False,
+                                                       default=None,
+                                                       repr=False)
+    _helix_runtime_host: Optional[torch.Tensor] = field(init=False,
+                                                        default=None,
+                                                        repr=False)
+    _helix_runtime: Optional[torch.Tensor] = field(init=False,
+                                                   default=None,
+                                                   repr=False)
+    _helix_window_mask: Optional[torch.Tensor] = field(init=False,
+                                                       default=None,
+                                                       repr=False)
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
@@ -1324,6 +1353,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._prepare_full_draft_page_table()
         self._update_draft_kv_lengths()
 
+    def update_helix_param(
+        self,
+        helix_position_offsets: list[int],
+        helix_is_inactive_rank: list[bool],
+        helix_owned_new_tokens: Optional[list[int]] = None,
+    ) -> None:
+        self._helix_positions_host = list(helix_position_offsets)
+        self._helix_inactive_host = list(helix_is_inactive_rank)
+
     def __post_init__(self) -> None:
         if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
                 and self.kv_cache_manager.enable_swa_scratch_reuse):
@@ -1407,12 +1445,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             cache_name="_draft_kv_runtime_lens",
             capture_graph=capture_graph,
         )
-        self._batch_indices = torch.empty((self.max_num_tokens, ),
+        if (self.mapping is not None and self.mapping.has_cp_helix()
+                and not self.enable_context_mla_with_cached_kv):
+            self._helix_runtime = self.get_empty(
+                buffers,
+                (3, self.max_num_tokens),
+                dtype=torch.int32,
+                cache_name="_helix_runtime",
+                capture_graph=capture_graph,
+            )
+            self._batch_indices = self._helix_runtime[0]
+            self._positions = self._helix_runtime[1]
+        else:
+            self._batch_indices = torch.empty((self.max_num_tokens, ),
+                                              dtype=torch.int,
+                                              device='cuda')
+            self._positions = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
-        self._positions = torch.empty((self.max_num_tokens, ),
-                                      dtype=torch.int,
-                                      device='cuda')
         self._plan_params_to_wrappers = {}
 
         # Host-side state for sync-free trtllm-gen decode plans, retained by
@@ -1855,14 +1905,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # subsequent forward calls.
             if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
                 wrappers = self._plan_params_to_wrappers[plan_params]
+                if (self._helix_runtime_host is not None
+                        and wrappers.helix_window_wrapper is not None):
+                    wrappers.is_planned = False
+                    self._plan_helix_window(plan_params)
+                    continue
                 if wrappers.fa2_plan_num_blocks is not None:
                     continue
                 wrappers.is_planned = False
                 if not defer_plan:
-                    decode = wrappers.decode_wrapper
-                    self._plan_with_params(
-                        plan_params,
-                        decode._backend if decode is not None else "fa2")
+                    self._plan_with_params(plan_params)
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
@@ -1894,6 +1946,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             """
             return maybe_pin_memory(
                 torch.from_numpy(arr.astype(np.int32, copy=False)))
+
+        helix_generation = self._helix_runtime is not None and self.num_contexts == 0
+        if helix_generation:
+            assert self.request_ids is not None
+            if self.num_seqs != len(self.request_ids):
+                raise NotImplementedError(
+                    "FlashInfer HELIX generation supports beam width one only.")
 
         super().prepare()
         extra_attrs = get_model_extra_attrs()
@@ -1949,13 +2008,29 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # Kept on the host: every consumer below needs host values, so a device-side computation
         # would force a sync per step. These logical block counts describe committed history, not
         # all pages that the KV manager has reserved for fixed-width speculative appends.
-        kv_lens_host = np.asarray(num_cached_tokens_per_seq,
-                                  dtype=np.int64) + self.seq_lens_kv.numpy()
+        helix_runtime_host = None
+        if helix_generation and self._helix_inactive_host is not None:
+            if (self.kv_cache_manager.max_draft_len > 0
+                    or not np.all(self.seq_lens_kv.numpy() == 1)):
+                raise NotImplementedError(
+                    "FlashInfer HELIX generation supports single-beam, non-speculative single-token queries."
+                )
+            cached = np.asarray(num_cached_tokens_per_seq, dtype=np.int32)
+            inactive = np.asarray(self._helix_inactive_host, dtype=np.bool_)
+            kv_lens_host = cached + ~inactive
+            helix_runtime_host = _to_int32_tensor(
+                np.stack(
+                    (np.arange(self.num_seqs), np.where(inactive, -1,
+                                                        cached), kv_lens_host)))
+        else:
+            kv_lens_host = np.asarray(
+                num_cached_tokens_per_seq,
+                dtype=np.int64) + self.seq_lens_kv.numpy()
+        self._helix_runtime_host = helix_runtime_host
         logical_num_blocks = ((kv_lens_host + self.page_size - 1) //
                               self.page_size)
         num_blocks = logical_num_blocks
-        use_full_generation_page_table = (
-            self.kv_cache_params.use_full_generation_page_table)
+        use_full_generation_page_table = self.kv_cache_params.use_full_generation_page_table
         self._uses_full_generation_page_table = use_full_generation_page_table
         if use_full_generation_page_table:
             # Generation rows need every reserved page to keep a speculative append addressable
@@ -2095,7 +2170,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                             non_blocking=True)
 
         # For cross attention, num_tokens is 0 during decode, and we don't need to update kv cache.
-        if self.num_tokens > 0:
+        if helix_runtime_host is not None:
+            copy_to_device(
+                _FlashInferCopySite.HELIX_RUNTIME,
+                self._helix_runtime[:, :self.num_seqs],
+                helix_runtime_host,
+            )
+        elif self.num_tokens > 0:
             if use_full_generation_page_table:
                 # The page-table indptr now describes addressable capacity. Deriving positions from
                 # it would count reserved pages as committed KV and potentially shift appends beyond
@@ -2396,6 +2477,119 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return _PageSizeOnePrefillWrapper(
             flashinfer.BatchPrefillWithPagedKVCacheWrapper(*args, **kwargs))
 
+    def _plan_helix_window(self, plan_params: PlanParams) -> PlanParams:
+        wrappers = self._plan_params_to_wrappers.setdefault(
+            plan_params, FlashInferWrappers(is_planned=False))
+        if wrappers.helix_window_wrapper is None:
+            wrapper_kwargs: Dict[str, Any] = {}
+            if self.is_cuda_graph:
+                window_pages = (plan_params.window_left +
+                                self.page_size) // self.page_size + 1
+                page_capacity = self.max_num_requests * window_pages
+                max_row_mask_bits = window_pages * self.page_size
+                mask_capacity = self.max_num_requests * (
+                    (max_row_mask_bits + 7) // 8) + 4
+                wrapper_kwargs = dict(
+                    qo_indptr_buf=self._qo_indptr[:self.max_num_requests + 1],
+                    paged_kv_indptr_buf=torch.empty(self.max_num_requests + 1,
+                                                    dtype=torch.int32,
+                                                    device='cuda'),
+                    paged_kv_indices_buf=torch.empty(page_capacity,
+                                                     dtype=torch.int32,
+                                                     device='cuda'),
+                    paged_kv_last_page_len_buf=torch.empty(
+                        self.max_num_requests, dtype=torch.int32,
+                        device='cuda'),
+                    custom_mask_buf=torch.empty(mask_capacity,
+                                                dtype=torch.uint8,
+                                                device='cuda'),
+                    mask_indptr_buf=torch.empty(self.max_num_requests + 1,
+                                                dtype=torch.int32,
+                                                device='cuda'),
+                )
+            wrappers.helix_window_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                self.kv_layout,
+                use_cuda_graph=self.is_cuda_graph,
+                backend="fa2",
+                **wrapper_kwargs,
+            )
+        local_ends = self._helix_runtime_host[2].numpy()
+        full_indptr = self._host_paged_kv_indptr_decode.numpy()
+        full_indices = self._host_pool_indices.get(
+            plan_params.kv_pool_id, self._host_paged_kv_indices).numpy()
+        page_indices = []
+        window_lens = []
+        window_blocks = []
+        masks = []
+        for sequence, (position, local_end) in enumerate(
+                zip(self._helix_positions_host, local_ends)):
+            global_start = max(0, position - plan_params.window_left)
+            if isinstance(self.kv_cache_manager, KVCacheManagerV2):
+                local_start = helix_local_len(global_start, self.page_size,
+                                              self.mapping.cp_size,
+                                              self.mapping.cp_rank)
+            else:
+                assert self.helix_global_prompt_lens is not None
+                prompt_len = self.helix_global_prompt_lens[sequence]
+                local_start = helix_local_len(min(global_start,
+                                                  prompt_len), self.page_size,
+                                              self.mapping.cp_size,
+                                              self.mapping.cp_rank)
+                local_start += helix_local_len(
+                    max(global_start - prompt_len, 0), self.page_size,
+                    self.mapping.cp_size, self.mapping.cp_rank)
+            first_page = local_start // self.page_size
+            last_page = (local_end + self.page_size - 1) // self.page_size
+            if local_start == local_end:
+                last_page = first_page
+                window_len = 0
+            else:
+                window_len = local_end - first_page * self.page_size
+            page_start = full_indptr[sequence]
+            page_indices.append(full_indices[page_start +
+                                             first_page:page_start + last_page])
+            window_lens.append(window_len)
+            window_blocks.append(last_page - first_page)
+            masks.append(np.arange(window_len) >= local_start % self.page_size)
+        host_mask = maybe_pin_memory(torch.from_numpy(np.concatenate(masks)))
+        if (self._helix_window_mask is None
+                or self._helix_window_mask.numel() < host_mask.numel()):
+            self._helix_window_mask = torch.empty(host_mask.numel(),
+                                                  dtype=torch.bool,
+                                                  device='cuda')
+        mask = self._helix_window_mask[:host_mask.numel()]
+        copy_to_device(_FlashInferCopySite.HELIX_WINDOW_MASK, mask, host_mask)
+        last_page_lens = maybe_pin_memory(
+            torch.from_numpy(((np.asarray(window_lens) - 1) % self.page_size +
+                              1).astype(np.int32)))
+        window_indptr = maybe_pin_memory(
+            torch.from_numpy(
+                np.concatenate(
+                    ([0], np.cumsum(window_blocks))).astype(np.int32)))
+        window_indices = maybe_pin_memory(
+            torch.from_numpy(np.concatenate(page_indices)))
+        query_indptr = maybe_pin_memory(
+            torch.arange(self.num_generations + 1, dtype=torch.int32))
+        wrappers.helix_window_wrapper.plan(
+            query_indptr,
+            window_indptr,
+            window_indices,
+            last_page_lens,
+            plan_params.num_heads,
+            plan_params.num_kv_heads,
+            plan_params.head_dim,
+            self.page_size,
+            causal=False,
+            custom_mask=mask,
+            sm_scale=plan_params.sm_scale,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            o_data_type=plan_params.q_dtype,
+        )
+        wrappers.is_planned = True
+        return plan_params
+
     def _plan_with_params(self,
                           plan_params: PlanParams,
                           flashinfer_backend: str = "fa2") -> PlanParams:
@@ -2407,6 +2601,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 "Cannot plan() for flashinfer kernels while stream is capturing. "
                 "Make sure you run a few warmup runs before capturing the graph!"
             )
+
+        if (self._helix_runtime_host is not None
+                and plan_params.window_left is not None
+                and plan_params.window_left >= 0):
+            return self._plan_helix_window(plan_params)
 
         if self.kv_cache_manager is None:
             if plan_params.multi_item_params is None:
@@ -2538,7 +2737,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     use_tensor_cores=use_tensor_cores or use_graph_tensor_cores
                     or flashinfer_backend == "trtllm-gen",
                     backend=flashinfer_backend
-                    if flashinfer_backend != "fa2" else
+                    if (flashinfer_backend != "fa2"
+                        or self._helix_runtime_host is not None) else
                     ("fa2" if torch.cuda.get_device_capability() == (
                         9, 0) else "auto"),
                 )
@@ -2923,6 +3123,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         latent_cache: Optional[torch.Tensor] = None,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
         xqa_out_scale: float = 1.0,
+        softmax_stats_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         # MLA dispatch
         if self.is_mla_enable:
@@ -3044,17 +3245,63 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
             )
 
-            _append_paged_kv_cache(
-                append_key=k,
-                append_value=v,
-                batch_indices=metadata.batch_indices,
-                positions=metadata.positions,
-                paged_kv_cache=kv_cache,
-                kv_indices=metadata.get_paged_kv_indices_for_layer(
-                    self.layer_idx),
-                kv_indptr=metadata.paged_kv_indptr,
-                kv_last_page_len=metadata.paged_kv_last_page_len,
-                kv_layout=metadata.kv_layout)
+            if metadata._helix_runtime is not None and num_contexts == 0:
+                append_helix_kv_cache(
+                    k, v, kv_cache, metadata.batch_indices, metadata.positions,
+                    metadata.get_paged_kv_indices_for_layer(self.layer_idx),
+                    metadata.paged_kv_indptr, metadata.kv_layout)
+            else:
+                _append_paged_kv_cache(
+                    append_key=k,
+                    append_value=v,
+                    batch_indices=metadata.batch_indices,
+                    positions=metadata.positions,
+                    paged_kv_cache=kv_cache,
+                    kv_indices=metadata.get_paged_kv_indices_for_layer(
+                        self.layer_idx),
+                    kv_indptr=metadata.paged_kv_indptr,
+                    kv_last_page_len=metadata.paged_kv_last_page_len,
+                    kv_layout=metadata.kv_layout)
+
+        if softmax_stats_tensor is not None:
+            plan = metadata.plan(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_dtype=q.dtype,
+                kv_dtype=kv_cache.dtype,
+                q_scaling=self.q_scaling,
+                attention_window_size=attention_window_size,
+                attention_mask_type=attention_mask_type,
+                flashinfer_backend=self.flashinfer_backend,
+            )
+            wrappers = metadata._plan_params_to_wrappers[plan]
+            if wrappers.helix_lse is None:
+                wrappers.helix_lse = torch.empty(
+                    (metadata.max_num_requests, self.num_heads),
+                    dtype=torch.float32,
+                    device=q.device)
+            lse = wrappers.helix_lse[:metadata.num_generations]
+            wrapper = (wrappers.helix_window_wrapper
+                       if attention_window_size is not None
+                       and attention_window_size >= 0 else
+                       wrappers.decode_wrapper)
+            wrapper.run(q,
+                        kv_cache,
+                        out=output.view(-1, self.num_heads, self.head_dim),
+                        lse=lse,
+                        return_lse=True)
+            if attention_window_size is not None and attention_window_size >= 0:
+                empty = torch.isneginf(lse)
+            else:
+                empty = (metadata._helix_runtime[2, :metadata.num_generations]
+                         == 0)[:, None].expand(-1, self.num_heads)
+            output.view(-1, self.num_heads,
+                        self.head_dim).masked_fill_(empty[..., None], 0)
+            softmax_stats_tensor[..., 0].copy_(
+                (lse * math.log(2)).masked_fill(empty, float("-inf")))
+            softmax_stats_tensor[..., 1].copy_(~empty)
+            return
 
         # For trtllm-gen + FP8 KV cache: cast Q to FP8 so context cubins
         # (QkvE4m3OBfloat16) can be used.  trtllm-gen context cubins
@@ -3381,6 +3628,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_input_type=forward_args.attention_input_type,
                 xqa_out_scale=(xqa_out_scale
                                if xqa_out_scale is not None else 1.0),
+                softmax_stats_tensor=forward_args.softmax_stats_tensor,
             )
         except RuntimeError as exc:
             # Report the TRTLLM-convention (exclusive) window, not the
