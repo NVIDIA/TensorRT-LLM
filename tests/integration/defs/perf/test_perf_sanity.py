@@ -45,7 +45,7 @@ from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info, print_warning
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
-from ..conftest import get_llm_root, llm_models_root
+from ..conftest import get_device_count, get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
 from .perf_regression_utils import _percentile, get_job_info, process_and_upload_test_results
 from .time_breakdown_metrics import ALL_METRICS as TIME_BREAKDOWN_METRIC_NAMES
@@ -1686,10 +1686,29 @@ def write_warmup_time(
     """
     print_info(f"{server_name} warmup time: {warmup_time:.1f}s")
     path = _warmup_time_path(test_output_dir, server_name, server_idx)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as output_file:
-        json.dump({"warmup_time": warmup_time}, output_file)
-    os.replace(tmp_path, path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=test_output_dir, prefix=f"{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output_file:
+            json.dump({"warmup_time": warmup_time}, output_file)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def record_warmup_time(
+    test_output_dir: str, server_name: str, server_idx: int, warmup_time: float
+) -> None:
+    """Save a server's warmup time for test_e2e, where the field is informational.
+
+    A failure to save it leaves the row without the field instead of failing the benchmark.
+    """
+    try:
+        write_warmup_time(test_output_dir, server_name, server_idx, warmup_time)
+    except OSError as error:
+        print_warning(f"Failed to save the {server_name} warmup time: {error}")
 
 
 def warmup_time_fields(
@@ -1717,6 +1736,11 @@ def warmup_time_fields(
     return fields
 
 
+def spans_nodes(server_config: "ServerConfig") -> bool:
+    """Whether the server has more GPUs than a node."""
+    return server_config.gpus > server_config.gpus_per_node
+
+
 def is_multi_node_case(runtime: str, server_config: "ServerConfig") -> bool:
     """Whether the case runs on more than one node, which CI does alone in a stage.
 
@@ -1726,7 +1750,7 @@ def is_multi_node_case(runtime: str, server_config: "ServerConfig") -> bool:
     process, and each reuses the caches of the cases before it, so test_warmup
     measures single-node servers instead.
     """
-    return runtime == "multi_node_disagg_server" or server_config.gpus > server_config.gpus_per_node
+    return runtime == "multi_node_disagg_server" or spans_nodes(server_config)
 
 
 def _server_reports_healthy(addr_path: str) -> bool:
@@ -1771,7 +1795,7 @@ class WarmupTimeRecorder:
         def record() -> None:
             while not self._stop_event.is_set() and server_proc.poll() is None:
                 if _server_reports_healthy(addr_path):
-                    write_warmup_time(
+                    record_warmup_time(
                         test_output_dir, server_name, server_idx, time.monotonic() - launch_time
                     )
                     return
@@ -1893,6 +1917,23 @@ def _cache_footprint(cold_dir: str) -> Dict[str, int]:
     return footprint
 
 
+#: Seconds a cold-start server gets to exit after SIGTERM before it is killed.
+SERVER_STOP_TIMEOUT = 300
+
+
+def stop_server(server_proc: subprocess.Popen, server_name: str) -> None:
+    """Stop a server with SIGTERM, and kill it if it has not exited within SERVER_STOP_TIMEOUT."""
+    server_proc.terminate()
+    try:
+        server_proc.wait(timeout=SERVER_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print_warning(
+            f"{server_name} did not exit {SERVER_STOP_TIMEOUT}s after SIGTERM; killing it"
+        )
+        server_proc.kill()
+        server_proc.wait()
+
+
 def run_cold_warmup(
     server_cmd: List[str],
     server_env: Dict[str, str],
@@ -1923,31 +1964,34 @@ def run_cold_warmup(
 
     drop_page_cache(model_dirs)
     cold_dir = tempfile.mkdtemp(prefix="psc_")
-    footprint = _cache_footprint(cold_dir)
-    env = cold_start_env({**os.environ, **server_env}, cold_dir)
-    server_proc = None
-    print_info(f"Starting {server_name} cold, caches in {cold_dir}. cmd is {cmd}")
     try:
-        with open(log_path, "w") as log_file:
-            launch_time = time.monotonic()
-            server_proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-            _, port = wait_for_reported_addr(addr_path, timeout, server_proc)
-            wait_for_endpoint_ready(
-                f"http://{host}:{port}/health",
-                timeout=timeout,
-                check_files=[log_path],
-                server_proc=server_proc,
-            )
-            write_warmup_time(
-                test_output_dir, server_name, server_idx, time.monotonic() - launch_time
-            )
-    except Exception as error:
-        report_error(error_msg=error, log_files=[log_path])
-        raise
+        footprint = _cache_footprint(cold_dir)
+        env = cold_start_env({**os.environ, **server_env}, cold_dir)
+        server_proc = None
+        print_info(f"Starting {server_name} cold, caches in {cold_dir}. cmd is {cmd}")
+        try:
+            with open(log_path, "w") as log_file:
+                launch_time = time.monotonic()
+                server_proc = subprocess.Popen(
+                    cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT
+                )
+                _, port = wait_for_reported_addr(addr_path, timeout, server_proc)
+                wait_for_endpoint_ready(
+                    f"http://{host}:{port}/health",
+                    timeout=timeout,
+                    check_files=[log_path],
+                    server_proc=server_proc,
+                )
+                write_warmup_time(
+                    test_output_dir, server_name, server_idx, time.monotonic() - launch_time
+                )
+        except Exception as error:
+            report_error(error_msg=error, log_files=[log_path])
+            raise
+        finally:
+            if server_proc is not None:
+                stop_server(server_proc, server_name)
     finally:
-        if server_proc is not None:
-            server_proc.terminate()
-            server_proc.wait()
         shutil.rmtree(cold_dir, ignore_errors=True)
 
     grown = [
@@ -3332,12 +3376,16 @@ class AggrTestCmds(NamedTuple):
                     check_files=[server_file_path],
                     server_proc=server_proc,
                 )
-                write_warmup_time(
-                    self.test_output_dir,
-                    AGGREGATE_SERVER_NAME,
-                    server_idx,
-                    time.monotonic() - launch_time,
-                )
+                # Uploaded only for a server that spans nodes (is_multi_node_case).
+                if server_idx < len(self.server_configs) and spans_nodes(
+                    self.server_configs[server_idx]
+                ):
+                    record_warmup_time(
+                        self.test_output_dir,
+                        AGGREGATE_SERVER_NAME,
+                        server_idx,
+                        time.monotonic() - launch_time,
+                    )
                 observation = collect_startup_observation(
                     f"{server_hostname}:{server_port}",
                     [server_file_path],
@@ -4704,9 +4752,16 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
                     stdout=gen_ctx,
                     stderr=subprocess.STDOUT,
                 )
-                gen_warmup_recorder = WarmupTimeRecorder(
-                    gen_proc, gen_addr_path, launch_time, self.test_output_dir, "GEN_0", server_idx
-                )
+                # Uploaded only for a gen worker that spans nodes (is_multi_node_case).
+                if gen_cfg is not None and spans_nodes(gen_cfg):
+                    gen_warmup_recorder = WarmupTimeRecorder(
+                        gen_proc,
+                        gen_addr_path,
+                        launch_time,
+                        self.test_output_dir,
+                        "GEN_0",
+                        server_idx,
+                    )
                 gen_host, gen_port = wait_for_reported_addr(gen_addr_path, self.timeout, gen_proc)
 
                 self._write_proxy_config(server_idx, [f"{gen_host}:{gen_port}"])
@@ -5777,6 +5832,8 @@ class PerfSanityTestConfig:
         """
         self._output_dir = os.path.join(self._output_dir, "warmup")
         commands = self.get_commands()
+        device_count = get_device_count()
+        launches = []
         for server_idx, server_cmd in enumerate(commands.server_cmds):
             if self.runtime == GEN_ONLY_NO_CONTEXT_RUNTIME:
                 server_config = self.server_configs[server_idx][1]
@@ -5792,14 +5849,30 @@ class PerfSanityTestConfig:
                     f"test_warmup runs single-node servers only; {server_config.name} uses "
                     f"{server_config.gpus} GPUs at {server_config.gpus_per_node} per node."
                 )
+            if server_config.gpus > device_count:
+                pytest.skip(
+                    f"{server_config.name} needs {server_config.gpus} GPUs; this node has "
+                    f"{device_count}."
+                )
             model_dirs = [server_config.model_path]
             if server_config.speculative_model:
                 model_dirs.append(os.path.join(llm_models_root(), server_config.speculative_model))
+            launches.append(
+                (
+                    server_cmd,
+                    server_env,
+                    model_dirs,
+                    getattr(server_config, "num_serve_frontends", 1) or 1,
+                    server_name,
+                    server_idx,
+                )
+            )
+        for server_cmd, server_env, model_dirs, num_frontends, server_name, server_idx in launches:
             run_cold_warmup(
                 server_cmd,
                 server_env,
                 model_dirs,
-                getattr(server_config, "num_serve_frontends", 1) or 1,
+                num_frontends,
                 self.test_output_dir,
                 server_name,
                 server_idx,
