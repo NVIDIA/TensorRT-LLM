@@ -2276,6 +2276,80 @@
         {
           "if": {
             "properties": {
+              "multimodal_config": {
+                "properties": {
+                  "encoder_data_parallel_size": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "encoder_data_parallel_size"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "multimodal_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "context_parallel_size": {
+                "const": 1
+              },
+              "pipeline_parallel_size": {
+                "const": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "enable_attention_dp": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "enable_attention_dp"
+                ]
+              },
+              {
+                "properties": {
+                  "multimodal_config": {
+                    "properties": {
+                      "encoder_data_parallel_size": {
+                        "minimum": 2,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "encoder_data_parallel_size"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "multimodal_config"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "mm_encoder_only": {
+                "not": {
+                  "const": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
               "kv_cache_config": {
                 "properties": {
                   "defer_generation_only_release": {
@@ -7777,6 +7851,21 @@
           "status": "prototype",
           "title": "Encoder Cuda Graph"
         },
+        "encoder_data_parallel_size": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of multimodal encoder replicas within the LLM tensor-parallel group. None preserves the model's existing encoder parallelism. An explicit value divides the group into this many replicas, each using tensor parallelism over tensor_parallel_size / encoder_data_parallel_size ranks, independently of LLM attention DP. Requires pipeline- and context-parallel sizes of 1.",
+          "status": "prototype",
+          "title": "Encoder Data Parallel Size"
+        },
         "encoder_scheduling_policy": {
           "$ref": "#/$defs/MultimodalEncoderSchedulingPolicy",
           "default": "DEFAULT",
@@ -10765,6 +10854,80 @@
           },
           "tensor_parallel_size": {
             "minimum": 2
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "multimodal_config": {
+            "properties": {
+              "encoder_data_parallel_size": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "encoder_data_parallel_size"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "multimodal_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "context_parallel_size": {
+            "const": 1
+          },
+          "pipeline_parallel_size": {
+            "const": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "allOf": [
+          {
+            "properties": {
+              "enable_attention_dp": {
+                "const": false
+              }
+            },
+            "required": [
+              "enable_attention_dp"
+            ]
+          },
+          {
+            "properties": {
+              "multimodal_config": {
+                "properties": {
+                  "encoder_data_parallel_size": {
+                    "minimum": 2,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "encoder_data_parallel_size"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "multimodal_config"
+            ]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "mm_encoder_only": {
+            "not": {
+              "const": true
+            }
           }
         }
       }

@@ -897,6 +897,18 @@ class MultimodalConfig(StrictBaseModel):
         telemetry=False,
     )
 
+    encoder_data_parallel_size: PositiveInt | None = Field(
+        default=None,
+        description=
+        ("Number of multimodal encoder replicas within the LLM tensor-parallel "
+         "group. None preserves the model's existing encoder parallelism. An "
+         "explicit value divides the group into this many replicas, each using "
+         "tensor parallelism over tensor_parallel_size / encoder_data_parallel_size "
+         "ranks, independently of LLM attention DP. Requires pipeline- and "
+         "context-parallel sizes of 1."),
+        status="prototype",
+    )
+
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,
         description=
@@ -9544,6 +9556,35 @@ class TorchLlmArgs(BaseLlmArgs):
             # standalone outside of a `TorchLlmArgs` instance, we make a copy to be safe.
             self.multimodal_config = self.multimodal_config.model_copy(
                 update={"encoder_cache_max_bytes": 0})
+        return self
+
+    @model_validator(mode="after")
+    def _validate_encoder_data_parallel(self) -> 'TorchLlmArgs':
+        mm_config = self.multimodal_config
+        size = mm_config.encoder_data_parallel_size
+        if size is None:
+            return self
+        if self.pipeline_parallel_size != 1 or self.context_parallel_size != 1:
+            raise ValueError(
+                "Explicit multimodal encoder parallelism requires "
+                "pipeline_parallel_size == 1 and context_parallel_size == 1.")
+        if self.tensor_parallel_size % size:
+            raise ValueError(
+                "multimodal_config.encoder_data_parallel_size must divide "
+                f"tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
+            )
+        if self.orchestrator_type == "ray" and 1 < size < self.tensor_parallel_size:
+            raise ValueError(
+                "With orchestrator_type='ray', encoder_data_parallel_size must "
+                f"be 1 or tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
+            )
+        shared_tp = self.enable_attention_dp and size < self.tensor_parallel_size
+        if self.mm_encoder_only and (shared_tp or
+                                     (size > 1
+                                      and not self.enable_attention_dp)):
+            raise ValueError(
+                "Multimodal encoder parallelism across ranks does not support "
+                "mm_encoder_only yet.")
         return self
 
     @model_validator(mode="after")

@@ -198,14 +198,57 @@ def _is_set_to(name: str, schema: dict) -> dict:
     return {"properties": {name: schema}, "required": [name]}
 
 
-def _launch_rules() -> list[dict]:
-    """Top-level ``if``/``then`` rules: DWDP and ``validate_defer_generation_only_release()``.
+def _encoder_parallel_launch_rules() -> list[dict]:
+    """``if``/``then`` rules mirroring ``TorchLlmArgs._validate_encoder_data_parallel()``.
 
-    ``_dwdp_launch_rules()``, plus ``TorchLlmArgs.validate_defer_generation_only_release()`` (the overlap loop
-    without pipeline parallelism). As there, values the YAML does not set are left to runtime validation.
+    Only its rules that compare a value with a constant are mirrored. The size must also divide
+    ``tensor_parallel_size``, and attention DP with a smaller size has more rules; those compare two
+    sizes and, like values the YAML does not set, are left to runtime validation.
+    """
+
+    def size_is(schema: dict) -> dict:
+        return _is_set_to(
+            "multimodal_config",
+            {"type": "object", **_is_set_to("encoder_data_parallel_size", schema)},
+        )
+
+    return [
+        {
+            "if": size_is({"type": "integer"}),
+            "then": {
+                "properties": {
+                    "pipeline_parallel_size": {"const": 1},
+                    "context_parallel_size": {"const": 1},
+                }
+            },
+        },
+        {
+            "if": {
+                "allOf": [
+                    _is_set_to("enable_attention_dp", {"const": False}),
+                    size_is({"type": "integer", "minimum": 2}),
+                ]
+            },
+            "then": {
+                "properties": {
+                    "mm_encoder_only": {"not": {"const": True}},
+                }
+            },
+        },
+    ]
+
+
+def _launch_rules() -> list[dict]:
+    """Top-level ``if``/``then`` rules: DWDP, encoder parallelism and deferred release.
+
+    ``_dwdp_launch_rules()``, ``_encoder_parallel_launch_rules()``, plus
+    ``TorchLlmArgs.validate_defer_generation_only_release()`` (the overlap loop without pipeline
+    parallelism). As there, values the YAML does not set are left to runtime validation.
     """
     defer = {"type": "object", **_is_set_to("defer_generation_only_release", {"const": True})}
-    return _dwdp_launch_rules() + [
+    return [
+        *_dwdp_launch_rules(),
+        *_encoder_parallel_launch_rules(),
         {
             "if": _is_set_to("kv_cache_config", defer),
             "then": {
@@ -214,7 +257,7 @@ def _launch_rules() -> list[dict]:
                     "pipeline_parallel_size": {"maximum": 1},
                 }
             },
-        }
+        },
     ]
 
 
