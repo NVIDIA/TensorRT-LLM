@@ -419,6 +419,12 @@ class PyResult:
         cumulative totals in fresh request storage. Beam search publishes full
         histories, so it copies their lists instead of consuming them. Additional
         outputs share their lists with response-time lengths for reads and IPC.
+
+        Retaining an in-process response keeps the shared additional-output
+        dictionaries and lists alive, including tensors appended after its
+        captured lengths. An early response can therefore retain outputs for
+        the entire stream even after the request is released. Reads and
+        serialized state still include only the captured prefixes.
         """
         result = copy(self)
         if self.context_prompt_logprob_rows is not None:
