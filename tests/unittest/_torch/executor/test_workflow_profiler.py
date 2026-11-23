@@ -509,6 +509,7 @@ def test_decoder_capture_and_replay_named_capacity(
         memory_pool=object(),
         _hostfunc_graph_keys=set(),
         _step_input_prologue_keys={},
+        _prologue_copiers={},
         _pre_replay_hooks=[],
     )
     with (
@@ -1030,6 +1031,7 @@ def test_graph_metadata_failure_keeps_replay_body_exception(
         graph_outputs={},
         memory_pool=None,
         _step_input_prologue_keys={},
+        _prologue_copiers={},
         _pre_replay_hooks=[],
     )
     owner._get_num_tokens_for_key = lambda key: 1
