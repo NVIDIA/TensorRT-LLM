@@ -42,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
     GenTransferStatus,
     KvCacheTransceiver,
+    is_gen_only_no_context_benchmark,
 )
 from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
     supports_context_first_bf16,
@@ -1061,6 +1062,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_quiesced=None,
         locally_verified=None,
         local_session_count: Optional[int] = None,
+        peer_cancelled: Optional[list[int]] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
@@ -1076,6 +1078,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             local_outcome.append(list(locally_verified))
         if local_session_count is not None:
             local_outcome.append([local_session_count])
+        if peer_cancelled is not None:
+            local_outcome.append(peer_cancelled)
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -1086,6 +1090,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         n = len(all_c)
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
+        if peer_cancelled is not None:
+            # A peer that won cancellation on any protected GEN rank failed the
+            # receive, even if another rank observed its own local abort first.
+            peer_failures = self._union([p[-1] for p in packed])
+            global_cancelled.difference_update(peer_failures)
+            global_failed.update(peer_failures)
         global_completed = self._intersection(all_done, n)
         new_cancelled = [rid for rid in to_process if rid in global_cancelled]
         cancel_set = set(new_cancelled)
@@ -1140,6 +1150,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 + deferred
                 + pending_admissions
                 if idle_skip
+                else None
+            ),
+            peer_cancelled=(
+                [
+                    rid
+                    for rid in cancelled
+                    if self._supports_group_receive_cancellation(self._recv_reqs[rid])
+                    and isinstance(session := self._recv_sessions[rid], RxSession)
+                    and session.cancelled_by_peer
+                ]
+                if self.supports_group_receive_cancellation()
                 else None
             ),
         )
@@ -1260,6 +1281,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 to_process.append(rid)
         return to_process
 
+    def _mark_retired_gen_failure(self, req: LlmRequest) -> None:
+        """Record the agreed failure, including on ranks where no session opened."""
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        if self._supports_group_receive_cancellation(req):
+            req.py_kv_receive_cancel_outcome = ReceiveCancellation.FAILED
+
     def _close_failed_sessions(
         self, sessions: dict, reqs: dict, failed: list, mark_retired: bool = False
     ):
@@ -1271,7 +1298,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = reqs.pop(rid, None)
             if req is not None:
                 if not mark_retired:
-                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    self._mark_retired_gen_failure(req)
                 else:
                     req.py_kv_send_session_retired = True
             sessions.pop(rid, None)
@@ -2050,10 +2077,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # A cancel after a failure must not free pages a writer is still writing.
                 if self._retirement_blocked(session):
                     continue
-                # Session cancelled — either by local cancel_request() (user
-                # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
-                # server timeout).  Return the req objects so the caller can
-                # distinguish the two cases and set the appropriate state.
+                # Group-owned receives distinguish local and peer cancellation
+                # in the outcome exchange before any session is closed.
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
@@ -2149,7 +2174,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in failed:
             req = start_failures.pop(rid, None)
             if req is not None:
-                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._mark_retired_gen_failure(req)
                 self._recv_reqs.pop(rid, None)
         return GenTransferStatus(completed, failed + admission_failed, cancelled_reqs)
 
@@ -2233,7 +2258,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Allow bridge cancellation or a session-free generation-first CTX wait."""
         if getattr(self, "_fp4_mla_bridge_enabled", False) is True:
             return True
-        if req is not None and self._supports_group_receive_cancellation(req):
+        if req is not None and self._owns_context_first_gen_receive(req):
             return True
         return (
             req is not None
@@ -2246,10 +2271,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def supports_group_receive_cancellation(self) -> bool:
         """Bind immutable IDs, owned access and symmetric receive progress.
 
-        The native implementation currently qualifies these guarantees only
-        through its existing context-first ownership configuration gate.
+        Context-first ownership qualifies the binding, but the no-context
+        benchmark never drives the receive poll in which owners agree.
         """
-        return getattr(self, "_context_first_ownership", False) is True
+        return (
+            getattr(self, "_context_first_ownership", False) is True
+            and not is_gen_only_no_context_benchmark()
+        )
+
+    def supports_no_context_gen_cancellation(self, req: LlmRequest) -> bool:
+        return self._owns_context_first_gen_receive(req) and is_gen_only_no_context_benchmark()
 
     def take_receive_cancellation_intents(self) -> dict[int, bool]:
         """Hand peer intent to the coordinator without transferring resource ownership."""
@@ -2260,9 +2291,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def wake_gen_cancellation_poll(self) -> None:
         self._gen_idle_agreed = False
 
+    def has_pending_gen_cancellation_vote(self) -> bool:
+        return bool(self._cancelled_gen_receives)
+
     def _supports_group_receive_cancellation(self, req: Optional[LlmRequest]) -> bool:
-        """Check this binding's qualified request shape without widening it."""
-        if not self.supports_group_receive_cancellation():
+        return self.supports_group_receive_cancellation() and self._owns_context_first_gen_receive(
+            req
+        )
+
+    def _owns_context_first_gen_receive(self, req: Optional[LlmRequest]) -> bool:
+        """Check request eligibility independently of whether this worker polls receives."""
+        if getattr(self, "_context_first_ownership", False) is not True:
             return False
         if req is None:
             return True
@@ -2295,10 +2334,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             Only cancel_request confirms that its resources can be released.
         """
         group_cancel = self._supports_group_receive_cancellation(req)
+        if (
+            self._owns_context_first_gen_receive(req)
+            and req.py_kv_receive_cancel_outcome is not None
+            and (group_cancel or ready is None)
+        ):
+            return req.py_kv_receive_cancel_outcome
         if not getattr(self, "_fp4_mla_bridge_enabled", False) and not group_cancel:
             return ReceiveCancellation.NOT_HANDLED
-        if group_cancel and req.py_kv_receive_cancel_outcome is not None:
-            return req.py_kv_receive_cancel_outcome
         rid = get_unique_rid(req)
         if group_cancel:
             admission = None
@@ -2316,7 +2359,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 )
                 self._recv_reqs[rid] = req
                 self._ever_had_recv_session = True
-                self._gen_idle_agreed = False
+                # The shared cancellation boundary wakes an agreed-idle TP
+                # poll. A local wake could enter an intervening poll alone.
             record = records[rid]
             if record.outcome is ReceiveCancellation.PENDING:
                 # An earlier executor error can reach this owner on a later
@@ -2528,7 +2572,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             accepted = self.request_logical_context_cancellation(req)
             return accepted and rid not in self._send_sessions
 
-        if self._supports_group_receive_cancellation(req):
+        if self._owns_context_first_gen_receive(req):
+            if not self.supports_group_receive_cancellation():
+                # No receive poll can retire a vote here. Never substitute this
+                # fast path for retirement of a published or admitted owner.
+                return not self.has_inflight_transfer(req) and rid not in (
+                    self._pending_rank_info_admissions or {}
+                )
             self.cancel_gen_logically(
                 req,
                 prior_failure=(

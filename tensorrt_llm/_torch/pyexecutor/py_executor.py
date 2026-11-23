@@ -74,7 +74,8 @@ from ..disaggregation.orchestration.admission import \
 from ..disaggregation.orchestration.cancellation import ReceiveCancellation
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator,
-    is_gen_only_no_context_benchmark, transfer_window_bypass_eligible)
+    is_gen_only_no_context_benchmark, transfer_window_bypass_eligible,
+    uses_async_gen_transfer)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -6109,7 +6110,7 @@ class PyExecutor:
         Args:
             local_status: Caller-defined ``(state, flag)`` pair from this rank.
                 The fill gate uses ``(ready, transfer_progress)`` and the
-                fail-fast path uses ``(all_fetched, terminal_no_fit)``.
+                fail-fast path uses ``(ready_to_fail, local_no_fit)``.
 
         Returns:
             One status pair per TP+CP rank in the current pipeline-parallel
@@ -6149,27 +6150,46 @@ class PyExecutor:
                 progress can unblock a deferred request.
 
         Returns:
-            True when every TP+CP rank has fetched its full benchmark queue and
-            at least one rank has an INIT request that cannot fit KV capacity
-            and has no transfer progress that can unblock it; otherwise False.
+            True when every TP+CP rank has fetched its full benchmark queue,
+            no receive or pending KV release still needs progress, and a rank
+            has an INIT request that cannot fit; otherwise False.
         """
         if (self.benchmark_req_queues_size <= 0 or self.is_warmup
                 or not self._benchmark_fill_phase_active):
             return False
 
+        cancelled = self._cancelled_disagg_model_request_ids()
         local_has_stuck = any(req.is_disagg_generation_init_state
+                              and req.py_request_id not in cancelled
                               for req in self.active_requests)
         local_all_fetched = (self._benchmark_stage_fetched()
                              >= self.benchmark_req_queues_size)
-        local_terminal_no_fit = (local_has_stuck and
-                                 not scheduler_fitting_disagg_gen_init_requests
-                                 and not wait_for_disagg_gen_transfer_progress)
-        local_status = (local_all_fetched, local_terminal_no_fit)
+        local_no_fit = (local_has_stuck
+                        and not scheduler_fitting_disagg_gen_init_requests
+                        and not wait_for_disagg_gen_transfer_progress)
+        # A terminal vote exits every rank. Allow a rank's receive to settle
+        # first, even if only a peer is short of KV: error cleanup otherwise
+        # parks the request and the loop exits before its response or release.
+        # A live vote also owes a poll even if it never acquired local pages.
+        transceiver = self.kv_cache_transceiver
+        drain_pending = False
+        if transceiver is not None and uses_async_gen_transfer():
+            drain_pending = (
+                transceiver.has_cancelling_gen_pages() is True
+                or transceiver.has_pending_gen_cancellation_vote() is True
+                or any(req.is_disagg_generation_transmission_in_progress
+                       for req in self.active_requests))
+        # An already settled cancellation can still hold pages until the
+        # response flush later in this same iteration.
+        release_pending = self._is_kv_manager_v2 and any(
+            self.kv_cache_manager.is_request_active(req.py_request_id)
+            for req in getattr(self, "_pending_response_terminations", ()))
+        local_status = (local_all_fetched and not drain_pending
+                        and not release_pending, local_no_fit)
 
         all_rank_status = self._allgather_model_parallel_status(local_status)
-        all_ranks_fetched = all(status[0] for status in all_rank_status)
-        any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
-        return all_ranks_fetched and any_rank_terminal_no_fit
+        return all(status[0] for status in all_rank_status) and any(
+            status[1] for status in all_rank_status)
 
     def _prepare_and_schedule_batch(
         self,
@@ -13127,8 +13147,10 @@ class PyExecutor:
                                      LlmRequestState.GENERATION_IN_PROGRESS):
                 # A pending receive cancellation closes future KV admission and
                 # decode too, even before the request has entered a model batch.
-                if not (self.disagg.supports_group_receive_cancellation
-                        and request.is_generation_only_request
+                if not (request.is_generation_only_request and
+                        (self.disagg.supports_group_receive_cancellation
+                         or self.kv_cache_transceiver.
+                         supports_no_context_gen_cancellation(request) is True)
                         and self.kv_cache_transceiver.
                         supports_idle_request_cancellation(request) is True
                         and request.state in (
@@ -13437,6 +13459,11 @@ class PyExecutor:
             return False
 
         if not self._is_request_in_transmission(request):
+            if (request.state == LlmRequestState.DISAGG_GENERATION_INIT
+                    and self.kv_cache_transceiver.
+                    supports_no_context_gen_cancellation(request) is True):
+                # Even a session-free INIT may own cache-manager admission work.
+                return self.disagg.request_cancellation(request)
             return True
 
         if self.disagg.inflight_cancel_active():
@@ -13499,6 +13526,12 @@ class PyExecutor:
             py_request_id for request in ready_to_cancel
             if request.py_request_id not in aligned_ids)
         for request in aligned:
+            if (self._kv_connector_moves_kv
+                    and getattr(request, "py_kv_receive_cancel_outcome",
+                                None) is ReceiveCancellation.FAILED):
+                # Retirement permits error cleanup, not a save of the failed KV.
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                continue
             if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
                     and request.is_generation_only_request
                     and self.kv_cache_transceiver is not None

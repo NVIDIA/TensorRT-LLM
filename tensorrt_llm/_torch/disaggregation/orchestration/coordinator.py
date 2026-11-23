@@ -17,6 +17,7 @@ from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     is_disagg_inflight_cancel_enabled,
+    is_gen_only_no_context_benchmark,
 )
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -55,11 +56,6 @@ _MODEL_IDLE_GEN_STATES = (
     LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
     LlmRequestState.DISAGG_TRANS_ERROR,
 )
-
-
-def is_gen_only_no_context_benchmark() -> bool:
-    """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
-    return os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
 
 
 def uses_async_gen_transfer() -> bool:
@@ -617,15 +613,24 @@ class DisaggTransferCoordinator:
         ]
         payload = (list(cancel_ids), gen_active, list(gen_ready), active_clients)
         gather = self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
-        peers = gather(payload, small_payload=True)
+        group_cancel = self.supports_group_receive_cancellation
+        peer_retiring = False
+        if group_cancel:
+            # A fatal failure can retain a replica without any client abort.
+            # Tell every rank to poll, without manufacturing a cancellation ID.
+            votes = gather(
+                (payload, self._transceiver.has_pending_gen_cancellation_vote()), small_payload=True
+            )
+            peers = [vote for vote, _ in votes]
+            peer_retiring = any(retiring for _, retiring in votes)
+        else:
+            peers = gather(payload, small_payload=True)
         all_cancel_ids = set().union(*(set(peer[0]) for peer in peers))
         self._any_rank_requested_cancel = bool(all_cancel_ids)
         requests = {
             rid: client for _, active_ids, _, _ in peers for rid, client in active_ids.items()
         }
-        if self.supports_group_receive_cancellation and not all_cancel_ids.isdisjoint(
-            requests.values()
-        ):
+        if group_cancel and (peer_retiring or not all_cancel_ids.isdisjoint(requests.values())):
             # One rank may see the abort first. All peers must re-enter the
             # receive vote, even if they previously agreed to skip idle polls.
             self._transceiver.wake_gen_cancellation_poll()
@@ -1352,15 +1357,33 @@ class DisaggTransferCoordinator:
         return outcome
 
     def retain_fatal_gen_receive(self, request: LlmRequest) -> None:
-        """Keep a model-idle GEN replica in the receive vote after fatal error delivery."""
+        """Keep a model-idle GEN destination rooted after fatal error delivery."""
         if not (
-            self.supports_group_receive_cancellation
-            and getattr(request, "is_generation_only_request", False)
+            getattr(request, "is_generation_only_request", False)
             and request.state in _MODEL_IDLE_GEN_STATES
             and self._transceiver.supports_idle_request_cancellation(request) is True
         ):
             return
         request_id = request.py_request_id
+        if not uses_async_gen_transfer():
+            # The no-context benchmark never publishes a receive or drives a
+            # receive vote. Do not create one solely because its model failed.
+            if (
+                request_id in self._unpublished_gen_receives
+                or self._transceiver.has_inflight_transfer(request)
+            ):
+                self._retiring_gen_receives[request_id] = request
+            return
+        if not self.supports_group_receive_cancellation:
+            # The FP4 bridge latches the local outcome before a published writer
+            # or CUDA fence necessarily settles. Do not notify or vote on a
+            # rank-local ADP fatal; its existing crash containment owns shutdown.
+            if (
+                request.py_kv_receive_cancel_disposition is not None
+                and self._transceiver.has_inflight_transfer(request)
+            ):
+                self._retiring_gen_receives[request_id] = request
+            return
         if (
             request.state == LlmRequestState.DISAGG_GENERATION_INIT
             and request_id not in self._unpublished_gen_receives
@@ -1416,6 +1439,21 @@ class DisaggTransferCoordinator:
         failed = failed or request.py_kv_transfer_timed_out
         try:
             pending = self._unpublished_gen_receives.get(request.py_request_id)
+            if self._transceiver.supports_no_context_gen_cancellation(request) is True:
+                # A no-context request never publishes a receive. Do not
+                # infer safety from INIT alone: an admission or native owner
+                # must not lose its destination as a result of cancellation.
+                if pending is not None and pending[1] is not None and not pending[1].query():
+                    return False
+                if self._is_kv_manager_v2 and not self._kv_cache_manager.disagg_receive_ready_done(
+                    request
+                ):
+                    return False
+                if not self._transceiver.cancel_request(request):
+                    return False
+                self._unpublished_gen_receives.pop(request.py_request_id, None)
+                self._pending_gen_cancellation_intents.pop(request.py_request_id, None)
+                return True
             if (
                 pending is not None
                 and self._transceiver.supports_idle_request_cancellation(request) is True
@@ -1712,6 +1750,11 @@ class DisaggTransferCoordinator:
             or any(
                 req.is_disagg_generation_init_state
                 or req.is_disagg_generation_transmission_in_progress
+                or (
+                    req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                    and req.is_generation_only_request
+                    and self._transceiver.has_inflight_transfer(req)
+                )
                 for req in self._registry.active_requests()
             )
         )

@@ -40,6 +40,11 @@ _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
 
 
+def is_gen_only_no_context_benchmark() -> bool:
+    """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
+    return getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+
+
 def is_disagg_inflight_cancel_enabled() -> bool:
     """Return whether disaggregated in-flight KV transfer cancellation is enabled."""
     global _disagg_inflight_cancel_enabled_cache
@@ -475,6 +480,10 @@ class KvCacheTransceiver(ABC):
         """
         return False
 
+    def supports_no_context_gen_cancellation(self, req: LlmRequest) -> bool:
+        """Whether this GEN request can cancel without a receive-progress poll."""
+        return False
+
     def take_receive_cancellation_intents(self) -> dict[int, bool]:
         """Take peer intent observed by the existing receive-progress exchange.
 
@@ -487,6 +496,10 @@ class KvCacheTransceiver(ABC):
 
     def wake_gen_cancellation_poll(self) -> None:
         """Resume receive-status polling on every rank after a shared cancellation vote."""
+
+    def has_pending_gen_cancellation_vote(self) -> bool:
+        """Whether this rank must enter the shared receive poll, even without a client abort."""
+        return False
 
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
