@@ -823,7 +823,7 @@ class CuDNNAttention(AttentionBackend):
                 f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
                 f"{type(kv_cache).__name__}"
             )
-        if self._resolve_mask(attention_mask, key_padding_mask):
+        if key_padding_mask is not None or attention_mask == PredefinedAttentionMask.CAUSAL:
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_dtype is not None:
             raise NotImplementedError("cuDNN paged K/V cache attention runs unquantized only.")
