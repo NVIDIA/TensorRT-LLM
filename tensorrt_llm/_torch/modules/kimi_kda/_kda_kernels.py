@@ -216,8 +216,7 @@ _PREFILL_IMPORT_ERROR: Optional[Exception] = None
 
 # The per-request vectors are the generation rows of whole-batch tensors, sliced
 # from row ``num_contexts`` (``update_mamba_states``), so their alignment follows
-# the batch, as ``num_requests`` does. Specializing on either compiled new
-# variants mid-serving.
+# the batch, as ``num_requests`` does; neither is part of the compile key.
 @triton.jit(
     do_not_specialize=["num_requests"],
     do_not_specialize_on_alignment=["state_indices_ptr", "num_accepted_ptr", "is_dummy_ptr"],
