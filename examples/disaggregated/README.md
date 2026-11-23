@@ -308,7 +308,8 @@ connection is re-established, is accepted when it is less than 2048 numbers behi
 the highest one and dropped otherwise. A receiving socket keeps these numbers for
 up to 4096 sending sockets in memory. Once it holds 4096 and accepts a message
 from one more sending socket, it forgets the numbers of the socket it has least
-recently accepted a message from, and the next message from that socket is
+recently accepted a message from and logs a warning (at most one every 10
+seconds, with the total count), and the next message from that socket is
 accepted with any number. A newly opened socket (each RankInfo exchange opens one)
 and a restarted worker start with none, so the first message they get from a
 sending socket is accepted with any number. A reply is

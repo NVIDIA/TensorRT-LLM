@@ -343,6 +343,9 @@ class ZMQMessenger(MessengerInterface):
         # Repeated messages and messages below the window, counted for the
         # listener and for receive() callers alike.
         self.replays_rejected = 0
+        # Streams whose seqs were forgotten to stay within _MAX_REPLAY_STATE.
+        self.replay_state_evicted = 0
+        self._last_eviction_warning = float("-inf")
 
         logger.info(
             f"Initialized ZMQMessenger(mode={mode}, endpoint={self._endpoint}, "
@@ -448,6 +451,7 @@ class ZMQMessenger(MessengerInterface):
         # authenticated (sender id, stream id) pairs.
         key = (header.sender_id, header.stream_id)
         seq = header.seq
+        evicted = 0
         with self._replay_lock:
             # Bit i of seen is set once seq (highest - i) was accepted.
             highest, seen = self._replay_state.get(key, (seq, 0))
@@ -472,6 +476,17 @@ class ZMQMessenger(MessengerInterface):
             self._replay_state.move_to_end(key)
             while len(self._replay_state) > self._MAX_REPLAY_STATE:
                 self._replay_state.popitem(last=False)
+                self.replay_state_evicted += 1
+                evicted = self.replay_state_evicted
+        if evicted:
+            now = time.monotonic()
+            if now - self._last_eviction_warning >= self._AUTH_WARNING_INTERVAL_S:
+                self._last_eviction_warning = now
+                logger.warning(
+                    f"{self._endpoint} keeps the seqs of {self._MAX_REPLAY_STATE} streams "
+                    f"and forgot those of the least recently used one; the next message "
+                    f"of that stream is accepted with any seq (total forgotten: {evicted})"
+                )
 
     def _record_auth_failure(self, error: FrameAuthenticationError) -> None:
         # Drop the message and keep listening: one rejected message must not

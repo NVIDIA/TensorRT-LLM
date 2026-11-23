@@ -530,6 +530,7 @@ def test_replay_state_is_bounded_and_keeps_recently_used_streams(
         raw.send(_raw_signed(router, seq=seq, stream_id=stream_id))
         router.receive(timeout_ms=1000)
     assert len(router._replay_state) == 2
+    assert router.replay_state_evicted == 1
     # `first` was used after `second`, so its state is the one that is kept.
     raw.send(_raw_signed(router, seq=2, stream_id=first))
     with pytest.raises(FrameAuthenticationError, match="Repeated message"):
