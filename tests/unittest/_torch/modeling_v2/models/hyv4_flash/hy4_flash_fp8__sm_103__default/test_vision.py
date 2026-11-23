@@ -42,6 +42,8 @@ def _image_media() -> tuple:
     """Every test image through the checkpoint's image processor: `(pixels, grid rows)`."""
     from transformers import AutoProcessor
 
+    import tensorrt_llm._torch.models.modeling_hyv4_flash  # noqa: F401 - registers the processor
+
     image_processor = AutoProcessor.from_pretrained(CKPT).image_processor
     out = []
     for seed, (height, width) in enumerate(IMAGE_SIZES):

@@ -6,7 +6,9 @@ The compressed indexer pools ``index_kpool`` tokens into one group key, stored a
 quantized bytes followed by its fp32 scale, so a page holds ``tokens_per_block // index_kpool``
 records. The base sizes ``Role.INDEX_KEY`` one record per token; this class sizes it per group.
 
-The manager also owns the DFly2 draft layers' picks state (:class:`DraftPicks`).
+The manager also owns the DFly2 draft layers' picks state (:class:`DraftPicks`), and reserves the
+DFly2 block in every request's allocation: the drafter appends its block to this manager's own
+target layers, which the base counts only for layers a drafter owns.
 """
 
 from __future__ import annotations
@@ -93,6 +95,10 @@ class Hyv4FlashCacheManager(DSACacheManagerV2):
         tokens_per_block = kwargs.get("tokens_per_block")
         if tokens_per_block is not None:
             self._indexer_groups_per_block(int(tokens_per_block))
+        # Read by the base's allocation sizing inside its __init__, so set before it.
+        from tensorrt_llm._torch.speculative import get_draft_block_width
+
+        self._dfly_block_width = get_draft_block_width(kwargs.get("spec_config"))
         super().__init__(
             *args,
             pretrained_config=pretrained_config,
@@ -100,6 +106,42 @@ class Hyv4FlashCacheManager(DSACacheManagerV2):
             **kwargs,
         )
         self._draft_picks: DraftPicks | None = None
+
+    @property
+    @override
+    def _kv_alloc_extra_tokens(self) -> int:
+        """The base's extra tokens, at least the DFly2 block.
+
+        A step's block starts after the last accepted token, so it ends at most
+        ``tokens_per_gen_step + width`` past the history; the base reserves
+        ``tokens_per_gen_step`` plus this.
+        """
+        return max(super()._kv_alloc_extra_tokens, self._dfly_block_width)
+
+    @property
+    def _generation_kv_capacity_headroom(self) -> int:
+        """The base's headroom (assigned in its __init__), grown by the block's extra tokens."""
+        return (
+            self._base_generation_kv_capacity_headroom
+            + self._kv_alloc_extra_tokens
+            - super()._kv_alloc_extra_tokens
+        )
+
+    @_generation_kv_capacity_headroom.setter
+    def _generation_kv_capacity_headroom(self, value: int) -> None:
+        self._base_generation_kv_capacity_headroom = value
+
+    def owned_base_pages(self, kv_cache_block_offsets: torch.Tensor) -> torch.Tensor:
+        """``[rows, blocks]`` int64 primary-pool page per block, ``-1`` where the table holds none.
+
+        ``kv_cache_block_offsets`` is the attention metadata's ``[pools, rows, 2, blocks]`` table,
+        the one the attention kernels write through. DSA's ``block_table`` holds the same pages
+        only up to a step's own KV and ``-1`` after; a drafter appending past it reads here.
+        """
+        if self._use_per_layer_page_tables:
+            raise NotImplementedError("owned_base_pages reads the shared page table of pool 0")
+        pages = kv_cache_block_offsets[0, :, 0].to(torch.int64)
+        return torch.where(pages >= 0, pages // self._index_scale_ints[0], -1)
 
     def draft_picks(
         self,

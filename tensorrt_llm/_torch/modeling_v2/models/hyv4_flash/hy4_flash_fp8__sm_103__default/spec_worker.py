@@ -216,18 +216,23 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
 
         manager = attn_metadata.kv_cache_manager
         page_size = int(manager.tokens_per_block)
+        # The block runs up to `width` rows past the step's own KV, where DSA's `block_table`
+        # already reads -1; the pages come from the table the block's KV write goes through
+        # instead. The manager reserves the block in every allocation, so a -1 here (the op then
+        # leaves the request inactive) is a guard, not an expected case.
+        pages = manager.owned_base_pages(
+            attn_metadata.kv_cache_block_offsets[:, num_contexts:batch_size]
+        )
+        owned = pages >= 0
         # One block per draft layer: the layers' pool rows differ, so only the slots depend on the
-        # layer; positions, anchors and source rows are the first layer's.
+        # layer; positions, anchors, source rows and activity are the first layer's.
         block = None
         layer_slots = []
         for layer in range(d.num_layers):
             scale, layer_offset = manager.get_primary_pool_page_index_params(
                 draft_model._pool_row(attn_metadata, layer)
             )
-            table = (
-                attn_metadata.block_table[num_contexts:batch_size].to(torch.int64) * int(scale)
-                + int(layer_offset)
-            ).to(torch.int32)
+            table = torch.where(owned, pages * int(scale) + int(layer_offset), -1).to(torch.int32)
             layer_block = dfly_block_prepare(
                 bonus,
                 num_drafts.to(torch.int32),

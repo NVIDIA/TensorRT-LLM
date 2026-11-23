@@ -19,7 +19,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_hyv4_flash_text_c
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -99,5 +99,49 @@ def test_pool_geometry(tmp_path, kv_cache_quant_algo, kv_dtype) -> None:
             records = cm.get_indexer_k_cache_buffers(layer)
             assert records.shape == (latent.shape[0], groups_per_page, 1, record)
             assert records.dtype == torch.uint8
+    finally:
+        cm.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the manager allocates on the GPU")
+def test_every_allocation_reserves_the_dfly_block(tmp_path) -> None:
+    """A DFly2 block ends up to `tokens_per_gen_step + width` past the history: both are reserved."""
+    (tmp_path / "config.json").write_text(json.dumps(config_dict()))
+    mapping = Mapping(
+        rank=0, gpus_per_node=4, world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4
+    )
+    model_config = ModelConfig.from_pretrained(str(tmp_path), mapping=mapping)
+    validate_and_set_kv_cache_quant(model_config, "auto")
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False, max_tokens=4096, use_kv_cache_manager_v2=True
+    )
+    declared = model_declared_kv_cache_manager_cls(
+        _Declares(), get_kv_cache_manager_cls(model_config, kv_cache_config)
+    )
+    spec_config = DFlashDecodingConfig(max_draft_len=5, mask_token_id=120009)
+    width = spec_config.max_draft_len + 1
+    cm = _create_kv_cache_manager(
+        None,
+        declared,
+        mapping,
+        kv_cache_config,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=MAX_BATCH_SIZE,
+        spec_config=spec_config,
+        sparse_attention_config=model_config.sparse_attention_config,
+        max_num_tokens=MAX_NUM_TOKENS,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        max_cuda_graph_batch_size=MAX_BATCH_SIZE,
+    )
+    try:
+        assert type(cm) is Hyv4FlashCacheManager
+        # The base alone reserves max_draft_len - 1 extra tokens for one-model speculation.
+        assert cm.num_extra_kv_tokens < width
+        assert cm._kv_alloc_extra_tokens == width
+        assert cm._generation_kv_capacity_headroom == spec_config.tokens_per_gen_step + width
     finally:
         cm.shutdown()

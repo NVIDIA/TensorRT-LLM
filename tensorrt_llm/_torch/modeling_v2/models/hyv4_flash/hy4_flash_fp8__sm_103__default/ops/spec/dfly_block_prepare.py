@@ -46,7 +46,7 @@ def _dfly_block_prepare_kernel(
     NUM_ACCEPTED,  # [G] int32, drafts accepted this step
     QUERY_START_LOC,  # [G + 1] int64, the target batch's per-request token offsets
     TARGET_POSITIONS,  # [T] int64, the target batch's absolute positions
-    BLOCK_TABLE,  # [G, NB] int32, the pool's page table per request
+    BLOCK_TABLE,  # [G, NB] int32, the pool's page table per request, negative where not owned
     BLOCK_IDS,  # [G * W] int64
     POSITIONS,  # [G * W] int64
     MROPE,  # [PLANES, G * W] int64
@@ -65,26 +65,38 @@ def _dfly_block_prepare_kernel(
     PLANES: tl.constexpr,
     PAD: tl.constexpr,
 ):
-    """One request per program. A request drafts only if it accepted a draft and the block fits
-    under ``max_model_len``; an inactive request gets mask rows at positions ``0 .. W - 1`` and
-    ``PAD`` slots.
+    """One request per program. ``NUM_ACCEPTED`` counts accepted drafts, so 0 still drafts from the
+    bonus token. A block is inactive (mask rows at ``0 .. W - 1``, ``PAD`` slots) only if it runs
+    past ``max_model_len`` or one of its rows lands on a page the request does not own (a negative
+    table entry or a column past the table).
     """
     g = tl.program_id(0)
     start = tl.load(QUERY_START_LOC + g)
     nacc = tl.load(NUM_ACCEPTED + g).to(tl.int64)
     source = start + nacc
     anchor = tl.load(TARGET_POSITIONS + source) + 1
-    active = (nacc > 0) & (anchor + WIDTH <= max_model_len)
+    fits = anchor + WIDTH <= max_model_len
     bonus = tl.load(BONUS + g).to(tl.int64)
+
+    j = tl.arange(0, WBLOCK)
+    in_block = j < WIDTH
+    row = g * WIDTH + j
+    block_pos = anchor + j.to(tl.int64)
+    block_idx = block_pos // block_size
+    in_table = in_block & fits & (block_idx < num_blocks)
+    page = tl.load(
+        BLOCK_TABLE + g * num_blocks + tl.minimum(block_idx, num_blocks - 1),
+        mask=in_table,
+        other=-1,
+    ).to(tl.int64)
+    unowned = in_block & (page < 0)
+    active = fits & (tl.sum(unowned.to(tl.int32), axis=0) == 0)
     tl.store(ACTIVE + g, active)
     tl.store(SOURCE_ROWS + g, source)
     tl.store(ANCHORS + g, anchor)
     tl.store(SEQ_LENS + g, (tl.where(active, anchor, 0) + WIDTH).to(tl.int32))
 
-    j = tl.arange(0, WBLOCK)
-    in_block = j < WIDTH
-    row = g * WIDTH + j
-    positions = tl.where(active, anchor + j.to(tl.int64), j.to(tl.int64))
+    positions = tl.where(active, block_pos, j.to(tl.int64))
     mask = tl.full([WBLOCK], mask_token_id, tl.int64)
     block_ids = tl.where(j == 0, tl.where(active, bonus, mask), mask)
     tl.store(BLOCK_IDS + row, block_ids, mask=in_block)
@@ -92,15 +104,8 @@ def _dfly_block_prepare_kernel(
     for plane in tl.static_range(PLANES):
         tl.store(MROPE + plane * rows + row, positions, mask=in_block)
 
-    block_idx = positions // block_size
-    valid = in_block & active & (positions < max_model_len) & (block_idx < num_blocks)
-    page = tl.load(
-        BLOCK_TABLE + g * num_blocks + tl.minimum(block_idx, num_blocks - 1),
-        mask=valid,
-        other=0,
-    ).to(tl.int64)
-    slot = page * block_size + positions % block_size
-    tl.store(SLOTS + row, tl.where(valid, slot, PAD).to(tl.int32), mask=in_block)
+    slot = page * block_size + block_pos % block_size
+    tl.store(SLOTS + row, tl.where(active, slot, PAD).to(tl.int32), mask=in_block)
 
 
 class DflyBlockPrepare(OpWrapper):
@@ -108,13 +113,15 @@ class DflyBlockPrepare(OpWrapper):
 
     ``source_rows = query_start_loc[:G] + num_accepted`` and ``anchors = positions[source] + 1``,
     so both must index the same batch. ``block_table`` is already mapped to the draft layer's slab
-    (``page * scale + layer_offset``) and ``block_size`` must be that pool's page.
+    (``page * scale + layer_offset``), negative where the request owns no page, and ``block_size``
+    must be that pool's page.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
     # `accepted` is how many of the 5 drafts each request accepted; `page_scale`/`layer_offset`
-    # (default 1/0) put the table in the caller's `page * scale + offset` form.
+    # (default 1/0) put the table in the caller's `page * scale + offset` form; `unowned` marks
+    # the page of request 0's last block row as not owned.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one decode request: six block rows and their pool slots",
@@ -127,6 +134,11 @@ class DflyBlockPrepare(OpWrapper):
         Cell(
             why="a block crossing a page boundary: the anchor at offset 30 of its page",
             spec=dict(gens=2, prefix=0, pos_offset=24, accepted="all", pages=8),
+        ),
+        Cell(
+            why="a block crossing into a page its request does not own: that request is inactive, "
+            "the other drafts",
+            spec=dict(gens=2, prefix=0, pos_offset=24, accepted="all", pages=8, unowned=True),
         ),
         Cell(
             why="the model-length edge: the last request's block does not fit and is inactive",
@@ -146,8 +158,8 @@ class DflyBlockPrepare(OpWrapper):
             ),
         ),
         Cell(
-            why="one request that accepted none of its five drafts: its whole block row is "
-            "inactive",
+            why="one request that accepted none of its five drafts: it drafts again from its bonus "
+            "token",
             spec=dict(
                 gens=1,
                 prefix=0,
@@ -256,20 +268,18 @@ class DflyBlockPrepare(OpWrapper):
         num_blocks = block_table.shape[1]
         source = query_start_loc[:gens] + num_accepted.long()
         anchor = target_positions[source] + 1
-        active = (num_accepted > 0) & (anchor + width <= max_model_len)
         j = torch.arange(width, dtype=torch.int64, device=device)
-        positions = torch.where(active[:, None], anchor[:, None] + j, j.expand(gens, width))
+        block_pos = anchor[:, None] + j
+        block_idx = block_pos // block_size
+        in_table = (anchor + width <= max_model_len)[:, None] & (block_idx < num_blocks)
+        page = block_table.long().gather(1, block_idx.clamp(max=num_blocks - 1))
+        page = torch.where(in_table, page, torch.full_like(page, -1))
+        active = (page >= 0).all(dim=1)
+        positions = torch.where(active[:, None], block_pos, j.expand(gens, width))
         block_ids = torch.full((gens, width), mask_token_id, dtype=torch.int64, device=device)
         block_ids[:, 0] = torch.where(active, bonus, torch.full_like(bonus, mask_token_id))
-        block_idx = positions // block_size
-        valid = (
-            active[:, None].expand(gens, width)
-            & (positions < max_model_len)
-            & (block_idx < num_blocks)
-        )
-        page = block_table.long().gather(1, block_idx.clamp(max=num_blocks - 1))
-        slots = page * block_size + positions % block_size
-        slots = torch.where(valid, slots, torch.full_like(slots, PAD_SLOT_ID))
+        slots = page * block_size + block_pos % block_size
+        slots = torch.where(active[:, None], slots, torch.full_like(slots, PAD_SLOT_ID))
         rows = gens * width
         block_ids = block_ids.reshape(rows)
         positions = positions.reshape(rows)

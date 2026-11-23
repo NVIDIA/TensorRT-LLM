@@ -42,7 +42,8 @@ def _prepare_args(spec: dict, seed: int) -> dict:
     """A target batch of `prefix` context tokens then one block per request, disjoint page ranges.
 
     With raw page ids the first request starts at page 0 (a real page in TRT-LLM);
-    `page_scale`/`layer_offset` give the caller's `page * scale + layer_offset` table form.
+    `page_scale`/`layer_offset` give the caller's `page * scale + layer_offset` table form, and
+    `unowned` marks the page under request 0's last block row as not owned (-1).
     """
     g = torch.Generator(device=DEV).manual_seed(seed)
     gens = spec["gens"]
@@ -74,6 +75,11 @@ def _prepare_args(spec: dict, seed: int) -> dict:
     page_ids = torch.arange(used, dtype=torch.int32, device=DEV)
     for i in range(gens):
         table[i, :used] = (page_ids + i * used) * page_scale + layer_offset
+    if spec.get("unowned"):
+        anchor = offset + prefix + int(num_accepted[0]) + 1
+        last_page = (anchor + width - 1) // block_size
+        assert last_page < used and last_page != anchor // block_size, (anchor, last_page)
+        table[0, last_page] = -1
     return dict(
         bonus=bonus,
         num_accepted=num_accepted,
@@ -130,6 +136,23 @@ def test_block_prepare_certified_cells(cell, certifying) -> None:  # noqa: F811 
         a, b = getattr(out, name), getattr(ref, name)
         assert a.dtype == b.dtype and a.shape == b.shape, (name, a.dtype, b.dtype, a.shape, b.shape)
         assert torch.equal(a, b), f"{name} differs in {int((a != b).sum())} of {a.numel()} elements"
+
+
+def test_block_activity_follows_ownership_not_acceptance() -> None:
+    """A request that accepted nothing still drafts; one whose block leaves its pages does not."""
+    zero = _prepare_args(dict(gens=3, accepted="zero", pages=8), seed=0)
+    out = prepare(**zero)
+    assert out.active.tolist() == [True, True, True]
+    width = BLOCK_WIDTH
+    anchors = zero["target_positions"][zero["query_start_loc"][:3]] + 1
+    assert torch.equal(out.anchors, anchors)
+    assert torch.equal(out.positions.view(3, width)[:, 0], anchors)
+    assert torch.equal(out.block_ids.view(3, width)[:, 0], zero["bonus"])
+    assert int(out.slots.min()) >= 0
+    hole = _prepare_args(dict(gens=2, pos_offset=24, accepted="all", pages=8, unowned=True), 0)
+    out = prepare(**hole)
+    assert out.active.tolist() == [False, True]
+    assert bool((out.slots.view(2, width)[0] == PAD_SLOT_ID).all())
 
 
 @pytest.mark.parametrize("cell", INDICES_CELLS, ids=[c.why[:44] for c in INDICES_CELLS])
