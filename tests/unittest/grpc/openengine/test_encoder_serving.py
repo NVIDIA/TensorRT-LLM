@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import gc
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -912,6 +913,7 @@ async def test_encoder_service_shares_control_abort_and_releases_outputs(
                 with pytest.raises(grpc.aio.AioRpcError) as error:
                     await call
                 assert error.value.code() == grpc.StatusCode.CANCELLED
+                del error
             else:
                 response = await call
                 assert response.request_id == "encode" and response.encoded_media.opaque_state
@@ -927,3 +929,6 @@ async def test_encoder_service_shares_control_abort_and_releases_outputs(
             assert not server._inference.active_request_count()
     finally:
         await server.stop(grace=0)
+    # Closed aio objects must be collected before the per-test thread check.
+    del call, encoder, channel, server
+    gc.collect()
