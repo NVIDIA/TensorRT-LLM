@@ -785,12 +785,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        # Tensors handed to the attention backend, kept as (key, tensor): the layers and steps
-        # of a request pass one tensor object, which backends key their caches on.
-        #   tags key: (copy of the caller's tags, pad)
-        #   mask key: (padded tags tensor, batch size)
+        # Tags handed to the attention backend, kept as (key, tensor): the layers and steps of
+        # a request pass one tensor object, which backends key their caches on.
+        #   key: (copy of the caller's tags, pad)
         self._cached_token_tags: tuple[tuple[torch.Tensor, int], torch.Tensor] | None = None
-        self._cached_key_padding_mask: tuple[tuple[torch.Tensor, int], torch.Tensor] | None = None
         # Padding between packed modalities needs a backend that takes it anywhere.
         (
             self._supports_key_padding_mask,
@@ -1156,20 +1154,14 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "backend that takes interior padding, such as VANILLA."
                 )
             if self._supports_key_padding_mask:
-                # Reuse the mask of the same padded tags tensor and batch size. Attention
-                # caches use the mask version to detect changes.
-                batch_size = packed_hidden_states.shape[0]
-                cached = self._cached_key_padding_mask
-                if (
-                    cached is None
-                    or cached[0][0] is not padded_token_tags
-                    or cached[0][1] != batch_size
-                ):
-                    with torch.inference_mode(False):
-                        mask = (padded_token_tags >= 0).unsqueeze(0).expand(batch_size, -1)
-                    cached = ((padded_token_tags, batch_size), mask)
-                    self._cached_key_padding_mask = cached
-                key_padding_mask = cached[1]
+                # One mask tensor per forward, shared by the blocks. Attention caches use the
+                # mask version to detect changes.
+                with torch.inference_mode(False):
+                    key_padding_mask = (
+                        (padded_token_tags >= 0)
+                        .unsqueeze(0)
+                        .expand(packed_hidden_states.shape[0], -1)
+                    )
 
         padded_sequence_length = packed_hidden_states.shape[1]
         packed_hidden_states = self.sharder.shard(packed_hidden_states, dim=1)

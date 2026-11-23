@@ -888,9 +888,9 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
             num_layers=num_refiner_layers,
             model_config=model_config,
         )
-        # Tensor handed to the attention backend, kept as (key, tensor): the layers and steps
-        # of a request pass one tensor object, which backends key their caches on.
-        #   tags key: (video rows, image rows, context rows, device)
+        # Tags handed to the attention backend, kept as (key, tensor): the layers and steps of
+        # a request pass one tensor object, which backends key their caches on.
+        #   key: (video rows, image rows, context rows, device)
         self._cached_token_tags: Optional[
             Tuple[Tuple[int, int, int, torch.device], torch.Tensor]
         ] = None
@@ -1087,9 +1087,9 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         # mask and one tags tensor, which attention backends key their caches on.
         num_video, num_context = hidden_states.shape[1], encoder_hidden_states.shape[1]
         num_image = 0 if is_t2v else encoder_hidden_states_3.shape[1]
-        # The mask follows the prompt: one tensor per forward.
+        # One mask tensor per forward, shared by the blocks.
         joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
-        # The tags follow the row counts only: one tensor across forwards.
+        # One tags tensor across forwards: it depends on the row counts only.
         tags_key = (num_video, num_image, num_context, hidden_states.device)
         cached = self._cached_token_tags
         if cached is None or cached[0] != tags_key:
