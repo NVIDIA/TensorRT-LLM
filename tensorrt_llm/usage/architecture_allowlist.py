@@ -67,7 +67,6 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "HunYuanDenseV1ForCausalLM",
         "HunYuanMoEForCausalLM",
         "HunYuanMoEV1ForCausalLM",
-        "HYV4FlashForConditionalGeneration",
         "InternLM3ForCausalLM",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",

@@ -83,15 +83,15 @@ l0_dgx_b300:
   # modeling_v2 hyv4-flash-FP8 sm_103 unified target: gsm8k on the three 4-GPU layouts
   # routing admits, the checkpoint's five-draft DFly2 engine on each feature member,
   # and the core variants paired against core's own score (two engines per test).
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_gsm8k[tp4] TIMEOUT (120)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_gsm8k[tep4] TIMEOUT (120)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_gsm8k[dep4] TIMEOUT (120)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_spec_gsm8k[dflash] TIMEOUT (120)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_spec_gsm8k[multimodal] TIMEOUT (120)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_spec_gsm8k[host_offload] TIMEOUT (120)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_kv_fp8_gsm8k TIMEOUT (240)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_chunked_gsm8k TIMEOUT (240)
-  - accuracy/modeling_v2/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/test_accuracy.py::TestModelingV2Hf003107fOrigSm103Unified::test_reuse_gsm8k TIMEOUT (240)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_gsm8k[tp4] TIMEOUT (120)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_gsm8k[tep4] TIMEOUT (120)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_gsm8k[dep4] TIMEOUT (120)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_spec_gsm8k[dflash] TIMEOUT (120)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_spec_gsm8k[multimodal] TIMEOUT (120)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_spec_gsm8k[host_offload] TIMEOUT (120)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_kv_fp8_gsm8k TIMEOUT (240)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_chunked_gsm8k TIMEOUT (240)
+  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_reuse_gsm8k TIMEOUT (240)
 - condition:
     ranges:
       system_gpu_count:
@@ -122,7 +122,7 @@ l0_dgx_b300:
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/comm/test_modeling_v2_mhc_ar_boundary.py
   # modeling_v2 hyv4-flash-FP8 sm_103 unified target: its all-gather and reduce-scatter
   # matrices, one 4-rank run.
-  - unittest/_torch/modeling_v2/models/hyv4_flash_for_conditional_generation/hf_003107f_orig__sm_103__unified/ops/comm
+  - unittest/_torch/modeling_v2/models/hyv4_flash/hy4_flash_fp8__sm_103__default/ops/comm
   # ------------- MoE components tests (multi-GPU) ---------------
   # ------------- MoE: multi-GPU module tests (DEP parallel, per backend per quant) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16

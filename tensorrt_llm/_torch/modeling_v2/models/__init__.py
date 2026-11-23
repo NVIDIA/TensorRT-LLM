@@ -15,8 +15,8 @@ from .deepseek_v3 import routing as deepseek_v3_routing  # noqa: F401
 from .glm5_next import routing as glm5_next_routing  # noqa: F401
 from .glm_moe_dsa import routing as glm_moe_dsa_routing  # noqa: F401
 from .gpt_oss import routing as gpt_oss_routing  # noqa: F401
-from .hyv4_flash_for_conditional_generation import (
-    routing as hyv4_flash_for_conditional_generation_routing,  # noqa: F401
+from .hyv4_flash import (
+    routing as hyv4_flash_routing,  # noqa: F401
 )
 from .kimi_k3_vl import routing as kimi_k3_vl_routing  # noqa: F401
 from .minimax_m3 import routing as minimax_m3_routing  # noqa: F401
