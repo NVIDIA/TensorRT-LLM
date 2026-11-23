@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FLA's one-token short-convolution step (``fla.modules.conv.triton.ops.causal_conv1d_update``): the step of Kimi
+"""FLA's one-token short-convolution step (``fla.modules.causal_conv1d.ops.causal_conv1d_update``): the step of Kimi
 K3's sequential KDA verify."""
 
 from typing import Optional
@@ -53,7 +53,7 @@ class ShortConvUpdate(OpWrapper):
         activation: Optional[str],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Imported on the first call, so that importing the target does not need FLA.
-        from fla.modules.conv.triton.ops import causal_conv1d_update
+        from fla.modules.causal_conv1d.ops import causal_conv1d_update
 
         return causal_conv1d_update(
             x=x, cache=cache, residual=None, weight=weight, bias=None, activation=activation

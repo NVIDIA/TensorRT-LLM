@@ -51,7 +51,7 @@ def test_kda_load_time_imports_are_runtime_requirements() -> None:
     providers = metadata.packages_distributions()
     # The KDA layers import `fla` at load; with no distribution to map it to, the check is vacuous.
     assert providers.get("fla"), (
-        "flash-linear-attention is not installed: `fla` cannot be mapped to a distribution"
+        "fla-core is not installed: `fla` cannot be mapped to a distribution"
     )
     missing = []
     for path in sorted(KDA_PACKAGE.glob("*.py")):
