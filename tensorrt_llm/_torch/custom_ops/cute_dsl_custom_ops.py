@@ -20273,10 +20273,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # zero_output, the output itself) with one launch. PDL lets
                     # it overlap the previous kernel's tail and the fused GEMM's
                     # prologue; the GEMM's griddepcontrol_wait precedes its
-                    # first workspace access. Cluster launches keep the plain
-                    # ordering.
-                    use_reset_pdl = TRTLLM_ENABLE_PDL and (
-                        cluster_shape_mn[0] * cluster_shape_mn[1] == 1)
+                    # first workspace access whatever its cluster shape.
+                    use_reset_pdl = TRTLLM_ENABLE_PDL
                     quant_args = {}
                     input_dtype = None
                     if input_unquantized is not None:

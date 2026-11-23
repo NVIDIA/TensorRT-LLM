@@ -5672,6 +5672,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
     num_experts: int,
     tile_size: int,
     swiglu_limit: float,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """End-to-end check of the fused MXFP8 FC1+FC2 MoE op against a float oracle.
 
@@ -5846,6 +5847,53 @@ def test_mxfp8_fused_fc12_moe_rubin(
     check(raw_output_prezeroed, "raw BF16 input, zero_output=False")
     assert (raw_kwargs["input_scale"] == 255).all()
     torch.testing.assert_close(raw_output_prezeroed.float(), output.float(), rtol=2e-2, atol=2e-2)
+
+    if num_experts == 16 and swiglu_limit == float("inf"):
+        op = torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin
+        # 1c. Each FC1 A gather variant. The static-shape rule picks the sparse
+        #     gather for every shape here, so force each variant once and check
+        #     that it is the one compiled.
+        for sparse_gather in (False, True):
+            chosen = []
+
+            def use_sparse_gather(self, num_rows: int, padded_routes: int, v=sparse_gather) -> bool:
+                chosen.append(v)
+                return v
+
+            forced_output = torch.zeros_like(output)
+            with monkeypatch.context() as m, torch.inference_mode():
+                m.setattr(Sm107Mxfp8FusedFc12MoeRunner, "_use_sparse_gather", use_sparse_gather)
+                op(output=forced_output, **common_kwargs)
+            torch.cuda.synchronize()
+            label = f"forced sparse_gather={sparse_gather}"
+            assert chosen == [sparse_gather], label
+            # The compile key's ninth element is the gather variant.
+            assert any(key[8] is sparse_gather for key in Sm107Mxfp8FusedFc12MoeRunner.kernel_cache)
+            check(forced_output, label)
+            torch.testing.assert_close(forced_output.float(), output.float(), rtol=2e-2, atol=2e-2)
+
+        # 1d. The whole op (workspace reset + fused GEMM) twice in one CUDA
+        #     graph, on one output, replayed back to back with no host sync.
+        #     The second reset clears the output while the first GEMM may
+        #     still scatter-add into it unless its PDL wait orders them.
+        graph_output = torch.full_like(output, float("nan"))
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.inference_mode():
+            op(output=graph_output, zero_output=True, **raw_kwargs)
+            with torch.cuda.graph(graph, stream=stream):
+                for _ in range(2):
+                    op(output=graph_output, zero_output=True, **raw_kwargs)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph_output.fill_(float("nan"))
+        for _ in range(8):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert not torch.isnan(graph_output).any(), "graph replay left rows uncleared"
+        check(graph_output, "graph replay, raw BF16 input")
+        torch.testing.assert_close(graph_output.float(), output.float(), rtol=2e-2, atol=2e-2)
+        assert (raw_kwargs["input_scale"] == 255).all()
 
     # 2. Every tactic the runner enumerates (small shapes only: each distinct
     #    geometry is a DSL compile).
@@ -6055,7 +6103,7 @@ def test_mxfp8_local_input_quantization_deferred(
     for rows in (0, 1, max_rows):
         x = torch.empty((rows, hidden), dtype=dtype)
         raw, sf = impl.quantize_input(backend, x, post_quant_comm=False)
-        assert raw is x and sf.shape == (rows, scale_cols) and sf.dtype == torch.uint8
+        assert raw is x and sf is None
     assert not calls
     x = torch.empty((max_rows, hidden), dtype=dtype)
     quantized, sf = impl.quantize_input(backend, x, post_quant_comm=True)
@@ -6072,6 +6120,58 @@ def test_mxfp8_local_input_quantization_deferred(
     strided = torch.empty((2, hidden * 2), dtype=dtype)[:, :hidden]
     quantized, _ = impl.quantize_input(backend, strided, post_quant_comm=False)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_deferred_input_runs_with_shape_only_scales(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run_moe_mxfp8`` builds the op's scale placeholder when ``x_sf`` is None.
+
+    A deferred ``quantize_input`` returns ``(x, None)``; the tuner and the op
+    still see a ``[num_tokens, hidden // 32]`` uint8 scale input. Missing
+    scales with E4M3 input, or scales with raw input, are rejected.
+    """
+    impl = TrtllmCutedslFusedFc12Mxfp8Impl
+    num_tokens, hidden, top_k = 3, 512, 2
+    leaf = SimpleNamespace(
+        hidden_size=hidden,
+        num_slots=8,
+        expert_size_per_partition=8,
+        slot_start=0,
+        tune_max_num_tokens=64,
+        quant_method=SimpleNamespace(BLOCK_SIZE=32),
+        FUSED_INPUT_QUANT_MAX_ELEMENTS=impl.FUSED_INPUT_QUANT_MAX_ELEMENTS,
+        _tuner_key=impl._tuner_key,
+    )
+    leaf._fuses_input_quant = impl._fuses_input_quant.__get__(leaf)
+    impl_calls = []
+
+    def run_moe_mxfp8_impl(*inputs: torch.Tensor, **kwargs) -> torch.Tensor:
+        impl_calls.append(inputs)
+        return inputs[4]
+
+    leaf.run_moe_mxfp8_impl = run_moe_mxfp8_impl
+    tuned_inputs = []
+
+    def choose_one(key: str, runners: list, config, inputs: list) -> tuple:
+        tuned_inputs.append(inputs)
+        return runners[0], -1
+
+    monkeypatch.setattr(AutoTuner.get(), "choose_one", choose_one)
+    routing = dict(
+        token_selected_experts=torch.zeros((num_tokens, top_k), dtype=torch.int32),
+        token_final_scales=torch.ones((num_tokens, top_k)),
+    )
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16)
+    impl.run_moe_mxfp8(leaf, x=x, x_sf=None, **routing)
+    x_sf = tuned_inputs[0][3]
+    assert impl_calls[0][3] is x_sf and impl_calls[0][0] is x
+    assert x_sf.shape == (num_tokens, hidden // 32) and x_sf.dtype == torch.uint8
+
+    x_q = torch.empty((num_tokens, hidden), dtype=torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="without block scales"):
+        impl.run_moe_mxfp8(leaf, x=x_q, x_sf=None, **routing)
+    with pytest.raises(AssertionError, match="come with E4M3 input"):
+        impl.run_moe_mxfp8(leaf, x=x, x_sf=x_sf, **routing)
 
 
 @pytest.mark.cpu_only

@@ -98,10 +98,10 @@ def _reset_fc12_sync_workspace_kernel(
     if cutlass.const_expr(input_raw is not None):
         # Every lane of every warp runs the quantizer, so partial warps still
         # call each scale-group shuffle with all lanes; lanes past the input
-        # clamp their load address and store nothing.
-        chunk = idx * values_per_lane
+        # neither load nor store. The divisibility hint keeps the per-lane
+        # copies vectorized: one 16-byte load and one 8-byte store per lane.
+        chunk = cute.assume(idx * values_per_lane, divby=values_per_lane)
         valid = chunk < cute.size(input_raw)
-        chunk = cutlass.min(chunk, cutlass.max(cute.size(input_raw) - values_per_lane, 0))
         layout = cute.make_layout((values_per_lane,))
         src = cute.make_tensor(input_raw.iterator + chunk, layout)
         dst = cute.make_tensor(input_quant.iterator + chunk, layout)
