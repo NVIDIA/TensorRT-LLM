@@ -52,15 +52,33 @@ def _buckets(num_heads: int) -> list[int]:
     return [32 + (head * 19) % 97 for head in range(num_heads)]
 
 
-def _checkpoint(num_heads: int) -> dict[str, torch.Tensor]:
+def _checkpoint(num_heads: int, mxfp4: bool = False) -> dict[str, torch.Tensor]:
+    """An E4M3 table, or with ``mxfp4`` an MXFP4 one: uint8 E2M1 pairs, element ``2k`` in byte ``k``'s
+    low nibble."""
     generator = torch.Generator().manual_seed(31)
     rows = sum(_buckets(num_heads))
+    if mxfp4:
+        weight = torch.randint(
+            0, 256, (rows, _HEAD_DIM // 2), dtype=torch.uint8, generator=generator
+        )
+    else:
+        weight = (torch.randn(rows, _HEAD_DIM, generator=generator) * 0.1).to(torch.float8_e4m3fn)
     return {
-        "weight": (torch.randn(rows, _HEAD_DIM, generator=generator) * 0.1).to(torch.float8_e4m3fn),
+        "weight": weight,
         "scale": torch.randint(
             124, 129, (rows, _HEAD_DIM // 32), dtype=torch.uint8, generator=generator
         ).view(torch.float8_e8m0fnu),
     }
+
+
+_E2M1_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+
+
+def _table_values(weight: torch.Tensor) -> torch.Tensor:
+    """FP32 elements of an E4M3 or uint8 E2M1-pair (low nibble first) table."""
+    if weight.dtype != torch.uint8:
+        return weight.float()
+    return _E2M1_VALUES[torch.stack([weight & 0xF, weight >> 4], dim=-1).flatten(-2).long()]
 
 
 def _config(num_heads: int) -> EngramConfig:
@@ -87,11 +105,15 @@ def _hash_provider(num_heads: int) -> EngramHashProvider:
     provider._moduli_ints = {
         0: [buckets[start : start + width] for start in range(0, num_heads, width)]
     }
+    provider._moduli_keys = {0: tuple(tuple(moduli) for moduli in provider._moduli_ints[0])}
     provider._modules = {0: [torch.tensor(sizes) for sizes in provider._moduli_ints[0]]}
     provider._device = None
     provider._cached_hashes = None
     provider._cached_hashes_store = {}
     provider._captured_shapes = set()
+    provider._cached_hash_stacks = {}
+    provider._multiplier_stack = None
+    provider._moduli_stack = (provider._moduli_keys[0],)
     provider._history = None
     provider._history_row_of = {}
     provider._history_free_rows = []
@@ -100,7 +122,7 @@ def _hash_provider(num_heads: int) -> EngramHashProvider:
     return provider
 
 
-def _module(world_size: int, rank: int, num_heads: int) -> DeepseekV41Engram:
+def _module(world_size: int, rank: int, num_heads: int, mxfp4: bool = False) -> DeepseekV41Engram:
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
@@ -118,8 +140,9 @@ def _module(world_size: int, rank: int, num_heads: int) -> DeepseekV41Engram:
                 stream=torch.cuda.Stream(),
                 mapping=mapping,
                 allreduce_strategy=AllReduceStrategy.NCCL,
+                table_mxfp4=mxfp4,
             )
-        module.multi_head_embedding.load_weights(_checkpoint(num_heads))
+        module.multi_head_embedding.load_weights(_checkpoint(num_heads, mxfp4))
     generator = torch.Generator().manual_seed(47)
     out_features, in_features = module.kv_proj.weight.shape
     weight = (torch.randn(out_features, in_features, generator=generator) * 0.01).to(
@@ -150,11 +173,14 @@ def _head_group_size(world_size: int, num_heads: int) -> int | None:
 
 
 def _dense_lookup(
-    indices: torch.Tensor, num_heads: int, checkpoint: dict[str, torch.Tensor] | None = None
+    indices: torch.Tensor,
+    num_heads: int,
+    checkpoint: dict[str, torch.Tensor] | None = None,
+    mxfp4: bool = False,
 ) -> torch.Tensor:
-    checkpoint = _checkpoint(num_heads) if checkpoint is None else checkpoint
+    checkpoint = _checkpoint(num_heads, mxfp4) if checkpoint is None else checkpoint
     scales = torch.exp2(checkpoint["scale"].view(torch.uint8).float() - 127)
-    table = (checkpoint["weight"].float() * scales.repeat_interleave(32, dim=-1)).to(
+    table = (_table_values(checkpoint["weight"]) * scales.repeat_interleave(32, dim=-1)).to(
         device="cuda", dtype=torch.bfloat16
     )
     offsets = torch.tensor([0, *_buckets(num_heads)[:-1]], device="cuda").cumsum(0)
@@ -206,7 +232,7 @@ def _check_forward(module: DeepseekV41Engram, rank: int, counts: list[int], num_
         actual = module(hidden, prefetched, add_residual=True)
     finally:
         hook.remove()
-    reference = _dense_lookup(indices, num_heads)
+    reference = _dense_lookup(indices, num_heads, mxfp4=module.table_mxfp4)
     if counts[rank]:
         assert len(projection_inputs) == 1
         torch.testing.assert_close(projection_inputs[0], reference, rtol=0, atol=0)
@@ -281,19 +307,19 @@ def _check_graph(module: DeepseekV41Engram, rank: int, world_size: int, num_head
         hidden.add_(0.0625)
         graph.replay()
         torch.cuda.synchronize()
-        reference = _dense_lookup(refreshed, num_heads)
+        reference = _dense_lookup(refreshed, num_heads, mxfp4=module.table_mxfp4)
         torch.testing.assert_close(projection_inputs[0], reference, rtol=0, atol=0)
         torch.testing.assert_close(captured, _expected(module, hidden, reference), rtol=0, atol=0)
 
 
 @torch.inference_mode()
-def _run_rank(world_size: int, num_heads: int) -> bool:
+def _run_rank(world_size: int, num_heads: int, mxfp4: bool = False) -> bool:
     rank = tensorrt_llm.mpi_rank()
     local_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
     local_rank = local_comm.Get_rank()
     local_comm.Free()
     torch.cuda.set_device(local_rank)
-    module = _module(world_size, rank, num_heads)
+    module = _module(world_size, rank, num_heads, mxfp4)
     patterns = [
         [3] * world_size,
         [2, 5] + [1] * (world_size - 2),
@@ -347,38 +373,46 @@ def _run_rank(world_size: int, num_heads: int) -> bool:
 
 @skip_pre_blackwell
 @pytest.mark.parametrize(
-    "world_size,num_heads",
+    "world_size,num_heads,mxfp4",
     [
-        pytest.param(8, 24, id="world8-head-sharded"),
-        pytest.param(4, 24, id="world4-head-sharded"),
-        pytest.param(2, 24, id="world2-head-sharded"),
-        pytest.param(2, 3, id="world2-row-sharded"),
+        pytest.param(8, 24, False, id="world8-head-sharded"),
+        pytest.param(4, 24, False, id="world4-head-sharded"),
+        pytest.param(2, 24, False, id="world2-head-sharded"),
+        pytest.param(2, 3, False, id="world2-row-sharded"),
+        # MXFP4 tables: lookups, packed rows and the owner push widen E2M1 to E4M3.
+        pytest.param(4, 24, True, id="world4-head-sharded-mxfp4"),
         # Heads not divisible by the world: one copy of every head per rank group.
-        pytest.param(4, 6, id="world4-head-groups"),
-        pytest.param(8, 12, id="world8-head-groups"),
+        pytest.param(4, 6, False, id="world4-head-groups"),
+        pytest.param(8, 12, False, id="world8-head-groups"),
     ],
 )
-def test_attention_dp_engram(world_size: int, num_heads: int) -> None:
+def test_attention_dp_engram(world_size: int, num_heads: int, mxfp4: bool) -> None:
     external_world = tensorrt_llm.mpi_world_size()
     if external_world > 1:
         if external_world != world_size:
             pytest.skip(f"MPI launch has {external_world} ranks, test requires {world_size}")
-        assert _run_rank(world_size, num_heads)
+        assert _run_rank(world_size, num_heads, mxfp4)
         return
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"need {world_size} local GPUs or an external MPI launch")
     with MPIPoolExecutor(max_workers=world_size) as executor:
-        assert all(executor.map(_run_rank, [world_size] * world_size, [num_heads] * world_size))
+        assert all(
+            executor.map(
+                _run_rank, [world_size] * world_size, [num_heads] * world_size, [mxfp4] * world_size
+            )
+        )
 
 
-def _exchange_checkpoint(num_heads: int) -> dict[str, torch.Tensor]:
+def _exchange_checkpoint(num_heads: int, mxfp4: bool = False) -> dict[str, torch.Tensor]:
     """``_checkpoint`` with negative zeros and UE8M0 code 0 (FP32-subnormal products)."""
-    checkpoint = _checkpoint(num_heads)
+    checkpoint = _checkpoint(num_heads, mxfp4)
     weight = checkpoint["weight"].view(torch.uint8).clone()
     scale = checkpoint["scale"].view(torch.uint8).clone()
-    weight[::7, ::5] = 0x80
+    weight[::7, ::5] = 0x88 if mxfp4 else 0x80
     scale[::13, 0] = 0
-    return {"weight": weight.view(torch.float8_e4m3fn), "scale": scale.view(torch.float8_e8m0fnu)}
+    if not mxfp4:
+        weight = weight.view(torch.float8_e4m3fn)
+    return {"weight": weight, "scale": scale.view(torch.float8_e8m0fnu)}
 
 
 def _check_exchange(
@@ -391,7 +425,7 @@ def _check_exchange(
     """The peer-memory exchange of two layers' lookups equals the dense lookup bit for bit (and so
     the NCCL path): counts with idle ranks and idle groups, forwards issued back to back with NCCL
     forwards between them, and CUDA graph replays of the whole exchange with fresh hash rows."""
-    checkpoint = _exchange_checkpoint(num_heads)
+    checkpoint = _exchange_checkpoint(num_heads, module.table_mxfp4)
     module.multi_head_embedding.load_weights(checkpoint)
     capacity = exchange.capacity
     start, size = module.exchange_start, module.exchange_size
@@ -486,7 +520,9 @@ def _check_exchange(
 _REPLAY_HIDDEN_SIZE = 128
 _REPLAY_SWA_WINDOW = 4
 _REPLAY_WINDOW = 5
-_REPLAY_MAX_TOKENS = 256
+_ENCODER_REPLAY_WINDOW = 128
+# Both ADP ranks can recover a full cache block plus their uncached suffixes.
+_REPLAY_MAX_TOKENS = 512
 
 
 def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) -> torch.nn.Module:
@@ -820,7 +856,7 @@ def _check_dp_encoder_replay_case(
         )
         requests = []
         try:
-            assert manager._decoder_replay_window == _REPLAY_WINDOW
+            assert manager._decoder_replay_window == _ENCODER_REPLAY_WINDOW
             assert manager._encoder_optional_groups
             metadata = CSA2TrtllmMetadata(
                 max_num_requests=1,
@@ -881,6 +917,7 @@ def _check_dp_encoder_replay_case(
     with pytest.MonkeyPatch.context() as settings, ExitStack() as stack:
         settings.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
         settings.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+        settings.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(_ENCODER_REPLAY_WINDOW))
         actual_case = stack.enter_context(cache(mapping))
         reference_case = stack.enter_context(cache(Mapping()))
         with torch.device("cuda"):
@@ -889,6 +926,7 @@ def _check_dp_encoder_replay_case(
             for actual, expected in zip(attention, reference_attention):
                 expected.load_state_dict(actual.state_dict())
             model = _replay_boundary(attention[1])
+            model.decoder_replay_window = _ENCODER_REPLAY_WINDOW
             model.layers[0].layer_idx = 1
             model.layers = [None, model.layers[0]]
             model.decoder_replay_split = 1
@@ -944,7 +982,7 @@ def _check_dp_encoder_replay_case(
             state = HCState.resolved(
                 encoder[:, None, :], pre_mix=torch.ones(length, 1, 1, device="cuda")
             )
-            kept = min(length, _REPLAY_WINDOW)
+            kept = min(length, _ENCODER_REPLAY_WINDOW)
             decoder_start = start + length - kept
             reference_attention[1].prepare_global_cache(norm(encoder), reference_metadata)
             reference_metadata.seq_lens = torch.tensor([kept], dtype=torch.int32, device="cpu")
@@ -960,7 +998,7 @@ def _check_dp_encoder_replay_case(
             new_positions, new_ids, replay_state = model._enter_bounded_replay(
                 plan, metadata, positions, ids, state
             )
-            expected_counts = [min(count, _REPLAY_WINDOW) for count in counts]
+            expected_counts = [min(count, _ENCODER_REPLAY_WINDOW) for count in counts]
             assert metadata.all_rank_num_tokens == expected_counts
             assert MPI.COMM_WORLD.allgather(replay_state.residual.shape[0]) == expected_counts
             torch.testing.assert_close(new_positions, positions[-kept:], rtol=0, atol=0)
@@ -1008,8 +1046,11 @@ def _check_dp_encoder_replay_case(
         requests = [admit(case, 1742, tokens) for case in (actual_case, reference_case)]
         for request in requests:
             assert request.context_current_position == prefix
-            assert encoder_replay_tokens(request) == (_REPLAY_WINDOW if prefix else 0)
-        expected_counts = [_REPLAY_WINDOW + 5, _REPLAY_WINDOW + 1 if reused_peer else 3]
+            assert encoder_replay_tokens(request) == (_ENCODER_REPLAY_WINDOW if prefix else 0)
+        expected_counts = [
+            _ENCODER_REPLAY_WINDOW + 5,
+            _ENCODER_REPLAY_WINDOW + 1 if reused_peer else 3,
+        ]
         assert (
             MPI.COMM_WORLD.allgather(
                 requests[0].context_chunk_size + encoder_replay_tokens(requests[0])

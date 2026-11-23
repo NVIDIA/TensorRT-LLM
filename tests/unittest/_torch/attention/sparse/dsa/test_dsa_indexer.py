@@ -769,6 +769,12 @@ def test_cute_dsl_paged_mqa_logits_default_is_aligned():
         (dict(sm_version=103, index_topk=2048, compress_ratio=4), True),
         (dict(sm_version=107), False),
         (dict(sm_version=107, is_prefill=False), False),
+        (dict(sm_version=107, sm107_decode=True), True),
+        (dict(sm_version=107, sm107_decode=True, index_topk=256), False),
+        (dict(sm_version=107, sm107_decode=True, compress_ratio=2), False),
+        (dict(sm_version=107, sm107_decode=True, is_cute_dsl_available=False), False),
+        (dict(sm_version=107, sm107_decode=True, use_self_sampling_topk=False), False),
+        (dict(sm_version=107, sm107_decode=True, enable_heuristic_topk=False), False),
         (dict(sm_version=107, is_prefill=True), True),
         (dict(sm_version=107, is_prefill=True, index_topk=1024), True),
         (dict(sm_version=107, is_prefill=True, index_topk=2048), True),
@@ -2308,6 +2314,12 @@ def _create_mock_metadata(
             self._num_seqs = num_contexts + num_generations
             self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
+            self.sparse_metadata_params = SimpleNamespace(
+                use_cute_dsl_paged_mqa_logits=use_cute_dsl_paged_mqa_logits,
+                q_split_threshold=DeepSeekSparseAttentionConfig.model_fields[
+                    "q_split_threshold"
+                ].default,
+            )
             self.num_sparse_topk = index_topk
             self._radix_rows_per_sequence = 1 + self.max_draft_tokens
             self._create_radix_aux_buffers(capture_graph=False)

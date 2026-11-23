@@ -372,6 +372,7 @@ class DeepseekV4Indexer(Indexer):
         pre_aux: Optional[
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = None,
+        decode_topk_start_event: Optional[torch.cuda.Event] = None,
     ):
         use_overlapped_prepare = (
             do_multi_stream()
@@ -404,5 +405,6 @@ class DeepseekV4Indexer(Indexer):
                 k_scale,
                 weights,
                 q_scale=q_scale,
+                decode_topk_start_event=decode_topk_start_event,
             )
         return topk_indices

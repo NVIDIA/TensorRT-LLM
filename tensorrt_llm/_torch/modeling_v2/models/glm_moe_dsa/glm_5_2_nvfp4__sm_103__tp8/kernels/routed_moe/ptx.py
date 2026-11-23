@@ -720,23 +720,6 @@ def mbar_arrive_remote(cluster_addr: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def mbar_try_wait_cluster(mbar: Int32, phase: Int32, *, loc=None, ip=None) -> Int32:
-    """One acquire (cluster scope) try-wait on a local mbarrier phase; 1 when done."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [Int32(mbar).ir_value(loc=loc, ip=ip), Int32(phase).ir_value(loc=loc, ip=ip)],
-            "{\n.reg .pred p;\n"
-            "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n"
-            "selp.u32 $0, 1, 0, p;\n}",
-            "=r,r,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def ld_nc_v4_u32(addr: Int64, *, loc=None, ip=None):
     res = _asm(
         llvm.StructType.get_literal([T.i32()] * 4),

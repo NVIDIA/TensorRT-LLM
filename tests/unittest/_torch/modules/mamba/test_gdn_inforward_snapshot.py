@@ -19,16 +19,17 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 from tensorrt_llm._torch.modules.mamba import gdn_inforward_split
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
+from tensorrt_llm._torch.modules.mamba.fused_gdn_conv import fused_gdn_conv_post_conv
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
     _gdn_prefill_uses_flashinfer,
     _inforward_split_conv_states,
     _inforward_split_prefill_core,
     chunk_gated_delta_rule,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -58,7 +59,7 @@ def _split():
         request_ids=[rid for rid, _, _, _ in _BATCH],
         seq_lens=torch.tensor([length for _, _, length, _ in _BATCH], dtype=torch.int32),
     )
-    metadata = Mamba2Metadata(max_batch_size=8, chunk_size=128)
+    metadata = GDNMambaMetadata(max_batch_size=8, chunk_size=128)
     metadata._prepare_inforward_split(attn, manager, plan, len(_BATCH), len(_BATCH))
     return metadata.inforward_split
 
@@ -149,7 +150,8 @@ def test_split_prefill_core_matches_two_iterations(linear_gate):
     assert torch.equal(ssm_states[untouched], expected_live[untouched])
 
 
-def test_split_conv_states_match_two_iterations():
+@pytest.mark.parametrize("fused", [False, True], ids=["causal_conv1d", "fused_conv"])
+def test_split_conv_states_match_two_iterations(fused):
     split = _split()
     total = sum(length for _, _, length, _ in _BATCH)
     torch.manual_seed(1)
@@ -190,20 +192,38 @@ def test_split_conv_states_match_two_iterations():
     # In-forward path: whole chunks, then the state swap.
     window = mixed_qkv.index_select(0, split.conv_win)
     cu = torch.tensor([0] + torch.tensor(lengths).cumsum(0).tolist(), dtype=torch.int32)
-    out = causal_conv1d_fn(
-        mixed_qkv.t().contiguous(),
-        weight,
-        bias,
-        query_start_loc=cu.cuda(),
-        cache_indices=torch.tensor(slots, dtype=torch.int32, device="cuda"),
-        has_initial_state=torch.ones(len(slots), dtype=torch.bool, device="cuda"),
-        conv_states=conv_states,
+    seq_args = (
+        cu.cuda(),
+        torch.tensor(slots, dtype=torch.int32, device="cuda"),
+        torch.ones(len(slots), dtype=torch.bool, device="cuda"),
     )
+    if fused:
+        # One Q, one K and two V heads of 64 make up CONV_DIM; V is the tail of the conv output.
+        gates = torch.zeros(total, 2, device="cuda")
+        gate_args = (gates, gates, gates[0], gates[0], 1, 64, 2, 64)
+        _, _, v, _, _ = fused_gdn_conv_post_conv(
+            mixed_qkv, weight, bias, conv_states, *seq_args, *gate_args
+        )
+        out = v.reshape(total, -1).t()
+        expected_out = expected_out[CONV_DIM // 2 :]
+    else:
+        out = causal_conv1d_fn(
+            mixed_qkv.t().contiguous(),
+            weight,
+            bias,
+            query_start_loc=seq_args[0],
+            cache_indices=seq_args[1],
+            has_initial_state=seq_args[2],
+            conv_states=conv_states,
+        )
     _inforward_split_conv_states(conv_states, window, split, stage)
     torch.cuda.synchronize()
     assert torch.equal(conv_states, expected_live)
     assert torch.equal(stage, expected_stage)
-    assert torch.equal(out, expected_out)
+    if fused:
+        torch.testing.assert_close(out, expected_out, rtol=1e-2, atol=1e-2)
+    else:
+        assert torch.equal(out, expected_out)
 
 
 def _random_states(rows, seed):
