@@ -206,6 +206,7 @@ enum class ReusePolicy
     //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
     //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
     //! These pages may be evicted independently without removing the REQUIRED prefix.
+    //! Attention buffers require a sliding window.
     OPTIONAL = 2,
     //! REQUIRED for sink blocks, OPTIONAL for the sliding window: sinks constrain the prefix match and are
     //! claimed with it; the window is selected at resume, and ReuseGroupStatus::complete describes it.

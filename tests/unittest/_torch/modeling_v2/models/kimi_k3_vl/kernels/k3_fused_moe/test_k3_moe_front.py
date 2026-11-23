@@ -15,7 +15,7 @@
 """trtllm::k3_moe_front (the Kimi K3 MoE front: sharded head GEMV, head all-gather, top-16 routing, MXFP8 latent,
 shared gate_up + SiTU), alone on random input and followed by trtllm::k3_moe through a head_flags K3MoeLayer (k3_moe
 acquires the ready words the front publishes with ag_ready), one process per GPU over the TP group of this run, over
-one K3MoeHeadWorkspace shared by fabric handle (the catalog entry's matrix runs POSIX handles, exact payloads, the
+one K3MoeHeadWorkspace shared by fabric handle (the op's matrix runs POSIX handles, exact payloads, the
 fused head_flags handoff, capture and the refusals). The head is sharded over the group
 (TP W: 3584 / W latent + 896 / W router rows and 2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the
 model's TP16 shapes with 16 processes); the routed experts are one rank of experts TP4 x EP4 (224 local experts,

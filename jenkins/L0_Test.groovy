@@ -1323,7 +1323,8 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     try {
         echo "[SLURM-FINALIZER] ${entry.id}: reconciling orphaned SLURM resources off-pod " +
              "(job=${entry.slurmJobId ?: entry.jobUID}, node=${entry.nodeName ?: 'n/a'})."
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, {
+        def stageName = entry.id.toString().replaceFirst(/\/slurm\/[^\/]+$/, "")
+        launchKubernetesStagePod(pipeline, podSpec, containerName, stageName, [reportFailure: false], {
             if (entry.usedSbatch) {
                 cleanUpSlurmResources(pipeline, cluster, entry.clusterName, entry.jobUID)
             } else {
@@ -3595,11 +3596,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             # and perf folders for the final snapshot. The watcher first finishes any
                             # checkpoint under way and then starts no other, so that the copy and a
                             # checkpoint never write the results at the same time. The copies are
-                            # best-effort, and each logs its own failure.
-                            touch "\$PROGRESS_STOP_FILE"
-                            while [ -e "\$PROGRESS_STOP_FILE.busy" ] && kill -0 \$WATCHER_PID 2>/dev/null; do
-                                sleep 1
-                            done
+                            # best-effort, and each logs its own failure. If the stop file cannot
+                            # be created, the watcher cannot be asked to pause, so a signal ends
+                            # it here: its final snapshot then comes before the copies. A watcher
+                            # that cannot remove the mark of its checkpoint ends on its own, and
+                            # takes no final snapshot beside the copies either. A final snapshot
+                            # from before the copies has no timeout results.
+                            watcher_ended=0
+                            if touch "\$PROGRESS_STOP_FILE"; then
+                                while [ -e "\$PROGRESS_STOP_FILE.busy" ] && kill -0 \$WATCHER_PID 2>/dev/null; do
+                                    sleep 1
+                                done
+                                if ! kill -0 \$WATCHER_PID 2>/dev/null; then
+                                    wait \$WATCHER_PID
+                                    watcher_ended=1
+                                fi
+                            else
+                                kill -s USR1 \$WATCHER_PID 2>/dev/null
+                                wait \$WATCHER_PID
+                                watcher_ended=1
+                            fi
                             mkdir -p '${WORKSPACE}/${stageName}'
                             ${sshRefreshCacheCmd}
                             for _attempt in 1 2 3; do
@@ -3626,8 +3642,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             done < <(eval '${sshListPerfCmd}' 2>/dev/null || true)
                             # Give the final snapshot this job's timeout markers.
                             [ -f "\$TIMEOUT_EVIDENCE_FILE" ] && ${timeoutLogCmd} >> "\$TIMEOUT_EVIDENCE_FILE"
-                            touch "\$PROGRESS_DONE_FILE"
-                            wait \$WATCHER_PID
+                            # A signal stands in for a done file that cannot be created. A watcher
+                            # that ended above gets no signal: its PID may belong to another
+                            # process by now. The step has waited for it already.
+                            if [ "\$watcher_ended" -eq 0 ]; then
+                                touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
+                                wait \$WATCHER_PID
+                            fi
                             exit \$rc
                         """
                     }
@@ -3861,6 +3882,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
+  // Capture the outer node before entering a nested SLURM compute agent.
+  String dispatcherNodeName = env.NODE_NAME
+
   // Per-stage override of the SLURM infra-retry budget (from opts.infraRetryMax,
   // threaded via the dispatcher's retryContext). Lets resource-scarce pools cap
   // or disable stage-level retries (0 = no retry). Null falls back to the global.
@@ -3886,6 +3910,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
     // Shared by result suppression and the retry decision for this attempt only.
     Map slurmRetryContext = [
       scope: InfraFailure.SLURM,
+      dispatcherNodeName: dispatcherNodeName,
       stageName: stageName,
       attempt: attempt,
       backoffMs: 60L * 1000L,
@@ -3930,15 +3955,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       // User abort / pipeline timeout -- never retry
       throw e
     } catch (Exception e) {
-      // If the K8s dispatcher pod this stage runs inside died mid-run, every
-      // retry attempt would execute on that same dead pod and fail immediately,
-      // and the in-pod cleanup can no longer reach the SLURM controller. Stop
-      // retrying in place and propagate so the pod-level wrapper reconciles the
-      // orphaned SLURM job / Jenkins node off-pod (fail closed).
-      if (isDispatcherPodFailure(e)) {
-        echo "[INFRA-RETRY] ${stageName}: dispatcher pod died mid-run; not retrying on the dead pod (${e.toString()}). Failing closed for off-pod reconciliation."
-        throw e
-      }
       // classifyFailure() handles FlowInterruptedException + exit-code-143 +
       // typed throws + originating-step evidence and cause-chain fallback, returning one of
       // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
@@ -3950,6 +3966,13 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
         // exception matches no catalog pattern lands here and would
         // otherwise decline the retry with no log output at all.
         echo "[INFRA-RETRY] ${stageName}: SLURM attempt failed with no infra pattern matched (classified as user failure); not retrying. Exception: ${e.toString()}"
+        throw e
+      }
+
+      // A compute-agent failure does not imply the outer dispatcher died.
+      // Only retry in place when that dispatcher is still online.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown; not retrying in place. Failing closed for off-pod reconciliation."
         throw e
       }
 
@@ -3974,6 +3997,12 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
       sleep(60)
+      // The dispatcher may have gone offline during cooldown.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown after cooldown; " +
+             "not starting another SLURM attempt."
+        throw e
+      }
     }
   }
 }
@@ -4365,9 +4394,17 @@ boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error,
     if (!(classified instanceof InfraFailure)) {
         return false
     }
+    if (scope == InfraFailure.SLURM) {
+        String dispatcherNodeName = retryContext.dispatcherNodeName
+        if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+            return false
+        }
+    }
     Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
     int attempt = parsedAttempt != null ? parsedAttempt as int : 1
-    int effectiveMax = retryMaxForFailure(scope, classified, retryContext.infraRetryMax as Integer)
+    int effectiveMax = retryContext.launchOnly ?
+        resolveInfraRetryMax(scope, retryContext.infraRetryMax as Integer) :
+        retryMaxForFailure(scope, classified, retryContext.infraRetryMax as Integer)
     Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
     long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
     return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
@@ -4595,7 +4632,7 @@ def getHostNodeName() {
 // deferCheckpointDelete leaves the delete of the attempt's checkpoints to the caller, which runs
 // it where no test runs: a Slurm agent stage deletes them from its dispatcher pod. Otherwise the
 // delete runs in the pod's jnlp container.
-def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean deferCheckpointDelete=false)
+def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean deferCheckpointDelete=false, boolean collectTimeoutResult=true)
 {
     checkStageName([stageName])
     // Resolve the attempt's primary location as it starts; every write and delete of its outputs
@@ -4650,7 +4687,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else {
+                } else if (collectTimeoutResult) {
                     // Regenerate authoritatively after all regular, rerun, and
                     // isolated test work; an earlier snapshot may be stale.
                     generateTimeoutTestResultXml(pipeline, stageName)
@@ -4981,15 +5018,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     imagePullPolicy: Always
         """
     }
-    // CPU test pods mount the model scratch from 10.117.145.14, which can't be accessed from ipp6/ipp9 DC.
-    // Pods placed there stay in ContainerCreating. Build stage pods do not mount the model scratch,
-    // so they can still use these nodes.
-    def scratchUnreachableNodeAffinity = type == "cpu" ? '''
-                              - key: "region"
-                                operator: NotIn
-                                values:
-                                - "ipp6"
-                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -5005,6 +5033,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+    // Any kubernetes-cpu stage mounting this NFS must be covered by cpu-model-scratch-nfs in
+    // trtllm-jenkins-shared-lib/resources/trtllm/ci/excluded_nodes.yaml.
     def llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
@@ -5043,7 +5073,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                                 values:
                                 - "core"
                                 - "qa_only"
-${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -5717,7 +5746,9 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
                         cd ${llmSrc}/tests/integration/defs && \\
                         ${newTestCmdLine.join(" ")}
                         rc=\$?
-                        touch "\$PROGRESS_DONE_FILE"
+                        # As in the first run: a signal stands in for a done file that cannot
+                        # be created.
+                        touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
                         wait \$WATCHER_PID
                         exit \$rc
                     """)
@@ -6660,7 +6691,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                         cd '${llmSrc}/tests/integration/defs'
                                         ${pytestCommand.join(" ")}
                                         rc=\$?
-                                        touch "\$PROGRESS_DONE_FILE"
+                                        # The watcher exits only once it learns that the tests
+                                        # have ended. If the done file cannot be created, a
+                                        # signal tells it instead.
+                                        touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
                                         wait \$WATCHER_PID
                                         exit \$rc
                                     """)
@@ -7233,7 +7267,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
 
     sh "pwd && ls -alh"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${whlUrl}' -O '${wheel_path.tokenize('/').last()}'")
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
@@ -7249,7 +7283,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
 
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${pkgUrl}' -O '${linuxPkgName}'")
     sh "tar -zvxf ${linuxPkgName}"
 
     // TODO: The steps below drove the removed TensorRT engine flow (trtllm-build / examples/run.py).
@@ -7352,11 +7386,40 @@ def runInEnrootOnNode(label, partitionTimeout)
     }
 }
 
+def launchKubernetesStagePod(pipeline, podSpec, containerName, String stageName, Map opts = [:], Closure runner)
+{
+    def stagePodSpec
+    try {
+        stagePodSpec = ciNodePolicy.apply(podSpec, [pipeline: "L0_Test", stage: stageName])
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "[NODE-EXCLUSION] ${stageName}: failed to apply node policy: ${e.toString()}"
+        if (opts.reportFailure != false) {
+            // Report before launch from an isolated parent-agent directory; no test tracker exists yet.
+            def resultStage = stageName.replaceAll(/[^-+\w\[\]]/, "_")
+            def postTag = opts.postTag ?: ""
+            preservePrimaryFailure(e) {
+                try {
+                    dir("node-policy-${resultStage}${postTag}") {
+                        cacheErrorAndUploadResult(pipeline, resultStage, { throw e }, {}, true,
+                            postTag, opts.isFinalAttempt != false, opts.retryContext, false, false)
+                    }
+                } catch (Exception reportError) {
+                    if (!reportError.is(e)) throw reportError
+                }
+            }
+        }
+        throw e
+    }
+    trtllm_utils.launchKubernetesPodWithPlacement(pipeline, stagePodSpec, containerName, opts.placementContext, runner)
+}
+
 def runInKubernetes(pipeline, podSpec, containerName)
 {
     return {
         stageName, runner -> stage(stageName) {
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName) {
+            launchKubernetesStagePod(pipeline, podSpec, containerName, stageName) {
                 echoNodeAndGpuInfo(pipeline, stageName)
                 runner()
             }
@@ -7403,7 +7466,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
     if (testFilter[(DEBUG_MODE)]) {
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
+        launchKubernetesStagePod(pipeline, podSpec, containerName, stageName, { runner("", true, null) })
         return
     }
 
@@ -7436,7 +7499,11 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                     // launch a fresh cleanup pod if this pod dies mid-run.
                     registerSlurmResource(stageName, [podSpec: attemptPodSpec, containerName: containerName])
                 }
-                trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
+                launchKubernetesStagePod(pipeline, attemptPodSpec, containerName, stageName,
+                    [placementContext: attemptPlacementContext, postTag: "-node-policy-launch-${launchAttempt}",
+                     isFinalAttempt: launchAttempt > K8S_INFRA_RETRY_MAX,
+                     retryContext: [scope: InfraFailure.K8S, stageName: stageName, attempt: launchAttempt,
+                         backoffMs: 60L * 1000L, infraRetryMax: K8S_INFRA_RETRY_MAX, launchOnly: true]], {
                     attemptPlacementContext.runnerStarted = true
                     runner("", true, null)
                 })
@@ -7534,7 +7601,10 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
             def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
-            trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, { runner(attemptTag, isFinalAttempt, retryContext) })
+            launchKubernetesStagePod(pipeline, attemptPodSpec, containerName, stageName,
+                [placementContext: attemptPlacementContext, postTag: attemptTag,
+                 isFinalAttempt: isFinalAttempt, retryContext: retryContext],
+                { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
             }
@@ -8223,7 +8293,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb -O cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             // Match the CUDA the DLFW base image builds the wheel with.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
@@ -8624,7 +8694,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
         } else {
             stage(values.name) {
                 def imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                launchKubernetesStagePod(pipeline, imageSanitySpec, "trt-llm", values.name, {
                     sh "env | sort"
                     def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
                     runLLMBuild(pipeline, cpuArch, false, "imageTest/")
@@ -8639,7 +8709,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
 
 pipeline {
     agent {
-        kubernetes createKubernetesPodConfig("", "agent")
+        kubernetes ciNodePolicy.apply(createKubernetesPodConfig("", "agent"), [pipeline: "L0_Test"])
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/

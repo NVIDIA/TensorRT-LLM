@@ -241,6 +241,7 @@ def test_latency_command_forwards_iteration_log(enabled: bool, tmp_path: Path) -
     options = SimpleNamespace(
         backend="pytorch",
         beam_width=1,
+        checkpoint_format=None,
         checkpoint_path=tmp_path,
         concurrency=1,
         dataset_path=dataset,

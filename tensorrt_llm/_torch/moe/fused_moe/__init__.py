@@ -20,7 +20,8 @@ from .activation import (ACTIVATION_PAYLOAD, DEFAULT_MOE_ACTIVATION,
 from .configurable_moe import ConfigurableMoE
 from .create_moe import (MoEImplClass, create_moe, resolve_moe_cls,
                          resolve_moe_impl)
-from .cutedsl import (TrtllmCutedslFusedFc12Nvfp4Impl,
+from .cutedsl import (TrtllmCutedslFusedFc12Mxfp8Impl,
+                      TrtllmCutedslFusedFc12Nvfp4Impl,
                       TrtllmCutedslGroupedGemmBf16Impl,
                       TrtllmCutedslGroupedGemmNvfp4Impl,
                       TrtllmCutedslGroupedGemmNvfp4PlusImpl,
@@ -77,6 +78,7 @@ __all__ = [
     "FlashinferCutedslNvfp4Impl",
     "FlashinferCutedslW4a16Nvfp4Impl",
     "CuteDslFc12FusedMoE",
+    "TrtllmCutedslFusedFc12Mxfp8Impl",
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "CuteDslFusedMoE",
     "TrtllmCutedslGroupedGemmNvfp4Impl",

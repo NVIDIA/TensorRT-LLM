@@ -1092,9 +1092,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # A backend that reuses its buffers across calls can have only one chunk
         # in flight, and each chunk's output is gone once the next one runs.
-        reuses_buffers = moe.backend.input_requirement.run_moe_reuses_buffers
+        # A backend whose grid must be co-resident cannot overlap two chunks.
+        input_requirement = moe.backend.input_requirement
+        reuses_buffers = input_requirement.run_moe_reuses_buffers
         use_multi_stream = (
-            not moe.enable_alltoall and moe.aux_stream is not None and not reuses_buffers
+            not moe.enable_alltoall
+            and moe.aux_stream is not None
+            and not reuses_buffers
+            and not input_requirement.run_moe_requires_coresident_grid
         )
 
         # ========== Setup auxiliary stream ==========
@@ -1655,8 +1660,10 @@ class FusedCommMoEScheduler(MoEScheduler):
     ) -> List[torch.Tensor]:
         """Drive the per-chunk kernel launches, padding zero-token chunks.
 
-        Stage hooks + AllReduce only fire at the (first|last) chunk of the
-        (first|last) repeat, matching the external-comm path. The
+        Standard EPLB stage hooks and statistics AllReduce only fire at the
+        (first|last) chunk of the (first|last) repeat, matching the
+        external-comm path. A per-layer dynamic EPLB layer instead plans every
+        chunk and releases that chunk's replica plan after its kernel. The
         ``idx_chunk >= len(x_chunks)`` branch only triggers when
         ``real_local == 0`` (this rank has no tokens but peers do): class
         invariant 7 says launch every chunk on every EP rank so the in-kernel
@@ -1687,6 +1694,10 @@ class FusedCommMoEScheduler(MoEScheduler):
                 [lst[idx_chunk] for lst in all_rank_chunk_size_list] if had_meta else None
             )
 
+            # Bracket the whole chunk, not ``run_moe``: overrides of ``_forward_chunk`` (e.g. the
+            # GLM Rubin direct stage) launch the kernel themselves on some ranks only.
+            if moe.enable_dummy_allreduce:
+                moe.dummy_allreduce()
             out_chunk = self._forward_chunk(
                 x_chunk,
                 rl_chunk,
@@ -1699,6 +1710,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 row_offset=row_offset,
                 routing_aux=routing_aux_chunk,
             )
+            if moe.enable_dummy_allreduce:
+                moe.dummy_allreduce()
             row_offset += x_chunk.shape[0]
             outputs.append(out_chunk)
         return outputs

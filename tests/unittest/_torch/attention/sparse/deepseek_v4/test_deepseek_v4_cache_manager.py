@@ -653,7 +653,14 @@ class _HistoryCache:
         self.calls: list[tuple[int | None, int | None]] = []
         self.fail_resize = False
 
-    def resize(self, capacity: int | None, history_length: int | None) -> bool:
+    def resize(
+        self,
+        capacity: int | None,
+        history_length: int | None,
+        *,
+        complete_optional_recovery: bool = False,
+    ) -> bool:
+        del complete_optional_recovery
         self.calls.append((capacity, history_length))
         if self.fail_resize:
             return False

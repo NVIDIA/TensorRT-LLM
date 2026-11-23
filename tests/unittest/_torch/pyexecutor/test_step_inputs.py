@@ -982,6 +982,7 @@ def test_replay_with_a_different_pack_issues_its_copies_eagerly(early):
     runner._check_strict_buffer_stability = lambda meta: None
     runner._get_num_tokens_for_key = lambda key: 16
     runner._step_input_prologue_keys = {key: captured}
+    runner._prologue_copiers = {}
     runner._pre_replay_hooks = []
     runner._hostfunc_graph_keys = set()
     runner.graphs = {key: graph}

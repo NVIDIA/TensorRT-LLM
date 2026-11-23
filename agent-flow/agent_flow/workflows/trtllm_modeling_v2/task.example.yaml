@@ -1,5 +1,5 @@
 # trtllm-modeling-v2 task specification: every key the spec accepts, with its default. Fill it in
-# by following spec/INTAKE.md, lint it with `trtllm-modeling-v2 intake lint --task task.yaml`, and check it
+# by following spec/INTAKE.md and check it
 # with `trtllm-modeling-v2 --task task.yaml --workspace W --dry-run`. `trtllm-modeling-v2 intake
 # derive --checkpoint <dir> --repo <checkout> --goal "..." --out D` writes a starting spec. Or derive one:
 # `trtllm-modeling-v2 --checkpoint <dir> --site site.yaml --goal "..." --workspace W` writes
@@ -41,9 +41,10 @@ features: []
 #   kv_fp8:
 #     unit: core                    # default core
 #     members: [tep4]               # default: the unit's, and the benchmark runs at one of them
-#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at every
-#                                   # member of its unit; accuracy alone checks the setting took
-#                                   # effect (spec/INTAKE.md). `acceptance` needs a speculator unit
+#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at the
+#                                   # members of its unit its benchmark does not run at; accuracy
+#                                   # alone judges the setting by its score (spec/INTAKE.md).
+#                                   # `acceptance` needs a speculator unit
 #     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # over the unit's; flags appended
 #     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
 #     env: {}                       # added to the gate command's environment
@@ -56,14 +57,10 @@ features: []
 #   # on a feature unit that changes a KV dtype or chunking is a combination; core's own variant
 #   # proves the axis, so add it only when the request names it.
 
-# A requested feature@member cell no check covers (`coverage.yaml`) stops the run at preflight
-# unless accepted here: `<feature>@<member>`, `<feature>@*` for a row, `<unit>+<unit>` for a pair.
-# coverage: {accept: [mtp7@tp4, disagg+multimodal@*]}
-
 # `smoke` (a unit's boot alone), `bringup` (each unit at its cheapest member; no variant, no
 # delivery check, and no CI files: the accuracy test, its test list entry, the anchor's row,
 # when every unit is smoke or bringup), `standard` (the default: this file as written), `certified` (also the
-# boot boundary phases and the serve gate, and each benchmark at every member). For the
+# serve gate, and each benchmark at every member). For the
 # run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
 
@@ -91,7 +88,7 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #   chunked_prefill: false     # default false
 #   overlap_scheduler: true    # default true  (--disable_overlap_scheduler)
 #   kv_cache_reuse: false      # default false: block reuse is a non-core feature, proven by a
-#                              # `reuse` variant (kv_cache_config.enable_block_reuse: true)
+#                              # `reuse` variant (runtime: {kv_cache_reuse: true})
 #   # Anything else the gate command needs, verbatim. Without --max_seq_len the engine sizes its
 #   # cache for `max_position_embeddings` (`Impossible to fit in any sequence in kvCache`).
 #   # max_seq_len = isl + osl; max_batch_size >= the concurrency the workload claims (a global total).
@@ -110,7 +107,7 @@ environment:
   kind: local
 
   # REQUIRED: the interpreter every Python command runs under, the editable install to measure.
-  # It must exist at launch (`intake lint` checks a path visible from this host).
+  # It must exist at launch.
   python: /path/to/TensorRT-LLM/.venv-3.12/bin/python
 
   # Exported to every command. Preflight requires TMPDIR and CLAUDE_CODE_TMPDIR outside /tmp, and
@@ -119,19 +116,14 @@ environment:
     TMPDIR: /path/to/scratch/tmp
     CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
 
-  # A checkpoint the STOCK modeling path supports, booted by the substrate gate when the stock path
-  # does not know the run's own architecture (and only then). Prefer it to `--skip-substrate-gate`,
-  # which also gives up the MPI spawn and NVRTC checks.
-  # substrate_checkpoint: /path/to/Qwen3-30B-A3B
-
   # --- session_spool ------------------------------------------------------
   # REQUIRED with session_spool: the gate spool, a directory a running session watches.
   # spool: /path/to/scratch/spool
   # gpus_per_node: 4
-  # gpu_memory_gib: 288                     # per device: the lint sizes engines and disagg by it
+  # gpu_memory_gib: 288                     # per device: engines and disagg are sized by it
   # time_limit: "04:00:00"                  # the bare spool's own session
-  # The image the GPU jobs run in, if any, and how host paths appear inside it: the intake lint
-  # checks the run's paths through them. How the image is started is yours.
+  # The image the GPU jobs run in, if any, and how host paths appear inside it. How the image is
+  # started is yours.
   # container_image: /path/to/image
   # mounts: [/data:/data]
   #
@@ -171,13 +163,10 @@ accuracy:
 
   # `statistical` (default): reference - k x SE, the SE binomial over the benchmark's sample count
   # (0.75 points for GSM8K's 1319 questions at 92 %: k = 2 puts the floor 1.5 points down);
-  # `tolerance`: reference - `tolerance`. A unit gated at `shift_min_members` or more whose every
-  # member scores over 1 SE low is a FINDING, blocking delivery until `acknowledge` gives a reason.
+  # `tolerance`: reference - `tolerance`.
   # floor:
   #   rule: statistical
   #   k: 2.0                   # default
-  #   shift_min_members: 2     # default
-  #   acknowledge: {dspark: "every member -0.9..-1.1: drafter changes rounding, see 06-gates/..."}
 
   # In benchmark points; read only under `floor.rule: tolerance`. Default 5.0.
   tolerance: 5.0
@@ -222,10 +211,10 @@ accuracy:
   #   tests: []                    # more node ids, each run as a job of its own
   #   timeout: 7200                # default, seconds
 
-  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration per prompt
-  # against built-in modeling (`=off`; fails under a 0.95 ratio when a paired test finds the drop
-  # significant), against the previous tree's verdict, and against 1.0. With no `=off` path, declare
-  # `measured_reference` (floor 0.95 x it) or `min_absolute` with its `floor_source`, per unit.
+  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration over the
+  # workload, in one load, held to 1.0 (every draft rejected) and to the floor the unit declares:
+  # `measured_reference` (floor 0.95 x it) or `min_absolute`, with its `floor_source`. A unit that
+  # declares none is held to 1.0 alone, and its verdict says so.
   # acceptance:
   #   # Default: the first `num_prompts` questions of the accuracy dataset, from the local cache.
   #   # Each workload key below also works inside a unit's entry, for that unit alone.
@@ -235,49 +224,23 @@ accuracy:
   #   # prompts: [...]              # or the prompts outright, or prompts_file: a YAML/JSON list
   #   max_tokens: 256               # default
   #   min_draft_iterations: 32      # default; fewer fails as "workload too short"
-  #   min_prompts: 32               # default; fewer fails as "workload too small"
-  #   regression: {alpha: 0.05, min_effect: 0.1}   # the defaults
   #   mtp: {min_absolute: 1.5, floor_source: "03-plan/acceptance-spike.md: reference 2.31"}
   #   dspark: {measured_reference: 3.32}   # floor 3.15
 
-  # The BOOT gate's workload, run-wide or per unit; keywords match
-  # generated text only. A `multimodal` unit with no image prompt sends the tree's
-  # tests/integration/test_input_files/merlion.png.
+  # The BOOT gate's workload, run-wide or per unit. An answer must not be empty; what it
+  # says is the benchmark's to judge. A `multimodal` unit with no image prompt sends the
+  # tree's tests/integration/test_input_files/merlion.png.
   # boot:
   #   prompts:
   #     - "The capital of France is"
-  #     - prompt: "Natalia sold 48 clips in April and half as many in May. How many in all?"
-  #       keywords: ["72"]
+  #     - "In one sentence, photosynthesis is"
   #   # prompts_file: boot_prompts.yaml   # or a YAML/JSON list of plain prompts
-  #   keywords: [Paris]             # each must appear in some generated text
   #   max_tokens: 32                # default
   #   multimodal:
   #     prompts:
   #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
   #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
   #         render: raw                              # pre-rendered; or `loader`
-  #         keywords_any: [carrot]
-
-  # Optional BOOT BOUNDARIES, off unless `enabled: true` or `profile: certified`.
-  # One member's boot of each unit (`members`, else attention DP first, then the widest; never a
-  # configuration variant's) adds sequential probes then loaded requests in the SAME engine.
-  # Both probe outputs must contain and match at least `agree_tokens` tokens (EOS ignored), but for
-  # a near-tie: legs that part on two tokens within `tie_margin` nats in a leg's own top-5 log-probs.
-  # Long inputs are exactly max_seq_len - max_tokens - 1 tokens, capped at max_num_tokens - 1
-  # without chunked prefill. Needs explicit max_seq_len; long_prompts: 0 disables long inputs.
-  # Submitted concurrency is at most max_batch_size, not proof of actual scheduler batches or
-  # CUDA graph execution. Cache reuse stays as declared. Stock-path substrate boots omit these.
-  # envelope:
-  #   enabled: true
-  #   max_tokens: 16               # default
-  #   agree_tokens: 4              # default
-  #   long_prompts: 2              # default
-  #   tie_margin: 0.15             # default, nats
-  #   members: [dep4]              # default: one per unit, as above
-  #   # One right continuation each: open-ended prompts have near-tied tokens that flip with batch
-  #   # shape (MoE routing, low-precision GEMM tactics) far more often than these.
-  #   probes: ["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]
-  #   timeout: 3600                # default, seconds for the complete boot; CLI --timeout overrides
 
   # The SERVE gate: `trtllm-serve` starts each unit's target with the accuracy gate's options at its
   # widest member and answers one completion (and an image chat for a unit whose boot sends one).

@@ -467,12 +467,13 @@ class ReportUtility:
             if kv_cache_mem_percent is not None else None
 
         # Engine/Backend details
-        from tensorrt_llm._torch.model_config import ModelConfig
         from tensorrt_llm._utils import torch_dtype_to_str
+        from tensorrt_llm.bench.tuning.settings import load_runtime_model_config
 
+        # Read the configuration in the checkpoint format the LLM loaded.
         model = self.rt_cfg.model_path or self.rt_cfg.model
-        model_config = ModelConfig.from_pretrained(model,
-                                                   trust_remote_code=True)
+        model_config = load_runtime_model_config(
+            model, self.kwargs.get("checkpoint_format"))
 
         validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 

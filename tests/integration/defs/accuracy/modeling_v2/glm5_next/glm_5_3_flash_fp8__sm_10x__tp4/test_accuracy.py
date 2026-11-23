@@ -33,8 +33,9 @@ from ....accuracy_core import GSM8K, LlmapiAccuracyTestHarness, assert_acceptanc
 from ..._env import scoped_env_overrides
 
 # The target refuses other GPUs at construction: certification is per GPU architecture.
-skip_not_sm100 = pytest.mark.skipif(
-    get_sm_version() != 100, reason="the glm5_next FP8 target is certified on sm_100 only"
+skip_not_sm10x = pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="the glm5_next FP8 target is certified on sm_100 and sm_103 only",
 )
 
 
@@ -72,7 +73,7 @@ class TestModelingV2Glm53FlashFp8Sm10xTp4(LlmapiAccuracyTestHarness):
     # Each engine also checks, on its first forward, that the metadata fields and cache members
     # the target reads exist (TRTLLM_MODELING_V2_VALIDATE, passed to the ranks).
 
-    @skip_not_sm100
+    @skip_not_sm10x
     @pytest.mark.skip_less_device(4)
     def test_gsm8k(self):
         with (
@@ -100,7 +101,7 @@ class TestModelingV2Glm53FlashFp8Sm10xTp4(LlmapiAccuracyTestHarness):
             f"one-token prompt changed with the slot's history: {fresh} -> {after}"
         )
 
-    @skip_not_sm100
+    @skip_not_sm10x
     @pytest.mark.skip_less_device(4)
     def test_gsm8k_mtp3(self):
         with (

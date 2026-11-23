@@ -11,18 +11,24 @@ produces the runner's gemm2 rows bit for bit and returns its ``do_finalize=False
 * ``CUBIN``: the runner's own FC1 and FC2 (also where it runs its fine-grained-sync pair, which has no FC1-only
   entry: ``TLLM_USE_FINE_GRAINED_SYNC`` with such a cubin for the shape).
 
+A model that declares only ``MoEDecodeOptions.cute_fc2_rows`` takes ``CUTE_FC2`` alone (:func:`cute_fc2_opt_in`), on the
+NVFP4 runner's entries with routing tables too.
+
 Lamport FC2 (:class:`LamportFc2Buffer`): ``ENGINE`` / ``CUTE_FC2`` store nothing before their PDL wait, release their
 dependents only after it and write each word of a real row once (``cvt.rn.satfinite.bf16x2.f32``, never 0xFFFFFFFF),
 so the MoE-output all-reduce can poll their rows instead of waiting for FC2.
 """
 
 import enum
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._utils import is_blackwell_datacenter
 
 from .decode_front import max_num_tiles
 from .kernel_inputs import get_data_or_none, to_trtllm_gen_act_type
@@ -46,7 +52,8 @@ N64_MIN_ROWS = 225
 
 #: The FC2 cubin options ``moe_lowm_fc2`` reproduces bit for bit (``get_gemm2_kernel_options`` of the C++ runner):
 #: E2m1 x E2m1 -> FP32 -> BF16 in tiles of 128 x TILE_N with M128 N8 K64 MMAs over the whole K in order (one CTA per
-#: tile, no split-K). The tile K, stage count, unrolling and tile scheduler only change when those MMAs issue.
+#: tile, no split-K). The stage count, unrolling and tile scheduler only change when those MMAs issue; the tile K sets
+#: the zero-filled K tail the kernel re-applies (``moe_lowm_fc2.supports``).
 _CUTE_FC2_OPTIONS = {
     "dtypeA": "E2m1",
     "dtypeB": "E2m1",
@@ -76,37 +83,53 @@ class DecodeKernel(enum.Enum):
     ENGINE = 2
 
 
-#: (act type, tile, config) -> whether ``moe_lowm_fc2`` reproduces that tactic's FC2 cubin. The C++ runners are
-#: shared per act type (``FP4BlockScaleMoERunner.get_runner``), so the key names the cubin.
-_FC2_REPRODUCED: Dict[Tuple[int, int, int], bool] = {}
+#: (act type, tile, config) -> the tile K of that tactic's FC2 cubin where ``moe_lowm_fc2`` reproduces it, else None.
+#: The C++ runners are shared per act type (``FP4BlockScaleMoERunner.get_runner``), so the key names the cubin.
+_FC2_REPRODUCED: Dict[Tuple[int, int, int], Optional[int]] = {}
 
 
-def _cute_fc2_fits(
+def fc2_cubin_tile_k(
+    kernel_runner: torch.ScriptObject, act_type: int, tactic: List[int]
+) -> Optional[int]:
+    """The tile K of the tactic's FC2 cubin where ``moe_lowm_fc2`` reproduces it, else None."""
+    key = (int(act_type), int(tactic[0]), int(tactic[1]))
+    if key not in _FC2_REPRODUCED:
+        options = kernel_runner.get_gemm2_kernel_options(key[1], key[2])
+        _FC2_REPRODUCED[key] = int(options["tileK"]) if cute_fc2_reproduces(options) else None
+    return _FC2_REPRODUCED[key]
+
+
+def cute_fc2_tile_k(
     kernel_runner: torch.ScriptObject,
     act_type: int,
     tactic: List[int],
     args: "FP4BlockScaleMoEInputs",
     top_k: int,
     intermediate_size: int,
-) -> bool:
-    if len(tactic) != 2 or tactic[0] != TILE_N or tactic[1] < 0:
-        return False
+    max_tokens: int = MAX_TOKENS,
+) -> Optional[int]:
+    """The tile K of the tactic's FC2 cubin where ``moe_lowm_fc2`` stands in for it on a call of up to ``max_tokens``
+    tokens, else None."""
+    if len(tactic) != 2 or tactic[0] != TILE_N or tactic[1] < 0 or not IS_CUTLASS_DSL_AVAILABLE:
+        return None
     x, w2, w2_sf = args.hidden_states, args.gemm2_weights, args.gemm2_weights_scale
-    if x.shape[0] > MAX_TOKENS or w2.dim() != 3 or w2_sf.dim() != 3:
-        return False
+    if x.shape[0] > max_tokens or w2.dim() != 3 or w2_sf.dim() != 3:
+        return None
     if w2.shape[2] * 2 != intermediate_size:
-        return False
-    key = (int(act_type), int(tactic[0]), int(tactic[1]))
-    reproduced = _FC2_REPRODUCED.get(key)
-    if reproduced is None:
-        reproduced = _FC2_REPRODUCED[key] = cute_fc2_reproduces(
-            kernel_runner.get_gemm2_kernel_options(key[1], key[2])
-        )
+        return None
+    tile_k = fc2_cubin_tile_k(kernel_runner, act_type, tactic)
+    if tile_k is None:
+        return None
+    from tensorrt_llm._torch.kernels.blackwell.moe_lowm_fc2 import supports
+
+    if not supports(w2.shape, tile_k):
+        return None
     # The CuTe FC2 stands in for the tuned tactic's FC2; the runner runs its fine-grained-sync pair instead (which
     # has no FC1-only entry) only where TLLM_USE_FINE_GRAINED_SYNC is set and such a cubin exists for this shape.
-    return reproduced and not kernel_runner.uses_fine_grained_sync(
-        key[1], top_k, 2 * x.shape[1], intermediate_size, w2.shape[0], x.shape[0]
+    fine_grained = kernel_runner.uses_fine_grained_sync(
+        tactic[0], top_k, 2 * x.shape[1], intermediate_size, w2.shape[0], x.shape[0]
     )
+    return None if fine_grained else tile_k
 
 
 def _engine_fits(args: "FP4BlockScaleMoEInputs", act_type: int, top_k: int) -> bool:
@@ -248,9 +271,40 @@ def select(
         return DecodeKernel.ENGINE
     if do_finalize or output is not None or args.gemm2_bias is not None:
         return DecodeKernel.CUBIN
-    if _cute_fc2_fits(kernel_runner, act_type, tactic, args, top_k, intermediate_size):
+    if cute_fc2_tile_k(kernel_runner, act_type, tactic, args, top_k, intermediate_size) is not None:
         return DecodeKernel.CUTE_FC2
     return DecodeKernel.CUBIN
+
+
+def cute_fc2_opt_in(
+    kernel_runner: torch.ScriptObject,
+    act_type: int,
+    tactic: List[int],
+    args: "FP4BlockScaleMoEInputs",
+    *,
+    top_k: int,
+    intermediate_size: int,
+    rows: int,
+    use_dp: bool,
+    do_finalize: bool,
+    output: Optional[torch.Tensor],
+) -> Optional[int]:
+    """:func:`cute_fc2_tile_k` for a model's ``MoEDecodeOptions.cute_fc2_rows`` (``rows``): un-finalized attention-TP
+    calls of up to that many tokens on SM 10.0 / 10.3, without FC2 bias or output tensor."""
+    _LAST_FC2.ptr, _LAST_FC2.node = 0, None
+    if rows <= 0 or use_dp or do_finalize or output is not None or args.gemm2_bias is not None:
+        return None
+    if not is_blackwell_datacenter():
+        return None
+    return cute_fc2_tile_k(
+        kernel_runner,
+        act_type,
+        tactic,
+        args,
+        top_k,
+        intermediate_size,
+        max_tokens=rows,
+    )
 
 
 def n_max_for(num_rows: int) -> int:
@@ -371,8 +425,11 @@ def run_cute_fc2(
     fc1_outputs: List[torch.Tensor],
     args: "FP4BlockScaleMoEInputs",
     lamport_out: Optional[torch.Tensor],
+    cubin_tile_k: Optional[int] = None,
+    record: bool = False,
 ) -> List[torch.Tensor]:
-    """``CUTE_FC2`` on the FC1-only runner's outputs; returns the runner's ``do_finalize=False`` triple."""
+    """``CUTE_FC2`` on the FC1-only runner's outputs, bit for bit the FC2 cubin of tile K ``cubin_tile_k`` (None: the
+    kernel's); returns the runner's ``do_finalize=False`` triple. ``record``: the rows :func:`precedes` vouches for."""
     from tensorrt_llm._torch.kernels.blackwell.moe_lowm_fc2 import moe_lowm_fc2
 
     (
@@ -398,8 +455,65 @@ def run_cute_fc2(
         cta_limit,
         num_ctas.view(-1),
         out,
+        cubin_k_tile=cubin_tile_k,
     )
+    if record:
+        state = _capture_state()
+        _LAST_FC2.ptr = out.data_ptr()
+        _LAST_FC2.node = (state[0], state[1][0]) if state and len(state[1]) == 1 else None
     return [out, expert_weights, expanded_idx_to_permuted_idx]
+
+
+@dataclass
+class _Fc2Record:
+    """A CuTe FC2 launch: its output address and, under graph capture, (capture id, kernel node)."""
+
+    ptr: int = 0
+    node: Optional[Tuple[int, int]] = None
+
+
+#: The last recorded CuTe FC2 (:func:`run_cute_fc2`).
+_LAST_FC2 = _Fc2Record()
+
+
+def _capture_state() -> Optional[Tuple[int, List[int]]]:
+    """(capture id, dependency node addresses) of the current stream while a graph is captured."""
+    if not torch.cuda.is_current_stream_capturing():
+        return None
+    from cuda.bindings import driver
+
+    res = driver.cuStreamGetCaptureInfo(driver.CUstream(torch.cuda.current_stream().cuda_stream))
+    if res[0] != driver.CUresult.CUDA_SUCCESS:
+        return None
+    if res[1] != driver.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+        return None
+    deps = next((x for x in res[3:] if isinstance(x, (list, tuple))), None)
+    if deps is None:
+        return None
+    return int(res[2]), [_node_id(d) for d in deps]
+
+
+def _node_id(node: object) -> int:
+    try:
+        return int(node)
+    except TypeError:
+        return int(node.getPtr())
+
+
+def precedes(fc2: torch.Tensor) -> Tuple[bool, str]:
+    """(Whether ``fc2`` is the last recorded CuTe FC2's output and that launch is a dependency of the current stream's
+    next launch in the captured graph, reason). The FC2 releases its dependents after its own wait."""
+    # Each FC2 launch vouches for one boundary at most.
+    ptr, node = _LAST_FC2.ptr, _LAST_FC2.node
+    _LAST_FC2.ptr, _LAST_FC2.node = 0, None
+    if not ptr or fc2.data_ptr() != ptr:
+        return False, "rows not from the last CuTe FC2"
+    state = _capture_state()
+    if state is None:
+        return False, "not captured"
+    if node is None or node[0] != state[0] or node[1] not in state[1]:
+        return False, "CuTe FC2 not a dependency of the boundary"
+    return True, "behind the CuTe FC2"
 
 
 def rows_in_lamport(rows: torch.Tensor, lamport_out: Optional[torch.Tensor]) -> bool:

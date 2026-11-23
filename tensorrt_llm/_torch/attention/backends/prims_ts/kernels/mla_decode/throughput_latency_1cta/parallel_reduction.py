@@ -938,6 +938,7 @@ def run_parallel_gmem_reduction_kernel(
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
     requested_splits=None,
+    cp_rank=0,
 ):
     """Reduce split-KV partials with row-shared local and peer statistics."""
 
@@ -952,7 +953,10 @@ def run_parallel_gmem_reduction_kernel(
     request_is_active = cutlass.Boolean(True)
     if cutlass.const_expr(not finalize_attention):
         request_is_active = runtime_request_publishes(
-            cfg, cache_seqs, cute.arch.block_idx()[2]
+            cfg,
+            cache_seqs,
+            cute.arch.block_idx()[2],
+            cp_rank=cp_rank,
         )
 
     if cutlass.const_expr(cluster_size == 1):

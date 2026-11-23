@@ -651,6 +651,8 @@ def _forward_step_executor(monkeypatch, log: list):
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current)
     monkeypatch.setattr(torch.cuda, "stream", stream)
+    monkeypatch.setattr(py_executor, "current_cuda_stream", lambda: current)
+    monkeypatch.setattr(py_executor, "CudaStreamScope", stream)
     monkeypatch.setattr(py_executor, "nvtx_range", lambda message: (lambda fn: fn))
 
     executor = PyExecutor.__new__(PyExecutor)

@@ -54,6 +54,7 @@ def _request(mm_data=None):
         py_disaggregated_params=None,
         sampling_config=None,
         py_multimodal_data=mm_data,
+        raise_if_validation_failed=Mock(),
     )
 
 
@@ -67,6 +68,8 @@ def _validating_executor(model):
     executor.sampler = Mock()
     executor._validate_token_id_range = Mock()
     executor._validate_request_budget = Mock()
+    executor._validate_embedding_bias = Mock()
+    executor._num_embeddings = 1234
     return executor
 
 

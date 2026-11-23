@@ -99,6 +99,17 @@ inline const AlgoListType spark_bf16_algo_list = {
     {{8, 8192, 4096}, {67, 3, 38, 1, 0, 0, 0, 0}},
 };
 
+// bf16*bf16->fp32->bf16 on SM120, looked up before bf16_algo_list
+inline const AlgoListType sm120_bf16_algo_list = {
+    // Gemma tied lm_head (hidden 2560, vocab 262144), m 33-64.
+    // [-algo67 -m_tile20 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom22 -m_mma0 -m_cga0]
+    {{64, 2560, 262144}, {67, 20, 35, 1, 0, 0, 22, 0}},
+    // Gemma tied lm_head (hidden 1536, vocab 262144), m 17-64.
+    // [-algo67 -m_tile495 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom30 -m_mma0 -m_cga0]
+    {{32, 1536, 262144}, {67, 495, 35, 1, 0, 0, 30, 0}},
+    {{64, 1536, 262144}, {67, 495, 35, 1, 0, 0, 30, 0}},
+};
+
 // bf16*bf16->fp32->bf16
 inline const AlgoListType bf16_algo_list = {
     // Deepseek v3/R1 router gemm

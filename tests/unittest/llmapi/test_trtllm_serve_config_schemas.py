@@ -295,6 +295,25 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": 7}}}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": -1}}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_batch_size": 4, "max_queue_delay_ms": 5}},
+            True,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": True}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_queue_delay_ms": -1}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 3_000_000_000}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 2_147_483_647}},
+            True,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_szie": 4}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 1}}, True),
@@ -582,12 +601,146 @@ def test_connector_timeout_constraints(
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+def test_memory_monitor_config_matches_runtime(schemas: dict[str, dict], filename: str) -> None:
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+    cases = [
+        ({"mode": "full", "ranks": [0, 3], "periodic_report_interval_s": 30}, True),
+        ({"mode": "full", "record_stacks": True, "report_dir": "/tmp/reports"}, True),
+        ({"oom_report_interval_s": 0}, True),
+        ({"oom_report_interval_s": 7 * 24 * 3600}, True),
+        ({"mode": "on"}, False),
+        ({"mode": 2}, False),
+        ({"ranks": []}, False),
+        ({"ranks": [-1]}, False),
+        ({"periodic_report_interval_s": 0.5}, False),
+        ({"periodic_report_interval_s": 1e10}, False),
+        ({"oom_report_interval_s": -1}, False),
+        ({"oom_report_interval_s": 7 * 24 * 3600 + 1}, False),
+        ({"report_dir": ""}, False),
+        ({"interval": 5}, False),
+        ({"periodic_report_interval": 30}, False),
+    ]
+    # As a trtllm-serve --config file is read: yaml.safe_load turns unquoted
+    # off/on into booleans and .inf into an infinite float.
+    for text, valid in [
+        ("mode: off", True),
+        ("mode: on", True),
+        ("mode: 0", True),
+        ("mode: 1", True),
+        ("mode: '1'", True),
+        ("mode: full", True),
+        ("oom_report_interval_s: .inf", False),
+        ("periodic_report_interval_s: .inf", False),
+    ]:
+        cases.append((yaml.safe_load(text), valid))
+    for value, valid in cases:
+        config = {"memory_monitor_config": value}
+        if filename == generator.DISAGG_SCHEMA:
+            config = {"context_servers": config}
+        errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+        assert (not errors) == valid, (value, [error.message for error in errors])
+        try:
+            MemoryMonitorConfig(**value)
+            runtime_valid = True
+        except ValidationError:
+            runtime_valid = False
+        assert runtime_valid == valid, value
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
 @pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
 def test_branch_snapshot_field_types(
     schemas: dict[str, dict], filename: str, section: str, value: bool | str, valid: bool
 ) -> None:
     config = {"kv_cache_config": {section: {"enable_branch_snapshot": value}}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (None, True),
+        (0, True),
+        (-1, True),
+        (4096, True),
+        (-2, False),
+        ("4096", False),
+        (1.5, False),
+    ],
+)
+def test_dspark_context_recompute_tail_type(
+    schemas: dict[str, dict], filename: str, value: object, valid: bool
+) -> None:
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 7,
+            "speculative_model": "/path/to/drafter",
+            "context_recompute_tail": value,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    "decoding",
+    [
+        {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
+        {"decoding_type": "Eagle3", "max_draft_len": 3, "speculative_model": "/path/to/eagle3"},
+        {"decoding_type": "DSpark", "max_draft_len": 7, "speculative_model": "/path/to/drafter"},
+    ],
+    ids=["MTP", "Eagle3", "DSpark"],
+)
+@pytest.mark.parametrize(
+    ("field", "value", "valid"),
+    [
+        ("rejection_sample_method", "standard", True),
+        ("rejection_sample_method", "block", True),
+        ("rejection_sample_method", "blocks", False),
+        ("rejection_sample_method", "Block", False),
+    ],
+)
+def test_rejection_sampling_option_values(
+    schemas: dict[str, dict],
+    filename: str,
+    decoding: dict,
+    field: str,
+    value: object,
+    valid: bool,
+) -> None:
+    config = {"speculative_config": {**decoding, "use_rejection_sampling": True, field: value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("yes", False)])
+def test_dspark_ancestral_draft_sampling_values(
+    schemas: dict[str, dict], filename: str, value: bool | str, valid: bool
+) -> None:
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 7,
+            "speculative_model": "/path/to/drafter",
+            "use_rejection_sampling": True,
+            "use_ancestral_draft_sampling": value,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 
@@ -935,6 +1088,24 @@ _GIB = 1 << 30
         (
             "kv_cache_config",
             {"defer_generation_only_release": True, "use_kv_cache_manager_v2": False},
+            False,
+        ),
+        # BlockReuseConfig
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_conversation", "drop_extended_turns": True}},
+            True,
+        ),
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_request", "drop_extended_turns": False}},
+            True,
+        ),
+        ("kv_cache_config", {"block_reuse_config": {"drop_extended_turns": False}}, True),
+        ("kv_cache_config", {"block_reuse_config": {"drop_extended_turns": True}}, False),
+        (
+            "kv_cache_config",
+            {"block_reuse_config": {"policy": "per_request", "drop_extended_turns": True}},
             False,
         ),
         # AttentionDpConfig

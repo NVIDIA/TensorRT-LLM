@@ -23,6 +23,12 @@ from torch.distributed.constants import default_pg_timeout
 
 from tensorrt_llm._torch.distributed.initialization import init_torch_distributed
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.visual_gen.batching import (
+    BatchInfo,
+    DynamicBatchScheduler,
+    split_batch_output,
+)
+from tensorrt_llm._torch.visual_gen.memory_monitor import WorkerMemoryMonitor
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
@@ -374,6 +380,7 @@ class DiffusionRequest:
     # Set only while the request is in flight on the rank0 -> N-rank hop; see
     # ``DiffusionExecutor._broadcast_request``.
     ref_sizes: Optional[List[int]] = field(default=None, repr=False)
+    batch_info: Optional[BatchInfo] = None
 
     def refs_to_shm(self) -> None:
         """Move reference payloads into shared memory, in place (producer side).
@@ -477,6 +484,7 @@ class DiffusionExecutor:
         self.world_size = dist.get_world_size()
         self.response_queue = queue.Queue()
         self.sender_thread = None
+        self.memory_monitor = WorkerMemoryMonitor(device_id, self.rank, self.world_size)
 
         # Only rank 0 handles IPC
         if self.rank == 0:
@@ -523,16 +531,19 @@ class DiffusionExecutor:
         logger.info(f"Worker {self.device_id}: Loading pipeline")
 
         try:
-            args = self.visual_gen_args
-            loader = PipelineLoader(args, device=f"cuda:{self.device_id}")
-            self.pipeline = loader.load(
-                skip_warmup=args.compilation_config.skip_warmup,
-            )
+            with self.memory_monitor.startup():
+                args = self.visual_gen_args
+                loader = PipelineLoader(args, device=f"cuda:{self.device_id}")
+                self.pipeline = loader.load(
+                    skip_warmup=args.compilation_config.skip_warmup,
+                )
+                self.memory_monitor.claim_weights(self.pipeline)
 
         except Exception as e:
             logger.error(f"Worker {self.device_id}: Failed to load pipeline: {e}")
             raise
 
+        self.memory_monitor.arm()
         logger.info(f"Worker {self.device_id}: Pipeline ready")
 
         # Sync all workers
@@ -604,10 +615,27 @@ class DiffusionExecutor:
 
     def serve_forever(self):
         """Main execution loop."""
+        config = self.visual_gen_args.batching_config
+        scheduler = DynamicBatchScheduler(
+            max_batch_size=config.max_batch_size,
+            max_queue_delay_ms=config.max_queue_delay_ms,
+        )
+        batching_enabled = (
+            self.pipeline.supports_dynamic_batching and self.visual_gen_args.cache_config is None
+        )
+        if config.max_batch_size > 1 and not batching_enabled:
+            logger.warning(
+                "Dynamic batching is inactive: the pipeline must support request batching "
+                "and cache_config must be unset. Requests will run independently."
+            )
         while True:
             req = None
             if self.rank == 0:
-                req = self.requests_ipc.get()
+                req = scheduler.next_request(
+                    self.requests_ipc.get,
+                    self.requests_ipc.poll,
+                    enabled=batching_enabled,
+                )
                 if req is not None:
                     req.refs_from_shm()
                 logger.info(f"Worker {self.device_id}: Request available")
@@ -625,6 +653,11 @@ class DiffusionExecutor:
                 break
 
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
+            if req.batch_info is not None:
+                logger.info(
+                    f"Dynamic batch: requests={req.batch_info.request_ids}, "
+                    f"images={sum(req.batch_info.sample_counts)}"
+                )
             self.process_request(req)
 
     def _merge_defaults(self, req: DiffusionRequest):
@@ -663,7 +696,9 @@ class DiffusionExecutor:
                     params.extra_params[key] = spec.default
 
     def process_request(self, req: DiffusionRequest):
-        """Process a single request."""
+        """Run one pipeline call and respond to every original request."""
+        request_ids = req.batch_info.request_ids if req.batch_info else (req.request_id,)
+        pending_request_ids = deque(request_ids)
         log_cuda_memory = _cuda_memory_logging_enabled()
         if log_cuda_memory:
             self._reset_cuda_peak_memory_stats()
@@ -693,29 +728,43 @@ class DiffusionExecutor:
             generation = time.perf_counter() - generation_start  # seconds
 
             if self.rank == 0:
+                outputs = split_batch_output(output, req.batch_info) if req.batch_info else [output]
                 # CUDA IPC handles are invalid within the producing process, so
                 # a same-process client takes the media via in-process handoff.
-                output.to_handle(local=self.in_client_process)
-                self.response_queue.put(
-                    DiffusionResponse(
-                        request_id=req.request_id,
-                        output=output,
-                        generation=generation,
-                    )
-                )
+                for request_id, request_output in zip(request_ids, outputs, strict=True):
+                    try:
+                        request_output.to_handle(local=self.in_client_process)
+                    except Exception as e:
+                        logger.error(f"Worker {self.device_id}: Output handoff failed: {e}")
+                        response = DiffusionResponse(
+                            request_id=request_id,
+                            error_msg=str(e),
+                            error_type=self.pipeline.classify_request_failure(e),
+                        )
+                    else:
+                        response = DiffusionResponse(
+                            request_id=request_id,
+                            output=request_output,
+                            generation=generation,
+                        )
+                    self.response_queue.put(response)
+                    pending_request_ids.popleft()
         except Exception as e:
             if log_cuda_memory:
                 self._log_cuda_peak_memory(req.request_id)
             logger.error(f"Worker {self.device_id}: Error: {e}")
             logger.error(traceback.format_exc())
             if self.rank == 0:
-                self.response_queue.put(
-                    DiffusionResponse(
-                        request_id=req.request_id,
-                        error_msg=str(e),
-                        error_type=self.pipeline.classify_request_failure(e),
+                for request_id in pending_request_ids:
+                    self.response_queue.put(
+                        DiffusionResponse(
+                            request_id=request_id,
+                            error_msg=str(e),
+                            error_type=self.pipeline.classify_request_failure(e),
+                        )
                     )
-                )
+            # After the error response is queued: the report takes a while.
+            self.memory_monitor.report_error(e)
 
     def _reset_cuda_peak_memory_stats(self) -> None:
         """Reset CUDA peak memory stats for this worker if CUDA is available."""
@@ -844,7 +893,10 @@ def run_diffusion_worker(
             resp_hmac_key=resp_hmac_key,
             in_client_process=in_client_process,
         )
-        executor.serve_forever()
+        try:
+            executor.serve_forever()
+        finally:
+            executor.memory_monitor.release()
         if executor.pipeline is not None:
             executor.pipeline.cleanup()
         dist.destroy_process_group()
@@ -1218,27 +1270,29 @@ class DiffusionRemoteClient:
         except RuntimeError as e:
             logger.warning(f"DiffusionClient: Failed to release request {request.request_id}: {e}")
 
-    def _process_requests(self):
-        """Process pending requests."""
+    def _process_requests(self, max_requests: int = 1):
+        """Send a bounded burst before polling responses so queued peers can batch."""
         req = None
         try:
-            if self._request_to_send is None:
-                req = self.pending_requests.get(timeout=POLL_TIMEOUT)
-                if req is None:
-                    try:
-                        self._send_shutdown()
-                    finally:
-                        self.shutdown_event.set()
-                    return
-                self._request_to_send = req
+            for index in range(max_requests):
+                if self._request_to_send is None:
+                    req = self.pending_requests.get(timeout=POLL_TIMEOUT if index == 0 else 0)
+                    if req is None:
+                        try:
+                            self._send_shutdown()
+                        finally:
+                            self.shutdown_event.set()
+                        return
+                    self._request_to_send = req
 
-            req = self._request_to_send
-            logger.info(f"DiffusionClient: Sending request {req.request_id}")
-            self.requests_ipc.put_nowait(req)
-            self._request_to_send = None
-            # Once the request has been handed to the workers it becomes the
-            # in-flight ("active") request from the client's perspective.
-            self._iter_stats.record_request_started(req.request_id, self.pending_requests.qsize())
+                req = self._request_to_send
+                logger.info(f"DiffusionClient: Sending request {req.request_id}")
+                self.requests_ipc.put_nowait(req)
+                self._request_to_send = None
+                # The client tracks requests handed to workers as in flight.
+                self._iter_stats.record_request_started(
+                    req.request_id, self.pending_requests.qsize()
+                )
         except queue.Empty:
             pass
         except zmq.Again:
@@ -1253,10 +1307,12 @@ class DiffusionRemoteClient:
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
 
-    def _process_responses(self):
-        """Poll and process responses."""
+    def _process_responses(self, max_responses: int = 1):
+        """Poll once, then drain a bounded burst of already-ready responses."""
         try:
-            if self.responses_ipc.poll(timeout=POLL_TIMEOUT):
+            for index in range(max_responses):
+                if not self.responses_ipc.poll(timeout=POLL_TIMEOUT if index == 0 else 0):
+                    break
                 response = self.responses_ipc.get()
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
@@ -1369,8 +1425,8 @@ class DiffusionRemoteClient:
             if worker_failure is not None:
                 self._abort_worker_group(worker_failure)
             if self._worker_failure is None:
-                self._process_requests()
-                self._process_responses()
+                self._process_requests(max_requests=self.args.batching_config.max_batch_size)
+                self._process_responses(max_responses=self.args.batching_config.max_batch_size)
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
 
         self._cleanup_ipc()

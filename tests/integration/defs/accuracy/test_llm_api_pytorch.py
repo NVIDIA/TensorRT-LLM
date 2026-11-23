@@ -58,8 +58,8 @@ from ..deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT, evaluate_gsm8k
 # isort: off
 from .accuracy_core import (
     GSM8K, MMLU, CnnDailymail, GPQADiamond, GSM8KInferenceX, JsonModeEval,
-    LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2,
-    assert_acceptance_length, assert_acceptance_length_for_llm,
+    QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS, LlmapiAccuracyTestHarness, LongBenchV1,
+    LongBenchV2, assert_acceptance_length, assert_acceptance_length_for_llm,
     assert_guided_decoding_regex, assert_kv_cache_reuse_for_llm,
     compute_acceptance_length)
 
@@ -1277,7 +1277,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             (False, False, False, True, False),
             (True, False, True, True, False),
             (True, True, True, True, False),
-            # low_precision_combine only valid with attention_dp=True
             (False, True, False, False, True),
             (True, True, True, True, True),
         ])
@@ -1291,6 +1290,27 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_tactic):
+        # create_strategy passes use_low_precision_moe_combine to
+        # NVLinkOneSided, NVLinkTwoSided, NcclEP, and DeepEPLowLatency. It
+        # returns None or AllGatherReduceScatter, without the flag, when
+        # attention DP is off or dp_size == 1, moe_tp_size != 1, or the tactic
+        # disallows all-to-all. dp_size is tp_size under attention_dp, and
+        # moe_tp_size is tp_size // ep_size.
+        tactic_allows_alltoall = moe_tactic != "cutlass"
+        if moe_tactic == "cutlass":
+            from tensorrt_llm._torch.moe.fused_moe.impl_environment import \
+                collect_moe_environment
+
+            # Cutlass NVFP4 issues the fused_moe op, which rejects all-to-all
+            # unless the build enables the OSS Cutlass MoE GEMM.
+            tactic_allows_alltoall = collect_moe_environment().oss_cutlass_moe
+        if low_precision_combine and not (attention_dp and tp_size > 1
+                                          and tp_size == ep_size
+                                          and tactic_allows_alltoall):
+            pytest.skip(
+                "use_low_precision_moe_combine is unused unless attention_dp, "
+                "dp_size > 1, moe_tp_size == 1, and the tactic allows all-to-all"
+            )
         skip_unless_moe_tactic_runs_here(moe_tactic)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -1482,10 +1502,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+    def _evaluate_guided_decoding(self, backend: str, mtp_nextn: int, mocker,
+                                  **llm_kwargs):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -1498,10 +1516,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
                   max_num_tokens=256,
-                  speculative_config=mtp_config)
+                  speculative_config=mtp_config,
+                  **llm_kwargs)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+        self._evaluate_guided_decoding(backend, mtp_nextn, mocker)
+
+    @skip_pre_hopper
+    def test_guided_decoding_breakable_prefill_cuda_graph(self, mocker):
+        self._evaluate_guided_decoding(
+            "xgrammar",
+            2,
+            mocker,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("mtp_nextn",
@@ -2790,6 +2823,59 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
+class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
+    # V4-Flash with its embedded DSpark drafter and NVFP4 routed experts.
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-nvfp4-DSpark"
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_gsm8k_dep4_confidence_scheduling(self, tmp_path: Path) -> None:
+        """Confidence-scheduled DSpark verification keeps GSM8K accuracy on DEP4."""
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64]
+        # Compact verify windows cost less than native K+1 rows, as in a measured table.
+        cost_table = tmp_path / "dspark_costs.json"
+        cost_table.write_text(
+            json.dumps({
+                "schema_version": 3,
+                "costs": {
+                    "5": {
+                        str(g): {
+                            "token_counts": [0, 3 * g, 4 * g, 5 * g],
+                            "step_time_ms": [10.0, 8.5, 9.0, 9.5],
+                        }
+                        for g in batch_sizes
+                    }
+                },
+            }))
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model=self.MODEL_PATH,
+            enable_confidence_scheduling=True,
+            confidence_cost_table_path=str(cost_table))
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
+                 max_batch_size=64,
+                 cuda_graph_config=CudaGraphConfig(batch_sizes=batch_sizes,
+                                                   enable_padding=True),
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                               free_gpu_memory_fraction=0.5),
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                task.evaluate(llm)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
 class TestDeepSeekV41FlashDSpark(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4.1-Flash"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
@@ -3237,6 +3323,50 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
                                      acceptance_length)
 
 
+@skip_no_sm120
+class TestGemma4_E4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-4-E4B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-E4B-it"
+    MTP_MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-E4B-it-assistant"
+    # Gemma 4 GSM8K: chat template with thinking off, a final-answer format prompt, and room for
+    # the full answer (256 tokens cuts many off).
+    GSM8K_MAX_OUTPUT_LEN = 1024
+    GSM8K_EVALUATOR_KWARGS = {
+        "apply_chat_template":
+        True,
+        "system_prompt":
+        ("Solve each math problem. End your answer with exactly one final "
+         "line in this format: #### <number>"),
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
+    }
+
+    def test_bf16_mtp(self, monkeypatch):
+        """MTP assistant with the overlap scheduler and CUDA graphs on FlashInfer."""
+        monkeypatch.setattr(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.8)
+        with LLM(self.MODEL_PATH,
+                 max_batch_size=32,
+                 max_seq_len=GSM8K.MAX_INPUT_LEN + self.GSM8K_MAX_OUTPUT_LEN,
+                 disable_mm_encoder=True,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                   enable_padding=True),
+                 prefill_cuda_graph_backend="breakable",
+                 prefill_capture_num_tokens=[512, 1024, 2048, 4096],
+                 speculative_config=MTPDecodingConfig(
+                     max_draft_len=3, speculative_model=self.MTP_MODEL_PATH),
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
+            assert_acceptance_length_for_llm("TestGemma4_E4B::test_bf16_mtp",
+                                             llm)
+
+
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
 
@@ -3369,11 +3499,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ])
     def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
                     enable_max_concurrency, enable_draft_len_schedule):
-        max_concurrency = 100 if enable_max_concurrency else None
+        max_concurrency = 16 if enable_max_concurrency else None
         draft_len_schedule = {
-            50: 4,
-            200: 3,
-            350: 2
+            4: 4,
+            16: 2,
+            32: 1,
         } if enable_draft_len_schedule else None
         cuda_graph_config = (CudaGraphConfig(
             enable_padding=True, max_batch_size=32) if enable_draft_len_schedule
@@ -3500,6 +3630,146 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   f"= {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_8B::test_dspark",
                                      acceptance_length)
+
+    _DSPARK_SAMPLED_SYSTEM_PROMPT = (
+        "You are a careful math tutor. Read the problem, identify the "
+        "quantities it gives and the quantity it asks for, and solve it step "
+        "by step. Show each intermediate calculation on its own line, check "
+        "the arithmetic once more before answering, and keep the explanation "
+        "short and concrete. Do not restate the problem, do not introduce "
+        "variables you do not use, and do not round intermediate results. "
+        "When a problem involves money, keep two decimal places; when it "
+        "involves time, convert everything to the same unit before adding. "
+        "End your response with a final line exactly in the form "
+        "#### <answer>, using the simplest numeric form without units.")
+    _DSPARK_SAMPLED_QUESTIONS = (
+        "Natalia sold clips to 48 of her friends in April, and then she sold "
+        "half as many clips in May. How many clips did Natalia sell "
+        "altogether in April and May?",
+        "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 "
+        "minutes of babysitting. How much did she earn?",
+        "Betty is saving money for a new wallet which costs $100. Betty has "
+        "only half of the money she needs. Her parents decided to give her "
+        "$15 for that purpose, and her grandparents twice as much as her "
+        "parents. How much more money does Betty need to buy the wallet?",
+        "James writes a 3-page letter to 2 different friends twice a week. "
+        "How many pages does he write a year?",
+        "Mark has a garden with flowers. He planted plants of three different "
+        "colors in it. Ten of them are yellow, and there are 80% more of "
+        "those in purple. There are only 25% as many green flowers as there "
+        "are yellow and purple flowers. How many flowers does Mark have in "
+        "his garden?",
+        "Albert buys 2 large pizzas and 2 small pizzas. A large pizza has 16 "
+        "slices and a small pizza has 8 slices. If he eats it all, how many "
+        "pieces does he eat that day?",
+        "Ken created a care package to send to his brother. He placed a box "
+        "on a scale and poured in enough jelly beans to bring the weight to "
+        "2 pounds. Then he added enough brownies to cause the weight to "
+        "triple. Next, he added another 2 pounds of jelly beans. Finally, he "
+        "added enough gummy worms to double the weight once again. What was "
+        "the final weight of the box of goodies, in pounds?",
+        "Alexis is applying for a new job and bought a new set of business "
+        "clothes to wear to the interview. She went to a department store "
+        "with a budget of $200 and spent $30 on a button-up shirt, $46 on "
+        "suit pants, $38 on a suit coat, $11 on socks, and $18 on a belt. "
+        "She also purchased a pair of shoes, but lost the receipt for them. "
+        "She has $16 left from her budget. How much did Alexis pay for the "
+        "shoes?",
+    )
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "rejection_sample_method,fused_chain,context_recompute_tail",
+        [("standard", True, None), ("block", False, 64)],
+        ids=["standard-fused_chain", "block-per_position"])
+    def test_dspark_rejection_sampling(self, rejection_sample_method,
+                                       fused_chain, context_recompute_tail):
+        """Sampled DSpark drafts under rejection sampling, with prefix reuse.
+
+        The two ancestral draft paths run end to end: a no_topk_no_topp
+        deployment takes the fused Markov chain, and filtered drafts with
+        use_ancestral_draft_sampling take the per-position sampler. They pair
+        with token-level and block verification. Every prompt runs twice, so
+        the repeat takes a prefix-cache hit and the target recomputes the
+        drafter's context tail: None resolves from this drafter's unwindowed
+        layer to -1, a full re-prefill, and 64 reuses all but the last 64
+        prompt tokens. Both passes must finish every request with an
+        acceptance length a broken draft distribution would not reach.
+        """
+        dspark_model_dir = (
+            f"{llm_models_root()}/dspark/dspark_qwen3_8b_block7")
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7,
+            speculative_model=dspark_model_dir,
+            attention_backend="VANILLA",
+            use_rejection_sampling=True,
+            rejection_sample_method=rejection_sample_method,
+            advanced_sampling_mode=("no_topk_no_topp"
+                                    if fused_chain else "full"),
+            use_ancestral_draft_sampling=not fused_chain,
+            context_recompute_tail=context_recompute_tail)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True,
+                                        free_gpu_memory_fraction=0.6)
+        # Qwen3's recommended non-thinking sampling; the no_topk_no_topp
+        # deployment samples by temperature alone.
+        filters = {} if fused_chain else dict(top_k=20, top_p=0.8)
+        sampling_params = SamplingParams(max_tokens=256,
+                                         temperature=0.7,
+                                         seed=0,
+                                         **filters)
+
+        with LLM(model=target_model_dir,
+                 max_batch_size=8,
+                 disable_overlap_scheduler=True,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                                   enable_padding=True),
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            resolved_tail = llm.args.speculative_config.context_recompute_tail
+            assert resolved_tail == (context_recompute_tail or -1)
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{
+                        "role": "system",
+                        "content": self._DSPARK_SAMPLED_SYSTEM_PROMPT
+                    }, {
+                        "role": "user",
+                        "content": question
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False)
+                for question in self._DSPARK_SAMPLED_QUESTIONS
+            ]
+            for repeat in (False, True):
+                outputs = llm.generate(prompts, sampling_params)
+                for output in outputs:
+                    assert output.outputs[0].finish_reason in ("stop", "length")
+                    assert output.outputs[0].text.strip()
+                    assert output.decoding_iter > 0
+                if repeat:
+                    # A full re-prefill claims no cached tokens; a positive
+                    # tail reuses the prompt up to the tail.
+                    assert all((output.cached_tokens > 0) == (resolved_tail > 0)
+                               for output in outputs)
+                    # The claim stops at least the tail short of the prompt end
+                    # (lower for block alignment).
+                    assert all(
+                        output.cached_tokens <= len(output.prompt_token_ids) -
+                        resolved_tail for output in outputs
+                        if resolved_tail > 0)
+                acceptance_length = sum(
+                    output.avg_decoded_tokens_per_iter * output.decoding_iter
+                    for output in outputs) / sum(output.decoding_iter
+                                                 for output in outputs)
+                print(f"[AL] test_dspark_rejection_sampling"
+                      f"[{rejection_sample_method}] repeat={repeat}: "
+                      f"{acceptance_length:.3f}")
+                # 4.94-5.09 on RTX PRO 6000 (VANILLA), both passes.
+                assert acceptance_length >= 4.0, (
+                    f"acceptance length {acceptance_length:.3f} < 4.0 "
+                    f"(repeat={repeat})")
 
     @skip_pre_blackwell
     @pytest.mark.parametrize("tp_size,pp_size,ep_size,attention_dp",
@@ -4043,10 +4313,14 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         [
             (2, 1, 2, False, False, False, "cutlass", False),
             (2, 1, 2, False, False, False, "cutlass", True),
+            (2, 1, 2, False, True, True, "cutlass", False),
+            (2, 1, 2, True, False, False, "cutlass", False),
         ],
         ids=[
             "latency_moe_cutlass",
             "latency_moe_cutlass_eagle3",
+            "latency_moe_cutlass_cuda_graph_overlap",
+            "latency_moe_cutlass_attention_dp",
         ],
     )
     def test_nvfp4_2gpus(self, tp_size, pp_size, ep_size, attention_dp,
@@ -5485,11 +5759,7 @@ class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
 
 class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-4B"
-    EXTRA_EVALUATOR_KWARGS = dict(
-        apply_chat_template=True,
-        fewshot_as_multiturn=True,
-        chat_template_kwargs=dict(enable_thinking=False),
-    )
+    EXTRA_EVALUATOR_KWARGS = QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                     enable_block_reuse=False)
     cuda_graph_config = CudaGraphConfig(enable_padding=True, max_batch_size=32)
@@ -6530,6 +6800,40 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         mocker=mocker)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(2)
+    @pytest.mark.skip_less_device_memory(100000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_nvfp4_tp2_cutedsl(self, monkeypatch: pytest.MonkeyPatch,
+                               mocker) -> None:
+        """CuteDSL cannot serve the MTP layer's FP8 experts, so run without MTP."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=2,
+                        moe_backend="CUTEDSL",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=2,
+                        ple_host_offload=False)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(2)
+    @pytest.mark.skip_less_device_memory(100000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_fp8_tp2_cutlass(self, monkeypatch: pytest.MonkeyPatch,
+                             mocker) -> None:
+        """MTP at TP2 fails in the FP8 block-scale GEMM (K=320), so run without MTP."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+                        tensor_parallel_size=2,
+                        moe_backend="CUTLASS",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=2,
+                        ple_host_offload=False)
+
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(70000)
     @pytest.mark.skip_less_host_memory(131072)
@@ -6644,6 +6948,29 @@ class TestQwen3_8_27B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             assert_acceptance_length_for_llm("TestQwen3_8_27B::test_dflash2",
                                              llm)
+
+    def _evaluate_gsm8k(self, model_path, tensor_parallel_size=1):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=False)
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=tensor_parallel_size,
+                 max_batch_size=32,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                   max_batch_size=32)) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    def test_nvfp4(self):
+        self._evaluate_gsm8k(f"{llm_models_root()}/Qwen3.8-27B-NVFP4")
+
+    @pytest.mark.skip_less_mpi_world_size(2)
+    def test_auto_dtype_2gpus(self):
+        self._evaluate_gsm8k(self.MODEL_PATH, tensor_parallel_size=2)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
@@ -6881,7 +7208,7 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float32",
                 ),
-                max_batch_size=32,
+                max_batch_size=8 if get_sm_version() == 121 else 32,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
@@ -6903,6 +7230,25 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
                 guided_decoding_backend="xgrammar",
         ) as llm:
             assert_guided_decoding_regex(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(40000)
+    def test_nvfp4(self):
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                ),
+                max_batch_size=32,
+                moe_config=MoeConfig(backend="CUTLASS"),
+        ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
@@ -6939,6 +7285,35 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+class TestNemotronV3Nano4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-3-Nano-4B"
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    def _evaluate(self, model_dir):
+        with LLM(
+                model_dir,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                max_batch_size=32,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    def test_auto_dtype(self):
+        self._evaluate(f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-4B-BF16")
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        self._evaluate(f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-4B-FP8")
 
 
 class TestNemotronV3Super(LlmapiAccuracyTestHarness):
@@ -7098,6 +7473,16 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         ],
     )
     def test_fp8_4gpus(self, attention_dp):
+        self._run_fp8(tp_size=4, attention_dp=attention_dp)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(2)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8_2gpus(self):
+        # CUDA graphs with the overlap scheduler hang across two DGX Spark nodes.
+        self._run_fp8(tp_size=2, attention_dp=False, overlap_scheduler=False)
+
+    def _run_fp8(self, tp_size, attention_dp, overlap_scheduler=True):
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
                 kv_cache_config=KvCacheConfig(
@@ -7107,12 +7492,12 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     use_kv_cache_manager_v2=True,
                 ),
                 max_batch_size=32,
-                tensor_parallel_size=4,
-                moe_expert_parallel_size=4,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=tp_size,
                 enable_attention_dp=attention_dp,
                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                                   enable_padding=True),
-                disable_overlap_scheduler=False,
+                disable_overlap_scheduler=not overlap_scheduler,
                 moe_config=MoeConfig(tactic="cutlass"),
         ) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -7408,41 +7793,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 accept_rate = num_accepted / num_drafted
                 assert accept_rate > 0.2, \
                     f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_nvfp4_8gpus_mtp_custom_op(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
-        # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
-                                       moe_tactic="cutlass")
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        with LLM(
-                model_path,
-                kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=False,
-                    mamba_ssm_cache_dtype="float16",
-                    free_gpu_memory_fraction=0.5,
-                ),
-                max_batch_size=32,
-                tensor_parallel_size=8,
-                moe_expert_parallel_size=8,
-                pipeline_parallel_size=1,
-                enable_attention_dp=False,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
-                                                  enable_padding=True),
-                disable_overlap_scheduler=False,
-                moe_config=MoeConfig(tactic="cutlass"),
-                speculative_config=mtp_config,
-        ) as llm:
-            assert isinstance(llm.args.speculative_config, MTPDecodingConfig)
-            assert llm.args.speculative_config.max_draft_len == 3
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 # Reading this 352 GB checkpoint cold over a slow model-store link takes most of

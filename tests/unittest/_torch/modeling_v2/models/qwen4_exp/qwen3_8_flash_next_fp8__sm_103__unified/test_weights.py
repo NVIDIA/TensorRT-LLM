@@ -6,6 +6,7 @@ index and safetensors headers: each rank's shard, each member's coverage and `lo
 from __future__ import annotations
 
 import collections
+import gc
 import json
 import re
 import struct
@@ -605,16 +606,18 @@ def test_host_table_preserves_stored_dtype(dtype: torch.dtype) -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", (torch.float8_e4m3fn, torch.bfloat16))
 def test_host_table_node_allocates_dtype_bytes(dtype: torch.dtype, monkeypatch) -> None:
-    """Node allocations reserve every byte while retaining dtype-independent row chunks."""
+    """Node allocations reserve every byte while retaining dtype-independent row chunks, and are
+    released when the table is collected."""
     host_table = _host_table_module()
     allocations = []
+    closed = []
 
     class Chunks:
         def __init__(self, device_index: int, chunk_bytes: int, count: int, node: int) -> None:
             allocations.append((device_index, chunk_bytes, count, node))
 
         def close(self) -> None:
-            pass
+            closed.append(True)
 
     monkeypatch.setattr(host_table, "_VmmChunks", Chunks)
     monkeypatch.setattr(host_table, "device_numa_node", lambda device: 0)
@@ -639,7 +642,9 @@ def test_host_table_node_allocates_dtype_bytes(dtype: torch.dtype, monkeypatch) 
         assert allocations == [(0, chunk_bytes, host_table.CHUNKS, 0)]
         assert table._node_error is None
     finally:
-        table.close()
+        del table
+        gc.collect()
+    assert closed == [True]
 
 
 @pytest.mark.cpu_only
@@ -983,7 +988,7 @@ def test_host_table_modes(mode: str, monkeypatch, dtype: torch.dtype) -> None:
     )
     _check_tables(tables, data, want[mode])
     if mode == "node":
-        created = sorted(len(t._segments) for t in tables)
+        created = sorted(len(t._node.segments) for t in tables)
         assert created == [PH.CHUNKS // 2, PH.CHUNKS // 2], [t.describe() for t in tables]
     for t in tables:
         t.close()
