@@ -1087,8 +1087,10 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         # mask and one tags tensor, which attention backends key their caches on.
         num_video, num_context = hidden_states.shape[1], encoder_hidden_states.shape[1]
         num_image = 0 if is_t2v else encoder_hidden_states_3.shape[1]
-        # One mask tensor per forward, shared by the blocks.
-        joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
+        # One mask tensor per forward, shared by the blocks. Attention backends keep what they
+        # derive from a mask while its version counter stands, which an inference tensor lacks.
+        with torch.inference_mode(False):
+            joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
         # One tags tensor across forwards: it depends on the row counts only.
         tags_key = (num_video, num_image, num_context, hidden_states.device)
         cached = self._cached_token_tags

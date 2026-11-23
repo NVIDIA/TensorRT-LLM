@@ -134,6 +134,56 @@ def test_deco_selection() -> None:
     assert not DeCoAttention.support_valid_seq_len()
 
 
+def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> None:
+    """The Attention module builds a cross-attention layer on VANILLA under a DeCo-Attention
+    recipe, with separate or fused K and V projections, and a self-attention layer on the DeCo
+    backend: the backend reads q, k and v of one shape as one sequence, which a cross-attention
+    layer with as many queries as keys is not."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+    from tensorrt_llm._torch.visual_gen.attention.backends import VanillaAttention
+    from tensorrt_llm._torch.visual_gen.config import (
+        DiffusionModelConfig,
+        create_attention_metadata_state,
+    )
+
+    require_deco_kernels()
+    num_heads, hidden_size = 2, 2 * HEAD_DIM
+    config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=hidden_size, num_attention_heads=num_heads, attention_head_dim=HEAD_DIM
+        ),
+        attention=AttentionConfig(backend="CUTEDSL", quant_attention_config=_quant_config()),
+        skip_create_weights_in_init=True,
+    )
+    config.attention_metadata_state = create_attention_metadata_state()
+
+    for cross in (
+        Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=config),
+        Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_KV, config=config),
+    ):
+        assert type(cross.attn) is VanillaAttention
+    for self_attention in (
+        Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=config),
+        Attention(
+            hidden_size,
+            num_heads,
+            qkv_mode=QKVMode.SEPARATE_QKV,
+            separate_qkv_is_self_attention=True,
+            config=config,
+        ),
+        Attention(
+            hidden_size,
+            num_heads,
+            qkv_mode=QKVMode.FUSE_KV,
+            separate_qkv_is_self_attention=True,
+            config=config,
+        ),
+    ):
+        assert type(self_attention.attn) is DeCoAttention
+
+
 def test_deco_layer_construction(require_deco_kernels) -> None:
     """A layer needs a recipe with a kernel on this GPU (NVFP4 PV: SM120 only) and the attention
     state of the model component. A layer whose head dimension or K/V head count the kernels
@@ -492,6 +542,32 @@ def test_deco_key_padding_mask_attends_the_tokens(require_deco_kernels, v_dtype:
     assert not out[0].any() and not out[1, 900:].any()
     assert _relative_error(out[1, :900], ref) < 2e-2
 
+    # An inference mask has no version counter: it is read on the device on every call, so a
+    # write into it between two calls is followed and no plan holds it. With token tags the
+    # basis rows are those of the tags, kept for the tags, and a capture finds them.
+    plans_before = len(state["deco_plans"])
+    with torch.inference_mode():
+        inference_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device=device)
+        attn.forward(q, k, v, key_padding_mask=inference_mask)
+        inference_mask[:, 700:] = False
+        out = attn.forward(q, k, v, key_padding_mask=inference_mask)
+    assert torch.equal(out, attn.forward(q, k, v, key_padding_mask=inference_mask.clone()))
+    assert len(state["deco_plans"]) == plans_before + 1
+    fresh_state: dict = {}
+    fresh = _backend(num_heads, v_dtype, state=fresh_state)
+    with torch.inference_mode():
+        warm = fresh.forward(q, k, v, key_padding_mask=inference_mask, token_tags=token_tags)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = fresh.forward(
+                q, k, v, key_padding_mask=inference_mask, token_tags=token_tags
+            )
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, warm)
+    (plan,) = fresh_state["deco_plans"]
+    assert plan.key_padding_mask is None and plan.captured
+
 
 def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels) -> None:
     """With token tags and a mask whose tokens are not a prefix, the basis rows are the
@@ -559,7 +635,8 @@ def test_deco_cuda_graph_with_a_key_padding_mask(require_deco_kernels, v_dtype: 
     another object than the mask of that forward."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 2, 512, 2
-    attn = _backend(num_heads, v_dtype)
+    state: dict = {}
+    attn = _backend(num_heads, v_dtype, state=state)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
     gen = torch.Generator(device=device).manual_seed(1)
     key_padding_mask = torch.rand((batch_size, seq_len), generator=gen, device=device) < 0.7
@@ -592,6 +669,10 @@ def test_deco_cuda_graph_with_a_key_padding_mask(require_deco_kernels, v_dtype: 
     token_tags[1800:] = 1
     lengths = torch.tensor([[2000], [1850]], device=device)
     warm_mask = torch.arange(seq_len, device=device) < lengths
+    # A batch of one first: its plan holds one draw, the plan of the batch of two one per sample.
+    expected_one = attn.forward(
+        q[:1], k[:1], v[:1], token_tags=token_tags, key_padding_mask=warm_mask[:1]
+    ).clone()
     expected = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=warm_mask).clone()
 
     capture_mask = warm_mask.clone()
@@ -602,6 +683,32 @@ def test_deco_cuda_graph_with_a_key_padding_mask(require_deco_kernels, v_dtype: 
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(graph_out, expected)
+
+    # The capture of the batch of one takes the rows drawn for one sample, not the newer rows
+    # drawn per sample of the batch of two.
+    graph_one = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_one):
+        graph_out_one = attn.forward(
+            q[:1], k[:1], v[:1], token_tags=token_tags, key_padding_mask=capture_mask[:1]
+        )
+    graph_out_one.fill_(float("nan"))
+    graph_one.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(graph_out_one, expected_one)
+
+    # A capture without a mask after the masked warm-up takes the rows drawn per sample with
+    # the full length of every sample.
+    (rows,) = [
+        plan.rows for plan in state["deco_plans"] if plan.rows is not None and plan.rows.dim() == 2
+    ]
+    graph_full = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_full):
+        graph_out_full = attn.forward(q, k, v, token_tags=token_tags)
+    graph_out_full.fill_(float("nan"))
+    graph_full.replay()
+    torch.cuda.synchronize()
+    full = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    assert torch.equal(graph_out_full, _kernels(q, k, v, v_dtype, rows=rows, valid_seq_lens=full))
 
     with pytest.raises(RuntimeError, match="eagerly once before capturing"):
         with torch.cuda.graph(torch.cuda.CUDAGraph()):

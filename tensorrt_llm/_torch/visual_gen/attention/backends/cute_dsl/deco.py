@@ -29,9 +29,13 @@ like any other backend.
   weight and come back zero. Tokens that are a prefix in every sample reach the kernels as token
   counts. For any other mask the backend gathers the tokens to the front and scatters the output
   rows back; Q and K carry their positions, so the result does not depend on the order of the
-  rows.
+  rows. A mask or tags tensor built outside inference mode carries a version counter and shares
+  one plan over the layers and steps; an inference mask is read on the device on every call,
+  and inference tags are drawn from once and kept by identity (a change needs a new tensor).
 * One sequence: a call whose q, k and v have one shape, on the kernels and on VANILLA alike. Its
-  padded rows are excluded as keys and come back zero as queries.
+  padded rows are excluded as keys and come back zero as queries. The Attention module builds
+  its cross-attention layers on VANILLA, so such a call is self-attention; a direct caller
+  whose cross-attention has as many queries as keys must not use this backend.
 * Token tags: with ``token_tags``, half of the tokens that the kernels sample for the
   compensation channels are text and audio tokens of a packed sequence.
 * CUDA graphs: first use (kernel compilation, the inputs of a sequence length, the rows of token
@@ -67,6 +71,11 @@ MIN_SEQ_LEN = 8192
 _PLANS_KEPT = 4
 
 
+def _version(t: torch.Tensor | None) -> int | None:
+    """Return the version counter of a tensor, None for no tensor or an inference tensor."""
+    return None if t is None or t.is_inference() else t._version
+
+
 def supported_v_dtypes() -> tuple[str, ...]:
     """Return the ``v_dtype`` values with a DeCo-Attention kernel on the current GPU; empty when
     the kernel package does not import or the GPU has no kernels."""
@@ -84,8 +93,9 @@ class _Plan:
 
     Attributes:
         token_tags, key_padding_mask: Arguments. The tensors of the call, compared by identity.
-        mask_version: Argument. Version counter of the mask, which an in-place write advances;
-            None for an inference tensor, which has no counter.
+        tags_version, mask_version: Arguments. Version counters of the tensors, which an in-place
+            write advances; None without the tensor and for inference tags, which have no
+            counter and are matched by identity alone.
         rows: Result. Basis rows; None without tags.
         token_counts: Result. Tokens per sample that the mask gives; None without a mask and
             for a mask that excludes no row.
@@ -95,6 +105,7 @@ class _Plan:
     """
 
     token_tags: torch.Tensor | None
+    tags_version: int | None
     key_padding_mask: torch.Tensor | None
     mask_version: int | None
     rows: torch.Tensor | None
@@ -178,32 +189,45 @@ class DeCoAttention(AttentionBackend):
             dtype=dtype,
         )
 
-    def _can_serve(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, one_sequence: bool, **kwargs: Any
-    ) -> bool:
-        """Return whether the kernels take this call; every other call is delegated."""
-        if not self._kernel_geometry or not q.is_cuda or q.numel() == 0:
-            return False
-        # The kernels attend one sequence to itself.
-        if not one_sequence or q.shape[1] < MIN_SEQ_LEN:
-            return False
+    def _delegation_reason(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Any
+    ) -> str | None:
+        """Return why a self-attention call of the kernels' geometry runs on VANILLA, None when
+        the kernels take it."""
+        if not q.is_cuda:
+            return "inputs that are not on a CUDA device"
+        if q.numel() == 0:
+            return "empty inputs"
+        if q.shape[1] < MIN_SEQ_LEN:
+            return f"a sequence of {q.shape[1]} rows, under the {MIN_SEQ_LEN} the kernels take"
         if not q.dtype == k.dtype == v.dtype == torch.bfloat16:
-            return False
-        mask = kwargs.get("attention_mask", PredefinedAttentionMask.FULL)
-        return mask == PredefinedAttentionMask.FULL
+            dtypes = sorted({str(x.dtype) for x in (q, k, v)} - {"torch.bfloat16"})
+            return f"{' and '.join(dtypes)} inputs"
+        if kwargs.get("attention_mask", PredefinedAttentionMask.FULL) != (
+            PredefinedAttentionMask.FULL
+        ):
+            return "an attention mask"
+        return None
 
     def _delegate(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, one_sequence: bool, **kwargs: Any
     ) -> torch.Tensor:
         """Run a call on VANILLA. For one sequence, the rows that ``key_padding_mask`` excludes
-        come back zero, as from the kernels."""
+        come back zero, as from the kernels, and what they hold has no influence: a padded V row
+        enters SDPA with weight zero, which spreads a NaN in it over the valid rows, so the
+        padded K and V rows are zeroed first."""
+        key_padding_mask = kwargs.get("key_padding_mask")
+        padded = None
+        if key_padding_mask is not None and one_sequence:
+            padded = ~key_padding_mask[:, :, None, None]
+            k = k.masked_fill(padded, 0)
+            v = v.masked_fill(padded, 0)
         # VANILLA works in HND ([B, H, S, D]).
         out = self._vanilla.forward(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **kwargs
         ).transpose(1, 2)
-        key_padding_mask = kwargs.get("key_padding_mask")
-        if key_padding_mask is not None and one_sequence:
-            out = out.masked_fill(~key_padding_mask[:, :, None, None], 0)
+        if padded is not None:
+            out = out.masked_fill(padded, 0)
         return out
 
     @torch.compile
@@ -248,7 +272,7 @@ class DeCoAttention(AttentionBackend):
             shorter than the longest repeats its rows, and a sample without tokens gets row 0,
             which the kernels read as padding.
         """
-        tags = token_tags.reshape(-1)
+        tags = token_tags.reshape(-1).to(device)
         if tokens is None or bool(((tags >= 0) == tokens).all()):
             draws = [deco_attention.sample_rows(seq_len, device, tags)]
         else:
@@ -265,13 +289,28 @@ class DeCoAttention(AttentionBackend):
         return rows[0].contiguous() if len(draws) == 1 else rows
 
     @staticmethod
-    def _captured_rows(plans: list[_Plan], token_tags: torch.Tensor) -> torch.Tensor:
-        """Return the basis rows for a CUDA graph capture, those of the newest plan with these
-        tags, and keep that plan for the replays."""
-        for plan in plans:
-            if plan.token_tags is token_tags:
-                plan.captured = True
-                return plan.rows
+    def _captured_rows(
+        plans: list[_Plan],
+        token_tags: torch.Tensor,
+        key_padding_mask: torch.Tensor | None,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Return the basis rows for a CUDA graph capture, those of the plan of these tags (at
+        their version) and this mask, or else of the newest plan of the tags whose rows fit the
+        batch (one draw, or one per sample of this batch size), and keep that plan for the
+        replays."""
+        fitting = [
+            plan
+            for plan in plans
+            if plan.token_tags is token_tags
+            and plan.tags_version == _version(token_tags)
+            and (plan.rows.dim() == 1 or plan.rows.shape[0] == batch_size)
+        ]
+        of_mask = [plan for plan in fitting if plan.key_padding_mask is key_padding_mask]
+        if fitting:
+            plan = (of_mask or fitting)[0]
+            plan.captured = True
+            return plan.rows
         raise RuntimeError(
             "DeCo-Attention draws the basis rows of token tags on first use: run the forward "
             "eagerly once before capturing a CUDA graph."
@@ -286,18 +325,39 @@ class DeCoAttention(AttentionBackend):
         device: torch.device,
     ) -> _Plan:
         """Return the plan of these arguments; on their first use resolve one, which reads back
-        to the host, and keep it in front of ``plans``."""
-        mask_version = None
-        if key_padding_mask is not None and not key_padding_mask.is_inference():
-            mask_version = key_padding_mask._version
+        to the host, and keep it in front of ``plans``. The mask has a version counter
+        (``_plan`` resolves an inference mask on the device instead); inference tags have none
+        and are kept by identity."""
+        mask_version = None if key_padding_mask is None else key_padding_mask._version
+        tags_version = _version(token_tags)
         for plan in plans:
             if (
                 plan.token_tags is token_tags
+                and plan.tags_version == tags_version
                 and plan.key_padding_mask is key_padding_mask
                 and plan.mask_version == mask_version
             ):
                 return plan
+        plan = self._resolved_plan(
+            key_padding_mask, token_tags, tags_version, mask_version, seq_len, device
+        )
+        plans.insert(0, plan)
+        # Drop the oldest plans past the kept count; a captured plan stays.
+        for old in [kept for kept in plans if not kept.captured][_PLANS_KEPT:]:
+            plans.remove(old)
+        return plan
 
+    def _resolved_plan(
+        self,
+        key_padding_mask: torch.Tensor | None,
+        token_tags: torch.Tensor | None,
+        tags_version: int | None,
+        mask_version: int | None,
+        seq_len: int,
+        device: torch.device,
+    ) -> _Plan:
+        """Resolve the plan of these arguments, which reads the mask and the token counts back
+        to the host."""
         # tokens: where the samples hold tokens; None when every row does.
         tokens, token_counts, order = None, None, None
         if key_padding_mask is not None:
@@ -313,12 +373,9 @@ class DeCoAttention(AttentionBackend):
         if token_tags is not None:
             rows = self._basis_rows(token_tags, tokens, seq_len, device)
 
-        plan = _Plan(token_tags, key_padding_mask, mask_version, rows, token_counts, order)
-        plans.insert(0, plan)
-        # Drop the oldest plans past the kept count; a captured plan stays.
-        for old in [kept for kept in plans if not kept.captured][_PLANS_KEPT:]:
-            plans.remove(old)
-        return plan
+        return _Plan(
+            token_tags, tags_version, key_padding_mask, mask_version, rows, token_counts, order
+        )
 
     @torch.compiler.disable
     def _plan(
@@ -332,9 +389,13 @@ class DeCoAttention(AttentionBackend):
         """Resolve the padding and the token tags of a call into the inputs of the kernels.
 
         Resolving reads back to the host, so the component state keeps the result (``_Plan``)
-        for the layers and steps that pass the same tags tensor and mask tensor; the content of
-        an inference mask tensor must not change in place meanwhile. Under CUDA graph capture
-        nothing is read back.
+        for the layers and steps that pass the same tags tensor and mask tensor, as long as
+        their version counters stand. Under CUDA graph capture nothing is read back: the
+        counts and the order come from the mask on the device, and the basis rows from the
+        plan of the tags. An inference mask has no version counter, so an in-place write to it
+        would go unseen: it takes the same device path on every call, with the basis rows of
+        its tags alone, which the kernels clamp into each sample's tokens. A model builds its
+        mask outside inference mode to get the plan of its padding.
 
         Returns:
             A tuple ``(rows, token_counts, order)``:
@@ -359,13 +420,26 @@ class DeCoAttention(AttentionBackend):
             return None, None, None
 
         plans: list[_Plan] = self._metadata_state.setdefault("deco_plans", [])
-        if torch.cuda.is_current_stream_capturing():
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing or (key_padding_mask is not None and key_padding_mask.is_inference()):
             rows = None
             if token_tags is not None:
-                rows = self._captured_rows(plans, token_tags)
+                rows = (
+                    self._captured_rows(plans, token_tags, key_padding_mask, batch_size)
+                    if capturing
+                    else self._kept_plan(plans, None, token_tags, seq_len, device).rows
+                )
             if key_padding_mask is None:
-                return rows, None, None
-            # A captured call with a mask is always compacted, inside the graph.
+                token_counts = None
+                if rows is not None and rows.dim() == 2:
+                    # Rows drawn per sample under a mask take the lengths of the samples, here
+                    # the full sequence.
+                    token_counts = torch.full(
+                        (batch_size,), seq_len, dtype=torch.int32, device=device
+                    )
+                return rows, token_counts, None
+            # A captured call with a mask, and a call with an inference mask, is compacted on
+            # the device.
             tokens = key_padding_mask.to(device)
             token_counts = tokens.sum(dim=1, dtype=torch.int32)
             return rows, token_counts, torch.argsort(~tokens, dim=1, stable=True)
@@ -400,42 +474,31 @@ class DeCoAttention(AttentionBackend):
                 )
                 rows = position.gather(1, rows.long().expand(batch_size, -1))
                 rows = rows.to(torch.int32).contiguous()
-        operands = deco_attention.prepare(
-            q,
-            k,
-            v,
-            self._workspace(num_bytes, q.device),
-            pv,
-            rows=rows,
-            valid_seq_lens=token_counts,
-        )
-        out = deco_attention.attention(operands, torch.empty_like(q))
+        # The kernels compile and launch on the current device, which is the device of q here.
+        with torch.cuda.device(q.device):
+            operands = deco_attention.prepare(
+                q,
+                k,
+                v,
+                self._workspace(num_bytes, q.device),
+                pv,
+                rows=rows,
+                valid_seq_lens=token_counts,
+            )
+            out = deco_attention.attention(operands, torch.empty_like(q))
         if order is not None:
             # The rows behind the tokens of a sample are zero and land on its padding.
             out = torch.empty_like(out).scatter_(1, index, out)
         return out
 
     @torch.compiler.disable
-    def _note_unquantized(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Any
-    ) -> None:
+    def _note_unquantized(self, reason: str) -> None:
         """Warn, once per layer, that one of its self-attention calls is delegated."""
         self._noted_unquantized = True
-        if kwargs.get("attention_mask", PredefinedAttentionMask.FULL) != (
-            PredefinedAttentionMask.FULL
-        ):
-            reason = "an attention mask"
-        elif not q.dtype == k.dtype == v.dtype == torch.bfloat16:
-            dtypes = sorted({str(x.dtype) for x in (q, k, v)} - {"torch.bfloat16"})
-            reason = f"{' and '.join(dtypes)} inputs"
-        elif q.numel() == 0:
-            reason = "empty inputs"
-        else:
-            reason = "inputs that are not on a CUDA device"
         logger.warning_once(
             f"DeCo-Attention runs self-attention unquantized on VANILLA because of {reason} "
-            f"(first seen in layer {self.layer_idx}); its kernels take bfloat16 CUDA inputs and "
-            "padding, no other mask.",
+            f"(first seen in layer {self.layer_idx}); its kernels take bfloat16 CUDA inputs of "
+            f"at least {MIN_SEQ_LEN} rows and padding, no other mask.",
             key=f"deco_attention_unquantized_{reason}",
         )
 
@@ -454,23 +517,26 @@ class DeCoAttention(AttentionBackend):
         key_padding_mask = kwargs.get("key_padding_mask")
         if key_padding_mask is not None and key_padding_mask.dtype != torch.bool:
             key_padding_mask = kwargs["key_padding_mask"] = key_padding_mask.bool()
+        # The kernels attend one sequence to itself at their head geometry; another geometry
+        # and cross-attention are delegated on every call and log nothing.
         one_sequence = q.shape == k.shape == v.shape
-        if not self._can_serve(q, k, v, one_sequence, **kwargs):
-            # Warn about a call of the kernels' shape and size that a mask or a dtype keeps
-            # from them; cross-attention is delegated on every call and logs nothing.
-            if (
-                self._kernel_geometry
-                and one_sequence
-                and q.shape[1] >= MIN_SEQ_LEN
-                and not self._noted_unquantized
-            ):
-                self._note_unquantized(q, k, v, **kwargs)
+        if not (self._kernel_geometry and one_sequence):
+            return self._delegate(q, k, v, one_sequence, **kwargs)
+        reason = self._delegation_reason(q, k, v, **kwargs)
+        if reason is not None:
+            if not self._noted_unquantized:
+                self._note_unquantized(reason)
             return self._delegate(q, k, v, one_sequence, **kwargs)
         rows, token_counts, order = self._plan(
             key_padding_mask, kwargs.get("token_tags"), q.shape[0], q.shape[1], q.device
         )
         if order is None:
-            q, k, v = self._contiguous_qkv(q, k, v)
+            # The kernels read contiguous tensors at aligned addresses; a contiguous view into
+            # an allocation at an odd offset is copied.
+            q, k, v = (
+                x if x.data_ptr() % deco_attention.TENSOR_ALIGNMENT == 0 else x.clone()
+                for x in self._contiguous_qkv(q, k, v)
+            )
         return self._launch(q, k, v, rows, token_counts, order)
 
     @property
