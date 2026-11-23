@@ -353,16 +353,14 @@ def _allocation_rows(x: torch.Tensor, device: int) -> tuple[int, ...] | None:
 class PreparedRowTopK:
     """Non-reentrant, graph-capturable top-k over caller-owned row allocations.
 
-    Verify complete padded-row ownership before applying the full-batch plan to
-    domain slices; ordinary or ineligible inputs retain tuned global execution.
+    By default, the prepared call uses tuned global execution. With ``co_local=True``,
+    the upstream producer (e.g. QK GEMM) must place complete padded rows in their
+    matching domains. The call verifies ownership before applying the full-batch
+    plan to each domain's rows. Ineligible inputs use tuned global execution.
     Preparation never copies logits. Separate concurrent calls need separate instances.
-    The upstream producer must allocate its logits output with complete padded rows
-    in matching locality domains; ordinary producer outputs use tuned global execution.
     Use CUDA Graph replay for domain performance. Prepare and warm before capture.
     Retain allocations and the executor until the graphs are destroyed. Values and
     lengths may change while the addresses and row ownership stay fixed.
-    Set ``co_local=True`` to probe ownership for an explicit domain invocation.
-    The default uses tuned global execution until QK GEMM produces localized logits.
     ``mode`` reports the selected execution path.
     Lengths are uncompressed token counts. Only ``next_n=1`` is supported.
     """

@@ -11,7 +11,7 @@ from typing import NamedTuple
 
 from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host import (
     PCW_API_ROW_ELEMENTS,
-    PCW_LEGACY_ROW_ELEMENTS,
+    PCW_DEFAULT_ROW_ELEMENTS,
 )
 
 
@@ -38,8 +38,8 @@ def select_lowp_tuning(
         cr2=k != 2048 or rows > num_sms,
         # Extra sampling headroom avoids retries on long unsplit rows.
         unsplit_aim=4 * k if k == 1024 and rows > num_sms and n >= 65536 else None,
-        # Keep the legacy filter on short rows where extra PCW instructions can outweigh the gain.
-        pcw_aligned=npad % PCW_LEGACY_ROW_ELEMENTS == 0
+        # Longer rows can use PCW at the public API's 16-byte alignment.
+        pcw_aligned=npad % PCW_DEFAULT_ROW_ELEMENTS == 0
         or (n > 2048 and npad % PCW_API_ROW_ELEMENTS == 0),
     )
 

@@ -151,8 +151,8 @@ SUPPORTED_SM_VERSIONS = (90, 100, 103, 107)
 PCW_VECTOR_ELEMENTS = 4
 # Public GVR row alignment in BF16 elements.
 PCW_API_ROW_ELEMENTS = 16 // 2
-# Historical PCW dispatch filter in elements.
-PCW_LEGACY_ROW_ELEMENTS = 64
+# Default PCW dispatch alignment in BF16 elements.
+PCW_DEFAULT_ROW_ELEMENTS = 64
 _BLACKWELL_SM_VERSIONS = (100, 103, 107)
 _BLACKWELL_WAVE_SMS = 148
 # Targets that take the register rungs and compile options below measured on hardware
@@ -3049,7 +3049,7 @@ def _varlen_launcher(
                 and (
                     lowp_tuning.pcw_aligned
                     if lowp_tuning is not None
-                    else npad % PCW_LEGACY_ROW_ELEMENTS == 0
+                    else npad % PCW_DEFAULT_ROW_ELEMENTS == 0
                 )
                 and num_rows <= 64
                 and 2 * num_rows <= num_sms
