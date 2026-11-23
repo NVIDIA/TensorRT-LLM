@@ -893,6 +893,9 @@ class BaseLLM:
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             multimodal_params = inputs.multimodal_params
+            self._check_mm_output_length(multimodal_params,
+                                         len(prompt_token_ids), sampling_params,
+                                         disaggregated_params)
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(
@@ -957,6 +960,11 @@ class BaseLLM:
             kv_hints=kv_hints,
         )
         result.mm_items_only = mm_items_only
+        if (self.args.mm_encoder_only and getattr(
+                self.input_processor, "supports_mm_item_handoff", False)):
+            # A raw digest describes the source, including its UUID, but not
+            # the processor settings that produced these particular rows.
+            result._multimodal_hashes = None
 
         if sampling_params.return_perf_metrics:
             result.metrics_dict.update(
@@ -976,6 +984,28 @@ class BaseLLM:
                 and inputs.get("prompt_token_ids") is None
                 and bool(inputs.get("multi_modal_data"))
                 and self.args.mm_encoder_only)
+
+    def _check_mm_output_length(
+        self,
+        params: Optional[MultimodalParams],
+        prompt_len: int,
+        sampling_params: SamplingParams,
+        disaggregated_params: Optional[DisaggregatedParams],
+    ) -> None:
+        if params is None or not params.multimodal_data:
+            return
+        limit = params.multimodal_data.get("mrope_max_output_tokens")
+        if limit is None or (disaggregated_params is not None
+                             and disaggregated_params.request_type
+                             == "context_only"):
+            return
+        requested = sampling_params.max_tokens
+        max_seq_len = getattr(self.args, "max_seq_len", None)
+        if max_seq_len is not None:
+            requested = min(requested, max_seq_len - prompt_len)
+        if requested > limit:
+            raise ValueError(
+                f"Video mRoPE positions allow at most {limit} output tokens")
 
     def _preprocess(
         self,
@@ -1067,6 +1097,10 @@ class BaseLLM:
                         mm_handles,
                         sampling_params,
                         mm_hashes=disaggregated_params.multimodal_hashes))
+                self._check_mm_output_length(multimodal_params,
+                                             len(prompt_token_ids),
+                                             sampling_params,
+                                             disaggregated_params)
                 multimodal_params.to_handle("multimodal_data")
             else:
                 layout_kwargs = {}
@@ -1184,6 +1218,10 @@ class BaseLLM:
                 if not multimodal_params.has_content():
                     multimodal_params = None
                 else:
+                    self._check_mm_output_length(multimodal_params,
+                                                 len(prompt_token_ids),
+                                                 sampling_params,
+                                                 disaggregated_params)
                     # Convert to shared tensor handle to reduce IPC overhead
                     multimodal_params.to_handle("multimodal_data")
                     # An item-only encode has a synthetic prompt, so its

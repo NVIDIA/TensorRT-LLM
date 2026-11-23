@@ -37,6 +37,7 @@ from transformers import (AutoProcessor, PretrainedConfig,
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 from .._errors import ConfigInputError, UnsupportedError
+from ..disaggregated_params import resolve_multimodal_hashes
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from . import multimodal
@@ -390,13 +391,19 @@ class BaseMultimodalInputProcessor(ABC):
                                                        multimodal_embedding,
                                                        sampling_params)
 
+    def _mm_item_placeholders(self, prompt: str) -> Dict[str, str]:
+        """Map the spellings accepted in this prompt to their modalities."""
+        placeholders = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder_metadata(
+            self._placeholder_model_type()).placeholder_map
+        return {text: modality for modality, text in placeholders.items()}
+
     def get_mm_item_text(self, modality: str, placeholder: str,
                          metadata: Dict[str, Any],
                          embedding_shape: Sequence[int]) -> str:
         """The prompt text of one encoded item, in place of its placeholder.
 
-        Needed for `supports_mm_item_handoff`. `placeholder` is the registered
-        placeholder the item replaces, `metadata` holds the item's metadata
+        Needed for `supports_mm_item_handoff`. `placeholder` is the matched
+        text the item replaces, `metadata` holds the item's metadata
         from the encoder (`handle["metadata"]`), and `embedding_shape` is the
         shape of its embedding. Raise ValueError if they do not fit.
         """
@@ -454,19 +461,12 @@ class BaseMultimodalInputProcessor(ABC):
                     for tensor, item_metadata in zip(tensors, metadata))
         else:
             pending = {None: deque()}
-            for index, handle in enumerate(items):
-                metadata = dict(handle.get("metadata") or {})
-                if mm_hashes is not None:
-                    metadata["multimodal_hash"] = mm_hashes[index]
+            for handle in items:
+                metadata = handle.get("metadata") or {}
                 pending[None].append(
                     (handle, tuple(handle["tensor_size"]), metadata))
 
-        placeholders = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder_metadata(
-            self._placeholder_model_type()).placeholder_map
-        modality_of = {
-            text: modality
-            for modality, text in placeholders.items()
-        }
+        modality_of = self._mm_item_placeholders(inputs["prompt"])
         refs, embeddings, rows, item_metadata = [], [], [], []
         counts = Counter()
 
@@ -521,12 +521,7 @@ class BaseMultimodalInputProcessor(ABC):
             mm_mask, special_mask, rows)
         run_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
             mm_mask, rows)
-        hashes = [metadata.get("multimodal_hash") for metadata in item_metadata]
-        if None in hashes:
-            if any(mm_hash is not None for mm_hash in hashes):
-                raise ValueError(
-                    "Give a multimodal_hash for every item or for none")
-            hashes = None
+        hashes = resolve_multimodal_hashes(item_metadata, mm_hashes)
         params = multimodal.MultimodalParams.from_embeddings(
             embeddings,
             MultimodalItemMetadata(refs, output_embedding_lengths=rows),

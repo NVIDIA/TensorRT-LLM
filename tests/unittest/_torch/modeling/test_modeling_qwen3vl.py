@@ -1040,13 +1040,14 @@ def test_external_embeddings_reuse_common_item_metadata(model):
         {"image": items},
         SamplingParams(),
     )
-    params = MultimodalParams(multimodal_data=extra["multimodal_data"])
+    params = MultimodalParams(**extra)
 
     assert tokens == expected_ids
     assert params.get_item_layout() == ((("image", 0), ("image", 1)), (4, 9))
     assert params.multimodal_data["multimodal_embedding"] == embeddings
     assert params.multimodal_data["mrope_config"] is mrope_config
-    assert params.multimodal_input is None
+    first, second = params.multimodal_input.multimodal_hashes
+    assert first != second
 
 
 @pytest.mark.cpu_only
@@ -1384,7 +1385,12 @@ def _make_qwen_vl_hf_processor(model: str):
         vision_config.tokens_per_second = 2
     config = SimpleNamespace(
         torch_dtype=torch.float32,
-        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=100, dtype=torch.float32),
+        text_config=SimpleNamespace(
+            hidden_size=hidden_size,
+            vocab_size=100,
+            dtype=torch.float32,
+            max_position_embeddings=128000,
+        ),
         vision_config=vision_config,
         image_token_id=12,
         video_token_id=14,
@@ -3270,3 +3276,219 @@ def test_qwen_vl_item_encode_manifest():
         )
     with pytest.raises(ValueError, match="cover every media item"):
         processor.get_mm_items_prompt(request["multi_modal_data"], request["mm_item_order"][:1])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "name,prompt",
+    [
+        ("wide", "look <|vision_start|><|image_pad|> <|vision_end|>"),
+        ("video", "look <|video_pad|>"),
+    ],
+)
+def test_qwen_vl_item_pad_spelling_matches_raw(name, prompt):
+    processor, width = _make_qwen_vl_hf_processor("qwen3")
+    request = _qwen_vl_request([name])
+    request["prompt"] = prompt
+    raw_ids, raw = create_input_processor_with_hash(processor)(request, SamplingParams())
+    items = _encode_items(processor, [name])
+    for form in ("embeddings", "handles"):
+        ids, params = _prefill_from_items(processor, prompt, items, width, form)
+        assert ids == raw_ids
+        torch.testing.assert_close(
+            params.multimodal_data["mrope_config"], raw["multimodal_data"]["mrope_config"]
+        )
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vl_rejects_ambiguous_video_marker_order():
+    processor, width = _make_qwen_vl_hf_processor("qwen3")
+    prompt = "<|video_pad|> then <|vision_start|><|video_pad|><|vision_end|>"
+    items = _encode_items(processor, ["video"]) * 2
+    with pytest.raises(ValueError, match="wrapped video placeholder"):
+        _prefill_from_items(processor, prompt, items, width, "embeddings")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_qwen_vl_item_video_timing_bounds(model):
+    processor, width = _make_qwen_vl_hf_processor(model)
+    processor.config.text_config.max_position_embeddings = 128
+    prompt = "look <|vision_start|><|video_pad|><|vision_end|>"
+    metadata = {"video_grid_thw": [2, 2, 2], "multimodal_hash": [0] * 8}
+    if model == "qwen2.5":
+        key, valid = "second_per_grid_ts", 0.5
+        # At 2 positions per second, 63 seconds fits the grid alone but
+        # overflows after the leading text and vision delimiters.
+        invalid = [float("inf"), -0.5, 63.0, 1000.0]
+    else:
+        key, valid = "video_timestamps", [0.0, 0.5]
+        invalid = [[0.0, float("nan")], [-0.5, 1.0]]
+    for form in ("embeddings", "handles"):
+
+        def prefill(timing):
+            item = ("video", 2, {**metadata, key: timing})
+            return _prefill_from_items(processor, prompt, [item], width, form)
+
+        _, params = prefill(valid)
+        assert params.multimodal_data["mrope_config"]["mrope_position_ids"].max() < 128
+        for timing in invalid:
+            with pytest.raises(ValueError, match=f"{key}|mRoPE positions"):
+                prefill(timing)
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vl_sampled_item_timestamps_reload(tmp_path):
+    processor, _ = _make_qwen_vl_hf_processor("qwen3")
+    request = _qwen_vl_request(["video"])
+    request["mm_processor_kwargs"] = {"do_sample_frames": True, "num_frames": 4}
+    _, extra = create_input_processor_with_hash(processor)(request, SamplingParams())
+    (metadata,) = extra["multimodal_data"]["multimodal_embedding_metadata"]
+    cache_file = tmp_path / "video.pt"
+    torch.save(metadata, cache_file)
+    assert torch.load(cache_file, weights_only=True) == metadata
+
+
+@pytest.mark.cpu_only
+def test_qwen25_video_timing_limits_generated_tokens():
+    processor, width = _make_qwen_vl_hf_processor("qwen2.5")
+    processor.config.text_config.max_position_embeddings = 128
+    llm, results = _mock_qwen_vl_encoder(processor)
+    llm.args.mm_encoder_only = False
+    llm.args.max_seq_len = 128
+    llm._prepare_sampling_params.side_effect = lambda params: params
+    prompt = "<|vision_start|><|video_pad|><|vision_end|>"
+    request = {
+        "prompt": prompt,
+        "multi_modal_embeddings": {
+            "video": [
+                {
+                    "mm_embeddings": torch.zeros(2, width),
+                    "video_grid_thw": [2, 2, 2],
+                    "second_per_grid_ts": 62.0,
+                    "multimodal_hash": [0] * 8,
+                }
+            ]
+        },
+    }
+    with (
+        patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+        patch.object(MultimodalParams, "to_handle"),
+    ):
+        prepared = llm.preprocess(request, SamplingParams(max_tokens=2))
+        config = prepared.multimodal_params.multimodal_data["mrope_config"]
+        assert config["mrope_position_ids"].max() == 126
+        llm.generate_async(prepared, SamplingParams(max_tokens=2))
+        for inputs in (request, prepared):
+            with pytest.raises(ValueError, match="mRoPE positions allow at most 2"):
+                llm.generate_async(inputs, SamplingParams(max_tokens=3))
+        llm.args.max_seq_len = len(prepared.prompt_token_ids) + 2
+        llm.generate_async(prepared, SamplingParams(max_tokens=3))
+    assert len(results) == 2
+
+
+@pytest.mark.cpu_only
+def test_qwen3_hashless_video_kv_keys():
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    processor, width = _make_qwen_vl_hf_processor("qwen3")
+    prompt = _qwen_vl_request(["video"])["prompt"]
+    modality, rows, metadata = _encode_items(processor, ["video"])[0]
+    metadata.pop("multimodal_hash")
+    keys = []
+    for fill in (0, 1):
+        ids, extra = processor.attach_multimodal_embeddings(
+            {"prompt": prompt},
+            {modality: [{"mm_embeddings": torch.full((rows, width), fill), **metadata}]},
+            SamplingParams(),
+        )
+        identity = extra["multimodal_input"]
+        assert identity is not None
+        manager = SimpleNamespace(vocab_size=processor.get_vocab_size())
+        keys.append(KVCacheManagerV2._augment_tokens_for_block_reuse(manager, ids, identity))
+    assert keys[0] != keys[1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("form", ["embeddings", "handles"])
+def test_qwen_vl_item_digest_words(form):
+    processor, width = _make_qwen_vl_hf_processor("qwen3")
+    prompt = _qwen_vl_request(["wide"])["prompt"]
+    modality, rows, meta = _encode_items(processor, ["wide"])[0]
+    for digest in ([1], [2**31] * 8, [-(2**31) - 1] * 8, [True] * 8):
+        with pytest.raises(ValueError, match="eight signed int32"):
+            _prefill_from_items(
+                processor,
+                prompt,
+                [(modality, rows, {**meta, "multimodal_hash": digest})],
+                width,
+                form,
+            )
+    digest = [-(2**31), 2**31 - 1] * 4
+    _, params = _prefill_from_items(
+        processor, prompt, [(modality, rows, {**meta, "multimodal_hash": digest})], width, form
+    )
+    assert params.multimodal_input.multimodal_hashes == [digest]
+
+
+@pytest.mark.cpu_only
+def test_qwen3_item_export_hash_with_processor_overrides():
+    from tensorrt_llm.executor.result import GenerationResultBase
+
+    processor, width = _make_qwen_vl_hf_processor("qwen3")
+    encoder, _ = _mock_qwen_vl_encoder(processor)
+    request = _qwen_vl_request(["wide"], text=None)
+    request["multi_modal_uuids"] = {"image": ["same-media"]}
+    prompt = _qwen_vl_request(["wide"])["prompt"]
+    saved_items = []
+    raw_hashes = []
+
+    def submit(ids, *, multimodal_params, sampling_params, disaggregated_params, **kwargs):
+        result = GenerationResultBase(id=1, sampling_params=sampling_params)
+        result._disaggregated_params = disaggregated_params
+        result._multimodal_hashes = multimodal_params.multimodal_input.multimodal_hashes
+        raw_hashes.append(result._multimodal_hashes[0])
+        rows = multimodal_params.item_metadata.output_embedding_lengths[0]
+        metadata = multimodal_params.multimodal_data["multimodal_embedding_metadata"][0]
+        saved_items.append((result, rows, metadata))
+        return result
+
+    encoder._executor.generate_async.side_effect = submit
+    with (
+        patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+        patch.object(MultimodalParams, "to_handle"),
+    ):
+        encoder.generate_async({**request, "mm_processor_kwargs": {"do_normalize": False}})
+        encoder.generate_async(
+            encoder.preprocess({**request, "mm_processor_kwargs": {"do_normalize": True}})
+        )
+        encoder.generate_async({**request, "prompt": prompt})
+
+    assert raw_hashes[0] == raw_hashes[1] == raw_hashes[2]
+    exported = []
+    for result, rows, metadata in saved_items:
+        handle = {"tensor_size": [rows, width], "metadata": metadata}
+        reply = SimpleNamespace(
+            is_final=True,
+            context_phase_params=None,
+            decoding_iter=1,
+            avg_decoded_tokens_per_iter=1.0,
+            finish_reasons=[],
+            output_token_ids=[[]],
+            request_perf_metrics=None,
+            sequence_index=0,
+            context_logits=None,
+            mm_embedding_handles=[handle],
+        )
+        with patch.object(result, "_handle_sequence"):
+            result._handle_response(SimpleNamespace(result=reply, has_error=lambda: False))
+        digest = handle["metadata"]["multimodal_hash"]
+        assert result.disaggregated_params.multimodal_hashes == [digest]
+        assert digest != raw_hashes[0]
+        exported.append(tuple(digest))
+    assert len(set(exported)) == len(saved_items)
+
+    item = ("image", rows, handle["metadata"])
+    for form in ("handles", "embeddings"):
+        _, params = _prefill_from_items(processor, prompt, [item], width, form)
+        assert params.multimodal_input.multimodal_hashes == [digest]

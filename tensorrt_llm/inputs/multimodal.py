@@ -1615,6 +1615,7 @@ def find_mm_token_lengths(
 # check_mm_embed_cumsum_if_needed gate short-circuits.
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
+    "mrope_max_output_tokens",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_metadata",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,

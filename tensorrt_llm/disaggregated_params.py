@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -155,32 +156,34 @@ class DisaggregatedParams:
                     "context_and_generation"
                 )
         if self.multimodal_embedding_handles is not None:
-            if self.multimodal_hashes is None:
-                item_hashes = [
-                    (handle.get("metadata") or {}).get("multimodal_hash")
-                    for handle in self.multimodal_embedding_handles
-                ]
-                if any(value is not None for value in item_hashes):
-                    if None in item_hashes:
-                        raise ValueError("Give a multimodal_hash for every item or for none")
-                    self.multimodal_hashes = item_hashes
-            if self.multimodal_hashes is not None:
-                # if mm hashes are provided, kvcache reuse can be enabled
-                assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
-                    "multimodal_embedding_handles and multimodal_hashes must have the same length"
-                )
-                for mm_hash in self.multimodal_hashes:
-                    assert isinstance(mm_hash, list), "mm_hash must be a list"
-                    assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
-                    assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
-            else:
-                # Fresh keys keep unrelated items from sharing KV blocks.
-                assert len(self.multimodal_embedding_handles) > 0, (
-                    "multimodal_embedding_handles must be provided"
-                )
-                self.multimodal_hashes = random_multimodal_hashes(
-                    len(self.multimodal_embedding_handles)
-                )
+            self.multimodal_hashes = resolve_multimodal_hashes(
+                [handle.get("metadata") or {} for handle in self.multimodal_embedding_handles],
+                self.multimodal_hashes,
+            )
+
+
+def resolve_multimodal_hashes(
+    metadata: list[dict[str, Any]], hashes: list[list[int]] | None = None
+) -> list[list[int]]:
+    """Validate item identities or assign fresh identities to a hashless submission."""
+    if hashes is None:
+        if not metadata:
+            raise ValueError("At least one multimodal item is required")
+        hashes = [item.get("multimodal_hash") for item in metadata]
+        if all(digest is None for digest in hashes):
+            return random_multimodal_hashes(len(metadata))
+        if any(digest is None for digest in hashes):
+            raise ValueError("Give a multimodal_hash for every item or for none")
+    if not isinstance(hashes, list) or len(hashes) != len(metadata):
+        raise ValueError("The items and multimodal_hashes must have the same length")
+    for digest in hashes:
+        if (
+            not isinstance(digest, list)
+            or len(digest) != 8
+            or any(type(word) is not int or not -(2**31) <= word < 2**31 for word in digest)
+        ):
+            raise ValueError("multimodal_hash must contain eight signed int32 values")
+    return hashes
 
 
 def random_multimodal_hashes(num_items: int) -> List[List[int]]:
@@ -188,6 +191,4 @@ def random_multimodal_hashes(num_items: int) -> List[List[int]]:
 
     Each item gets its own value, so two different items never share a hash.
     """
-    return np.random.randint(
-        np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=(num_items, 8), dtype=np.int32
-    ).tolist()
+    return np.frombuffer(os.urandom(num_items * 32), dtype=np.int32).reshape(num_items, 8).tolist()

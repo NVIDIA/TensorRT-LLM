@@ -5,7 +5,9 @@ import copy
 import dataclasses
 import math
 import re
+import sys
 from functools import lru_cache
+from numbers import Real
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 from typing import Mapping as TypingMapping
 
@@ -93,6 +95,9 @@ from .multimodal_encoder_graph import (
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
+
+
+_QWEN3_VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
 def _expand_prompt_token_ids_for_mm_handoff(
@@ -305,6 +310,16 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
         return self.config.text_config.hidden_size * (1 + len(deepstack_indexes or []))
 
+    def _mm_item_placeholders(self, prompt: str) -> Dict[str, str]:
+        placeholders = super()._mm_item_placeholders(prompt)
+        pad = _QWEN_PAD_TOKENS["video"]
+        wrapped = _QWEN3_VIDEO_PLACEHOLDER
+        # The HF processor assigns videos to all wrapped markers before bare ones.
+        if pad in prompt.rpartition(wrapped)[0].replace(wrapped, ""):
+            raise ValueError("A wrapped video placeholder cannot follow a bare video pad")
+        placeholders[wrapped] = "video"
+        return placeholders
+
     def get_mm_item_text(
         self,
         modality: str,
@@ -317,7 +332,11 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             return super().get_mm_item_text(modality, placeholder, metadata, embedding_shape)
         grid_t, grid_h, grid_w = self._check_mm_item_grid(modality, metadata, embedding_shape)
         timestamps = metadata.get("video_timestamps")
-        if timestamps is None or len(timestamps) < grid_t:
+        if isinstance(timestamps, np.ndarray) or (
+            isinstance(timestamps, torch.Tensor) and timestamps.device.type == "cpu"
+        ):
+            timestamps = timestamps.tolist()
+        if not isinstance(timestamps, (list, tuple)) or len(timestamps) < grid_t:
             raise ValueError(
                 f"it needs video_timestamps with one value per frame group ({grid_t}), which "
                 f"{type(self).__name__} writes in the prompt; got {timestamps}. Pass the "
@@ -325,9 +344,15 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             )
         pad = _QWEN_PAD_TOKENS["video"]
         frame_rows = grid_h * grid_w // self.config.vision_config.spatial_merge_size**2
-        frame = placeholder.replace(pad, pad * frame_rows)
+        frame = _QWEN3_VIDEO_PLACEHOLDER.replace(pad, pad * frame_rows)
         text = ""
         for seconds in timestamps[:grid_t]:
+            if (
+                isinstance(seconds, bool)
+                or not isinstance(seconds, Real)
+                or not 0 <= seconds <= sys.float_info.max
+            ):
+                raise ValueError("video_timestamps must contain finite nonnegative seconds")
             text += f"<{seconds:.1f} seconds>{frame}"
         return text
 
@@ -538,9 +563,12 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             # the prompt ("<t seconds>"). A prefill worker rebuilds the text from it.
             temporal_patch_size = self.processor.video_processor.temporal_patch_size
             processed["video_timestamps"] = [
-                self.processor._calculate_timestamps(
-                    list(video.frames_indices), video.fps, temporal_patch_size
-                )
+                [
+                    float(seconds)
+                    for seconds in self.processor._calculate_timestamps(
+                        list(video.frames_indices), video.fps, temporal_patch_size
+                    )
+                ]
                 for video in sampled_videos
             ]
         return processed
@@ -594,7 +622,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # run the full processor here.
         do_rescale = not (video and isinstance(video[0], torch.Tensor))
         processed = self._processor(
-            text=["<|vision_start|><|video_pad|><|vision_end|>"],
+            text=[_QWEN3_VIDEO_PLACEHOLDER],
             videos=[video],
             padding=True,
             do_rescale=do_rescale,
@@ -2136,7 +2164,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
             "image": "<|vision_start|><|image_pad|><|vision_end|>",
-            "video": "<|vision_start|><|video_pad|><|vision_end|>",
+            "video": _QWEN3_VIDEO_PLACEHOLDER,
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",

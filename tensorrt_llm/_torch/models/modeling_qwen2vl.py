@@ -6,6 +6,7 @@ import copy
 import math
 import re
 from functools import lru_cache
+from numbers import Real
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -1369,19 +1370,32 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 f"must equal its {rows} rows.")
         return grid
 
+    def _mm_item_placeholders(self, prompt: str) -> Dict[str, str]:
+        return {pad: modality for modality, pad in _QWEN_PAD_TOKENS.items()}
+
     def get_mm_item_text(self, modality: str, placeholder: str,
                          metadata: Dict[str, Any],
                          embedding_shape: Tuple[int, ...]) -> str:
         """The placeholder with one pad token per embedding row, as in HF."""
-        self._check_mm_item_grid(modality, metadata, embedding_shape)
-        if (modality == "video"
-                and getattr(self.config.vision_config, "tokens_per_second",
-                            None) is not None
-                and metadata.get("second_per_grid_ts") is None):
-            raise ValueError(
-                f"it has no second_per_grid_ts, which {type(self).__name__} "
-                "needs for video mRoPE positions. Pass the encoder's item "
-                "metadata (handle['metadata']).")
+        grid = self._check_mm_item_grid(modality, metadata, embedding_shape)
+        tokens_per_second = getattr(self.config.vision_config,
+                                    "tokens_per_second", None)
+        if modality == "video" and tokens_per_second is not None:
+            seconds = metadata.get("second_per_grid_ts")
+            if seconds is None:
+                raise ValueError(
+                    "it has no second_per_grid_ts for video mRoPE positions")
+            if isinstance(
+                    seconds, torch.Tensor
+            ) and seconds.device.type == "cpu" and seconds.ndim == 0:
+                seconds = seconds.item()
+            if (isinstance(seconds, bool) or not isinstance(seconds, Real)
+                    or not 0 < seconds <= torch.finfo(torch.float32).max):
+                raise ValueError(
+                    "second_per_grid_ts must be a positive finite interval")
+            limit = self.config.text_config.max_position_embeddings
+            if (grid[0] - 1) * float(seconds) * tokens_per_second >= limit:
+                raise ValueError("video mRoPE positions exceed model bounds")
         pad = _QWEN_PAD_TOKENS[modality]
         return placeholder.replace(pad, pad * embedding_shape[0])
 
@@ -1405,8 +1419,17 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             torch.stack(grids["image"]).long() if grids["image"] else None,
             torch.stack(grids["video"]).long() if grids["video"] else None,
             torch.ones_like(input_ids),
-            torch.tensor(seconds) if seconds and None not in seconds else None)
-        return {"mrope_config": mrope_config}
+            torch.tensor(seconds, dtype=torch.float32)
+            if seconds and None not in seconds else None)
+        data: Dict[str, Any] = {"mrope_config": mrope_config}
+        if seconds and None not in seconds:
+            # Include preceding items, prompt text and the final vision delimiter.
+            limit = self.config.text_config.max_position_embeddings
+            remaining = limit - int(mrope_config["mrope_position_ids"].max())
+            if remaining <= 0:
+                raise ValueError("video mRoPE positions exceed model bounds")
+            data["mrope_max_output_tokens"] = remaining
+        return data
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
     @torch.inference_mode()

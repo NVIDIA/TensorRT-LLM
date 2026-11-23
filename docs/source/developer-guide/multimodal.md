@@ -223,34 +223,71 @@ common batching policy on every model.
 
 ### Items Without a Prompt
 
-A processor sets `supports_mm_item_handoff` when each media item is processed
-on its own, independent of the prompt text and of the other items. Qwen2.5-VL
-and the Qwen3-VL family set it. For these models:
+A processor sets `supports_mm_item_handoff` when it can encode items without
+prompt text and rebuild their positions at prefill. The prefill target must
+also support attaching embedding rows. The Qwen2.5-VL and Qwen3-VL Python
+processors provide these hooks.
 
 - `MultimodalEncoder` takes `multi_modal_data` with no prompt. It builds a
   prompt with one registered placeholder per item (`get_mm_items_prompt`) and
-  encodes the items as in a full request. The result has one embedding handle
-  per item; `handle["metadata"]` holds the item's metadata (for Qwen-VL the
+  encodes the items. The result has one embedding handle per item.
+  `handle["metadata"]` holds the item's metadata (for Qwen-VL the
   grid and, for a video, its frame timing) and its `multimodal_hash`. It has no
-  prompt layout and no mRoPE positions.
+  prompt layout and no mRoPE positions. To interleave modalities, set
+  `mm_item_order` to one entry per item in prompt order. Within each modality,
+  list indices in ascending order starting at zero. To reorder items of the
+  same modality, reorder the media and their corresponding UUIDs together.
 - Prefill takes the real prompt and items from one or more encode calls or a
-  cache: as `multi_modal_embeddings` (`{"mm_embeddings": tensor, **metadata}`
+  cache as `multi_modal_embeddings` (`{"mm_embeddings": tensor, **metadata}`
   per item, by modality), or as `DisaggregatedParams` handles without encoder
   mRoPE or layout. `build_mm_item_prefill_inputs` replaces each placeholder with
   the item's text (`get_mm_item_text`), tokenizes the prompt once, and adds
   model data such as mRoPE positions (`get_mm_item_prefill_data`).
 
+Each exported handle has one consumer. To cache an item for several prompts,
+open the handle once, copy its rows and retain its metadata alongside them.
+Each prompt below contains a placeholder for the same image.
+
 ```python
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
 out = encoder.generate({"multi_modal_data": {"image": [image]}})
 handle = out.disaggregated_params.multimodal_embedding_handles[0]
-item = {"mm_embeddings": embedding, **handle["metadata"]}  # e.g. from a cache
-llm.generate({"prompt": prompt, "multi_modal_embeddings": {"image": [item]}})
+rows = SharedTensorContainer.from_dict(handle).get_local_view().to("cpu", copy=True)
+item = {"mm_embeddings": rows, **handle["metadata"]}
+for prompt in prompts:
+    llm.generate({"prompt": prompt, "multi_modal_embeddings": {"image": [item]}})
 ```
 
-Qwen2.5-VL encodes images and videos in separate encoder calls.
+To deliver the cached rows to another process on the same host, create a fresh export with
+`SharedTensorContainer.from_tensor(rows).dump_to_dict()` for each delivery
+and set its `metadata` to the saved item metadata.
 
-For Qwen3-VL requests with several videos and a `num_frames` or `fps`
-target, set `mm_processor_kwargs["do_sample_frames"]` explicitly. Use the
-same value for all encode calls and include it in the caller's cache key.
-The processor can otherwise choose a different sampling policy for a
-subset of videos than it would for the full request.
+Qwen2.5-VL requires one modality per scheduled encoder batch. For a shared
+encoder serving both images and videos, set `max_batch_size=1` and send one
+modality per request. An encoder dedicated to a single modality can batch
+requests for that modality.
+
+For prompt-free Qwen encoding, provide RGB PIL images or `uint8` NumPy arrays
+with channels last. Use video frames in the same format. These inputs share a
+rescaling policy whether encoded together or separately.
+
+For prompt-free Qwen3-VL video encoding with a `num_frames` or `fps` target,
+set `mm_processor_kwargs["do_sample_frames"]` explicitly, even for one video.
+Use the same setting for every item in the request. Include processor settings
+and the media identity in the application's cache key.
+
+For externally supplied videos, Qwen2.5-VL needs a finite positive
+`second_per_grid_ts` that keeps positions within the model's rotary table.
+For a separate decode worker, ensure the largest prefill position plus the
+planned output length minus one stays below `max_position_embeddings`.
+Context-only prefill cannot check that worker's future output length.
+Qwen3-VL needs one finite nonnegative value in `video_timestamps` per temporal
+grid step. Use consistent video placeholder spelling within a Qwen3-VL prompt.
+
+Each Qwen encoder export gets a fresh `multimodal_hash`. Keep it with the
+saved rows and metadata to reuse KV across deliveries of that item. When
+upgrading an existing cache that stored raw media hashes, discard those
+hashes or encode the items again. Caller-supplied hashes must identify the
+processed rows and contain eight signed 32-bit integers for every item.
+Omitting all hashes gives each item a fresh identity at each submission.
