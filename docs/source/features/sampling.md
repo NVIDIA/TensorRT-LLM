@@ -210,6 +210,24 @@ Moreover, Torch Sampler internally batches requests with compatible sampling par
 can greatly reduce the overall latency of the sampling step when request batches are comprised
 of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).
 
+## Minimum output length with standalone DSpark
+
+`SamplingParams(min_tokens=N)` suppresses the original EOS token and single-token
+stop words until `N` newly generated tokens have been accepted. The prompt is not
+counted. Standalone DSpark supports this with its standard worker verification,
+including the fused advanced sampler and vocabulary-sharded target sampling.
+Greedy and sampled requests use the same minimum-length rule. Multi-token stop
+words retain the ordinary stop-handler behavior.
+
+The request can contain up to 64 unique EOS and single-token stop IDs when its
+minimum is positive. Larger sets and sets covering the entire target vocabulary
+are rejected. `min_tokens=0`
+keeps neutral score semantics. Positive minima remain unsupported for embedded
+DSpark, custom step folds that bypass worker verification, artificially forced
+acceptance, and other one-model speculative modes; they are rejected rather than
+silently ignored. Existing restrictions on bad words, n-gram bans, callbacks,
+watermarking and other sampling combinations still apply.
+
 ## Advanced sampling mode (speculative decoding)
 
 For one-model speculative decoding (e.g. MTP-Eagle one-model), the per-request
