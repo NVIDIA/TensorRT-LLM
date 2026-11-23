@@ -54,6 +54,7 @@ from tensorrt_llm._torch.disaggregation.native.retirement import (
     RetirementDeadline,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    ReceiveAdmissionFenced,
     RxSession,
     TransferWorker,
     TransferWorkerConfig,
@@ -1177,6 +1178,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         intents = self._failure_intents(sessions, "gen") if recovery else None
         terminal = None
         if recovery:
+            intents.update(self._rank_info_start_failures or ())
             self._cancel_failed_transfers(sessions, intents)
             terminal = intents | set(cancelled) | set(failed) | set(completed)
         locally_retirable = [
@@ -1198,6 +1200,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 len(sessions)
                 + self._gen_deferred_receives
                 + len(self._pending_rank_info_admissions or {})
+                + len(self._rank_info_start_failures or {})
                 if idle_skip
                 else None
             ),
@@ -1578,6 +1581,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return (
             rid in self._send_sessions
             or rid in self._recv_sessions
+            or rid in (self._rank_info_start_failures or ())
             or rid in getattr(self, "_cancelled_receive_fences", {})
         )
 
@@ -1769,6 +1773,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 settlement_outcome = "failed"
+        except ReceiveAdmissionFenced as error:
+            logger.warning(f"Synchronous receive {rid} could not start: {error}")
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
         except Exception:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
             settlement_outcome = "failed"
@@ -1877,7 +1884,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 pending[rid] = (req, error)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
             return
-        self._start_async_receive(req)
+        try:
+            self._start_async_receive(req)
+        except ReceiveAdmissionFenced as error:
+            logger.warning(f"Asynchronous receive {rid} could not start: {error}")
+            self._remember_receive_start_failure(rid, req)
+
+    def _remember_receive_start_failure(self, rid: int, req: LlmRequest) -> None:
+        if self._rank_info_start_failures is None:
+            self._rank_info_start_failures = {}
+        self._rank_info_start_failures[rid] = req
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 
     def _poll_rank_info_admissions(self, local_done: list[int]) -> tuple[list[int], list[int]]:
         pending = self._pending_rank_info_admissions
@@ -1915,9 +1932,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for rid in sorted(set().union(*(errors.keys() for errors in errors_by_rank))):
                 error = next(errors[rid] for errors in errors_by_rank if rid in errors)
                 logger.error(f"Receive start failed for request {rid}: {error}")
-                if self._rank_info_start_failures is None:
-                    self._rank_info_start_failures = {}
-                self._rank_info_start_failures[rid] = started[rid]
+                self._remember_receive_start_failure(rid, started[rid])
                 session = self._recv_sessions.get(rid)
                 if session is not None:
                     session.fail_admission(RuntimeError(error))
@@ -2477,7 +2492,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
 
-        has_transferring = False
+        # An unpublished start failure still owes the receive group a retirement vote.
+        has_transferring = rid in (self._rank_info_start_failures or ())
 
         if rid in self._send_sessions:
             session = self._send_sessions[rid]

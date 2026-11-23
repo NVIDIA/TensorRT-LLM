@@ -276,6 +276,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
 
     // NixlTransferAgent class
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
+        .def_static("normalize_backend", &kvc::NixlTransferAgent::normalizeBackend, nb::arg("backend"))
         .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &kvc::NixlTransferAgent::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"),

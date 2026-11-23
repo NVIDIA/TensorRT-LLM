@@ -289,9 +289,15 @@ def test_fallback_sender_refreshes_peer_after_submitted_write_drains(worker, tas
     agent.shutdown.assert_not_called()
 
 
-@pytest.mark.parametrize(("backend", "enabled"), [("UCX", True), ("LIBFABRIC", False)])
+@pytest.mark.parametrize(
+    ("backend", "enabled"),
+    [(None, True), ("", True), ("UCX", True), ("unknown", True), ("LIBFABRIC", False)],
+)
 def test_peer_replacement_is_enabled_only_for_ucx(worker, monkeypatch, backend, enabled):
-    monkeypatch.setenv("TRTLLM_NIXL_KVCACHE_BACKEND", backend)
+    if backend is None:
+        monkeypatch.delenv("TRTLLM_NIXL_KVCACHE_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_NIXL_KVCACHE_BACKEND", backend)
     monkeypatch.setattr(transfer.NixlTransferAgent, "supports_handle_retirement", True)
     monkeypatch.setattr(transfer.Sender, "_start_listener", Mock())
     monkeypatch.setattr(threading.Thread, "start", Mock())
@@ -368,9 +374,34 @@ def test_fenced_agent_rejects_new_receive_publications(worker):
         _recovery_sender=weakref.ref(worker._sender),
     )
     session = SimpleNamespace(_enforce_physical_ownership=False, disagg_request_id=73)
-    with pytest.raises(RuntimeError, match="receive admission is closed"):
+    with pytest.raises(transfer.ReceiveAdmissionFenced, match="receive admission is closed"):
         receiver.setup_session(session)
     assert not receiver._sessions
+
+
+def test_unpublished_receive_failure_waits_for_peer_retirement():
+    rid = 73
+    node = object.__new__(KvCacheTransceiverV2)
+    node.__dict__.update(
+        _agent_recovery=True,
+        _gen_need_sync=True,
+        _gen_idle_poll_skip=False,
+        _recv_sessions={},
+        _local_agent_ready=lambda: True,
+    )
+    req = SimpleNamespace()
+    node._remember_receive_start_failure(rid, req)
+
+    def gather(local_vote):
+        assert local_vote[3] == local_vote[-2] == [rid]
+        peer_vote = [[], [], [], [rid] if peer_drained else [], [], [], [1]]
+        return [local_vote, peer_vote]
+
+    node._gen_allgather = gather
+    peer_drained = False
+    assert node._gen_consensus_outcome([rid], [], [rid], [], [])[1] == []
+    peer_drained = True
+    assert node._gen_consensus_outcome([rid], [], [rid], [], [])[1] == [rid]
 
 
 @pytest.mark.parametrize("side", ["gen", "ctx"])

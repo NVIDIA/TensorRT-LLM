@@ -120,6 +120,14 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
 
     supports_handle_retirement = hasattr(CppTransferStatus, "release")
 
+    @staticmethod
+    def normalize_backend(backend: str) -> str:
+        normalize = getattr(CppNixlTransferAgent, "normalize_backend", None)
+        if normalize is None:
+            # Older bindings support these same two native backends.
+            return "LIBFABRIC" if backend == "LIBFABRIC" else "UCX"
+        return normalize(backend)
+
     def __init__(
         self,
         name: str,

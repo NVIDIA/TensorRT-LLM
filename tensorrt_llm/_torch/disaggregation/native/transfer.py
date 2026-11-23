@@ -169,8 +169,15 @@ class OlderReleaseRequestError(ValueError):
         self.req_info = req_info
 
 
+class ReceiveAdmissionFenced(RuntimeError):
+    """The agent closed receive admission before this destination was published."""
+
+
 def _ucx_peer_refresh_supported() -> bool:
-    return os.getenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX") == "UCX"
+    normalize_backend = getattr(NixlTransferAgent, "normalize_backend", None)
+    return normalize_backend is not None and (
+        normalize_backend(os.getenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX")) == "UCX"
+    )
 
 
 def agent_recovery_supported(
@@ -3757,11 +3764,13 @@ class Receiver(ReceiverBase):
                 sender = sender_ref() if sender_ref is not None else None
                 with sender._admission_lock if sender is not None else nullcontext():
                     if sender is not None and (sender._agent_failed or sender._shutdown_requested):
-                        raise RuntimeError("NIXL receive admission is closed during agent recovery")
-                if getattr(rx_session, "_enforce_physical_ownership", False):
-                    self._sessions[rx_session.disagg_request_id] = rx_session
-                else:
-                    self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
+                        raise ReceiveAdmissionFenced(
+                            "NIXL receive admission is closed during agent recovery"
+                        )
+                    if getattr(rx_session, "_enforce_physical_ownership", False):
+                        self._sessions[rx_session.disagg_request_id] = rx_session
+                    else:
+                        self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
                 if rx_session.disagg_request_id in self._pre_cancelled_rids:
                     pre_cancel = True
                     cancelled_by_peer = self._pre_cancelled_rids.pop(rx_session.disagg_request_id)

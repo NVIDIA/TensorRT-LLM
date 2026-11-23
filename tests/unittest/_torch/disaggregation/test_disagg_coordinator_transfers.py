@@ -8,6 +8,8 @@ assertion is about request state, transfer ownership and what the executor
 was asked to do -- not about which internal method was called.
 """
 
+import threading
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,7 +18,11 @@ from coordinator_harness import CoordinatorHarness as _Harness
 from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
+from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.transfer import Receiver
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import LlmRequestState
@@ -578,6 +584,91 @@ def test_fatal_error_during_the_synced_drain_leaves_no_stale_pending_state() -> 
 
 
 # -- in-flight cancellation of generation receives ---------------------------
+
+
+@pytest.mark.parametrize("async_receive", [True, False])
+def test_receive_admission_fence_only_fails_the_unpublished_request(
+    monkeypatch, async_receive
+) -> None:
+    monkeypatch.setattr(coordinator_module, "uses_async_gen_transfer", lambda: async_receive)
+    monkeypatch.setattr(transceiver_module, "_chunk_bytes_by_kind", lambda *_: (0, 0))
+    h = _Harness()
+    rejected = _Request(1, is_context_only_request=False, set_kv_cache_transfer_start=Mock())
+    allowed = _Request(
+        2,
+        is_context_only_request=False,
+        set_kv_cache_transfer_start=Mock(),
+        set_kv_cache_size=Mock(),
+    )
+    h.active.extend((rejected, allowed))
+    sender = Mock(_agent_failed=False, _shutdown_requested=False, _admission_lock=threading.Lock())
+    receiver = object.__new__(Receiver)
+    receiver.__dict__.update(
+        _sessions_lock=threading.Lock(),
+        _sessions={},
+        _pre_cancelled_rids={},
+        _shutdown=False,
+        _recovery_sender=weakref.ref(sender),
+        shutdown=Mock(),
+    )
+    node = object.__new__(KvCacheTransceiverV2)
+    node.__dict__.update(
+        _agent_recovery=True,
+        _gen_need_sync=False,
+        _gen_allgather=None,
+        _gen_idle_probe=False,
+        _recv_sessions={},
+        _recv_reqs={},
+        _send_sessions={},
+        _dist=h.dist,
+        _page_table=None,
+        kv_transfer_timeout_ms=None,
+        _create_cache_extent=Mock(return_value=SimpleNamespace(local=None)),
+        _request_kv_bytes=Mock(return_value=0),
+        _need_aux_transfer=Mock(return_value=False),
+        _assert_disagg_history_declared=Mock(),
+        _validate_bridge_req=Mock(return_value=True),
+        _local_agent_ready=lambda: not sender._agent_failed,
+    )
+    node._init_gen_idle_poll(False)
+    h.transceiver.request_and_receive_async = node.request_and_receive_async
+    h.transceiver.request_and_receive_sync = node.request_and_receive_sync
+    h.transceiver.check_gen_transfer_status = node.check_gen_transfer_status
+    h.transceiver.has_inflight_transfer = node.has_inflight_transfer
+
+    def open_source(req):
+        fetches = SimpleNamespace(session=None)
+        session = Mock(
+            _enforce_physical_ownership=False,
+            disagg_request_id=req.py_request_id,
+            status=SessionStatus.TRANSFERRED,
+            transfer_end_time=None,
+            kv_cache_size_bytes=0,
+        )
+        session.wait_complete.return_value = WaitResult.COMPLETED
+        session.kv_write_verified.return_value = True
+        session.is_completed.return_value = True
+
+        def fetch(*args, **kwargs):
+            with sender._admission_lock:
+                sender._agent_failed = req is rejected
+            receiver.setup_session(session)
+            fetches.session = session
+            return Mock()
+
+        session.close.side_effect = lambda: receiver.clear_session(req.py_request_id)
+        fetches.fetch = fetch
+        return fetches
+
+    node._open_peer_source = open_source
+    assert node._local_agent_ready()
+    h.coordinator.receive_gen_init([rejected, allowed])
+
+    assert rejected.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert allowed.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert [requests for _, requests, _ in h.effects.failed] == [[rejected]]
+    assert node._recv_sessions == node._recv_reqs == receiver._sessions == {}
+    assert not node._rank_info_start_failures
 
 
 def _receiving(h: _Harness, rid: int, started_at: float) -> _Request:

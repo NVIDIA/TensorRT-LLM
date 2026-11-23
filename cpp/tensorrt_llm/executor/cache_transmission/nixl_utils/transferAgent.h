@@ -104,6 +104,8 @@ private:
 class NixlTransferAgent : public BaseTransferAgent
 {
 public:
+    static std::string normalizeBackend(std::string const& backend);
+
     NixlTransferAgent(BaseAgentConfig const& config);
     ~NixlTransferAgent();
 
