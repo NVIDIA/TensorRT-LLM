@@ -528,12 +528,19 @@ class DecoderInputPreparer:
             )
 
     def warmup_speculative_inputs(self, warmup_timer: _WarmupTimer) -> None:
-        """Initialize staged speculative copies before serving, without reading request data."""
+        """Initialize staged speculative copies before serving, without reading request data.
+
+        The zero-row launch zero-fills ``previous_pos_id_offsets_cuda`` and
+        ``previous_kv_lens_offsets_cuda``. This is startup-only; neither buffer
+        may hold live request state.
+        """
         if not self._spec_overlap_staging:
             return
         with warmup_timer.phase("speculative_input_staging"):
             buffers = self._buffers
             source = buffers.input_ids_cuda[:1]
+            # Match SpecSampler.Store.allocate: num_slots is max_num_sequences,
+            # new_tokens uses beam width 1, and the draft row width is max_total_draft_tokens.
             num_slots = (
                 self._config.max_batch_size
                 if self._config.num_seq_slots is None

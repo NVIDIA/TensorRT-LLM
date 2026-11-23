@@ -730,16 +730,23 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         self.assertEqual(kernel_path[0][:num_tokens].tolist(), expected_input_ids.tolist())
 
     def test_staged_speculative_inputs_warmup_respects_serving_role(self) -> None:
-        for is_disagg, role, speculative, expected_launches in (
-            (True, "context", True, 0),
-            (True, "ctx0", True, 0),
-            (True, "CONTEXT", True, 0),
-            (True, "generation", True, 1),
-            (False, "context", True, 1),
-            (False, "generation", False, 0),
+        for is_disagg, role, role_after_init, speculative, expected_launches in (
+            (True, "context", None, True, 0),
+            (True, "ctx0", None, True, 1),
+            (True, "CONTEXT", None, True, 1),
+            (True, "generation", None, True, 1),
+            (False, "context", None, True, 1),
+            (False, "generation", None, False, 0),
+            (True, "context", "generation", True, 0),
+            (True, "generation", "context", True, 1),
         ):
             with (
-                self.subTest(is_disagg=is_disagg, role=role, speculative=speculative),
+                self.subTest(
+                    is_disagg=is_disagg,
+                    role=role,
+                    role_after_init=role_after_init,
+                    speculative=speculative,
+                ),
                 patch.dict(os.environ, {"TRTLLM_DISAGG_ROLE": role}),
                 create_model_engine_and_kvcache(
                     llm_args=TorchLlmArgs(
@@ -756,6 +763,8 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                 ) as (model_engine, kv_cache_manager),
                 patch.object(_stage_kernel, "run", wraps=_stage_kernel.run) as stage_launch,
             ):
+                if role_after_init is not None:
+                    os.environ["TRTLLM_DISAGG_ROLE"] = role_after_init
                 resource_manager = ResourceManager(
                     {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
                 )

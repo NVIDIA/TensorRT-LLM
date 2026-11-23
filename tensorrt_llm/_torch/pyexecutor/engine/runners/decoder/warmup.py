@@ -334,8 +334,9 @@ class DecoderWarmup:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with.
 
         Decode-input staging is prewarmed for generation and aggregated workers,
-        not disaggregated context roles. A context-role worker that accepts an
-        aggregated request initializes staging on demand at its first staged step.
+        not workers configured for the disaggregated context role. A context-role
+        worker that accepts an aggregated request initializes staging on demand
+        at its first staged step.
         """
         from tensorrt_llm._torch.modules.low_m_gemm import release_mma_staging_buffers
 
@@ -347,11 +348,7 @@ class DecoderWarmup:
         try:
             # Retain a partial summary when a phase raises.
             with self._warmup_timer:
-                disagg_role = os.getenv("TRTLLM_DISAGG_ROLE", "").lower()
-                if not (
-                    self._config.is_disagg
-                    and (disagg_role == "context" or disagg_role.startswith("ctx"))
-                ):
+                if not self._config.is_disagg_context:
                     self._inputs.warmup_speculative_inputs(self._warmup_timer)
                 return self._warmup_scheduled(resource_manager, kv_cache_manager)
         finally:

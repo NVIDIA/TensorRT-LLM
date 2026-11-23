@@ -310,6 +310,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             device: str = "cuda",
         ) -> "SpecSampler.Store":
             """A store for ``num_slots`` slots."""
+            # DecoderInputPreparer.warmup_speculative_inputs mirrors these strides
+            # for beam width 1; keep the slot count and draft width in sync.
             new_tokens_shape = (accepted_len, num_slots, beam_width)
             host_read = int_tensor(
                 (math.prod(new_tokens_shape) + num_slots * (1 + draft_len),), device=device
