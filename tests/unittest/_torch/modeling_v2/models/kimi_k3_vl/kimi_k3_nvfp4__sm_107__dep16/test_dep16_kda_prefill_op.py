@@ -36,7 +36,9 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.sm107_short_conv 
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig  # noqa: E402
 from tensorrt_llm.quantization import QuantAlgo  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import KimiKDAReference
+
+__extra_import_path__ = ["../../../../modules/kimi_kda"]
+from kimi_kda_test_utils import KimiKDAReference
 
 NUM_HEADS = 96
 HEAD_DIM = 128

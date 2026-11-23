@@ -1078,19 +1078,18 @@ class TestLogsprobsInBatchedSampling:
 
             # permute all but one sub-batch
             for unperm_sub_batch_idx in range(len(sub_batches)):
-                head = [
+                perm = [
                     params
                     for sub_batch in sub_batches[:unperm_sub_batch_idx]
+                    + sub_batches[(unperm_sub_batch_idx + 1) :]
                     for params in sub_batch
                 ]
-                tail = [
-                    params
-                    for sub_batch in sub_batches[(unperm_sub_batch_idx + 1) :]
-                    for params in sub_batch
-                ]
-                rng.shuffle(head)  # inplace
-                rng.shuffle(tail)  # inplace
-                partially_perm_batch = head + sub_batches[unperm_sub_batch_idx] + tail
+                rng.shuffle(perm)  # inplace
+                split_idx = rng.integers(low=min(1, len(perm) - 1), high=max(1, len(perm)))
+
+                partially_perm_batch = (
+                    perm[:split_idx] + sub_batches[unperm_sub_batch_idx] + perm[split_idx:]
+                )
 
                 partially_perm_label = "partially_permuted_" + "_".join(
                     list(labels[:unperm_sub_batch_idx])
@@ -1157,7 +1156,15 @@ class TestLogsprobsInBatchedSampling:
             (key, value) for key, value in BASE_CASES.items() if key.startswith("single")
         ]
         assert single_configs
-        test_cases += _combine_up_to_3_configs(single_configs)
+        test_cases += [
+            (
+                # Prepending a different sampling strategy to test interplay of batching by strategy
+                # and logprob output.
+                [SamplingParams(temperature=0.7)] * 3 + batch,
+                label,
+            )
+            for batch, label in _combine_up_to_3_configs(single_configs)
+        ]
 
         if include_beam_search:
             # All ordered combinations of up to three configs from the "beam_search" family
@@ -1179,7 +1186,9 @@ class TestLogsprobsInBatchedSampling:
         # Raw logprobs of rows the sampler rewrites before sampling (embedding bias, bad words,
         # min_length), alone and mixed with requests it leaves alone.
         logit_rewrites = {
-            "embedding_bias": {"embedding_bias": torch.linspace(-5.0, 5.0, vocab_size)},
+            "embedding_bias": {
+                "embedding_bias": tuple(enumerate(torch.linspace(-5.0, 5.0, vocab_size).tolist()))
+            },
             "bad_words": {"bad_token_ids": list(range(0, vocab_size, 2))},
             "min_length": {"end_id": 5, "min_tokens": 10},
         }

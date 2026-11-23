@@ -216,8 +216,9 @@ def _build_fake_self(
       * ``executor_request_queue.get_request_queue_size()`` — for
         top-level ``num_queued_requests`` (not one of the fields
         exercised here)
-      * ``resource_manager.resource_managers.get(...)`` — returns None so
-        the KV-cache-stats block is skipped entirely
+      * ``resource_manager.resource_managers.get(...)`` — a KV cache manager
+        reporting zeroed ``KvCacheStats`` and no per-iteration KV stats (the
+        KV fields are not exercised here)
       * ``drafter`` — None (spec-decode block no-ops when
         ``stats.specdec_stats`` is None, which is the default on a fresh
         ``IterationStats``)
@@ -239,7 +240,12 @@ def _build_fake_self(
     fake.iter_counter = 1
     fake.executor_request_queue.get_request_queue_size.return_value = len(queued_items)
     fake.executor_request_queue.get_request_queue.return_value.queue = queued_items
-    fake.resource_manager.resource_managers.get.return_value = None
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_kv_cache_stats.return_value = KvCacheStats()
+    kv_cache_manager.get_iteration_stats.return_value = None
+    fake.resource_manager.resource_managers.get.return_value = kv_cache_manager
+    fake._kv_iter_stats_interval = 1
+    fake._last_kv_iter_stats_fetch_iter = None
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp

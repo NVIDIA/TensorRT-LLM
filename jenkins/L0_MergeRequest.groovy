@@ -455,7 +455,7 @@ boolean enableUpdateGitlabStatus =
     testFilter[TEST_BACKEND] == null
 
 
-def createKubernetesPodConfig(image, type, arch = "amd64")
+def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
 {
     def targetCould = "kubernetes-cpu"
     def selectors = """
@@ -559,7 +559,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "L0_MergeRequest", stage: stageName])
 }
 
 def echoNodeAndGpuInfo(pipeline, stageName)
@@ -805,7 +805,7 @@ def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
 def preparation(pipeline, testFilter, globalVars)
 {
     image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
-    setupPipelineSpec = createKubernetesPodConfig(image, "package")
+    setupPipelineSpec = createKubernetesPodConfig(image, "package", "amd64", "Setup Environment")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         def targetBranchInfo = [:]
         stage("Setup Environment") {
@@ -962,7 +962,7 @@ def launchReleaseCheck(pipeline, globalVars)
 
     def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"
     stageName = "Release-Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package", "amd64", stageName), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
@@ -1001,7 +1001,7 @@ def launchTestListCheck(pipeline, globalVars)
 {
     def key = "Check-Test-List"
     def image = globalVars["LLM_DOCKER_IMAGE"]
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package", "amd64", key), "trt-llm", {
         stage("[${key}] Run") {
             timeout(time: 30, unit: 'MINUTES') {
                 echoNodeAndGpuInfo(pipeline, key)
@@ -1961,6 +1961,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
         "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
         "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
+        "tensorrt_llm/_torch/memory/monitor/ranks.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",
@@ -2207,7 +2208,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
     def sbsaArchiveEre = '^results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-.*\\.tar\\.gz$'
     try {
         timeout(time: 15, unit: 'MINUTES') {
-            def podSpec = createKubernetesPodConfig("", "agent")
+            def podSpec = createKubernetesPodConfig("", "agent", "amd64", "Upload Single-GPU Coverage (${arch})")
             trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
                 stage("Upload Single-GPU Coverage (${arch})") {
                     sh "rm -rf cov && mkdir -p cov"
@@ -2262,7 +2263,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
 
 def collectTestResults(pipeline, testFilter, globalVars)
 {
-    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+    collectResultPodSpec = createKubernetesPodConfig("", "agent", "amd64", "Collect Test Result")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
         // 1. Serial: download tarballs, extract, and run junit
         stage ("Collect Test Result") {
@@ -2792,7 +2793,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // pod instead (same image used by preparation()'s mergeWaiveList.py call).
                         def cached
                         def packageImage = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
-                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package"), "trt-llm", {
+                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package", "amd64", "OSS-Compliance-Check"), "trt-llm", {
                             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                             cached = findCachedPLCSourceScanResult(env.gitlabCommit)
                         })

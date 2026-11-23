@@ -85,7 +85,12 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
 
     prompt_token_ids, extra_processed_inputs = processor.attach_multimodal_embeddings(
         {"prompt": "Describe this image."},
-        {"image": [image_embedding]},
+        {
+            "image": [{
+                "mm_embeddings": image_embedding,
+                "image_grid_thw": [1, 4, 4]
+            }]
+        },
         SamplingParams(),
     )
 
@@ -345,6 +350,30 @@ def test_llama4_attached_embeddings_are_keyed_per_image() -> None:
     changed = attach(first, second + 1).multimodal_hashes
     assert changed[0] == hashes[0]
     assert changed[1] != hashes[1]
+
+
+@pytest.mark.parametrize("with_grid", [False, True], ids=["tensor", "grid"])
+def test_llava_next_embeddings_keep_tensor_list(with_grid):
+    """Models without mRoPE take a plain list of tensors and ignore a grid."""
+    processor = object.__new__(LlavaNextInputProcessor)
+    processor._config = SimpleNamespace(
+        image_token_index=9, text_config=SimpleNamespace(hidden_size=4))
+    embeddings = [torch.ones(3, 4), torch.zeros(2, 4)]
+    items = embeddings
+    if with_grid:
+        # trtllm-serve passes an image_embeds part with a grid in this form.
+        items = [{
+            "mm_embeddings": embedding,
+            "image_grid_thw": [1, 2, 2]
+        } for embedding in embeddings]
+
+    ids, extra = processor.attach_multimodal_embeddings(
+        {"prompt_token_ids": [1, 9, 2, 9, 3]}, {"image": items},
+        SamplingParams())
+
+    assert ids == [1, 9, 9, 9, 2, 9, 9, 3]
+    torch.testing.assert_close(extra["multimodal_data"]["multimodal_embedding"],
+                               torch.cat(embeddings))
 
 
 if __name__ == "__main__":

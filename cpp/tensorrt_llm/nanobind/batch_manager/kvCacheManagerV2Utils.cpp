@@ -253,6 +253,53 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("index_scales"), nb::arg("kv_offset"),
         nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Materialize attention block offsets from V2 base-page indices");
+
+    module.def(
+        "copy_per_layer_block_offsets_to_device",
+        [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor converters, at::Tensor poolLaneOffsets,
+            at::Tensor poolLanes, SizeType32 maxBlocks, uintptr_t stream)
+        {
+            auto const checkInt32Contiguous = [](at::Tensor const& tensor, char const* name)
+            {
+                TLLM_CHECK_WITH_INFO(tensor.scalar_type() == at::kInt, "%s must contain int32 values", name);
+                TLLM_CHECK_WITH_INFO(tensor.is_contiguous(), "%s must be contiguous", name);
+            };
+            checkInt32Contiguous(input, "input");
+            checkInt32Contiguous(output, "output");
+            checkInt32Contiguous(copyIndex, "copy_index");
+            checkInt32Contiguous(converters, "converters");
+            checkInt32Contiguous(poolLaneOffsets, "pool_lane_offsets");
+            checkInt32Contiguous(poolLanes, "pool_lanes");
+
+            TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
+            c10::cuda::CUDAGuard const deviceGuard(output.device());
+            TLLM_CHECK_WITH_INFO(converters.device() == output.device() && poolLaneOffsets.device() == output.device()
+                    && poolLanes.device() == output.device(),
+                "converters, pool_lane_offsets, and pool_lanes must be on the output device");
+
+            // CUDA pointer queries are diagnostic checks, not per-step work in normal execution.
+            if (copyIndex.numel() > 0 && tensorrt_llm::DebugConfig::isCheckDebugEnabled())
+            {
+                checkTensorReadableByGpu(input, output.device(), "input");
+                checkTensorReadableByGpu(copyIndex, output.device(), "copy_index");
+            }
+
+            auto source = from_torch(input);
+            auto destination = from_torch(output);
+            auto rows = from_torch(copyIndex);
+            auto mapping = from_torch(converters);
+            auto laneOffsets = from_torch(poolLaneOffsets);
+            auto lanes = from_torch(poolLanes);
+            TLLM_CHECK_WITH_INFO(source.has_value() && destination.has_value() && rows.has_value()
+                    && mapping.has_value() && laneOffsets.has_value() && lanes.has_value(),
+                "Invalid page-table tensor.");
+            copyPerLayerBlockOffsetsToDevice(*(source.value()), *(destination.value()), *(rows.value()),
+                *(mapping.value()), *(laneOffsets.value()), *(lanes.value()), maxBlocks,
+                reinterpret_cast<CUstream>(stream));
+        },
+        nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("converters"), nb::arg("pool_lane_offsets"),
+        nb::arg("pool_lanes"), nb::arg("max_blocks"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Write per-layer page tables from a pinned-host or device base-page table");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

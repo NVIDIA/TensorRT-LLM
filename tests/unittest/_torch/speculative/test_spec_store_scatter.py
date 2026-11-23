@@ -147,8 +147,8 @@ def _assert_step(state, scheduled, outputs):
 
 def test_sample_async_snapshots_the_store_on_the_side_stream(monkeypatch):
     sampler = _sampler(monkeypatch)
-    for seed in (1, 2):  # the second step reuses the batch's slot index
-        scheduled, outputs = _step(seed)
+    for seed, slots in enumerate(((6, 2), (6, 2), (6,), (6, 7), (7, 6))):
+        scheduled, outputs = _step(seed, slots)
         state = sampler.sample_async(scheduled, outputs, [])
         assert state.sampler_event.side_stream_event is not None
         state.sampler_event.synchronize()

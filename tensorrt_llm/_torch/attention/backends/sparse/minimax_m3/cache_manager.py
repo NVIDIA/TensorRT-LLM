@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -42,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _BasePageTableMaterializer,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Replicated
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -343,7 +345,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     skip_unchanged_block_offsets = False
     reuse_pool_views = False
 
-    _main_kv_mapper_kind = MapperKind.HND
+    _main_kv_storage_layout = "HND"
     _main_kv_view_layout = "NHD"
     _dense_native_layer_ids: Tuple[int, ...] = ()
     # Virtual attention-op pools for dense target and shared draft layers:
@@ -382,7 +384,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
         native_dense_cache = kwargs.get("dtype") not in (DataType.FP8, DataType.NVFP4)
         if not self.main_kv_is_head_major(sparse_attention_config, kwargs.get("dtype")):
-            self._main_kv_mapper_kind = MapperKind.NHD
+            self._main_kv_storage_layout = "NHD"
 
         if sparse_index_dim is None:
             sparse_index_dim = getattr(sparse_attention_config, "sparse_index_dim", None)
@@ -453,11 +455,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         hosts_draft_layers = layer_specs is not None and any(
             spec.owner is KVCacheLayerOwner.DRAFT for spec in layer_specs
         )
-        if (
-            hosts_draft_layers
-            and kwargs.get("is_disagg")
-            and self._main_kv_mapper_kind != MapperKind.HND
-        ):
+        if hosts_draft_layers and kwargs.get("is_disagg") and self._main_kv_storage_layout != "HND":
             # Drafters write head-major K/V, but transfer reads every K/V buffer with the main mapper.
             raise ValueError(
                 f"{type(self).__name__} transfers draft layers only with the HND K/V layout."
@@ -1021,6 +1019,20 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             if layer_id in self.layer_offsets
         }
 
+    def page_table_spec(self) -> PageTableSpec:
+        """K/V and their block scales split by head as the backend writes them: token-major for
+        the Triton backend over an FP8 or NVFP4 cache, else head-major (``_main_kv_storage_layout``);
+        index-K alike on every rank."""
+        return replace(
+            super().page_table_spec(),
+            role_layouts={Role.INDEX_KEY: Replicated()},
+            default_layout=ByHead(token_major=self._main_kv_storage_layout == "NHD"),
+        )
+
+    @property
+    def _main_kv_mapper_kind(self) -> MapperKind:
+        return MapperKind.HND if self._main_kv_storage_layout == "HND" else MapperKind.NHD
+
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Declare the backend's main K/V layout and replicated index-K."""
         return {
@@ -1029,8 +1041,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         }
 
     def _main_kv_layout_name(self) -> str:
-        """Return the tensor-view layout name for the selected mapper kind."""
-        return "HND" if self._main_kv_mapper_kind == MapperKind.HND else "NHD"
+        """Return the layout name of the main K/V storage, ``"HND"`` or ``"NHD"``."""
+        return self._main_kv_storage_layout
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.

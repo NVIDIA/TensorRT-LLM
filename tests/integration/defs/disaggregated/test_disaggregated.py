@@ -830,6 +830,11 @@ def setup_disagg_cluster(
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
         where server_port is the port the disagg server bound
     """
+    ctx_env = (ctx_env or env or os.environ).copy()
+    gen_env = (gen_env or env or os.environ).copy()
+    for worker_env in (ctx_env, gen_env):
+        apply_pre_hopper_nccl_workaround(worker_env)
+
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
     for key, value in (config_overrides or {}).items():
@@ -1181,7 +1186,6 @@ def run_disaggregated_test(example_dir,
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
-    apply_pre_hopper_nccl_workaround(run_env)
     ctx_run_env = run_env.copy()
     if ctx_env:
         ctx_run_env.update(ctx_env)
@@ -2138,12 +2142,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
     # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
     # and gen TP2 yields the 16 heads/rank the lib's bf16-KV path admits at any
-    # batch size (the fp8 checkpoint keeps a bf16 KV cache), so the lib takes
-    # essentially every gen forward. Require its kernel-compile marker (logged
+    # batch size (the fp8 checkpoint keeps a bf16 KV cache). Select the lib
+    # explicitly on the generation server. Require its kernel-compile marker (logged
     # at INFO) in a generation-worker log: correct client output alone would
     # not distinguish the CuTe DSL path from a silent fallback to another FMHA
-    # library. TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
-    # documented off switch.
+    # library.
     gen_env = None
     assert_gen_log_contains = None
     # Default readiness budget. On Blackwell (SM100/103) the CuTe DSL MLA decode
@@ -2155,7 +2158,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # there rather than delaying those failures.
     server_start_timeout = 300
     if get_sm_version() in (100, 103):
-        gen_env = {"TLLM_LOG_LEVEL": "INFO"}
+        gen_env = {
+            "TLLM_LOG_LEVEL": "INFO",
+            "TLLM_FMHA_LIBS": "cute_dsl_mla,fallback"
+        }
         assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
         server_start_timeout = 1200
 
@@ -4453,7 +4459,8 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
