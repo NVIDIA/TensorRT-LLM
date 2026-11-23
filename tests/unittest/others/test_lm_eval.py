@@ -299,30 +299,25 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 
 
 # ===========================================================================
-# Mistral-Large-4: scored on the response, not its reasoning
+# reasoning_parser: scored on the response, not its reasoning
 # ===========================================================================
 
 
-def _make_native_mistral_wrapper(model_type: str | None) -> LmEvalWrapper:
-    fake_llm = MagicMock()
-    fake_llm._hf_model_config = SimpleNamespace(model_type=model_type)
-    return LmEvalWrapper(fake_llm)
+def _make_reasoning_wrapper(reasoning_parser: str | None) -> LmEvalWrapper:
+    return LmEvalWrapper(MagicMock(), reasoning_parser=reasoning_parser)
 
 
 def _output(text: str):
     return MagicMock(outputs=[MagicMock(text=text)])
 
 
-def test_mistral_large_4_keeps_its_reasoning_delimiters_in_the_text():
-    wrapper = _make_native_mistral_wrapper("mistral_large_4")
+def test_special_token_reasoning_delimiters_stay_in_the_text():
+    wrapper = _make_reasoning_wrapper("mistral_large_4")
     out = wrapper._get_sampling_params({"max_gen_toks": 512, "until": ["</s>"]})
     assert out.skip_special_tokens is False
-    assert (
-        _make_native_mistral_wrapper(None)
-        ._get_sampling_params({"max_gen_toks": 512})
-        .skip_special_tokens
-        is True
-    )
+    for reasoning_parser in (None, "deepseek-r1"):
+        out = _make_reasoning_wrapper(reasoning_parser)._get_sampling_params({"max_gen_toks": 512})
+        assert out.skip_special_tokens is True
 
 
 @pytest.mark.parametrize(
@@ -336,13 +331,13 @@ def test_mistral_large_4_keeps_its_reasoning_delimiters_in_the_text():
         ("Answer: C</s>", "Answer: C"),
     ],
 )
-def test_mistral_large_4_is_scored_on_its_response(text, response):
-    assert _make_native_mistral_wrapper("mistral_large_4")._response_text(_output(text)) == response
+def test_outputs_are_scored_on_the_response_the_parser_separates(text, response):
+    assert _make_reasoning_wrapper("mistral_large_4")._response_text(_output(text)) == response
 
 
-def test_other_models_are_scored_on_their_text():
+def test_without_a_reasoning_parser_outputs_are_scored_on_their_text():
     text = "[THINK]reasoning[/THINK]Answer: C"
-    assert _make_native_mistral_wrapper(None)._response_text(_output(text)) == text
+    assert _make_reasoning_wrapper(None)._response_text(_output(text)) == text
 
 
 # ===========================================================================
@@ -2095,6 +2090,13 @@ def test_the_multimodal_wrapper_reads_the_loaded_model_type(tmp_path):
 _MISTRAL_LARGE_4_CONFIG = SimpleNamespace(model_type="mistral_large_4")
 
 
+def _native_tokenizer():
+    """A tokenizer the wrapper reads as mistral-common's: its chats reach the engine as ids."""
+    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
+
+    return MagicMock(spec=MistralTokenizer)
+
+
 def test_native_mistral_eval_does_not_require_a_synthetic_hf_config():
     from types import SimpleNamespace
 
@@ -2149,7 +2151,7 @@ def test_native_text_chat_keeps_control_ids_through_harness(
 
     monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, str(window))
     llm = _canned_llm(_E2E_RESPONSES)
-    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
+    llm.tokenizer = _native_tokenizer()
     llm.tokenizer.name_or_path = "native-test"
     llm.tokenizer.chat_template = None
     llm.tokenizer.encode.side_effect = AssertionError("Native chat must keep token IDs")
@@ -2235,7 +2237,6 @@ def test_native_text_chat_real_tekken_keeps_control_ids(source):
     history = [{"role": "user", "content": "What is 2+2?"}]
     partial = history + [{"role": "assistant", "content": "The answer is"}]
     llm = MagicMock()
-    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
     llm.tokenizer = tokenizer
     contexts = set()
     for kwargs in settings:
@@ -2277,12 +2278,11 @@ def test_native_text_chat_real_tekken_keeps_control_ids(source):
     assert len(contexts) == len(settings)
 
 
-@pytest.mark.parametrize("model_type", ["mistral_large_4", "llama"])
-def test_text_eval_plain_prompts_are_unchanged(model_type):
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize("native", [True, False])
+def test_text_eval_plain_prompts_are_unchanged(native):
     llm = _canned_llm(["ok"])
-    llm._hf_model_config = SimpleNamespace(model_type=model_type)
+    if native:
+        llm.tokenizer = _native_tokenizer()
     wrapper = LmEvalWrapper(llm)
     prompt = "<s>[INST]literal user text[/INST]"
     assert wrapper._prepare_prompt(prompt) == prompt
@@ -2294,7 +2294,7 @@ def test_native_text_chat_encoding_and_continuation():
     from tensorrt_llm.evaluate.lm_eval import _NATIVE_CHAT_TOKENS_PREFIX
 
     llm = MagicMock()
-    llm._hf_model_config = _MISTRAL_LARGE_4_CONFIG
+    llm.tokenizer = _native_tokenizer()
     llm.tokenizer.apply_chat_template.return_value = [1, 3, 1000, 4, 1001]
     wrapper = LmEvalWrapper(llm, chat_template_kwargs={"reasoning_effort": "none"})
     context = wrapper.apply_chat_template(
@@ -2307,6 +2307,6 @@ def test_native_text_chat_encoding_and_continuation():
     assert kwargs["continue_final_message"] is True
     assert kwargs["reasoning_effort"] == "none"
     llm.tokenizer.encode.assert_not_called()
-    llm._hf_model_config = SimpleNamespace(model_type="llama")
+    llm.tokenizer = MagicMock()
     non_native = LmEvalWrapper(llm)
     assert non_native._prepare_prompt(context) == context

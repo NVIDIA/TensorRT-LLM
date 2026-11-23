@@ -65,6 +65,9 @@ skip_not_sm107 = pytest.mark.skipif(
     reason="the mistral_large4 sm_107 modeling_v2 targets are certified on sm_107 only",
 )
 
+# lm-eval scores the response after the [THINK] section, as a trtllm-serve chat client reads it.
+REASONING_PARSER = "mistral_large_4"
+
 
 # The eight-rank deployments: eight ranks over two nodes of four (one NVL72 segment). Each node
 # sees four devices, so the gate is the MPI world the launcher started (one node of eight,
@@ -224,7 +227,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 **bounds,
             ) as llm,
         ):
-            task.evaluate(llm)
+            task.evaluate(llm, extra_evaluator_kwargs=dict(reasoning_parser=REASONING_PARSER))
 
     # GSM8K with 24 exemplars: every prompt is 3152-5115 tokens, past index_topk, so the
     # indexer's selection prunes context on every sample (5-shot prompts stay under 2048,
@@ -255,7 +258,10 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 **bounds,
             ) as llm,
         ):
-            task.evaluate(llm, extra_evaluator_kwargs=dict(num_fewshot=24))
+            task.evaluate(
+                llm,
+                extra_evaluator_kwargs=dict(num_fewshot=24, reasoning_parser=REASONING_PARSER),
+            )
 
     # A passkey hidden in filler text, asked for at the end. GSM8K's prompts stay under the
     # indexer's index_topk (2048), where the engine skips the indexer; these prompts are about
@@ -428,6 +434,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                             log_samples=True,
                             output_path=str(root / f"{task.DATASET}.json"),
                             output_dir=str(root / task.DATASET),
+                            reasoning_parser=REASONING_PARSER,
                         )
                         evaluate_kwargs = {}
                         if isinstance(task, GSM8K):
@@ -512,6 +519,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                                     llm,
                                     extra_evaluator_kwargs=dict(
                                         num_fewshot=5,
+                                        reasoning_parser=REASONING_PARSER,
                                         log_samples=True,
                                         output_path=str(origin / f"{task.DATASET}.json"),
                                         output_dir=str(origin / task.DATASET),

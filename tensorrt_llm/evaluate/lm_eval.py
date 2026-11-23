@@ -197,9 +197,14 @@ def _parse_partial_scores_env() -> Optional[int]:
     return value if value > 0 else None
 
 
-def _model_type(llm) -> Optional[str]:
-    """The model type of the config the LLM read from its checkpoint, if any."""
-    return getattr(getattr(llm, "_hf_model_config", None), "model_type", None)
+def _renders_chat_token_ids(tokenizer) -> bool:
+    """Whether chats rendered by ``tokenizer`` must reach the engine as token ids.
+
+    mistral-common renders control tokens that the text encoding of the same
+    tokenizer does not read back, so its rendered text cannot stand in for them.
+    """
+    from .._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
+    return isinstance(tokenizer, MistralTokenizer)
 
 
 # lm-eval caches contexts as strings. Keep native control IDs in a lossless,
@@ -220,10 +225,14 @@ class LmEvalWrapper(TemplateLM):
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
                  partial_scores_every: Optional[int] = None,
-                 partial_scoring_task_dict: Optional[dict] = None):
+                 partial_scoring_task_dict: Optional[dict] = None,
+                 reasoning_parser: Optional[str] = None):
         super().__init__()
         self.llm = llm
-        self._native_chat_tokens = _model_type(llm) == "mistral_large_4"
+        self._native_chat_tokens = _renders_chat_token_ids(llm.tokenizer)
+        # When set, outputs are scored on the content this reasoning parser
+        # separates from the reasoning, as a trtllm-serve chat client reads it.
+        self.reasoning_parser = reasoning_parser
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
@@ -362,27 +371,27 @@ class LmEvalWrapper(TemplateLM):
             # populated when perf metrics are requested. Small per-request
             # overhead, opted into together with the stats themselves.
             sampling_params.return_perf_metrics = True
-        if self._native_chat_tokens:
-            # Mistral-Large-4's reasoning delimiters are control tokens: keep
-            # them in the text for _response_text, as trtllm-serve does for its
-            # mistral_large_4 reasoning parser.
+        if (self.reasoning_parser is not None
+                and ReasoningParserFactory.needs_raw_special_tokens(
+                    self.reasoning_parser)):
+            # The reasoning delimiters are special tokens: keep them in the
+            # text for _response_text, as trtllm-serve does for this parser.
             sampling_params.skip_special_tokens = False
         return sampling_params
 
     def _response_text(self, output: RequestOutput) -> str:
         """The text lm-eval scores for one output.
 
-        Mistral-Large-4 reasons between ``[THINK]`` and ``[/THINK]`` before it
-        answers. Its output is scored on the content the mistral_large_4
-        reasoning parser separates from the reasoning, the response a
-        trtllm-serve chat client reads; a reasoning block that never closes
-        leaves no response. Every other model is scored on its text.
+        With ``reasoning_parser`` set, the content that parser separates from
+        the reasoning, the response a trtllm-serve chat client reads; otherwise
+        the whole text.
         """
         text = output.outputs[0].text
-        if not self._native_chat_tokens:
+        if self.reasoning_parser is None:
             return text
         return ReasoningParserFactory.create_reasoning_parser(
-            "mistral_large_4").parse(text).content
+            self.reasoning_parser,
+            chat_template_kwargs=self.chat_template_kwargs).parse(text).content
 
     def _log_spec_stats(self, outputs: List[RequestOutput]) -> None:
         """Log corpus-aggregate speculative-decoding stats (TLLM_EVAL_SPEC_STATS=1).
@@ -605,7 +614,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  preserve_caller_max_tokens: bool = False,
                  post_process_fn: Optional[Callable[[str], str]] = None,
                  partial_scores_every: Optional[int] = None,
-                 partial_scoring_task_dict: Optional[dict] = None):
+                 partial_scoring_task_dict: Optional[dict] = None,
+                 reasoning_parser: Optional[str] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -629,6 +639,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 path scores the post-processed text (the same string lm-eval
                 itself scores).
             partial_scoring_task_dict: See partial_scores_every.
+            reasoning_parser: Same as LmEvalWrapper; ``post_process_fn``
+                applies to the content it separates.
         """
         super().__init__(
             llm,
@@ -642,6 +654,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             preserve_caller_max_tokens=preserve_caller_max_tokens,
             partial_scores_every=partial_scores_every,
             partial_scoring_task_dict=partial_scoring_task_dict,
+            reasoning_parser=reasoning_parser,
         )
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
@@ -992,7 +1005,8 @@ class LmEvalEvaluator(Evaluator):
                  num_fewshot: Optional[int] = None,
                  stop_strings: Optional[List[str]] = None,
                  shuffle_dataset: bool = True,
-                 fewshot_random_seed: Optional[int] = None):
+                 fewshot_random_seed: Optional[int] = None,
+                 reasoning_parser: Optional[str] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -1026,6 +1040,9 @@ class LmEvalEvaluator(Evaluator):
         # larger than the lm-eval task's max_gen_toks. Used by thinking
         # models (e.g. Kimi K2.5) whose CoT output exceeds the task default.
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        # Opt-in: score outputs on the content this reasoning parser separates
+        # from the reasoning (see LmEvalWrapper).
+        self.reasoning_parser = reasoning_parser
         # shuffle_dataset=False and fewshot_random_seed reproduce the lm-eval
         # CLI's exemplar selection (unshuffled data, few-shot sampler seed).
         self.shuffle_dataset = shuffle_dataset
@@ -1163,6 +1180,7 @@ class LmEvalEvaluator(Evaluator):
             partial_scores_every=partial_scores_every,
             partial_scoring_task_dict=self.task_dict
             if partial_scores_every else None,
+            reasoning_parser=self.reasoning_parser,
         )
         # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
         if self.MULTIMODAL:
