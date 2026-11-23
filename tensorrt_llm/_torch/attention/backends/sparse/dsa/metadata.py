@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, FrozenSet, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 import tensorrt_llm
@@ -891,7 +892,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
         )
         self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-        if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
+        if (
+            self.max_draft_tokens > 0
+            and not self.use_expanded_buffers_for_mtp
+            and not self.use_cute_dsl_paged_mqa_logits
+        ):
             scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
                 scheduler_context_lens.contiguous(),
                 _DG_SCHEDULE_BLOCK_KV,
@@ -2333,10 +2338,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_for_indices_conversion(self):
         # Build req_idx_per_token for topk_indices conversion
         # Use pinned staging buffer to avoid pageable H2D memcpy
-        self.host_req_idx_per_token[: self.num_tokens] = torch.repeat_interleave(
-            torch.arange(self.num_seqs, dtype=torch.int32),
-            self.seq_lens,
-            dim=0,
+        self.host_req_idx_per_token.numpy()[: self.num_tokens] = np.repeat(
+            np.arange(self.num_seqs, dtype=np.int32), self.seq_lens.numpy()
         )
         self.req_idx_per_token[: self.num_tokens].copy_(
             self.host_req_idx_per_token[: self.num_tokens],

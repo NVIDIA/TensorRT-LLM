@@ -77,6 +77,12 @@ def _request(request_id: int = 1) -> SimpleNamespace:
         is_finished=False,
         py_decoding_iter=0,
         cached_tokens=32,
+        py_draft_tokens=[],
+        py_per_pos_drafted=[],
+        py_per_pos_accepted=[],
+        py_total_draft_tokens=0,
+        py_total_accepted_draft_tokens=0,
+        py_disaggregated_params=None,
         create_response=Mock(return_value=response),
     )
 

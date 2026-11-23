@@ -53,6 +53,7 @@ from .kernel import (
     mask_logits_,
     mask_packed_logits_,
     paged_finalize_sorts,
+    prefetch_candidate_blocks_,
 )
 from .metadata import CSA2IndexerGroup, CSA2TrtllmMetadata, block_select_batch, csa2_side_stream
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
@@ -1448,6 +1449,38 @@ class CSA2Indexer(Indexer):
         stream while it projects, and its indexer then finds them current."""
         if self._native_decode(metadata, count)[1]:
             metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+
+    def prefetches_candidates(self, metadata: CSA2TrtllmMetadata, count: int) -> bool:
+        """Whether ``prefetch_candidate_pages`` applies to ``count`` decode rows: a candidate
+        consumer's attention-TP decode on SM100/SM103 within the fused select's row range."""
+        from .reindex_select import _FUSED_SELECT_MAX_ROWS
+
+        layer = self.layout.layer(self.layer_idx)
+        decode_start, native = self._native_decode(metadata, count)
+        return (
+            layer.consumes_candidates
+            and self.sparse_block > 0
+            and native
+            and decode_start == 0
+            and count <= _FUSED_SELECT_MAX_ROWS
+            and self._tp_selection_chain(metadata)
+            and metadata.csa2_candidate_blocks.get(layer.candidate_source) is not None
+            and metadata.csa2_candidate_counts.get(layer.candidate_source) is not None
+        )
+
+    def prefetch_candidate_pages(self, metadata: CSA2TrtllmMetadata) -> None:
+        """Start reading the index rows of the candidate blocks this consumer's decode rows score
+        into L2, once their source published them (``prefetches_candidates``)."""
+        source = self.layout.layer(self.layer_idx).candidate_source
+        metadata.wait_candidates(source)
+        metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+        prefetch_candidate_blocks_(
+            metadata.csa2_indexer_k_cache,
+            metadata.csa2_indexer_block_table,
+            metadata.csa2_candidate_blocks[source],
+            metadata.csa2_candidate_counts[source].reshape(-1),
+            self.sparse_block,
+        )
 
     def _sparse_schedule_unused(self, metadata: CSA2TrtllmMetadata) -> bool:
         """Whether every consumer recorded at this decode shape took the fused Reindex select."""

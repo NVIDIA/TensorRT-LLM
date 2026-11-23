@@ -699,6 +699,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.drop_extended_turns"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_config.block_reuse_config.enable_branch_snapshot"
     },
     {
@@ -1200,6 +1205,36 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "max_stats_len"
+    },
+    {
+      "allowed_values": [
+        "off",
+        "oom",
+        "full"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "memory_monitor_config.mode"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "memory_monitor_config.oom_report_interval_s"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "memory_monitor_config.periodic_report_interval_s"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "memory_monitor_config.ranks"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "memory_monitor_config.record_stacks"
     },
     {
       "capture_policy": "float",

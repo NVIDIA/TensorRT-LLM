@@ -24,6 +24,8 @@
 #include <tensorrt_llm/common/assert.h>
 #include <tensorrt_llm/common/envUtils.h>
 
+#include <algorithm>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -480,11 +482,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType,
     bool useFineGrained)
-    : mDtypeAct(dtypeAct)
-    , mDtypeWeights(dtypeWeights)
-    , mTileTokensDim(tileTokensDim)
+    : mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useFineGrained)))
+          getOptions(dtypeAct, dtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useFineGrained)))
     , mActType(actType)
 {
 }
@@ -495,17 +495,13 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
     void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
-    int32_t validHiddenSize, int32_t validIntermediateSize)
+    int32_t validHiddenSize, int32_t validIntermediateSize, int32_t maxNumCtasInBatchDim)
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
-        // FIXME: enforce valid hidden dim to be multiple of 512 due to unhandled OOB read in routeAct. Please keep this
-        // in sync with
-        // tensorrt_llm/_torch/moe/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    if (maxNumCtasInBatchDim > 0)
+    {
+        maxNumCgasInBatchDim = std::min(maxNumCgasInBatchDim, maxNumCtasInBatchDim);
+    }
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
     mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, numTokens,
@@ -530,30 +526,22 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        // Keep in sync with run(): the kernel is launched with the 512-rounded valid hidden size.
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
-        hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize,
-        validHiddenSize);
+        hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens,
+        is_gated_activation ? 2 * validIntermediateSize : validIntermediateSize, validHiddenSize);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
         is_gated_activation ? 2 * intermediateSize : intermediateSize, hiddenSize, {}, numTokens, numExperts,
-        maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
+        maxNumCgasInBatchDim, numTokens, is_gated_activation ? 2 * validIntermediateSize : validIntermediateSize,
+        validHiddenSize);
 
     return isValid;
 }
@@ -597,10 +585,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8,
     int tileTokensDim, bool useFineGrained)
-    : mDtypeAct(dtypeAct)
-    , mDtypeWeights(dtypeWeights)
-    , mDtypeOut(dtypeOut)
-    , mTileTokensDim(tileTokensDim)
+    : mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8, useFineGrained)))
 {
@@ -611,14 +596,13 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
     int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
     void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize,
-    int32_t validIntermediateSize)
+    int32_t validIntermediateSize, int32_t maxNumCtasInBatchDim)
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    if (maxNumCtasInBatchDim > 0)
+    {
+        maxNumCgasInBatchDim = std::min(maxNumCgasInBatchDim, maxNumCtasInBatchDim);
+    }
     mRunner.run(numTokens, hiddenSize, intermediateSize, numTokens, validHiddenSize, validIntermediateSize, {},
         numTokens, numExperts, maxNumCgasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
         weightsScale, /* perTokensSfA */ nullptr,
@@ -647,7 +631,6 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-
     auto const maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens, hiddenSize, intermediateSize, {}, numTokens,
@@ -869,7 +852,7 @@ void Runner::run(
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
         args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
         args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+        args.valid_intermediate_size.value_or(args.intermediate_size), args.max_num_ctas_in_batch_dim);
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
     TLLM_CHECK_WITH_INFO(!args.skip_gemm2 || !args.do_finalize, "skip_gemm2 requires do_finalize == false.");
@@ -896,7 +879,7 @@ void Runner::run(
         workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
         workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream, config.gemm2Config,
         args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+        args.valid_intermediate_size.value_or(args.intermediate_size), args.max_num_ctas_in_batch_dim);
 
     // Run finalize
     if (args.do_finalize)

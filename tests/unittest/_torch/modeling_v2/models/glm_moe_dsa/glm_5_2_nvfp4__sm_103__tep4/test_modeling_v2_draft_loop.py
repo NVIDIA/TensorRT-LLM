@@ -249,6 +249,8 @@ def _metadata(batch, draft_len, expand, seed, seq_len, skip=False, gvr=False):
         _indexer_compress_ratio=1,
         runtime_tokens_per_gen_step=0,
         max_draft_tokens=draft_len,
+        # Enable the full DeepGEMM schedule for parity with the fused producer's writes.
+        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=False),
         kv_lens_cuda_2d=torch.randint(0, 9, (cap, 1 + draft_len), generator=g,
                                       dtype=torch.int32).to(DEV),
         num_sms=num_sms,
