@@ -169,12 +169,17 @@ class OlderReleaseRequestError(ValueError):
         self.req_info = req_info
 
 
+def _ucx_peer_refresh_supported() -> bool:
+    return os.getenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX") == "UCX"
+
+
 def agent_recovery_supported(
     enforce_physical_ownership: bool, context_first_ownership: bool, agent_buffer_size_mb: int
 ) -> bool:
     """Whether the native, direct-transfer profile supports agent replacement."""
     return (
-        not enforce_physical_ownership
+        _ucx_peer_refresh_supported()
+        and not enforce_physical_ownership
         and not context_first_ownership
         and agent_buffer_size_mb == 0
         and not use_pure_python_transfer_agent()
@@ -807,7 +812,8 @@ class Sender(SenderBase):
         self._deferred_remote_agents: dict[str, tuple[bytes, float]] = {}
         self._peer_transfer_counts: dict[str, int] = {}
         self._peer_refresh_enabled = (
-            not enforce_physical_ownership
+            _ucx_peer_refresh_supported()
+            and not enforce_physical_ownership
             and not context_first_ownership
             and getattr(agent, "supports_handle_retirement", False) is True
             and getattr(agent, "bounce_enabled", False) is not True

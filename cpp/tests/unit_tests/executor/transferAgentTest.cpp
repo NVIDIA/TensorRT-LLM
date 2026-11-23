@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/transferAgent.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include <gmock/gmock.h>
@@ -165,15 +166,17 @@ TEST_P(TransferAgentTest, CheckRemoteDescriptorRanges)
 
 TEST_P(TransferAgentTest, ReloadAfterInvalidRemoteSection)
 {
-    if (backend != "nixl")
+    if (backend != "nixl" || tensorrt_llm::common::getEnvNixlBackend() != "UCX")
     {
-        GTEST_SKIP() << "NIXL metadata validation";
+        GTEST_SKIP() << "UCX metadata rollback";
     }
     std::string const senderName{"rollbackSender"}, peerName{"rollbackPeer"};
     BaseAgentConfig senderConfig{senderName, true, false, true}, peerConfig{peerName, true, false, true};
     auto sender = makeTransferAgent(senderConfig);
     auto peer = makeTransferAgent(peerConfig);
+    std::vector<char> source(64, 42);
     std::vector<char> destination(64);
+    RegisteredHostMemory registeredSource(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{source}}}, sender.get());
     RegisteredHostMemory registered(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{destination}}}, peer.get());
     auto const valid = peer->getLocalAgentDesc();
     auto invalid = valid.getBackendAgentDesc();
@@ -187,6 +190,11 @@ TEST_P(TransferAgentTest, ReloadAfterInvalidRemoteSection)
         EXPECT_FALSE(sender->checkRemoteDescs(peerName, registered.getDescs()));
         ASSERT_NO_THROW(sender->loadRemoteAgent(peerName, valid));
         EXPECT_TRUE(sender->checkRemoteDescs(peerName, registered.getDescs()));
+        std::fill(destination.begin(), destination.end(), 0);
+        TransferRequest const write{TransferOp::kWRITE, registeredSource.getDescs(), registered.getDescs(), peerName};
+        auto status = sender->submitTransferRequests(write);
+        ASSERT_EQ(status->wait(5000), TransferState::kSUCCESS);
+        EXPECT_EQ(destination, source);
     }
 }
 

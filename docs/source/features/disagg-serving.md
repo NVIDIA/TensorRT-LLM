@@ -752,8 +752,8 @@ Because a node can be broken in isolation, a NIXL failure that appears on only o
 
 ### Native NIXL agent recovery
 
-Agent recovery is automatic for the Python transceiver with C++ NIXL, bounce
-buffers disabled, and ownership enforcement disabled. Multi-rank recovery uses
+Agent recovery is automatic for the Python transceiver with C++ NIXL over UCX,
+bounce buffers disabled, and ownership enforcement disabled. Multi-rank recovery uses
 the MPI executor containment path; other launchers retain their existing path.
 It requires bindings that
 expose `TransferStatus.release`; older bindings log

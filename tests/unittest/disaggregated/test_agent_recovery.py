@@ -289,6 +289,34 @@ def test_fallback_sender_refreshes_peer_after_submitted_write_drains(worker, tas
     agent.shutdown.assert_not_called()
 
 
+@pytest.mark.parametrize(("backend", "enabled"), [("UCX", True), ("LIBFABRIC", False)])
+def test_peer_replacement_is_enabled_only_for_ucx(worker, monkeypatch, backend, enabled):
+    monkeypatch.setenv("TRTLLM_NIXL_KVCACHE_BACKEND", backend)
+    monkeypatch.setattr(transfer.NixlTransferAgent, "supports_handle_retirement", True)
+    monkeypatch.setattr(transfer.Sender, "_start_listener", Mock())
+    monkeypatch.setattr(threading.Thread, "start", Mock())
+    monkeypatch.setattr(transfer, "ZMQMessenger", Mock())
+    agent = Mock(supports_handle_retirement=True, bounce_enabled=False)
+    registrar = Mock(self_rank_info=SimpleNamespace(device_id=0, instance_rank=0))
+    sender = transfer.Sender(registrar, agent)
+    sender.shutdown = Mock()
+
+    assert sender._peer_refresh_enabled is enabled
+    assert transfer.agent_recovery_supported(False, False, 0) is enabled
+    if not enabled:
+        old = SimpleNamespace(instance_name="decode", instance_rank=11, transfer_engine_info=b"old")
+        new = SimpleNamespace(instance_name="decode", instance_rank=11, transfer_engine_info=b"new")
+        monkeypatch.setattr(transfer.RankInfo, "from_bytes", Mock(side_effect=[old, new]))
+        agent.load_remote_agent.side_effect = [None, RuntimeError("handshake send failed")]
+        registration = [transfer.MessageType.REGISTER_RANK_INFO, b""]
+        sender._register_peer_rank(b"", registration)
+        with pytest.raises(RuntimeError, match="handshake send failed"):
+            sender._register_peer_rank(b"", registration)
+        agent.invalidate_remote_agent.assert_not_called()
+        assert not sender._deferred_remote_agents
+        assert sender._agent_generation == 0
+
+
 def test_recovery_releases_terminal_outbound_handles_before_inbound_drain(worker, task):
     sender, old = worker._sender, worker._agent
     outbound_retired = threading.Event()
