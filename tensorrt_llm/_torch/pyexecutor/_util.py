@@ -4862,9 +4862,6 @@ def _create_kv_cache_manager(
             head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = hidden_size // num_attention_heads
-    if layer_specs is None:
-        layer_specs = model_layer_specs
-
     # Derive per-layer max_attention_window for any model that publishes a
     # mixed sliding/full `layer_types` schedule (Gemma4 hybrid included) so V2
     # creates separate pool groups for sliding vs full-attention layers;
