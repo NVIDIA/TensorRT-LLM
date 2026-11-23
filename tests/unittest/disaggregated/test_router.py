@@ -736,6 +736,63 @@ async def test_kv_cache_aware_server_state_uses_hash_algo():
 
 
 @pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_ignores_recurrent_checkpoint_events(
+):
+    """A recurrent checkpoint (layer_group_kind="mamba") shares the attention block's hash.
+
+    Its stored and removed events must not touch the attention block table: after
+    stored(H), stored(H, mamba), removed(H, mamba) the block H is still matched.
+    """
+    state = KvCacheAwareServerState("server1", tokens_per_block=4)
+    stored = {
+        "type": "stored",
+        "parent_hash": None,
+        "blocks": [{
+            "block_hash": "H"
+        }],
+    }
+    state.update_with_events([
+        {
+            "event_id": 0,
+            "hash_algo": KV_CACHE_HASH_ALGO_V2,
+            "layer_group_id": 0,
+            "layer_group_kind": "attention",
+            "data": stored,
+        },
+        {
+            "event_id": 1,
+            "hash_algo": KV_CACHE_HASH_ALGO_V2,
+            "layer_group_id": 1,
+            "layer_group_kind": "mamba",
+            "data": stored,
+        },
+        {
+            "event_id": 2,
+            "hash_algo": KV_CACHE_HASH_ALGO_V2,
+            "layer_group_id": 1,
+            "layer_group_kind": "mamba",
+            "data": {
+                "type": "removed",
+                "block_hashes": ["H"]
+            },
+        },
+    ])
+    assert await state.matched_tokens([["H"]],
+                                      hash_algo=KV_CACHE_HASH_ALGO_V2) == 4
+    # An attention removal still clears it; events without a kind behave as before.
+    state.update_with_events([{
+        "event_id": 3,
+        "hash_algo": KV_CACHE_HASH_ALGO_V2,
+        "data": {
+            "type": "removed",
+            "block_hashes": ["H"]
+        },
+    }])
+    assert await state.matched_tokens([["H"]],
+                                      hash_algo=KV_CACHE_HASH_ALGO_V2) == 0
+
+
+@pytest.mark.asyncio
 async def test_kv_cache_aware_router_routes_to_v2_server(servers):
     tokens_per_block = 4
     token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]

@@ -375,13 +375,17 @@ def test_native_streaming_sink_tags_recurrent_checkpoints(
     event_sink = manager.event_sink
     manager.start()
     try:
-        # Life cycle 0 is the attention target. The test manager has no SSM layer, so life
-        # cycle 1 (a windowed attention group) stands in for the recurrent state by override.
+        # In this fixture life cycle 0 is the windowed attention group and life cycle 1 the
+        # full-attention group; 0 is the streaming target. The manager has no SSM layer, so
+        # life cycle 1 stands in for the recurrent state by override. The manager's constructor
+        # declares its registry to the sink, which replaces an override, so override after it.
         manager.set_layer_group_window_sizes({0: 128, 1: 64})
-        manager.set_recurrent_life_cycles([1])
         published: list[KVEventBatch] = []
         manager._publisher.publish = lambda batch: published.append(batch) or True
         make_block = real_block_factory(event_sink, num_life_cycles=2, tokens_per_block=2)
+        assert event_sink.publishes_recurrent_checkpoints is False  # no SSM life cycle
+        manager.set_recurrent_life_cycles([1])
+        assert event_sink.publishes_recurrent_checkpoints is True
 
         first = make_block(_token_ids(1, 3), [2, 0])
         # Attention page only at store time; the snapshot is attached and announced later,
@@ -1244,7 +1248,8 @@ def test_v2_kv_cache_event_manager_serializes_layer_group_kind(
 ) -> None:
     """Kinds come from the manager's life cycle registry when the sink is installed."""
     event_manager = KVCacheEventManager(max_kv_event_entries=4, window_size=128)
-    # Life cycle 0 is full attention, life cycle 1 a sliding-window attention group.
+    # create_config gives even layers the window: life cycle 0 is the sliding-window group,
+    # life cycle 1 the full-attention group; 2 is not a life cycle of this manager.
     real_block_factory(event_manager, num_life_cycles=2, tokens_per_block=2)
     event_manager.add_created_event([2, 3], [0, 1, 2])
 
@@ -1252,8 +1257,8 @@ def test_v2_kv_cache_event_manager_serializes_layer_group_kind(
 
     assert [event["layer_group_id"] for event in events] == [0, 1, 2]
     assert [event.get("layer_group_kind") for event in events] == [
-        "attention",
         "sliding_window",
+        "attention",
         None,
     ]
 

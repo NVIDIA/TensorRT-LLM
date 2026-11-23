@@ -706,8 +706,9 @@ Block reuse must be on. Replay regions of speculative decoding are PRIVATE life 
 never advertised as recurrent groups.
 
 On the buffered path the same option adds `stored`/`removed` events for the recurrent layer
-groups; every buffered event now carries `layer_group_kind` (`attention`, `sliding_window` or
-`mamba`) so consumers can filter by it. Without the option the buffered stream is unchanged.
+groups (full-block snapshots only); every buffered event carries `layer_group_kind` (`attention`,
+`sliding_window` or `mamba`) so consumers can filter by it, as trtllm-serve's KV-cache-aware
+router does. Without the option the buffered stream is unchanged.
 
 **Limitations.** Pipeline and context parallelism are unsupported. Buffered polling returns
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish

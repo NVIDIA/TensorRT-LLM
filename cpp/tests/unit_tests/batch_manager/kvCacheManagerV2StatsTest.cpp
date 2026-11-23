@@ -438,6 +438,53 @@ TEST_F(ReplayCacheTest, BufferedEventsAnnounceTheRecurrentLifeCycleOnlyWithTheOp
     }
 }
 
+// With the opt-in, a snapshot on a partial final block (here three tokens of a four-token
+// block) must not be announced by the buffered sink: the event payload cannot express a
+// mid-block resume point. The partial attention page is still announced, as before.
+TEST_F(ReplayCacheTest, BufferedEventsSkipMidBlockRecurrentSnapshots)
+{
+    auto const config = makeHybridEventConfig();
+    auto const buffered = std::make_shared<EventManager>(64, 4096);
+    buffered->setPublishRecurrentCheckpoints(true);
+    auto manager = std::make_shared<KvCacheManager>(config, buffered);
+    auto const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+
+    auto const tokens = makeTokens(7);
+    TokenSpan const tokenSpan{tokens.data(), static_cast<int>(tokens.size())};
+    auto first = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(first->resume(mStream));
+    ASSERT_TRUE(first->resize(7));
+    first->commit(tokenSpan, true);
+    buffered->flushIterationEvents();
+    auto const events = buffered->getLatestEvents(0.0);
+
+    int attentionBlocks = 0;
+    int ssmBlocks = 0;
+    for (auto const& event : events)
+    {
+        auto const* stored = std::get_if<KVCacheStoredData>(&event.data);
+        if (stored == nullptr)
+        {
+            continue;
+        }
+        ASSERT_TRUE(event.layerGroupId.has_value());
+        if (*event.layerGroupId == ssmLc.value())
+        {
+            ssmBlocks += static_cast<int>(stored->blocks.size());
+        }
+        else
+        {
+            attentionBlocks += static_cast<int>(stored->blocks.size());
+        }
+    }
+    // One full attention block plus the partial final block; the snapshot lives on the partial
+    // block only (commit_min_snapshot), so no recurrent checkpoint is announced.
+    EXPECT_EQ(attentionBlocks, 2);
+    EXPECT_EQ(ssmBlocks, 0);
+    first->close();
+    manager->shutdown();
+}
+
 TEST_F(ReplayCacheTest, SsmSnapshotLocksDoNotUseAttentionPageIndices)
 {
     auto config = makeConfig();

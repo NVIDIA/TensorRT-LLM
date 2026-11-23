@@ -1650,16 +1650,12 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, 
     }
     if (commitSsm)
     {
-        // Announced only when the sink opted in: the default event stream never mentions the
-        // recurrent-state life cycles.
-        bool const announceSsm = treeBlock->eventSink && treeBlock->eventSink->publishesRecurrentCheckpoints();
+        // A snapshot on a partial block is a resume point only at that token depth, which the
+        // stored-event payload (the block's whole token list) cannot express, so it is never
+        // announced as a checkpoint; the sinks also drop it themselves.
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
         {
-            if (_snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending)
-                && announceSsm)
-            {
-                attachedLcs.push_back(lcId);
-            }
+            _snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending);
         }
     }
     if (treeBlock->eventSink)

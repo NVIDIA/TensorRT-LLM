@@ -99,8 +99,9 @@ public:
     //! published for a block only after the block's attention page was published, under the same
     //! block hash, so consumers can align it with the attention prefix.
     void setPublishRecurrentCheckpoints(bool enabled);
-    //! Override the recurrent life cycles derived by declareLifeCycles(); also opts in. For tests
-    //! and for managers whose registry is not declared through the sink.
+    //! Override the recurrent life cycles and opt in. Every KvCacheManager declares its registry
+    //! through declareLifeCycles() in its constructor, which replaces an earlier override, so a
+    //! test must call this after the manager that owns the sink exists.
     void setRecurrentLifeCycles(std::vector<LifeCycleId> lifeCycles);
     void declareLifeCycles(LifeCycleRegistry const& lifeCycles) override;
     bool publishesRecurrentCheckpoints() const override;

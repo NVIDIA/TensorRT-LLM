@@ -657,15 +657,15 @@ class StreamingKVCacheEventManager:
         self._publisher = create_event_publisher(config, data_parallel_rank)
         self._max_window_size = max_window_size
         self.publish_recurrent_checkpoints = config.publish_recurrent_checkpoints
-        if self.publish_recurrent_checkpoints:
-            # The sink derives the recurrent life cycles from the manager's registry when it
-            # is installed; this only opens the gate.
-            self._event_source.set_publish_recurrent_checkpoints(True)
         self._event_source = _StreamingEventSource(
             block_size=block_size,
             max_entries=max_entries,
             mm_token_id_offset=mm_token_id_offset,
         )
+        if self.publish_recurrent_checkpoints:
+            # The sink derives the recurrent life cycles from the manager's registry when it
+            # is installed; this only opens the gate.
+            self._event_source.set_publish_recurrent_checkpoints(True)
         self._closed = False
         self.enqueued_batches = 0
         self.enqueued_events = 0

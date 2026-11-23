@@ -211,12 +211,25 @@ void EventManager::addStoredBlock(Block const& block)
     addStoredBlockUnlocked(block);
 }
 
+bool EventManager::announcesLifeCycleUnlocked(Block const& block, LifeCycleId lifeCycle) const
+{
+    auto const kind = mKindByLayerGroup.find(lifeCycle.value());
+    if (kind == mKindByLayerGroup.end() || kind->second != "mamba")
+    {
+        return true;
+    }
+    // A recurrent-state snapshot is a resume point only for the exact token depth it was taken
+    // at. It is announced only on opt-in and only when it covers a full block: a mid-block
+    // snapshot cannot be expressed by a stored event that carries the block's token list.
+    return mPublishRecurrentCheckpoints && block.isFull();
+}
+
 void EventManager::addStoredBlockUnlocked(Block const& block)
 {
     std::set<int> lifeCycleIds;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
     {
-        if (pageCoversBlock(block.getPage(lifeCycle), block))
+        if (pageCoversBlock(block.getPage(lifeCycle), block) && announcesLifeCycleUnlocked(block, lifeCycle))
         {
             lifeCycleIds.insert(lifeCycle.value());
         }
@@ -254,7 +267,7 @@ void EventManager::addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle)
         return;
     }
     int const lifeCycleId = lifeCycle.value();
-    if (state->second.lifeCycleIds.count(lifeCycleId) != 0)
+    if (state->second.lifeCycleIds.count(lifeCycleId) != 0 || !announcesLifeCycleUnlocked(block, lifeCycle))
     {
         return;
     }

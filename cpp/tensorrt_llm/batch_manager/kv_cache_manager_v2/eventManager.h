@@ -232,6 +232,7 @@ private:
     std::optional<KVCacheStoredBlockData> storedBlockFromBlock(
         Block const& block, std::optional<std::set<int>> const& lifeCycleIds = std::nullopt);
 
+    bool announcesLifeCycleUnlocked(Block const& block, LifeCycleId lifeCycle) const;
     void addStoredBlockUnlocked(Block const& block);
     void addStoredEventUnlocked(KVCacheStoredData data, EventLayerGroupId layerGroupId);
     void enqueueRemovedEventUnlocked(std::vector<EventBlockHash> blockHashes, EventLayerGroupId layerGroupId);

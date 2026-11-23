@@ -233,8 +233,12 @@ def test_kv_events_config_recurrent_checkpoints_default_off() -> None:
         assert manager.publish_recurrent_checkpoints is True
         # The gate is open, but no recurrent life cycle was declared yet.
         assert manager.event_sink.publishes_recurrent_checkpoints is False
+        manager.set_recurrent_life_cycles([1])
+        assert manager.event_sink.publishes_recurrent_checkpoints is True
+        # Closing the gate must disable native publication, not only the Python flag.
         manager.set_publish_recurrent_checkpoints(False)
         assert manager.publish_recurrent_checkpoints is False
+        assert manager.event_sink.publishes_recurrent_checkpoints is False
     finally:
         manager.shutdown()
 
