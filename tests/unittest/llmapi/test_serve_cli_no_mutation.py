@@ -38,7 +38,13 @@ from tensorrt_llm.llmapi.disagg_utils import (
     RouterConfig,
     extract_disagg_cluster_config,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    KvCacheConnectorConfig,
+    NGramDecodingConfig,
+    TorchLlmArgs,
+    update_llm_args_with_extra_dict,
+)
 from tensorrt_llm.serve._frontend_processes import _init_multi_frontend_mode
 from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
 
@@ -151,7 +157,7 @@ def test_provision_kv_cache_pool_does_not_mutate_llm_args():
     _assert_unchanged("_provision_kv_cache_pool", llm_args, snapshot)
 
 
-def test_launch_server_does_not_mutate_llm_args(monkeypatch):
+def test_launch_server_does_not_mutate_llm_args(monkeypatch, tmp_path):
     monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
     monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
     monkeypatch.setattr(
@@ -163,13 +169,24 @@ def test_launch_server_does_not_mutate_llm_args(monkeypatch):
     )
     monkeypatch.setattr(socket, "socket", _FakeSocket)
     recorder = _Recorder()
-    monkeypatch.setattr(serve_module, "PyTorchLLM", recorder)
+    validated = []
+
+    def validate_then_record(**kwargs) -> None:
+        validated.append(TorchLlmArgs(**kwargs))
+        recorder(**kwargs)
+
+    monkeypatch.setattr(serve_module, "PyTorchLLM", validate_then_record)
 
     llm_args = {
-        "model": "m",
+        "model": str(tmp_path),
         "backend": "pytorch",
+        "gpus_per_node": 1,
         "build_config": {"max_batch_size": 8},
         "num_serve_frontends": 2,
+        "cuda_graph_config": CudaGraphConfig(batch_sizes=[1, 8], enable_padding=False),
+        "speculative_config": NGramDecodingConfig(
+            max_draft_len=2, draft_len_schedule={4: 2}, use_rejection_sampling=False
+        ),
     }
     snapshot = copy.deepcopy(llm_args)
 
@@ -181,8 +198,12 @@ def test_launch_server_does_not_mutate_llm_args(monkeypatch):
     _assert_unchanged("launch_server", llm_args, snapshot)
     assert "build_config" not in recorder.kwargs
     assert "num_serve_frontends" not in recorder.kwargs
-    assert recorder.kwargs["model"] == "m"
+    assert recorder.kwargs["model"] == str(tmp_path)
     assert recorder.kwargs["backend"] == "pytorch"
+    assert len(validated) == 1
+    assert validated[0].cuda_graph_config is not llm_args["cuda_graph_config"]
+    assert validated[0].cuda_graph_config.batch_sizes == [1, 4, 8]
+    assert validated[0].cuda_graph_config.enable_padding is True
 
 
 @pytest.mark.parametrize("enabled", [False, True])

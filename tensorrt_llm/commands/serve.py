@@ -63,6 +63,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     parse_disagg_config_file, parse_metadata_server_config_file,
     validate_config_bool, validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
+                                          BaseCudaGraphConfig,
                                           CacheTransceiverConfig,
                                           KvCacheConnectorConfig, SleepConfig,
                                           TorchLlmArgs, build_cli_config)
@@ -809,8 +810,12 @@ def launch_server(
         enable_runtime_control_endpoints: bool = False,
         runtime_control_api_key: Optional[str] = None) -> None:
 
-    # Never write into the caller's mapping; every edit below is on this copy.
+    # Model validation normalizes graph settings; keep those changes local to
+    # this launch as well as edits to the outer mapping.
     llm_args = dict(llm_args)
+    cuda_graph_config = llm_args.get("cuda_graph_config")
+    if isinstance(cuda_graph_config, BaseCudaGraphConfig):
+        llm_args["cuda_graph_config"] = cuda_graph_config.model_copy(deep=True)
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
