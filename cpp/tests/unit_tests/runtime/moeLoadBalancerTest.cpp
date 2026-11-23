@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
@@ -1134,6 +1135,19 @@ uint8_t readByte(void const* ptr, size_t offset)
     return value;
 }
 
+//! Bytes the native-memory ledger records as EPLB device memory on device 0.
+int64_t eplbDeviceBytes()
+{
+    for (auto const& [label, usage] : tensorrt_llm::common::getNativeMemoryUsage(0))
+    {
+        if (label == tensorrt_llm::common::nativeMemoryLabels::kEplbDevice)
+        {
+            return usage.bytes;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 TEST(UnbackedSlotMemoryTest, SavesOnlyChunksInsideUnbackedSlots)
@@ -1183,6 +1197,23 @@ TEST(UnbackedSlotMemoryTest, BackedSlotKeepsItsOwnBytes)
     TLLM_CUDA_CHECK(cudaMemset(slots + 2 * granularity, 0, granularity));
     EXPECT_EQ(readByte(slots, 0), 0xCD);
     memory.free(ptr);
+}
+
+TEST(UnbackedSlotMemoryTest, LedgerRecordsBackedSlotMemory)
+{
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    auto& memory = UnbackedSlotMemory::getInstance();
+    auto const granularity = static_cast<int64_t>(slotMemoryGranularity());
+    int64_t const before = eplbDeviceBytes();
+    // Slot 0 has memory of its own; slot 1 maps the shared scratch, which the ledger does not count.
+    void* ptr = memory.allocate(granularity, 2, {1});
+    EXPECT_EQ(eplbDeviceBytes() - before, granularity);
+    EXPECT_EQ(memory.setBacked(ptr, {1}, true), size_t(granularity));
+    EXPECT_EQ(eplbDeviceBytes() - before, 2 * granularity);
+    EXPECT_EQ(memory.setBacked(ptr, {1}, false), size_t(granularity));
+    EXPECT_EQ(eplbDeviceBytes() - before, granularity);
+    memory.free(ptr);
+    EXPECT_EQ(eplbDeviceBytes(), before);
 }
 
 // Without fault tolerance a CPU-copied slot is kept at its host pointer, so an unbacked spare slot, which has no host

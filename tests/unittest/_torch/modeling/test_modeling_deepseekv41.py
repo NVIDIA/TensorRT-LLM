@@ -2180,6 +2180,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
             _config=SimpleNamespace(enable_attention_dp=True),
             mapping=metadata.mapping,
             dist=SimpleNamespace(tp_cp_allgather_int64=gather),
+            cuda_graph_runner=None,
         )
         spec = SimpleNamespace(
             dp_num_tokens=lambda: 6, seq_lens=[6], num_generations=1, runtime_draft_len=3

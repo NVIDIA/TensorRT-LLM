@@ -48,9 +48,15 @@ if TYPE_CHECKING:
     from .inputs import DecoderInputBuffers
 
 
-def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
-    """Resolve the model-specific Mamba metadata class with a default."""
-    return getattr(model, "mamba_metadata_cls", None) or Mamba2Metadata
+def resolve_mamba_metadata_cls(
+    model: torch.nn.Module, kv_cache_manager: object | None = None
+) -> type[Mamba2Metadata]:
+    """Resolve the Mamba metadata class: the model's, else the cache manager's, else the default."""
+    return (
+        getattr(model, "mamba_metadata_cls", None)
+        or getattr(kv_cache_manager, "mamba_metadata_cls", None)
+        or Mamba2Metadata
+    )
 
 
 class DecoderMetadata:
@@ -121,7 +127,9 @@ class DecoderMetadata:
             self.attn_metadata.mamba_chunk_size = getattr(
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
-        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(
+            self.model, kv_cache_manager
+        )
         if isinstance(self.attn_metadata, TrtllmAttentionMetadata):
             self.attn_metadata.host_uploader = self._host_uploader
         self._arm_msa_policy(kv_cache_manager)
@@ -164,6 +172,7 @@ class DecoderMetadata:
         )
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
         self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        self.spec_metadata.skip_verify_row_gather = self.runtime_hooks.skip_verify_row_gather
         if self.runtime_hooks.pack_spec_rng_uploads:
             logger.info(
                 "Sampled-step Philox uploads: written by the steady MTP stager on its steps, "

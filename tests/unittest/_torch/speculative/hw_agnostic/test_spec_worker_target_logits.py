@@ -3,6 +3,7 @@
 """The one-model spec worker's target-logits hook and the engine gather of vocabulary-sharded logits."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -185,7 +186,9 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     model.spec_worker = Worker()
     model.spec_decode_fast_paths = False
     model.lm_head, model.logits_processor, model.draft_model = "lm_head", "processor", "drafter"
-    spec_metadata = SimpleNamespace(is_layer_capture=lambda layer: False, gather_ids=gather_ids)
+    spec_metadata = SimpleNamespace(
+        is_layer_capture=lambda layer: False, gather_ids=gather_ids, skip_verify_row_gather=False
+    )
     attn_metadata = SimpleNamespace(padded_num_tokens=None, num_tokens=4)
 
     out = SpecDecOneEngineForCausalLM.forward(
@@ -197,6 +200,33 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     assert torch.equal(rows, hidden[gather_ids])
     assert rest == ["lm_head", "processor", attn_metadata, spec_metadata, "drafter"]
     assert calls["forward"]["logits"] == "worker logits"
+
+
+@pytest.mark.parametrize("mode", ["identity", "context", "shorter"])
+def test_verify_row_gather_preserves_rows_and_only_bypasses_identity(
+    mode: str,
+) -> None:
+    hidden = torch.arange(24).reshape(4, 6)
+    gather_ids = torch.tensor(
+        [1, 3] if mode == "context" else [0, 1] if mode == "shorter" else [0, 1, 2, 3]
+    )
+    worker = SimpleNamespace(
+        reads_lm_head_dtype_logits=False,
+        takes_vocab_sharded_target_logits=lambda *_: False,
+        target_logits=Mock(return_value="logits"),
+    )
+    model = SimpleNamespace(
+        spec_worker=worker, lm_head=None, logits_processor=None, draft_model=None
+    )
+    metadata = SimpleNamespace(gather_ids=gather_ids, skip_verify_row_gather=True)
+    attention = SimpleNamespace(num_contexts=int(mode == "context"))
+
+    logits, sharded = SpecDecOneEngineForCausalLM._verify_logits(model, hidden, attention, metadata)
+
+    rows = worker.target_logits.call_args.args[0]
+    assert torch.equal(rows, hidden[gather_ids])
+    assert (rows is hidden) is (mode == "identity")
+    assert logits == "logits" and sharded is False
 
 
 @pytest.mark.parametrize(

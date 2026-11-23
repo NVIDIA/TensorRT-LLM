@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 from einops import repeat
 
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+from tensorrt_llm._torch.modules.mamba.replay_metadata import (
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
     REPLAY_WORK_ITEM_WIDTH,
@@ -1094,7 +1094,7 @@ def test_replay_selective_state_update_with_separate_replay_slots(mode, rectangl
 @pytest.mark.parametrize("builder", ["torch", "triton"])
 def test_replay_work_items_read_replay_slots(builder):
     """Work items carry the state slot and replay slot and read PNAT through the replay slot."""
-    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    from tensorrt_llm._torch.modules.mamba.replay_metadata import (
         _build_replay_work_items_torch,
         _build_replay_work_items_triton,
     )

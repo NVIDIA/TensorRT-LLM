@@ -32,7 +32,7 @@ from tensorrt_llm._torch.cute_dsl_utils import (
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = ["../../../..", "../../../../moe"]
 from _fp4_moe_test_utils import _q_nvfp4  # noqa: E402
 from _validating import assert_within_ulp  # noqa: E402
 

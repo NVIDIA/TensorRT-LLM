@@ -28,11 +28,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager impo
     MiniMaxM3KVCacheManagerV2,
 )
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
-    MambaHybridCacheManagerV2,
-)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -67,14 +65,6 @@ def _model_config(*, kv_heads, head_dim, kv_quant_algo=None):
 
 class _V1LikeManager:
     """A non-V2 manager: predates the appended-draft layer specs."""
-
-
-class _MambaAppendsManager(MambaHybridCacheManagerV2):
-    """A hybrid manager: its appended draft layers must match its cache type."""
-
-    @classmethod
-    def accepts_appended_draft_layers(cls) -> bool:
-        return True
 
 
 def _mla_model_config(*, kv_quant_algo=None):
@@ -236,7 +226,7 @@ def test_non_v2_target_manager_keeps_separate_cache(is_disagg: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    "manager_cls", [KVCacheManagerV2, _MambaAppendsManager], ids=["plain_v2", "mamba_hybrid"]
+    "manager_cls", [KVCacheManagerV2, KimiK3HybridCacheManager], ids=["plain_v2", "mamba_hybrid"]
 )
 @pytest.mark.parametrize("target_is_mla", [True, False])
 @pytest.mark.parametrize("is_disagg", [False, True])

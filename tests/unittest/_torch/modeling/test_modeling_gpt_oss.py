@@ -94,10 +94,14 @@ def dump_config_json(dst_dir):
         json.dump(json_configs, f, indent=2, ensure_ascii=False)
 
 
-@pytest.mark.parametrize(
-    "moe_backend",
-    ["CUTLASS", pytest.param("TRITON", marks=skip_no_hopper)])
-def test_gpt_oss_trtllmgen(moe_backend):
+# TritonFusedMoE has no implementation id, so it is selected by the TRITON
+# backend (tactic "triton" names a different kernel, the Triton FP8
+# block-scale GEMM).
+@pytest.mark.parametrize("moe_kwargs", [
+    pytest.param({"tactic": "cutlass"}, id="cutlass"),
+    pytest.param({"backend": "TRITON"}, id="TRITON", marks=skip_no_hopper),
+])
+def test_gpt_oss_trtllmgen(moe_kwargs: dict[str, str]) -> None:
     prompts = [
         "How are you?",
         "Hello, my name is",
@@ -111,7 +115,7 @@ def test_gpt_oss_trtllmgen(moe_backend):
         cuda_graph_config=CudaGraphConfig(),
         attn_backend="TRTLLM",
         load_format="dummy",
-        moe_config=MoeConfig(backend=moe_backend),
+        moe_config=MoeConfig(**moe_kwargs),
     )
 
     tmp_model_dir = f"/tmp/test_model_trtllm"

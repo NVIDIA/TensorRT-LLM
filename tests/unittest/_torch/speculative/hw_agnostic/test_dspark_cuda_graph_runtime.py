@@ -525,7 +525,9 @@ def test_shape_vote_is_consumed_on_normal_and_exceptional_forward_exit(monkeypat
     runner.adp_shape_agreement = agreement
 
     @contextmanager
-    def parent_pad(self, scheduled_requests, _resource_manager, _runtime_draft_len):
+    def parent_pad(
+        self, scheduled_requests, _resource_manager, _runtime_draft_len, _sampling_mode=None
+    ):
         if failure == "enter":
             raise RuntimeError("padding failed")
         yield scheduled_requests

@@ -128,7 +128,9 @@ class M3MoeEngine(OpWrapper):
     NVFP4 MoE (fp4_quantize + fp4_block_scale_moe_runner) on the same routing; the test checks that too.
 
     The all-reduce push (`arp`) needs a multicast exchange: its 2-rank certification (pushed boundary bit for bit the
-    unpushed one) is comm/_m3_moe_push_op_matrix.py. Not covered: the non-shared state (`shared=False`), which this
+    unpushed one) is covered by:
+    tests/unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/comm/_m3_moe_push_op_matrix.py
+    Not covered: the non-shared state (`shared=False`), which this
     target never builds. Every layer on one state
     must run in one stream order: the workspace is shared and tagged per call, never reset.
 

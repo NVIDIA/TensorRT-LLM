@@ -315,8 +315,10 @@ decoder queries. The query pass preserves those cache entries and still
 executes its attention and FFN. Replay is enabled by default with a shared
 Encoder/Decoder range of 140 tokens (`DEFAULT_BOUNDED_REPLAY_TOKENS`), or one
 token more than the required SWA window (including the embedded DSpark capture
-window) when that window is wider, without a physical-ring or page-alignment
-constraint. `TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides the range; a value that
+window) when that window is wider. With prefix block reuse enabled, Encoder replay requires the range to be at
+least `tokens_per_block`; cache initialization and sizing reject smaller ranges
+so cold recovery stays within the configured replay budget.
+`TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides the range; a value that
 does not exceed the required window is an error. The released checkpoint's SWA
 window remains 128.
 This policy is approximate across stacked
@@ -423,18 +425,40 @@ before or at the final decoder window. A hit inside that window still needs
 Encoder replay to produce the missing decoder inputs.
 
 Global partial-prefix matching follows `enable_partial_reuse`, independently
-of Decoder replay. Partial Encoder checkpoint reuse remains future work:
-OPTIONAL coverage at a non-block-aligned Global endpoint is currently incomplete
-and triggers Encoder replay while retaining the Global hit.
+of Decoder replay. Encoder checkpoints also support partial pages: a snapshot
+published at 255 may restore a match at 253 when every required lookback page
+is present. The shared tail is copied into a private writable page, and only
+the matched prefix is visible. Ratio-two continuation reads the saved raw
+KV/score row at an odd boundary; later compressed rows are not reusable.
 
-Encoder recovery starts at `max(0, P - R)`, using the same configured `R` as
+When the checkpoint at `P` is unavailable or cannot supply the final Decoder
+window's HC rows, recovery first looks for a complete checkpoint
+`S` shared by all Encoder groups. The search is bounded by `P - R <= S < P`
+and `S <= prompt_length - R`. Native cache creation reports each group's
+complete half-open `endpoint_ranges` in `reuse_status`, collected during the
+forward radix-tree walk. CSA2 passes `optional_reuse_max_backtrack=R` so creation
+holds only the candidate lookback pages needed by endpoints in `[max(1, P-R), P]`.
+The model selects a common endpoint in their intersection, including inside a page.
+First `resume(optional_reuse_endpoints={group: S, ...})` restores the selected
+read-only lookback, copies a partial tail at `S`, and allocates private writable
+pages for the remainder of `[S, P)`.
+It releases unused candidate references, while the selected working pages
+follow the ordinary hold/lock lifecycle across allocation retries and suspension.
+The normal post-forward history update retires their initial histories and
+reclaims stale lookback without committing the recomputed prefix again.
+Queries start at `S`,
+but Encoder SWA can read the restored history before `S`. GLOBAL and INDEX
+publication still excludes their cached prefix; ratio-two partial state is
+rebuilt at the GLOBAL boundary. Decoder SWA keeps its own replay floor.
+
+Without a suitable checkpoint, Encoder recovery starts at `max(0, P - R)`, using the same configured `R` as
 Decoder replay. Physical SWA retention is at least `R + 1` for Decoder layers
 and, when Encoder replay is enabled, Encoder layers, before speculative and
 reuse-backoff reserves. The extra row protects the first replay row at
 partial-block endpoints. Checkpoint coverage and pool sizing use the same
 enlarged window; the attention window itself remains unchanged. First resume
 uses the ordinary fresh-page allocation for missing OPTIONAL and PRIVATE groups,
-which covers historical replay rows without an additional native cache interface.
+which covers cold historical replay rows.
 The executor declares the pending Encoder replay before its first metadata
 preparation, including the active Global claim, source interval and SWA read
 floor. Historical query rows are excluded from GLOBAL/compressor source rows
@@ -459,6 +483,10 @@ generation CUDA graphs do not disable final-window replay.
 Disaggregated execution uses the same CED lifecycle. Ordinary context workers
 complete the final Decoder window before handoff; generation workers resume available Encoder groups
 independently and receive missing state without scheduling local Encoder replay.
+When Encoder replay is enabled, generation-side requests do not publish received
+KV or subsequent decode KV for reuse: transferred Encoder pages can contain rows
+before the sender's cold-recovery start. Transfer byte coverage does not establish
+that those rows were computed. Local prefill publication is unchanged.
 The V2 transfer adapter reports each native lifecycle group's admitted reuse
 endpoint. It skips only restored pages: a Global hit does not skip missing
 OPTIONAL Encoder pages or PRIVATE Decoder pages. Generation admission does not

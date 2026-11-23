@@ -77,7 +77,7 @@ scheduler_config:
 ### Selecting the KV Cache Manager
 
 ```{warning}
-KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`) and RocketKV still require V1 until V2 support is available; keep V1 for these features during migration.
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`) still requires V1 until V2 support is available; keep V1 for this feature during migration.
 ```
 
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
@@ -108,7 +108,7 @@ algorithms select their KV cache manager per algorithm:
 | DeepSeek-V4, MiniMax-M3, CSA2 | The algorithm's V2 manager, whatever the setting |
 | QSA | The algorithm's V2 hybrid manager; the setting must select V2 |
 | DSA | Follows the setting (`DSACacheManagerV2` or `DSACacheManager`) |
-| RocketKV | The algorithm's V1 manager, whatever the setting |
+| RocketKV | Follows the setting (`RocketKVCacheManagerV2` or `RocketKVCacheManager`) |
 | Skip Softmax Attention | The manager a dense model would get |
 
 Skip Softmax Attention changes only the attention kernel and keeps the dense KV
