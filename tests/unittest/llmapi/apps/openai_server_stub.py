@@ -49,6 +49,7 @@ def make_stub_openai_server(
             speculative_config=None,
             post_processor_hook=None,
             sleep_config=None,
+            memory_monitor_config=None,
             num_serve_frontends=1,
             enable_iter_perf_stats=False,
         ),

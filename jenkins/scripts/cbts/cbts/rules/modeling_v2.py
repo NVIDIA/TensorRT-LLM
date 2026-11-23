@@ -184,6 +184,17 @@ _EXTRA_SOURCE_UNIT_TESTS.update(
         )
     }
 )
+# The MiniMax-M3 family-root CPU checks guard every family op, including ops whose
+# mirror unit directory would otherwise select only itself.
+_M3_FAMILY_ROOT_CHECKS = {
+    f"{_M3_UNIT_ROOT}/{relative}"
+    for relative in (
+        "test_collective_launcher_cleanup.py",
+        "test_modeling_v2_eagle3_worker_api.py",
+        "test_shared_kernel_contracts.py",
+        "ops/spec/test_modeling_v2_spec_tail_contracts.py",
+    )
+}
 
 # Substrings that mark a test entry as modeling_v2. All are unambiguous:
 #   - "unittest/_torch/modeling_v2/" → the op and target unit tests
@@ -521,6 +532,7 @@ class ModelingV2Rule(Rule):
             | targets
             | tests
             | _EXTRA_SOURCE_UNIT_TESTS.get(path, set())
+            | (_M3_FAMILY_ROOT_CHECKS if path.startswith(f"{_M3_OPS_SOURCE_ROOT}/") else set())
         )
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:

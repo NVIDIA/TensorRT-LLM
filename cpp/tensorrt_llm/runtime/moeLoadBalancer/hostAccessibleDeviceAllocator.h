@@ -88,6 +88,9 @@ public:
     void memcpyToDevice(void* dst, void const* src, size_t size);
 
 private:
+    //! \brief Native-memory ledger label for an allocation; `gdr` is true for GDRCopy-backed device memory.
+    char const* nativeMemoryLabel(bool gdr) const;
+
     struct AllocationInfo
     {
         size_t size;

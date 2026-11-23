@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _get_local_mamba_cache_layout,
     _is_disagg_context_server,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
@@ -216,6 +217,21 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
     # QSA_INDEX_POSITION page, unvalidated for cross-request reuse.
     # KvCacheCreator reads this off the class, so dense Qwen4-Exp opts out too.
     _supports_draft_reuse_match_backoff = False
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """PLE state is computed from replicated inputs and index positions are request-wide
+        coordinates, so every rank holds the same bytes; so do the packed side planes. They carry
+        no head axis, which splitting them by the rank's KV heads would assume."""
+        spec = super().page_table_spec()
+        if self._replay_region is not None:
+            spec = replace(
+                spec, untransferred_roles=spec.untransferred_roles | self._replay_region.roles
+            )
+        roles = (PLE_CONV_STATE, PLE_NGRAM_CONTEXT, QSA_INDEX_POSITION, QSA_SIDE_PLANES)
+        return replace(
+            spec, role_layouts={**spec.role_layouts, **{role: Replicated() for role in roles}}
+        )
 
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
