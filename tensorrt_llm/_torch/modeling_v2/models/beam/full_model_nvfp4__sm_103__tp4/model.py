@@ -21,13 +21,12 @@ concatenated into the call's T rows. A context request appends its ``n`` tokens 
 generation request appends one token. Each request's ``position_ids`` must be exactly
 ``past .. past + n - 1``. ``logit_rows`` selects the hidden rows that reach the final norm and
 the head before either runs: ``None`` (default) is the last row of each request, in request
-order -- the next-token logits a sampler needs -- ``"all"`` every row, or explicit row
-indices.
+order -- the next-token logits a sampler needs -- ``"all"`` every row.
 
 The cache must be a BF16 ``KVCacheManagerV2`` holding all 52 logical layers in logical order
 with 2 kv heads of 128 per rank, a 512-token window on every sliding layer and the whole
-sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 41, 47 and 51
-(``attention_windows``). Input geometry, metadata and cache are validated before execution; absolute position
+sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 41, 47 and 51.
+Input geometry, metadata and cache are validated before execution; absolute position
 values are compared with the request spans only in diagnostic mode. A call with T above
 ``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
 the supported deployment's native ``max_num_tokens``).
@@ -60,7 +59,7 @@ NUM_LAYERS = SUPPORTED_CONFIG["num_hidden_layers"]
 #: Tokens per call of the supported deployment (its native ``max_num_tokens``).
 MAX_NUM_TOKENS = 8192
 
-LogitRows = Literal["all"] | Sequence[int] | None
+LogitRows = Literal["all"] | None
 
 
 class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
@@ -85,13 +84,6 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             raise ValueError(f"the full model holds logical layers 0..{NUM_LAYERS - 1}")
         self.vocab_size = config["vocab_size"]
         self._checked_manager = None
-
-    def attention_windows(self, max_seq_len: int) -> list[int]:
-        """Per logical layer: the attention window its cache must keep (512 or ``max_seq_len``)."""
-        return [
-            self.window if self.schedule.is_sliding(layer) else max_seq_len
-            for layer in range(NUM_LAYERS)
-        ]
 
     def check_cache_manager(self, manager: KVCacheManagerV2) -> None:
         """Raise ValueError unless ``manager`` holds every logical layer as this model needs.
@@ -124,10 +116,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             raise ValueError(f"the KV cache manager states {len(windows)} attention windows")
         for layer, window in enumerate(windows):
             if self.schedule.is_sliding(layer):
-                # The estimator uses a full-context pool, and short sequences
-                # normalize the sliding window to full context. The attention
-                # operator still applies self.window independently of retention.
-                ok = window is None or int(window) in (self.window, manager.max_seq_len)
+                # Retention may exceed the attention window, or cover a shorter
+                # whole sequence. The attention operator still applies self.window.
+                ok = window is None or int(window) >= min(self.window, manager.max_seq_len)
             else:
                 ok = window is None or int(window) >= manager.max_seq_len
             if not ok:
@@ -145,22 +136,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                 end += n
                 ends.append(end - 1)
             return ends
-        if isinstance(logit_rows, str):
-            if logit_rows != "all":
-                raise ValueError(
-                    f"logit_rows must be None, 'all' or row indices, got {logit_rows!r}"
-                )
+        if isinstance(logit_rows, str) and logit_rows == "all":
             return list(range(num_tokens))
-        rows = list(logit_rows)
-        if (
-            not rows
-            or any(type(r) is not int or not 0 <= r < num_tokens for r in rows)
-            or len(set(rows)) != len(rows)
-        ):
-            raise ValueError(
-                f"logit_rows must be distinct row indices in [0, {num_tokens}), got {logit_rows!r}"
-            )
-        return rows
+        raise ValueError(f"logit_rows must be None or 'all', got {logit_rows!r}")
 
     def check_call(
         self,

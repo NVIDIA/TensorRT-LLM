@@ -23,7 +23,7 @@ Producers that push (the o_proj / shared-expert GEMV ``ar`` tuple, the routed-ex
 pointed at a bucket's exchange by its ``mc`` address, ``flags_for(8)`` counters, ``rank``, ``world_size`` and
 ``max_tokens``; ``get_workspace`` and ``_bucket`` select it.
 
-The kernel is ``torch.ops.trtllm.minimax_m3_mc_allreduce_norm``, reached through the ``ops/comm`` entries
+The kernel is ``family_ops().minimax_m3_mc_allreduce_norm``, reached through the ``ops/comm`` entries
 ``m3_mc_allreduce_norm`` and ``m3_mc_finalize_allreduce_norm``; this module owns the workspaces, the bucket and
 epilogue-option choice and the MXFP8 publication.
 """

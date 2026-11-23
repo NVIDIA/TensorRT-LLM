@@ -30,7 +30,15 @@ def native_mxfp8_gemm(
     weight: torch.Tensor | None = None,
     weight_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Consume prequantized input with the native projection's startup tactic cache."""
+    """Consume prequantized input: SM107's prefill-sized GEMM for an opted-in ``linear``, else the
+    native projection's startup tactic cache."""
+    from tensorrt_llm._torch.modules.linear import _mxfp8_prefill_gemm_sm107
+
+    weight = linear.weight if weight is None else weight
+    weight_scale = linear.weight_scale if weight_scale is None else weight_scale
+    output = _mxfp8_prefill_gemm_sm107(linear, activation, scales, weight, weight_scale)
+    if output is not None:
+        return output
     gemm = (
         torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
         if linear.quant_method.needs_native_autotune
@@ -39,8 +47,8 @@ def native_mxfp8_gemm(
     return gemm(
         activation,
         scales,
-        linear.weight if weight is None else weight,
-        linear.weight_scale if weight_scale is None else weight_scale,
+        weight,
+        weight_scale,
         linear._mxfp8_alpha,
         linear.dtype,
     )

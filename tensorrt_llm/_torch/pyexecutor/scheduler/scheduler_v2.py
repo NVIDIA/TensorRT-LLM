@@ -167,6 +167,17 @@ class BudgetTracker:
         self._seen_peft_task_ids.add(lora_task_id)
 
 
+def _in_other_locality_domain(victim, locality_domain_id) -> bool:
+    # Pages are allocated per locality domain, so a victim in another
+    # domain frees nothing for this request.
+    victim_domain = getattr(victim, "py_locality_domain_id", None)
+    return (
+        isinstance(locality_domain_id, int)
+        and isinstance(victim_domain, int)
+        and victim_domain != locality_domain_id
+    )
+
+
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
 
@@ -281,6 +292,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
         self.has_cp_helix = kv_cache_manager._has_cp_helix
+        # Every request runs at exactly max_beam_width (checked on admission).
+        self._single_beam = kv_cache_manager.max_beam_width == 1
         draft_mgr_name = (
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
         )
@@ -405,7 +418,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._sched_iter = 0
         # Reuse probe results of this scheduling pass, by request id (_uncached_tokens).
         self._reuse_probes: dict[int, Optional[int]] = {}
-        # In-forward Mamba snapshots (MambaHybridCacheManagerV2): staging rows
+        # In-forward Mamba snapshots (the GDN cache manager's): staging rows
         # per batch, and those left in the batch being scheduled.
         self._inforward_snapshot_rows = kv_cache_manager.inforward_snapshot_rows
         self._inforward_snapshot_rows_left = 0
@@ -720,20 +733,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         requests_list = self._filter_remote_tail_phase_requests(list(active_requests))
         if self._gen_paused_ids:
             requests_list = self._filter_paused_requests(requests_list)
-        # Only context requests can carry an exclusive mode, so test the state
-        # first: during decode every request fails it, one cheap compare each.
-        exclusive_remote_mode = next(
-            (
-                getattr(req, "py_csa2_remote_tail_mode", None)
-                for req in requests_list
-                if req.state_value == self._context_init_state_value
-                and not defer_remote_tail_context
-                and self.remote_tail_phase is not RemoteTailPhase.DECODE
-                and req.request_id not in inflight_request_ids
-                and getattr(req, "py_csa2_remote_tail_mode", None) == "source"
-            ),
-            None,
-        )
+        exclusive_remote_mode = None
+        if not defer_remote_tail_context and self.remote_tail_phase is not RemoteTailPhase.DECODE:
+            # Only context requests can carry an exclusive mode, so test the state
+            # first: during decode every request fails it, one cheap compare each.
+            context_init_state_value = self._context_init_state_value
+            exclusive_remote_mode = next(
+                (
+                    getattr(req, "py_csa2_remote_tail_mode", None)
+                    for req in requests_list
+                    if req.state_value == context_init_state_value
+                    and getattr(req, "py_csa2_remote_tail_mode", None) == "source"
+                    and req.request_id not in inflight_request_ids
+                ),
+                None,
+            )
 
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
         # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
@@ -788,6 +802,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
+        # Membership costs two binding calls per request; the set is usually empty.
+        has_inflight = len(inflight_request_ids) > 0
         while req_it < req_it_end:
             req = requests_list[req_it]
 
@@ -796,7 +812,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
 
             # --- Filter ---
-            if req.request_id in inflight_request_ids:
+            if has_inflight and req.request_id in inflight_request_ids:
                 req_it += 1
                 continue
 
@@ -958,6 +974,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 recompute_paused,
                 preempted_ids,
                 pending_ctx_index[req.py_request_id],
+                locality_domain_id=getattr(req, "py_locality_domain_id", None),
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -1340,7 +1357,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         A first-chunk request has not claimed its reusable prefix yet, so its
         remaining length still counts it; the prefix is probed once per
-        scheduling pass, without claiming pages.
+        scheduling pass, without claiming pages, and capped like the claim
+        (``context_reuse_claim_limit``).
         """
         remaining = req.context_remaining_length
         if not req.is_first_context_chunk:
@@ -1350,6 +1368,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         reusable = self._reuse_probes[req.py_request_id]
         if reusable is None:
             return remaining
+        limit = self.kv_cache_manager.context_reuse_claim_limit(req)
+        if limit is not None:
+            reusable = min(reusable, limit)
         return remaining - min(max(reusable - req.context_current_position, 0), remaining)
 
     def _order_ctx_shortest_first(self, pending_ctx: RequestList) -> RequestList:
@@ -2004,7 +2025,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         """The snapshot point P a forced chunk ends at, if the chunk can run through the prompt end instead.
 
         The GDN layers then record the state at P inside the forward
-        (MambaHybridCacheManagerV2 in-forward snapshots), which saves the extra
+        (the GDN cache manager's in-forward snapshots), which saves the extra
         context iteration of the short tail [P, prompt end).
         """
         manager = self.kv_cache_manager
@@ -2039,18 +2060,24 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Doing this up front rather than claim-then-reconcile keeps the mismatch
         path (free the draft pages and re-claim shallower) off the common case.
+
+        The target's spec recompute tail (``context_reuse_claim_limit``) caps the
+        common depth too: the unpaired path applies it in ``prepare_context``,
+        which a paired first chunk does not go through.
         """
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
             return None
+        tail_limit = self.kv_cache_manager.context_reuse_claim_limit(req)
         draft_match = draft_manager.probe_context_reuse(req)
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:
-            return None
+            return tail_limit
         # Claiming the minimum stops the target's lookup there, hiding where the
         # prompt leaves the tree; the attention-only draft match still reaches it.
         self.kv_cache_manager.note_context_fork(req, draft_match)
-        return min(draft_match, target_match)
+        common = min(draft_match, target_match)
+        return common if tail_limit is None else min(common, tail_limit)
 
     def _admit_unpaired_draft(self, req: LlmRequest) -> bool:
         """Create and resume an unpaired draft mirror as part of admitting *req*.
@@ -2417,7 +2444,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
         """
-        beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
+        beam_width = (
+            1 if self._single_beam else req.get_beam_width_by_iter(for_next_iteration=False)
+        )
         req_tokens = beam_width + get_draft_token_length(req)
 
         if not budget.can_fit_tokens(req_tokens):
@@ -2642,6 +2671,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_paused: RequestList,
         preempted_ids: set[int],
         requester_idx: int,
+        locality_domain_id: int | None = None,
     ) -> bool:
         """Release one started request's KV cache so another can allocate.
 
@@ -2689,6 +2719,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             victim
             for victim in reversed(requests_list[stop + 1 :])
             if victim.py_request_id not in protected_ids
+            and not _in_other_locality_domain(victim, locality_domain_id)
             and self._is_recompute_pause_candidate(victim, inflight_request_ids)
         ]
         # An active request holds its pages on GPU, so preempting it always
@@ -3146,7 +3177,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             context_requests.extend(last)
         else:
             context_requests.sort(key=self._lora_key)
-        generation_requests.sort(key=self._lora_key)
+        # Requests without a LoRA task share one key, which the stable sort keeps in place.
+        if any(getattr(req, "lora_task_id", None) is not None for req in generation_requests):
+            generation_requests.sort(key=self._lora_key)
 
     # ---- can_schedule (PP dry-run) ----
 

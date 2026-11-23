@@ -26,7 +26,7 @@ NVLINK One-Sided supports post-quant dispatch.
 
 import os
 import sys
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -973,6 +973,18 @@ class NVLinkOneSided(Communication):
             self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.execution_state.abort
         )
 
+    def _refuse_active_rank_mask(self, kwargs: Dict[str, Any]) -> None:
+        """Refuse an ``active_rank_mask`` argument: the active ranks come from the bound execution
+        state with enable_wide_ep_fault_tolerance, and there are none to mask without it."""
+        if kwargs.get("active_rank_mask") is None:
+            return
+        if not self._rank_mask_enabled:
+            raise ValueError("active_rank_mask requires committed EP group health")
+        raise ValueError(
+            "active_rank_mask is not an argument: NVLinkOneSided takes the active ranks from its "
+            "bound execution state"
+        )
+
     def _rank_mask_args(self) -> Dict[str, Optional[torch.Tensor]]:
         """Return the rank-mask arguments of the all-to-all ops: the device mask that the rank-mask
         kernels read and the abort state that ends their waits, or no mask without a rank mask."""
@@ -1161,6 +1173,7 @@ class NVLinkOneSided(Communication):
             to this rank (or that rank src does not have) has ``invalid_token_expert_id`` in every
             top-k slot.
         """
+        self._refuse_active_rank_mask(kwargs)
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
@@ -1295,6 +1308,7 @@ class NVLinkOneSided(Communication):
             Combined output tensor [local_num_tokens, hidden_size]
 
         """
+        self._refuse_active_rank_mask(kwargs)
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")

@@ -7,8 +7,7 @@ The workflow's own gate functions, with the environment, runner and flags
 resolved from the same task.yaml. Like the orchestrator's checks, it measures
 a snapshot of one commit of ``trtllm_repo_path`` (``run/workspace/snapshots.py``): the
 commit the checkout is at, or ``--commit``. ``--tree`` measures another tree
-as it is, and ``--results`` keeps the per-tree measurements the acceptance
-gate compares a later tree against::
+as it is::
 
     trtllm-modeling-v2 gate acceptance --task task.yaml \
         --unit dspark --member tep4 --tree .dev-worktrees/pre-fix
@@ -43,7 +42,7 @@ from ..spec.task_schema import (
 from . import acceptance as acceptance_checks
 from . import accuracy as accuracy_checks
 from . import boot as boot_checks
-from . import check_config, check_runtime, gate_records
+from . import check_config, check_runtime
 from . import verdict as check_result
 
 #: The gates this command runs, by the name it takes.
@@ -104,13 +103,6 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         default=Path("trtllm-modeling-v2-gates"),
         help="where the gate writes the files its job reads; on the shared filesystem when the "
         "job runs elsewhere (a spool session). Default ./trtllm-modeling-v2-gates",
-    )
-    parser.add_argument(
-        "--results",
-        type=Path,
-        default=None,
-        help="the results file the acceptance gate compares against and appends "
-        "to (default <workdir>/gate_results.jsonl); share one across trees to compare them",
     )
     parser.add_argument(
         "--features",
@@ -210,9 +202,10 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         devices = ()
     else:
         devices = tuple(range(gpus))
-    environment = resolve_environment(task_data, devices=devices, world_size=world)
+    environment = resolve_environment(task_data, devices=devices).at_width(world)
     # The unit's own, without a variant's overlay: what a relative variant is judged against.
-    unit_environment = resolve_environment(declared, devices=devices, world_size=world)
+    unit_environment = resolve_environment(declared, devices=devices).at_width(world)
+    nodes, lead = disagg.job_span(task_data, args.name, environment.nodes)
     if args.python:
         environment = replace(environment, python=args.python)
         unit_environment = replace(unit_environment, python=args.python)
@@ -224,10 +217,10 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         elif tree is not None:
             task_data = {**task_data, "trtllm_repo_path": str(tree.resolve())}
             declared = {**declared, "trtllm_repo_path": str(tree.resolve())}
-        # A worker's own gate run queues after the run's checks and before perf work.
+        # A worker's own gate run queues with the run's other checks.
         executor = select_command_executor(
             environment, name_prefix=f"gate-{args.name}", gpus=str(gpus), tree=tree,
-            priority=FEATURE, nodes=spec.nodes if spec else 1,
+            priority=FEATURE, nodes=nodes, lead=lead,
         )  # fmt: skip
         runner = shell_runner_for(executor)
         runner = pin.runner(runner) if pin is not None else check_runtime.in_tree(runner, tree)
@@ -268,7 +261,6 @@ def _run_named(
         else features_for(task_data, unit)
     )
     workdir = args.workdir.resolve()
-    records = gate_records.GateRecords(args.results or workdir / gate_records.RESULTS_FILENAME)
     timeout = {"timeout": args.timeout} if args.timeout else {}
     common = dict(task_data=task_data, runner=runner, unit=unit, member=member)
 
@@ -332,7 +324,6 @@ def _run_named(
             environment,
             features=features,
             workdir=workdir / unit,
-            records=records,
             **timeout,
             **common,
         )

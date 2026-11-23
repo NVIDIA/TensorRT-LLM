@@ -14,11 +14,27 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
 
 import torch
 
 
-def k3_mla_decode_view(attn, meta, num_tokens: int):
+@dataclass(frozen=True)
+class K3MlaGeometry:
+    """What ``k3_mla_decode_view`` needs of an MLA layer: its per-rank shape and the layer's index in the model.
+
+    ``layer_idx`` is the model's layer index, as the KV cache manager's ``get_buffers`` and ``layer_offsets`` take it.
+    """
+
+    num_heads: int
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    q_scaling: float
+    layer_idx: int
+
+
+def k3_mla_decode_view(attn: K3MlaGeometry, meta, num_tokens: int):
     """The per-layer inputs of trtllm::k3_mla_qkv and trtllm::k3_mla_attn(_vb)_out for a bf16 decode step of R
     generation requests of T = num_tokens / R tokens each (no context requests, R <= 8, T <= 8), or the reason it
     does not apply (a string; never raises). The dict: ``pool`` (flat bf16 pool), ``row_stride``, ``page_table``
@@ -80,7 +96,8 @@ def k3_mla_decode_view(attn, meta, num_tokens: int):
         return f"pool layout {tuple(kv_pool.shape)}"
     if not (kv_pool.is_contiguous() and kv_pool.stride(2) >= 576 and kv_pool.stride(2) % 8 == 0):
         return f"pool strides {kv_pool.stride()}"
-    pool_idx = int(meta.host_kv_cache_pool_mapping[attn.get_local_layer_idx(meta), 0])
+    local_layer_idx = meta.kv_cache_manager.layer_offsets[attn.layer_idx]
+    pool_idx = int(meta.host_kv_cache_pool_mapping[local_layer_idx, 0])
     gen = slice(meta.num_contexts, meta.num_contexts + num_requests)
     page_table = meta.kv_cache_block_offsets[pool_idx, gen, 0, :]
     seq_len = meta.kv_lens_cuda_runtime[gen]
