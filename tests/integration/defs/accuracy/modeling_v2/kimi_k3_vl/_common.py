@@ -64,7 +64,7 @@ def _run_gsm8k(model_path: str, moe_tp_size: int, moe_ep_size: int) -> None:
                 max_tokens=8192,
             ),
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1], enable_padding=True),
-            moe_config=MoeConfig(backend="TRTLLM", use_low_precision_moe_combine=True),
+            moe_config=MoeConfig(tactic="trtllm_gen", use_low_precision_moe_combine=True),
             env_overrides=rank_env,
         ) as llm,
     ):

@@ -14,6 +14,9 @@ from tensorrt_llm.bindings.internal.runtime import (
     get_virtual_memory_manager, pop_virtual_memory_allocator,
     push_virtual_memory_allocator)
 
+from .memory.monitor import pools as monitor_pools
+from .memory.monitor import triggers as monitor_triggers
+
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
     "materialize_with_tag", "release_host_backups_with_tag"
@@ -50,8 +53,10 @@ class _MultiPoolProxy:
         self._pools.clear()
 
 
-_pool_stack: list[tuple[contextlib.AbstractContextManager,
-                        _MultiPoolProxy]] = []
+# Each open scope's pool context, proxy and tag; the tag registers the new
+# pool a resumed parent scope opens.
+_pool_stack: list[tuple[contextlib.AbstractContextManager, _MultiPoolProxy,
+                        str]] = []
 
 
 def _scope(
@@ -69,7 +74,7 @@ def _scope(
     #  which natively supports MemPool nesting:
     #  https://github.com/pytorch/pytorch/commit/d038b0130ec7c20ebcac219301292fd8e98a1ace
     if _pool_stack:
-        parent_ctx, _ = _pool_stack[-1]
+        parent_ctx, _, _ = _pool_stack[-1]
         parent_ctx.__exit__(None, None, None)
 
     pushed_allocator = False
@@ -82,15 +87,17 @@ def _scope(
         proxy = _MultiPoolProxy()
         pool = torch.cuda.MemPool(
             _get_torch_pluggable_virtual_memory_allocator())
+        # Lets the memory monitor name this pool and track its release.
+        monitor_pools.register_pool(pool.id, f"sleep: {tag}", sleep_tag=tag)
         pool_ctx = torch.cuda.use_mem_pool(pool)
         pool_ctx.__enter__()
         proxy._add(pool)
-        _pool_stack.append((pool_ctx, proxy))
+        _pool_stack.append((pool_ctx, proxy, tag))
         child_pushed = True
         yield proxy
     finally:
         if child_pushed:
-            current_ctx, _ = _pool_stack.pop()
+            current_ctx, _, _ = _pool_stack.pop()
             current_ctx.__exit__(None, None, None)
         if pushed_allocator:
             pop_virtual_memory_allocator()
@@ -98,11 +105,14 @@ def _scope(
         if _pool_stack:
             new_pool = torch.cuda.MemPool(
                 _get_torch_pluggable_virtual_memory_allocator())
+            _, parent_proxy, parent_tag = _pool_stack[-1]
+            monitor_pools.register_pool(new_pool.id,
+                                        f"sleep: {parent_tag}",
+                                        sleep_tag=parent_tag)
             new_ctx = torch.cuda.use_mem_pool(new_pool)
             new_ctx.__enter__()
-            _, parent_proxy = _pool_stack[-1]
             parent_proxy._add(new_pool)
-            _pool_stack[-1] = (new_ctx, parent_proxy)
+            _pool_stack[-1] = (new_ctx, parent_proxy, parent_tag)
 
 
 scope = contextmanager(_scope)
@@ -127,7 +137,14 @@ def release_with_tag(*tags: str) -> int:
     :return: Number of memory blobs released
     """
     manager = get_virtual_memory_manager()
-    released_blobs = sum(manager.release_with_tag(tag) for tag in tags)
+    released_blobs = 0
+    for tag in tags:
+        try:
+            released_blobs += manager.release_with_tag(tag)
+        finally:
+            # A failing release still releases the tag's other blobs and drops
+            # the failing one, so the tag is no longer backed either way.
+            monitor_pools.mark_released((tag, ))
     return released_blobs
 
 
@@ -138,7 +155,19 @@ def materialize_with_tag(*tags: str) -> int:
     :return: Number of memory blobs materialized
     """
     manager = get_virtual_memory_manager()
-    materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
+    materialized_blobs = 0
+    try:
+        for tag in tags:
+            # A failing materialize rolls its tag back to released, so a tag
+            # is marked backed only once its own call has succeeded.
+            materialized_blobs += manager.materialize_with_tag(tag)
+            monitor_pools.mark_materialized((tag, ))
+    except Exception as exc:
+        # Materializing allocates outside PyTorch, so no allocator hook sees
+        # a failure; every caller (the sleep/wakeup listener and
+        # BaseWorker.wakeup) reaches the memory monitor through here.
+        monitor_triggers.notify_error(str(exc), error=exc)
+        raise
     return materialized_blobs
 
 

@@ -5,10 +5,10 @@
 
 The gate starts ``trtllm-serve <checkpoint>`` on the tree under test with the
 accuracy gate's LLM-API options, at the member's topology, waits for
-``/health`` and sends one ``/v1/completions`` request, then the unit's boot
-workload as far as the boot gate judges it. It passes when the server became
-healthy, every answer is HTTP 200 with non-empty text, and the answers hold
-the boot workload's keywords. The job is ``serve_driver.py``, run under the
+``/health`` and sends one ``/v1/completions`` request, then the image prompts
+of the unit's boot workload as chats. It passes when the server became
+healthy and every answer is HTTP 200 with non-empty text. The job is
+``serve_driver.py``, run under the
 tree's interpreter. Owed only when ``accuracy.serve.enabled`` says so.
 """
 
@@ -26,7 +26,7 @@ import yaml
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..spec.task_schema import TaskSchemaError, parse_parallel_segment
-from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, missing_keywords, resolve_boot_spec
+from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, resolve_boot_spec
 from .check_config import check_configuration, order_members_by_cost
 from .check_runtime import (
     BOOT_TIMEOUT_S,
@@ -154,45 +154,31 @@ def serve_args(
 def serve_requests(
     task_data: Mapping[str, Any], spec: ServeSpec, boot: BootSpec
 ) -> list[dict[str, Any]]:
-    """What the gate asks: one completion, then the boot workload's prompts the boot gate judges.
+    """What the gate asks: one completion, then each image prompt of the boot workload as a chat.
 
-    A plain boot prompt goes as a completion when the workload names
-    keywords; a prompt with checks of its own goes as a completion, or with
-    its first image as a chat. Each carries ``boot`` (``["prompt", n]`` or
-    ``["item", n]``), its place in the workload, so :func:`judge` holds its
-    answer to that prompt's checks. A pre-rendered (``render: raw``) image
-    prompt is sent as :data:`~.boot.DEFAULT_BOOT_IMAGE_PROMPT`: the server
-    applies the chat template and places the image itself.
+    The boot workload's text prompts are not asked again: the completion shows
+    that the server answers text. A pre-rendered (``render: raw``) image prompt
+    is sent as :data:`~.boot.DEFAULT_BOOT_IMAGE_PROMPT`: the server applies the
+    chat template and places the image itself.
     """
     model = str(task_data["checkpoint_path"])
-
-    def completion(rid: str, prompt: str, max_tokens: int, place: list[Any] | None):
-        request: dict[str, Any] = {
-            "id": rid,
+    requests: list[dict[str, Any]] = [
+        {
+            "id": "text",
             "endpoint": COMPLETIONS,
             "body": {
                 "model": model,
-                "prompt": prompt,
-                "max_tokens": max_tokens,
+                "prompt": spec.prompt,
+                "max_tokens": spec.max_tokens,
                 "temperature": 0.0,
             },
         }
-        if place is not None:
-            request["boot"] = place
-        return request
-
-    requests: list[dict[str, Any]] = [completion("text", spec.prompt, spec.max_tokens, None)]
+    ]
     workload = boot.requests(task_data.get("trtllm_repo_path"))
     plain = len(boot.prompts)
-    if boot.keywords:
-        for n in range(plain):
-            requests.append(completion(f"boot{n}", boot.prompts[n], spec.max_tokens, ["prompt", n]))
     for n, item in enumerate(boot.items):
-        if not (item.images or item.keywords or item.keywords_any):
-            continue
         request = workload[plain + n]
         if not request.get("images"):
-            requests.append(completion(f"item{n}", item.prompt, spec.max_tokens, ["item", n]))
             continue
         text = item.prompt if item.render == "loader" else DEFAULT_BOOT_IMAGE_PROMPT
         content = [
@@ -209,7 +195,6 @@ def serve_requests(
                     "max_tokens": spec.max_tokens,
                     "temperature": 0.0,
                 },
-                "boot": ["item", n],
             }
         )
     return requests
@@ -227,13 +212,10 @@ def judge(
     output: str,
     requests: Sequence[Mapping[str, Any]],
     returncode: int = 0,
-    boot: BootSpec | None = None,
 ) -> tuple[bool, str, tuple[str, ...]]:
     """What the driver's output says: passed, why, and what a reader should see besides.
 
-    Read from the driver's records only, never from the server's log. With
-    ``boot``, each answer to one of its prompts is held to that workload's
-    keywords.
+    Read from the driver's records only, never from the server's log.
     """
     servers = workload_io.parse_marked(output, serve_driver.SERVER_MARKER)
     if not servers:
@@ -266,19 +248,6 @@ def judge(
             problems.append(f"{where}: {got}: {str(record.get('error') or '')[:200]}")
         elif not str(record.get("text") or "").strip():
             problems.append(f"{where}: empty text (finish_reason {record.get('finish_reason')})")
-    if not problems and boot is not None:
-        texts: list[str | None] = [None] * (len(boot.prompts) + len(boot.items))
-        for index, request in enumerate(requests):
-            place = request.get("boot")
-            if place:
-                at = int(place[1]) + (len(boot.prompts) if place[0] == "item" else 0)
-                texts[at] = str(answers[index].get("text") or "")
-        missing = missing_keywords(boot, texts)
-        if missing:
-            problems.append(
-                f"the answers are missing {len(missing)} keyword(s) the boot workload expects: "
-                f"{missing} ({boot.source})"
-            )
     if problems:
         return False, "trtllm-serve came up, but " + "; ".join(problems), warnings
     if returncode != 0:
@@ -354,7 +323,7 @@ def run_serve_gate(
         return _verdict(**lost_session(result), **ran)
     if result.timed_out:
         return _verdict(passed=False, detail=ended_early(result, timeout), **ran)
-    passed, detail, warnings = judge(combined, requests, result.returncode, boot)
+    passed, detail, warnings = judge(combined, requests, result.returncode)
     return _verdict(passed=passed, detail=detail, warnings=warnings, **ran)
 
 

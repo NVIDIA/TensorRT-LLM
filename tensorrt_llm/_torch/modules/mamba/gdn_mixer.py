@@ -51,6 +51,7 @@ from ...utils import (
     is_gdn_replay_enabled,
     is_torch_compiling,
 )
+from ..fla.gdn_metadata import GDNMambaMetadata, InforwardSnapshotSplit
 from ..linear import (
     FP8QDQLinearMethod,
     FP8RowwiseLinearMethod,
@@ -87,7 +88,6 @@ from .gdn_prefill_conv import (
 )
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
-from .mamba2_metadata import InforwardSnapshotSplit, Mamba2Metadata
 from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
 
@@ -101,8 +101,9 @@ class GdnIterationContext(NamedTuple):
     """Metadata-derived arguments of forward_extend / forward_decode, shared by every GDN layer of one iteration.
 
     Built by the first GDN layer of the iteration (Qwen3NextGatedDeltaNet._iteration_context, which needs the
-    speculative metadata that Mamba2Metadata.prepare does not see), stored on ``Mamba2Metadata.gdn_iteration_context``
-    and cleared by every Mamba2Metadata.prepare / prepare_steady_gen_step. Layers only read it; per-layer state and
+    speculative metadata that GDNMambaMetadata.prepare does not see), stored on
+    ``GDNMambaMetadata.gdn_iteration_context`` and cleared by every GDNMambaMetadata.prepare /
+    prepare_steady_gen_step. Layers only read it; per-layer state and
     scratch are passed separately.
     """
 
@@ -249,7 +250,7 @@ def _inforward_split_prefill_core(
     Args:
         query, key, value, g, beta: Post-convolution GDN inputs, ``[1, num_tokens, heads, dim]``.
         ssm_states: The layer's SSM state pool, ``[slots, H, V, K]``.
-        split: This step's split (``Mamba2Metadata.inforward_split``).
+        split: This step's split (``GDNMambaMetadata.inforward_split``).
         stage_ssm: The layer's SSM staging rows, ``[rows, H, V, K]``.
         output: Optional preallocated output.
         g_is_linear: ``g`` holds ``alpha = exp(g)`` (the FlashInfer gate convention) instead of log space;
@@ -2452,7 +2453,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         pure-decode iteration. Updates the pool slots ``state_indices_d`` in place.
 
         With a preallocated output, a bf16 pool and 32-byte aligned gate columns
-        and slot buffer (the fused in_proj layout and Mamba2Metadata's decode slot
+        and slot buffer (the fused in_proj layout and GDNMambaMetadata's decode slot
         buffer provide both) the batched views go straight to FlashInfer's
         launcher (flashinfer_gdn_decode_t1); the same kernel, without the two
         adapter layers.
@@ -2669,7 +2670,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ) -> None:
         """Zero the recurrent and conv state of context requests that start without one.
 
-        Host-gated and hoisted: ``Mamba2Metadata.prepare`` records whether any
+        Host-gated and hoisted: ``GDNMambaMetadata.prepare`` records whether any
         context request of the iteration needs a reset (continuation chunks
         under prefix reuse never do), and the first GDN layer that runs clears
         the slots of every local layer in one launch. Each layer used to launch
@@ -2703,7 +2704,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        mamba_metadata: Mamba2Metadata,
+        mamba_metadata: GDNMambaMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         h_fp8: Optional[torch.Tensor] = None,
@@ -2781,7 +2782,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def _iteration_context(
         self,
         attn_metadata: AttentionMetadata,
-        mamba_metadata: Mamba2Metadata,
+        mamba_metadata: GDNMambaMetadata,
         spec_metadata: Optional[SpecMetadata],
         has_layer_cache: bool,
     ) -> GdnIterationContext:
@@ -2893,7 +2894,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         a: torch.Tensor,
         b: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        mamba_metadata: Mamba2Metadata,
+        mamba_metadata: GDNMambaMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         output: Optional[torch.Tensor] = None,
     ):
@@ -2909,7 +2910,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # Everything below that derives from the metadata alone is the same for
         # every GDN layer of the iteration: the first layer builds it, the
-        # others reuse it (Mamba2Metadata.prepare clears the slot).
+        # others reuse it (GDNMambaMetadata.prepare clears the slot).
         common = getattr(mamba_metadata, "gdn_iteration_context", None)
         if common is None:
             common = self._iteration_context(

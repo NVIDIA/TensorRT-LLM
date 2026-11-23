@@ -138,9 +138,14 @@ def query_opensearch_durations(days):
         query_str = json.dumps(query)
         res = None
         for attempt in range(DEFAULT_RETRY_COUNT):
-            res = requests.get(
-                search_url, data=query_str, headers=headers, timeout=QUERY_TIMEOUT_SECONDS
-            )
+            try:
+                res = requests.get(
+                    search_url, data=query_str, headers=headers, timeout=QUERY_TIMEOUT_SECONDS
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if attempt + 1 == DEFAULT_RETRY_COUNT:
+                    raise
+                continue
             if res.status_code in (200, 201, 202):
                 break
             print(
