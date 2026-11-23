@@ -1172,6 +1172,11 @@ class TestFlashInferAttention(unittest.TestCase):
 
             # Reuse the final context+generation batch to exercise variable
             # prefill bounds without losing the sliding window on decode.
+            if scenario.full_page_table:
+                for layer in layers:
+                    self.assertFalse(
+                        layer.supports_variable_window(attn_metadata))
+                return
             window = 8
             length = context_sequence_lengths[1]
             prefix = past_seen_tokens[1]
@@ -1272,12 +1277,6 @@ class TestFlashInferAttention(unittest.TestCase):
                                            rtol=1e-2)
 
                 # The same cached-prefix mixed batch must work in NHD as well.
-                # Preserve logical values while changing the physical layout.
-                hnd_cache = kv_cache_manager.get_buffers(
-                    flashinfer_attn.layer_idx, kv_layout="HND").clone()
-                kv_cache_manager.get_buffers(flashinfer_attn.layer_idx,
-                                             kv_layout="NHD").copy_(
-                                                 hnd_cache.transpose(2, 3))
                 nhd_reference = flashinfer_attn.forward(
                     q, k, v, nhd_metadata, attention_window_size=window)
                 torch.testing.assert_close(nhd_reference, reference)

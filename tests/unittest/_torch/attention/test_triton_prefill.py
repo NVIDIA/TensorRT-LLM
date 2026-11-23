@@ -485,22 +485,23 @@ class TestTritonPrefillNoPrefix:
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
 
         # Check a request whose V rows begin beyond the signed int32 offset limit.
+        # At BF16 the strided V needs 4 GiB; using one head keeps Q/K/output near 128 MiB each.
         packed_start = 2**18
         rows = packed_start + seq_len
         packed_v = torch.empty_strided(
-            (rows, num_kv_heads, head_dim), (8192, head_dim, 1), dtype=v.dtype, device=device
+            (rows, 1, head_dim), (8192, head_dim, 1), dtype=v.dtype, device=device
         )
-        packed_v[packed_start:].copy_(v)
+        packed_v[packed_start:].copy_(v[:, :1])
         # The first request attends only to itself, keeping this check linear.
         positions = torch.arange(rows, dtype=torch.int32, device=device)
         starts = positions.clone()
         starts[packed_start:] = 0
         positions[packed_start:] -= packed_start
-        packed_q = q[:1].expand(rows, -1, -1).clone()
-        packed_q[packed_start:] = q
+        packed_q = q[:1, :1].expand(rows, -1, -1).clone()
+        packed_q[packed_start:] = q[:, :1]
         packed_k = torch.empty_like(packed_q)
         packed_k[:packed_start].zero_()
-        packed_k[packed_start:] = k
+        packed_k[packed_start:] = k[:, :1]
         packed_out = torch.empty_like(packed_q)
         triton_prefill_with_custom_mask(
             q=packed_q,
@@ -519,7 +520,7 @@ class TestTritonPrefillNoPrefix:
             max_len_extend=packed_start,
             sm_scale=sm_scale,
         )
-        torch.testing.assert_close(packed_out[packed_start:], output, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(packed_out[packed_start:], output[:, :1], atol=1e-2, rtol=1e-2)
 
 
 # ===========================================================================

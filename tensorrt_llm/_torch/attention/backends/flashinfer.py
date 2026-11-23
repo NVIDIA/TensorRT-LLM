@@ -2663,7 +2663,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         return (self.flashinfer_backend in ("fa2", "fa3")
                 and isinstance(metadata, FlashInferAttentionMetadata)
                 and metadata.kv_cache_manager is not None
-                and metadata.num_contexts > 0 and not self.has_fp8_kv_cache
+                and metadata.num_contexts > 0 and not self.has_fp8_kv_cache and
+                not (metadata.num_generations > 0 and
+                     metadata.uses_xqa_target_decode(self.flashinfer_backend))
                 and not self.is_mla_enable and self.head_dim >= 16
                 and self.num_heads > 0 and self.num_kv_heads > 0
                 and self.num_heads % self.num_kv_heads == 0)
