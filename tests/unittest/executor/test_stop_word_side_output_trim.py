@@ -68,6 +68,10 @@ def _handle(
         cum_log_probs=None,
         log_probs=[[{token: Logprob(logprob=-0.5, rank=1)} for token in generated]],
         generation_logits=logits,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+        time_breakdown_metrics=None,
         request_perf_metrics=None,
         additional_context_outputs=None,
         additional_generation_outputs=additional_generation_outputs,
@@ -181,6 +185,12 @@ def test_sampler_logprobs_survive_prompt_response_wrapper(streaming, beam_search
                 for values in sampler_logprobs
             ],
             generation_logits=None,
+            per_pos_drafted=None,
+            per_pos_accepted=None,
+            spec_dec_totals=None,
+            time_breakdown_metrics=None,
+            additional_context_outputs=None,
+            additional_generation_outputs=None,
             request_perf_metrics=None,
         )
         for beam in range(len(sequences)):
@@ -209,6 +219,12 @@ def test_generation_only_response_preserves_sampler_logprobs(first_token_logprob
         cum_log_probs=None,
         log_probs=[sampler_logprobs],
         generation_logits=None,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+        time_breakdown_metrics=None,
+        additional_context_outputs=None,
+        additional_generation_outputs=None,
         request_perf_metrics=None,
     )
 

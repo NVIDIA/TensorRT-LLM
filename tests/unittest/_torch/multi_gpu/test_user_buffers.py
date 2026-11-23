@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pickle
 import sys
 import traceback
@@ -18,6 +21,8 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              userbuffers_allreduce_finalize)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -271,6 +276,51 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
     return True
 
 
+def run_single_rank_ledger(tensor_parallel_size, ub_size):
+    """Registered userbuffers are in the native memory ledger at their size."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        if not ub.ub_supported():
+            return True
+
+        def recorded():
+            labels, counts, nbytes, _ = torch.ops.trtllm.get_native_memory_usage(
+                rank)
+            usage = dict(zip(labels, zip(counts, nbytes)))
+            return usage.get("userbuffers", (0, 0))
+
+        before_count, before_bytes = recorded()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
+        init_count, init_bytes = recorded()
+        # Initialization registers the communicator's own region.
+        assert init_count == before_count + 1, (before_count, init_count)
+        assert init_bytes > before_bytes
+
+        tensor = create_userbuffers_tensor((ub_size // 4, ), torch.float32)
+        assert tensor is not None
+        count, nbytes = recorded()
+        assert count == init_count + 1, (init_count, count)
+        # The buffer is rounded up to the allocation and multicast granularity.
+        assert nbytes - init_bytes >= ub_size, (init_bytes, nbytes)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_are_in_the_native_memory_ledger(mpi_pool_executor):
+    tensor_parallel_size = 2
+    results = mpi_pool_executor.map(
+        run_single_rank_ledger,
+        *zip(*[(tensor_parallel_size, 8 << 20)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
@@ -497,9 +547,12 @@ def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
                           mapping=mapping)
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
 
-        with torch.inference_mode():
-            ref_dequantized, ref_residual, ref_scale = model(a, c)
-            fused_dequantized, fused_residual, fused_scale = model_opt(a, c)
+        with torch.inference_mode(), nccl_window_tensor_scope((a, c)):
+            # Snapshot outputs before releasing leases for rank-local checks.
+            ref_dequantized, ref_residual, ref_scale = (
+                output.clone() for output in model(a, c))
+            fused_dequantized, fused_residual, fused_scale = (
+                output.clone() for output in model_opt(a, c))
 
         _assert_match_counts(
             backend, {
@@ -618,8 +671,8 @@ def run_single_rank_ub_pass(
                           enable_userbuffers=True,
                           mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
-        with torch.inference_mode():
-            output_fused = model_opt(input)
+        with torch.inference_mode(), nccl_window_tensor_scope(input) as scope:
+            output_fused = scope.escape(model_opt(input))
         # Assert the exact named pass totals rather than the raw fixed-point
         # trace in backend.match_count. This is still an intentional tripwire
         # for optimizer changes, but on semantic pass names instead of
@@ -961,7 +1014,9 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
                           enable_userbuffers=True,
                           mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
-        with torch.inference_mode():
+        with torch.inference_mode(), nccl_window_tensor_scope(
+            (mm0_input_0, mm0_input_1, mm1_input_0, mm1_input_1, residual_0,
+             residual_1)) as scope:
             output_fused = model_opt(mm0_input_0, mm0_input_1, mm1_input_0,
                                      mm1_input_1, residual_0, residual_1)
             torch.cuda.synchronize()
@@ -972,6 +1027,7 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
             torch.cuda.synchronize()
             output_ref = model(mm0_input_0, mm0_input_1, mm1_input_0,
                                mm1_input_1, residual_0, residual_1)
+            scope.escape((output_fused, output_ref))
         # Assert the exact named pass totals rather than the raw fixed-point
         # trace in backend.match_count. This is still an intentional tripwire
         # for optimizer changes, but on semantic pass names instead of
@@ -1223,9 +1279,9 @@ def run_single_rank_ub_pass_fp4(
                           enable_userbuffers=True,
                           mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
-        with torch.inference_mode():
-            output_ref = model(input)
-            output_fused = model_opt(input)
+        with torch.inference_mode(), nccl_window_tensor_scope(input) as scope:
+            output_ref = scope.escape(model(input))
+            output_fused = scope.escape(model_opt(input))
 
         # Assert the exact named pass totals rather than the raw fixed-point
         # trace in backend.match_count. This is still an intentional tripwire

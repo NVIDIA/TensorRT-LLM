@@ -249,6 +249,26 @@ def test_mm_key_with_uuid():
         mock_mm_key_old_format)
     assert result_old_format["hash"] == expected_hash
 
+    # V2 marks UUID as additive: hash remains the digest and UUID is emitted
+    # separately for routing identity.
+    mock_mm_key_v2 = (mock_hash, mock_offset, test_uuid, True)
+    result_v2 = KVCacheEventSerializer._mm_key_to_json(mock_mm_key_v2)
+    assert result_v2 == {
+        "type": "mm_key",
+        "hash": expected_hash,
+        "uuid": test_uuid,
+        "start_offset": 42,
+    }
+
+    mock_mm_key_v2_without_uuid = (mock_hash, mock_offset, None, True)
+    result_v2_without_uuid = KVCacheEventSerializer._mm_key_to_json(
+        mock_mm_key_v2_without_uuid)
+    assert result_v2_without_uuid == {
+        "type": "mm_key",
+        "hash": expected_hash,
+        "start_offset": 42,
+    }
+
 
 def test_apply_mm_hashes_with_uuids():
     """Test apply_mm_hashes with user-provided UUIDs."""
@@ -991,7 +1011,9 @@ def check_v2_events(llm: LLM,
 
     tokens_per_block = llm.get_kv_cache_capacity()["tokensPerBlock"]
     prompt_length = 127
-    blocks_per_request = (prompt_length + tokens_per_block -
+    # The last sampled token has no KV, so it is never committed.
+    committed_length = prompt_length + sampling_params.max_tokens - 1
+    blocks_per_request = (committed_length + tokens_per_block -
                           1) // tokens_per_block
     num_requests = 1
     cached_blocks = {}
@@ -1059,11 +1081,13 @@ def check_v2_events(llm: LLM,
                     del cached_blocks[block_hash]
                     num_removed_blocks += 1
 
-        # V2 publishes the prompt, including its partial tail, but no decode tokens.
+        # V2 publishes the prompt and the decode tokens, including the partial tail.
+        committed_tokens = (
+            prompt + list(output.outputs[0].token_ids))[:committed_length]
         assert [[token["token_id"] for token in block["tokens"]]
                 for block in stored_blocks] == [
-                    prompt[start:start + tokens_per_block]
-                    for start in range(0, prompt_length, tokens_per_block)
+                    committed_tokens[start:start + tokens_per_block]
+                    for start in range(0, committed_length, tokens_per_block)
                 ]
         if request_index == 0:
             assert num_offloaded_blocks == 0

@@ -12,9 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CBTS runtime config template; only [run] source and data_file are consumed by sitecustomize.py.
+# CBTS runtime config template, consumed by sitecustomize.py.
 
 [run]
 source =
     @TRTLLM_WHEEL_PATH@/tensorrt_llm/
+    %(repository_root)s/
+# fnmatch patterns on repository-relative paths; * also matches directory separators.
+include =
+    tensorrt_llm/*.py
+    examples/*.py
+    scripts/*.py
+    tests/test_common/*.py
+    conftest.py
+    tests/conftest.py
+    tests/*/conftest.py
 data_file = @JOB_WORKSPACE@/.coverage.@STAGE_NAME@

@@ -37,7 +37,7 @@ reuses everything numerically identical from the K2.5 implementation:
 """
 
 import copy
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -76,6 +76,9 @@ from .modeling_utils import (
     register_auto_model,
     register_vision_encoder,
 )
+
+if TYPE_CHECKING:
+    from ..recurrent_state_spec import RecurrentStateSpec
 
 # ---------------------------------------------------------------------------
 # Native MoonViT3d Vision Encoder Components (K3 deltas)
@@ -291,6 +294,9 @@ class KimiK3VisionModel(KimiK25VisionModel):
         self.model_config = copy.copy(model_config)
         self.model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         self.model_config._frozen = False
+        self.model_config.attn_backend = model_config.get_encoder_attention_backend(
+            "vision", model_config.attn_backend
+        )
         # Vision tower is not quantized (checkpoint quant ignore list covers
         # vision_tower.* / mm_projector.*), and its encoder layers keep no KV
         # cache — so do not carry the text model's kv_cache_quant_algo over:
@@ -317,8 +323,9 @@ class KimiK3VisionModel(KimiK25VisionModel):
         # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
         # 12 heads under TP16); run the whole tower replicated (tp=1) in that
         # case so module construction and weight loading agree. Attention-DP
-        # already replicates the vision tower via its own path, so leave it be.
-        if not model_config.mapping.enable_attention_dp:
+        # already replicates the vision tower via its own path, except under
+        # helix: the mapping still carries cp, which Attention would shard by.
+        if not model_config.mapping.enable_attention_dp or model_config.mapping.cp_size > 1:
             self.model_config.mapping = _get_vision_tp_mapping(model_config, num_heads)
         pretrained_config = self.model_config.pretrained_config
         # Normalize the checkpoint dtype once (covers both the modern `dtype`
@@ -457,8 +464,25 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     backbone classes).
     """
 
+    # fmt: off
+    supported_encoder_attention_backends = KimiK25ForConditionalGeneration.supported_encoder_attention_backends
+    # fmt: on
+
     _VISION_MODEL_CLS = KimiK3VisionModel
     mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the text backbone's declaration, read from ``text_config``."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return KimiLinearForCausalLM.get_recurrent_state_spec(
+            text_config, quant_config=quant_config
+        )
 
     def __init__(
         self,

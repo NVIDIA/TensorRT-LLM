@@ -23,6 +23,11 @@ l0_l40s:
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::test_qwen3vl_init_preserves_caller_quant_config
   - unittest/_torch/modeling/test_modeling_cosmos3.py::TestCosmos3::test_all
+  - unittest/_torch/modeling/test_modeling_cosmos3_edge.py::TestCosmos3Edge::test_all
+  - unittest/_torch/modeling/test_modeling_cosmos3_edge.py::TestCosmos3Edge::test_encoder_output_reaches_prefill_through_cache
+  - unittest/_torch/modeling/test_modeling_cosmos3_edge.py::test_cosmos3_edge_init_preserves_caller_quant_config
+  - unittest/_torch/modeling/test_modeling_cosmos3_edge.py::test_edge_to_device_keeps_grids_on_cpu
+  - unittest/_torch/modeling/test_modeling_cosmos3_edge.py::test_edge_yarn_fused_cache_matches_decoder
   - unittest/_torch/modeling/test_modeling_step3p7vl.py
   - unittest/llmapi/apps/_test_openai_chat_multimodal.py::test_single_chat_session_image_embeds -m needs_l40s
   # Encoder-only /v1/embeddings dynamic batching (BERT classifier + PRM-7B reward + Qwen3-Embedding)
@@ -30,6 +35,7 @@ l0_l40s:
   # Qwen3-Embedding text-embedding accuracy vs HuggingFace (0.6B small/fast + 8B large)
   - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-0.6b]
   - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-8b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_cuda_graph_matches_eager[qwen3-embedding-0.6b]
   # PyTorch: force NVFP4 Marlin on Ada to cover the SM89-compiled Marlin kernels.
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=1]
   # Marlin NVFP4: Triton top-k combine matches the established ATen scatter-reduce.
@@ -45,6 +51,7 @@ l0_l40s:
   - llmapi/test_llm_api_pytorch_bart.py::test_mbart_pytorch_generate_encoder_decoder_end_to_end
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2-bart-large-cnn]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_fp8_self_cache_with_model_dtype_cross_cache
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-small]

@@ -9,11 +9,12 @@ Covers:
 - MultimodalDataTracker.retrieve_all_async gathers all modalities concurrently
 """
 
+import asyncio
 import base64
 import tempfile
 import threading
 from io import BytesIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -24,7 +25,7 @@ from PIL import Image
 
 import tensorrt_llm.inputs.media_io as media_io_module
 import tensorrt_llm.inputs.utils as utils_module
-from tensorrt_llm.inputs.media_io import _get_aiohttp_session
+from tensorrt_llm.inputs.media_io import _close_aiohttp_session, _get_aiohttp_session
 from tensorrt_llm.inputs.utils import MultimodalDataTracker, async_load_audio, async_load_image
 
 pytestmark = pytest.mark.cpu_only
@@ -58,6 +59,15 @@ def _make_audio_file(tmp_path: str) -> str:
 
 
 class TestAsyncLoadImage:
+    @pytest.mark.asyncio
+    async def test_load_image_from_raw_bytes_pil(self):
+        encoded = _make_image_data_url().partition(",")[2]
+        image = await media_io_module.ImageMediaIO(format="pil").async_load_bytes(
+            base64.b64decode(encoded)
+        )
+        assert isinstance(image, Image.Image)
+        assert image.mode == "RGB"
+
     @pytest.mark.asyncio
     async def test_load_image_from_data_url_pil(self):
         url = _make_image_data_url()
@@ -100,6 +110,49 @@ class TestAsyncLoadImage:
         assert worker_thread_ids[0] != event_loop_thread_id, (
             "PIL decoding ran on the event loop thread — event loop is being blocked"
         )
+
+
+# ──────────────────────────────────────────────────────────────
+# load_image / async_load_image: local files
+# ──────────────────────────────────────────────────────────────
+
+
+class TestLoadImageLocalFile:
+    """`load_image` and `async_load_image` resolve local files the same way."""
+
+    @staticmethod
+    def _write_image(directory, name):
+        path = directory / name
+        Image.new("RGB", (6, 4), color=(10, 20, 30)).save(path)
+        return path
+
+    @staticmethod
+    def _reference(path):
+        return np.asarray(Image.open(path).convert("RGB"))
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "plain.png",
+            "with space.png",
+            "hash#mark.png",
+            "question?mark.png",
+            "semi;colon.png",
+            "100%.png",
+        ],
+    )
+    @pytest.mark.parametrize("as_uri", [False, True], ids=["bare_path", "file_uri"])
+    @pytest.mark.asyncio
+    async def test_sync_and_async_load_the_same_file(self, tmp_path, name, as_uri):
+        path = self._write_image(tmp_path, name)
+        source = path.as_uri() if as_uri else str(path)
+
+        expected = self._reference(path)
+        sync_image = utils_module.load_image(source, format="pil")
+        async_image = await async_load_image(source, format="pil")
+
+        assert np.array_equal(np.asarray(sync_image), expected)
+        assert np.array_equal(np.asarray(async_image), expected)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -147,12 +200,10 @@ class TestAsyncLoadAudio:
 
 class TestSessionReuse:
     @pytest_asyncio.fixture(autouse=True)
-    async def reset_global_session(self):
-        media_io_module._global_aiohttp_session = None
+    async def reset_loop_session(self):
+        await _close_aiohttp_session()
         yield
-        if media_io_module._global_aiohttp_session is not None:
-            await media_io_module._global_aiohttp_session.close()
-        media_io_module._global_aiohttp_session = None
+        await _close_aiohttp_session()
 
     @pytest.mark.asyncio
     async def test_same_session_returned_on_repeated_calls(self):
@@ -161,6 +212,7 @@ class TestSessionReuse:
         assert first_session is second_session, (
             "Expected the same ClientSession object to be returned"
         )
+        assert isinstance(first_session.connector._resolver, media_io_module._ValidatingResolver)
 
     @pytest.mark.asyncio
     async def test_new_session_created_after_close(self):
@@ -171,6 +223,42 @@ class TestSessionReuse:
             "Expected a fresh session after the old one was closed"
         )
         assert not second_session.closed
+
+    @pytest.mark.asyncio
+    async def test_closed_event_loop_sessions_are_disposed_on_next_lookup(self):
+        async def abandoned_session():
+            return asyncio.get_running_loop(), await _get_aiohttp_session()
+
+        loop, session = await asyncio.to_thread(asyncio.run, abandoned_session())
+        assert loop.is_closed()
+        assert loop in media_io_module._aiohttp_sessions
+        assert not session.closed
+        current_session = await _get_aiohttp_session()
+        assert loop not in media_io_module._aiohttp_sessions
+        assert session.closed
+        assert not current_session.closed
+
+    @pytest.mark.asyncio
+    async def test_live_event_loops_keep_independent_sessions(self):
+        first_session = await _get_aiohttp_session()
+        worker_ready = threading.Event()
+        release_worker = threading.Event()
+        worker_sessions = []
+
+        async def use_session_on_worker_loop() -> None:
+            worker_sessions.append(await _get_aiohttp_session())
+            worker_ready.set()
+            await asyncio.to_thread(release_worker.wait, 5)
+            await _close_aiohttp_session()
+
+        worker = asyncio.create_task(asyncio.to_thread(asyncio.run, use_session_on_worker_loop()))
+        try:
+            assert await asyncio.to_thread(worker_ready.wait, 5)
+            assert worker_sessions[0] is not first_session
+            assert not first_session.closed
+        finally:
+            release_worker.set()
+            await worker
 
 
 # ──────────────────────────────────────────────────────────────
@@ -312,3 +400,21 @@ class TestDataUriMimeCheck:
         with patch.object(media_io_module.VideoMediaIO, "load_base64", return_value="decoded"):
             result = await io.async_load("data:video/mp4;base64,AAAA")
         assert result == "decoded"
+
+
+def test_video_media_io_forwards_decoded_frame_limit():
+    decoded = object()
+    reserver = Mock()
+    io = media_io_module.VideoMediaIO(
+        max_decoded_frame_bytes=123,
+        decoded_memory_reserver=reserver,
+    )
+
+    with (
+        patch.object(media_io_module, "_select_cv2_stream_buffered_backend", return_value=7),
+        patch.object(media_io_module, "_load_video_by_cv2", return_value=decoded) as decode,
+    ):
+        assert io.load_bytes(b"video") is decoded
+
+    assert decode.call_args.kwargs["max_decoded_frame_bytes"] == 123
+    assert decode.call_args.kwargs["decoded_memory_reserver"] is reserver

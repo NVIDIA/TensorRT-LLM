@@ -22,7 +22,9 @@
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
+#include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
+#include <cuda.h>
 #include <torch/extension.h>
 #include <unordered_map>
 
@@ -40,6 +42,36 @@ using tensorrt_llm::common::check;
 using tensorrt_llm::common::CublasMMWrapper;
 
 using cublas_lut::AlgoListType;
+
+CUcontext getCurrentCudaContext()
+{
+    CUcontext context{};
+    CUresult result = cuCtxGetCurrent(&context);
+    if (result == CUDA_ERROR_NOT_INITIALIZED || context == nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaFree(nullptr));
+        result = cuCtxGetCurrent(&context);
+    }
+    TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "cuCtxGetCurrent failed with error %d", result);
+    TLLM_CHECK_WITH_INFO(context != nullptr, "Current CUDA context is null");
+    return context;
+}
+
+// Each locality domain runs under its own green CUDA context, so the wrapper
+// cannot be a single thread-local instance.
+std::shared_ptr<CublasMMWrapper> getCublasWrapper()
+{
+    thread_local std::unordered_map<CUcontext, std::shared_ptr<CublasMMWrapper>> cublasWrappers;
+    auto& cublasWrapper = cublasWrappers[getCurrentCudaContext()];
+    if (!cublasWrapper)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
+
+    return cublasWrapper;
+}
 
 void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 8> const& attr_list)
 {
@@ -71,13 +103,41 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     if ((aType == CUDA_R_16BF || aType == CUDA_R_16F) && (outType == aType || outType == CUDA_R_32F)
         && compType == CUBLAS_COMPUTE_32F)
     {
+        if (tensorrt_llm::common::getSMVersion() == 120)
+        {
+            if (auto iter = cublas_lut::sm120_bf16_algo_list.find({mp2, k, n});
+                iter != cublas_lut::sm120_bf16_algo_list.end())
+            {
+                check_cuda_error(cublasLtMatmulAlgoInit(cublasWrapper->getCublasLtHandle(), compType, scaleType, aType,
+                    bType, outType, outType, iter->second[0], &algo));
+                set_algo_attr(algo, iter->second);
+                TLLM_LOG_DEBUG("Found SM120 cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+                return true;
+            }
+        }
         // TODO: remove this after cublas fix the heuristic for Spark
-        algo_list = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121
-            ? &cublas_lut::spark_bf16_algo_list
-            : &cublas_lut::bf16_algo_list;
+        algo_list = tensorrt_llm::common::getSMVersion() == 121 ? &cublas_lut::spark_bf16_algo_list
+                                                                : &cublas_lut::bf16_algo_list;
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
     {
+        if (tensorrt_llm::common::getSMVersion() == 103)
+        {
+            // Configs for an exact m take precedence on the architecture they were tuned on.
+            if (auto exact_iter = cublas_lut::sm103_fp8_exact_m_algo_list.find({m, k, n});
+                exact_iter != cublas_lut::sm103_fp8_exact_m_algo_list.end())
+            {
+                check_cuda_error(cublasLtMatmulAlgoInit(cublasWrapper->getCublasLtHandle(), compType, scaleType, aType,
+                    bType, outType, outType, exact_iter->second[0], &algo));
+                set_algo_attr(algo, exact_iter->second);
+                // The exact-m configs were tuned with the inner shape left undefined.
+                uint16_t const innerShape = CUBLASLT_MATMUL_INNER_SHAPE_UNDEFINED;
+                check_cuda_error(cublasLtMatmulAlgoConfigSetAttribute(
+                    &algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &innerShape, sizeof(innerShape)));
+                TLLM_LOG_DEBUG("Found exact-m cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+                return true;
+            }
+        }
         algo_list = &cublas_lut::fp8_algo_list;
     }
     else
@@ -198,13 +258,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
 
-    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
-    if (cublasWrapper == nullptr)
-    {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
-    }
+    at::cuda::CUDAGuard deviceGuard(a.device());
+    auto cublasWrapper = getCublasWrapper();
 
     cudaDataType_t aType = convert_torch_dtype(a.scalar_type());
     cudaDataType_t bType = convert_torch_dtype(b.scalar_type());

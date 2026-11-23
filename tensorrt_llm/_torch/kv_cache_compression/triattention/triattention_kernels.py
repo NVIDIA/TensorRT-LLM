@@ -98,6 +98,7 @@ def _score_row_stats_kernel(
     NUM_KV_HEADS: tl.constexpr,
     PADDED_COLUMNS: tl.constexpr,
     BUCKET: tl.constexpr,
+    COMPACT: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr = 256,
     # Triton rejects plain-global capture; the default binds the module float
@@ -115,6 +116,8 @@ def _score_row_stats_kernel(
     plane = kv_head * PADDED_COLUMNS + query_head % QUERY_GROUP_SIZE
     decode_length = tl.load(decode_lengths + request)
     prompt_start = tl.load(prompt_lengths + request)
+    if COMPACT:
+        prompt_start = prompt_start % 128
     score_row = (
         score_scratch
         + plane.to(tl.int64) * segment_tokens
@@ -155,6 +158,7 @@ def _score_per_head_reduce_kernel(
     NUM_KV_HEADS: tl.constexpr,
     PADDED_COLUMNS: tl.constexpr,
     BUCKET: tl.constexpr,
+    COMPACT: tl.constexpr,
     WIDTH: tl.constexpr,
     PER_LAYER: tl.constexpr,
     NORMALIZE: tl.constexpr,
@@ -169,6 +173,8 @@ def _score_per_head_reduce_kernel(
     token = token_block * BLOCK + tl.arange(0, BLOCK)
     decode_length = tl.load(decode_lengths + request)
     prompt_start = tl.load(prompt_lengths + request)
+    if COMPACT:
+        prompt_start = prompt_start % 128
     valid_token = token < decode_length
 
     if token_block == 0:
@@ -240,6 +246,7 @@ def reduce_per_head_scores(
     score_token_capacity: int,
     per_layer: bool,
     normalize_scores: bool,
+    compact_scores: bool = False,
 ) -> None:
     """Reduce score-scratch decode windows into per-head selection rows."""
     request_capacity = int(decode_lengths.numel())
@@ -264,6 +271,7 @@ def reduce_per_head_scores(
             NUM_KV_HEADS=num_kv_heads,
             PADDED_COLUMNS=padded_head_columns,
             BUCKET=score_token_capacity,
+            COMPACT=compact_scores,
             WIDTH=selection_width,
         )
     # 256-token tiles match the reduce kernel's BLOCK default.
@@ -283,6 +291,7 @@ def reduce_per_head_scores(
         NUM_KV_HEADS=num_kv_heads,
         PADDED_COLUMNS=padded_head_columns,
         BUCKET=score_token_capacity,
+        COMPACT=compact_scores,
         WIDTH=selection_width,
         PER_LAYER=per_layer,
         NORMALIZE=normalize_scores,
@@ -434,4 +443,70 @@ def settle_ties(
         WIDTH=int(selection_scores_rows.shape[1]),
         KEEP_COUNT=int(kept_ordinal_rows.shape[1]),
         SELECTION_ROWS=selection_rows_per_request,
+    )
+
+
+@triton.jit
+def _compute_mean_phase_kernel(
+    logical_lengths,
+    omega,
+    source_lengths,
+    prompt_lengths,
+    mean_cos,
+    mean_sin,
+    decode_lengths,
+    swa_bases,
+    swa_delta,
+    NUM_FREQS: tl.constexpr,
+    F_BLOCK: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+):
+    """Evaluate fixed-order phase means and derive active decode/SWA metadata."""
+    request = tl.program_id(0)
+    f = tl.arange(0, F_BLOCK)
+    position = tl.load(logical_lengths + request).to(tl.float32)
+    frequency = tl.load(omega + f, f < NUM_FREQS, other=0.0)
+    cos_sum = tl.full((F_BLOCK,), 0.0, tl.float32)
+    sin_sum = tl.full((F_BLOCK,), 0.0, tl.float32)
+    for exponent in tl.static_range(17):
+        angle = (position + float(1 << exponent)) * frequency
+        cos_sum = cos_sum + tl.extra.cuda.libdevice.cos(angle)
+        sin_sum = sin_sum + tl.extra.cuda.libdevice.sin(angle)
+    tl.store(mean_cos + request * NUM_FREQS + f, cos_sum * (1.0 / 17), f < NUM_FREQS)
+    tl.store(mean_sin + request * NUM_FREQS + f, sin_sum * (1.0 / 17), f < NUM_FREQS)
+    prompt = tl.load(prompt_lengths + request)
+    tl.store(decode_lengths + request, tl.load(source_lengths + request) - prompt)
+    if HAS_SWA:
+        tl.store(swa_bases + request, prompt + swa_delta)
+
+
+def compute_mean_phase(
+    logical_lengths: torch.Tensor,
+    omega: torch.Tensor,
+    source_lengths: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    mean_cos: torch.Tensor,
+    mean_sin: torch.Tensor,
+    decode_lengths: torch.Tensor,
+    swa_bases: torch.Tensor | None,
+    *,
+    request_count: int,
+    swa_rebase_delta: int,
+) -> None:
+    """Evaluate active phase rows without a sequence-length-sized lookup table."""
+    _compute_mean_phase_kernel[(request_count,)](
+        logical_lengths,
+        omega,
+        source_lengths,
+        prompt_lengths,
+        mean_cos,
+        mean_sin,
+        decode_lengths,
+        swa_bases,
+        swa_rebase_delta,
+        NUM_FREQS=omega.numel(),
+        F_BLOCK=triton.next_power_of_2(omega.numel()),
+        HAS_SWA=swa_bases is not None,
+        num_warps=1,
+        enable_fp_fusion=False,
     )

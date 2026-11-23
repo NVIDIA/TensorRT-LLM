@@ -28,7 +28,9 @@ from tensorrt_llm.llmapi.llm import _TorchLLM
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
-from tensorrt_llm.llmapi.utils import AsyncQueue
+from tensorrt_llm.llmapi.utils import (AsyncQueue, _SyncQueue,
+                                       download_hf_model,
+                                       split_hf_repo_subfolder)
 
 # isort: off
 from .test_llm import llama_model_path
@@ -94,6 +96,48 @@ def test_attached_model_loader_resolves_hub_on_nonzero_device(
         model, revision="pinned-revision") == tmp_path
     assert model.model_dir == tmp_path
     download.assert_called_once_with("example/model", "pinned-revision")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model, expected", [
+    ("owner/repo", ("owner/repo", None)),
+    ("owner/repo/dspark", ("owner/repo", "dspark")),
+    ("owner/repo/a/b", ("owner/repo", "a/b")),
+    ("/abs/missing/dir", ("/abs/missing/dir", None)),
+    ("./rel/missing/dir", ("./rel/missing/dir", None)),
+    ("owner//repo", ("owner//repo", None)),
+    ("owner/repo/../other", ("owner/repo/../other", None)),
+    ("owner/repo/./dspark", ("owner/repo/./dspark", None)),
+])
+def test_split_hf_repo_subfolder(model, expected):
+    assert split_hf_repo_subfolder(model) == expected
+
+
+@pytest.mark.cpu_only
+def test_download_hf_model_fetches_only_the_subfolder(monkeypatch, tmp_path):
+    (tmp_path / "dspark").mkdir()
+    snapshot = MagicMock(return_value=str(tmp_path))
+    monkeypatch.setattr("tensorrt_llm.llmapi.utils.snapshot_download", snapshot)
+
+    assert download_hf_model("owner/repo/dspark",
+                             "pinned-revision") == tmp_path / "dspark"
+    assert snapshot.call_args.args == ("owner/repo", )
+    assert snapshot.call_args.kwargs["allow_patterns"] == ["dspark/*"]
+    assert snapshot.call_args.kwargs["revision"] == "pinned-revision"
+
+    with pytest.raises(FileNotFoundError, match="no subfolder 'missing'"):
+        download_hf_model("owner/repo/missing")
+
+
+@pytest.mark.cpu_only
+def test_download_hf_model_keeps_whole_repo_download(monkeypatch, tmp_path):
+    snapshot = MagicMock(return_value=str(tmp_path))
+    monkeypatch.setattr("tensorrt_llm.llmapi.utils.snapshot_download", snapshot)
+
+    assert download_hf_model("owner/repo") == tmp_path
+    assert snapshot.call_args.args == ("owner/repo", )
+    assert snapshot.call_args.kwargs["ignore_patterns"] == ["original/**/*"]
+    assert "allow_patterns" not in snapshot.call_args.kwargs
 
 
 @pytest.mark.cpu_only
@@ -184,3 +228,77 @@ def test_AsyncQueue():
     thread.start()
     asyncio.run(get_data_from_queue())
     thread.join()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batched", [False, True])
+def test_async_queue_thread_notifications(batched):
+
+    async def run():
+        queues = [AsyncQueue(), AsyncQueue()]
+        loop = asyncio.get_running_loop()
+
+        async def consume(queue):
+            return [await queue.get() for _ in range(10)]
+
+        def produce(offset):
+            for value in range(offset, offset + 10):
+                for queue in queues:
+                    if batched:
+                        queue.sync_q.put_nowait(value)
+                    else:
+                        queue.sync_q.put(value)
+            if batched:
+                _SyncQueue.notify_many(loop, [q.sync_q for q in queues] * 2)
+
+        for offset in (0, 10, 20):
+            cancelled = asyncio.create_task(queues[0].get())
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            consumers = [asyncio.create_task(consume(q)) for q in queues]
+            await asyncio.sleep(0)
+            await asyncio.to_thread(produce, offset)
+            values = await asyncio.wait_for(asyncio.gather(*consumers), 5)
+            assert values == [list(range(offset, offset + 10))] * 2
+            assert all(q.empty() for q in queues)
+            # A late notification after draining must not strand the next get.
+            await asyncio.to_thread(_SyncQueue.notify_many, loop,
+                                    [q.sync_q for q in queues])
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("state",
+                         ["stopped", "closed", "close_during_schedule"])
+def test_async_queue_notification_shutdown(batched, state, monkeypatch):
+    loop = asyncio.new_event_loop()
+
+    async def make_queue():
+        return AsyncQueue()
+
+    queue = loop.run_until_complete(make_queue())
+    if state == "closed":
+        loop.close()
+    elif state == "close_during_schedule":
+        monkeypatch.setattr(loop, "is_running", lambda: True)
+
+        def close(*args):
+            monkeypatch.setattr(loop, "is_running", lambda: False)
+            loop.close()
+            raise RuntimeError("Event loop is closed")
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", close)
+    try:
+        with pytest.raises(AsyncQueue.EventLoopShutdownError):
+            if batched:
+                queue.sync_q.put_nowait(1)
+                _SyncQueue.notify_many(loop, [queue.sync_q])
+            else:
+                queue.sync_q.put(1)
+    finally:
+        loop.close()

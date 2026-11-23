@@ -9,7 +9,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.sparse.flashinfer_utils import get_sparse_mla_op
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.logger import logger
 
 from .interface import Fmha
@@ -26,7 +26,7 @@ _SUPPORTED_ALGORITHMS = frozenset({"deepseek_v4", "dsa"})
 
 def is_flashinfer_sparse_mla_enabled(algorithm: Optional[str]) -> bool:
     """Whether FlashInfer sparse MLA is available for this model."""
-    if algorithm not in _SUPPORTED_ALGORITHMS or get_sm_version() not in (120, 121):
+    if algorithm not in _SUPPORTED_ALGORITHMS or not is_sm_120f():
         return False
 
     try:

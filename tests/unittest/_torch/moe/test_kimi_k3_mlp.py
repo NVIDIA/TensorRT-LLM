@@ -20,6 +20,7 @@ layout against an unfused reference built from the HF checkpoint's split
 """
 
 import os
+import pickle
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -29,13 +30,16 @@ import cloudpickle
 import pytest
 import torch
 from _torch.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP
+from mpi4py import MPI
 from torch import nn
 
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.situ import SituAndMul
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import AuxStreamType
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
@@ -213,6 +217,8 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
         (False, 8, 7, 8, 7, "TRTLLM", "EXTERNAL_COMM"),
         (True, 8, 7, 1, 0, "MEGAMOE_CUTEDSL", "FUSED_COMM"),
         (False, 8, 7, 8, 7, "MEGAMOE_CUTEDSL", "FUSED_COMM"),
+        (False, 1, 0, 1, 0, "CUTEDSL", "EXTERNAL_COMM"),
+        (False, 1, 0, 1, 0, "CUTEDSL_FC12", "EXTERNAL_COMM"),
     ],
     ids=[
         "attention_dp",
@@ -220,6 +226,8 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
         "direct_tp",
         "megamoe_attention_dp",
         "megamoe_direct_tp",
+        "cutedsl_sm_reserve",
+        "fc12_sm_reserve",
     ],
 )
 def test_kimi_k3_shared_expert_parallel_construction(
@@ -246,20 +254,23 @@ def test_kimi_k3_shared_expert_parallel_construction(
             super().__init__()
 
     class _FakeMoE(ConfigurableMoE):
-        def __init__(self):
+        def __init__(self, sm_reserve_ceiling: int = 0):
             nn.Module.__init__(self)
             # ``scheduler_kind`` is a class attribute on the ``MoE`` interface
             # (default ``EXTERNAL_COMM``), so every real backend carries it and
             # the runtime reads it unguarded; the stand-in must too.
+            # ``sm_reserve_ceiling`` mirrors the side-effect-free capability the
+            # real backends declare (16 on the fused-FC12 leaf, 0 everywhere else).
             self.backend = SimpleNamespace(
                 initial_local_expert_ids=[0, 1, 2, 3],
                 scheduler_kind=MoESchedulerKind[scheduler_kind],
+                sm_reserve_ceiling=lambda: sm_reserve_ceiling,
             )
             self.comm = None
             self.layer_load_balancer = None
             self.all_reduce = _FakeAllReduce()
 
-    fake_moe = _FakeMoE()
+    fake_moe = _FakeMoE(sm_reserve_ceiling=16 if moe_backend == "CUTEDSL_FC12" else 0)
 
     create_moe_kwargs = {}
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
@@ -322,6 +333,25 @@ def test_kimi_k3_shared_expert_parallel_construction(
     )
     assert shared.gate_up_proj.weight.shape == (2 * local_intermediate, config.hidden_size)
     assert shared.down_proj.weight.shape == (config.hidden_size, local_intermediate)
+    # The SMs the routed grid offers beside itself are a backend capability: only the
+    # fused-FC12 leaf sizes a persistent grid it can shrink, and the deferred-all-reduce
+    # case never reserves SMs. Everything else keeps the full grid -- in particular the
+    # ``_cublas_sm_limit`` pairing can never confine a shared expert whose routed grid
+    # holds every SM, and ``shared_first`` remains reachable for the grouped GEMM.
+    expected_shared_sms = (
+        0 if runtime._defer_shared_allreduce else fake_moe.backend.sm_reserve_ceiling()
+    )
+    assert runtime._shared_sms == expected_shared_sms
+    if moe_backend in ("CUTEDSL", "CUTEDSL_FC12"):
+        # With the NVFP4 / sort-table gates stubbed open, the lead order is decided by
+        # the reserve alone: a full-SM grouped GEMM leads from enough routed rows, the
+        # reserving FC12 never asks its shared expert to lead the grid. 128 tokens:
+        # top_k 2 and 4 of the 8 experts local make 128 routed rows per rank,
+        # past the 80-row lead minimum.
+        fake_moe.nvfp4_input_scale = lambda num_tokens: torch.tensor(1.0)
+        fake_moe.routes_with_sort_tables = lambda num_tokens: True
+        plan = runtime._front_plan(128)
+        assert plan.shared_first is (expected_shared_sms == 0)
 
 
 @pytest.mark.cpu_only
@@ -342,6 +372,7 @@ def test_kimi_k3_shared_allreduce_ordering(
     has_aux_stream: bool,
 ) -> None:
     """Check shared-allreduce dependencies and result propagation without CUDA work."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.distributed import AllReduceParams
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -394,6 +425,12 @@ def test_kimi_k3_shared_allreduce_ordering(
         calls.append(("routed_moe", current_stream))
         return value * 2
 
+    # The forward reads the routed experts' backend for the per-launch SM
+    # reserve; the stand-in's backend is the no-reserve MoEImplBase default.
+    routed_experts.backend = SimpleNamespace(
+        reserve_sms_for_concurrent_kernels=lambda num_sms: None
+    )
+
     def shared_allreduce(value: torch.Tensor) -> torch.Tensor:
         calls.append(("shared_allreduce", current_stream))
         return value + 5
@@ -424,6 +461,8 @@ def test_kimi_k3_shared_allreduce_ordering(
     runtime.shared_experts = _Shared()
     runtime._reduce_routed_output = False
     runtime._defer_shared_allreduce = defer
+    # _shared_sms as __init__ builds it here: the stand-in backend reserves none.
+    runtime._shared_sms = 0
     runtime.shared_expert_stream = aux_stream
     runtime.moe_main_event = _Event("fork", parallel)
     runtime.moe_shared_event = _Event("shared_done", parallel)
@@ -440,6 +479,11 @@ def test_kimi_k3_shared_allreduce_ordering(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
     monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: is_compiling)
+    # The serial path still asks the AutoTuner whether a tuning pass owns this
+    # forward, and bringing the real singleton up needs a CUDA device the CPU
+    # stand-in lacks. Not tuning: the reserve is the zero the no-reserve
+    # backend above declares.
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=False))
 
     shared_stream = "aux" if parallel else "main"
 
@@ -474,6 +518,7 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
 ) -> None:
     """The latent down-projection forks onto the CuteDSL quantization stream
     before the router GEMM, and the MoE receives the event to join."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
@@ -513,10 +558,33 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
 
     received = {}
 
-    def routed_experts(value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
-        calls.append(("routed_moe", current_stream))
-        received.update(kwargs)
-        return value
+    class _RoutedExperts:
+        """BF16-input routed experts (no NVFP4 input contract)."""
+
+        # The forward reads the routed experts' backend for the per-launch SM
+        # reserve; the stand-in's backend is the no-reserve MoEImplBase default.
+        backend = SimpleNamespace(reserve_sms_for_concurrent_kernels=lambda num_sms: None)
+
+        def __call__(self, value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+            calls.append(("routed_moe", current_stream))
+            received.update(kwargs)
+            return value
+
+        def nvfp4_input_scale(self, num_tokens: int) -> None:
+            return None
+
+    class _Shared:
+        """Shared stand-in: zero output, with the plain down-projection the
+        runtime inspects for the SM-limit pairing.
+
+        An empty SimpleNamespace down-projection carries none of the traits
+        that route the shared GEMMs past torch's cuBLAS (FP8 weight-read swap,
+        CuTe DSL GEMM)."""
+
+        down_proj = SimpleNamespace()
+
+        def __call__(self, value, final_all_reduce_params=None):
+            return value * 0
 
     def compute_logits(value: torch.Tensor) -> torch.Tensor:
         calls.append(("router_gemm", current_stream))
@@ -525,14 +593,17 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=compute_logits)
-    runtime.routed_experts = routed_experts
+    runtime.routed_experts = _RoutedExperts()
     runtime.routed_expert_down_proj = _Projection("routed_down")
     runtime.routed_expert_norm = _Projection("routed_norm")
     runtime.routed_expert_up_proj = _Projection("routed_up")
-    runtime.shared_experts = lambda value, final_all_reduce_params=None: value * 0
+    runtime.shared_experts = _Shared()
     runtime._reduce_routed_output = False
     runtime._defer_shared_allreduce = False
     runtime.shared_expert_stream = None
+    runtime._shared_gemms_can_lead = False
+    # _shared_sms as __init__ builds it here: the stand-in backend reserves none.
+    runtime._shared_sms = 0
     runtime.moe_main_event = _Event("fork")
     runtime.moe_shared_event = _Event("shared_done")
     runtime.moe_routed_event = None
@@ -542,6 +613,11 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    # The serial path still asks the AutoTuner whether a tuning pass owns this
+    # forward, and bringing the real singleton up needs a CUDA device the CPU
+    # stand-in lacks. Not tuning: the reserve is the zero the no-reserve
+    # backend above declares.
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=False))
 
     with with_multi_stream(multi_stream):
         output = runtime(torch.zeros(2, 4))
@@ -778,11 +854,16 @@ def _run_kimi_k3_moe_multi_rank_worker(attention_dp):
             )
             expected = _kimi_k3_moe_reference(hidden_states, weights, config)
             all_rank_num_tokens = [hidden_states.shape[0]] * world_size if attention_dp else None
-            with torch.inference_mode(), with_multi_stream(True):
+            with (
+                torch.inference_mode(),
+                with_multi_stream(True),
+                nccl_window_tensor_scope(hidden_states),
+            ):
+                # Keep accuracy checks independent of the window lease lifetime.
                 actual = runtime(
                     hidden_states,
                     all_rank_num_tokens=all_rank_num_tokens,
-                )
+                ).clone()
             torch.testing.assert_close(actual, expected, rtol=8e-2, atol=8e-2)
     finally:
         if runtime is not None:

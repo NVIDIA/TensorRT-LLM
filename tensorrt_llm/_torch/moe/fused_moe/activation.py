@@ -319,6 +319,45 @@ class MoEActivationSupport:
                 "clamp_after_silu describes the ordering of a clamp, so it requires limit support."
             )
 
+    def rejection_detail(
+        self,
+        owner: str,
+        kind: ActivationType,
+        *,
+        clamp_after_silu: bool,
+        constants: frozenset[str],
+    ) -> str | None:
+        """Why ``owner``'s kernels cannot run this activation, or None if they can.
+
+        Args:
+            owner: The backend named in the message.
+            kind: The layer's activation kind.
+            clamp_after_silu: Whether the layer clamps after the SiLU.
+            constants: The ABI registers the layer's activation supplies.
+        """
+        if kind not in self.kinds:
+            executes = ", ".join(sorted(k.name for k in self.kinds))
+            return f"{owner} does not execute {kind.name} (executes: {executes})"
+        if clamp_after_silu and not self.clamp_after_silu:
+            return f"{owner} does not implement post-SiLU clamping"
+        # Sorted so the rejection names the same register every run.
+        for constant in sorted(constants):
+            field = _CONSTANT_SHAPE_FIELDS.get(constant)
+            if field is not None and getattr(self, field) is ActivationParamShape.UNSUPPORTED:
+                return (
+                    f"{owner} kernels take no activation {constant}, "
+                    f"which this layer's {kind.name} supplies"
+                )
+        return None
+
+
+#: ABI register name -> the ``MoEActivationSupport`` field declaring its shape.
+_CONSTANT_SHAPE_FIELDS: dict[str, str] = {
+    "alpha": "alpha_beta",
+    "beta": "alpha_beta",
+    "clamp": "limit",
+}
+
 
 # ---------------------------------------------------------------------------
 # Adapter

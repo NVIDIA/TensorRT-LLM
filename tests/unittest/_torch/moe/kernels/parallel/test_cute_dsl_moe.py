@@ -30,8 +30,10 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
+from tensorrt_llm._torch.locality_domain.autotune import LocalityDomainConcurrentTunableRunner
 from tensorrt_llm._torch.locality_domain_utils import (
     end_for_all_locality_domain,
     get_locality_domain_stream,
@@ -39,13 +41,12 @@ from tensorrt_llm._torch.locality_domain_utils import (
     locality_domain_device,
     start_for_all_locality_domain,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
-    CuteDslFusedMoE,
-    _expert_count_tile_plan,
-    _LocalityDomainConcurrentTunableRunner,
-    _runner_tactics_match_tile_size,
-    cute_dsl_nvfp4_grouped_gemm_ref,
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import _runner_tactics_match_tile_size
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     interleave_gate_and_linear,
     interleave_linear_and_gate,
@@ -60,6 +61,29 @@ from tensorrt_llm._torch.utils import (
 )
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+
+def _nvfp4_quantize_fp32_ref(
+    x: torch.Tensor, inverse_global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize without the BF16 rounding absent from the fused FP32 epilogue."""
+    m, n = x.shape
+    blocks = x.reshape(m, n // 16, 16)
+    scales = (blocks.abs().amax(dim=-1) / 6 * inverse_global_scale).to(torch.float8_e4m3fn)
+    inverse_scales = (inverse_global_scale / scales.float()).clamp(
+        max=torch.finfo(torch.float32).max
+    )
+    normalized = (blocks * inverse_scales.unsqueeze(-1)).reshape(m, n)
+    magnitudes = normalized.abs().contiguous()
+    # E2M1 magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6. At midpoint ties,
+    # choose the even code, matching round-to-nearest-even conversion.
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    codes = torch.bucketize(magnitudes, midpoints)
+    for index in (1, 3, 5):
+        codes += (magnitudes == midpoints[index]).to(codes.dtype)
+    codes = codes.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, swizzle_sf(scales.view(torch.uint8), m, n)
 
 
 def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
@@ -107,6 +131,75 @@ def apply_activation_ref(
     raise ValueError(f"Unsupported activation_type: {activation_type}")
 
 
+def cute_dsl_nvfp4_grouped_gemm_ref(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+    output_dtype: torch.dtype,
+    scaling_vector_size: int = 16,
+):
+    assert a.dtype == torch.float4_e2m1fn_x2
+    assert a.dim() == 2
+    assert b.dtype == torch.float4_e2m1fn_x2
+    assert b.dim() == 3
+    assert a_sf.dtype == torch.uint8
+    assert a_sf.dim() == 1
+    assert b_sf.dtype == torch.uint8
+    assert b_sf.dim() == 3
+    assert alpha.dtype == torch.float32
+    assert alpha.dim() == 1
+
+    m, k = a.size(0), a.size(1) * 2
+    num_groups, n = b.size(0), b.size(1)
+    scale_k = k // scaling_vector_size
+    assert m % tile_size == 0
+    assert k % (scaling_vector_size * 4) == 0
+    assert b.size(2) * 2 == k
+    assert a_sf.size(0) == m * scale_k
+    assert b_sf.size(0) == num_groups
+    assert b_sf.size(1) == n
+    assert b_sf.size(2) == scale_k
+    assert alpha.size(0) == num_groups
+
+    num_tiles = m // tile_size
+    assert tile_idx_to_group_idx.dtype == torch.int32
+    assert tile_idx_to_group_idx.size() == (num_tiles,)
+    assert num_non_exiting_tiles.dtype == torch.int32
+    assert num_non_exiting_tiles.size() == (1,)
+
+    num_tiles_per_expert = torch.bincount(
+        tile_idx_to_group_idx[: num_non_exiting_tiles[0].item()], minlength=num_groups
+    )
+    offsets = [0] + num_tiles_per_expert.cumsum(dim=0).tolist()
+
+    ref = torch.empty(m, n, dtype=output_dtype, device="cuda")
+    for i, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        if end <= start:
+            continue
+        a_sliced = a[start * tile_size : end * tile_size]
+        a_sf_sliced = a_sf[
+            start * tile_size * k // scaling_vector_size : end
+            * tile_size
+            * k
+            // scaling_vector_size
+        ]
+        ref[start * tile_size : end * tile_size] = torch.ops.trtllm.nvfp4_gemm(
+            a_sliced.view(torch.uint8),
+            b[i].view(torch.uint8),
+            a_sf_sliced,
+            b_sf[i],
+            alpha[i],
+            output_dtype,
+        )
+
+    return ref
+
+
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 6, 8])
@@ -152,68 +245,6 @@ def test_grouped_gemm_inputs_helper_fixed_expert_capacity(tile_size: int):
     assert helper.infer_shape_padded_rows_from_input5(input_shapes) == 16 * tile_size
     with pytest.raises(ValueError, match="capacity must be positive"):
         helper.get_expert_capacity_num_permuted_tokens(0)
-
-
-@pytest.mark.parametrize(
-    ("tile_size", "expected"),
-    [
-        (
-            128,
-            [
-                (1, 1, 257),
-                (2, 255, 514),
-                (3, 384, 771),
-                (4, 512, 1028),
-                (4, 513, 1156),
-                (6, 768, 1542),
-                (6, 896, 1670),
-                (7, 1024, 1799),
-                (7, 1152, 1927),
-                (7, 1153, 2055),
-            ],
-        ),
-        (
-            256,
-            [
-                (1, 1, 513),
-                (2, 511, 1026),
-                (3, 768, 1539),
-                (4, 1024, 2052),
-                (4, 1025, 2308),
-                (6, 1536, 3078),
-                (6, 1792, 3334),
-                (7, 2048, 3591),
-                (7, 2304, 3847),
-                (7, 2305, 4103),
-            ],
-        ),
-    ],
-)
-def test_count_native_tile_plan_empty_and_boundary_experts(
-    tile_size: int,
-    expected: list[tuple[int, int, int]],
-) -> None:
-    """Count-native scheduling must preserve expert-major rows at M boundaries."""
-    capacity = 2 * tile_size + 1
-    counts = [0, 1, tile_size - 1, tile_size, tile_size + 1, 0, 2 * tile_size, capacity]
-
-    plan = _expert_count_tile_plan(counts, capacity, tile_size)
-
-    assert plan == expected
-
-
-@pytest.mark.parametrize("tile_size", [128, 256])
-def test_count_native_tile_plan_clamps_counts(tile_size: int):
-    capacity = tile_size + 1
-
-    plan = _expert_count_tile_plan([0, -1, capacity, capacity + tile_size], capacity, tile_size)
-
-    assert plan == [
-        (2, tile_size, 2 * capacity),
-        (2, tile_size + 1, 2 * capacity + tile_size),
-        (3, 3 * tile_size, 3 * capacity),
-        (3, 3 * tile_size + 1, 3 * capacity + tile_size),
-    ]
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -883,16 +914,18 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
             tile_idx += 1
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
 
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 16 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -975,16 +1008,18 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     )
 
     max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 16 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -1041,6 +1076,81 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+@pytest.mark.parametrize("top_k", [1, 2])
+@pytest.mark.parametrize("num_tokens", [7, 48 * 7, 4 * 52 * 7])
+def test_nvfp4_grouped_gemm_finalize_weights_evict_first_bitwise(num_tokens: int, top_k: int):
+    """The L2 evict_first policy on the FC2 weight loads leaves every output bit unchanged (top-k <= 2: the
+    finalize's scatter-add is order-independent)."""
+    sf_vec_size, tile_size = 16, 128
+    hidden_size, interm_size = 4096, 1024
+    num_experts, num_local_experts = 512, 128
+
+    torch.manual_seed(0)
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    # Token 0 picks local expert 0 first, so the output is never all zero (no local pick at all).
+    routing_logits[0, 0] = routing_logits.max() + 1
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        _,
+        permuted_idx_to_expanded_idx,
+        _,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+    a = torch.randn(permuted_idx_to_expanded_idx.size(0), interm_size, device="cuda").bfloat16()
+    b = torch.randn(num_local_experts, hidden_size, interm_size, device="cuda").bfloat16()
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b_sf = b_sf.view(num_local_experts, hidden_size, interm_size // sf_vec_size)
+
+    def run(weights_evict_first):
+        out = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            a.view(torch.float4_e2m1fn_x2),
+            b.view(torch.float4_e2m1fn_x2),
+            a_sf,
+            b_sf,
+            a_global_sf * b_global_sf,
+            out,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+            weights_evict_first=weights_evict_first,
+        )
+        return out
+
+    expected = run(False)
+    assert expected.abs().sum().item() > 0
+    assert torch.equal(run(True).view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
@@ -1085,16 +1195,18 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
             tile_idx += 1
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
 
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 32 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size * 2, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -1182,7 +1294,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     ep_size: int,
     tile_size: int,
     activation_type: ActivationType,
-):
+) -> None:
     """Test gather-based grouped GEMM with fused activation.
 
     This test validates the gather kernel which:
@@ -1192,6 +1304,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
        non-gated)
     4. Quantizes output to FP4 with scale factor generation
     """
+    torch.manual_seed(143)
     is_gated = is_gated_activation(activation_type)
     is_situ = activation_type == ActivationType.SiTu
     # SiTU rejects the SwiGLU clamp (matching MegaMoE and DeepGEMM).
@@ -1307,6 +1420,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         hidden_size,
     )
 
+    # Match the fused epilogue's FP32 GEMM and activation computation.
     c_ref = cute_dsl_nvfp4_grouped_gemm_ref(
         a_gathered,
         b,
@@ -1316,10 +1430,11 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
+    # The standalone FP4 quantizer requires a half-precision input.
+    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit).to(torch.bfloat16)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
@@ -1378,7 +1493,18 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
 
         c_sf_valid = torch.cat(c_sf_valid)
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)
-        check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+        # The kernel computes the activation and each block's amax in fp32, while the
+        # reference rounds the GEMM output and the activation to bf16 before
+        # fp4_quantize, so blocks whose scale sits near an E4M3 rounding midpoint can
+        # round to the adjacent code. This affects a few percent of the blocks for
+        # unclamped Relu2; SwiGLU and SiTu saturate, so their block amax match exactly.
+        check_accuracy(
+            c_sf_valid,
+            c_sf_ref_valid,
+            atol=1e-4,
+            rtol=1e-4,
+            percent=0.9 if activation_type == ActivationType.Relu2 else 0.95,
+        )
 
 
 # ============================================================================
@@ -1530,12 +1656,15 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32 if activation_type == ActivationType.Relu2 else torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
     c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
-    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+    if activation_type == ActivationType.Relu2:
+        c_ref, c_sf_ref = _nvfp4_quantize_fp32_ref(c_ref, 1 / global_sf)
+    else:
+        c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call Rubin gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -2057,12 +2186,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
     )
     num_valid_permuted_tokens = n_tiles * tile_size
     for i in range(min(num_valid_permuted_tokens, max_num_permuted_tokens)):
+        # Routing metadata defines valid rows; expanded index zero is valid.
+        if i >= tile_idx_to_mn_limit[i // tile_size].item():
+            continue
         expanded_idx = permuted_idx_to_expanded_idx[i].item()
-        if expanded_idx > 0 or i == 0:
-            token_id = expanded_idx // top_k
-            if token_id < num_tokens:
-                a_gathered[i] = a[token_id]
-                a_sf_gathered[i] = a_sf_unswizzled[token_id]
+        token_id = expanded_idx // top_k
+        a_gathered[i] = a[token_id]
+        a_sf_gathered[i] = a_sf_unswizzled[token_id]
 
     a_sf_gathered_swizzled = swizzle_sf(
         a_sf_gathered.view(max_num_permuted_tokens, hidden_size // sf_vec_size),
@@ -2597,19 +2727,16 @@ def _create_quantized_locality_domain_weights(
 
 
 def test_moe_output_memset_aux_stream_guard_requires_full_aux_state():
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
     from tensorrt_llm._torch.utils import AuxStreamType, EventType
 
-    backend = object.__new__(CuteDslFusedMoE)
-    backend.event_dict = {EventType.Main: object()}
-    backend.aux_stream_dict = {}
+    backend = SimpleNamespace(event_dict={EventType.Main: object()}, aux_stream_dict={})
 
-    assert not backend._has_moe_output_memset_aux_stream()
+    assert not CuteDslFusedMoE._has_moe_output_memset_aux_stream(backend)
 
     backend.event_dict[EventType.MoeOutputMemset] = object()
     backend.aux_stream_dict[AuxStreamType.MoeOutputMemset] = object()
 
-    assert backend._has_moe_output_memset_aux_stream()
+    assert CuteDslFusedMoE._has_moe_output_memset_aux_stream(backend)
 
 
 def test_runner_tactics_match_tile_size_unwraps_locality_domain_runner():
@@ -2624,7 +2751,7 @@ def test_runner_tactics_match_tile_size_unwraps_locality_domain_runner():
             return None
 
     op_runner = FakeOpRunner()
-    runner = _LocalityDomainConcurrentTunableRunner(
+    runner = LocalityDomainConcurrentTunableRunner(
         op_runner,
         SimpleNamespace(num_partitions=2),
         2,
@@ -2687,7 +2814,7 @@ def test_locality_domain_concurrent_tunable_runner_delegates_and_launches_all_pa
     def launch(partition_id, launch_inputs, tactic):
         runtime.events.append(("launch", partition_id, id(launch_inputs), tactic))
 
-    runner = _LocalityDomainConcurrentTunableRunner(op_runner, runtime, 3, launch)
+    runner = LocalityDomainConcurrentTunableRunner(op_runner, runtime, 3, launch)
     profile = OptimizationProfile()
 
     assert runner.get_valid_tactics(inputs, profile, marker="x") == [-1, ("fast", 128)]
@@ -2696,7 +2823,7 @@ def test_locality_domain_concurrent_tunable_runner_delegates_and_launches_all_pa
     assert runner.op_runner is op_runner
 
     other_runtime = FakeRuntime(((106, 212), (106, 212), (0, 212)))
-    other_runner = _LocalityDomainConcurrentTunableRunner(op_runner, other_runtime, 3, launch)
+    other_runner = LocalityDomainConcurrentTunableRunner(op_runner, other_runtime, 3, launch)
     assert runner.unique_id() != other_runner.unique_id()
 
     tactic = ("chosen", 256)
@@ -2730,16 +2857,16 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
     output_idx: int,
     tile_sizes: list[int],
 ):
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import runners
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(runners, "get_sm_version", lambda: 107)
     preparation_calls = []
 
     def forward_impl(*args, **kwargs):
         preparation_calls.append((args, kwargs))
         return args[output_idx]
 
-    runner_cls = getattr(fused_moe_cute_dsl, runner_name)
+    runner_cls = getattr(runners, runner_name)
     runner = runner_cls(
         forward_impl,
         num_experts=1,
@@ -2764,11 +2891,11 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
 @pytest.mark.parametrize(
     "module_name,runner_name,num_inputs,output_idx",
     [
-        ("fused_moe_cute_dsl", "CuteDslFusedMoENvfp4Runner", 5, 4),
-        ("fused_moe_cute_dsl", "CuteDslFusedMoEBF16Runner", 4, 3),
+        ("cutedsl.runners", "CuteDslFusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.runners", "CuteDslFusedMoEBF16Runner", 4, 3),
         # The subclass production instantiates for CUTEDSL_FC12. It overrides
         # _tile_sizes, so a green result on the parent is not evidence about it.
-        ("fused_moe_cute_dsl_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.fused_fc12.nvfp4", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
     ],
 )
 def test_workload_identity_alone_does_not_prime_inner_tactics(
@@ -2787,9 +2914,9 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     """
     import importlib
 
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import runners
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(runners, "get_sm_version", lambda: 107)
     preparation_calls = []
 
     def forward_impl(*args, enable_alltoall=False, tile_size=128):
@@ -2817,33 +2944,65 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     assert preparation_calls == []
 
 
-@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream"])
+@pytest.mark.parametrize("reason", ["disabled", "no_aux_stream", "too_many_tokens"])
 def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
-    """Without an aux stream, NVFP4, or with the kill switch off, the async
-    quantization is the synchronous one and hands back no event to join."""
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    """Without an aux stream, with the kill switch off, or for a batch above
+    the token cap (prefill), the async quantization is the synchronous one and
+    hands back no event to join."""
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
 
-    monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
+    monkeypatch.setattr(nvfp4, "ASYNC_INPUT_QUANT", reason != "disabled")
+    monkeypatch.setattr(
+        nvfp4, "ASYNC_INPUT_QUANT_MAX_TOKENS", 1 if reason == "too_many_tokens" else 2
+    )
     calls = []
     backend = SimpleNamespace(
-        has_nvfp4=reason != "not_nvfp4",
         quantize_input=lambda x, post_quant_comm: calls.append(post_quant_comm) or (x, None),
         _has_moe_output_memset_aux_stream=lambda: reason != "no_aux_stream",
     )
     x = torch.empty(2, 4)
 
-    x_q, x_sf, event = fused_moe_cute_dsl.CuteDslFusedMoE.quantize_input_async(backend, x)
+    x_q, x_sf, event = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async(backend, x)
 
     assert x_q is x and x_sf is None and event is None
     assert calls == [False]
 
 
-def test_join_pending_x_ready_waits_once():
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+@pytest.mark.parametrize("num_tokens, reaches_aux_stream_check", [(1024, True), (1025, False)])
+def test_quantize_input_async_token_cap_boundary(
+    monkeypatch, num_tokens: int, reaches_aux_stream_check: bool
+):
+    """With the production cap, a 1024-token batch is still eligible for the
+    aux stream and a 1025-token batch (prefill) is quantized synchronously."""
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
 
+    monkeypatch.setattr(nvfp4, "ASYNC_INPUT_QUANT", True)
+    assert nvfp4.ASYNC_INPUT_QUANT_MAX_TOKENS == 1024
+    aux_stream_checks = []
+    backend = SimpleNamespace(
+        quantize_input=lambda x, post_quant_comm: (x, None),
+        # Declining the aux stream keeps the test on CPU; whether the check is
+        # reached shows which side of the cap the batch is on.
+        _has_moe_output_memset_aux_stream=lambda: aux_stream_checks.append(1) or False,
+    )
+    x = torch.empty(num_tokens, 4)
+
+    x_q, x_sf, event = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async(backend, x)
+
+    assert x_q is x and x_sf is None and event is None
+    assert bool(aux_stream_checks) == reaches_aux_stream_check
+
+
+def test_bf16_leaf_offers_no_async_input_quantization():
+    """The scheduler forks input quantization only for a backend that defines
+    ``quantize_input_async``; BF16 input has nothing to quantize."""
+    assert not hasattr(TrtllmCutedslGroupedGemmBf16Impl, "quantize_input_async")
+
+
+def test_join_pending_x_ready_waits_once():
     waits = []
     backend = SimpleNamespace(_pending_x_ready_event=SimpleNamespace(wait=lambda: waits.append(1)))
-    join = fused_moe_cute_dsl.CuteDslFusedMoE._join_pending_x_ready
+    join = TrtllmCutedslGroupedGemmNvfp4Impl._join_pending_x_ready
 
     join(backend)
     join(backend)
@@ -2858,12 +3017,10 @@ def test_join_pending_x_ready_waits_once():
 )
 def test_quantize_input_async_matches_sync():
     """The aux-stream quantization produces the same bytes as the main-stream one."""
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
     from tensorrt_llm._torch.utils import AuxStreamType, EventType
 
     hidden = 256
     backend = SimpleNamespace(
-        has_nvfp4=True,
         hidden_size=hidden,
         scaling_vector_size=16,
         fc31_input_scale=torch.tensor([1.0], device="cuda"),
@@ -2874,7 +3031,7 @@ def test_quantize_input_async_matches_sync():
         },
         _x_quant_event=torch.cuda.Event(),
     )
-    cls = fused_moe_cute_dsl.CuteDslFusedMoE
+    cls = TrtllmCutedslGroupedGemmNvfp4Impl
     backend.quantize_input = cls.quantize_input.__get__(backend)
     backend._has_moe_output_memset_aux_stream = cls._has_moe_output_memset_aux_stream.__get__(
         backend
@@ -2900,7 +3057,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     """
     import inspect
 
-    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl_fc12 as fc12
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import nvfp4 as fc12
 
     captured = {}
 
@@ -2935,11 +3092,12 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         activation_type=ActivationType.SiTu,
         act_alpha=4.0,
         act_beta=25.0,
+        routing_method=None,
     )
     for name in ("_situ_betas", "_epilogue_identity"):
-        setattr(backend, name, getattr(fc12.CuteDslFc12FusedMoE, name).__get__(backend))
+        setattr(backend, name, getattr(fc12.TrtllmCutedslFusedFc12Nvfp4Impl, name).__get__(backend))
     # Bound, like production's ``self.run_moe_nvfp4_impl``.
-    real_impl = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl.__get__(backend)
+    real_impl = fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4_impl.__get__(backend)
 
     def tracking_impl(*args, **kwargs):
         impl_calls.append(kwargs)
@@ -2956,7 +3114,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         moe_output=torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
         weight_view=weight_view,
     )
-    out = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4(backend, **inputs)
+    out = fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4(backend, **inputs)
     assert out.shape == (num_tokens, hidden)
 
     # Positive control: the activation-keyed identity is non-None.
@@ -2980,11 +3138,11 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     # And the reason it must not: the impl cannot take that kwarg.
     assert (
         "overlap_moe_output_memset"
-        not in inspect.signature(fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl).parameters
+        not in inspect.signature(fc12.TrtllmCutedslFusedFc12Nvfp4Impl.run_moe_nvfp4_impl).parameters
     )
 
 
-def _cute_dsl_eligibility(**deployment_kwargs):
+def _cute_dsl_eligibility(activation: str = "Swiglu", **deployment_kwargs):
     """``can_implement`` verdict for NVFP4 on an SM107 machine with Rubin DSL."""
     from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
         MoEDeployment,
@@ -2993,7 +3151,7 @@ def _cute_dsl_eligibility(**deployment_kwargs):
     )
     from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
 
-    problem = MoEProblem(quant="NVFP4", dtype_act=torch.bfloat16)
+    problem = MoEProblem(quant="NVFP4", dtype_act=torch.bfloat16, activation=activation)
     deployment = MoEDeployment(
         ep_size=1,
         tp_size=1,
@@ -3006,7 +3164,83 @@ def _cute_dsl_eligibility(**deployment_kwargs):
         ),
         **deployment_kwargs,
     )
-    return CuteDslFusedMoE.can_implement(problem, deployment)
+    return TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, deployment)
+
+
+@pytest.mark.parametrize(
+    ("intermediate_size_per_partition", "hidden_size", "enabled"),
+    [
+        pytest.param(768, 2048, True, id="halves-are-128-multiples"),
+        # Qwen3-235B-A22B / GLM-4.5 at moe_tp_size=8: 2 * 192 = 384 splits into 192.
+        pytest.param(192, 4096, False, id="fc1-half-not-128-multiple"),
+        # GPT-OSS-120B hidden size: FC2 halves of 1440.
+        pytest.param(2880, 2880, False, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_plan_vetoes_shards_the_kernels_cannot_tile(
+    intermediate_size_per_partition, hidden_size, enabled
+):
+    """The default split halves FC1 N and FC2 N; a half that is not a 128-row
+    multiple falls back to the full-GPU kernels instead of failing at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        hidden_size=hidden_size,
+    )
+    plan = PartitionPlan(enabled=True, num_partitions=2)
+    adjusted = CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, plan)
+    assert adjusted.enabled is enabled
+    if enabled:
+        assert adjusted is plan
+    else:
+        assert "multiple of 128" in adjusted.reason_if_disabled
+    disabled = PartitionPlan(enabled=False, reason_if_disabled="policy off")
+    assert CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, disabled) is disabled
+
+
+@pytest.mark.parametrize(
+    ("fc1_n", "fc2_n"),
+    [
+        pytest.param(384, 4096, id="fc1-half-odd-multiple-of-64"),
+        pytest.param(1536, 2880, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_split_rejects_shards_the_kernels_cannot_tile(fc1_n, fc2_n):
+    """The split checks the stored widths itself, so a weight padded past what
+    the plan veto saw fails at load instead of at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        _locality_domain_plan=PartitionPlan(enabled=True, num_partitions=2),
+        w3_w1_weight=torch.empty(1, fc1_n, 8),
+        w2_weight=torch.empty(1, fc2_n, 8),
+    )
+    with pytest.raises(ValueError, match="multiple of 128"):
+        CuteDslLocalityDomainMixin._split_weights_for_locality_domain(host)
+
+
+def test_locality_domain_mixin_precedes_moe_impl_base():
+    """The mixin's lifecycle overrides chain to super(), so with the bases
+    swapped MoEImplBase's defaults would silently win; every host must list
+    the mixin first."""
+    import tensorrt_llm._torch.moe.fused_moe  # noqa: F401  (registers every leaf)
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+    from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+
+    hosts = []
+    pending = list(CuteDslLocalityDomainMixin.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        hosts.append(cls)
+        pending.extend(cls.__subclasses__())
+    assert hosts
+    for cls in hosts:
+        mro = cls.__mro__
+        if MoEImplBase in mro:
+            assert mro.index(CuteDslLocalityDomainMixin) < mro.index(MoEImplBase), cls
 
 
 def test_cute_dsl_locality_domain_rejects_eplb():
@@ -3029,29 +3263,10 @@ def test_cute_dsl_sm107_requires_fused_finalize():
     assert verdict.reject_reason is MoERejectReason.FINALIZE_FUSION_REQUIRED
 
 
-def test_cute_dsl_unquantized_rejects_non_swiglu():
-    """The BF16 FC1 op fuses SwiGLU by name; NVFP4 serves both activations."""
-    from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
-        MoEDeployment,
-        MoEEnvironment,
-        MoEProblem,
-        MoERejectReason,
-    )
-    from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
-
-    env = MoEEnvironment(sm=107, available_deps=(MoEDep.CUTEDSL_RUBIN.value,))
-    deployment = MoEDeployment(
-        ep_size=1, tp_size=1, parallel_size=1, use_dp=False, num_slots=8, env=env
-    )
-
-    def verdict(quant):
-        return CuteDslFusedMoE.can_implement(
-            MoEProblem(quant=quant, dtype_act=torch.bfloat16, activation="Relu2"), deployment
-        )
-
-    assert not verdict(None).eligible
-    assert verdict(None).reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-    assert verdict("NVFP4").eligible
+def test_cute_dsl_nvfp4_admits_relu2_on_rubin():
+    """The NVFP4 FC1 fuses Relu2 too; only the BF16 leaf is SwiGLU-only."""
+    verdict = _cute_dsl_eligibility(activation="Relu2")
+    assert verdict.eligible, verdict.detail
 
 
 def test_cute_dsl_locality_domain_disables_dwdp():
@@ -3077,15 +3292,12 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
 
     if quantized:
         backend = SimpleNamespace(
-            has_nvfp4=True,
-            has_deepseek_fp8_block_scales=False,
-            has_any_quant=True,
             activation_type=ActivationType.Swiglu,
             _locality_domain_runtime=object(),
             hidden_size=hidden_size,
             scaling_vector_size=4,
         )
-        x, x_sf = CuteDslFusedMoE.quantize_input(
+        x, x_sf = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input(
             backend,
             Fp4QuantizedTensor(
                 fp4_tensor=torch.empty((0, hidden_size // 2), dtype=torch.uint8),
@@ -3094,7 +3306,7 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
             ),
         )
         assert x_sf.shape == (0, hidden_size // backend.scaling_vector_size)
-        output = CuteDslFusedMoE.run_moe_nvfp4(
+        output = TrtllmCutedslGroupedGemmNvfp4Impl.run_moe_nvfp4(
             backend,
             x,
             token_selected_experts,
@@ -3105,11 +3317,10 @@ def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
         )
     else:
         backend = SimpleNamespace(
-            has_any_quant=False,
             hidden_size=hidden_size,
             use_fused_finalize=True,
         )
-        output = CuteDslFusedMoE.run_moe_bf16(
+        output = TrtllmCutedslGroupedGemmBf16Impl.run_moe_bf16(
             backend,
             torch.empty((0, hidden_size), dtype=torch.bfloat16),
             token_selected_experts,
@@ -3128,21 +3339,21 @@ def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
     hidden_size = 32
     scaling_vector_size = 16
     backend = SimpleNamespace(
-        has_nvfp4=True,
-        has_deepseek_fp8_block_scales=False,
-        has_any_quant=True,
         fc31_input_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
         hidden_size=hidden_size,
         scaling_vector_size=scaling_vector_size,
     )
 
-    x, x_sf = CuteDslFusedMoE.quantize_input(
+    x, x_sf = TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input(
         backend,
         torch.empty((0, hidden_size), dtype=torch.bfloat16, device="cuda"),
     )
 
     assert x.shape == (0, hidden_size // 2)
     assert x_sf.shape == (0, hidden_size // scaling_vector_size)
+    # The empty input must not leave a pending CUDA error for the next launch.
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
 
 
 def test_sm107_nvfp4_tile512_fallback_uses_two_cta_cluster():
@@ -3220,6 +3431,65 @@ def test_sm107_nvfp4_finalize_accepts_two_cta_n_tiling():
     runner_cls = cute_dsl_custom_ops.Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner
 
     assert runner_cls._is_n_tiling_compatible(n=256, mma_n=128, cluster_n=2)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="This test requires the public Rubin CuTe DSL package",
+)
+def test_sm107_nvfp4_gather_act_fusion_cache_key_ignores_inplace_output_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
+    runner = cute_dsl_custom_ops.Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+        num_experts=1, top_k=1, num_local_experts=1, local_expert_offset=0, tile_size=128
+    )
+    tuning_config = runner.get_tuning_config()
+    shard_n, packed_k, tile_size = 512, 128, 128
+
+    def input_shapes(m: int) -> tuple[torch.Size, ...]:
+        num_tiles, num_tokens, scale_k = m // tile_size, m // 2, packed_k * 2 // 16
+        return (
+            torch.Size((num_tokens, packed_k)),
+            torch.Size((1, shard_n, packed_k)),
+            torch.Size((num_tokens, scale_k)),
+            torch.Size((1, shard_n, scale_k)),
+            torch.Size((1,)),
+            torch.Size((num_tiles,)),
+            torch.Size((num_tiles,)),
+            torch.Size((m,)),
+            torch.Size((1,)),
+            torch.Size((1,)),
+            # Inplace output and output scale factors, sized from the actual m.
+            torch.Size((m, shard_n // 2)),
+            torch.Size((m * shard_n // 16,)),
+        )
+
+    def cache_key(m: int) -> tuple[tuple[int, ...], ...]:
+        return AutoTuner._find_nearest_profile(
+            input_shapes(m),
+            tuning_config.dynamic_tensor_specs,
+            tuning_config.constraint_specs,
+            tuning_config.tune_max_num_tokens,
+            True,
+        )
+
+    # Two permuted-token counts in one tuning bucket must share a cache entry.
+    bucket_map = tuning_config.dynamic_tensor_specs[0].map_to_tuning_buckets
+    assert bucket_map(1024) == bucket_map(1152)
+    assert cache_key(1024) == cache_key(1152)
+
+    # Profiling sizes the output and scale-factor buffers as the kernel asserts them.
+    # A shape-only tuner: constructing AutoTuner queries the CUDA device.
+    tuner = object.__new__(AutoTuner)
+    tuner.skip_dynamic_tuning_buckets = False
+    tuner._debug_logger = lambda *_: None
+    inputs = [torch.empty(shape, dtype=torch.uint8, device="meta") for shape in input_shapes(1152)]
+    for profile in tuner._optimization_profiles(tuning_config, inputs):
+        shapes = profile.get_opt_shapes()
+        assert shapes[10] == (shapes[7][0], shard_n // 2)
+        assert shapes[11] == (shapes[7][0] * shard_n // 16,)
 
 
 def _get_registered_rubin_moe_op(name: str):
@@ -4096,8 +4366,8 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
         assert execution_order == ["tune", "launch"]
         assert not memset_calls
     if quantized:
-        assert leaf_calls[0][1]["weight_scale"] is weight_scale_0
-        assert leaf_calls[1][1]["weight_scale"] is weight_scale_1
+        assert leaf_calls[0][1]["weight_scale"] is call_kwargs["weight_scale_0"]
+        assert leaf_calls[1][1]["weight_scale"] is call_kwargs["weight_scale_1"]
         assert all(kwargs["input_scale"] is call_kwargs["input_scale"] for _, kwargs in leaf_calls)
         assert all(kwargs["alpha"] is alpha for _, kwargs in leaf_calls)
         assert all(kwargs["scaling_vector_size"] == 16 for _, kwargs in leaf_calls)
@@ -5191,3 +5461,403 @@ def test_bf16_grouped_gemm_finalize_rubin(
         f"tile_size={tile_size}: {len(failed)}/{len(tactics)} tactics failed:\n  "
         + "\n  ".join(failed)
     )
+
+
+# ============================================================================
+# Rubin MXFP8 fused FC12 MoE (gather + FC1 + SwiGLU + requant + FC2 + finalize)
+# ============================================================================
+
+
+def _mxfp8_dequant(w_e4m3: torch.Tensor, sf_ue8m0: torch.Tensor) -> torch.Tensor:
+    """[O, K] e4m3 + [O, K/32] UE8M0 -> [O, K] float32."""
+    from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
+
+    return dequant_mxfp8_weight(w_e4m3, sf_ue8m0, block_size=32)
+
+
+def _mxfp8_quant_weights(w: torch.Tensor):
+    """[L, N, K] bf16 -> ([L, N, K] e4m3, [L, N, K/32] UE8M0) with 1x32 blocks."""
+    from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
+
+    num_groups, n, k = w.shape
+    w_q, w_sf = quant_bf16_to_mxfp8(w.reshape(num_groups * n, k), 32)
+    return w_q.view(num_groups, n, k), w_sf.view(num_groups, n, k // 32)
+
+
+def _mxfp8_fused_fc12_reference(
+    a_deq: torch.Tensor,
+    w31_q: torch.Tensor,
+    w31_sf: torch.Tensor,
+    w2_q: torch.Tensor,
+    w2_sf: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+    top_k: int,
+    swiglu_limit: float,
+) -> torch.Tensor:
+    """Float32 oracle following the kernel's data flow, expert by expert.
+
+    The FC1 intermediate is requantized to MXFP8 (1x32 UE8M0 blocks) before FC2
+    exactly like the fused kernel does; the reference uses the power-of-two
+    scale picked by ``quant_bf16_to_mxfp8`` (ceil), so blocks whose scale the
+    kernel rounds differently contribute a small per-element mismatch.
+    """
+    from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
+
+    num_tokens, hidden = a_deq.shape
+    out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=a_deq.device)
+
+    num_valid_tiles = num_non_exiting_tiles.item()
+    groups = tile_idx_to_group_idx[:num_valid_tiles].cpu().tolist()
+    limits = tile_idx_to_mn_limit[:num_valid_tiles].cpu().tolist()
+    permuted = permuted_idx_to_expanded_idx.cpu()
+    rows_per_expert = {}
+    for tile_idx, (group, limit) in enumerate(zip(groups, limits)):
+        start = tile_idx * tile_size
+        if limit > start:
+            rows_per_expert.setdefault(group, []).append(permuted[start:limit])
+
+    for expert, chunks in rows_per_expert.items():
+        expanded = torch.cat(chunks).to(torch.long)
+        tokens = expanded // top_k
+        slots = expanded % top_k
+        w31 = _mxfp8_dequant(w31_q[expert], w31_sf[expert])  # [2I, H]
+        w2 = _mxfp8_dequant(w2_q[expert], w2_sf[expert])  # [H, I]
+        h = a_deq[tokens.to(a_deq.device)] @ w31.t()  # [n, 2I]
+        act = swiglu_ref(h, swiglu_limit)  # up * silu(gate)
+        act_q, act_sf = quant_bf16_to_mxfp8(act, 32)
+        act_deq = _mxfp8_dequant(act_q, act_sf)
+        y = act_deq @ w2.t()  # [n, H]
+        scale = token_final_scales[tokens.to(a_deq.device), slots.to(a_deq.device)]
+        out.index_add_(0, tokens.to(a_deq.device), y * scale[:, None])
+    return out
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_moe_module_mxfp8_chunked_forward_with_aux_stream():
+    """A layer whose ``moe_max_num_tokens`` is below the batch gets an aux
+    stream for chunk overlap. The persistent MXFP8 fused FC12 grid needs all
+    its CTAs resident, so the scheduler must run the chunks one after another
+    on the main stream; the chunked forward then finishes and matches an
+    unchunked one."""
+    from _torch.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    num_tokens, chunk_tokens, top_k = 1024, 256, 8
+    hidden_size, intermediate_size, num_experts = 2048, 1536, 64
+    dtype = torch.bfloat16
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        input_tensor = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, input_tensor, "CUTEDSL"
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        def create_module(moe_max_num_tokens: int):
+            model_config = ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                mapping=mapping,
+                moe_backend="CUTEDSL",
+                max_num_tokens=num_tokens,
+                moe_max_num_tokens=moe_max_num_tokens,
+            )
+            moe = create_moe(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=model_config,
+                allow_backend_degradation=False,
+            )
+            assert type(moe.backend).__name__ == "TrtllmCutedslFusedFc12Mxfp8Impl"
+            moe.create_weights()
+            moe.load_weights([weights])
+            moe.post_load_weights()
+            moe.cuda()
+            return moe
+
+        full_moe = create_module(num_tokens)
+        chunked_moe = create_module(chunk_tokens)
+        assert full_moe.aux_stream is None
+        assert chunked_moe.aux_stream is not None
+
+        with torch.inference_mode():
+            full_output = full_moe.forward(input_tensor, router_logits)
+            chunked_output = chunked_moe.forward(input_tensor, router_logits)
+            torch.cuda.synchronize()
+
+        # Each token's routing and MXFP8 input quantization do not depend on
+        # the other tokens. The finalize scatter-adds the top-k contributions
+        # in no fixed order, so two unchunked runs already differ by about
+        # 0.25% RMS (0.45% on the worst row) at outputs of order 1e5; compare
+        # relative errors, not elements.
+        diff = (chunked_output.float() - full_output.float()).norm(dim=1)
+        row_rel = diff / full_output.float().norm(dim=1).clamp_min(1e-6)
+        rms_rel = (diff.norm() / full_output.float().norm()).item()
+        cos = torch.nn.functional.cosine_similarity(
+            chunked_output.float().flatten(), full_output.float().flatten(), dim=0
+        ).item()
+        assert rms_rel < 1e-2, f"chunked vs unchunked RMS error {rms_rel:.4%}"
+        assert row_rel.max().item() < 2e-2, (
+            f"worst row error {row_rel.max().item():.4%} at row {row_rel.argmax().item()}"
+        )
+        assert cos > 0.9999, f"cosine {cos}"
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize(
+    "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts",
+    [
+        (128, 2, 1, 1024, 512, 16),
+        (515, 8, 8, 1024, 512, 64),
+        # Qwen3.5-397B expert geometry: hidden 4096, inner 1024, 512 experts,
+        # top-k 10; EP4 large batch and EP16 decode-shaped.
+        (1024, 10, 4, 4096, 1024, 512),
+        (32, 10, 16, 4096, 1024, 512),
+    ],
+)
+def test_mxfp8_fused_fc12_moe_rubin(
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    hidden_size: int,
+    interm_size: int,
+    num_experts: int,
+    tile_size: int,
+):
+    """End-to-end check of the fused MXFP8 FC1+FC2 MoE op against a float oracle.
+
+    Exercises the full adapter contract: linear per-token activation scales,
+    swizzled + gate/up-interleaved FC1 weights and scales, swizzled FC2 scales,
+    unit alphas / norm const, moe_sort metadata, and the scatter-add finalize
+    into a pre-zeroed output. The small shapes additionally run every tactic
+    the runner enumerates for the routing tile.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    torch.manual_seed(0)
+    sf_vec_size = 32
+    num_local_experts = num_experts // ep_size
+    swiglu_limit = float("inf")
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    # Ensure at least one route lands on a local expert.
+    token_selected_experts[0, 0] = 0
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    # Activations: dynamic MXFP8 with LINEAR per-token scales (what the backend
+    # produces in quantize_input for this path).
+    a = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    a_q, a_sf = torch.ops.trtllm.mxfp8_quantize(a, False, alignment=128)
+    a_sf = a_sf.view(num_tokens, hidden_size // sf_vec_size)
+    a_deq = _mxfp8_dequant(a_q, a_sf)
+
+    # Weights: [up(w3); gate(w1)] stacked along N for FC1, plain for FC2. Scale
+    # to keep the MoE output O(1) so absolute tolerances are meaningful.
+    w31 = torch.randn(
+        num_local_experts, 2 * interm_size, hidden_size, dtype=torch.bfloat16, device="cuda"
+    ) / (hidden_size**0.5)
+    w2 = torch.randn(
+        num_local_experts, hidden_size, interm_size, dtype=torch.bfloat16, device="cuda"
+    ) / (interm_size**0.5)
+    w31_q, w31_sf = _mxfp8_quant_weights(w31)
+    w2_q, w2_sf = _mxfp8_quant_weights(w2)
+
+    # Kernel-side layouts: gate/up interleave (granularity 64) of the FC1
+    # weight and scales, then the 128x4 block-scale swizzle for both GEMMs.
+    w31_kernel = interleave_linear_and_gate(w31_q.view(torch.uint8), group_size=64, dim=1).view(
+        torch.float8_e4m3fn
+    )
+    w31_sf_interleaved = interleave_linear_and_gate(w31_sf, group_size=64, dim=1)
+    w31_sf_kernel = swizzle_sf(w31_sf_interleaved, 2 * interm_size, hidden_size, sf_vec_size).view(
+        num_local_experts, 2 * interm_size, hidden_size // sf_vec_size
+    )
+    w2_sf_kernel = swizzle_sf(w2_sf, hidden_size, interm_size, sf_vec_size).view(
+        num_local_experts, hidden_size, interm_size // sf_vec_size
+    )
+    unit_alpha = torch.ones(num_local_experts, dtype=torch.float32, device="cuda")
+    unit_norm_const = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    out_ref = _mxfp8_fused_fc12_reference(
+        a_deq,
+        w31_q,
+        w31_sf,
+        w2_q,
+        w2_sf,
+        token_final_scales,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        tile_size,
+        top_k,
+        swiglu_limit,
+    )
+
+    def check(out: torch.Tensor, label: str):
+        out_f32 = out.float()
+        match = torch.isclose(out_f32, out_ref, rtol=1e-1, atol=1e-1).sum().item() / out_ref.numel()
+        cos = torch.nn.functional.cosine_similarity(
+            out_f32.flatten(), out_ref.flatten(), dim=0
+        ).item()
+        assert match >= 0.95 and cos >= 0.99, (
+            f"{label}: match={match:.4f} cosine={cos:.5f} (tile_size={tile_size}, "
+            f"tokens={num_tokens}, top_k={top_k}, ep={ep_size})"
+        )
+
+    common_kwargs = dict(
+        input=a_q,
+        fc1_weight=w31_kernel,
+        input_scale=a_sf,
+        fc1_weight_scale=w31_sf_kernel,
+        fc1_alpha=unit_alpha,
+        tile_idx_to_group_idx=tile_idx_to_group_idx,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        fc1_norm_const=unit_norm_const,
+        fc2_weight=w2_q,
+        fc2_weight_scale=w2_sf_kernel,
+        fc2_alpha=unit_alpha,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        swiglu_limit=-1.0,
+    )
+
+    # 1. Public op with the default tactic; the output must be pre-zeroed.
+    output = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(output=output, **common_kwargs)
+    torch.cuda.synchronize()
+    check(output, "default tactic")
+
+    # 2. Every tactic the runner enumerates (small shapes only: each distinct
+    #    geometry is a DSL compile).
+    if num_experts > 64:
+        return
+    runner = Sm107Mxfp8FusedFc12MoeRunner(
+        num_experts, top_k, num_local_experts, 0, tile_size, swiglu_limit=swiglu_limit
+    )
+    inputs = [
+        a_q,
+        w31_kernel,
+        a_sf,
+        w31_sf_kernel,
+        unit_alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        unit_norm_const,
+        w2_q,
+        w2_sf_kernel,
+        unit_alpha,
+        output,
+        token_final_scales,
+    ]
+    tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
+    assert len(tactics) > 0, f"No valid tactics for tile_size={tile_size}"
+    assert all(t[0][0] == tile_size for t in tactics), "mma_tiler_m must equal the routing tile"
+    failed = []
+    for tactic in tactics:
+        mma_tiler, mma_inst, cluster, scheduler = tactic
+        label = f"mma_tiler={mma_tiler} inst={mma_inst} cluster={cluster} sched={scheduler}"
+        output.zero_()
+        with torch.inference_mode():
+            runner.forward(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        try:
+            check(output, label)
+        except AssertionError as e:  # collect every failing geometry
+            failed.append(str(e))
+    assert not failed, (
+        f"tile_size={tile_size}: {len(failed)}/{len(tactics)} tactics failed:\n  "
+        + "\n  ".join(failed)
+    )
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
+    """Tactics must survive the AutoTuner's JSON/repr round trip."""
+    import ast
+    import json
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    runner = Sm107Mxfp8FusedFc12MoeRunner(64, 8, 8, 0, 128)
+    tactic = runner._default_tactic()
+    assert tactic == ((128, 128, 128), (128, 128, 64), (1, 1), "l2_atomic")
+    assert ast.literal_eval(repr(tactic)) == tactic
+    assert runner._normalize_tactic(json.loads(json.dumps(tactic))) == tactic
+    runner_2cta = Sm107Mxfp8FusedFc12MoeRunner(64, 8, 8, 0, 256)
+    assert runner_2cta._default_tactic() == ((256, 128, 128), (256, 128, 64), (2, 1), "l2_atomic")

@@ -4,10 +4,10 @@ This folder contains test definition which is consumed by `trt-test-db` tool bas
 
 ## Installation
 
-Install `trt-test-db` using the following command:
+Install `trt-test-db` using the following command (substitute `TRT_TEST_DB_VERSION` with the version from `jenkins/ci_versions.properties`):
 
 ```bash
-pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7
+pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==<TRT_TEST_DB_VERSION>
 ```
 
 ## Test Definition
@@ -57,6 +57,25 @@ pytest -v --test-list=/TensorRT-LLM/src/l0_e2e.txt --output-dir=/tmp/logs
 ```
 
 This command runs the tests specified in the test list and outputs the results to the specified directory.
+
+## Check Test List (CI)
+
+Jenkins **Check Test List** and the GitHub Actions workflow
+`.github/workflows/check-test-list.yml` both run
+`scripts/check_test_list.py --l0 --qa --waive`.
+Neither needs `trt-test-db`: the L0 entries are read from `test-db/*.yml` directly.
+L0/QA/waive collection uses pure-Python stubs of the compiled modules
+(`tests/integration/defs/stubify_bindings.py`, loaded only via
+`-p stubify_bindings`), so no TensorRT-LLM wheel or C++
+compile or binary download is required.
+The `validate-test-lists` pre-commit hook runs
+`scripts/check_test_list.py --validate --check-duplicate-waives` in one invocation.
+Both Jenkins Release-Check and GHA Release Checks run this hook through
+`scripts/release_check.py`. The Check Test List jobs do not run the optional
+`--parity` audit between static validation and collection.
+A separate hook runs `scripts/check_binding_stubs.py` to fail when
+`stubify_bindings.py` `_STUB_ROOTS` misses a compiled extension listed in
+`setup.py` `package_data`. That last check does not require stubs or a wheel.
 
 ## Additional Information
 - The `--context` parameter in the `trt-test-db` command specifies which context to search in the YAML files.

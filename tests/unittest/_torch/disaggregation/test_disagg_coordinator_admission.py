@@ -5,13 +5,16 @@ start receiving this iteration, and the scheduler V2 allocation revert for
 the ones that may not.
 
 Admission is rank-local (rank 0 decides under PP, every rank for itself under
-attention DP), so every case runs one ``CoordinatorHarness``.
+attention DP), so every case runs one ``CoordinatorHarness``. The CP alignment
+cases stand in for the CP peers through the harness dist's ``cp_allgather``.
 """
 
+import random
 from types import SimpleNamespace
 
 import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
+from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
@@ -135,6 +138,20 @@ def test_async_python_keeps_the_window_without_v2_and_pp1(kwargs) -> None:
     assert (admitted, blocked) == ([], True)
 
 
+def test_explicit_budget_keeps_the_window_for_async_python_v2_pp1() -> None:
+    """A max_tokens_in_buffer the user set bounds the transfers where the
+    defaulted one is bypassed."""
+    controller = DisaggTransferAdmissionController(32, 32, budget_is_explicit=True)
+    h = CoordinatorHarness(
+        admission_controller=controller, is_kv_manager_v2=True, consumes_transfer_buffer=False
+    )
+    _receiving(h, 1)
+
+    admitted, blocked = h.coordinator.admit([_candidate(2)])
+
+    assert (admitted, blocked) == ([], True)
+
+
 def test_sync_python_runtime_keeps_the_window(monkeypatch) -> None:
     """Synchronous receives block the executor, so the window still bounds how
     many are started per iteration even though the buffer is not consumed."""
@@ -242,3 +259,221 @@ def test_window_bypass_does_not_assume_pp1_when_dist_lacks_pp_size() -> None:
 
     with pytest.raises(AttributeError):
         transfer_window_bypass_eligible(async_python, SimpleNamespace(), True)
+
+
+# -- align_gen_admission_across_cp ---------------------------------------------
+
+
+def _cp_dist(peer_admitted_ids, cp_size=2) -> SimpleNamespace:
+    """This CP rank's dist: ``cp_allgather`` returns its own ids followed by
+    each peer's admitted ids, and records every payload it was given."""
+
+    def cp_allgather(ids, *, small_payload=False):
+        dist.gathered.append(list(ids))
+        return [ids, *peer_admitted_ids]
+
+    dist = SimpleNamespace(
+        rank=0, tp_size=1, pp_size=1, cp_size=cp_size, world_size=cp_size, gathered=[]
+    )
+    dist.cp_allgather = cp_allgather
+    return dist
+
+
+@pytest.mark.parametrize(
+    "peer_admitted_ids",
+    [
+        pytest.param([[3, 1]], id="cp2"),
+        pytest.param([[1, 2, 3], [3, 1], [1, 3, 2]], id="cp4"),
+    ],
+)
+def test_cp_alignment_keeps_only_requests_every_cp_rank_admitted(peer_admitted_ids) -> None:
+    """A request this CP rank admitted but a peer did not is dropped and its V2
+    KV growth reverted; the rest keep this rank's admission order."""
+    dist = _cp_dist(peer_admitted_ids, cp_size=len(peer_admitted_ids) + 1)
+    h = CoordinatorHarness(is_kv_manager_v2=True, dist=dist)
+    first, second, third = _candidate(1), _candidate(2), _candidate(3)
+
+    aligned = h.coordinator.align_gen_admission_across_cp([first, second, third])
+
+    assert aligned == [first, third]
+    assert h.effects.reverted == [[second]]
+    assert dist.gathered == [[1, 2, 3]]
+
+
+def test_cp_alignment_on_v1_drops_without_reverting() -> None:
+    """V1 allocates in receive_gen_init, after the alignment, so a dropped
+    request holds nothing to revert."""
+    h = CoordinatorHarness(dist=_cp_dist([[]]))
+
+    assert h.coordinator.align_gen_admission_across_cp([_candidate(1)]) == []
+    assert h.effects.reverted == []
+
+
+def test_cp_alignment_gathers_even_when_nothing_was_admitted() -> None:
+    """The gather runs whatever this rank admitted, so its count cannot depend
+    on admission; a peer's admission alone admits nothing here."""
+    dist = _cp_dist([[5]])
+    h = CoordinatorHarness(is_kv_manager_v2=True, dist=dist)
+
+    assert h.coordinator.align_gen_admission_across_cp([]) == []
+    assert dist.gathered == [[]]
+    assert h.effects.reverted == []
+
+
+def test_cp_alignment_keeps_an_admission_every_cp_rank_agrees_on() -> None:
+    dist = _cp_dist([[2, 1]])
+    h = CoordinatorHarness(is_kv_manager_v2=True, dist=dist)
+    admitted = [_candidate(1), _candidate(2)]
+
+    assert h.coordinator.align_gen_admission_across_cp(admitted) == admitted
+    assert h.effects.reverted == []
+
+
+def test_cp_alignment_is_skipped_without_cp() -> None:
+    """With cp_size == 1 there is no CP peer to agree with and no gather."""
+    dist = _cp_dist([], cp_size=1)
+    h = CoordinatorHarness(is_kv_manager_v2=True, dist=dist)
+    admitted = [_candidate(1)]
+
+    assert h.coordinator.align_gen_admission_across_cp(admitted) == admitted
+    assert dist.gathered == []
+
+
+def _gate_request(rid: int, tokens: int, in_progress: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=rid,
+        py_request_id=rid,
+        total_input_len_cp=tokens,
+        py_prompt_len=tokens,
+        prompt_len=tokens,
+        is_disagg_generation_transmission_in_progress=in_progress,
+    )
+
+
+@pytest.mark.parametrize("seed", range(400))
+def test_admission_gate_matches_select(seed) -> None:
+    """The scheduler-side gate closes at the first candidate select() defers, so selecting from
+    the candidates it let through admits the same prefix with the same signals."""
+    rng = random.Random(seed)
+    controller = DisaggTransferAdmissionController(
+        max_tokens_in_buffer=rng.randint(1, 4000), tokens_per_block=rng.choice([16, 32, 64])
+    )
+    active = [
+        _gate_request(1000 + k, rng.randint(1, 2500), in_progress=rng.random() < 0.7)
+        for k in range(rng.randint(0, 3))
+    ]
+    candidates = [_gate_request(k, rng.randint(0, 3000)) for k in range(rng.randint(0, 12))]
+    reference = controller.select(active, candidates)
+
+    gate = controller.begin_gate(active)
+    observed = []
+    for candidate in candidates:
+        if gate.closed:
+            break
+        observed.append(candidate)
+        gate.observe_candidate(candidate)
+    gated = controller.select(active, observed)
+
+    assert [r.request_id for r in gated.admitted_requests] == [
+        r.request_id for r in reference.admitted_requests
+    ]
+    assert gated.limited_by_budget == reference.limited_by_budget
+    assert gated.is_blocked_by_active_transfers() == reference.is_blocked_by_active_transfers()
+    assert gated.active_transfer_blocks == reference.active_transfer_blocks
+    assert gated.admitted_transfer_blocks == reference.admitted_transfer_blocks
+    # Only the candidate that closed the gate is allocated and then deferred.
+    assert gated.deferred_request_count == min(reference.deferred_request_count, 1)
+    assert len(candidates) - len(observed) == max(reference.deferred_request_count - 1, 0)
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("peer_admits", [False, True])
+def test_tp_admission_waits_for_every_non_adp_rank(tp_size: int, peer_admits: bool) -> None:
+    """A TP peer with no candidate must still join the admission vote."""
+    group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
+    ranks = [
+        CoordinatorHarness(dist=group.rank(rank), is_kv_manager_v2=True) for rank in range(tp_size)
+    ]
+    candidates = [[_candidate(1), _candidate(2)] for _ in ranks]
+    candidates[-1] = [_candidate(1)] if peer_admits else []
+
+    aligned = group.run(
+        lambda rank: ranks[rank].coordinator.align_gen_admission_across_cp(candidates[rank])
+    )
+
+    expected = [1] if peer_admits else []
+    assert [[request.py_request_id for request in requests] for requests in aligned] == [
+        expected for _ in ranks
+    ]
+    for rank, h in enumerate(ranks):
+        assert h.dist.calls == [("tp_allgather", [r.py_request_id for r in candidates[rank]])]
+        dropped = [r for r in candidates[rank] if r.py_request_id not in expected]
+        assert h.effects.reverted == ([dropped] if dropped else [])
+
+
+def test_non_adp_admission_spans_both_tp_and_cp() -> None:
+    """A TP peer outside the local CP group can veto a receive."""
+    gathered = []
+
+    def tp_cp_allgather(ids, *, small_payload=False):
+        assert small_payload
+        gathered.append(ids)
+        return [ids, ids, ids, [1]]
+
+    dist = SimpleNamespace(
+        rank=0,
+        tp_size=2,
+        cp_size=2,
+        pp_size=1,
+        world_size=4,
+        tp_cp_allgather=tp_cp_allgather,
+    )
+    h = CoordinatorHarness(dist=dist, is_kv_manager_v2=True)
+    first, second = _candidate(1), _candidate(2)
+
+    assert h.coordinator.align_gen_admission_across_cp([first, second]) == [first]
+    assert h.effects.reverted == [[second]]
+    assert gathered == [[1, 2]]
+
+
+def test_attention_dp_does_not_intersect_independent_tp_owners() -> None:
+    """Different ADP owners must remain free to admit different requests."""
+    dist = SimpleNamespace(rank=0, tp_size=8, cp_size=1, pp_size=1, world_size=8)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True, is_kv_manager_v2=True)
+    candidate = _candidate(1)
+
+    assert h.coordinator.align_gen_admission_across_cp([candidate]) == [candidate]
+    assert h.effects.reverted == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "bridge", "expected"),
+    [
+        ({}, False, True),
+        ({"enable_attention_dp": True}, False, False),
+        ({"pp_size": 2}, False, False),
+        ({"consumes_transfer_buffer": True}, False, False),
+        ({}, True, False),
+        ({"world_size": 1, "tp_size": 1}, False, False),
+    ],
+)
+def test_gen_cancellation_consensus_preserves_runtime_capability_gates(
+    overrides: dict,
+    bridge: bool,
+    expected: bool,
+) -> None:
+    """C++ transfers, ADP, PP and the ownership bridge retain their cancellation paths."""
+    options = dict(world_size=2, tp_size=2, consumes_transfer_buffer=False)
+    options.update(overrides)
+    h = CoordinatorHarness(**options)
+    h.transceiver.supports_idle_request_cancellation = lambda req=None: bridge
+
+    assert h.coordinator.requires_gen_cancellation_consensus is expected
+
+
+def test_gen_cancellation_consensus_is_disabled_for_sync_receives(monkeypatch) -> None:
+    """A rank-local blocking receive must not acquire the async cancellation vote."""
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    h = CoordinatorHarness(world_size=2, tp_size=2, consumes_transfer_buffer=False)
+
+    assert not h.coordinator.requires_gen_cancellation_consensus

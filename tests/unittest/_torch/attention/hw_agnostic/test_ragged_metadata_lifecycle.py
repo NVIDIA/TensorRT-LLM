@@ -314,6 +314,7 @@ def test_flash_mla_rejects_token_major_generation_before_dispatch(metadata_valid
     attention = SimpleNamespace(
         sparse_params=None,
         is_mla_enable=False,
+        cache_context_plan=False,
         create_output=Mock(side_effect=_StopBeforeDispatch),
     )
     metadata.use_paged_context_fmha = False
@@ -341,6 +342,7 @@ def test_uniform_flash_mla_and_ragged_native_pass_the_guard(
     attention = SimpleNamespace(
         sparse_params=None,
         is_mla_enable=False,
+        cache_context_plan=False,
         create_output=Mock(side_effect=_StopBeforeDispatch),
     )
     with pytest.raises(_StopBeforeDispatch):

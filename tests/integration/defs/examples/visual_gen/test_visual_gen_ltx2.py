@@ -26,6 +26,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
     _assert_feature_quantization_installed,
     _assert_lpips_below_threshold,
+    _assert_nvfp4_gemm_cache_pinned,
     _assert_resolved_single_device_feature_config,
     _assert_single_device_feature_executed,
     _build_single_device_feature_args,
@@ -36,6 +37,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _golden_media_path,
     _lpips_deterministic_algorithms,
     _preserve_lpips_candidate_on_failure,
+    _run_diffusion_worker_with_fixed_nvfp4_gemm,
     _run_lpips_eval,
     _run_reusable_video_lpips_eval,
     _run_single_device_feature_generator,
@@ -270,8 +272,11 @@ def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
 
-def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
+def _generate_ltx2_cuda_graph_trtllm_backend_video(
+    output_path: str | os.PathLike[str], *, enable_cuda_graph: bool = True
+) -> None:
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+    from tensorrt_llm._torch.visual_gen import executor as visual_gen_executor
     from tensorrt_llm.visual_gen.args import (
         AttentionConfig,
         CompilationConfig,
@@ -304,7 +309,7 @@ def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
             ],
             num_frames=[LTX2_LPIPS_NUM_FRAMES],
         ),
-        cuda_graph_config=CudaGraphConfig(enable=True),
+        cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
         torch_compile_config=TorchCompileConfig(
             enable=True,
             enable_fullgraph=False,
@@ -317,7 +322,16 @@ def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
         },
     )
 
-    visual_gen = VisualGen(model=checkpoint_path, args=visual_gen_args)
+    # The fixed golden needs a stable NVFP4 GEMM backend, which autotuning would otherwise
+    # pick per machine by timing. Workers spawned while VisualGen starts build their
+    # pipelines under the CUTLASS pin.
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            visual_gen_executor,
+            "run_diffusion_worker",
+            _run_diffusion_worker_with_fixed_nvfp4_gemm,
+        )
+        visual_gen = VisualGen(model=checkpoint_path, args=visual_gen_args)
     try:
         params = VisualGenParams(
             height=LTX2_T2V_HEIGHT,
@@ -382,15 +396,52 @@ def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path):
+def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path, monkeypatch):
+    conftest.skip_fp4_pre_blackwell(True)
+    reference_path = tmp_path / "ltx2_trtllm_backend_generated.mp4"
     generated_path = tmp_path / "ltx2_cuda_graph_trtllm_backend_generated.mp4"
-    golden_path = _golden_media_path(
-        tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
-    )
+    # Compare the same NVFP4, attention, and compilation configuration.
+    # Reuse the reference worker's tuning decisions so only graph capture differs.
+    autotuner_cache_path = tmp_path / "ltx2_autotuner_cache.json"
+    monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_PATH", str(autotuner_cache_path))
+    _generate_ltx2_cuda_graph_trtllm_backend_video(reference_path, enable_cuda_graph=False)
+    assert autotuner_cache_path.is_file(), "Reference worker did not save its tuning decisions"
     _generate_ltx2_cuda_graph_trtllm_backend_video(generated_path)
+    # Both workers merge their tuning decisions into this cache; the golden is only
+    # comparable if every NVFP4 GEMM was tuned on the pinned backend.
+    _assert_nvfp4_gemm_cache_pinned(autotuner_cache_path)
     score = _run_lpips_eval(
         tmp_path,
         "ltx2_cuda_graph_trtllm_backend",
+        "video",
+        LTX2_T2V_PROMPT,
+        reference_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_CUDA_GRAPH_LPIPS_THRESHOLD,
+        reference_path,
+        "ltx2_trtllm_backend_generated.mp4",
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_CUDA_GRAPH_LPIPS_THRESHOLD,
+        generated_path,
+        "ltx2_cuda_graph_trtllm_backend_generated.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX2_CUDA_GRAPH_LPIPS_THRESHOLD)
+
+    golden_path = _golden_media_path(
+        tmp_path,
+        "ltx2_trtllm_backend_lpips_golden_video.mp4",
+        "LTX-2 NVFP4 TRTLLM backend LPIPS golden video",
+    )
+    golden_score = _run_lpips_eval(
+        tmp_path,
+        "ltx2_trtllm_backend_golden",
         "video",
         LTX2_T2V_PROMPT,
         golden_path,
@@ -398,12 +449,12 @@ def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path):
     )
     _preserve_lpips_candidate_on_failure(
         request,
-        score,
+        golden_score,
         LTX2_LPIPS_THRESHOLD,
         generated_path,
         "ltx2_cuda_graph_trtllm_backend_generated.mp4",
     )
-    _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(golden_score, LTX2_LPIPS_THRESHOLD)
 
 
 @pytest.fixture(scope="session")

@@ -16,6 +16,10 @@
 import unittest
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 L0_TEST = (REPO_ROOT / "jenkins" / "L0_Test.groovy").read_text()
 L0_PARENT = (REPO_ROOT / "jenkins" / "L0_MergeRequest.groovy").read_text()
@@ -85,8 +89,8 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         for body, empty_result in ((changed_files, "return []"), (one_file_diff, 'return ""')):
             with self.subTest(empty_result=empty_result):
                 self.assertIn(f"if ({infra_dry_run_check} ||", body)
-                self.assertLess(body.index(infra_dry_run_check), body.index("def githubPrApiUrl"))
-                self.assertLess(body.index(empty_result), body.index("def githubPrApiUrl"))
+                self.assertLess(body.index(infra_dry_run_check), body.index("getMRChangedFile("))
+                self.assertLess(body.index(empty_result), body.index("getMRChangedFile("))
 
     def test_docs_skip_results_only_after_a_successful_build(self) -> None:
         result_handler = _function_body(
@@ -115,6 +119,25 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             classifier.index("retryContext.failureEvidence = evidence"),
         )
 
+    def test_no_rerun_failure_preserves_initial_infra_classification(self) -> None:
+        isolated = _function_body(L0_TEST, "runIsolatedTests", "getInfraDryRunPytestTargets")
+        platform = _function_body(
+            L0_TEST, "runLLMTestlistOnPlatformImpl", "runLLMTestlistOnPlatform"
+        )
+        classify_initial_failure = "classifyFailure(pipeline, e, scope, retryContext)"
+
+        self.assertIn(classify_initial_failure, isolated)
+        self.assertIn("unrerunInfraFailure: unrerunInfraFailure", isolated)
+        self.assertIn(classify_initial_failure, platform)
+        self.assertIn(
+            "unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure",
+            platform,
+        )
+        self.assertLess(
+            platform.index("throw unrerunInfraFailure"),
+            platform.rindex('error "Some tests failed and were not eligible for rerun'),
+        )
+
     def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:
         result_handler = _function_body(
             L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"
@@ -124,10 +147,15 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
 
         self.assertIn("caughtError = e\n        stageIsInterrupted = true", result_handler)
-        self.assertIn("catch (InterruptedException e) {\n        throw e", preserve_primary)
+        self.assertIn("catch (Exception e)", preserve_primary)
+        self.assertNotIn("catch (InterruptedException e)", preserve_primary)
         self.assertIn(
-            "FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption",
+            "FailureClassifier.classify(e, InfraFailure.K8S) instanceof PipelineInterruption",
             preserve_primary,
+        )
+        self.assertLess(
+            preserve_primary.index("instanceof PipelineInterruption) throw e"),
+            preserve_primary.index("FailureClassifier.attachAgentLoss(primaryError, e)"),
         )
 
     def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
@@ -170,7 +198,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
 
         self.assertIn("--resolve-pin cbts_db_pin.json", audit)
         self.assertIn("pinPlan.pin_upload_required", audit)
-        self.assertIn("trtllm_utils.uploadArtifacts", audit)
+        self.assertIn("trtllm_utils.uploadToTargets(", audit)
         self.assertNotIn("curl --noproxy", audit)
 
 

@@ -56,10 +56,7 @@ class QuantKind(str, enum.Enum):
         pair -- falls back to mxf8f6f4. Keeping the two in sync matters because we build the tiled
         MMA through that helper but emit the instruction ourselves.
         """
-        both_fp4 = (
-            self.weight_dtype is cutlass.Float4E2M1FN
-            and self.activation_dtype is cutlass.Float4E2M1FN
-        )
+        both_fp4 = self.weight_dtype is cutlass.Float4E2M1FN and self.activation_dtype is cutlass.Float4E2M1FN
         if not both_fp4:
             return "mxf8f6f4"
         return "mxf4nvf4" if self.sf_vec_size == 16 else "mxf4"
@@ -105,10 +102,7 @@ class QuantKind(str, enum.Enum):
             normalized_architecture = normalized_architecture[2:]
         if normalized_architecture not in ("100", "103", "107"):
             raise ValueError(f"Unsupported TCGen05 architecture {architecture!r}.")
-        return (
-            normalized_architecture in ("100", "103")
-            and self.weight_dtype.width != self.activation_dtype.width
-        )
+        return normalized_architecture in ("100", "103") and self.weight_dtype.width != self.activation_dtype.width
 
     @property
     def uses_global_scale(self) -> bool:
@@ -145,23 +139,15 @@ def _instruction_descriptor_format_code(umma_kind: str, dtype: Type[cutlass.Nume
     try:
         return codes[dtype]
     except KeyError as error:
-        raise ValueError(
-            f"{dtype} has no instruction-descriptor format code under kind::{umma_kind}."
-        ) from error
+        raise ValueError(f"{dtype} has no instruction-descriptor format code under kind::{umma_kind}.") from error
 
 
 @dataclasses.dataclass(frozen=True)
 class CombineFormat:
     """Data and scale representation of one cross-rank FC2 payload."""
 
-    _act_by_tag: ClassVar[Dict[str, type]] = {
-        "e2m1": cutlass.Float4E2M1FN,
-        "e4m3": cutlass.Float8E4M3FN,
-    }
-    _scale_by_tag: ClassVar[Dict[str, type]] = {
-        "bf16": cutlass.BFloat16,
-        "e8m0": cutlass.Float8E8M0FNU,
-    }
+    _act_by_tag: ClassVar[Dict[str, type]] = {"e2m1": cutlass.Float4E2M1FN, "e4m3": cutlass.Float8E4M3FN}
+    _scale_by_tag: ClassVar[Dict[str, type]] = {"bf16": cutlass.BFloat16, "e8m0": cutlass.Float8E8M0FNU}
     _rejection_reason: ClassVar[Dict[str, str]] = {
         "32e5m2xe8m0": (
             "e5m2 costs the same 8.25 bits per element as e4m3 and trades a mantissa bit (6 dB of "
@@ -200,9 +186,7 @@ class CombineFormat:
         if not self.is_quantized:
             return "bf16"
         act_tag = next(tag for tag, dtype in self._act_by_tag.items() if dtype is self.act_dtype)
-        scale_tag = next(
-            tag for tag, dtype in self._scale_by_tag.items() if dtype is self.scale_dtype
-        )
+        scale_tag = next(tag for tag, dtype in self._scale_by_tag.items() if dtype is self.scale_dtype)
         return f"{self.scale_block}{act_tag}x{scale_tag}"
 
     def __str__(self) -> str:
@@ -217,9 +201,7 @@ class CombineFormat:
         }
         token = text.strip().lower()
         if token in cls._rejection_reason:
-            raise ValueError(
-                f"Combine format {token!r} is deliberately unsupported: {cls._rejection_reason[token]}"
-            )
+            raise ValueError(f"Combine format {token!r} is deliberately unsupported: {cls._rejection_reason[token]}")
         if token not in specs:
             raise ValueError(f"Invalid combine format {text!r}; expected one of {tuple(specs)}.")
         act_dtype, scale_dtype, scale_block = specs[token]
@@ -252,15 +234,12 @@ def _verify_pinned_hardware_encoding() -> None:
             kind.scale_format_code,
         )
         if derived != expected:
-            raise AssertionError(
-                f"QuantKind.{kind.name} derives {derived}, pinned encoding is {expected}."
-            )
+            raise AssertionError(f"QuantKind.{kind.name} derives {derived}, pinned encoding is {expected}.")
         expected_instruction_k_2x = expected[2] * 2
         instruction_k_2x = kind.instruction_k("2x")
         if instruction_k_2x != expected_instruction_k_2x:
             raise AssertionError(
-                f"QuantKind.{kind.name} derives 2x instruction K {instruction_k_2x}, "
-                f"expected {expected_instruction_k_2x}."
+                f"QuantKind.{kind.name} derives 2x instruction K {instruction_k_2x}, expected {expected_instruction_k_2x}."
             )
 
 

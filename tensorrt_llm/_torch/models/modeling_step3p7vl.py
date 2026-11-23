@@ -55,6 +55,7 @@ from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from ..modules.mlp import MLP
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
@@ -729,7 +730,9 @@ class Step3p7VisionTower(nn.Module):
         vision_model_config = ModelConfig(
             pretrained_config=vision_config,
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
-            attn_backend=getattr(model_config, "attn_backend", "TRTLLM"),
+            attn_backend=model_config.get_encoder_attention_backend(
+                "vision", model_config.attn_backend
+            ),
             skip_create_weights_in_init=False,
         )
         self.vision_model = Step3p7VisionEncoder(
@@ -1217,6 +1220,12 @@ class Step3p7VLForConditionalGeneration(nn.Module):
     benchmarks continue to use the original Step3p7 text path.
     """
 
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
+    lora_owner = DecoderLoraOwner(module_path="language_model")
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__()
         self.model_config = model_config
@@ -1239,6 +1248,10 @@ class Step3p7VLForConditionalGeneration(nn.Module):
         self.mm_encoder = None
 
     # ----- engine-facing surface (delegate to the inner causal LM) -------
+
+    @property
+    def language_model(self) -> nn.Module:
+        return self.llm
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:

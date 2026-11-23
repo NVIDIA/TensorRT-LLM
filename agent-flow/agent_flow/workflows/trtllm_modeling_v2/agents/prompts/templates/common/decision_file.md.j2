@@ -1,0 +1,25 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## The decision file
+
+**Your last action is to write your decision file.** Write it with the `Write` tool to:
+
+```
+<workspace>/decisions/<unit>-{{ agent }}-<turn>.yaml
+```
+
+The exact path is given at the end of your dispatch prompt. Write that file and no other: every turn gets a path no earlier turn used, and a decision written anywhere else is never read. The file is YAML with exactly these keys:
+
+```yaml
+summary: |
+  What you did, in a few lines. Numbers verbatim from tool output.
+decision: <exactly one of the decisions listed above>
+```
+{% if extra %}
+This role also carries these keys when they apply:
+
+```yaml
+{% for key in extra %}  {{ key }}: ...
+{% endfor %}```
+{% endif %}
+Any other value, or no file, is a turn that produced no decision.

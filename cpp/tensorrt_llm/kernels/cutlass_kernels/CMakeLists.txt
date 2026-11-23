@@ -163,7 +163,8 @@ file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
 # Get the sources for MOE Grouped GEMM launchers. They live in the MoE domain
 # directory; the targets stay here, next to the CUTLASS instantiation generator
 # and the helpers (process_target, add_instantiations) they use.
-set(MOE_CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../moe/cutlass)
+get_filename_component(MOE_CUTLASS_DIR
+                       "${CMAKE_CURRENT_SOURCE_DIR}/../moe/cutlass" ABSOLUTE)
 file(GLOB_RECURSE GROUPED_SRC_CPP ${MOE_CUTLASS_DIR}/*.cpp)
 file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 
@@ -171,26 +172,16 @@ file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
 
 # Get the sources for FP8 Blockwise GEMM launchers
-file(GLOB_RECURSE FP8_BLOCKSCALE_GEMM_SRC_CU fp8_blockscale_gemm/*.cu)
+set(FP8_BLOCKSCALE_GEMM_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu
+)
 
 # Get the sources for FP4 GEMM launchers
 file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
 
 # Get the sources for AllReduce GEMM
 file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
-
-# Get the sources for all the remaining sources
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
-set(ALL_SRCS ${SRC_CPP};${SRC_CU})
-list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "low_latency_gemm/.*")
-list(REMOVE_ITEM ALL_SRCS
-     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 
 message(
   VERBOSE
@@ -203,9 +194,9 @@ message(VERBOSE "Fbgemm srcs ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS}")
 message(VERBOSE "FP8 Blockscale GEMM srcs ${FP8_BLOCKSCALE_GEMM_SRC_CU}")
 message(VERBOSE "FP4 srcs ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS}")
 message(VERBOSE "ARgemm srcs ${ARGEMM_SRC_CU}")
-message(VERBOSE "All srcs ${ALL_SRCS}")
 
-add_library(cutlass_src STATIC ${ALL_SRCS})
+add_library(cutlass_src INTERFACE)
+target_link_libraries(cutlass_src INTERFACE tllm::kernel_gemm_utilities)
 
 add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU})
 add_cuda_architectures(fpA_intB_gemm_src 89)
@@ -217,12 +208,12 @@ set_cuda_architectures(fb_gemm_src ${CUTLASS_COMMON_ARCHS})
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
+add_library(tllm::kernel_fp8_block_scale_gemm ALIAS fp8_blockscale_gemm_src)
+target_link_libraries(
+  fp8_blockscale_gemm_src
+  PUBLIC tllm::kernel_gemm_utilities tllm::common_environment CUDA::cuda_driver
+         ${NVRTC_LIB} ${NVRTC_BUILTINS_LIB})
 set_cuda_architectures(fp8_blockscale_gemm_src ${CUTLASS_COMMON_ARCHS})
-
-set(GEMM_SWIGLU_SM90_SRC_CU
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
-add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
-set_cuda_architectures(gemm_swiglu_sm90_src 90)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   file(GLOB LOW_LATENCY_GEMM_SRC_CU
@@ -242,6 +233,10 @@ endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   file(GLOB MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/*.cu")
+  list(
+    REMOVE_ITEM MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/moe_lora_pointer_expand.cu"
+    "${MOE_CUTLASS_DIR}/moe_lora_problem_builder.cu"
+    "${MOE_CUTLASS_DIR}/moe_lora_slot_expand.cu")
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
@@ -276,8 +271,9 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 
   add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
   target_link_libraries(
-    moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_hopper_fp4 _moe_gemm_fp4
-                         _moe_gemm_fp8)
+    moe_gemm_src
+    PRIVATE tllm::kernel_moe_lora tllm::kernel_pre_quant_scale
+            _moe_gemm_launcher _moe_gemm_hopper_fp4 _moe_gemm_fp4 _moe_gemm_fp8)
   target_include_directories(
     moe_gemm_src
     PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
@@ -306,8 +302,7 @@ endif()
 
 set(ALL_KERNELS_LIB)
 
-set(TARGET_LIB
-    fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src)
+set(TARGET_LIB fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src)
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   list(APPEND TARGET_LIB low_latency_gemm_src)
 endif()

@@ -10,6 +10,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 # 2D block edge of FP8 block-scale tensors (weight_scale_inv), matching
 # FP8BlockScalesLinearMethod.
@@ -92,7 +93,7 @@ def _permute_rows(tensor: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     return out.squeeze(1) if squeeze else out
 
 
-@register_mapper("HF", "Qwen3NextForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen3NextForCausalLM")
 class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
 
     @staticmethod
@@ -130,6 +131,15 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
             tensors_to_duplicate.append("weight_scale")
         if module.quant_config.quant_mode.has_fp8_block_scales():
             tensors_to_duplicate.append("weight_scale_inv")
+        if module.quant_config.quant_mode.has_mxfp8():
+            # MXFP8 keeps one UE8M0 scale per weight row, so the scale rows
+            # must be duplicated exactly like the rows they describe -- unlike
+            # 128x128 block FP8, whose scale rows are out_features/128 and are
+            # remapped instead. Both spellings are listed because
+            # MXFP8LinearMethod._get_scale_name probes weight_scale_inv first
+            # and falls back to weight_scale; only the key actually present is
+            # touched.
+            tensors_to_duplicate.extend(["weight_scale_inv", "weight_scale"])
 
         if new_name in ['k_proj', 'v_proj']:
             num_kv_heads_list = [self._num_kv_heads

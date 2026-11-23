@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 TOOLS_SYSTEM_TEMPLATE = """## Tools
+
 You have access to a set of tools you can use to answer the user's question.
 You can invoke functions by writing a "<{dsml_token}function_calls>" block like the following as part of your reply to the user:
 <{dsml_token}function_calls>
@@ -17,15 +18,21 @@ You can invoke functions by writing a "<{dsml_token}function_calls>" block like 
 ...
 </{dsml_token}invoke>
 </{dsml_token}function_calls>
+
 String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The "string" attribute should be set to "true" for string type parameters and "false" for other types (numbers, booleans, arrays, objects).
+
 If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:
+
 <{dsml_token}function_calls>
 ...
 </{dsml_token}function_calls>
+
 <function_results>
 ...
 </function_results>
+
 {thinking_start_token}...thinking about results{thinking_end_token}
+
 Here are the functions available in JSONSchema format:
 <functions>
 {tool_schemas}

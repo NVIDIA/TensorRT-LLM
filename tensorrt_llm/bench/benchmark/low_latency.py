@@ -220,7 +220,8 @@ def latency_command(
 
     custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer,
+                                     options.checkpoint_format)
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
@@ -269,6 +270,7 @@ def latency_command(
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings["iteration_log"] = options.iteration_log
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Construct the runtime configuration dataclass.

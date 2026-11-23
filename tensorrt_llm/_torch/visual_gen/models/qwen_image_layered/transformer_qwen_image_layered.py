@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import is_sm_100f, is_sm_120f
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import ceil_to_ue8m0
 
@@ -271,7 +271,7 @@ class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
     def _uses_e8m0_post_load_repack(module: Linear) -> bool:
         return (
             is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm)
-        ) or get_sm_version() == 120
+        ) or is_sm_120f()
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         if not self.model_config.dynamic_weight_quant:

@@ -14,9 +14,12 @@
 # limitations under the License.
 """MoE-owned fused kernels.
 
-Kernels whose only production consumer is the MoE module layer beside this
-package. Each submodule hosts one operator; callers own the enablement
-checks and keep the unfused op chains as fallbacks.
+Per-architecture kernels live under ``blackwell/`` and ``rubin/``, keyed below
+that by kernel family, so a submodule may host several related operators
+rather than exactly one. ``cutedsl_megamoe/`` keeps the MegaMoE kernels for
+both architectures in a self-contained tree behind its own ``KernelClass``
+entry points. Callers own the enablement checks and decide what to do when a
+kernel does not apply.
 
 Nothing is re-exported from this file on purpose: importing one kernel must
 not drag in the others, several of which are arch-gated.

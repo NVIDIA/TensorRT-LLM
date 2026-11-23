@@ -1,0 +1,296 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Gen-side completion consensus under attention-DP with helix CP or PP.
+
+Under attention-DP the DP groups schedule independently, but the helix CP
+ranks (or the PP ranks) of one DP group share the same requests. The Python
+transceiver must therefore still reach completion consensus across that
+group; otherwise one CP rank can start decoding a request whose KV its
+partner has not received yet and the helix all-to-all deadlocks.
+Attention-DP with both helix CP and pp_size > 1 is rejected.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+pytestmark = pytest.mark.cpu_only
+
+
+def _transceiver(mapping, dist) -> KvCacheTransceiverV2:
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._mapping = mapping
+    tc._dist = dist
+    tc._init_sync_policy()
+    return tc
+
+
+def _mapping(**overrides) -> SimpleNamespace:
+    base = dict(tp_size=1, pp_size=1, cp_size=1, world_size=1, enable_attention_dp=False)
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_adp_without_cp_or_pp_skips_gen_sync() -> None:
+    """Attention-DP with pp == cp == 1 keeps the no-sync fast path."""
+    dist = SimpleNamespace(
+        allgather=Mock(side_effect=AssertionError("must not sync")),
+        pp_allgather=Mock(side_effect=AssertionError("must not sync")),
+        cp_allgather=Mock(side_effect=AssertionError("must not sync")),
+    )
+    tc = _transceiver(_mapping(tp_size=2, world_size=2, enable_attention_dp=True), dist)
+
+    assert tc._gen_need_sync is False
+    assert tc._gen_consensus([7, 8]) == [7, 8]
+
+
+def test_adp_with_helix_cp_syncs_across_cp_group() -> None:
+    """Attention-DP + helix CP gathers over the CP group only."""
+    # Two helix CP ranks of one DP group: only rid 1 has arrived on both.
+    dist = SimpleNamespace(
+        allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
+        pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
+        cp_allgather=lambda payload: [payload, [1]],
+    )
+    tc = _transceiver(_mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist)
+
+    assert tc._gen_need_sync is True
+    assert tc._gen_consensus([1, 2]) == [1]
+
+
+def test_adp_with_cp_and_pp_is_rejected() -> None:
+    """KvCacheTransceiverV2 rejects attention-DP with helix CP when pp_size > 1.
+
+    Only the pp=1 executor loops align gen-init admission across the CP ranks.
+    """
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._mapping = _mapping(
+        tp_size=2,
+        cp_size=2,
+        pp_size=2,
+        world_size=8,
+        enable_attention_dp=True,
+        has_cp_helix=lambda: True,
+    )
+
+    with pytest.raises(ValueError, match=r"pp_size > 1"):
+        tc._check_compatible()
+
+
+def test_adp_consensus_outcome_completes_only_when_every_cp_rank_completed() -> None:
+    """Completion needs every CP rank of the DP group to report the request done."""
+    dist = SimpleNamespace(
+        allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
+        pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
+        # Peer CP rank: nothing cancelled/failed, only rid 5 completed.
+        cp_allgather=lambda payload: [payload, [[], [], [5]]],
+    )
+    tc = _transceiver(_mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist)
+
+    cancelled, failed, completed = tc._consensus_outcome(
+        [5, 6], [], [], [5, 6], tc._gen_allgather, tc._gen_need_sync
+    )
+    assert cancelled == []
+    assert failed == []
+    assert completed == [5]
+
+
+def test_non_adp_still_uses_world_allgather() -> None:
+    """Without attention-DP the world allgather path is unchanged."""
+    dist = SimpleNamespace(
+        allgather=lambda payload: [payload, payload],
+        pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
+        cp_allgather=Mock(side_effect=AssertionError("cp allgather must be skipped")),
+    )
+    tc = _transceiver(_mapping(tp_size=1, cp_size=2, world_size=2), dist)
+
+    assert tc._gen_need_sync is True
+    assert tc._gen_consensus([4]) == [4]
+
+
+def test_adp_with_pp_only_syncs_across_pp_group() -> None:
+    """Attention-DP + PP without CP wraps the local payload and gathers over PP only."""
+    dist = SimpleNamespace(
+        allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
+        cp_allgather=Mock(side_effect=AssertionError("cp allgather must be skipped")),
+        # Other PP rank of this DP group only has rid 2.
+        pp_allgather=lambda gathered: [gathered, [[2]]],
+    )
+    tc = _transceiver(_mapping(tp_size=2, pp_size=2, world_size=4, enable_attention_dp=True), dist)
+
+    assert tc._gen_need_sync is True
+    assert tc._gen_consensus([1, 2]) == [2]
+
+
+def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_drained() -> None:
+    """A cancelled request retires only once both CP ranks report their resources drained."""
+
+    def run(local_drained: bool, local_cancelled: list[int]):
+        session = SimpleNamespace(
+            _enforce_physical_ownership=True,
+            resources_drained=lambda: local_drained,
+        )
+        dist = SimpleNamespace(
+            allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
+            pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
+            # Peer CP rank: rid 9 cancelled and already retirable there; nothing
+            # write-verified (payload = cancelled, failed, completed, retirable, verified).
+            cp_allgather=lambda payload: [payload, [[9], [], [], [9], []]],
+        )
+        tc = _transceiver(
+            _mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist
+        )
+        tc._recv_sessions = {9: session}
+        return tc._gen_consensus_outcome([9], local_cancelled, [], [], [])
+
+    assert run(local_drained=False, local_cancelled=[9]) == ([], [], [], set())
+    assert run(local_drained=True, local_cancelled=[9]) == ([9], [], [], set())
+    # A cancellation observed only on the CP peer still reaches this rank, which
+    # proves the outcome went through the CP gather rather than local state.
+    assert run(local_drained=True, local_cancelled=[]) == ([9], [], [], set())
+
+
+def test_kv_size_rank_factor_is_the_tp_scale() -> None:
+    """The constant factor counts the TP ranks that receive a request.
+
+    Helix CP is scaled per request instead.
+    """
+    factor = KvCacheTransceiverV2._kv_size_rank_factor_for
+    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=True)) == 1
+    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=False)) == 2
+    assert factor(_mapping(tp_size=1, cp_size=1, enable_attention_dp=False)) == 1
+
+
+_TPB = 32
+_BLOCK_BYTES = 100
+
+
+def _metric_transceiver(mapping, local_len, total_len):
+    """A transceiver for ``mapping`` and a request holding ``local_len`` of ``total_len`` tokens."""
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._mapping = mapping
+    tc._kv_size_rank_factor = KvCacheTransceiverV2._kv_size_rank_factor_for(mapping)
+    tc._reuse_adapter = SimpleNamespace(tokens_per_block=_TPB)
+    return tc, SimpleNamespace(prompt_len=local_len, total_input_len_cp=total_len)
+
+
+@pytest.mark.parametrize(
+    "enable_attention_dp,tp_size,cp_size,total_len,local_len,expected_blocks",
+    [
+        # One-block prompt: CP rank 0 owns the only block; reported as one block, not two.
+        (True, 2, 2, 20, 20, 1),
+        # The empty CP rank has no bytes and reports 0.
+        (True, 2, 2, 20, 0, 0),
+        # Two blocks: one per CP rank.
+        (True, 2, 2, 64, 32, 2),
+        # Three blocks: CP rank 0 holds blocks 0 and 2 (the partial one), CP rank 1 block 1.
+        (True, 2, 2, 80, 48, 3),
+        (True, 2, 2, 80, 32, 3),
+        # Without attention-DP the TP shards scale on top: 3 blocks x tp 2.
+        (False, 2, 2, 80, 48, 6),
+        # No helix: the local prompt is the whole prompt; only the TP scale applies.
+        (False, 2, 1, 80, 80, 6),
+    ],
+)
+def test_helix_kv_cache_size_counts_round_robin_blocks(
+    enable_attention_dp: bool,
+    tp_size: int,
+    cp_size: int,
+    total_len: int,
+    local_len: int,
+    expected_blocks: int,
+) -> None:
+    """kv_cache_size is the request total, not one CP rank's share times cp_size."""
+    local_paged = (local_len + _TPB - 1) // _TPB * _BLOCK_BYTES
+    tc, req = _metric_transceiver(
+        _mapping(tp_size=tp_size, cp_size=cp_size, enable_attention_dp=enable_attention_dp),
+        local_len,
+        total_len,
+    )
+
+    assert tc._request_kv_bytes(req, local_paged, 0) == expected_blocks * _BLOCK_BYTES
+
+
+_STATE_BYTES = 7
+
+
+@pytest.mark.parametrize(
+    "enable_attention_dp,tp_size,cp_size,total_len,local_len,expected",
+    [
+        # Helix tp1 x cp2, 3 blocks: CP rank 0 holds 2. Both CP ranks hold a STATE
+        # slot, so STATE counts twice, not by the 3/2 block ratio.
+        (False, 1, 2, 80, 48, 3 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # The empty CP rank still holds its STATE slot.
+        (False, 1, 2, 20, 0, 0 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # Helix tp2 x cp2: paged bytes scale by tp, STATE by tp x cp.
+        (False, 2, 2, 80, 48, 6 * _BLOCK_BYTES + 4 * _STATE_BYTES),
+        # Attention DP with helix: the CP ranks of one DP rank each hold the slot.
+        (True, 2, 2, 80, 48, 3 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # No helix: STATE scales by tp like the paged bytes.
+        (False, 2, 1, 80, 80, 6 * _BLOCK_BYTES + 2 * _STATE_BYTES),
+        # Attention DP without helix: one DP rank holds the request.
+        (True, 2, 1, 80, 80, 3 * _BLOCK_BYTES + 1 * _STATE_BYTES),
+    ],
+)
+def test_request_kv_bytes_counts_state_once_per_holding_rank(
+    enable_attention_dp: bool,
+    tp_size: int,
+    cp_size: int,
+    total_len: int,
+    local_len: int,
+    expected: int,
+) -> None:
+    """STATE bytes scale by the ranks that hold the request, paged bytes by the block ratio.
+
+    Each such rank has a STATE (recurrent) slot of the same size, even with no prompt block.
+    """
+    local_paged = (local_len + _TPB - 1) // _TPB * _BLOCK_BYTES
+    tc, req = _metric_transceiver(
+        _mapping(tp_size=tp_size, cp_size=cp_size, enable_attention_dp=enable_attention_dp),
+        local_len,
+        total_len,
+    )
+
+    assert tc._request_kv_bytes(req, local_paged, _STATE_BYTES) == expected
+
+
+def test_chunk_bytes_by_kind_counts_paged_per_block_and_state_once(monkeypatch) -> None:
+    """Paged views count per valid block, STATE views once, excluded views not at all."""
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
+    from tensorrt_llm._torch.disaggregation.base import CacheKind
+
+    # Each pool view stands for its own slot byte count.
+    monkeypatch.setattr(transceiver_module, "get_pool_view_slot_bytes", lambda pv: pv)
+    page_table = SimpleNamespace(
+        layer_groups=[
+            SimpleNamespace(kind=CacheKind.PAGED, pool_views=[10, 1]),
+            SimpleNamespace(kind=CacheKind.STATE, pool_views=[100]),
+        ]
+    )
+    chunk = SimpleNamespace(
+        block_ids_per_layer_groups=[np.array([3, 4, -1]), np.array([5])],
+        excluded_pool_views={(0, 1)},
+    )
+
+    paged, state = transceiver_module._chunk_bytes_by_kind(page_table, chunk)
+
+    assert (paged, state) == (2 * 10, 100)

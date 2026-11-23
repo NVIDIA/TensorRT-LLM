@@ -31,6 +31,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from pydantic import ValidationError
+from torch._dynamo.testing import CompileCounter
 
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -90,6 +91,7 @@ def _make_backend(params: SolParams, *, layer_idx: int = 1) -> SOLTrtllmAttentio
     backend.sparse_params = None
     backend._fmha_manager = SimpleNamespace(fmha_libs=[object.__new__(PrimsTSBlockSparseFmha)])
     backend.sol_params = params
+    backend.is_dense_layer = layer_idx in params.dense_layers
     backend.metadata = TrtllmAttentionMetadata(
         device=torch.device("cpu"), attention_metadata_state={}
     )
@@ -198,6 +200,7 @@ def _stub_backend(
     *,
     seq_len: int = 64,
     unsupported_reason: str | None = None,
+    layer_idx: int = 1,
 ) -> tuple[SOLTrtllmAttention, SimpleNamespace]:
     """Backend whose predictor functions are recorded mocks."""
     predictor = SimpleNamespace(
@@ -206,7 +209,7 @@ def _stub_backend(
     )
     monkeypatch.setattr(sol_predictor, "support_reason", predictor.support_reason)
     monkeypatch.setattr(sol_predictor, "predict", predictor.predict)
-    return _make_backend(params or SolParams(tau=1.0)), predictor
+    return _make_backend(params or SolParams(tau=1.0), layer_idx=layer_idx), predictor
 
 
 # --------------------------------------------------------------------------- TRTLLM backend
@@ -288,6 +291,43 @@ def test_sol_config_lowers_and_factory_initializes_backend(monkeypatch) -> None:
     assert not backend.support_fused_qkv()
     assert "forward" not in SOLTrtllmAttention.__dict__
     assert "block_sparse_attn_predict" in SOLTrtllmAttention.__dict__
+
+
+@_CPU_ONLY
+def test_sol_sparse_decision_shares_compiled_code_across_layers(monkeypatch) -> None:
+    """Compiled callers of the sparse decision reuse one graph for all sparse layers.
+
+    Each backend resolves whether it is a dense layer when it is built, so a compiled
+    caller guards on that flag rather than on ``layer_idx``.
+    """
+
+    def _core_init(self, **kwargs) -> None:
+        self.layer_idx = kwargs["layer_idx"]
+        self.head_dim = kwargs["head_dim"]
+        self.q_scaling = 1.0
+
+    monkeypatch.setattr(CoreTrtllmAttention, "__init__", _core_init)
+    params = SolParams(dense_layers=frozenset({0}))
+    backends = [
+        SOLTrtllmAttention(
+            layer_idx=layer_idx,
+            num_heads=2,
+            head_dim=128,
+            sparse_params=params,
+            attention_metadata_state=create_attention_metadata_state(),
+        )
+        for layer_idx in range(4)
+    ]
+    counter = CompileCounter()
+
+    @torch.compile(backend=counter)
+    def route(backend: SOLTrtllmAttention, x: torch.Tensor) -> torch.Tensor:
+        return x + 1 if backend.should_use_sparse(None) else x - 1
+
+    routed = [route(backend, torch.zeros(1)).item() for backend in backends]
+
+    assert routed == [-1.0, 1.0, 1.0, 1.0]
+    assert counter.frame_count == 2
 
 
 @_CPU_ONLY
@@ -405,8 +445,7 @@ def test_sol_dense_policy_returns_no_routes_without_predicting(
     timestep: float | None,
 ) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend(monkeypatch, params)
-    backend.layer_idx = layer_idx
+    backend, predictor = _stub_backend(monkeypatch, params, layer_idx=layer_idx)
 
     assert _predict(backend, q, q, q, timestep=timestep) is None
     predictor.support_reason.assert_not_called()
@@ -615,8 +654,9 @@ def test_cutedsl_sol_dense_layers_guard_skips_kernel(monkeypatch) -> None:
         raise AssertionError("kernel must not be invoked for a dense_layers-forced layer")
 
     monkeypatch.setattr(sol_backend, "_sol_attn_run", _fail_if_called)
-    backend = SOLCuTeDSLAttention(layer_idx=3, num_heads=2, head_dim=16)
-    backend.dense_layers = frozenset({3})
+    backend = SOLCuTeDSLAttention(
+        layer_idx=3, num_heads=2, head_dim=16, sparse_params=SolParams(dense_layers=frozenset({3}))
+    )
     q = k = v = torch.randn(1, 4, 2, 16)
 
     out = backend.forward(q, k, v)
@@ -697,7 +737,7 @@ def test_cutedsl_sol_dense_paths_use_cutedsl_dense_kernel(monkeypatch) -> None:
     assert calls["n"] == 1, "dense prefix was not delegated to the CuTeDSL dense kernel"
 
     backend, calls = _make()
-    backend.dense_layers = frozenset({backend.layer_idx})
+    backend.is_dense_layer = True
     backend.forward(q, k, v)
     assert calls["n"] == 1, "dense_layers guard was not delegated to the CuTeDSL dense kernel"
 
@@ -891,27 +931,24 @@ def test_sol_public_config_requires_supported_backend() -> None:
 
 
 @_CPU_ONLY
-@pytest.mark.parametrize(
-    ("backend", "quant_recipe"),
-    [
-        ("TRTLLM", {"qk_dtype": "fp8", "q_block_size": 1, "k_block_size": 1, "v_block_size": 1}),
-        ("CUTEDSL", {"qk_dtype": "bf16", "v_dtype": "fp8"}),
-    ],
-    ids=["TRTLLM", "CUTEDSL"],
-)
-def test_sol_and_attention_quantization_are_mutually_exclusive(
-    backend: str, quant_recipe: dict
-) -> None:
-    """A recipe the backend accepts on its own is still rejected next to SOL."""
+def test_sol_and_attention_quantization_compose_only_on_trtllm() -> None:
+    """TRTLLM runs SOL with its Sage recipe; CUTEDSL rejects a recipe it accepts on its own."""
 
     with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
-        AttentionConfig(
-            backend=backend, quant_attention_config=QuantAttentionConfig(**quant_recipe)
+        sage = QuantAttentionConfig(qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1)
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config=sage,
+            sparse_attention_config=SolAttentionConfig(),
         )
+        assert attention.quant_attention_config is sage
+
+        cutedsl_recipe = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")
+        AttentionConfig(backend="CUTEDSL", quant_attention_config=cutedsl_recipe)
         with pytest.raises(ValidationError, match="SOL and quant_attention_config"):
             AttentionConfig(
-                backend=backend,
-                quant_attention_config=QuantAttentionConfig(**quant_recipe),
+                backend="CUTEDSL",
+                quant_attention_config=cutedsl_recipe,
                 sparse_attention_config=SolAttentionConfig(),
             )
 

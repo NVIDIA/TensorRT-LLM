@@ -20,7 +20,7 @@ To enable chunked context, please set the `enable_chunked_prefill` in `LLM` API 
     )
 ```
 
-Note that if chunked context is enabled, please set the `max_num_tokens` to be an integer multiple of the kv-cache block size `tokens_per_block`, which defaults to 64.
+Note that if chunked context is enabled, please set the `max_num_tokens` to be an integer multiple of the kv-cache block size `tokens_per_block`. The generic `KvCacheConfig.tokens_per_block` defaults to 32, but some model and attention-backend combinations select a different block size (for example, FlashMLA uses 64 and FP4 MLA attention uses 128), so align `max_num_tokens` with the `tokens_per_block` actually in effect for your configuration.
 
 ## Chunked attention
 
@@ -33,17 +33,25 @@ Note that if chunked context is enabled, please set the `max_num_tokens` to be a
 
 Instead of splitting the input tokens into smaller chunks for the whole model, chunked attention is another method that is only applied to the attention layers in models.
 
-With chunked attention, the tokens in context requests are split into chunks of a specified size. Then tokens can only attend to other tokens in the same chunk. For example, if the chunk size is 3, we might have a mask illustrated in Figure 1. Each token only needs to attend to at most the past chunk-sized tokens. As a result, both the KV cache size and the attention computation can be significantly reduced.
+Chunked attention divides a sequence into chunks of a specified size. Each token attends only to itself and earlier tokens in its own chunk, as illustrated in Figure 1 for a chunk size of 3. This applies during context processing and, with the TRTLLM backend's native generation kernels (MMHA and TRTLLM-Gen through the XQA dispatcher), during generation. Both the KV cache size and the attention computation can be significantly reduced.
 
 Currently TensorRT LLM can only support chunked attention in llama4 model with TRTLLM attention backend. TensorRT LLM will read `attention_chunk_size` from the model config. If it is not None, the chunked attention will be enabled with chunk size `attention_chunk_size`. If you want to enable chunked attention to other models, you can set the `attention_chunk_size` in attention API to a valid value.
 
-Note that chunked attention can only be applied to context requests.
+Generation chunking is not supported by the FlashInfer TRTLLM-Gen kernels, which are preferred by default for supported configurations with beam width 1 on Blackwell (SM100/SM103), or by tree-based speculative decoding. On Hopper, Llama4 disables chunked attention in both phases when speculative decoding is enabled. For other models configured through the generic attention API, the Hopper native fallback also does not support chunked attention with linear speculative decoding: XQA rejects the chunk size, and speculative generation cannot fall back to MMHA. On the supported native generation paths, chunking is enabled by default.
+
+Chunked attention cannot be combined with an active sliding window during native generation. If the generation batch's maximum past KV length exceeds a chunked-attention layer's effective attention window, generation fails before selecting XQA or MMHA.
+
+```{warning}
+Leave `TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE` unset when using chunked attention. In the MMHA fallback, setting it to `1` disables the chunk mask but retains the chunk-size limit used to size shared memory and distribute KV work. For sequences longer than a chunk, this can cause incorrect attention results or out-of-bounds shared-memory accesses. The setting is not a safe general-purpose way to disable generation chunking in the current implementation.
+```
+
+For configurations supported by the native fallback kernels, set `TLLM_FMHA_LIBS=fallback` before initializing the model to select that path. This setting also restricts kernel selection during context processing.
 
 ## Sliding Window Attention
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/feat_long_seq_chunked_attention.png" alt="feat_long_seq_sliding_win_attn" width="240" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/feat_long_seq_sliding_win_attn.png" alt="feat_long_seq_sliding_win_attn" width="240" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Illustration of sliding window attention </em></sub></p>

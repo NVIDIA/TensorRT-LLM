@@ -19,4 +19,6 @@ l0_b200_perf_sanity:
       orchestrator: mpi
   tests:
   # gemma-4-26b-a4b-nvfp4
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gemma4_26b_a4b_nvfp4_blackwell-gemma4_26b_a4b_nvfp4_tp1_1k1k] TIMEOUT (60)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gemma4_26b_a4b_nvfp4_blackwell-gemma4_26b_a4b_nvfp4_tp1_1k1k] TIMEOUT (30)
+  # qwen3.8-flash-next-nvfp4
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_8_flash_next_fp4_blackwell-qwen3_8_flash_next_fp4_tp1_mtp3_8k1k] TIMEOUT (30)

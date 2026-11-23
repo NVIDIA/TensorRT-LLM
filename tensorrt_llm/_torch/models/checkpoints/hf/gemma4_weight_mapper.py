@@ -19,6 +19,7 @@ from torch import nn
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 _LANG_PREFIX = "model.language_model."
 _MODEL_PREFIX = "model."
@@ -29,10 +30,10 @@ _K_PROJ_KEY_RE = re.compile(
 )
 
 
-@register_mapper("HF", "Gemma4ForCausalLM")
-@register_mapper("HF", "Gemma4ForConditionalGeneration")
-@register_mapper("HF", "Gemma4UnifiedForConditionalGeneration")
-@register_mapper("HF", "Gemma4AssistantForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Gemma4ForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Gemma4ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Gemma4UnifiedForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Gemma4AssistantForCausalLM")
 class Gemma4HfWeightMapper(HfWeightMapper):
     @property
     def _is_vlm(self) -> bool:
@@ -49,13 +50,13 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         """Thread-safe override that inlines ``_duplicate_kv_weights`` with
         per-layer ``head_dim``.
 
-        Gemma4 uses per-layer head_dim (256 for sliding, 512 for full).  The
-        base class's single ``self._head_dim`` miscomputes ``num_kv_heads``
-        for full-attention layers under TP>1, and the weight mapper is
-        called concurrently from a ``ThreadPoolExecutor`` so stashing the
-        value on ``self`` would race across threads.  Instead, compute the
-        correct head_dim locally here and pass it through a per-call
-        callback bound to that layer.
+        Gemma4 uses per-layer head_dim (256 for sliding, 512 for full) and,
+        on K=V models, per-layer KV-head counts.  The base class's single
+        ``self._num_kv_heads`` cannot describe both layer types under TP>1,
+        and the weight mapper is called concurrently from a
+        ``ThreadPoolExecutor``, so stashing the value on ``self`` would race
+        across threads.  Instead, compute the correct head_dim locally here
+        and pass it through a per-call callback bound to that layer.
         """
         layer_head_dim = self._resolve_layer_head_dim(module_names_breakdown)
         if layer_head_dim is None:

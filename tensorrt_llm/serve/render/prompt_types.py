@@ -35,6 +35,14 @@ class UnsupportedRenderError(ValueError):
     """
 
 
+class HarmonyConversionError(RuntimeError):
+    """The Harmony adapter could not convert the messages (a tool without a description)."""
+
+
+class UnrenderableMessagesError(UnsupportedRenderError):
+    """The messages (object-valued tool-call arguments) can only be rendered from the raw body."""
+
+
 @dataclass
 class RenderedPrompt:
     """A prompt after chat-template rendering and, optionally, tokenization.

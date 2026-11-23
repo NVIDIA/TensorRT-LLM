@@ -1,4 +1,5 @@
 metadata:
+  architecture: DeepseekV4ForCausalLM
   model_name: deepseek_v4_pro_fp4
   precision: fp4
   model_dir_name: DeepSeek-V4-Pro

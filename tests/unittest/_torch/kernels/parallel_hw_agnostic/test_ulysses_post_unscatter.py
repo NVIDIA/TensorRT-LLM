@@ -28,6 +28,11 @@ def torch_ref(q_5d, k_5d, v_5d, is_hnd):
     return post(q_5d), post(k_5d), post(v_5d)
 
 
+def torch_ref_packed(qkv_6d, is_hnd):
+    q, k, v = qkv_6d.unbind(dim=3)
+    return torch_ref(q.contiguous(), k.contiguous(), v.contiguous(), is_hnd)
+
+
 @pytest.mark.parametrize("layout", [0, 1], ids=["HND", "NHD"])
 @pytest.mark.parametrize(
     "P,B,Sp,H,D",
@@ -118,12 +123,57 @@ def test_ulysses_post_unscatter_cross_attn_varshape(P, B, D, Sp_q, H_q, Sp_kv, H
         assert max_diff == 0, f"{name}: max_diff={max_diff} (expected exact match)"
 
 
+@pytest.mark.parametrize("layout", [0, 1], ids=["HND", "NHD"])
+@pytest.mark.parametrize(
+    "P,B,Sp,H,D",
+    [
+        (2, 1, 128, 8, 128),
+        (4, 2, 256, 16, 64),
+        (8, 1, 128, 4, 128),
+    ],
+)
+@torch.inference_mode()
+def test_ulysses_packed_qkv_post_unscatter_exact_match(P, B, Sp, H, D, layout):
+    """Packed self-attention op must exactly match unbind + eager unscatter."""
+    is_hnd = layout == 0
+    torch.manual_seed(0)
+    qkv = torch.randn(P, B, Sp, 3, H, D, device="cuda", dtype=torch.bfloat16).contiguous()
+
+    q_ref, k_ref, v_ref = torch_ref_packed(qkv, is_hnd=is_hnd)
+    q_out, k_out, v_out = torch.ops.trtllm.ulysses_packed_qkv_post_unscatter(qkv, layout)
+
+    expected_shape = (B, H, P * Sp, D) if is_hnd else (B, P * Sp, H, D)
+    assert q_out.shape == expected_shape
+    if is_hnd:
+        assert not q_out.is_contiguous() and not k_out.is_contiguous() and not v_out.is_contiguous()
+    else:
+        assert q_out.is_contiguous() and k_out.is_contiguous() and v_out.is_contiguous()
+    assert q_out.dtype == torch.bfloat16
+    for name, ref, got in [("Q", q_ref, q_out), ("K", k_ref, k_out), ("V", v_ref, v_out)]:
+        max_diff = (ref - got).abs().max().item()
+        assert max_diff == 0, f"{name}: max_diff={max_diff} (expected exact match)"
+
+
 @torch.inference_mode()
 def test_ulysses_post_unscatter_rejects_invalid_layout():
     """layout must be 0 (HND) or 1 (NHD)."""
     q = torch.randn(2, 1, 128, 8, 64, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError):
         torch.ops.trtllm.ulysses_post_unscatter_qkv(q, q, q, 2)
+
+
+@torch.inference_mode()
+def test_ulysses_packed_qkv_post_unscatter_rejects_invalid_layout():
+    qkv = torch.randn(2, 1, 128, 3, 8, 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.ulysses_packed_qkv_post_unscatter(qkv, 2)
+
+
+@torch.inference_mode()
+def test_ulysses_packed_qkv_post_unscatter_rejects_invalid_qkv_dim():
+    qkv = torch.randn(2, 1, 128, 2, 8, 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.ulysses_packed_qkv_post_unscatter(qkv)
 
 
 @torch.inference_mode()
@@ -135,9 +185,23 @@ def test_ulysses_post_unscatter_rejects_d_not_multiple_of_8():
 
 
 @torch.inference_mode()
+def test_ulysses_packed_qkv_post_unscatter_rejects_d_not_multiple_of_8():
+    qkv = torch.randn(2, 1, 128, 3, 8, 60, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.ulysses_packed_qkv_post_unscatter(qkv)
+
+
+@torch.inference_mode()
 def test_ulysses_post_unscatter_rejects_oversized_block():
     """Threads/block = H * (D/8) must be <= 1024 (CUDA hw limit)."""
     # H=128, D=128 -> 128 * 16 = 2048 threads, exceeds the 1024 hw cap.
     q = torch.randn(2, 1, 64, 128, 128, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError):
         torch.ops.trtllm.ulysses_post_unscatter_qkv(q, q, q)
+
+
+@torch.inference_mode()
+def test_ulysses_packed_qkv_post_unscatter_rejects_oversized_block():
+    qkv = torch.randn(2, 1, 64, 3, 128, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.ulysses_packed_qkv_post_unscatter(qkv)

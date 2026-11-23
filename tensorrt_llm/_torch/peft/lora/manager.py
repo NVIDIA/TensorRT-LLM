@@ -46,6 +46,7 @@ from .loaders import (
     invert_module_mapping,
     unpack_nemo_weights,
 )
+from .ownership import DecoderLoraOwner
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime import ModelConfig
@@ -145,9 +146,12 @@ class LoraModelConfig:
     hidden_size: int
     dtype: str
     swap_gate_up_proj_lora_b_weight: bool = True
+    owner: DecoderLoraOwner = DecoderLoraOwner()
 
 
-def load_torch_hf_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
+def load_torch_hf_lora(
+    lora_config: LoraConfig, *, owner: DecoderLoraOwner = DecoderLoraOwner()
+) -> Optional[torch.dtype]:
     """Load an HF LoRA checkpoint for the PyTorch workflow.
 
     Populates lora_config (trtllm_modules_to_hf_modules and inferred
@@ -155,19 +159,20 @@ def load_torch_hf_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
     loaded later by LoraManager when requests arrive with LoRA UIDs.
 
     Returns:
-        The common dense LoRA weight dtype, or ``None`` when no homogeneous
-        dense LoRA weights are present.
+        The common LoRA weight dtype, or ``None`` when no homogeneous LoRA
+        weights are present.
     """
     if not lora_config.trtllm_modules_to_hf_modules:
         lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
-    lora_loader = HfLoraLoader(lora_config.lora_dir)
+    lora_loader = HfLoraLoader(lora_config.lora_dir, owner=owner)
+    inferred_target_modules = lora_loader.get_target_modules(
+        lora_config.trtllm_modules_to_hf_modules
+    )
 
     if len(lora_config.lora_target_modules) == 0:
-        lora_config.lora_target_modules = lora_loader.get_target_modules(
-            lora_config.trtllm_modules_to_hf_modules
-        )
+        lora_config.lora_target_modules = inferred_target_modules
 
     if len(lora_config.lora_target_modules) == 0:
         raise ValueError(
@@ -177,10 +182,12 @@ def load_torch_hf_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
 
     missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
     lora_config.lora_target_modules.extend(missing_qkv_modules)
-    return lora_loader.get_dense_lora_dtype()
+    return lora_loader.get_lora_dtype()
 
 
-def load_torch_nemo_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
+def load_torch_nemo_lora(
+    lora_config: LoraConfig, *, owner: DecoderLoraOwner = DecoderLoraOwner()
+) -> Optional[torch.dtype]:
     """Load NeMo LoRA checkpoint for PyTorch workflow.
 
     This is a PyTorch-specific loader for NeMo LoRA checkpoints, similar to
@@ -204,7 +211,7 @@ def load_torch_nemo_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
     lora_config.trtllm_modules_to_hf_modules = {"attn_qkv": "attn_qkv"}
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
-    lora_loader = NemoLoraLoader(lora_config.lora_dir)
+    lora_loader = NemoLoraLoader(lora_config.lora_dir, owner=owner)
 
     if not lora_loader.is_valid:
         raise ValueError(f"Failed to load NeMo LoRA from {lora_config.lora_dir}")
@@ -225,10 +232,13 @@ def load_torch_nemo_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
             f"but got unsupported modules: {unsupported_modules}. "
             f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
         )
+    lora_loader.validate_weights()
     return None
 
 
-def load_torch_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
+def load_torch_lora(
+    lora_config: LoraConfig, *, owner: DecoderLoraOwner = DecoderLoraOwner()
+) -> Optional[torch.dtype]:
     """Load LoRA checkpoint for PyTorch workflow.
 
     This function routes to the appropriate loader based on lora_ckpt_source.
@@ -243,9 +253,9 @@ def load_torch_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
         ValueError: If lora_ckpt_source is not supported
     """
     if lora_config.lora_ckpt_source == "nemo":
-        return load_torch_nemo_lora(lora_config)
+        return load_torch_nemo_lora(lora_config, owner=owner)
     elif lora_config.lora_ckpt_source == "hf":
-        return load_torch_hf_lora(lora_config)
+        return load_torch_hf_lora(lora_config, owner=owner)
     else:
         raise ValueError(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}. "
@@ -420,13 +430,15 @@ class LoraManager(object):
         self.lora_target_modules = model_config.lora_target_modules
 
         def load_from_model_file(uid, model_file):
+            _, nemo_weights = unpack_nemo_weights(model_file)
+            all_lora_weights = get_all_nemo_lora_weights(
+                nemo_weights, owner=getattr(model_config, "owner", DecoderLoraOwner())
+            )
+
             if uid not in self._cpp_lora_weights:
                 self._cpp_lora_weights[uid] = []  # Will be converted to tensor later
             if uid not in self._cpp_lora_config:
                 self._cpp_lora_config[uid] = []  # Will be converted to tensor later
-
-            _, nemo_weights = unpack_nemo_weights(model_file)
-            all_lora_weights = get_all_nemo_lora_weights(nemo_weights)
 
             self._lora_uid_to_low_ranks[uid] = {}
             self._lora_weights_pointers_list[uid] = {}
@@ -667,7 +679,13 @@ class LoraManager(object):
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
             lora_model = preprocess_lora_weights(lora_model, model_config)
-            all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
+            all_weights = get_all_hf_lora_weights(
+                lora_model,
+                hf_modules,
+                component,
+                owner=getattr(model_config, "owner", DecoderLoraOwner()),
+                hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
+            )
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
             model_dtype = str_dtype_to_torch(model_config.dtype)
@@ -680,14 +698,17 @@ class LoraManager(object):
                         for weights in module_weights.values()
                         if "out" in weights
                     }
-                    return next(iter(output_dtypes)) if len(output_dtypes) == 1 else model_dtype
+                    if len(output_dtypes) > 1:
+                        dtype_names = ", ".join(sorted(str(dtype) for dtype in output_dtypes))
+                        raise ValueError(
+                            f"MoE LoRA experts must have one output dtype; {model_dir} has {dtype_names}."
+                        )
+                    return next(iter(output_dtypes)) if output_dtypes else model_dtype
                 return module_weights["out"].dtype if "out" in module_weights else model_dtype
 
             def uses_native_fp8(module_weights):
                 return (
-                    get_output_dtype(module_weights) == torch.float8_e4m3fn
-                    and not _is_moe_module_weights(module_weights)
-                    and supports_native_fp8
+                    get_output_dtype(module_weights) == torch.float8_e4m3fn and supports_native_fp8
                 )
 
             for layer_weights in all_weights.values():
@@ -718,8 +739,8 @@ class LoraManager(object):
                 dtype_names = ", ".join(sorted(str(dtype) for dtype in cache_dtypes))
                 raise ValueError(
                     "A LoRA adapter must use one PEFT cache dtype across all modules; "
-                    f"{model_dir} requires {dtype_names}. Mixing native FP8 dense modules "
-                    "with compute-dtype modules such as routed-expert MoE is not supported."
+                    f"{model_dir} requires {dtype_names}. Mixing native FP8 modules "
+                    "with compute-dtype modules is not supported."
                 )
 
             cpp_lora_weights = []

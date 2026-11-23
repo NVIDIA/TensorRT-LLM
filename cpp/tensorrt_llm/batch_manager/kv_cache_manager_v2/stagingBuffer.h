@@ -41,10 +41,24 @@ enum class StagingBufferMemory
 
 struct DeviceDeleter
 {
-    void operator()(std::byte* ptr) const noexcept;
+    void operator()(void* ptr) const noexcept;
 };
 
-using CudaUniqPtr = std::unique_ptr<std::byte, DeviceDeleter>;
+template <typename T = std::byte>
+using CudaUniqPtr = std::unique_ptr<T, DeviceDeleter>;
+
+template <typename T = std::byte>
+CudaUniqPtr<T> allocateDeviceMemory(size_t size)
+{
+    // Null for an empty request, which cuMemAlloc refuses: a caller whose size is a
+    // computed extent can then allocate unconditionally and hold null for "none".
+    CUdeviceptr ptr = 0;
+    if (size != 0)
+    {
+        cuCheck(cuMemAlloc(&ptr, sizeof(T) * size));
+    }
+    return CudaUniqPtr<T>{reinterpret_cast<T*>(ptr)};
+}
 
 struct StagingBufferRange;
 
@@ -133,7 +147,7 @@ private:
     void retire(StagingBufferRange* range, CachedCudaEvent readyEvent) noexcept;
 
     size_t mSize;
-    std::variant<StaticHostMem, CudaUniqPtr> mMemoryOwner;
+    std::variant<StaticHostMem, CudaUniqPtr<std::byte>> mMemoryOwner;
     // Full spatial partition; retired fragments retain their previous temporal owner event.
     std::list<StagingBufferRange> mRanges;
     std::list<StagingBufferRange>::iterator mHead;

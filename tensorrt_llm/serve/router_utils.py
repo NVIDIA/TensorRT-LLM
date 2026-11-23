@@ -17,12 +17,21 @@ Extracted from ``router.py`` so the surface routers there can share a single
 implementation of block hashing without importing the whole router module.
 """
 
+import base64
 import os
+import sys
 from collections import OrderedDict
-from typing import Iterable, List, Optional, Union
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional, Union
+
+import numpy as np
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
+from tensorrt_llm.inputs.utils import ChatRejectedError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import kv_cache_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -32,17 +41,22 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
-    tokenize_chat_request_for_serving,
     uses_harmony_tokenization,
 )
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ResponsesRequest,
+)
 from tensorrt_llm.serve.render import (
+    HarmonyConversionError,
     PreparedContext,
     RenderResources,
+    UnrenderableMessagesError,
     UnsupportedRenderError,
     fingerprint_mismatch,
-    legacy_render_enabled,
     render_chat,
+    render_chat_for_length,
     worker_resolves_thinking,
 )
 
@@ -60,8 +74,14 @@ KV_CACHE_HASH_ALGOS = frozenset(
 hash_v1_block_key = kv_cache_hash.hash_v1_block_key
 truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
-OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
+OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest, ResponsesRequest]
 BlockHash = Union[int, str]
+
+# Checkpoint formats whose servers take the tokenizer, the input processor and the model
+# configuration from the checkpoint's Mistral-native files (mistral-common's tekken.json and
+# params.json), not from its Hugging Face files.
+_MISTRAL_NATIVE_FORMATS = frozenset({CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3})
+_MISTRAL_TOKENIZER_MODULE = "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer"
 
 __all__ = [
     "KV_CACHE_HASH_ALGO_DEFAULT",
@@ -73,70 +93,36 @@ __all__ = [
     "truncate_sha256_hash_to_int64",
     "OpenAIRequest",
     "BlockHash",
+    "responses_request_text",
     "get_request_num_tokens",
     "block_key_hasher",
     "BlockHashMixin",
-    "PrefixBlockSet",
 ]
 
 
-class PrefixBlockSet:
-    """Single-owner block-hash index -- a flat ``set`` of held block hashes.
+def responses_request_text(request: ResponsesRequest) -> str:
+    """Return the instructions and input as ``role:content`` lines, like a chat request's text.
 
-    A KV-cache block hash folds in its parent chain (the worker computes it with
-    ``BlockKeyHasher.hash(block_key, parent_hash)``), so every block-hash *value*
-    is globally unique to one position in one prefix path. A request's ordered
-    block-hash list is itself the prefix path, so longest-common-prefix against a
-    set of held blocks is just "walk the list until the first hash the owner
-    doesn't hold" -- no explicit tree needed.
-
-    This is the exact structure the orchestrator ``KvCacheAwareServerState`` uses
-    (a ``set[block_hash]`` per server, walked until the first miss). It is the
-    right index whenever there is only ONE logical owner -- e.g. the centralized
-    router's per-instance ``combined_trie`` (owner = instance) and each rank's
-    trie (owner = that rank). Those are only ever queried for a single owner's
-    prefix depth (:meth:`match_one`), so a ``hash -> {owner}`` reverse map with
-    per-depth set intersections would be pure overhead here.
-
-    The ``owner_id`` argument on :meth:`add` / :meth:`remove` / :meth:`match_one`
-    is accepted and ignored so this is a drop-in for the single-owner call sites.
+    A later turn re-sends the earlier turns' input, so its text extends theirs.
     """
+    from tensorrt_llm.serve.responses_utils import chat_messages_from_responses_input
 
-    __slots__ = ("_blocks",)
-
-    def __init__(self) -> None:
-        self._blocks: set[int] = set()
-
-    def add(self, owner_id: str, block_hashes: Iterable[int]) -> None:
-        self._blocks.update(block_hashes)
-
-    def remove(self, owner_id: str, block_hashes: Iterable[int]) -> None:
-        self._blocks.difference_update(block_hashes)
-
-    def remove_worker(self, owner_id: str) -> None:
-        self._blocks.clear()
-
-    def match_one(self, owner_id: str, block_hashes: List[int]) -> int:
-        """Consecutive prefix-block count held by the (single) owner.
-
-        Identical to ``KvCacheAwareServerState.matched_tokens``: walk the query
-        path, counting blocks present in the set, and stop at the first miss.
-        """
-        blocks = self._blocks
-        depth = 0
-        for h in block_hashes:
-            if h not in blocks:
-                break
-            depth += 1
-        return depth
-
-    def has_worker(self, owner_id: str) -> bool:
-        return bool(self._blocks)
+    messages = chat_messages_from_responses_input(request, [])
+    return "\n".join(f"{m.get('role', '')}:{m.get('content', '')}" for m in messages)
 
 
 def get_request_num_tokens(request: Optional[OpenAIRequest]) -> int:
     if request is None:
         return 0
+
+    if isinstance(request, ResponsesRequest):
+        # Without relayed token ids the text is counted in characters, as a
+        # string completion prompt is below, which weighs a request several
+        # times what its token count would. A router sees one kind only: the
+        # context router routes before any ids exist, and the generation
+        # router gets them relayed (context-first) or never (generation-first).
+        token_ids = request.relayed_prompt_token_ids()
+        return len(responses_request_text(request) if token_ids is None else token_ids)
 
     if (
         request.disaggregated_params is None
@@ -179,6 +165,15 @@ def block_key_hasher(
     return hash_v1_block_key(token_ids, parent_hash=parent, cache_salt_id=cache_salt_id)
 
 
+@dataclass(frozen=True)
+class WriteBackDecision:
+    """Whether rendered ids may be forwarded to the workers, and what blocks them if not."""
+
+    allowed: bool
+    mismatched: dict[str, str] = field(default_factory=dict)  # server -> reason
+    needs_prompt_text: list[str] = field(default_factory=list)  # reasoning parser reads the prompt
+
+
 class BlockHashMixin:
     """Shared tokenization and block-hash computation.
 
@@ -192,7 +187,19 @@ class BlockHashMixin:
         tokenizer_dir: Optional[str] = None,
         use_harmony: Optional[bool] = None,
         model_path: Optional[str] = None,
+        enable_tokenization_cache: bool = False,
+        checkpoint_format: Optional[str] = None,
+        revision: Optional[str] = None,
     ) -> None:
+        """Set up tokenization for block hashing.
+
+        ``checkpoint_format`` is the servers' checkpoint format. For a Mistral-native one
+        (``mistral``, ``mistral_large_3``) the router loads the tokenizer and the rendering
+        resources from the checkpoint as the servers do (``RenderResources.load``); for any
+        other it loads the Hugging Face tokenizer. ``revision`` is the servers' model
+        revision, at which the router reads a Mistral-native checkpoint given as a Hugging
+        Face Hub ID.
+        """
         env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
@@ -204,13 +211,27 @@ class BlockHashMixin:
         self._tokenizer_dir = tokenizer_dir
         self._model_path = model_path
         self._use_harmony = use_harmony
+        self._checkpoint_format = checkpoint_format
+        self._revision = revision
+        self._tok_prefix_cache: OrderedDict = OrderedDict()
+        self._enable_tokenization_cache = enable_tokenization_cache
+        # id(tokenizer) -> (tokenizer, its prefix token cache or None)
+        self._prefix_token_caches: dict[int, tuple[object, Optional[PrefixTokenCache]]] = {}
         logger.info(
             f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
             f", custom_tokenizer={self._custom_tokenizer}"
             f", model_path={self._model_path}"
+            f", checkpoint_format={self._checkpoint_format}"
+            f", revision={self._revision}"
             f", use_harmony={self._use_harmony}"
+            f", enable_tokenization_cache={self._enable_tokenization_cache}"
         )
+
+    @property
+    def _mistral_native(self) -> bool:
+        """Whether the servers load a Mistral-native checkpoint (see ``_init_block_hashing``)."""
+        return getattr(self, "_checkpoint_format", None) in _MISTRAL_NATIVE_FORMATS
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
@@ -218,6 +239,11 @@ class BlockHashMixin:
             # Only an operator-configured tokenizer directory may run remote
             # tokenizer code; request model values are client-controlled.
             trust_remote_code = self._tokenizer_dir is not None
+            if self._mistral_native:
+                # The servers' own tokenizer wrapper (mistral-common's, for a Mistral-native
+                # checkpoint), which encodes as they do; its ``.tokenizer`` is not a
+                # Hugging Face tokenizer. Shared by every model name (see _render_key).
+                return self._render_resources(model).tokenizer
             if self._custom_tokenizer:
                 from tensorrt_llm.tokenizer import load_custom_tokenizer
 
@@ -232,20 +258,49 @@ class BlockHashMixin:
                 tokenizer = load_hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
                 if tokenizer is None:
                     raise ValueError(f"Could not load a tokenizer from {model_path!r}.")
-                self._tokenizers[model] = tokenizer.tokenizer
+                # load_hf_tokenizer imports mistral-common's wrapper before it returns one;
+                # importing it here for every other tokenizer would load the model packages.
+                mistral = sys.modules.get(_MISTRAL_TOKENIZER_MODULE)
+                if mistral is None or not isinstance(tokenizer, mistral.MistralTokenizer):
+                    self._tokenizers[model] = tokenizer.tokenizer
+                else:
+                    # A Mistral-native directory loads as mistral-common's wrapper, whose
+                    # ``.tokenizer`` is not a Hugging Face tokenizer: keep the wrapper, as for
+                    # a custom tokenizer. Without the format there is no renderer for its chats.
+                    logger.warning(
+                        f"Router reads {model_path!r} as a Mistral-native checkpoint but has no "
+                        "Mistral-native checkpoint_format: it tokenizes completions as the "
+                        "servers do and routes chats on no ids. Give it the servers' "
+                        "checkpoint_format (mistral or mistral_large_3) to route chats on "
+                        "their ids."
+                    )
+                    self.__dict__.setdefault("_mistral_native_dirs", set()).add(model)
+                    self._tokenizers[model] = tokenizer
         return self._tokenizers[model]
 
+    def _prefix_token_cache(self, tokenizer) -> Optional[PrefixTokenCache]:
+        """The prefix token cache of ``tokenizer`` with enable_tokenization_cache, else None."""
+        if not self._enable_tokenization_cache:
+            return None
+        entry = self._prefix_token_caches.get(id(tokenizer))
+        if entry is None or entry[0] is not tokenizer:
+            entry = (tokenizer, create_prefix_token_cache(tokenizer))
+            self._prefix_token_caches[id(tokenizer)] = entry
+        return entry[1]
+
     def _encode_with_prefix_cache(self, rendered: str, key: int, tokenizer) -> list[int]:
-        cache = getattr(self, "_tok_prefix_cache", None)
-        if cache is None:
-            cache = self._tok_prefix_cache = OrderedDict()
+        cache = self._tok_prefix_cache
         entry = cache.get(key)
         if entry is not None and rendered == entry[0]:
             ids = entry[1]
         else:
-            # Tokenizing a suffix independently is not generally composable:
-            # BPE/SentencePiece merges can cross the cached string boundary.
-            ids = tokenizer.encode(rendered, add_special_tokens=False)
+            prefix_token_cache = self._prefix_token_cache(tokenizer)
+            if prefix_token_cache is not None:
+                ids = prefix_token_cache.encode(tokenizer, rendered)
+            else:
+                # Tokenizing a suffix independently is not generally composable:
+                # BPE/SentencePiece merges can cross the cached string boundary.
+                ids = tokenizer.encode(rendered, add_special_tokens=False)
         cache[key] = (rendered, ids)
         cache.move_to_end(key)
         while len(cache) > 1024:
@@ -285,27 +340,80 @@ class BlockHashMixin:
 
         return encode_rendered
 
-    def _tokenize_chat_legacy(
-        self, request: ChatCompletionRequest, set_prompt_token_ids: bool = True
-    ) -> list[int]:
-        """The pre-merge router renderer (``TRTLLM_RENDER_LEGACY=1``)."""
+    def _length_chat_ids(self, request: ChatCompletionRequest) -> list[int]:
+        """Routing ids from :func:`render_chat_for_length`; never forwarded to a worker.
 
-        def tokenizer_factory() -> object:
-            return self._get_tokenizer(request.model)
+        A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
+        template rejects raises; one the model's own renderer rejects (``ChatRejectedError``:
+        mistral-common, for a Mistral-native checkpoint) gets no ids, and the worker answers it.
+        So do the chats of a Mistral-native directory read without the servers' checkpoint
+        format, which this router cannot render.
+        """
+        resources = self._render_resources(request.model)
+        if request.model in self.__dict__.get("_mistral_native_dirs", ()):
+            logger.debug(
+                "Router cannot render the chats of a Mistral-native directory without its "
+                "checkpoint format; routing on no ids."
+            )
+            return []
+        try:
+            return render_chat_for_length(
+                request,
+                resources,
+                encode_rendered=self._make_encode_rendered(request),
+            ).token_ids
+        except (UnsupportedRenderError, HarmonyConversionError, ChatRejectedError) as error:
+            logger.debug(f"Router has no length for the request ({error}); routing on no ids.")
+            return []
 
-        return tokenize_chat_request_for_serving(
-            request,
-            tokenizer_factory=tokenizer_factory,
-            encode_rendered=self._make_encode_rendered(request),
-            use_harmony=self._use_harmony,
-            model_type_resolver=self._get_model_type,
-            set_prompt_token_ids=set_prompt_token_ids,
+    def _render_key(self, model: str) -> str:
+        """What ``model``'s rendering resources are cached under.
+
+        A Mistral-native router loads the configured checkpoint whatever model name a
+        client sends, so it keys them by that checkpoint; any other router by the name.
+        """
+        if self._mistral_native:
+            return self._model_path or self._tokenizer_dir or model
+        return model
+
+    def _mistral_native_checkpoint_dir(self, key: str) -> str:
+        """The local directory of the Mistral-native checkpoint ``key`` names.
+
+        A server given a Hugging Face Hub ID reads the snapshot of that repo at its revision,
+        and the native configuration loader reads only local directories. The router reads
+        the same snapshot's rendering files: the configuration (``params.json``) and the
+        mistral-common tokenizer file (``tekken.json`` or a SentencePiece ``*.model*``), not
+        the weights. A model name a client sends is not resolved.
+        """
+        if Path(key).is_dir() or key not in (self._model_path, self._tokenizer_dir):
+            return key
+        from tensorrt_llm.llmapi.utils import download_hf_partial
+
+        return str(
+            download_hf_partial(
+                key,
+                allow_patterns=["params.json", "tekken.json", "*.model*"],
+                revision=self._revision,
+            )
         )
 
     def _render_resources(self, model: str) -> RenderResources:
         """Rendering resources of this router for ``model``, built once."""
         cache = self.__dict__.setdefault("_render_resources_cache", {})
-        resources = cache.get(model)
+        key = self._render_key(model)
+        resources = cache.get(key)
+        if resources is None and self._mistral_native:
+            # What a server of this checkpoint loads: the tokenizer and input processor of
+            # the checkpoint format, and the model type from its native configuration.
+            resources = cache[key] = RenderResources.load(
+                self._mistral_native_checkpoint_dir(key),
+                tokenizer=self._tokenizer_dir,
+                trust_remote_code=self._tokenizer_dir is not None,
+                custom_tokenizer=self._custom_tokenizer,
+                checkpoint_format=self._checkpoint_format,
+                # As for from_tokenizer: the worker polices request-level templates.
+                allow_request_chat_template=True,
+            )
         if resources is None:
             try:
                 model_type = self._get_model_type()
@@ -332,12 +440,12 @@ class BlockHashMixin:
                 use_harmony=use_harmony,
                 custom_tokenizer=self._custom_tokenizer,
             )
-            cache[model] = resources
+            cache[key] = resources
         return resources
 
-    def _may_write_back_token_ids(
+    def _write_back_decision(
         self, model: str, resolved_thinking: Optional[dict[str, bool]] = None
-    ) -> bool:
+    ) -> "WriteBackDecision":
         """Whether prompt ids rendered here may replace the worker's own rendering.
 
         Only when every active worker reports the same rendering fingerprint as
@@ -349,9 +457,9 @@ class BlockHashMixin:
         off the prompt. A forwarded request has no prompt text for the worker to read it from,
         so ids go only to workers whose own parser does not need it.
 
-        The workers whose rendering differs are left in ``_write_back_blockers``, by server with
-        the reason; the workers that need the prompt text for the reasoning mode, in
-        ``_thinking_blockers``.
+        This runs on several threads at once (``_tokenize`` is called through
+        ``asyncio.to_thread``), so the decision and the reasons for it are built from local
+        values and returned, never kept on the instance.
         """
         published = self.__dict__.get("_published_render_fingerprints")
         servers = list(getattr(self, "_servers", None) or [])
@@ -365,26 +473,31 @@ class BlockHashMixin:
             # fetch leaves a worker active with no entry, and it must not be skipped.
             info = getattr(self, "_server_info", None) or {}
             remote = [(info.get(server) or {}).get("render_fingerprint") for server in servers]
-        self._write_back_blockers = {}
-        self._thinking_blockers = []
         if not remote:
-            return False
+            return WriteBackDecision(allowed=False)
         cache = self.__dict__.setdefault("_render_fingerprint_cache", {})
-        local = cache.get(model)
+        key = self._render_key(model)
+        local = cache.get(key)
         if local is None:
-            local = cache[model] = self._render_resources(model).fingerprint()
+            local = cache[key] = self._render_resources(model).fingerprint()
+        mismatched: dict[str, str] = {}
         for server, fingerprint in zip(servers, remote):
             reason = fingerprint_mismatch(local, fingerprint)
             if reason is not None:
-                self._write_back_blockers[server] = reason
-        if self._write_back_blockers:
-            return False
-        self._thinking_blockers = [
+                mismatched[server] = reason
+        if mismatched:
+            return WriteBackDecision(allowed=False, mismatched=mismatched)
+        needs_prompt_text = [
             server
             for server, fingerprint in zip(servers, remote)
             if worker_resolves_thinking(fingerprint, resolved_thinking or {})
         ]
-        return not self._thinking_blockers
+        return WriteBackDecision(allowed=not needs_prompt_text, needs_prompt_text=needs_prompt_text)
+
+    def _may_write_back_token_ids(
+        self, model: str, resolved_thinking: Optional[dict[str, bool]] = None
+    ) -> bool:
+        return self._write_back_decision(model, resolved_thinking).allowed
 
     def set_published_render_fingerprints(self, fingerprints: dict[str, Optional[dict]]) -> None:
         """Worker fingerprints (summaries) a disagg coordinator published, by server."""
@@ -394,19 +507,35 @@ class BlockHashMixin:
         """Render a chat request with the shared core and decide on write-back."""
         if request.prompt_token_ids is not None:
             return list(request.prompt_token_ids)
+        if request.prompt_token_ids_b64:
+            # The context worker's ids, which the orchestrator relays to the generation worker
+            # with gen_tokids_ctxbytes. That worker serves them instead of the messages, which
+            # gen_strip_message_history cuts to the last one, so they are not rendered here.
+            return np.frombuffer(
+                base64.b64decode(request.prompt_token_ids_b64), dtype=np.int32
+            ).tolist()
+        # Outside the fallbacks below: resources that cannot be loaded are a configuration
+        # error, not a request the router cannot render.
+        resources = self._render_resources(request.model)
         try:
             rendered = render_chat(
                 request,
-                self._render_resources(request.model),
+                resources,
                 tokenize=True,
                 encode_rendered=self._make_encode_rendered(request),
             )
+        except UnrenderableMessagesError as error:
+            # The exact render spent the request's message iterators; the worker has the raw body.
+            logger.debug(f"Router could not render the messages ({error}); routing on no ids.")
+            return []
         except (UnsupportedRenderError, ValueError) as error:
-            # Media, a model the renderer does not support, or a request a serving extension
-            # rejects (kimi_k3 parameter policy, dynamic tools): route on an estimate and let
-            # the worker render the request itself, and answer it.
-            logger.debug(f"Router could not render the request ({error}); routing on an estimate.")
-            return self._tokenize_chat_legacy(request, set_prompt_token_ids=False)
+            # Media, an unsupported model, or an extension rejection: route on its text.
+            logger.debug(f"Router could not render the request exactly ({error}).")
+            return self._length_chat_ids(request)
+        except HarmonyConversionError as error:
+            # The router has no tokenizer for Harmony to fall back to; the worker answers it.
+            logger.debug(f"Router could not convert the messages ({error}); routing on no ids.")
+            return []
         # A forwarded request is an ordinary chat request carrying prompt_token_ids, so the
         # worker cannot see the rendered text and decides nothing from it: usage adjustments
         # (kimi_k3) and reasoning modes read off the prompt are lost. Ids whose serving
@@ -419,14 +548,17 @@ class BlockHashMixin:
             request_reason = "a named tool_choice is rendered by the worker"
         elif context.prompt_tokens_excluded_from_usage:
             request_reason = "the worker adjusts the reported prompt usage from the prompt text"
-        if request_reason is None and self._may_write_back_token_ids(
-            request.model, context.resolved_thinking
-        ):
+        decision = (
+            None
+            if request_reason is not None
+            else self._write_back_decision(request.model, context.resolved_thinking)
+        )
+        if decision is not None and decision.allowed:
             request.prompt_token_ids = rendered.token_ids
             self._last_fallback_reason = None
             return rendered.token_ids
-        blockers = getattr(self, "_write_back_blockers", None) or {}
-        thinking_blockers = getattr(self, "_thinking_blockers", None) or []
+        blockers = decision.mismatched if decision is not None else {}
+        thinking_blockers = decision.needs_prompt_text if decision is not None else []
         if request_reason is not None:
             logger.debug(f"Router rendered prompt ids are not forwarded: {request_reason}.")
         elif not blockers and thinking_blockers:
@@ -451,10 +583,11 @@ class BlockHashMixin:
         return rendered.token_ids
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
+        if isinstance(request, ResponsesRequest):
+            return [self._tokenize_responses_request(request)]
+
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
-            if legacy_render_enabled():
-                return [self._tokenize_chat_legacy(request)]
             return [self._tokenize_chat(request)]
 
         # Handle CompletionRequest (has prompt)
@@ -476,6 +609,45 @@ class BlockHashMixin:
         # skips re-tokenization
         request.prompt = token_lists if len(token_lists) > 1 else token_lists[0]
         return token_lists
+
+    def _tokenize_responses_request(self, request: ResponsesRequest) -> list[int]:
+        """Return the token ids of the prompt a worker builds for a Responses request.
+
+        The ids only drive routing and are not stored on the request, so the
+        context worker still renders the prompt itself.
+        """
+        token_ids = request.relayed_prompt_token_ids()
+        if token_ids is not None:
+            return token_ids
+        from tensorrt_llm.serve import responses_utils
+
+        # A disaggregated server rejects previous_response_id, so there is no
+        # stored history: the input is the whole conversation.
+        if uses_harmony_tokenization(
+            use_harmony=self._use_harmony, model_type_resolver=self._get_model_type
+        ):
+            return responses_utils._render_for_completion(
+                responses_utils._construct_harmony_messages(request, None)
+            )
+        tools = responses_utils._get_chat_completion_function_tools(request.tools)
+        # As on the worker, developer messages render as system for a chat
+        # template that has no developer role.
+        messages = responses_utils._render_developer_as_system(
+            responses_utils.chat_messages_from_responses_input(request, []),
+            self._get_tokenizer(request.model),
+            None,
+            [tool.model_dump() for tool in tools],
+        )
+        chat_request = ChatCompletionRequest.model_construct(
+            model=request.model,
+            messages=messages,
+            tools=tools,
+            chat_template_kwargs=responses_utils.reasoning_chat_template_kwargs(request),
+            injected_chat_template_kwargs=list(
+                responses_utils.reasoning_injected_chat_template_keys(request)
+            ),
+        )
+        return self._tokenize(chat_request)[0]
 
     def _compute_block_hashes(
         self,

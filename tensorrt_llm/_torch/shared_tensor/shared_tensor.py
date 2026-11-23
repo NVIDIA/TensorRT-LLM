@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import base64
 import itertools
 import logging
@@ -6,12 +9,7 @@ import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
-from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
-from torch.multiprocessing.reductions import (rebuild_cuda_tensor,
-                                              rebuild_storage_filename,
-                                              rebuild_tensor,
-                                              rebuild_typed_storage,
-                                              reduce_storage, reduce_tensor)
+from torch.multiprocessing import reductions
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +86,8 @@ class _SharedTensorRebuildMethodRegistry:
     def initialize(cls):
         """Initialize the registry with common rebuild methods."""
         # Register common methods with fixed keys
-        cls._registry[cls.REBUILD_CUDA] = rebuild_cuda_tensor
-        cls._registry[cls.REBUILD_CPU] = rebuild_tensor
+        cls._registry[cls.REBUILD_CUDA] = reductions.rebuild_cuda_tensor
+        cls._registry[cls.REBUILD_CPU] = reductions.rebuild_tensor
 
     @classmethod
     def register(cls, method: Callable) -> int:
@@ -101,9 +99,9 @@ class _SharedTensorRebuildMethodRegistry:
         Returns:
             The numeric key assigned to the method
         """
-        if method == rebuild_cuda_tensor:
+        if method == reductions.rebuild_cuda_tensor:
             return cls.REBUILD_CUDA
-        if method == rebuild_tensor:
+        if method == reductions.rebuild_tensor:
             return cls.REBUILD_CPU
         raise NotImplementedError("Other rebuild methods are not supported yet")
 
@@ -326,9 +324,9 @@ class SharedTensorContainer:
                                 storage_handle, tensor_info['storage_size'],
                                 str_to_torch_dtype(
                                     tensor_info['storage_dtype']))
-            storage = rebuild_storage_filename(*storage_metadata)
+            storage = reductions.rebuild_storage_filename(*storage_metadata)
             if not isinstance(storage, torch.storage.TypedStorage):
-                storage = rebuild_typed_storage(
+                storage = reductions.rebuild_typed_storage(
                     storage, str_to_torch_dtype(tensor_info['storage_dtype']))
 
             meta_data = (tensor_info['tensor_storage_offset'],
@@ -371,7 +369,7 @@ class SharedTensorContainer:
                 "local_token": token,
                 "producer_pid": os.getpid()
             })
-        rebuild_method, tensor_handle = reduce_tensor(tensor)
+        rebuild_method, tensor_handle = reductions.reduce_tensor(tensor)
         method_key = _SharedTensorRebuildMethodRegistry.register(rebuild_method)
         return cls(method_key, tensor_handle)
 
@@ -433,6 +431,18 @@ class SharedTensorContainer:
             self.method_key)
         return rebuild_method(*self.tensor_handle)
 
+    @classmethod
+    def release_dict(cls, tensor_info: Dict[str, Any]) -> None:
+        """Consume an exported handle that will not be delivered to a consumer."""
+        if tensor_info[
+                'method_key'] == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+            torch.UntypedStorage._release_ipc_counter(
+                base64.b64decode(tensor_info['ref_counter_handle']),
+                tensor_info['ref_counter_offset'],
+                device=tensor_info['storage_device'])
+        else:
+            cls.from_dict(tensor_info).get_local_view()
+
     def dump_to_dict(self) -> Dict[str, Any]:
         """Convert this container to a dictionary for direct IPC (Producer side).
 
@@ -452,18 +462,16 @@ class SharedTensorContainer:
             tensor_dict = SharedTensorContainer.cuda_handle_to_dict(
                 self.tensor_handle)
         elif self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
-            sharing_strategy = get_sharing_strategy()
-            # Here we use file_system sharing strategy to make it serializable between two non-python independent processes
-            set_sharing_strategy("file_system")
             storage = self.tensor_handle[1]
             meta_data = self.tensor_handle[2]
-            storage_handle = reduce_storage(storage)
-            # restore the original sharing strategy
-            set_sharing_strategy(sharing_strategy)
-            # exclude the first element which is the type of the storage
-            storage_metadata = storage_handle[-1][1:]
+            # Use filename sharing directly without changing PyTorch's process-wide strategy.
+            storage_metadata = storage._share_filename_cpu_() + (
+                storage.dtype, )
             tensor_dict = SharedTensorContainer.cpu_handle_to_dict(
                 meta_data, storage_metadata)
+            reductions.shared_cache[
+                storage_metadata[1]] = reductions.StorageWeakRef(storage)
+            storage._shared_incref()
         else:
             raise ValueError(f"Unsupported tensor device: {self.method_key}")
 

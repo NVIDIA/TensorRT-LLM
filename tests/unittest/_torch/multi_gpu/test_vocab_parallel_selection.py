@@ -1,0 +1,737 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Vocab-parallel token selection must match selection on the gathered logits.
+
+Every rank holds a vocab shard of the logits. The vocab-parallel argmax and the
+DSpark Markov chain must give the ids ``torch.argmax`` gives on the gathered
+logits (ties to the lowest global index, NaN first), and the Gumbel-max sampler
+the draw a single shard holding the whole vocab gives, on every rank, eagerly
+and under CUDA-graph replay, over the MNNVL and the default all-reduce.
+"""
+
+import os
+import pickle
+import platform
+import sys
+import traceback
+from types import SimpleNamespace
+from typing import Callable
+
+import cloudpickle
+import pytest
+import torch
+from _torch.helpers import dspark_markov_chain_logits_reference
+from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_pre_hopper
+
+import tensorrt_llm
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.distributed.ops import allgather
+from tensorrt_llm._torch.modules.embedding import LMHead
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm._torch.speculative.vocab_parallel import (
+    VocabParallelHead,
+    VocabShardedLogits,
+    _PairExchange,
+    _select_tokens,
+    markov_chain_logits,
+    markov_sampled_chain,
+    tp_pair_exchange,
+)
+from tensorrt_llm.mapping import Mapping
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(
+    cloudpickle.dumps,
+    cloudpickle.loads,
+    pickle.HIGHEST_PROTOCOL,
+)
+
+pytestmark = pytest.mark.threadleak(enabled=False)
+
+# The MNNVL all-reduce needs fabric-backed NVLink memory (GB200/GB300).
+_MNNVL = pytest.param(
+    True,
+    id="mnnvl",
+    marks=pytest.mark.skipif(
+        platform.machine().lower() != "aarch64" or not MnnvlMemory.supports_mnnvl(),
+        reason="needs fabric-backed MNNVL",
+    ),
+)
+_EXCHANGES = [pytest.param(False, id="auto"), _MNNVL]
+
+HIDDEN = 256
+SHARD = 3000  # not a multiple of the 2048-wide kernel tile
+
+
+def _run(fn, *args):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    # _make_head sets TLLM_TEST_MNNVL in this pooled MPI worker; later tasks on
+    # the same worker must see the value it had before.
+    saved_mnnvl = os.environ.get("TLLM_TEST_MNNVL")
+    try:
+        # The exchanges may return NCCL-window tensors, whose leases must end in a
+        # tensor scope and whose graph captures need a window graph-pool owner (the
+        # model engine and its CUDA-graph runner provide both). The scope is only
+        # active with a CUDA tensor among its inputs.
+        with discard_nccl_window_tensor_outputs(torch.empty(1, device="cuda")):
+            fn(rank, *args)
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        if saved_mnnvl is None:
+            os.environ.pop("TLLM_TEST_MNNVL", None)
+        else:
+            os.environ["TLLM_TEST_MNNVL"] = saved_mnnvl
+    return True
+
+
+def _make_head(rank, tp, mnnvl):
+    # Selects MNNVL for the pair all-reduce on a single node.
+    os.environ["TLLM_TEST_MNNVL"] = "1" if mnnvl else "0"
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    vocab = SHARD * tp
+    lm_head = LMHead(
+        vocab,
+        HIDDEN,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        gather_output=True,
+    ).cuda()
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    full = (torch.randn(vocab, HIDDEN, device="cuda", generator=gen) * 0.05).to(torch.bfloat16)
+    lm_head.weight.data.copy_(full[rank * SHARD : (rank + 1) * SHARD])
+    assert VocabParallelHead.supports(lm_head)
+    head = VocabParallelHead(lm_head)
+    assert (head._exchange.all_reduce.mnnvl_allreduce is not None) == mnnvl
+    return head, vocab
+
+
+def _capture(fn, inputs):
+    """A CUDA graph of ``fn()`` and its output, captured as the CUDA-graph runner does.
+
+    An eager warm-up whose NCCL-window buffers are released first, then the capture
+    under a window graph-pool owner, which reuses those buffers.
+    """
+    with discard_nccl_window_tensor_outputs(inputs):
+        fn()
+    graph = torch.cuda.CUDAGraph()
+    with nccl_window_graph_capture(graph, torch.cuda.graph_pool_handle()):
+        out = fn()
+    return graph, out
+
+
+def _shard(full, rank):
+    return full[..., rank * SHARD : (rank + 1) * SHARD].contiguous()
+
+
+def _special_rows(full):
+    """Ties across shards, all -inf, NaN and +inf rows."""
+    vocab = full.shape[-1]
+    full[0] = 1.0
+    full[1] = -float("inf")
+    full[2, vocab - 1] = float("nan")
+    full[2, SHARD + 5] = float("nan")
+    full[3, 2 * SHARD - 1] = float("inf")
+    full[3, vocab - 2] = float("inf")
+    full[4] = 0.0
+    full[4, vocab - 1] = 2.0
+    full[4, 1] = 2.0
+    return full
+
+
+@torch.inference_mode()
+def _argmax_check(rank, tp, mnnvl):
+    head, vocab = _make_head(rank, tp, mnnvl)
+    for rows in (1, 7, 64, 300):
+        gen = torch.Generator(device="cuda").manual_seed(rows)
+        full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+        if rows >= 5:
+            full = _special_rows(full)
+        local = _shard(full, rank)
+        expected = torch.argmax(full.float(), dim=-1)
+        assert torch.equal(head.argmax(local), expected)
+        assert torch.equal(head.argmax(local, out_dtype=torch.int32), expected.to(torch.int32))
+        # The gather fallback reproduces the gathered logits bit for bit.
+        assert torch.equal(
+            head.gather_logits(local).view(torch.int32), full.float().view(torch.int32)
+        )
+    # Through the real LM head, and under CUDA-graph replay.
+    hidden = torch.randn(48, HIDDEN, device="cuda").to(torch.bfloat16)
+    expected = torch.argmax(head.lm_head(hidden).float(), dim=-1)
+    assert torch.equal(head.argmax(head.local_logits(hidden)), expected)
+    graph, out = _capture(lambda: head.argmax(head.local_logits(hidden)), hidden)
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+
+
+@torch.inference_mode()
+def _sample_check(rank, tp, mnnvl):
+    # A Triton kernel holds a lock, so cloudpickle cannot ship it as a global of this check.
+    from tensorrt_llm._torch.speculative.vocab_parallel import _local_sample_kernel
+
+    head, vocab = _make_head(rank, tp, mnnvl)
+    for rows in (1, 64, 257):
+        gen = torch.Generator(device="cuda").manual_seed(rows)
+        full = (torch.randn(rows, vocab, device="cuda", generator=gen) * 2).to(torch.bfloat16)
+        temps = torch.full((rows,), 0.9, device="cuda")
+        temps[::4] = 1e-5  # greedy rows inside a sampled batch
+        seeds = torch.randint(0, 1 << 40, (rows,), device="cuda", generator=gen)
+        offsets = torch.arange(rows, dtype=torch.int64, device="cuda") * 32
+        out = head.sample(_shard(full, rank), temps, seeds, offsets, 1e-4)
+        # The draw of one shard holding the whole vocab: the noise is keyed by
+        # the global vocab id, so the split over ranks cannot change it.
+        single = _select_tokens(
+            _local_sample_kernel,
+            full,
+            (temps, seeds, offsets, 1e-4),
+            0,
+            _PairExchange(None, 1, 0),
+            torch.int64,
+        )
+        assert torch.equal(out, single)
+        assert torch.equal(out[::4], torch.argmax(full.float(), dim=-1)[::4])
+        gathered = MPI.COMM_WORLD.allgather(out.cpu())
+        assert all(torch.equal(g, gathered[0]) for g in gathered)
+    # Through the spec-worker wrapper.
+    sharded = VocabShardedLogits(head, _shard(full, rank))
+    md = SimpleNamespace(
+        is_all_greedy_sample=True, temperatures=temps, seeds=seeds, offsets=offsets
+    )
+    assert torch.equal(sharded.select_tokens(md), torch.argmax(full.float(), dim=-1))
+    md.is_all_greedy_sample = False
+    assert torch.equal(sharded.select_tokens(md), single)
+
+
+def _markov_reference(full, anchors, w1, w2):
+    biased = dspark_markov_chain_logits_reference(full.float(), anchors, w1, w2)
+    return torch.argmax(biased, dim=-1).to(torch.int32)
+
+
+@torch.inference_mode()
+def _markov_check(rank, tp, mnnvl):
+    head, vocab = _make_head(rank, tp, mnnvl)
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    for num_reqs, block in ((1, 1), (1, 7), (4, 7), (32, 6), (128, 6)):
+        full = (torch.randn(num_reqs, block, vocab, device="cuda", generator=gen) * 3).to(
+            torch.bfloat16
+        )
+        anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+        if num_reqs > 1:
+            anchors[0] = -1  # out-of-vocab anchor: zero bias
+        expected = _markov_reference(full, anchors, w1, w2)
+        assert torch.equal(head.markov_tokens(_shard(full, rank), anchors, w1, w2), expected)
+
+    # The biased shard logits of a vocab-sharded draft head.
+    def global_argmax(step_logits):
+        gathered = MPI.COMM_WORLD.allgather(step_logits.cpu())
+        return torch.cat(gathered, dim=-1).argmax(dim=-1).cuda()
+
+    exchange = tp_pair_exchange(head.lm_head.mapping, AllReduceStrategy.NCCL)
+    full = torch.randn(6, 7, vocab, device="cuda", generator=gen) * 3
+    anchors = torch.randint(0, vocab, (6,), device="cuda", generator=gen)
+    local = _shard(full, rank)
+    biased = markov_chain_logits(local, anchors, w1, w2, exchange)
+    # The eager chain on the shard: this rank's markov_w2 rows, global argmax.
+    expected = dspark_markov_chain_logits_reference(
+        local, anchors, w1, w2[rank * SHARD : (rank + 1) * SHARD], argmax_fn=global_argmax
+    )
+    assert torch.equal(biased.view(torch.int32), expected.view(torch.int32))
+    # Quantized logits and a zero bias make many cross-shard ties.
+    full = torch.randint(0, 3, (16, 6, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+    anchors = torch.randint(0, vocab, (16,), device="cuda", generator=gen)
+    zero_w2 = torch.zeros_like(w2)
+    assert torch.equal(
+        head.markov_tokens(_shard(full, rank), anchors, w1, zero_w2),
+        _markov_reference(full, anchors, w1, zero_w2),
+    )
+    # CUDA-graph replay.
+    full = (torch.randn(8, 6, vocab, device="cuda", generator=gen) * 3).to(torch.bfloat16)
+    local = _shard(full, rank)
+    anchors = torch.randint(0, vocab, (8,), device="cuda", generator=gen)
+    expected = _markov_reference(full, anchors, w1, w2)
+    graph, out = _capture(lambda: head.markov_tokens(local, anchors, w1, w2), (local, anchors))
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+
+
+@torch.inference_mode()
+def _markov_sampled_check(rank, tp, mnnvl):
+    """The sampled Markov chain draws the same tokens and stores the same proposals on every
+    rank, from the TP-gathered FP32 draft logits and BF16 Markov weights, as one GPU does
+    from the full logits."""
+    del mnnvl  # The chain runs on the gathered logits; no pair exchange is involved.
+    vocab = SHARD * tp
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    num_reqs, block = 8, 7
+    full = torch.randn(num_reqs, block, vocab, device="cuda", generator=gen) * 3
+    anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+    anchors[0] = -1  # out-of-vocab anchor: zero bias
+    temperatures = torch.tensor([0.0, 0.6, 1.0, 1.0, 1.5, 0.3, 1.0, 2.0], device="cuda")
+    seeds = torch.randint(0, 2**31, (num_reqs,), device="cuda", generator=gen)
+    offsets = torch.randint(0, 2**20, (block, num_reqs), device="cuda", generator=gen)
+    slots = torch.randperm(num_reqs + 2, device="cuda", generator=gen)[:num_reqs]
+
+    def chain(logits):
+        probs = torch.zeros(num_reqs + 2, block, vocab + 64, device="cuda")
+        tokens = markov_sampled_chain(
+            logits, anchors, w1, w2, temperatures, seeds, offsets, probs, slots
+        )
+        return tokens, probs[slots, :, :vocab]
+
+    # The worker gathers the TP-sharded draft logits before the chain.
+    gathered = allgather(_shard(full, rank).view(-1, SHARD), mapping, dim=-1)
+    tokens, probs = chain(gathered.view(num_reqs, block, vocab))
+    ref_tokens, ref_probs = chain(full)
+    assert torch.equal(tokens, ref_tokens)
+    assert torch.equal(probs.view(torch.int32), ref_probs.view(torch.int32))
+    # Every rank holds the same draws and proposals.
+    all_tokens = MPI.COMM_WORLD.allgather(tokens.cpu())
+    all_probs = MPI.COMM_WORLD.allgather(probs.cpu())
+    for other_tokens, other_probs in zip(all_tokens, all_probs):
+        assert torch.equal(other_tokens, all_tokens[0])
+        assert torch.equal(other_probs.view(torch.int32), all_probs[0].view(torch.int32))
+    # The greedy row stores its one-hot; sampled rows are normalized and hold their draws.
+    assert torch.equal(
+        probs[0], torch.nn.functional.one_hot(tokens[0].long(), vocab).to(probs.dtype)
+    )
+    torch.testing.assert_close(probs.sum(-1), torch.ones(num_reqs, block, device="cuda"))
+    assert (probs.gather(-1, tokens.long().unsqueeze(-1)) > 0).all()
+
+
+@torch.inference_mode()
+def _worker_accept_check(rank, tp, mnnvl):
+    """Strict acceptance on shard logits equals acceptance on gathered logits."""
+
+    class _Worker(SpecWorkerBase):
+        @property
+        def max_draft_len(self):
+            return 8
+
+        def _forward_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+    head, vocab = _make_head(rank, tp, mnnvl)
+    num_ctx, num_gens, draft_len = 2, 6, 6
+    rows = num_ctx + num_gens * (draft_len + 1)
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    full = torch.randint(0, 5, (rows, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+    target = torch.argmax(full.float(), dim=-1)[num_ctx:].view(num_gens, draft_len + 1)
+    draft = target[:, :draft_len].clone().to(torch.int32)
+    draft[1::2, 2] = (draft[1::2, 2] + 1) % vocab
+    md = SimpleNamespace(
+        is_all_greedy_sample=True,
+        is_cuda_graph=False,
+        is_ragged_verify=False,
+        sharded_target_logits=False,
+    )
+    worker = _Worker()
+    batch = num_ctx + num_gens
+    ref = worker._sample_and_accept_draft_tokens_base(full.float(), draft, num_ctx, batch, md)
+    out = worker._sample_and_accept_draft_tokens_base(
+        VocabShardedLogits(head, _shard(full, rank)), draft, num_ctx, batch, md
+    )
+    assert torch.equal(out[0][:num_ctx, 0], ref[0][:num_ctx, 0])
+    assert torch.equal(out[0][num_ctx:], ref[0][num_ctx:])
+    assert torch.equal(out[1], ref[1])
+
+
+@torch.inference_mode()
+def _worker_argmax_check(rank, tp, mnnvl):
+    """The vocab-parallel greedy argmax of the stock one-model workers
+    (``SpecWorkerBase.enable_vocab_parallel_argmax``), through the TP key
+    exchange and through the NCCL pair exchange: target and draft tokens equal
+    ``torch.argmax`` over the gathered logits, ties included, eagerly and under
+    CUDA-graph replay."""
+    from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
+    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+
+    class _Worker(SpecWorkerBase):
+        verifies_on_target_shard = True
+
+        @property
+        def max_draft_len(self):
+            return 4
+
+        def _forward_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+    head, vocab = _make_head(rank, tp, mnnvl)
+    lm_head = head.lm_head
+    mapping = lm_head.mapping
+    key_exchange = TPKeyExchange.create(mapping, max_rows=512)
+    assert key_exchange is not None, "no peer memory for the key exchange"
+    try:
+        for use_key_exchange in (True, False):
+            worker = _Worker()
+            assert worker.enable_vocab_parallel_argmax(
+                lm_head, key_exchange if use_key_exchange else None
+            )
+            assert (worker.key_exchange is not None) == use_key_exchange
+            assert worker._target_head_mapping is mapping
+            worker.mapping = mapping  # the draft head's TP rank
+            for rows in (1, 7, 64, 300):
+                gen = torch.Generator(device="cuda").manual_seed(rows)
+                full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(
+                    torch.bfloat16
+                )
+                if rows >= 5:
+                    full = _special_rows(full)
+                    # NaN logits do not occur in decoding; the key exchange
+                    # orders them by their bit pattern.
+                    full[2] = 0.0
+                expected = torch.argmax(full.float(), dim=-1).to(torch.int32)
+                assert torch.equal(worker._sharded_argmax(_shard(full, rank)), expected)
+
+            # Through target_logits and the target sampler, from the real head.
+            md = SimpleNamespace(
+                is_all_greedy_sample=True,
+                temperature_only=False,
+                enable_penalty=False,
+                sharded_target_logits=False,
+                is_cuda_graph=False,
+                is_ragged_verify=False,
+            )
+            hidden = torch.randn(48, HIDDEN, device="cuda").to(torch.bfloat16)
+            expected = torch.argmax(lm_head(hidden).float(), dim=-1).to(torch.int32)
+
+            def target_tokens():
+                logits = worker.target_logits(hidden, lm_head, LogitsProcessor(), None, md, None)
+                assert md.sharded_target_logits and logits.shape[-1] == SHARD
+                return worker._sample_tokens_for_batch(logits, md, 0, hidden.shape[0])
+
+            assert torch.equal(target_tokens(), expected)
+            graph, out = _capture(target_tokens, hidden)
+            for _ in range(3):
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out, expected)
+
+            # Greedy draft tokens of a vocab-sharded draft head, then d2t.
+            gen = torch.Generator(device="cuda").manual_seed(3)
+            full = torch.randint(-4, 4, (33, vocab), device="cuda", generator=gen).to(
+                torch.bfloat16
+            )
+            full[0] = 1.0  # tied across every shard: id 0
+            full[1, SHARD - 1] = full[1, vocab - 1] = 9.0  # tied across shards: id SHARD - 1
+            worker._d2t = torch.arange(vocab, device="cuda") % 7
+            draft_md = SimpleNamespace(
+                wants_advanced_draft_sampling=False,
+                draft_vocab_size=vocab,
+                vocab_size=vocab,
+                is_cuda_graph=False,
+            )
+            greedy = torch.argmax(full.float(), dim=-1)
+            assert greedy[:2].tolist() == [0, SHARD - 1]
+            draft = worker.sample_draft_tokens(_shard(full, rank), draft_md, full.shape[0])
+            assert torch.equal(draft, (greedy + worker._d2t[greedy]).to(torch.int32))
+            gathered = MPI.COMM_WORLD.allgather(draft.cpu())
+            assert all(torch.equal(g, gathered[0]) for g in gathered)
+    finally:
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        key_exchange.close()
+
+
+FUSED_HIDDEN = 2560  # a multiple of 512, not of 1024: the 512-element pipeline stages
+FUSED_SHARD = 5000
+
+
+def _fused_draft_head_check(rank, tp):
+    from unittest import mock
+
+    from tensorrt_llm._torch.modules import bf16_draft_head
+
+    # The test shard is far below the production minimum; restored however the check ends (the
+    # pooled MPI worker runs later tasks).
+    with mock.patch.object(bf16_draft_head, "MIN_SHARD_BYTES", 0):
+        _fused_draft_head_body(rank, tp)
+
+
+@torch.inference_mode()
+def _fused_draft_head_body(rank, tp):
+    """The fused BF16 draft head (``trtllm::lm_head_argmax``) on a TP key-exchange channel shared
+    with the GEMM + shard argmax path: the same greedy draft tokens as that path and as
+    ``torch.argmax`` over the gathered logits (ties to the lowest global id), for 1..max rows,
+    with d2t, a late rank, and under CUDA-graph replay; the fallbacks decline the head."""
+    from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
+
+    class _Worker(SpecWorkerBase):
+        verifies_on_target_shard = True
+
+        @property
+        def max_draft_len(self):
+            return 4
+
+        def _forward_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def _fused_draft_lm_head(self, draft_model):
+            return draft_model.lm_head
+
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    vocab = FUSED_SHARD * tp
+    lm_head = LMHead(
+        vocab,
+        FUSED_HIDDEN,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        gather_output=True,
+    ).cuda()
+    # Small integers times a power of two: every dot product is exact in fp32, so the bf16 logits
+    # of any GEMM are the same and their (many) ties are real.
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    full = torch.randint(-2, 3, (vocab, FUSED_HIDDEN), device="cuda", generator=gen) / 16.0
+    full[[3, FUSED_SHARD - 1, vocab - 1]] = 2 / 16.0  # the largest row, on several shards
+    lm_head.weight.data.copy_(full[rank * FUSED_SHARD : (rank + 1) * FUSED_SHARD])
+    key_exchange = TPKeyExchange.create(mapping, max_rows=512)
+    assert key_exchange is not None, "no peer memory for the key exchange"
+    try:
+        worker = _Worker()
+        assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange)
+        worker.mapping = mapping  # the draft head's TP rank
+        worker.build_fused_draft_head(SimpleNamespace(lm_head=lm_head))
+        head = worker.fused_draft_head
+        assert head is not None and head.max_rows == 8
+        draft_md = SimpleNamespace(
+            wants_advanced_draft_sampling=False,
+            draft_vocab_size=vocab,
+            vocab_size=vocab,
+            is_cuda_graph=False,
+        )
+
+        def gemm_path(x):
+            return worker.sample_draft_tokens(lm_head(x, gather_output=False), draft_md, x.shape[0])
+
+        for rows in range(1, head.max_rows + 1):
+            gen = torch.Generator(device="cuda").manual_seed(rows)
+            x = torch.randint(-3, 4, (rows, FUSED_HIDDEN), device="cuda", generator=gen).to(
+                torch.bfloat16
+            )
+            x[0] = 1.0  # rows 3, FUSED_SHARD - 1 and vocab - 1 tie at the maximum: id 3
+            expected = torch.argmax(lm_head(x).float(), dim=-1).to(torch.int32)
+            assert expected[0].item() == 3
+            assert worker._fused_draft_head_for(rows, draft_md) is head
+            if rank == rows % tp:
+                torch.cuda._sleep(5_000_000)  # a late rank: the others poll for its keys
+            # The fused head and the GEMM path take turns on the same exchange channel.
+            fused = worker._fused_draft_tokens(head, x)
+            assert torch.equal(gemm_path(x), expected)
+            assert torch.equal(fused, expected), (rows, fused, expected)
+            gathered = MPI.COMM_WORLD.allgather(fused.cpu())
+            assert all(torch.equal(g, gathered[0]) for g in gathered)
+
+        # Strided rows, a caller's output buffer, and d2t after the global argmax.
+        x = torch.randn(16, FUSED_HIDDEN, device="cuda").to(torch.bfloat16)[::2]
+        expected = torch.argmax(lm_head(x).float(), dim=-1)
+        out = torch.empty(x.shape[0], dtype=torch.int32, device="cuda")
+        assert worker._fused_draft_tokens(head, x, out=out) is out
+        assert torch.equal(out, expected.to(torch.int32))
+        worker._d2t = torch.arange(vocab, device="cuda") % 7
+        assert torch.equal(
+            worker._fused_draft_tokens(head, x), (expected + worker._d2t[expected]).to(torch.int32)
+        )
+        assert torch.equal(worker._fused_draft_tokens(head, x), gemm_path(x))
+        worker._d2t = None
+
+        # CUDA-graph replay of both paths on the shared channel.
+        x = torch.randn(4, FUSED_HIDDEN, device="cuda").to(torch.bfloat16)
+        expected = torch.argmax(lm_head(x).float(), dim=-1).to(torch.int32)
+        graph, outs = _capture(
+            lambda: (worker._fused_draft_tokens(head, x), gemm_path(x), head.sample(x)), x
+        )
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert all(torch.equal(o, expected) for o in outs)
+        # A weight refit (in place, then the rebuild) keeps the head the graph holds: replays
+        # see the new weights.
+        lm_head.weight.data.neg_()
+        worker.build_fused_draft_head(SimpleNamespace(lm_head=lm_head))
+        assert worker.fused_draft_head is head
+        expected = torch.argmax(lm_head(x).float(), dim=-1).to(torch.int32)
+        for _ in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert all(torch.equal(o, expected) for o in outs)
+        lm_head.weight.data.neg_()
+
+        # Fallbacks: more rows than a launch takes, advanced draft sampling, guided decoding.
+        assert worker._fused_draft_head_for(head.max_rows + 1, draft_md) is None
+        draft_md.wants_advanced_draft_sampling = True
+        assert worker._fused_draft_head_for(1, draft_md) is None
+        draft_md.wants_advanced_draft_sampling = False
+        worker.guided_decoder = object()
+        assert worker._fused_draft_head_for(1, draft_md) is None
+        worker.guided_decoder = None
+        # Without the vocab-parallel argmax (kill switch), no fused head is built.
+        plain = _Worker()
+        plain.build_fused_draft_head(SimpleNamespace(lm_head=lm_head))
+        assert plain.fused_draft_head is None
+    finally:
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        key_exchange.close()
+
+
+@pytest.mark.timeout(300, method="thread")
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "mpi_pool_executor",
+    [
+        pytest.param(2, marks=pytest.mark.skipif(torch.cuda.device_count() < 2, reason="2 GPUs")),
+        pytest.param(4, marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="4 GPUs")),
+    ],
+    indirect=True,
+)
+def test_fused_draft_head(mpi_pool_executor):
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_run, *zip(*[(_fused_draft_head_check, tp)] * tp))
+    assert all(results)
+
+
+_CHECKS = {
+    "argmax": _argmax_check,
+    "sample": _sample_check,
+    "markov": _markov_check,
+    "markov_sampled": _markov_sampled_check,
+    "worker_accept": _worker_accept_check,
+    "worker_argmax": _worker_argmax_check,
+}
+# Checks that run at TP2 only: what they add over the other checks (the worker
+# plumbing) does not depend on the TP size.
+_TP2_ONLY_CHECKS = {"worker_argmax"}
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("mnnvl", _EXCHANGES)
+@pytest.mark.parametrize("check", list(_CHECKS))
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_vocab_parallel_selection_tp2(check, mnnvl, mpi_pool_executor):
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp, mnnvl)] * tp))
+    assert all(results)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize("mnnvl", _EXCHANGES)
+@pytest.mark.parametrize("check", [c for c in _CHECKS if c not in _TP2_ONLY_CHECKS])
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_vocab_parallel_selection_tp4(check, mnnvl, mpi_pool_executor):
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp, mnnvl)] * tp))
+    assert all(results)
+
+
+# About 10 ms of GPU time: long enough for the other rank's Lamport kernel to
+# read the late rank's part of its buffer before that rank writes it.
+_LATE_RANK_SLEEP_CYCLES = 20_000_000
+_MODEL_HIDDEN = 6144
+
+
+@torch.inference_mode()
+def _after_large_allreduce_check(rank: int, tp: int, order: str) -> None:
+    """The pair exchange right after a large bf16 one-shot all-reduce, and the reverse.
+
+    The model's bf16 all-reduces and the float32 pair exchange share the
+    mapping's Lamport workspace, and each call clears the sub-buffer of the
+    call before it by the size that call left there. ``bf16_then_fp32`` runs
+    the exchange right after a bf16 call filling 0.9x the workspace, where
+    clearing more than the bf16 call wrote runs into a live sub-buffer.
+    ``fp32_then_bf16`` runs a large exchange, then small bf16 calls and a
+    large bf16 call on the exchange's sub-buffer, where clearing less leaves
+    stale values that the large call takes as already arrived. One rank per
+    round starts each call late, so the other rank reads its part of the
+    buffer before it arrives and takes any stale value.
+    """
+    head, vocab = _make_head(rank, tp, mnnvl=False)
+    mapping = head.lm_head.mapping
+    # Untuned AUTO runs the exchange on NCCL; the autotuner profiles it on the
+    # one-shot kernel at warm-up, right after the model's bf16 all-reduces.
+    head._exchange = tp_pair_exchange(mapping, AllReduceStrategy.ONESHOT)
+    model_allreduce = AllReduce(mapping, strategy=AllReduceStrategy.ONESHOT, dtype=torch.bfloat16)
+    max_bytes = CustomAllReduceHelper.max_workspace_size_auto(tp, support_deterministic=False)
+    big_rows = int(0.9 * max_bytes) // (_MODEL_HIDDEN * torch.bfloat16.itemsize)
+
+    def exchange(rows: int, seed: int) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+        expected = torch.argmax(full.float(), dim=-1)
+        return lambda: head.argmax(_shard(full, rank)), expected
+
+    def model(rows: int, seed: int) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
+        # Small integers sum exactly in bf16, so any stale or cleared element
+        # shows up.
+        parts = [
+            torch.randint(
+                -8,
+                9,
+                (rows, _MODEL_HIDDEN),
+                device="cuda",
+                generator=torch.Generator(device="cuda").manual_seed(seed + r),
+            ).to(torch.bfloat16)
+            for r in range(tp)
+        ]
+        expected = torch.stack(parts).float().sum(dim=0).to(torch.bfloat16)
+        return lambda: model_allreduce(parts[rank]), expected
+
+    if order == "bf16_then_fp32":
+        calls = [(model, big_rows), (exchange, 64), (exchange, 1), (model, 8)]
+    else:
+        # The large call lands on the exchange's sub-buffer three calls later.
+        calls = [(exchange, 8192), (model, 8), (model, 8), (model, big_rows), (model, 8)]
+    for step, (make, rows) in enumerate(calls * 3):
+        run, expected = make(rows, 100 * step)
+        if rank == step // len(calls) % tp:
+            torch.cuda._sleep(_LATE_RANK_SLEEP_CYCLES)
+        out = run()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected), (
+            f"step {step} {make.__name__} rows={rows}: "
+            f"{(out != expected).sum().item()} of {expected.numel()} differ"
+        )
+
+
+# A wrong clear size can hang the ranks inside the kernel; the thread method
+# ends the session with a failure instead of waiting on the MPI pool.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("order", ["bf16_then_fp32", "fp32_then_bf16"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_vocab_parallel_exchange_after_large_allreduce(
+    order: str, mpi_pool_executor: MPIPoolExecutor
+) -> None:
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_run, *zip(*[(_after_large_allreduce_check, tp, order)] * tp))
+    assert all(results)

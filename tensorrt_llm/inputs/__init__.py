@@ -6,14 +6,14 @@ from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .evs import (compute_retained_tokens_count,
                   compute_retained_tokens_from_tubelet_budget,
                   compute_retention_mask)
-from .multimodal import MultimodalInput
+from .multimodal import (MultimodalInput, MultimodalItemMetadata,
+                         MultimodalItemPartition)
 from .multimodal_data import AudioData, BaseModalityData, VideoData
 # yapf and isort conflict on the following import blocks
 # yapf: disable
 from .registry import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalEncoderItemMetadata,
-                       MultimodalPlaceholderMetadata,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, create_input_processor,
                        create_input_processor_with_hash,
                        maybe_compute_mm_embed_cumsum, register_input_processor,
@@ -53,7 +53,8 @@ __all__ = [
     "ExtraProcessedInputs",
     "BaseMultimodalDummyInputsBuilder",
     "BaseMultimodalInputProcessor",
-    "MultimodalEncoderItemMetadata",
+    "MultimodalItemMetadata",
+    "MultimodalItemPartition",
     "MultimodalPlaceholderMetadata",
     "MultimodalPlaceholderPlacement",
     "ConversationMessage",

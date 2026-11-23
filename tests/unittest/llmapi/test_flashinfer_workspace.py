@@ -39,13 +39,13 @@ def _isolate_flashinfer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         _FLASHINFER_CUBIN_ENV,
         _FLASHINFER_ISOLATION_ENV,
         _FLASHINFER_MANAGED_ENV,
+        "TRTLLM_CACHE_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
 
 
 def _worker_flashinfer_env() -> tuple[str | None, str | None]:
-    mpi_session.mpi4py.MPI.COMM_WORLD.barrier()
-    return (os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV))
+    return os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV)
 
 
 def _run_worker_bootstrap(monkeypatch: pytest.MonkeyPatch, workspace_root: Path) -> None:
@@ -212,8 +212,8 @@ _ISOLATED_WORKER_ARGS = [
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
-        (1, {}, _PLAIN_WORKER_ARGS),
-        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, _PLAIN_WORKER_ARGS),
+        (1, {}, _ISOLATED_WORKER_ARGS),
+        (1, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (4, {}, _ISOLATED_WORKER_ARGS),
         (4, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (

@@ -13,6 +13,8 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.runtime_lora import apply_runtime_lora
 from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 class TinyTransformer(nn.Module):
     def __init__(self) -> None:

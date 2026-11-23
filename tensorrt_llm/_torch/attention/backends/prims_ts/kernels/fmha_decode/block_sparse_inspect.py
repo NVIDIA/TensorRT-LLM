@@ -15,7 +15,7 @@
 """Validate paged request metadata and canonical BSR for one-shot planning.
 
 A BSR Q-block row is one ``block_indptr`` row keyed by
-``(batch, kv_head, q_block)``. The maximum row width gives the one-shot API the
+``(batch, pattern head, q_block)``. The maximum row width gives the one-shot API the
 same semantic ``max_blocks_per_row`` bound that reusable plans receive from
 their caller. Token-mask contents belong to the run-time prepare kernel and
 are not read here.
@@ -28,9 +28,12 @@ summary; no route payload is constructed.
 
 import functools
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+from ..._compile_cache import build_and_load_attention_kernel
+
 import torch
 from cuda.bindings import driver as cuda_drv
 
@@ -52,6 +55,29 @@ _BSR_ERROR_INDEX_OUT_OF_RANGE = 2
 _BSR_ERROR_INVALID_INDPTR = 3
 _ERROR_INVALID_SEQ_LEN = 4
 _ERROR_INVALID_PHYSICAL_PAGE_ID = 5
+
+
+@dataclass(frozen=True)
+class _BlockSparseInspectCompileSpec:
+    """Static BSR geometry shared by equivalent inspection specializations."""
+
+    batch_size: int
+    num_pattern_heads: int
+    num_q_block_rows: int
+    num_kv_blocks: int
+
+
+@dataclass(frozen=True)
+class _PagedBlockSparseInspectCompileSpec:
+    """Static BSR geometry, paging divisors, and request-validation bounds."""
+
+    batch_size: int
+    num_pattern_heads: int
+    num_q_block_rows: int
+    minimum_seq_len_kv: int
+    max_seq_len_kv: int
+    kv_block_size: int
+    page_size: int
 
 
 @cute.jit
@@ -92,7 +118,7 @@ def _inspect_bsr_row(
     block_indptr: cute.Tensor,
     block_indices: cute.Tensor,
     batch_idx: cutlass.Int32,
-    kv_head_idx: cutlass.Int32,
+    pattern_head_idx: cutlass.Int32,
     q_block_row_idx: cutlass.Int32,
     lane_idx: cutlass.Int32,
     bsr_row_is_valid: cutlass.Boolean,
@@ -105,10 +131,10 @@ def _inspect_bsr_row(
     row_range_is_valid = cutlass.Int32(0)
     if lane_idx == cutlass.Int32(0) and bsr_row_is_valid:
         bsr_row_begin = cutlass.Int32(
-            block_indptr[batch_idx, kv_head_idx, q_block_row_idx]
+            block_indptr[batch_idx, pattern_head_idx, q_block_row_idx]
         )
         bsr_row_end = cutlass.Int32(
-            block_indptr[batch_idx, kv_head_idx, q_block_row_idx + 1]
+            block_indptr[batch_idx, pattern_head_idx, q_block_row_idx + 1]
         )
         row_range_is_valid = cutlass.Int32(
             bsr_row_begin >= cutlass.Int32(0)
@@ -141,7 +167,7 @@ def _inspect_live_paged_bsr_row(
     block_indices: cute.Tensor,
     seq_lens_kv: cute.Tensor,
     batch_idx: cutlass.Int32,
-    kv_head_idx: cutlass.Int32,
+    pattern_head_idx: cutlass.Int32,
     q_block_row_idx: cutlass.Int32,
     lane_idx: cutlass.Int32,
     bsr_row_is_valid: cutlass.Boolean,
@@ -162,7 +188,7 @@ def _inspect_live_paged_bsr_row(
         block_indptr,
         block_indices,
         batch_idx,
-        kv_head_idx,
+        pattern_head_idx,
         q_block_row_idx,
         lane_idx,
         bsr_row_is_valid,
@@ -178,13 +204,13 @@ class _InspectBlockSparseBsr:
         self,
         *,
         batch_size: int,
-        num_kv_heads: int,
+        num_pattern_heads: int,
         seq_len_q: int,
         seq_len_kv: int | None,
         q_block_size: int,
         kv_block_size: int,
     ) -> None:
-        self.num_kv_heads = num_kv_heads
+        self.num_pattern_heads = num_pattern_heads
         self.num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
         self.num_kv_blocks = (
             0
@@ -192,7 +218,9 @@ class _InspectBlockSparseBsr:
             else (seq_len_kv + kv_block_size - 1) // kv_block_size
         )
         self.kv_block_size = kv_block_size
-        self.total_bsr_row_count = batch_size * num_kv_heads * self.num_q_block_rows
+        self.total_bsr_row_count = (
+            batch_size * num_pattern_heads * self.num_q_block_rows
+        )
 
     @cute.jit
     def _launch(
@@ -238,15 +266,15 @@ class _InspectBlockSparseBsr:
         )
         q_block_row_idx = safe_linear_bsr_row_idx % self.num_q_block_rows
         linear_batch_head_idx = safe_linear_bsr_row_idx // self.num_q_block_rows
-        kv_head_idx = linear_batch_head_idx % self.num_kv_heads
-        batch_idx = linear_batch_head_idx // self.num_kv_heads
+        pattern_head_idx = linear_batch_head_idx % self.num_pattern_heads
+        batch_idx = linear_batch_head_idx // self.num_pattern_heads
 
         if cutlass.const_expr(seq_lens_kv is None):
             error_code, selected_kv_block_count = _inspect_bsr_row(
                 block_indptr,
                 block_indices,
                 batch_idx,
-                kv_head_idx,
+                pattern_head_idx,
                 q_block_row_idx,
                 lane_idx,
                 bsr_row_is_valid,
@@ -258,7 +286,7 @@ class _InspectBlockSparseBsr:
                 block_indices,
                 seq_lens_kv,
                 batch_idx,
-                kv_head_idx,
+                pattern_head_idx,
                 q_block_row_idx,
                 lane_idx,
                 bsr_row_is_valid,
@@ -454,7 +482,7 @@ def compile_block_sparse_inspection(
     *,
     device_index: int,
     batch_size: int,
-    num_kv_heads: int,
+    num_pattern_heads: int,
     seq_len_q: int,
     seq_len_kv: int,
     q_block_size: int,
@@ -462,28 +490,36 @@ def compile_block_sparse_inspection(
 ) -> Callable[..., None]:
     """Compile one geometry specialization while keeping ``indices[nnz]`` dynamic.
 
-    Tensor ranks, dtypes, compact strides, and all attention geometry are part
-    of the specialization. Only the flat ``block_indices`` extent is symbolic;
-    tensor contents may of course vary between calls to the cached function.
+    The artifact key uses rounded Q/KV block counts: exact lengths and block
+    sizes that produce the same BSR tensor shape and index bounds share code.
+    ``block_indices[nnz]`` and tensor contents remain runtime inputs.
     """
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
+    num_kv_blocks = (seq_len_kv + kv_block_size - 1) // kv_block_size
+    compile_spec = _BlockSparseInspectCompileSpec(
+        batch_size=batch_size,
+        num_pattern_heads=num_pattern_heads,
+        num_q_block_rows=num_q_block_rows,
+        num_kv_blocks=num_kv_blocks,
+    )
     logical_nnz = cute.sym_int()
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = _InspectBlockSparseBsr(
         batch_size=batch_size,
-        num_kv_heads=num_kv_heads,
+        num_pattern_heads=num_pattern_heads,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
     )
-    with torch.cuda.device(device_index):
+
+    def compile_kernel():
         return cute.compile(
             kernel,
             _fake_compact(
                 cutlass.Int32,
-                (batch_size, num_kv_heads, num_q_block_rows + 1),
+                (batch_size, num_pattern_heads, num_q_block_rows + 1),
                 alignment=4,
             ),
             _fake_compact(cutlass.Int32, (logical_nnz,), alignment=4),
@@ -493,13 +529,23 @@ def compile_block_sparse_inspection(
             options=_COMPILE_OPTIONS,
         )
 
+    with torch.cuda.device(device_index):
+        return build_and_load_attention_kernel(
+            "block_sparse",
+            "inspect",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(),
+        )
+
 
 @functools.cache
 def compile_paged_block_sparse_metadata_inspection(
     *,
     device_index: int,
     batch_size: int,
-    num_kv_heads: int,
+    num_pattern_heads: int,
     seq_len_q: int,
     minimum_seq_len_kv: int,
     max_seq_len_kv: int,
@@ -507,9 +553,23 @@ def compile_paged_block_sparse_metadata_inspection(
     kv_block_size: int,
     page_size: int,
 ) -> Callable[..., None]:
-    """Compile one paged metadata entry that launches request then live-BSR."""
+    """Compile request and live-BSR validation keyed by its static geometry.
+
+    Exact Q lengths sharing a Q-block count reuse one artifact. Page/block
+    divisors and inclusive length limits stay in the key because they become
+    constants in the generated validation code; table widths remain symbolic.
+    """
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
+    compile_spec = _PagedBlockSparseInspectCompileSpec(
+        batch_size=batch_size,
+        num_pattern_heads=num_pattern_heads,
+        num_q_block_rows=num_q_block_rows,
+        minimum_seq_len_kv=minimum_seq_len_kv,
+        max_seq_len_kv=max_seq_len_kv,
+        kv_block_size=kv_block_size,
+        page_size=page_size,
+    )
     logical_nnz = cute.sym_int()
     runtime_page_columns = cute.sym_int()
     runtime_page_row_stride = cute.sym_int64(divisibility=1)
@@ -523,7 +583,7 @@ def compile_paged_block_sparse_metadata_inspection(
     )
     inspect_bsr = _InspectBlockSparseBsr(
         batch_size=batch_size,
-        num_kv_heads=num_kv_heads,
+        num_pattern_heads=num_pattern_heads,
         seq_len_q=seq_len_q,
         seq_len_kv=None,
         q_block_size=q_block_size,
@@ -534,12 +594,12 @@ def compile_paged_block_sparse_metadata_inspection(
         inspect_bsr=inspect_bsr,
     )
 
-    with torch.cuda.device(device_index):
+    def compile_kernel():
         return cute.compile(
             inspect_paged_block_sparse_metadata,
             _fake_compact(
                 cutlass.Int32,
-                (batch_size, num_kv_heads, num_q_block_rows + 1),
+                (batch_size, num_pattern_heads, num_q_block_rows + 1),
                 alignment=4,
             ),
             _fake_compact(cutlass.Int32, (logical_nnz,), alignment=4),
@@ -555,6 +615,16 @@ def compile_paged_block_sparse_metadata_inspection(
             _fake_compact(cutlass.Int64, (_SUMMARY_FIELDS,), alignment=8),
             stream,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        return build_and_load_attention_kernel(
+            "block_sparse",
+            "inspect_paged",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(),
         )
 
 

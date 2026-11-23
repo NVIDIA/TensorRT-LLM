@@ -1,5 +1,7 @@
 # NGram Speculative Decoding
 
+**NGram is deprecated and will be removed in January 2027.**
+
 This document shows how to run a model with NGram speculative decoding
 (supported as `ASSISTED_GENERATION` in transformers and vLLM, source:
 [GitHub](https://github.com/apoorvumang/prompt-lookup-decoding/tree/main))

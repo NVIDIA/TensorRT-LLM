@@ -49,6 +49,8 @@ class Stage:
 
 @dataclass
 class Block:
+    # The test-db context (top-level YAML key) holding the block, i.e. the test list a stage
+    # names. A YAML file may hold several contexts; for a single-context file this is its stem.
     yaml_stem: str
     block_index: int
     condition: dict
@@ -60,6 +62,10 @@ class Block:
 # the lookup must hit either form so we normalize on both sides.
 _TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT)\b.*$")
 
+# ISOLATION is an execution directive, not part of the pytest identity. Match
+# only the trailing token so a quoted -k expression containing it stays intact.
+_TEST_ID_ISOLATION_SUFFIX_RE = re.compile(r"\s+ISOLATION$")
+
 # Strip leading `full:<gpu>/` platform prefix used in waives.txt.
 _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
 
@@ -67,7 +73,7 @@ _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
 def normalize_test_id(test_id: str) -> str:
     """Canonical form for cross-referencing test-db YAML and waives.txt.
 
-    Strips trailing `SKIP`/`TIMEOUT` annotations, trailing `# comment`, and
+    Strips trailing `SKIP`/`TIMEOUT`/`ISOLATION` annotations, trailing `# comment`, and
     leading `full:<gpu>/` prefix. `YAMLIndex` indexes both the raw and the
     normalized form; `rules.waives_rule` looks up by this normalization.
     """
@@ -75,6 +81,7 @@ def normalize_test_id(test_id: str) -> str:
     s = _TEST_ID_SUFFIX_RE.sub("", s).strip()
     if "#" in s:
         s = s.split("#", 1)[0].strip()
+    s = _TEST_ID_ISOLATION_SUFFIX_RE.sub("", s)
     return _TEST_ID_PREFIX_RE.sub("", s)
 
 
@@ -202,6 +209,16 @@ def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
     )
 
 
+def _entry_in_filter_subtree(entry: str, filter_prefix: str) -> bool:
+    """Match parameter-specific filters without discarding the entry's parameters."""
+    target = (
+        _strip_pytest_options(normalize_test_id(entry))
+        if "[" in filter_prefix
+        else _entry_target(entry)
+    )
+    return _target_in_filter_subtree(target, filter_prefix)
+
+
 def _path_lookup_anchor(yaml_path: str) -> str:
     """Return the lineage anchor for a YAML-namespace path.
 
@@ -237,9 +254,14 @@ class YAMLIndex:
         return idx
 
     def _load_one(self, yml_path: Path) -> None:
-        yaml_stem = yml_path.stem
+        """Index every test-db context (top-level key) that `yml_path` defines."""
         data = yaml.safe_load(yml_path.read_text()) or {}
-        blocks_data = data.get(yaml_stem, []) or []
+        for context, blocks_data in data.items():
+            if context != "version" and isinstance(blocks_data, list):
+                self._load_context(context, blocks_data)
+
+    def _load_context(self, yaml_stem: str, blocks_data: list) -> None:
+        """Index the blocks of context `yaml_stem` and map each of their tests to its blocks."""
         for i, block_data in enumerate(blocks_data):
             if not isinstance(block_data, dict):
                 continue
@@ -423,6 +445,14 @@ _STAGE_ENTRY_RE = re.compile(
 # Used to track which cpu_arch bucket the stage entries below belong to.
 _MAP_OPEN_RE = re.compile(r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[\s*$")
 
+# Literal calls to the Groovy stage generator, including optional execution/schedule args.
+_STAGE_BUILDER_RE = re.compile(
+    r'(?P<var>\w+)\s*\+=\s*buildStageConfigs\(\s*"(?P<stage>[^"]+)"\s*,'
+    r'\s*"[^"]+"\s*,\s*"(?P<yml>[^"]+)"\s*,'
+    r"\s*(?P<total_splits>\d+)\s*,\s*(?P<gpu_count>\d+)\s*,\s*\d+"
+    r"(?:\s*,\s*(?:true|false|\d+))*\s*\)"
+)
+
 
 def _classify_map_var(var_name: str) -> Optional[str]:
     """Map a Groovy variable name to cpu_arch bucket, or None if unknown."""
@@ -445,7 +475,6 @@ _BACKEND_PATTERNS = [
     ("-Triton-", "triton"),
     ("-FMHA-", "fmha"),
     ("-Generic-", "generic"),
-    ("-Verl-", "verl"),
 ]
 
 # Regex mirror of parseTaskConfigFromStageName (jenkins/L0_Test.groovy:2066):
@@ -513,10 +542,10 @@ def parse_stages_from_groovy(
     stages: dict[str, Stage] = {}
     current_arch: Optional[str] = None
 
-    for line in groovy_path.read_text().splitlines():
-        # Skip commented-out lines: disabled stage configs must not be parsed.
-        if line.lstrip().startswith("//"):
-            continue
+    source = "\n".join(
+        line for line in groovy_path.read_text().splitlines() if not line.lstrip().startswith("//")
+    )
+    for line in source.splitlines():
         open_match = _MAP_OPEN_RE.search(line.rstrip())
         if open_match:
             # Reset on every map opening — including unfamiliar ones — so a
@@ -544,6 +573,25 @@ def parse_stages_from_groovy(
             total_splits=int(m.group("total_splits") or 1),
             mako=derive_mako_from_stage(stage_name),
         )
+
+    for match in _STAGE_BUILDER_RE.finditer(source):
+        prefix = match.group("stage")
+        if not include_post_merge and "Post-Merge" in prefix:
+            continue
+        for split_id in range(1, int(match.group("total_splits")) + 1):
+            stage_name = (
+                prefix.replace("{split}", str(split_id))
+                if "{split}" in prefix
+                else f"{prefix}-{split_id}"
+            )
+            stages[stage_name] = Stage(
+                name=stage_name,
+                yaml_stem=match.group("yml"),
+                cpu_arch=_classify_map_var(match.group("var")) or "x86",
+                split_id=split_id,
+                total_splits=int(match.group("total_splits")),
+                mako=derive_mako_from_stage(stage_name),
+            )
     return stages
 
 
@@ -624,10 +672,9 @@ def _kept_entries_for_stage(
             continue
         kept: list[str] = []
         for t in block.tests:
-            target = _entry_target(t)
             matched_waives: set[str] = set()
             for prefix, waives in prefix_to_waives.items():
-                if _target_in_filter_subtree(target, prefix):
+                if _entry_in_filter_subtree(t, prefix):
                     matched_waives |= waives
             if not matched_waives:
                 continue
@@ -727,10 +774,11 @@ def write_filtered_test_db(
 ) -> None:
     """Generate a tmp test-db dir narrowed by CBTS Layer 3.
 
-    Each output YAML contains ONLY the blocks listed in `block_filters` for
-    that stem, with each affected block's `tests:` array filtered to entries
-    in the per-block filter prefix subtree. Unaffected blocks and unaffected
-    YAML files are dropped entirely.
+    Each output YAML is `<context>.yml` for one affected test-db context and
+    contains ONLY the blocks listed in `block_filters` for that context, with
+    each affected block's `tests:` array filtered to entries in the per-block
+    filter prefix subtree. Unaffected blocks and unaffected contexts are
+    dropped entirely.
 
     Two narrowing checks per entry:
       1. Subtree match — entry's target lives under at least one filter prefix
@@ -761,47 +809,72 @@ def write_filtered_test_db(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     affected_stems = {stem for stem, _ in block_filters}
+    context_files = find_context_files(src_dir)
     for stem in sorted(affected_stems):
-        src = src_dir / f"{stem}.yml"
-        if not src.exists():
+        src = context_files.get(stem)
+        if src is None:
             continue
         data = yaml.safe_load(src.read_text()) or {}
-
-        for ctx_key, ctx_blocks in list(data.items()):
-            if not isinstance(ctx_blocks, list):
+        ctx_blocks = data.get(stem)
+        if not isinstance(ctx_blocks, list):
+            continue
+        new_blocks = []
+        for i, block_data in enumerate(ctx_blocks):
+            if not isinstance(block_data, dict):
                 continue
-            new_blocks = []
-            for i, block_data in enumerate(ctx_blocks):
-                if not isinstance(block_data, dict):
+            key = (stem, i)
+            if key not in block_filters:
+                # Drop unaffected blocks (see docstring rationale).
+                continue
+            original = block_data.get("tests") or []
+            prefix_to_waives = block_filters[key]
+            kept = []
+            for t in original:
+                matched_waives: set[str] = set()
+                for prefix, waives in prefix_to_waives.items():
+                    if _entry_in_filter_subtree(t, prefix):
+                        matched_waives |= waives
+                if not matched_waives:
                     continue
-                key = (stem, i)
-                if key not in block_filters:
-                    # Drop unaffected blocks (see docstring rationale).
-                    continue
-                original = block_data.get("tests") or []
-                prefix_to_waives = block_filters[key]
-                kept = []
-                for t in original:
-                    target = _entry_target(t)
-                    matched_waives: set[str] = set()
-                    for prefix, waives in prefix_to_waives.items():
-                        if _target_in_filter_subtree(target, prefix):
-                            matched_waives |= waives
-                    if not matched_waives:
-                        continue
-                    # -k keyword guard: drop entries whose `-k` filter
-                    # excludes every matching waive. Entries without `-k`
-                    # are always kept (`_entry_applies_to_waive` returns
-                    # True when no keyword is present).
-                    if any(_entry_applies_to_waive(t, w) for w in matched_waives):
-                        kept.append(t)
-                # Safety: empty filter result → fallback to original (prevents
-                # silent skip from typo'd waive ids or granularity mismatch).
-                if kept:
-                    block_data["tests"] = kept
-                new_blocks.append(block_data)
-            data[ctx_key] = new_blocks
+                # -k keyword guard: drop entries whose `-k` filter
+                # excludes every matching waive. Entries without `-k`
+                # are always kept (`_entry_applies_to_waive` returns
+                # True when no keyword is present).
+                if any(_entry_applies_to_waive(t, w) for w in matched_waives):
+                    kept.append(t)
+            # Safety: empty filter result → fallback to original (prevents
+            # silent skip from typo'd waive ids or granularity mismatch).
+            if kept:
+                block_data["tests"] = kept
+            new_blocks.append(block_data)
 
-        (output_dir / src.name).write_text(
-            yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
-        )
+        write_context_file(output_dir, data, stem, new_blocks)
+
+
+def find_context_files(test_db_dir: Path) -> dict[str, Path]:
+    """Map each test-db context (top-level key) to the YAML file that defines it.
+
+    A file may define several contexts, so a context is not looked up by file name.
+    """
+    files: dict[str, Path] = {}
+    for yml_path in sorted(test_db_dir.glob("*.yml")):
+        data = yaml.safe_load(yml_path.read_text()) or {}
+        for context, blocks in data.items():
+            if context != "version" and isinstance(blocks, list):
+                files[context] = yml_path
+    return files
+
+
+def write_context_file(output_dir: Path, source_data: dict, context: str, blocks: list) -> None:
+    """Write `<context>.yml` holding only the `version` key and `context`.
+
+    A stage finds its narrowed test list by its context name: renderTestDB looks for
+    `<testList>.yml` in the override directory.
+    """
+    out: dict = {}
+    if "version" in source_data:
+        out["version"] = source_data["version"]
+    out[context] = blocks
+    (output_dir / f"{context}.yml").write_text(
+        yaml.safe_dump(out, sort_keys=False, default_flow_style=False)
+    )

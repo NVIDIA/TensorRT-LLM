@@ -31,9 +31,9 @@ conversation (the chat route overlaps media loading with rendering).
 from __future__ import annotations
 
 import asyncio
-import os
+import dataclasses
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -42,34 +42,22 @@ from tensorrt_llm.inputs.utils import (
     _has_python_chat_template,
     apply_chat_template,
     async_apply_chat_template,
+    renders_from_loaded_media,
 )
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.serving_extensions import ServingExtension
 
-from .prompt_types import RenderedPrompt, UnsupportedRenderError
+from .prompt_types import (
+    HarmonyConversionError,
+    RenderedPrompt,
+    UnrenderableMessagesError,
+    UnsupportedRenderError,
+)
 from .resources import RenderResources
 
 if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
-
-_LEGACY_ENV = "TRTLLM_RENDER_LEGACY"
-
-
-def legacy_render_enabled() -> bool:
-    """Whether callers run in the pre-merge compatibility mode.
-
-    ``TRTLLM_RENDER_LEGACY=1`` is a compatibility mode, not a bit-for-bit rollback.
-    What it restores exactly: the router and ``count_tokens`` run their previous
-    implementations, and the router writes ids back without checking the fingerprint.
-    What it only approximates: the governor, Responses and multimodal-encoder routes
-    render without the server-level chat template and the model extension's rules (as
-    before) but still go through the shared render-then-tokenize pipeline, not the
-    previous helper. For a tokenizer whose two pipelines disagreed (one that renders text
-    itself, where the previous governor returned the text's characters as ids) the previous
-    output is not restored. The recorded pre-merge outputs and every intended difference
-    are in ``tests/unittest/llmapi/apps/test_render_golden.py``.
-    """
-    return os.getenv(_LEGACY_ENV, "0") == "1"
 
 
 @dataclass
@@ -92,12 +80,10 @@ def prepare_chat_request(request: "ChatCompletionRequest", res: RenderResources)
     ensure_request_chat_template_allowed(request, res.allow_request_chat_template)
     extension = res.extension
     extension.apply_chat_extensions(request)
-    if request.tool_choice == "required" and not extension.allows_required_tool_choice():
+    if request.tool_choice == "required" and extension.required_tool_choice_mode() is None:
         # Schema-accepting "required" everywhere but enforcing it only for models
         # whose extension allows it would silently degrade to "auto" elsewhere;
-        # reject loudly for models that cannot honor it. Still a ValueError for the
-        # routes (a 400); a router or counter that only needs an estimate catches
-        # UnsupportedRenderError and leaves the rejection to the worker.
+        # reject loudly for models that cannot honor it (a 400 on the routes).
         raise UnsupportedRenderError("tool_choice='required' is not supported for this model.")
     tool_dicts = (
         None
@@ -119,8 +105,9 @@ def _template_kwargs(
     chat_template_kwargs: Optional[Dict[str, Any]],
     injected_chat_template_kwargs: Any,
     enable_tokenize: bool,
+    mm_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return dict(
+    kwargs = dict(
         model_type=res.model_type or "",
         tokenizer=res.tokenizer,
         processor=res.processor,
@@ -134,6 +121,9 @@ def _template_kwargs(
         injected_chat_template_kwargs=injected_chat_template_kwargs,
         enable_tokenize=enable_tokenize,
     )
+    if mm_data is not None:
+        kwargs["mm_data"] = mm_data
+    return kwargs
 
 
 def tokenize_rendered(
@@ -187,8 +177,12 @@ def _finish(
     encode_rendered: Optional[Callable[[str, Any], List[int]]],
 ) -> RenderedPrompt:
     if not isinstance(rendered, str):
-        # A native renderer that tokenizes for itself returns ids.
-        return RenderedPrompt(token_ids=list(rendered))
+        # A native renderer that tokenizes for itself returns ids; truncation keeps their
+        # last ``truncate_prompt_tokens``, as it does a text prompt's.
+        token_ids = list(rendered)
+        if truncate_prompt_tokens is not None:
+            token_ids = token_ids[-truncate_prompt_tokens:]
+        return RenderedPrompt(token_ids=token_ids)
     template_text = rendered
     prefix_applied = False
     if forced_prefix is not None:
@@ -228,8 +222,15 @@ async def render_conversation(
     add_special_tokens: bool = False,
     truncate_prompt_tokens: Optional[int] = None,
     encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
+    mm_data: Optional[Dict[str, Any]] = None,
 ) -> RenderedPrompt:
-    """Render an already-parsed conversation without blocking the event loop."""
+    """Render an already-parsed conversation without blocking the event loop.
+
+    ``mm_data`` is the loaded media, for a renderer that needs it (see
+    ``renders_from_loaded_media``); others render without it. Such a renderer returns
+    token ids, which ``truncate_prompt_tokens`` truncates even when ``tokenize`` is off; a
+    truncation that would cut the media's tokens raises ``ValueError``.
+    """
     # A tokenizer-native template tokenizes segment by segment, so control-token strings inside
     # user or tool text stay text. Encoding the finished string would turn them into special
     # tokens, so keep the tokenizer's own ids when nothing is added after the template.
@@ -251,8 +252,19 @@ async def render_conversation(
             chat_template_kwargs=chat_template_kwargs,
             injected_chat_template_kwargs=injected_chat_template_kwargs,
             enable_tokenize=native_ids,
+            mm_data=mm_data,
         )
     )
+    if (
+        truncate_prompt_tokens is not None
+        and not isinstance(rendered, str)
+        and len(rendered) > truncate_prompt_tokens
+        and any(mm_data.values() if mm_data else ())
+    ):
+        raise ValueError(
+            f"truncate_prompt_tokens={truncate_prompt_tokens} would cut a prompt of "
+            f"{len(rendered)} tokens that carries media; its media tokens cannot be truncated."
+        )
     if tokenize:
         # Tokenization is CPU work that scales with the prompt; keep it off the loop.
         return await asyncio.to_thread(
@@ -274,6 +286,32 @@ async def render_conversation(
         truncate_prompt_tokens=truncate_prompt_tokens,
         encode_rendered=encode_rendered,
     )
+
+
+async def render_conversation_with_media(
+    res: RenderResources, mm_coroutines: Awaitable[Tuple[Any, Any]], **render_kwargs: Any
+) -> Tuple[RenderedPrompt, Tuple[Any, Any]]:
+    """Render a parsed conversation and load its media.
+
+    Returns ``(rendered, (mm_data, mm_embeddings))``. Rendering overlaps the media
+    loading, unless the model's renderer needs the loaded media (see
+    ``renders_from_loaded_media``); it then renders afterwards, from the
+    loaded media, which rules out precomputed embeddings. ``render_kwargs`` are
+    those of :func:`render_conversation`.
+    """
+    if not renders_from_loaded_media(res.model_type):
+        rendered, media = await asyncio.gather(
+            render_conversation(res, **render_kwargs), mm_coroutines
+        )
+        return rendered, media
+    mm_data, mm_embeddings = await mm_coroutines
+    if mm_embeddings:
+        raise ValueError(
+            "This model renders its prompt from the loaded media, so it cannot take "
+            "multimodal embeddings."
+        )
+    rendered = await render_conversation(res, mm_data=mm_data, **render_kwargs)
+    return rendered, (mm_data, mm_embeddings)
 
 
 _MEDIA_PART_MARKERS = ("image", "video", "audio")
@@ -330,7 +368,7 @@ def _parse_text_conversation(
         )
     except ValidationError as error:
         if raw_messages is None:
-            raise UnsupportedRenderError(
+            raise UnrenderableMessagesError(
                 "The messages carry fields the request model rejects; they can only be "
                 "rendered from the raw request body."
             ) from error
@@ -342,6 +380,27 @@ def _parse_text_conversation(
             model_type_override=res.model_type,
             resolve_media=False,
         )
+
+
+def _without_media(messages: Any) -> List[Any]:
+    """The messages with every non-text content part left out."""
+    result = []
+    for original in messages:
+        message = dict(original)
+        tool_calls = message.get("tool_calls")
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            # Written back too: the router forwards this request, and the drained iterator
+            # would leave it without its tool calls.
+            message["tool_calls"] = list(tool_calls)
+            if isinstance(original, dict):
+                original["tool_calls"] = message["tool_calls"]
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = [
+                part for part in content if isinstance(part, dict) and part.get("type") == "text"
+            ]
+        result.append(message)
+    return result
 
 
 def render_chat(
@@ -418,6 +477,65 @@ def render_chat(
     return result
 
 
+class _LengthExtension(ServingExtension):
+    """No extension hooks, but the model's tool serialization (kimi_k3 drops null defaults)."""
+
+    def __init__(self, model_extension: ServingExtension):
+        self._model_extension = model_extension
+
+    def serialize_tool(self, tool: Any) -> Dict[str, Any]:
+        return self._model_extension.serialize_tool(tool)
+
+
+def render_chat_for_length(
+    request: "ChatCompletionRequest",
+    res: RenderResources,
+    *,
+    encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
+) -> RenderedPrompt:
+    """Render a request ``render_chat`` refuses, for a caller that only needs its length.
+
+    Renders a copy that ``render_chat`` accepts: media left out, a forcing ``tool_choice``
+    (``required`` or a named function) cleared, and the model treated as a plain text model
+    (no extension hooks, no own input processor). System blocks, tools and the chat template
+    stay in the length; the media's own tokens do not. Harmony falls back to the tokenizer's
+    template for messages it cannot convert.
+
+    The result is not an executable prompt and must never be forwarded to a worker. Messages
+    the request model rejects raise :class:`UnrenderableMessagesError`.
+    """
+    try:
+        messages = _without_media(request.messages)
+    except ValidationError as error:
+        raise UnrenderableMessagesError(
+            "The messages carry fields the request model rejects; they can only be "
+            "rendered from the raw request body."
+        ) from error
+    update: Dict[str, Any] = {"messages": messages}
+    if request.tool_choice == "required" or getattr(request.tool_choice, "function", None):
+        # "none" and "auto" change which tools are rendered; keep them.
+        update["tool_choice"] = None
+    text_only = request.model_copy(update=update)
+    if res.use_harmony:
+        try:
+            token_ids = res.extension.render_prompt(text_only, res)
+        except HarmonyConversionError:
+            if res.tokenizer is None:
+                raise
+        else:
+            if token_ids is not None:
+                return RenderedPrompt(token_ids=list(token_ids))
+    plain = dataclasses.replace(
+        res,
+        model_type="" if _is_passthrough_model(res) else res.model_type,
+        hf_config=None,
+        input_processor=None,
+        extension=_LengthExtension(res.extension),
+        use_harmony=False,
+    )
+    return render_chat(text_only, plain, encode_rendered=encode_rendered)
+
+
 def preparation_context(
     request: "ChatCompletionRequest", res: RenderResources, rendered: RenderedPrompt
 ) -> Dict[str, Any]:
@@ -428,11 +546,12 @@ def preparation_context(
     with the ids (see ``PreparedContext``). ``request`` is the request as rendered, so it
     does not yet carry ``prompt_token_ids``.
     """
-    excluded = 0
-    if res.default_chat_template is None:
-        # A server-level chat template may end differently, so the route reports
-        # unadjusted usage when one is configured.
-        excluded = int(res.extension.prompt_tokens_excluded_from_usage(request) or 0)
+    excluded = res.prompt_tokens_excluded_from_usage(
+        add_generation_prompt=request.add_generation_prompt,
+        pre_tokenized=request.prompt_token_ids is not None
+        or request.prompt_token_ids_b64 is not None,
+        request_chat_template=request.chat_template,
+    )
     thinking: Dict[str, bool] = {}
     if rendered.template_text and request.add_generation_prompt:
         # Deferred: the reasoning parsers module is only needed here.

@@ -1,10 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import io
+import os
 import pickle
 import sys
 import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import cloudpickle
@@ -28,12 +34,17 @@ MPI.pickle.__init__(
 )
 
 
+# The real function, which `_isolated_loader_environment` replaces in every test.
+_EFFECTIVE_AVAILABLE_HOST_MEMORY = read_ahead.effective_available_host_memory
+
+
 @pytest.fixture(autouse=True)
 def _isolated_loader_environment(monkeypatch):
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
     monkeypatch.delenv("TLLM_OVERRIDE_LAYER_NUM", raising=False)
     monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", False)
     monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: 1 << 40)
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", lambda: 1 << 40)
 
 
 def _write_checkpoint(tmp_path: Path) -> tuple[Path, dict[str, torch.Tensor]]:
@@ -188,15 +199,223 @@ def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     ],
 )
 def test_cgroup_admission_honors_high_ancestors_and_namespaces(monkeypatch, cgroup, expected):
+    _fake_files(monkeypatch, cgroup)
+    assert read_ahead.cgroup_available_host_memory() == expected
+
+
+def _fake_files(monkeypatch, files):
+    """Serve `files` through `Path`: a file's text, or an exception that reading it raises.
+
+    A key ending in `/` holds an exception that listing that directory raises.
+    """
+
     def read_text(path, *args, **kwargs):
         del args, kwargs
         try:
-            return cgroup[str(path)]
+            content = files[str(path)]
         except KeyError as error:
             raise FileNotFoundError(path) from error
+        if isinstance(content, BaseException):
+            raise content
+        return content
+
+    def iterdir(path):
+        prefix = f"{path}/"
+        if isinstance(files.get(prefix), BaseException):
+            raise files[prefix]
+        names = {name[len(prefix) :].split("/", 1)[0] for name in files if name.startswith(prefix)}
+        if not names:
+            raise FileNotFoundError(path)
+        return iter(sorted(path / name for name in names))
 
     monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+
+@pytest.mark.parametrize(
+    ("cgroup", "expected"),
+    [
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": (
+                    "anon 100\nactive_file 150\ninactive_file 200\nshmem 50\n"
+                ),
+                "/sys/fs/cgroup/jobs/memory.current": "800\n",
+                "/sys/fs/cgroup/jobs/memory.max": "900\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 300\ninactive_file 100\n",
+            },
+            500,
+            id="v2-leaf-and-ancestor",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "5:memory:/host/path\n",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes": "300\n",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes": "750\n",
+                "/sys/fs/cgroup/memory/memory.stat": (
+                    "active_file 5\ninactive_file 5\ntotal_active_file 40\ntotal_inactive_file 60\n"
+                ),
+            },
+            550,
+            id="v1-hierarchical-totals",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "5:memory:/host/path\n",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes": "300\n",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes": "750\n",
+                "/sys/fs/cgroup/memory/memory.stat": "active_file 20\ninactive_file 30\n",
+            },
+            500,
+            id="v1-without-totals",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file x\ninactive_file 100\n",
+            },
+            600,
+            id="malformed-entry-ignored",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 400\ninactive_file 400\n",
+            },
+            1000,
+            id="usage-never-below-zero",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # Under the limit of `jobs`, the process's own cgroup protects all 200 of its page
+                # cache, and the sibling protects 600 of its 800.
+                "/sys/fs/cgroup/jobs/worker/memory.min": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "300\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 200\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.min": "600\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.stat": "active_file 800\n",
+            },
+            380,
+            id="v2-protected-child-cache-not-credited",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # Reclaim for the cgroup's own limit ignores the cgroup's own protection.
+                "/sys/fs/cgroup/jobs/worker/memory.min": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 150\ninactive_file 200\n",
+            },
+            850,
+            id="v2-own-limit-ignores-own-protection",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1500\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1600\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 900\ninactive_file 300\n",
+                "/sys/fs/cgroup/jobs/a/memory.low": "max\n",
+                "/sys/fs/cgroup/jobs/a/memory.stat": "active_file 500\ninactive_file 100\n",
+                "/sys/fs/cgroup/jobs/b/memory.min": "100\n",
+                "/sys/fs/cgroup/jobs/b/memory.low": "50\n",
+                "/sys/fs/cgroup/jobs/b/memory.stat": "inactive_file 300\n",
+                "/sys/fs/cgroup/jobs/c/memory.stat": "inactive_file 300\n",
+            },
+            600,
+            id="v2-protection-up-to-min-low-or-max",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+                # Without the sibling's protection, none of the page cache counts.
+                "/sys/fs/cgroup/jobs/sibling/memory.min": PermissionError("memory.min"),
+                "/sys/fs/cgroup/jobs/sibling/memory.stat": "active_file 800\n",
+            },
+            180,
+            id="v2-unreadable-protection-gives-no-credit",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.min": "600\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.stat": PermissionError("memory.stat"),
+            },
+            180,
+            id="v2-unreadable-protected-cache-gives-no-credit",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # The children's protection is unknown when they cannot be listed.
+                "/sys/fs/cgroup/jobs/": PermissionError("jobs"),
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+            },
+            180,
+            id="v2-unlistable-children-give-no-credit",
+        ),
+    ],
+)
+def test_cgroup_admission_counts_reclaimable_file_cache(monkeypatch, cgroup, expected):
+    _fake_files(monkeypatch, cgroup)
     assert read_ahead.cgroup_available_host_memory() == expected
+
+
+def test_kv_cache_host_tier_counts_reclaimable_file_cache(monkeypatch):
+    # KV cache manager V2 sizes its automatic pinned host tier with the same accounting, so the
+    # job's cached checkpoints count as available under its cgroup limit there too.
+    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+
+    monkeypatch.setattr(
+        read_ahead, "effective_available_host_memory", _EFFECTIVE_AVAILABLE_HOST_MEMORY
+    )
+    gib = 1 << 30
+    monkeypatch.setattr(
+        read_ahead.psutil, "virtual_memory", lambda: SimpleNamespace(available=4096 * gib)
+    )
+    monkeypatch.setattr(
+        kv_cache_manager_v2,
+        "Distributed",
+        SimpleNamespace(get=lambda mapping: SimpleNamespace(local_world_size=4)),
+    )
+    _fake_files(
+        monkeypatch,
+        {
+            "/proc/self/cgroup": "0::/job\n",
+            "/sys/fs/cgroup/job/memory.current": f"{900 * gib}\n",
+            "/sys/fs/cgroup/job/memory.max": f"{1000 * gib}\n",
+            "/sys/fs/cgroup/job/memory.stat": (
+                f"active_file {500 * gib}\ninactive_file {300 * gib}\n"
+            ),
+        },
+    )
+
+    limits = kv_cache_manager_v2.get_host_memory_limits(Mapping())
+
+    # 800 of the 900 GiB charged to the job are page cache, so 900 GiB of its 1000 GiB limit
+    # remain available, not 100 GiB.
+    assert limits.mem_available == 900 * gib
+    assert limits.local_ranks == 4
 
 
 def test_mapping_mismatch_coordinates_fallback_before_reader_setup(monkeypatch):
@@ -231,6 +450,9 @@ def test_mapping_mismatch_coordinates_fallback_before_reader_setup(monkeypatch):
     assert status.selected == "native"
     assert status.effective == "native"
     assert "mapping.world_size" in status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     warning.assert_called_once()
 
@@ -362,6 +584,9 @@ def test_ineligible_request_uses_exact_native_fallback(
     assert not status.activated
     assert status.effective == "native"
     assert status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     if requested_policy == "rank_striped_read_ahead":
         warning.assert_called_once()
@@ -443,7 +668,434 @@ def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch
         assert "model.norm.weight" in weights
 
     assert stopped.is_set()
-    assert loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "rank_striped_read_ahead"
+    # Preparation started the readers; finalization waited for them to stop.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds > 0
+
+
+def test_node_major_page_faults_reads_vmstat(monkeypatch):
+    vmstat = "pgpgin 1\npgmajfault 1234\npgrefill 5\n"
+    monkeypatch.setattr(
+        read_ahead, "open", lambda *args, **kwargs: io.StringIO(vmstat), raising=False
+    )
+    assert read_ahead.node_major_page_faults() == 1234
+
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("/proc/vmstat")
+
+    monkeypatch.setattr(read_ahead, "open", unavailable, raising=False)
+    assert read_ahead.node_major_page_faults() is None
+
+
+def _two_file_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_counts: Callable[[], int | None],
+    *,
+    checkpoint_bytes: int | None = None,
+) -> tuple[read_ahead.RankStripedReadAheadSession, list[str], list[str]]:
+    """Build a one-rank session over two files whose node fault counts the test controls."""
+    paths = []
+    for name in ("a.safetensors", "b.safetensors"):
+        path = tmp_path / name
+        path.write_bytes(b"\1" * 8)
+        paths.append(str(path))
+    plan = read_ahead.ReadAheadPlan(
+        tuple(read_ahead.ReadAheadExtent(path, 0, 8) for path in paths), workers=2
+    )
+    reads = []
+    real_read_extent = read_ahead.RankStripedReadAheadSession._read_extent
+
+    def recording_read_extent(session, extent):
+        completed = real_read_extent(session, extent)
+        reads.append(extent.path)
+        return completed
+
+    monkeypatch.setattr(read_ahead, "_RESIDENCY_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(read_ahead, "node_major_page_faults", fault_counts)
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", lambda: 1 << 40)
+    monkeypatch.setattr(
+        read_ahead.RankStripedReadAheadSession, "_read_extent", recording_read_extent
+    )
+    session = read_ahead.RankStripedReadAheadSession(
+        None,
+        None,
+        plan,
+        checkpoint_bytes=plan.assigned_bytes if checkpoint_bytes is None else checkpoint_bytes,
+    )
+    return session, paths, reads
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.01)
+
+
+def test_major_faults_after_first_pass_reread_the_extents(tmp_path, monkeypatch):
+    # The first count is the baseline taken after the first pass. The next poll
+    # sees enough new major faults to mean the cache dropped pages; the count
+    # then stays flat, so exactly one re-read pass follows.
+    counts = iter([0])
+    session, paths, reads = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, read_ahead._REFRESH_MAJOR_FAULTS)
+    )
+    session.start()
+    _wait_until(lambda: len(reads) >= 4)
+
+    assert session.finish(None) is None
+    assert sorted(reads[:2]) == sorted(paths)
+    assert sorted(reads[2:]) == sorted(paths)
+
+
+def test_no_major_faults_after_first_pass_reads_nothing_more(tmp_path, monkeypatch):
+    counts = iter([7])
+    session, paths, reads = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, 7 + read_ahead._REFRESH_MAJOR_FAULTS - 1)
+    )
+    session.start()
+    _wait_until(lambda: len(reads) == 2)
+    time.sleep(0.2)
+
+    assert session.finish(None) is None
+    assert sorted(reads) == sorted(paths)
+
+
+def test_fault_counter_loss_stops_session_without_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fault_counts = mock.Mock(side_effect=[123, None])
+    session, paths, reads = _two_file_session(tmp_path, monkeypatch, fault_counts)
+    descriptors = list(session._file_descriptors.values())
+
+    try:
+        session.start()
+        assert session._thread is not None
+        session._thread.join(timeout=5)
+        assert not session._thread.is_alive()
+        assert fault_counts.call_count == 2
+        assert session.finish(None) is None
+        assert sorted(reads) == sorted(paths)
+        assert not session._file_descriptors
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        session.cancel_and_close()
+
+
+def _run_refresh_timeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_count: Callable[[float], int],
+    stop_at: float,
+    read_duration: float = 0,
+    *,
+    checkpoint_bytes: int | None = None,
+    available_memory: Callable[[float], int] | None = None,
+) -> tuple[list[tuple[float, float]], mock.Mock]:
+    now = 0.0
+    passes = []
+    session, _, _ = _two_file_session(
+        tmp_path, monkeypatch, lambda: fault_count(now), checkpoint_bytes=checkpoint_bytes
+    )
+    if available_memory is not None:
+        monkeypatch.setattr(
+            read_ahead, "effective_available_host_memory", lambda: available_memory(now)
+        )
+    monkeypatch.setattr(read_ahead, "_RESIDENCY_POLL_SECONDS", 5.0)
+    monkeypatch.setattr(read_ahead, "time", SimpleNamespace(monotonic=lambda: now), raising=False)
+    warning = mock.Mock()
+    monkeypatch.setattr(read_ahead.logger, "warning", warning)
+    real_read_pass = session._read_pass
+
+    def advance(timeout: float) -> bool:
+        nonlocal now
+        assert timeout == 5.0
+        now += timeout
+        if now > stop_at:
+            session._cancel.set()
+        return session._cancel.is_set()
+
+    def read_pass(
+        executor: ThreadPoolExecutor, extents: tuple[read_ahead.ReadAheadExtent, ...]
+    ) -> None:
+        nonlocal now
+        started = now
+        real_read_pass(executor, extents)
+        now += read_duration
+        passes.append((started, now))
+
+    monkeypatch.setattr(session._cancel, "wait", advance)
+    monkeypatch.setattr(session, "_read_pass", read_pass)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            real_read_pass(executor, session._plan.extents)
+            session._refresh_dropped_pages(executor)
+    finally:
+        assert session.finish(None) is None
+    return passes, warning
+
+
+def test_refresh_cooldown_uses_completion_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: int(now / 5) * 1024,
+        stop_at=220,
+        read_duration=3,
+    )
+
+    assert passes == [(5, 8), (18, 21), (41, 44), (84, 87), (147, 150), (210, 213)]
+    assert [current[0] - previous[1] for previous, current in zip(passes, passes[1:])] == [
+        10,
+        20,
+        40,
+        60,
+        60,
+    ]
+    warning.assert_called_once()
+    assert "60" in warning.call_args.args[0]
+
+
+def test_refresh_cooldown_coalesces_a_burst(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 * ((now >= 5) + (now >= 10)),
+        stop_at=100,
+    )
+
+    assert passes == [(5, 5), (15, 15)]
+    warning.assert_not_called()
+
+
+def test_refresh_cooldown_keeps_subthreshold_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 0 if now < 5 else 1024 + int((now - 5) / 5) * 600,
+        stop_at=100,
+    )
+
+    assert passes == [(5, 5)]
+    warning.assert_not_called()
+
+
+def test_refresh_after_quiet_period_keeps_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, _ = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 * sum(now >= trigger for trigger in (5, 10, 600, 605)),
+        stop_at=700,
+    )
+
+    assert passes == [(5, 5), (15, 15), (600, 600), (640, 640)]
+
+
+def test_refresh_memory_admission_uses_checkpoint_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_bytes = 64 << 30
+    available_bytes = 40 << 30
+    assert read_ahead.memory_admission(16, available_bytes)[0]
+    assert not read_ahead.memory_admission(checkpoint_bytes, available_bytes)[0]
+    admission = mock.Mock(wraps=read_ahead.memory_admission)
+    monkeypatch.setattr(read_ahead, "memory_admission", admission)
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 if now >= 5 else 0,
+        stop_at=20,
+        checkpoint_bytes=checkpoint_bytes,
+        available_memory=lambda now: available_bytes,
+    )
+
+    assert passes == []
+    assert admission.call_args_list == [mock.call(checkpoint_bytes, available_bytes)] * 4
+    warning.assert_called_once()
+
+
+def test_refresh_memory_recovery_preserves_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes = []
+
+    def available_memory(now: float) -> int:
+        probes.append(now)
+        return (40 if now in (5, 10, 25, 30) else 128) << 30
+
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 * sum(now >= trigger for trigger in (5, 20, 40)),
+        stop_at=55,
+        checkpoint_bytes=64 << 30,
+        available_memory=available_memory,
+    )
+
+    assert passes == [(15, 15), (35, 35), (55, 55)]
+    assert probes == [5, 10, 15, 25, 30, 35, 55]
+    assert warning.call_count == 2
+
+
+@pytest.mark.parametrize("error_type", [OSError, ValueError, read_ahead.psutil.Error])
+def test_refresh_memory_probe_failure_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    probes = []
+
+    def available_memory(now: float) -> int:
+        probes.append(now)
+        if now < 15:
+            raise error_type("injected memory probe failure")
+        return 128 << 30
+
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 if now >= 5 else 0,
+        stop_at=25,
+        checkpoint_bytes=64 << 30,
+        available_memory=available_memory,
+    )
+
+    assert passes == [(15, 15)]
+    assert probes == [5, 10, 15]
+    warning.assert_called_once()
+
+
+@pytest.mark.parametrize("error_type", [TypeError, KeyboardInterrupt])
+def test_refresh_memory_probe_does_not_suppress_unexpected_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
+) -> None:
+    def available_memory(now: float) -> int:
+        raise error_type("unexpected memory probe failure")
+
+    with pytest.raises(error_type, match="unexpected memory probe failure"):
+        _run_refresh_timeline(
+            tmp_path,
+            monkeypatch,
+            lambda now: 1024 if now >= 5 else 0,
+            stop_at=20,
+            available_memory=available_memory,
+        )
+
+
+def test_finish_cancels_memory_deferred_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts = iter([0])
+    session, _, reads = _two_file_session(
+        tmp_path,
+        monkeypatch,
+        lambda: next(counts, read_ahead._REFRESH_MAJOR_FAULTS),
+        checkpoint_bytes=64 << 30,
+    )
+    descriptors = list(session._file_descriptors.values())
+    probed = threading.Event()
+    waiting = threading.Event()
+    real_wait = session._cancel.wait
+
+    def available_memory() -> int:
+        probed.set()
+        return 0
+
+    def wait(timeout: float) -> bool:
+        if probed.is_set():
+            waiting.set()
+            return real_wait(10)
+        return real_wait(timeout)
+
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", available_memory)
+    monkeypatch.setattr(session._cancel, "wait", wait)
+    try:
+        session.start()
+        assert waiting.wait(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(session.finish, None).result(timeout=2) is None
+        assert len(reads) == 2
+        assert not session._thread.is_alive()
+        assert not session._file_descriptors
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        session.cancel_and_close()
+
+
+@pytest.mark.parametrize("phase", ["wait", "read"])
+def test_finish_cancels_refresh_and_closes_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    counts = iter([0])
+    session, _, _ = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, read_ahead._REFRESH_MAJOR_FAULTS)
+    )
+    descriptors = list(session._file_descriptors.values())
+    entered = threading.Event()
+    release = threading.Event()
+    pass_count = 0
+    real_read_pass = session._read_pass
+    real_wait = session._cancel.wait
+    real_pread = os.pread
+
+    def read_pass(
+        executor: ThreadPoolExecutor, extents: tuple[read_ahead.ReadAheadExtent, ...]
+    ) -> None:
+        nonlocal pass_count
+        pass_count += 1
+        real_read_pass(executor, extents)
+
+    def wait(timeout: float) -> bool:
+        if phase == "wait" and pass_count == 2:
+            entered.set()
+            return real_wait(10)
+        return real_wait(timeout)
+
+    def pread(descriptor: int, size: int, offset: int) -> bytes:
+        if phase == "read" and pass_count == 2:
+            entered.set()
+            assert release.wait(timeout=5)
+        return real_pread(descriptor, size, offset)
+
+    monkeypatch.setattr(session, "_read_pass", read_pass)
+    monkeypatch.setattr(session._cancel, "wait", wait)
+    monkeypatch.setattr(read_ahead, "os", SimpleNamespace(pread=pread, close=os.close))
+    try:
+        session.start()
+        assert entered.wait(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            finished = executor.submit(session.finish, None)
+            try:
+                if phase == "read":
+                    assert session._cancel.wait(timeout=5)
+                    assert not finished.done()
+                    for descriptor in descriptors:
+                        os.fstat(descriptor)
+                    release.set()
+                assert finished.result(timeout=2) is None
+            finally:
+                release.set()
+        assert not session._thread.is_alive()
+        assert not session._file_descriptors
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        release.set()
+        session.cancel_and_close()
 
 
 def test_advisory_read_failure_keeps_materialized_weights(tmp_path, monkeypatch):
@@ -496,6 +1148,8 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     assert status.fallback_reason == (
         "model materialization failed: RuntimeError: materialization failed"
     )
+    # Finishing read-ahead is timed even when the with-block fails.
+    assert status.finalization_seconds > 0
     assert "model materialization failed" in error_log.call_args.args[0]
     assert "cleanup failure" not in error_log.call_args.args[0]
 
@@ -521,6 +1175,29 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
     for name, expected_tensor in expected.items():
         assert torch.equal(native[name], expected_tensor)
         assert torch.equal(striped[name], expected_tensor)
+
+
+def test_loader_passes_full_checkpoint_bytes_to_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_dir, _ = _write_checkpoint(tmp_path)
+    checkpoint_bytes = sum(path.stat().st_size for path in checkpoint_dir.glob("*.safetensors"))
+    monkeypatch.setattr(read_ahead, "_CHUNK_SIZE", 8)
+    monkeypatch.setattr(
+        weight_loader_module,
+        "build_local_plan",
+        lambda files, rank, size: read_ahead.build_local_plan(files, 0, 2),
+    )
+    session_factory = mock.Mock(wraps=read_ahead.RankStripedReadAheadSession)
+    monkeypatch.setattr(weight_loader_module, "RankStripedReadAheadSession", session_factory)
+
+    with _rank_striped_loader().open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+        pass
+
+    session_factory.assert_called_once()
+    plan = session_factory.call_args.args[2]
+    assert plan.assigned_bytes < checkpoint_bytes
+    assert session_factory.call_args.kwargs["checkpoint_bytes"] == checkpoint_bytes
 
 
 def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
@@ -561,6 +1238,8 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
 
     subgroup = communicator.Split(color=rank, key=0)
     set_thread_local_mpi_comm(subgroup)
+    subgroup_effective = None
+    subgroup_weights = None
     subgroup_error = None
     try:
         subgroup_loader = _rank_striped_loader(partial_model_loading=rank == 0)
@@ -617,6 +1296,25 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         rank_striped_read_ahead.RankStripedReadAheadSession._run = original_run
     communicator.Barrier()
 
+    # Only one of the two files holds the prefix; a rank that cannot read headers reads both.
+    original_read_header = weight_loader._read_safetensors_header
+    if rank == world_size - 1:
+
+        def fail_header(_path):
+            raise ValueError("rank-local header failure")
+
+        weight_loader._read_safetensors_header = fail_header
+    header_loader = _rank_striped_loader()
+    try:
+        with header_loader.open_weight_session(
+            checkpoint_dir, mapping=mapping, key_prefixes=("model.norm.",)
+        ) as header_weights:
+            pass
+        header_status = header_loader.last_checkpoint_io_status
+    finally:
+        weight_loader._read_safetensors_header = original_read_header
+    communicator.Barrier()
+
     return {
         "rank": rank,
         "success": success,
@@ -628,6 +1326,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         "read_effective": read_status.effective,
         "read_reason": read_status.fallback_reason,
         "read_sum": float(read_weights["model.norm.weight"].sum()),
+        "header_effective": header_status.effective,
+        "header_reason": header_status.fallback_reason,
+        "header_sum": float(header_weights["model.norm.weight"].sum()),
+        "header_read_both_files": "lm_head.weight" in header_weights,
     }
 
 
@@ -638,6 +1340,9 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
+    save_file(
+        {"lm_head.weight": torch.ones(6, 4)}, str(checkpoint_dir / "model-lm-head.safetensors")
+    )
     results = list(
         mpi_pool_executor.map(
             _run_real_mpi_scenarios,
@@ -662,3 +1367,10 @@ def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     assert all(result["read_effective"] == "native" for result in results)
     assert all("rank-local read failure" in result["read_reason"] for result in results)
     assert all(result["read_sum"] == expected_sum for result in results)
+    assert all(result["header_effective"] == "native" for result in results)
+    assert all("rank-local header failure" in result["header_reason"] for result in results)
+    assert all(result["header_sum"] == expected_sum for result in results)
+    assert {result["rank"]: result["header_read_both_files"] for result in results} == {
+        0: False,
+        1: True,
+    }

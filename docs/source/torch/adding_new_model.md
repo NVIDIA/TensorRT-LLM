@@ -1,3 +1,8 @@
+<!--
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-->
+
 # Adding a New Model in PyTorch Backend
 
 ## Table of Contents
@@ -14,6 +19,10 @@
 ## Introduction
 
 This guide provides a step-by-step process for adding a new model in PyTorch Backend.
+
+For multimodal models, also follow the
+[multimodal onboarding guide](../developer-guide/multimodal.md#onboarding-a-model)
+for processor metadata, payload selection, encoder scheduling, and E/P handoff.
 
 ## Prerequisites
 

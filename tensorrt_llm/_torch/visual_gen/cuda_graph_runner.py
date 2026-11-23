@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import contextvars
 import functools
@@ -9,6 +12,8 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ..nccl_window_graph import nccl_window_graph_capture
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..utils import make_weak_ref
 
 # Extra-key values the runner resolved host-side for the call it is currently
@@ -42,8 +47,15 @@ def resolved_extra_keys_scope(values: Dict[str, Any]):
         _RESOLVED_EXTRA_KEYS.reset(token)
 
 
-# One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
-KeyPart: TypeAlias = Tuple[str, Hashable]
+@dataclass(frozen=True)
+class _TensorKeyName:
+    """Keep callback names distinct from tensor keyword names in graph keys."""
+
+    name: str
+
+
+# Tensor shape names and registered callback names use separate namespaces.
+KeyPart: TypeAlias = Tuple[str | _TensorKeyName, Hashable]
 # Full CUDA graph cache key, stored as a tuple so it can be used as a dict key.
 KeyType: TypeAlias = Tuple[KeyPart, ...]
 
@@ -109,6 +121,7 @@ class CUDAGraphRunner:
         self.allow_capture = True
         self._shared_pool = shared_pool
         self._extra_key_fns: Dict[str, ExtraKeyFn] = {}
+        self._extra_key_capture_limits: Dict[str, int] = {}
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType, Any] = {}  # weak refs
@@ -121,28 +134,52 @@ class CUDAGraphRunner:
         self.static_inputs: Dict[KeyType, Tuple[List[Any], Dict[str, Any]]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
 
-    def register_extra_key_fn(self, name: str, fn: ExtraKeyFn) -> None:
+    def register_extra_key_fn(
+        self, name: str, fn: ExtraKeyFn, *, max_graphs: Optional[int] = None
+    ) -> None:
         """Register a graph-key extension computed from forward args/kwargs.
 
         The function is called with only the wrapped model.forward inputs.
+        If max_graphs is set, at most that many graphs carrying this key part
+        are retained. Uncached calls beyond the limit run eagerly; existing
+        graphs still replay. Calls for which fn returns None do not count.
         """
         if self.graphs:
             raise RuntimeError(
                 "CUDA graph extra key functions must be registered before graph capture."
             )
+        if max_graphs is not None and max_graphs < 1:
+            raise ValueError("CUDA graph capture limits must be positive")
         self._extra_key_fns[name] = fn
+        if max_graphs is None:
+            self._extra_key_capture_limits.pop(name, None)
+        else:
+            self._extra_key_capture_limits[name] = max_graphs
+
+    def _within_capture_limits(self, key: KeyType) -> bool:
+        # Keep captured outputs alive: callers may still hold a CFG branch's
+        # weak output reference while invoking the other branch with a new key.
+        names = {name for name, _ in key}
+        for name, limit in self._extra_key_capture_limits.items():
+            if (
+                name in names
+                and sum(any(part_name == name for part_name, _ in cached) for cached in self.graphs)
+                >= limit
+            ):
+                return False
+        return True
 
     def _get_tensor_shape_key(self, *args, **kwargs) -> KeyType:
         # Base VisualGen graphs are keyed by tensor shapes from the wrapped
         # model.forward call.
         return tuple(
             list(
-                (f"arg{i}", tuple(arg.shape))
+                (_TensorKeyName(f"arg{i}"), tuple(arg.shape))
                 for i, arg in enumerate(args)
                 if isinstance(arg, torch.Tensor)
             )
             + list(
-                (k, tuple(kwargs[k].shape))
+                (_TensorKeyName(k), tuple(kwargs[k].shape))
                 for k in sorted(kwargs.keys())
                 if isinstance(kwargs[k], torch.Tensor)
             )
@@ -185,19 +222,21 @@ class CUDAGraphRunner:
         # of syncing a CUDA tensor -- which capture would reject.
         with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
             for _ in range(self.WARMUP_STEPS):
-                fn(*static_args, **static_kwargs)
+                with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
+                    fn(*static_args, **static_kwargs)
                 torch.cuda.synchronize()
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            with torch.cuda.graph(graph, pool=self._get_pool()):
+            graph_pool = self._get_pool() or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph, graph_pool):
                 output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
         self._graph_output_refs[key] = output
         self.graph_outputs[key] = make_weak_ref(output)
-        self.memory_pool = graph.pool()
+        self.memory_pool = graph_pool
 
         # Publish pool so other runners sharing the same SharedGraphPool can reuse it
         if self._shared_pool is not None and self._shared_pool.handle is None:
@@ -243,7 +282,7 @@ class CUDAGraphRunner:
             key = self.get_graph_key(*args, **kwargs)
 
             if key not in self.graphs:
-                if not self.allow_capture:
+                if not self.allow_capture or not self._within_capture_limits(key):
                     return fn(*args, **kwargs)
                 self.capture(key, fn, args, kwargs)
                 return self.replay(key, args, kwargs)

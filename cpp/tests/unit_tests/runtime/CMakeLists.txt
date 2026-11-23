@@ -22,8 +22,7 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_buffers
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
+  "unit;runtime;gpu")
 add_tllm_gtest(
   cudaMemPoolTest
   OWNER
@@ -33,11 +32,27 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_memory
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
-add_gtest(gdrcopyTest gdrcopyTest.cpp)
-add_gtest(hostAccessibleDeviceAllocatorTest
-          hostAccessibleDeviceAllocatorTest.cu)
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  gdrcopyTest
+  OWNER
+  runtime
+  SOURCES
+  gdrcopyTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_gdr
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  hostAccessibleDeviceAllocatorTest
+  OWNER
+  runtime
+  SOURCES
+  hostAccessibleDeviceAllocatorTest.cu
+  LINK_LIBRARIES
+  tllm::runtime_host_accessible_memory
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   iBufferTest
   OWNER
@@ -48,7 +63,16 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;host")
-add_gtest(ipcNvlsMemoryTest ipcNvlsMemoryTest.cpp)
+add_tllm_gtest(
+  ipcNvlsMemoryTest
+  OWNER
+  runtime
+  SOURCES
+  ipcNvlsMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_ipc_nvls
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   iTensorTest
   OWNER
@@ -59,9 +83,39 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;host")
-add_gtest(loraCacheTest loraCacheTest.cpp)
-add_gtest(loraUtilsTest loraUtilsTest.cpp)
-add_gtest(moeLoadBalancerTest moeLoadBalancerTest.cpp)
+add_tllm_gtest(
+  loraCacheTest
+  OWNER
+  runtime
+  SOURCES
+  loraCacheTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_lora_cache
+  tllm::runtime_numpy
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  loraUtilsTest
+  OWNER
+  runtime
+  SOURCES
+  loraUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_lora
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  moeLoadBalancerTest
+  OWNER
+  runtime
+  SOURCES
+  moeLoadBalancerTest.cpp
+  ../../../tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_load_balance
+  tllm::runtime_host_accessible_memory
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   runtimeMpiUtilsTest
   OWNER
@@ -72,9 +126,37 @@ add_tllm_gtest(
   tllm::runtime_distributed
   LABELS
   "unit;runtime;host")
-add_gtest(localizationTest localizationTest.cu)
-add_gtest(localityDomainPublicConfigTest localityDomainPublicConfigTest.cpp)
-add_gtest(sanitizerTest sanitizerTest.cpp)
+add_tllm_gtest(
+  localizationTest
+  OWNER
+  runtime
+  SOURCES
+  localizationTest.cu
+  LINK_LIBRARIES
+  tllm::runtime_locality
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  localityDomainPublicConfigTest
+  OWNER
+  runtime
+  SOURCES
+  localityDomainPublicConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  CUDA::toolkit
+  LABELS
+  "unit;runtime;host")
+add_tllm_gtest(
+  sanitizerTest
+  OWNER
+  runtime
+  SOURCES
+  sanitizerTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   tllmBuffersTest
   OWNER
@@ -84,10 +166,28 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_buffers
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
-add_gtest(transposeKVKernelTest transposeKVKernelTest.cpp)
-add_gtest(utilsTest utilsTest.cpp)
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  transposeKVKernelTest
+  OWNER
+  runtime
+  SOURCES
+  transposeKVKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  utilsTest
+  OWNER
+  runtime
+  SOURCES
+  utilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_numpy
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   virtualMemoryTest
   OWNER
@@ -97,9 +197,17 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::runtime_buffers
   LABELS
-  "unit;runtime;gpu"
-  REQUIRES_GPU)
-add_gtest(workerPoolTest workerPoolTest.cpp)
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  workerPoolTest
+  OWNER
+  runtime
+  SOURCES
+  workerPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_worker_pool
+  LABELS
+  "unit;runtime;host")
 add_tllm_gtest(
   worldConfigTest
   OWNER
@@ -112,6 +220,15 @@ add_tllm_gtest(
   "unit;runtime;host")
 
 if(${BUILD_PYT})
-  add_gtest(torchTest torchTest.cpp)
-  target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
+  add_tllm_gtest(
+    torchTest
+    OWNER
+    runtime
+    SOURCES
+    torchTest.cpp
+    LINK_LIBRARIES
+    tllm::runtime_buffers
+    LABELS
+    "unit;runtime;gpu")
+  target_link_libraries(torchTest PRIVATE ${TORCH_LIBRARIES})
 endif()

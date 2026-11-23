@@ -21,14 +21,19 @@
 #include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/storage/remoteMem.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "kv_cache_manager_v2/utils/smallObjectPool.h"
 #include "tensorrt_llm/common/assert.h"
 
 #include <deque>
 #include <memory>
 #include <optional>
+#include <queue>
+#include <ranges>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -129,14 +134,62 @@ private:
     std::optional<SlotId> mSlotId;
 };
 
+// An allocator's own index of a slot; its SlotIdMap translates it to the global SlotId.
+using LocalSlotIndex = StrongIndex<SlotCount, struct LocalSlotIndexTag>;
+
+// ---------------------------------------------------------------------------
+// SlotIdMap — maps an allocator's local slot indices onto chunks of a slot-id space shared by
+// several allocators (one per locality domain), so each hands out disjoint global ids.
+// Mirrors _storage/_core.py::_SlotIdMap.
+// ---------------------------------------------------------------------------
+class SlotIdMap
+{
+public:
+    explicit SlotIdMap(SlotCount chunkSize)
+        : mChunkSize(chunkSize)
+    {
+    }
+
+    [[nodiscard]] SlotCount chunkSize() const noexcept
+    {
+        return mChunkSize;
+    }
+
+    [[nodiscard]] std::vector<size_t> const& chunks() const noexcept
+    {
+        return mChunks;
+    }
+
+    void append(size_t chunk);
+    size_t pop();
+
+    [[nodiscard]] SlotId slotId(LocalSlotIndex localIdx) const noexcept
+    {
+        return SlotId{static_cast<SlotCount>(mChunks[slotCountToSizeT(localIdx.value() / mChunkSize)]) * mChunkSize
+            + localIdx.value() % mChunkSize};
+    }
+
+    // nullopt when slotId lies in a chunk this map does not own.
+    [[nodiscard]] std::optional<LocalSlotIndex> localIndex(SlotId slotId) const noexcept;
+
+private:
+    SlotCount mChunkSize;
+    std::vector<size_t> mChunks;
+    std::unordered_map<size_t, size_t> mChunkIndices;
+};
+
 // ---------------------------------------------------------------------------
 // SlotAllocator — manages a fixed-capacity array of slot ids.
 // Mirrors _storage/_core.py::SlotAllocator.
+//
+// Without a SlotIdMap the slot id is the local index. With one, capacity and shrink accounting
+// stay local while the ids handed out come from the map's chunks.
 // ---------------------------------------------------------------------------
 class SlotAllocator
 {
 public:
-    explicit SlotAllocator(SlotCount capacity);
+    explicit SlotAllocator(SlotCount capacity, SlotIdMap const* slotMap = nullptr,
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
     ~SlotAllocator();
 
     [[nodiscard]] SlotCount numFreeSlots() const noexcept;
@@ -147,11 +200,23 @@ public:
         return mCapacity;
     }
 
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainId() const noexcept
+    {
+        return mLocalityDomainId;
+    }
+
+    // Local index of a slot this allocator issued; nullopt for a foreign slot id.
+    [[nodiscard]] std::optional<LocalSlotIndex> localIndexOf(SlotId slot) const noexcept
+    {
+        return localIndex(slot);
+    }
+
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
     // here so no caller has to remember the lower one.
     [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
     {
-        return slot >= SlotId{0} && slot < numSlots();
+        auto const local = localIndex(slot);
+        return local.has_value() && *local >= SlotCount{0} && *local < numSlots();
     }
 
     Slot allocate();
@@ -189,28 +254,56 @@ public:
 
 private:
     void scrubEvents();
+    // Takes one free slot, preferring ready recycled ones; the caller has scanned readiness.
+    Slot takeFreeSlot();
     [[nodiscard]] bool check() const noexcept;
+
+    [[nodiscard]] std::optional<LocalSlotIndex> localIndex(SlotId slot) const noexcept
+    {
+        return mSlotMap == nullptr ? std::optional<LocalSlotIndex>{slot.value()} : mSlotMap->localIndex(slot);
+    }
+
+    [[nodiscard]] SlotId slotId(LocalSlotIndex localIdx) const noexcept
+    {
+        return mSlotMap == nullptr ? SlotId{localIdx.value()} : mSlotMap->slotId(localIdx);
+    }
 
     SlotCount mCapacity;
     SlotCount mTargetCapacity;
     SlotCount mNumActiveSlots;
     SlotCount mNumReadyRecycledSlots;
-    std::deque<Slot> mRecycledSlots;
+    std::deque<Slot, PoolAllocator<Slot>> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
-    DynamicBitset mOccupiedMask;
+    DynamicBitset mOccupiedMask; // indexed by local index
+    SlotIdMap const* mSlotMap;
+    std::optional<LocalityDomainId> mLocalityDomainId;
 };
 
 //! Granularity a disk pool is sized in. Disk has no allocation unit to match,
 //! so this is just a rounding quantum.
 inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
 
+//! Granularity a remote pool is sized in. Its slots come in whole donated chunks, which RemoteRange
+//! claims as needed, so this is only a rounding quantum.
+inline constexpr size_t kRemotePoolSizeGranularity = size_t{2} << 20;
+
+//! The grain a hot-level pool of `medium` rounds its bytes to, where
+//! `deviceGranularity` is the VMM allocation granularity device pools grow in.
+//!
+//! For the config stage, which sizes pools before any exists to be asked. Once storage is
+//! built, ask the group: PoolGroupBase::poolSizeGranularity(CacheTier). The two agree
+//! because a host-backed pool commits in hostMemSizeGranularity() whatever level it is on.
+inline size_t hotPoolSizeGranularity(CacheTier medium, size_t deviceGranularity) noexcept
+{
+    return medium == CacheTier::HOST_MEM ? hostMemSizeGranularity() : deviceGranularity;
+}
+
 //! Unit a tier of the given size allocates and releases physical memory in,
 //! and therefore the quantum its pool sizes are rounded to.
 //!
-//! For GPU and host it scales with the tier: 2 MiB for small tiers, rising to
-//! 32 MiB, beyond which larger units measure no faster. A resize can give
-//! memory back only in whole units, so this trades that precision against the
-//! per-allocation cost.
+//! For GPU it scales with the tier: 2 MiB for small tiers, rising to 32 MiB, beyond
+//! which larger units measure no faster. A resize can give memory back only in whole
+//! units, so this trades that precision against the per-allocation cost.
 //!
 //! This is the policy. What a given StorageManager actually uses for a tier can
 //! differ -- see StorageManager::tierCommitUnit -- because every GPU level
@@ -250,6 +343,21 @@ public:
         return mSlotSize * slotCountToSizeT(numSlots());
     }
 
+    //! The unit this pool's backing is allocated in, and so the grain its byte total
+    //! rounds to. A property of the allocator behind the pool, not of the level it
+    //! sits in: two pools of one group can answer differently.
+    [[nodiscard]] virtual size_t sizeGranularity() const noexcept = 0;
+
+    //! What this pool's pages are. A group asks its pools rather than holding the answer,
+    //! so a group of one tier may still hold a pool of another.
+    [[nodiscard]] virtual CacheTier medium() const noexcept = 0;
+
+    //! Block until the backing for every slot up to `slot` exists.
+    //!
+    //! Only a progressively filled pool has anything to wait for; the rest are backed when
+    //! they are built, so this does nothing for them.
+    virtual void waitSlotUsable(SlotId) const {}
+
     virtual void destroy() = 0;
     virtual void resize(SlotCount newNumSlots) = 0;
     virtual Address slotAddress(SlotId slot) const = 0;
@@ -264,21 +372,47 @@ protected:
 class GpuSlotPool : public SlotPoolBase
 {
 public:
-    GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots);
+    // slotMaps: one per locality domain when the group places each domain's backing at
+    // chunk-aligned offsets of a shared slot-id space; nullptr for a single contiguous mapping.
+    GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots,
+        TypedVec<LocalityDomainId, SlotIdMap> const* slotMaps = nullptr);
 
+    // Slots backed across all locality domains.
     SlotCount numSlots() const noexcept override;
+    SlotCount numSlots(LocalityDomainId localityDomainId) const noexcept;
     void destroy() override;
     void resize(SlotCount newNumSlots) override;
+    void resize(SlotCount newNumSlots, LocalityDomainId localityDomainId);
     Address slotAddress(SlotId slot) const override;
 
-    // Extend by exactly one physical memory chunk; returns new numSlots.
-    SlotCount extendByOnePhysMem();
+    //! The VMM allocation granularity, which is what this pool's mapping grows in.
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return mVirtMem.physMemSize();
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
+
+    [[nodiscard]] int numLocalityDomains() const noexcept
+    {
+        return mVirtMem.numLocalityDomains();
+    }
+
+    // Merged mapped byte ranges relative to the pool base.
+    [[nodiscard]] std::vector<HalfOpenRange<size_t>> mappedRanges() const
+    {
+        return mVirtMem.mappedRanges();
+    }
 
     static size_t computeNumPhysMem(size_t slotSize, SlotCount numSlots, size_t physMemSize) noexcept;
     static SlotCount computeNumSlots(size_t slotSize, size_t numPhysMem, size_t physMemSize) noexcept;
 
 private:
     VirtMem mVirtMem;
+    TypedVec<LocalityDomainId, SlotIdMap> const* mSlotMaps;
 };
 
 // ---------------------------------------------------------------------------
@@ -290,6 +424,10 @@ public:
     //! vmSize is the address space reserved up front, and so the bound on every
     //! later resize. Reserving it all at once is what keeps the base address
     //! fixed, as it does for GpuSlotPool.
+    //!
+    //! The backing memory is committed on a worker thread, so a slot may exist
+    //! before it is backed. Closing that gap is the owning pool group's job: it
+    //! calls waitSlotUsable() before returning a slot from allocate().
     HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options);
 
     SlotCount numSlots() const noexcept override;
@@ -299,10 +437,20 @@ public:
 
     size_t alignedSize(SlotCount numSlots) const noexcept;
 
-    //! Blocks until `slot` is backed by physical memory.
-    //!
-    //! Rethrows the fill worker's exception if the fill failed.
-    void waitSlotUsable(SlotId slot) const;
+    //! The commit unit, which alignedSize() already rounds to.
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return mCommitUnit;
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
+
+    //! Blocks until `slot` is backed by physical memory, rethrowing the fill worker's
+    //! exception if the fill failed.
+    void waitSlotUsable(SlotId slot) const override;
 
 private:
     //! Declared before mHostMem: alignedSize() reads it while building mHostMem.
@@ -325,6 +473,16 @@ public:
     void resize(SlotCount newNumSlots) override;
     Address slotAddress(SlotId slot) const override;
 
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return kDiskPoolSizeGranularity;
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::DISK;
+    }
+
     int fd() const noexcept
     {
         return mFd;
@@ -340,6 +498,45 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// RemoteSlotPool — slots in host memory other processes donate (remoteMem.h).
+// The GPU cannot address them: their pages move through the page-staging buffer.
+// ---------------------------------------------------------------------------
+class RemoteSlotPool : public SlotPoolBase
+{
+public:
+    RemoteSlotPool(SharedPtr<RemoteMemClient> client, size_t slotSize, SlotCount numSlots);
+    ~RemoteSlotPool() override;
+
+    SlotCount numSlots() const noexcept override
+    {
+        return mNumSlots;
+    }
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return kRemotePoolSizeGranularity;
+    }
+
+    void destroy() override;
+    //! Growing claims more chunks and throws without resizing if none can be had; shrinking keeps them.
+    void resize(SlotCount newNumSlots) override;
+    //! Remote slots have no local address: their pages move through remoteRange(). Throws LogicError.
+    Address slotAddress(SlotId slot) const override;
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    [[nodiscard]] RemoteRange& remoteRange() const;
+
+private:
+    std::unique_ptr<RemoteRange> mRange;
+    // The slots resize() asked for; the range may hold more (whole chunks).
+    SlotCount mNumSlots{0};
+};
+
+// ---------------------------------------------------------------------------
 // PoolGroupBase — manages multiple pools with mirrored slot allocation.
 // Mirrors _storage/_core.py::PoolGroupBase.
 // ---------------------------------------------------------------------------
@@ -349,80 +546,260 @@ public:
     explicit PoolGroupBase(SlotCount numSlots);
     virtual ~PoolGroupBase();
 
+    //! The tier this pool group belongs to, which is what names it to the levels above:
+    //! which quota pays for it, which budget it is rebalanced within.
+    //!
+    //! A property of the pool group rather than of its level, because groups of one level
+    //! can differ. This is not necessarily the medium of any given pool's pages -- see
+    //! poolMedium().
+    [[nodiscard]] virtual CacheTier cacheTier() const noexcept = 0;
+
+    //! What one pool's pages actually are. This is cacheTier() for every pool except a
+    //! host-backed pool of a GPU-tier group, where the group's tier would name device
+    //! memory for a host address.
+    [[nodiscard]] CacheTier poolMedium(PoolIndex poolIdx) const
+    {
+        return mPools.at(poolIdx)->medium();
+    }
+
     PoolIndex numPools() const noexcept
     {
         return mPools.size();
     }
 
-    SlotCount numSlots() const noexcept;
-
-    SlotCount numFreeSlots() const noexcept
+    int numLocalityDomains() const noexcept
     {
-        return mSlotAllocator.numFreeSlots();
+        return mSlotAllocators.size().value();
     }
 
-    SlotAllocator& slotAllocator() noexcept
+    SlotCount numSlots(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept;
+
+    SlotCount numFreeSlots(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept
     {
-        return mSlotAllocator;
+        return mSlotAllocators[localityDomainId]->numFreeSlots();
     }
 
-    SlotAllocator const& slotAllocator() const noexcept
+    SlotAllocator& slotAllocator(LocalityDomainId localityDomainId = LocalityDomainId{0}) noexcept
     {
-        return mSlotAllocator;
+        return *mSlotAllocators[localityDomainId];
     }
 
-    virtual Slot allocate();
-    virtual std::vector<Slot> allocateMultiple(SlotCount numSlots);
+    SlotAllocator const& slotAllocator(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept
+    {
+        return *mSlotAllocators[localityDomainId];
+    }
+
+    //! Allocate, then block until the slots handed back are backed.
+    //!
+    //! The wait is the whole of a group's fill synchronization, and this is the single
+    //! point every later use of a slot passes through. Nothing downstream -- not
+    //! slotAddress(), not a device mapping read from it -- waits again. A pool with no
+    //! fill to wait on answers at once.
+    Slot allocate(LocalityDomainId localityDomainId = LocalityDomainId{0});
+    std::vector<Slot> allocateMultiple(SlotCount numSlots, LocalityDomainId localityDomainId = LocalityDomainId{0});
+    // Returns the slot to the allocator of the domain that issued it.
     void release(Slot slot);
     void destroy();
-    void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
+
+    // Locality domain whose memory backs a slot id this group issued; nullopt when not localized.
+    [[nodiscard]] virtual std::optional<LocalityDomainId> localityDomainOf(SlotId /*slot*/) const noexcept
+    {
+        return std::nullopt;
+    }
+
+    virtual void resizePools(
+        std::optional<SlotCount> newNumSlots = std::nullopt, LocalityDomainId localityDomainId = LocalityDomainId{0});
+
+    // Usable global slot ranges [begin, end), merged and sorted, excluding unmapped holes.
+    virtual std::vector<HalfOpenRange<SlotCount>> slotRanges() const;
+
+    // One past the highest usable slot id; equals numSlots() for a contiguous group.
+    SlotCount slotIndexUpperBound() const
+    {
+        SlotCount upperBound = 0;
+        for (auto const& [begin, end] : slotRanges())
+        {
+            upperBound = std::max(upperBound, end);
+        }
+        return upperBound;
+    }
 
     // Addresses for all pools at a given slot id.
     TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
     // Sizes per pool.
     TypedVec<PoolIndex, size_t> slotSize() const;
 
-    // Total bytes across all pools for one slot.
-    size_t numBytes() const noexcept
+    //! The grain a pool of `medium` rounds its byte total to. Media of one group differ --
+    //! a host-backed pool of a GPU group commits in host units, not in the device's VMM
+    //! granularity -- but pools sharing a medium do not: the grain follows the medium's
+    //! allocator, not the pool's slot size, which registration bounds absorb instead.
+    //!
+    //! Returns 0 if no pool of `medium` is here to ask.
+    [[nodiscard]] size_t poolSizeGranularity(CacheTier medium) const
+    {
+        auto ofMedium = std::views::iota(0, mPools.size().value())
+            | std::views::filter([this, medium](int pool) { return poolMedium(PoolIndex{pool}) == medium; });
+        if (std::ranges::empty(ofMedium))
+        {
+            return 0;
+        }
+        return getUniformAttribute(
+            ofMedium, [this](int pool) { return mPools.at(PoolIndex{pool})->sizeGranularity(); });
+    }
+
+    //! The medium of this group's pools that are not of its tier, if it has any. At most
+    //! one: a group's pools are its tier's own or of a single other medium.
+    //!
+    //! This is the group's half of what SecondaryPoolBudget calls the second medium. Ask
+    //! it rather than comparing against cacheTier() at each site: a group of the host tier
+    //! has no second medium even though all its pools are host memory, and a test written
+    //! as "pools that are HOST_MEM" names every one of them.
+    [[nodiscard]] std::optional<CacheTier> secondaryMedium() const
+    {
+        auto offTier = std::views::iota(0, mPools.size().value())
+            | std::views::filter([this](int pool) { return poolMedium(PoolIndex{pool}) != cacheTier(); });
+        if (std::ranges::empty(offTier))
+        {
+            return std::nullopt;
+        }
+        return getUniformAttribute(offTier, [this](int pool) { return poolMedium(PoolIndex{pool}); });
+    }
+
+    //! Bytes this group would hold at `slots`, each pool rounded to its own allocator's
+    //! grain. An absent `medium` counts every pool; a named one counts only its own.
+    //!
+    //! One slot count for every pool, though pools can report different counts: each
+    //! rounds its own allocation up to its own grain, so the excess is under one grain
+    //! and rounding returns the allocation whichever count is used.
+    [[nodiscard]] size_t roundedBytesWith(SlotCount slots, std::optional<CacheTier> medium) const
     {
         size_t total = 0;
         for (auto const& pool : mPools)
-            total += pool->numBytes();
+        {
+            if (medium.has_value() && pool->medium() != *medium)
+            {
+                continue;
+            }
+            total += roundUp(slotCountToSizeT(slots) * pool->slotSize(), pool->sizeGranularity());
+        }
         return total;
     }
 
-    // Total bytes across all pools, rounding each pool's bytes up to granularity.
-    // Mirrors Python total_quota: sum(round_up(p.num_bytes, granularity) for p in pg._pools).
-    size_t roundedNumBytes(size_t granularity) const noexcept
+    //! Bytes this group holds now in pools whose pages are `medium`. Pools of any other
+    //! medium contribute nothing.
+    //!
+    //! Bytes of different media are not comparable -- they are paid for from different
+    //! budgets and rounded to different grains -- so every caller measuring them names the
+    //! one it means. roundedNumBytes(cacheTier()) is what this group's own tier pays for;
+    //! roundedNumBytes(HOST_MEM) on a GPU-tier group is what it holds in host pages besides.
+    [[nodiscard]] virtual size_t roundedNumBytes(CacheTier medium) const
     {
-        size_t total = 0;
-        for (auto const& pool : mPools)
-            total += roundUp(pool->numBytes(), granularity);
-        return total;
+        return roundedBytesWith(numSlots(), medium);
     }
 
 protected:
     // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
-    SlotCount getNumSlotsFromPools() const noexcept;
+    [[nodiscard]] virtual SlotCount getNumSlotsFromPools(
+        LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept;
 
-    SlotAllocator mSlotAllocator;
+    //! Block until every pool backs the range ending just past `slot`.
+    void _waitSlotUsable(SlotId slot) const;
+
+    TypedVec<LocalityDomainId, std::unique_ptr<SlotAllocator>> mSlotAllocators;
     TypedVec<PoolIndex, std::unique_ptr<SlotPoolBase>> mPools;
     bool mDestroyed = false;
 };
 
+// Slots per locality-domain chunk: the smallest slot count that starts on a physical-page boundary in every pool
+// of the group.
+[[nodiscard]] size_t localityDomainChunkSlots(TypedVec<PoolIndex, size_t> const& slotSizeList, size_t physMemSize);
+
 // ---------------------------------------------------------------------------
 // GpuPoolGroup / HostPoolGroup / DiskPoolGroup
 // ---------------------------------------------------------------------------
+
+// With several locality domains the pools share one slot-id space: ids are handed out in chunks
+// whose byte extent is physically aligned in every pool, each chunk backed by one domain's memory.
 class GpuPoolGroup : public PoolGroupBase
 {
 public:
-    GpuPoolGroup(
-        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+    //! `numSlots` is the initial slot count per locality domain.
+    //!
+    //! `sparsity`, when given, marks the pools to allocate from host memory instead of
+    //! device memory. They hold a sparse buffer's pages: ordinary hot pages that are read
+    //! through the sparse GPU cache rather than directly, so they are device-mapped but do
+    //! not consume the tier's device budget. Sparse pools need a single locality domain.
+    //!
+    //! The group still reports GPU_MEM. Migration never reads the hot side's tier -- the
+    //! codec path keeps only the cold side's -- and host memory is device-accessible, so a
+    //! mixed group needs no second tier.
+    //!
+    //! `hostOptions` backs the sparse pools. One object for the whole level, so every
+    //! host-backed pool commits in the same unit.
+    //!
+    //! `sparseReservation`, when given, caps the host address space each sparse pool
+    //! reserves; a pool never reserves less than its initial slots. Unset reserves for the
+    //! most slots device memory could buy, which exceeds the address space once a sparse
+    //! slot is several hundred times the group's device bytes per slot.
+    GpuPoolGroup(TypedVec<LocalityDomainId, SlotCount> const& numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
+        HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
+    // The allocators hold pointers into mSlotMaps, so release them before the maps go away.
+    ~GpuPoolGroup() override;
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
+
+    void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt,
+        LocalityDomainId localityDomainId = LocalityDomainId{0}) override;
+    std::vector<HalfOpenRange<SlotCount>> slotRanges() const override;
+    // Each domain's backing is rounded up on its own, so the sum must be too or a quota
+    // round trip through totalQuota() loses slots.
+    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const override;
+
+    [[nodiscard]] std::vector<HalfOpenRange<size_t>> mappedRanges(PoolIndex poolIdx) const
+    {
+        auto const& pool = *mPools.at(poolIdx);
+        // A sparse pool is host memory committed contiguously from its base.
+        if (pool.medium() != CacheTier::GPU_MEM)
+        {
+            size_t const bytes = pool.numBytes();
+            return bytes == 0 ? std::vector<HalfOpenRange<size_t>>{}
+                              : std::vector<HalfOpenRange<size_t>>{{size_t{0}, bytes}};
+        }
+        return static_cast<GpuSlotPool const&>(pool).mappedRanges();
+    }
+
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainOf(SlotId slot) const noexcept override
+    {
+        if (mSlotMaps.empty())
+        {
+            return std::nullopt;
+        }
+        int8_t const owner = mChunkOwner[slotCountToSizeT(slot.value() / mChunkSize)];
+        return owner < 0 ? std::nullopt : std::optional<LocalityDomainId>{LocalityDomainId{owner}};
+    }
+
+protected:
+    SlotCount getNumSlotsFromPools(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept override;
+
+private:
+    // Grow or shrink a domain's chunk list to cover numSlots.
+    void resizeSlotMap(SlotCount numSlots, LocalityDomainId localityDomainId);
+
+    TypedVec<LocalityDomainId, SlotIdMap> mSlotMaps; // empty with one locality domain
+    SlotCount mChunkSize{0};
+    size_t mMaxChunks{0};
+    size_t mNumChunks{0};
+    std::priority_queue<size_t, std::vector<size_t>, std::greater<>> mFreeChunks;
+    // Owning locality domain of each chunk of the slot-id space, kept in step with mSlotMaps.
+    std::vector<int8_t> mChunkOwner;
 };
 
 //! Host pools are committed progressively on a background thread, so a slot may
-//! be handed out before its memory is backed. Both allocation entry points block
-//! until the slots they return are usable.
+//! be handed out before its memory is backed. PoolGroupBase::allocate waits for it.
 //!
 //! The wait is cheap in the steady state: fresh slot ids ascend from zero and
 //! recycled slots are reused first, so the Nth fresh allocation waits only for
@@ -439,18 +816,65 @@ public:
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
         HostMemBackingOptions const& options = {});
 
-    Slot allocate() override;
-    std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
-
-private:
-    //! Blocks until every pool backs the byte range ending just past `slot`.
-    void waitSlotUsable(SlotId slot) const;
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
 };
 
 class DiskPoolGroup : public PoolGroupBase
 {
 public:
     DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::DISK;
+    }
+};
+
+class RemotePoolGroup : public PoolGroupBase
+{
+public:
+    RemotePoolGroup(
+        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SharedPtr<RemoteMemClient> const& client);
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    //! The remote slots of pool `poolIdx`.
+    [[nodiscard]] RemoteRange& remoteRange(PoolIndex poolIdx) const;
+};
+
+//! A second medium's budget over a disjoint subset of each pool group's pools.
+//!
+//! A slot spans every pool of its group, so one slot count drives the bytes taken in every
+//! pool -- but the pools of the GPU tier are of two media, each with its own total and its
+//! own allocation grain. This names the second one. `pools[pg]` lists exactly the pools
+//! `quota` pays for; the rest are what the primary quota pays for, derived by
+//! poolsPaidByQuota(). The two are complements: no pool is named by both, and together
+//! they are all of the group's pools.
+//!
+//! `pools[pg]` may be empty, which is how "this group costs the second medium nothing" is
+//! said. Such a group takes no share of `quota` and can never be bound by it.
+struct SecondaryPoolBudget
+{
+    //! Bytes of the second medium, for the whole level, or unset to leave it unbounded.
+    //! A budget, not a per-group maximum: how it divides between groups is what the
+    //! allocator decides.
+    //!
+    //! `pools` is a property of the pools rather than of any budget, so a level with a
+    //! second medium supplies this struct even when nothing bounds it; only `quota` says
+    //! whether anything does.
+    std::optional<size_t> quota;
+    //! The second medium's allocation grain, which is a property of its allocator rather
+    //! than of the level. Host-backed pools round to HostMem::sizeGranularity(), not to the device
+    //! granularity, so charging them in device grains would over-count every one of them.
+    size_t granularity = 0;
+    //! The pools `quota` pays for, per pool group.
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> pools;
 };
 
 // ---------------------------------------------------------------------------
@@ -469,10 +893,17 @@ public:
         return mPoolGroups.size();
     }
 
-    std::vector<Slot> allocateMultiple(PoolGroupIndex pgIdx, SlotCount numSlots);
+    std::vector<Slot> allocateMultiple(
+        PoolGroupIndex pgIdx, SlotCount numSlots, LocalityDomainId localityDomainId = LocalityDomainId{0});
     void release(PoolGroupIndex pgIdx, Slot slot);
-    SlotCount numFreeSlots(PoolGroupIndex pgIdx) const;
+    SlotCount numFreeSlots(PoolGroupIndex pgIdx, LocalityDomainId localityDomainId = LocalityDomainId{0}) const;
     TypedVec<PoolIndex, Address> slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const;
+
+    // 1 unless this is a localized GPU level.
+    virtual int numLocalityDomains() const noexcept
+    {
+        return 1;
+    }
 
     // Additional accessors used by StorageManager and KvCacheManager.
     virtual void destroy()
@@ -486,9 +917,19 @@ public:
         return mPoolGroups.at(pgIdx)->numPools();
     }
 
-    SlotCount numSlots(PoolGroupIndex pgIdx) const
+    SlotCount numSlots(PoolGroupIndex pgIdx, LocalityDomainId localityDomainId = LocalityDomainId{0}) const
     {
-        return mPoolGroups.at(pgIdx)->numSlots();
+        return mPoolGroups.at(pgIdx)->numSlots(localityDomainId);
+    }
+
+    SlotCount slotIndexUpperBound(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->slotIndexUpperBound();
+    }
+
+    std::vector<HalfOpenRange<SlotCount>> slotRanges(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->slotRanges();
     }
 
     TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const
@@ -506,27 +947,99 @@ public:
         return *mPoolGroups.at(pgIdx);
     }
 
+    PoolGroupBase const& poolGroup(PoolGroupIndex pgIdx) const
+    {
+        return *mPoolGroups.at(pgIdx);
+    }
+
     MemAddress getBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotId slotId) const
     {
         return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
     }
 
-    size_t totalQuota() const noexcept
+    //! Bytes this level holds in pools whose pages are `medium`, each rounded to that
+    //! medium's grain. Every group of a level is of the level's tier, so the media
+    //! reachable here are this tier's own and, on a device level, the host pages its
+    //! host-backed pools hold.
+    //!
+    //! At cacheTier() this is what the level's quota pays for. Host-backed pools of a
+    //! device level fall outside it, which is the point: a rebalance given an inflated
+    //! figure would hand the level more slots than the device can hold.
+    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
     {
-        size_t granularity = poolSizeGranularity();
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
-            total += pg->roundedNumBytes(granularity);
+            total += pg->roundedNumBytes(medium);
         return total;
     }
 
-    // Returns numSlots() per pool group.
-    TypedVec<PoolGroupIndex, SlotCount> slotCountList() const
+    //! The medium of this level's pools that are not of its own tier, if any group has
+    //! one. At most one across the level: every group here is of the level's tier, and a
+    //! group has at most one second medium.
+    [[nodiscard]] std::optional<CacheTier> secondaryMedium() const
+    {
+        for (auto const& pg : mPoolGroups)
+        {
+            if (auto const medium = pg->secondaryMedium())
+            {
+                return medium;
+            }
+        }
+        return std::nullopt;
+    }
+
+    //! The grain pools of `medium` round to at this level, or 0 when it has none. Groups
+    //! holding that medium are held to agree, as the pools within one are.
+    //!
+    //! Read off a pool, for every medium alike. A host pool commits in the unit its level
+    //! was configured with and a device pool in its allocator's, so asking the pool gives
+    //! the quantum the quota is expressed in as well as the second medium's grain --
+    //! poolSizeGranularity(cacheTier()) is the former.
+    [[nodiscard]] size_t poolSizeGranularity(CacheTier medium) const
+    {
+        auto grainOf = [medium](auto const& pg) { return pg->poolSizeGranularity(medium); };
+        auto withMedium = mPoolGroups | std::views::filter([&](auto const& pg) { return grainOf(pg) != 0; });
+        if (std::ranges::empty(withMedium))
+        {
+            return 0;
+        }
+        return getUniformAttribute(withMedium, grainOf);
+    }
+
+    // Returns numSlots(localityDomainId) per pool group.
+    TypedVec<PoolGroupIndex, SlotCount> slotCountList(LocalityDomainId localityDomainId = LocalityDomainId{0}) const
     {
         TypedVec<PoolGroupIndex, SlotCount> ret;
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
-            ret.push_back(pg->numSlots());
+            ret.push_back(pg->numSlots(localityDomainId));
+        return ret;
+    }
+
+    //! The pools whose pages are `medium`, as indices into slotSizeLists()[pg].
+    //!
+    //! For "the pools this level's quota does not pay for", pass secondaryMedium() rather
+    //! than a literal: on a host level every pool is HOST_MEM, yet none of them is a
+    //! second medium.
+    //!
+    //! The complement is what the quota pays for, which the allocator derives rather than
+    //! taking: that way no pool can be charged twice or missed.
+    [[nodiscard]] TypedVec<PoolGroupIndex, std::vector<PoolIndex>> poolsOfMedium(CacheTier medium) const
+    {
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> ret;
+        ret.reserve(mPoolGroups.size());
+        for (auto const& pg : mPoolGroups)
+        {
+            std::vector<PoolIndex> matching;
+            for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
+            {
+                if (pg->poolMedium(pool) == medium)
+                {
+                    matching.push_back(pool);
+                }
+            }
+            ret.push_back(std::move(matching));
+        }
         return ret;
     }
 
@@ -546,14 +1059,43 @@ public:
         return ret;
     }
 
-    // Current ratio list: proportion of bytes per pool group.
-    TypedVec<PoolGroupIndex, float> ratioList() const
+    //! Bytes each pool group holds at `slotCounts`, every pool in its own allocator's grain.
+    //!
+    //! This is the measure the pool ratio speaks in, and the one the allocator divides
+    //! against. Measuring a host-backed pool in device grains instead -- they differ by up
+    //! to 8192x -- would put the two sides of a rebalance's comparison in different units.
+    [[nodiscard]] TypedVec<PoolGroupIndex, size_t> allMediaBytes(
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCounts) const
     {
+        TypedVec<PoolGroupIndex, size_t> ret(mPoolGroups.size(), 0);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+        {
+            ret[pgIdx] = mPoolGroups[pgIdx]->roundedBytesWith(slotCounts[pgIdx], std::nullopt);
+        }
+        return ret;
+    }
+
+    //! Current ratio list: proportion of bytes per pool group.
+    //!
+    //! Counts every pool, host-backed ones included -- unlike the quota, which pays for
+    //! the dense ones alone. The asymmetry is deliberate: this ratio is projected onto cold
+    //! levels, where one pool holds dense and sparse buffers together, and it is what a
+    //! rebalance compares its target against. Both sides of that comparison have to measure
+    //! the same bytes or it never settles; see "The quota excludes sparse pools; the ratio
+    //! counts them" in SPARSE_ATTENTION_DESIGN.md.
+    [[nodiscard]] TypedVec<PoolGroupIndex, float> ratioList() const
+    {
+        TypedVec<PoolGroupIndex, SlotCount> counts(mPoolGroups.size(), 0);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+        {
+            counts[pgIdx] = mPoolGroups[pgIdx]->numSlots();
+        }
+        auto const bytes = allMediaBytes(counts);
         TypedVec<PoolGroupIndex, float> ret(mPoolGroups.size(), 0.f);
         float total = 0.f;
         for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
         {
-            auto sz = static_cast<float>(mPoolGroups[pgIdx]->numBytes());
+            auto sz = static_cast<float>(bytes[pgIdx]);
             ret[pgIdx] = sz;
             total += sz;
         }
@@ -561,11 +1103,6 @@ public:
         for (auto& r : ret)
             r /= total;
         return ret;
-    }
-
-    virtual size_t poolSizeGranularity() const noexcept
-    {
-        return kDiskPoolSizeGranularity;
     }
 
     //! Largest quota this level may be resized to, when it has one.
@@ -577,26 +1114,53 @@ public:
         return std::nullopt;
     }
 
-    // Compute slot counts per pool group for a given ratio, min_slots, and optional quota.
-    // Instance convenience method — delegates to the static version below.
-    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountList(TypedVec<PoolGroupIndex, float> const& ratioList,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<size_t> quota = std::nullopt) const;
-
-    // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
-    // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
+    //! Divide `quota` between pool groups by `ratioList`, honouring `minSlots` as a floor,
+    //! and `secondBudget` as a second medium's total over a disjoint set of the same pools.
+    //!
+    //! `slotSizeLists` holds every pool's size; the pools `quota` pays for are those
+    //! `secondBudget->pools[pg]` does not name. A slot spans all of them, so one count per
+    //! group settles both media at once.
+    //!
+    //! Both budgets and the floors are kept exactly; the ratio is the only soft bound. The
+    //! floors come off the top rather than out of anyone's share, so no division of the rest
+    //! can break one, and a group bound by either budget releases what it does not use of
+    //! the other. A group named by neither budget for a medium costs that medium nothing.
+    //!
+    //! The two budgets can only conflict at the floors, and that condition names neither the
+    //! ratio nor `quota`. It is therefore a property of the configuration: it is rejected the
+    //! first time this runs, and a rebalance -- which changes both of those and none of the
+    //! terms in the condition -- cannot begin to fail.
+    //!
+    //! With `secondBudget` unset, `quota` is the only bound and every pool is charged to it.
+    //!
+    //! A pool group with a fixed slot count in `fixedSlots` gets exactly that many slots, taken
+    //! from both budgets first; the rest is divided among the other groups as above, and the
+    //! fixed groups' ratios and floors are ignored. An empty `fixedSlots` makes every group elastic.
+    //!
+    //! @throws std::runtime_error when the fixed groups and the floors alone exceed either budget.
     static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt, FixedSlotCounts const& fixedSlots = {});
 
-    // Distribute grains among pools within a pool group.
-    // Returns {num_slots, grains_consumed}.
-    static std::pair<SlotCount, size_t> grainsToSlots(
-        size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
+    //! The pools `quota` pays for: every pool the second budget does not name.
+    //!
+    //! Derived rather than given, so the two budgets partition the group's pools by
+    //! construction -- a pool cannot be charged to both, nor left to neither.
+    static TypedVec<PoolGroupIndex, std::vector<PoolIndex>> poolsPaidByQuota(
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        std::optional<SecondaryPoolBudget> const& secondBudget);
 
-    // Compute minimum grains needed for numSlots in a pool group.
-    static size_t grainsForSlots(
-        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
+    // Distribute grains among the named pools of one pool group.
+    // Returns {num_slots, grains_consumed}. `which` must not be empty.
+    static std::pair<SlotCount, size_t> grainsToSlots(size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        std::vector<PoolIndex> const& which, size_t granularity);
+
+    // Minimum grains the named pools of one pool group need for numSlots. Zero for an empty
+    // `which`, which is what lets a group with no pool of a medium cost that medium nothing.
+    static size_t grainsForSlots(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        std::vector<PoolIndex> const& which, size_t granularity);
 
 protected:
     TypedVec<PoolGroupIndex, std::unique_ptr<PoolGroupBase>> mPoolGroups;
@@ -605,17 +1169,25 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
+    //! Each SlotDesc declares per pool which pools are sparse, and so host-allocated.
+    //! `sparseReservation` is passed to every GpuPoolGroup.
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
+        HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
     CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
     }
 
-    size_t poolSizeGranularity() const noexcept override
+    int numLocalityDomains() const noexcept override
     {
-        return mPhysMemAllocator.physMemSize();
+        return mPhysMemAllocator.numLocalityDomains();
+    }
+
+    std::vector<HalfOpenRange<size_t>> mappedRanges(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+    {
+        return static_cast<GpuPoolGroup const&>(*mPoolGroups.at(pgIdx)).mappedRanges(poolIdx);
     }
 
 private:
@@ -625,8 +1197,6 @@ private:
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    //! `commitUnit` is the granularity memory is allocated and released in; it
-    //! is also what pool sizes are quantized to.
     HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota = std::nullopt,
         HostMemBackingOptions const& options = {});
@@ -636,14 +1206,9 @@ public:
         return CacheTier::HOST_MEM;
     }
 
-    size_t poolSizeGranularity() const noexcept override
-    {
-        return mOptions.commitUnit;
-    }
-
     //! Always set: an unset configured maxQuota resolves to the host memory the
     //! OS reports, and the pools reserve against that resolved value. Rounded
-    //! up to poolSizeGranularity(), which is the quantum quotas are expressed
+    //! up to poolSizeGranularity(cacheTier()), which is the quantum quotas are expressed
     //! in, so the configured bound is reachable.
     [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
     {
@@ -675,11 +1240,36 @@ private:
     std::string mDirectory;
 };
 
+//! A level whose slots are memory other processes donate, reached through one client (remoteMem.h).
+class RemoteCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    RemoteCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, SharedPtr<RemoteMemClient> client);
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    [[nodiscard]] RemoteMemClient& client() const noexcept
+    {
+        return *mClient;
+    }
+
+    //! The remote slots of one pool.
+    [[nodiscard]] RemoteRange& remoteRange(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
+private:
+    SharedPtr<RemoteMemClient> mClient;
+};
+
 // Factory: create appropriate CacheLevelStorage for a given tier config.
-//! `commitUnit` is the tier's allocation granularity, decided once from its
-//! quota and fixed for the tier's lifetime.
+// `sparseReservation` applies to a GPU tier only; see GpuPoolGroup. `remoteClient` is required by, and only used for,
+// a remote tier: the client of its rendezvous directory.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {});
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {},
+    std::optional<size_t> sparseReservation = std::nullopt, SharedPtr<RemoteMemClient> remoteClient = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

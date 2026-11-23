@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import re
+import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
@@ -58,8 +59,10 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
-from ..utils import AuxStreamType
+from ..recurrent_state_spec import RecurrentStateSpec, recurrent_state_spec_from_mamba_params
+from ..utils import AuxStreamType, get_model_extra_attrs
 from .checkpoints.hf.glm5_next_weight_mapper import (
     Glm5NextHfWeightMapper,
     glm5_next_is_quantized,
@@ -83,6 +86,20 @@ LINEAR_ATTENTION = "linear_attention"
 SPARSE_ATTENTION = "deepseek_sparse_attention"
 DENSE_MLP = "dense"
 SPARSE_MLP = "sparse"
+
+
+def _register_graph_layer(
+    model_config: ModelConfig, registry: str, layer_idx: int, module: nn.Module
+) -> str:
+    """Register ``module`` under a unique key for breakable-CUDA-graph eager ops."""
+    layers = model_config.extra_attrs.setdefault(registry, {})
+    key = str(layer_idx)
+    suffix = 0
+    while key in layers:
+        key = f"{layer_idx}_{suffix}"
+        suffix += 1
+    layers[key] = weakref.ref(module)
+    return key
 
 
 @dataclass(frozen=True)
@@ -283,6 +300,54 @@ class Glm5NextContextRows:
         )
 
 
+@dataclass(frozen=True)
+class Glm5NextGenerationRows:
+    """Device-side rows of the generation requests of one forward.
+
+    Built once per forward from the live ``kv_lens`` and shared by every sparse
+    layer, so each derived length tensor is one kernel per forward rather than
+    per layer. ``positions`` is ``[B]`` for plain decode and ``[B, T]`` while a
+    target verifies ``T - 1`` drafts; ``visible[i]`` is row ``i``'s visible
+    prefix length and ``num_candidates[i]`` its complete-pool count (int32).
+    Verification rows also get ``request_ids[i]``, row ``i``'s block-table row
+    (int32, counted from ``first_table``, the batch row of the first generation
+    request), so kernels index tables instead of copying them.
+    """
+
+    positions: torch.Tensor
+    visible: torch.Tensor
+    num_candidates: torch.Tensor
+    request_ids: torch.Tensor | None = None
+
+    @classmethod
+    def build(
+        cls,
+        kv_lens: torch.Tensor,
+        tokens_per_request: int,
+        kpool: int,
+        first_table: int,
+    ) -> Glm5NextGenerationRows:
+        request_ids = None
+        if tokens_per_request <= 1:
+            positions = kv_lens - 1
+            visible = kv_lens
+        else:
+            device = kv_lens.device
+            steps = torch.arange(tokens_per_request, device=device)
+            positions = (kv_lens - tokens_per_request).unsqueeze(1) + steps
+            visible = (positions + 1).reshape(-1)
+            tables = torch.arange(
+                first_table, first_table + kv_lens.shape[0], dtype=torch.int32, device=device
+            )
+            request_ids = tables.repeat_interleave(tokens_per_request)
+        return cls(
+            positions=positions,
+            visible=visible,
+            num_candidates=(visible // kpool).to(torch.int32),
+            request_ids=request_ids,
+        )
+
+
 @dataclass
 class Glm5NextRuntimeContext:
     """Per-forward schedule shared by all layers of a context-first packed batch.
@@ -312,6 +377,9 @@ class Glm5NextRuntimeContext:
     #: Context-row schedules by pool size, built on first use and shared by
     #: all sparse layers of this forward (prefill only, never captured).
     ctx_rows_cache: dict[int, Glm5NextContextRows] = field(default_factory=dict)
+    #: Generation-row lengths by pool size, built on first use and shared by
+    #: all sparse layers of this forward (inside a captured graph, too).
+    gen_rows_cache: dict[int, Glm5NextGenerationRows] = field(default_factory=dict)
 
     def context_rows(self, kpool: int, device: torch.device) -> Glm5NextContextRows:
         rows = self.ctx_rows_cache.get(kpool)
@@ -320,6 +388,18 @@ class Glm5NextRuntimeContext:
                 self.ctx_cu_seqlens, self.cached_lens[: self.num_contexts], kpool, device
             )
             self.ctx_rows_cache[kpool] = rows
+        return rows
+
+    def generation_rows(self, kpool: int) -> Glm5NextGenerationRows:
+        rows = self.gen_rows_cache.get(kpool)
+        if rows is None:
+            rows = Glm5NextGenerationRows.build(
+                self.kv_lens[self.num_contexts :],
+                self.gen_tokens_per_request,
+                kpool,
+                first_table=self.num_contexts,
+            )
+            self.gen_rows_cache[kpool] = rows
         return rows
 
 
@@ -538,6 +618,19 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
     def get_preferred_transceiver_runtime(cls, pretrained_config=None) -> str:
         """Use Python NIXL to transfer the hybrid cache, including recurrent state."""
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: QuantConfig | None = None,
+    ) -> RecurrentStateSpec:
+        """Declare the KDA state of the linear-attention layers."""
+        from ..attention.backends.sparse.glm_kpool.cache_manager import get_glm5_next_cache_params
+
+        params = get_glm5_next_cache_params(pretrained_config, quant_config=quant_config)
+        return recurrent_state_spec_from_mamba_params(params, conv_sections="q_k_v")
 
     # -- whole-model materialization --------------------------------------
 
@@ -879,6 +972,7 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         mapping: Mapping | None = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.ONESHOT,
         aux_stream: torch.cuda.Stream | None = None,
+        model_config: ModelConfig | None = None,
     ) -> None:
         del dtype  # the shared mixer is bf16 (fp32 gate parameters and pools)
         # The checkpoint's ``linear_attn_config`` does not name the gate rank:
@@ -898,6 +992,12 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
             allreduce_strategy=allreduce_strategy,
             aux_stream=aux_stream,
         )
+        # Join the shared mixer's breakable-CUDA-graph registry. model_config is
+        # not passed to the mixer itself, whose projections keep this module's
+        # quantization setup.
+        if model_config is not None:
+            self.layer_idx_str = _register_graph_layer(model_config, "kda_layers", layer_idx, self)
+            self.register_to_config = True
         # Preserve checkpoint FP32 gate parameters. MetaInitMode rejects detach
         # on meta tensors, so create empty FP32 parameters on that branch.
         for name in ("A_log", "dt_bias"):
@@ -1164,6 +1264,11 @@ class Glm5NextSparseAttention(nn.Module):
         self.indexer = Glm5NextIndexer(
             config, layer_idx, mapping=mapping, model_config=model_config
         )
+        self._graph_key = (
+            _register_graph_layer(model_config, "glm5_sparse_layers", layer_idx, self)
+            if model_config is not None
+            else None
+        )
 
         # The production sparse-MLA backend, selected through the standard
         # dispatch (`get_attention_backend(attn_backend, sparse_params)` via
@@ -1254,8 +1359,10 @@ class Glm5NextSparseAttention(nn.Module):
         _, w_v_t = self.absorbed_kv_b()
         tokens = out_latent.shape[0]
         per_head = out_latent.view(tokens, self.num_heads, self.kv_lora_rank)
-        out = torch.bmm(per_head.transpose(0, 1), w_v_t)  # [H, T, v_head]
-        out = self.o_proj(out.transpose(0, 1).reshape(tokens, -1))
+        # Write the per-head products straight into [T, H, v_head] for o_proj.
+        out = per_head.new_empty(tokens, self.num_heads, self.v_head_dim)
+        torch.bmm(per_head.transpose(0, 1), w_v_t, out=out.transpose(0, 1))
+        out = self.o_proj(out.view(tokens, -1))
         if not reduce or self.tp_all_reduce is None:
             return out
         return self.tp_all_reduce(out)
@@ -1272,13 +1379,19 @@ class Glm5NextSparseAttention(nn.Module):
         reduce: bool = True,
         request_ids: torch.Tensor | None = None,
         max_visible: int | None = None,
+        num_candidates: torch.Tensor | None = None,
+        context_spans: Sequence[tuple[int, int]] | None = None,
     ) -> torch.Tensor:
         """Score pools, select members and tail, then attend to paged latent rows.
 
         visible gives each query's prefix length. Packed context uses request_ids;
-        verification uses rows_per_request. Single-token decode reads live lengths
-        from metadata. All device work uses fixed buffer shapes for graph replay.
-        max_visible is an optional host bound on visible that limits scoring work.
+        verification uses rows_per_request and request_ids. Single-token decode
+        reads live lengths from metadata. All device work uses fixed buffer shapes
+        for graph replay.
+        max_visible is an optional host bound on visible that limits scoring work;
+        num_candidates, if given, is visible // index_kpool as int32. Packed context
+        passes context_spans, each request's (rows, visible bound), so scoring
+        runs in calls of bounded memory.
         """
         indexer = self.indexer
         rows = q_resid.shape[0]
@@ -1287,31 +1400,48 @@ class Glm5NextSparseAttention(nn.Module):
         # each request contributes several rows (context or verification).
         plain_decode = request_ids is None and rows_per_request == 1
         kv_lens = None if plain_decode else visible
-        scores = self.attn_backend.score_pools(
-            q_index,
-            index_weights,
-            metadata,
-            q_scale=indexer.softmax_scale,
-            w_scale=indexer.head_mix_scale,
-            kv_lens=kv_lens,
-            rows_per_request=rows_per_request,
-            request_ids=request_ids,
-            max_kv_len=max_visible,
+        num_cand = (
+            (visible // indexer.index_kpool).to(torch.int32)
+            if num_candidates is None
+            else num_candidates
         )
-        num_cand = (visible // indexer.index_kpool).to(torch.int32)
-        selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=scores.device)
-        indexer.pool_top_k(
-            scores,
-            selected,
-            is_prefill=False,
-            sequence_lengths=num_cand,
-            scan_lengths=num_cand,
-        )
+        selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=q_index.device)
+        # Each call scores and selects its own rows.
+        if context_spans is None:
+            calls = [(slice(None), max_visible, None)]
+        else:
+            calls = [
+                (slice(start, end), max_kv_len, (first, last))
+                for start, end, first, last, max_kv_len in self.attn_backend.plan_context_scores(
+                    metadata, context_spans
+                )
+            ]
+        for part, max_kv_len, table_range in calls:
+            scores = self.attn_backend.score_pools(
+                q_index[part],
+                index_weights[part],
+                metadata,
+                q_scale=indexer.softmax_scale,
+                w_scale=indexer.head_mix_scale,
+                kv_lens=None if kv_lens is None else kv_lens[part],
+                rows_per_request=rows_per_request,
+                request_ids=None if request_ids is None else request_ids[part],
+                max_kv_len=max_kv_len,
+                table_range=table_range,
+            )
+            indexer.pool_top_k(
+                scores,
+                selected[part],
+                is_prefill=False,
+                sequence_lengths=num_cand[part],
+                scan_lengths=num_cand[part],
+            )
+            # Release this call's scores before the next call allocates its own.
+            del scores
         topk_rows = self.attn_backend.expand_selection(
             selected,
             metadata,
             kv_lens=kv_lens,
-            rows_per_request=rows_per_request,
             request_ids=request_ids,
         )
         out_latent = self.attn_backend.forward(
@@ -1362,10 +1492,14 @@ class Glm5NextSparseAttention(nn.Module):
                 request_ids=rows.final_request_ids,
             )
         query = self.q_b_proj(q_resid).view(-1, self.num_heads, self.qk_head_dim)
-        max_visible = max(
-            int(cached_lens[i]) + int(cu_seqlens[i + 1]) - int(cu_seqlens[i])
+        spans = [
+            (
+                int(cu_seqlens[i + 1]) - int(cu_seqlens[i]),
+                int(cached_lens[i]) + int(cu_seqlens[i + 1]) - int(cu_seqlens[i]),
+            )
             for i in range(len(cu_seqlens) - 1)
-        )
+        ]
+        max_visible = max(visible for _, visible in spans)
         return self._select_and_attend_paged(
             q_resid,
             query,
@@ -1376,6 +1510,7 @@ class Glm5NextSparseAttention(nn.Module):
             reduce=reduce,
             request_ids=rows.request_ids,
             max_visible=max_visible,
+            context_spans=spans,
         )
 
     def forward_decode(
@@ -1384,6 +1519,7 @@ class Glm5NextSparseAttention(nn.Module):
         kv_lens: torch.Tensor,
         metadata: AttentionMetadata,
         reduce: bool = True,
+        runtime_ctx: Glm5NextRuntimeContext | None = None,
     ) -> torch.Tensor:
         """Decode one token per request using device-resident visible lengths.
 
@@ -1395,8 +1531,15 @@ class Glm5NextSparseAttention(nn.Module):
         the incomplete tail pool or its final complete pool.
         """
         batch = hidden_states.shape[0]
-        positions = kv_lens - 1  # [B]
         indexer = self.indexer
+        rows = (
+            Glm5NextGenerationRows.build(
+                kv_lens, 1, indexer.index_kpool, first_table=int(metadata.num_contexts)
+            )
+            if runtime_ctx is None
+            else runtime_ctx.generation_rows(indexer.index_kpool)
+        )
+        positions = rows.positions  # [B]
         q_resid, latent, packed, index_weights = self._project_attention_and_indexer(hidden_states)
         self.attn_backend.append_paged_state(
             latent.unsqueeze(1), packed.unsqueeze(1), positions.unsqueeze(1), metadata
@@ -1413,6 +1556,7 @@ class Glm5NextSparseAttention(nn.Module):
             metadata,
             AttentionInputType.generation_only,
             reduce=reduce,
+            num_candidates=rows.num_candidates,
         )
 
     def forward(
@@ -1426,12 +1570,25 @@ class Glm5NextSparseAttention(nn.Module):
 
         Reuse the model's per-forward schedules and row cache across layers.
         Reduce the complete output once, including context/verify mixtures.
+        Inside a breakable prefill CUDA graph the phase split runs eagerly
+        between graph segments over the live rows of the padded batch.
         """
-        ctx = (
-            runtime_ctx
-            if runtime_ctx is not None
-            else build_glm5_next_runtime_context(attn_metadata)
-        )
+        if is_in_breakable_cuda_graph() and self._graph_key is not None:
+            out = hidden_states.new_empty((hidden_states.shape[0], self.hidden_size))
+            maybe_bcg_glm5_sparse_attention_inplace(hidden_states, self._graph_key, out)
+        else:
+            ctx = (
+                runtime_ctx
+                if runtime_ctx is not None
+                else build_glm5_next_runtime_context(attn_metadata)
+            )
+            out = self._forward_phases(hidden_states, ctx)
+        return out if self.tp_all_reduce is None else self.tp_all_reduce(out)
+
+    def _forward_phases(
+        self, hidden_states: torch.Tensor, ctx: Glm5NextRuntimeContext
+    ) -> torch.Tensor:
+        """Run each batch phase and return the unreduced ``[tokens, hidden]`` output."""
         parts = []
         if ctx.num_contexts:
             parts.append(
@@ -1449,7 +1606,11 @@ class Glm5NextSparseAttention(nn.Module):
             lengths = ctx.kv_lens[ctx.num_contexts :]
             if ctx.gen_tokens_per_request == 1:
                 out = self.forward_decode(
-                    generation, kv_lens=lengths, metadata=ctx.metadata, reduce=False
+                    generation,
+                    kv_lens=lengths,
+                    metadata=ctx.metadata,
+                    reduce=False,
+                    runtime_ctx=ctx,
                 )
             else:
                 out = self.forward_verify(
@@ -1458,10 +1619,10 @@ class Glm5NextSparseAttention(nn.Module):
                     metadata=ctx.metadata,
                     tokens_per_request=ctx.gen_tokens_per_request,
                     reduce=False,
+                    runtime_ctx=ctx,
                 )
             parts.append(out)
-        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
-        return out if self.tp_all_reduce is None else self.tp_all_reduce(out)
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
     def forward_verify(
         self,
@@ -1470,6 +1631,7 @@ class Glm5NextSparseAttention(nn.Module):
         metadata: AttentionMetadata,
         tokens_per_request: int,
         reduce: bool = True,
+        runtime_ctx: Glm5NextRuntimeContext | None = None,
     ) -> torch.Tensor:
         """Verify packed [batch * tokens_per_request, hidden] generation rows.
 
@@ -1480,7 +1642,9 @@ class Glm5NextSparseAttention(nn.Module):
         """
         tokens_per_request = int(tokens_per_request)
         if tokens_per_request <= 1:
-            return self.forward_decode(hidden_states, kv_lens, metadata, reduce=reduce)
+            return self.forward_decode(
+                hidden_states, kv_lens, metadata, reduce=reduce, runtime_ctx=runtime_ctx
+            )
         num_tokens = hidden_states.shape[0]
         batch = num_tokens // tokens_per_request
         if batch * tokens_per_request != num_tokens or kv_lens.shape[0] != batch:
@@ -1488,9 +1652,15 @@ class Glm5NextSparseAttention(nn.Module):
                 f"glm5_next sparse verify: {num_tokens} tokens for {kv_lens.shape[0]} requests "
                 f"at {tokens_per_request} tokens per request"
             )
-        device = hidden_states.device
-        steps = torch.arange(tokens_per_request, device=device)
-        positions = (kv_lens - tokens_per_request).unsqueeze(1) + steps  # [B, T]
+        kpool = self.indexer.index_kpool
+        rows = (
+            Glm5NextGenerationRows.build(
+                kv_lens, tokens_per_request, kpool, first_table=int(metadata.num_contexts)
+            )
+            if runtime_ctx is None
+            else runtime_ctx.generation_rows(kpool)
+        )
+        positions = rows.positions  # [B, T]
         q_resid, latent, packed, index_weights = self._project_attention_and_indexer(hidden_states)
         self.attn_backend.append_paged_state(
             latent.view(batch, tokens_per_request, -1),
@@ -1509,12 +1679,35 @@ class Glm5NextSparseAttention(nn.Module):
             q_resid,
             query,
             index_weights,
-            (positions + 1).reshape(-1),
+            rows.visible,
             metadata,
             AttentionInputType.generation_only,
             rows_per_request=tokens_per_request,
             reduce=reduce,
+            request_ids=rows.request_ids,
+            num_candidates=rows.num_candidates,
         )
+
+
+def glm5_sparse_attention_inplace(
+    hidden_states: torch.Tensor, layer_key: str, output: torch.Tensor
+) -> None:
+    """Run one sparse-attention layer's phases on the live rows into ``output``.
+
+    Rows past the live token count (CUDA-graph padding) are zeroed.
+    """
+    extra_attrs = get_model_extra_attrs()
+    metadata = extra_attrs["attention_metadata"]()
+    layer = extra_attrs["glm5_sparse_layers"][layer_key]()
+    num_tokens = metadata.num_tokens
+    out = layer._forward_phases(
+        hidden_states[:num_tokens], build_glm5_next_runtime_context(metadata)
+    )
+    output[:num_tokens].copy_(out)
+    output[num_tokens:].zero_()
+
+
+maybe_bcg_glm5_sparse_attention_inplace = eager_on_graph(glm5_sparse_attention_inplace)
 
 
 class Glm5NextGate(DeepseekV3Gate):
@@ -1658,6 +1851,15 @@ class Glm5NextMoE(nn.Module):
         self, x: torch.Tensor, all_rank_num_tokens: list[int] | None = None
     ) -> torch.Tensor:
         flat = x.reshape(-1, self.hidden_size)
+        num_rows = flat.shape[0]
+        if self.use_dp and all_rank_num_tokens is not None:
+            # Peers dispatch and combine with the row count this rank announced
+            # in ``all_rank_num_tokens``. An eager pass over a prefill-graph-padded
+            # batch runs only its live rows (see ``Glm5NextModel.forward``), so
+            # the dispatch gets the announced rows back as zero padding.
+            missing = all_rank_num_tokens[self.mapping.tp_rank] - num_rows
+            if missing > 0:
+                flat = nn.functional.pad(flat, (0, 0, 0, missing))
         # The fused layer routes internally from the FP32 logits and runs
         # FC1 -> clamped SwiGLU -> FC2 in one backend call; one code path
         # serves prefill and decode with no host-dependent branching, so
@@ -1685,7 +1887,7 @@ class Glm5NextMoE(nn.Module):
         mixed = routed + shared
         if self.moe_all_reduce is not None:
             mixed = self.moe_all_reduce(mixed)
-        return mixed.view_as(x)
+        return mixed[:num_rows].view_as(x)
 
 
 # ---------------------------------------------------------------------------
@@ -1771,6 +1973,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 mapping=mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
                 aux_stream=attention_aux_stream,
+                model_config=model_config,
             )
         else:
             self.self_attn = Glm5NextSparseAttention(
@@ -1916,6 +2119,12 @@ class Glm5NextModel(DecoderModel):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        if attn_metadata.padded_num_tokens is not None and not is_in_breakable_cuda_graph():
+            # Eager passes over a CUDA-graph-padded batch run only the live rows;
+            # the speculative wrapper trims the output to the same rows. Under
+            # attention DP the MoE pads its dispatch back to the padded count
+            # its peers expect.
+            inputs_embeds = inputs_embeds[: attn_metadata.num_tokens]
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
         # Only the decoder stack: under one-model MTP the speculative base

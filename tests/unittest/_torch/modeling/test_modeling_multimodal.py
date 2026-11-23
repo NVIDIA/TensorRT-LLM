@@ -210,7 +210,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 ):
                     module.post_load_weights()
 
-        # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
+        # ModelEngine builds the vision encoders' AttentionMetadata after
         # load via `setup_mm_encoder_attn_metadata`. These standalone
         # model tests don't go through the engine, so mirror that walk here --
         # otherwise the encoder forward raises on an uninitialized attn_metadata.
@@ -351,9 +351,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         multimodal_params_list = []
         for input in inputs:
             input_processor_with_hash = create_input_processor_with_hash(processor)
-            prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
-                input, sampling_params=None
-            )
+            prompt_token_ids, extra_processed_inputs = input_processor_with_hash(input, None)
             input_ids.extend(prompt_token_ids)
             multimodal_params = MultimodalParams(
                 multimodal_data=extra_processed_inputs.get("multimodal_data"),
@@ -703,6 +701,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         # Context Phase
         print("  Running context phase...")
         with torch.inference_mode():
+            logits = None
             if scenario.chunked_prefill:
                 chunk_size = 128
                 total_prompt_len = len(trtllm_input_ids)

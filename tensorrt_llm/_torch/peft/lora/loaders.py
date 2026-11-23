@@ -33,43 +33,97 @@ import yaml
 
 from tensorrt_llm.models.convert_utils import get_model_path, load_state_dict
 
+from .ownership import DecoderLoraOwner
+
 logger = logging.getLogger(__name__)
 
 
 NEMO_SUPPORTED_LORA_MODULES = {"attn_qkv"}
 
 
+def _validate_owner_prefix(
+    key: str, prefix: str, owner: DecoderLoraOwner, source: str, *, layered: bool = True
+) -> None:
+    if source == "HF":
+        prefix = prefix.removeprefix("base_model.model.")
+        if prefix == "base_model.model":
+            prefix = ""
+        prefixes = owner.hf_prefixes
+        if not layered:
+            prefixes = tuple(p.rpartition(".")[0] for p in prefixes)
+    else:
+        prefixes = owner.nemo_prefixes
+    if prefix not in prefixes:
+        raise ValueError(
+            f"LoRA key '{key}' is outside selected owner 'decoder' "
+            f"(module path '{owner.module_path or '<root>'}'): "
+            f"unsupported {source} prefix '{prefix}'. "
+            "Encoder/projector LoRA is not supported. Use a decoder-only adapter checkpoint."
+        )
+
+
+def _validate_unparsed_key_owner(key: str, owner: DecoderLoraOwner, source: str) -> None:
+    normalized = key.removeprefix("base_model.model.") if source == "HF" else key
+    prefixes = owner.hf_prefixes if source == "HF" else owner.nemo_prefixes
+    if not any(normalized.startswith(f"{prefix}.") for prefix in prefixes):
+        _validate_owner_prefix(key, normalized, owner, source)
+
+
+def _check_duplicate_destination(
+    destinations: dict, destination: tuple, key: str, owner: DecoderLoraOwner
+) -> None:
+    if destination in destinations:
+        raise ValueError(
+            f"LoRA keys '{destinations[destination]}' and '{key}' have a duplicate "
+            f"destination {destination} for selected owner 'decoder' "
+            f"(module path '{owner.module_path or '<root>'}')."
+        )
+    destinations[destination] = key
+
+
 def get_all_nemo_lora_weights(
     lora_weights: Dict[str, torch.Tensor],
+    *,
+    owner: DecoderLoraOwner = DecoderLoraOwner(),
 ) -> Dict[int, Dict[str, torch.Tensor]]:
     """Extract and organize NeMo LoRA weights by layer and direction.
 
     Args:
         lora_weights: Dictionary mapping weight keys to tensors from NeMo checkpoint
+        owner: Decoder module and accepted checkpoint prefixes
 
     Returns:
         Dictionary mapping layer_idx -> {direction -> tensor} where direction is 'in' or 'out'
 
     Raises:
         KeyError: If unsupported keys are found or layer extraction fails
+        ValueError: If a key belongs to another owner or duplicates a destination
     """
     layer_weights: Dict[int, Dict[str, torch.Tensor]] = defaultdict(dict)
     adapter_key = "self_attention.adapter_layer.lora_kqv_adapter"
-    layer_pattern = re.compile(r".*\.layers\.(\d+)\..*")
+    layer_pattern = re.compile(r"(.*\.layers)\.(\d+)\..*")
+    destinations = {}
     for key, weights in lora_weights.items():
+        _validate_unparsed_key_owner(key, owner, "NeMo")
         if adapter_key in key:
+            m = layer_pattern.match(key)
+            if m is None:
+                if not key.endswith(("linear_in.weight", "linear_out.weight")):
+                    continue
+                raise KeyError(
+                    f"Failed to extract layer index from key {key} using pattern {layer_pattern.pattern}"
+                )
+            _validate_owner_prefix(key, m.group(1), owner, "NeMo")
             if key.endswith("linear_in.weight"):
                 inout = "in"
             elif key.endswith("linear_out.weight"):
                 inout = "out"
             else:
                 continue
-            m = layer_pattern.match(key)
-            if m is None:
-                raise KeyError(
-                    f"Failed to extract layer index from key {key} using pattern {layer_pattern.pattern}"
-                )
-            layer_idx = int(m.group(1))
+            layer_idx = int(m.group(2))
+            _check_duplicate_destination(
+                destinations, ("attn_qkv", layer_idx, None, inout), key, owner
+            )
             layer_weights[layer_idx][inout] = weights
         else:
             raise KeyError(f"unsupported key {key} from Nemo LoRA weights")
@@ -86,6 +140,9 @@ def iterate_hf_lora(
     lora_weights: Dict[str, torch.Tensor],
     hf_modules: Set[str],
     component: Optional[str] = None,
+    *,
+    owner: DecoderLoraOwner = DecoderLoraOwner(),
+    hf_modules_to_trtllm_modules: Optional[Dict[str, str]] = None,
 ):
     """Iterate over HuggingFace LoRA weights and call iterator function for each weight.
 
@@ -95,24 +152,30 @@ def iterate_hf_lora(
         lora_weights: Dictionary mapping weight keys to tensors from HF checkpoint
         hf_modules: Set of supported HF module names
         component: Optional component name to filter by (e.g., 'decoder')
+        owner: Decoder module and accepted checkpoint prefixes
+        hf_modules_to_trtllm_modules: Canonical destinations for detecting HF alias collisions
 
     Returns:
         Nested dictionary structure organizing the weights
 
     Raises:
         KeyError: If unsupported keys are found
-        AssertionError: If HF module is not in supported list
+        ValueError: If a key belongs to another owner or duplicates a destination
     """
     all_weights = defaultdict(lambda: defaultdict(dict))
+    destinations = {}
+    module_representations = {}
     pattern = HF_LORA_PATTERN
     for key, weights in lora_weights.items():
-        m = pattern.match(key)
+        m = pattern.fullmatch(key)
         if not m:
-            if "lm_head" not in key and "embed_tokens" not in key:
-                raise KeyError(f"unsupported key {key} from HF LoRA weights")
-            continue
-        if component is not None and component not in m.group(1):
-            continue
+            saved_module = re.search(r"(?:^|\.)(?:lm_head|embed_tokens)(?:\.|$)", key)
+            if saved_module is not None:
+                _validate_owner_prefix(key, key[: saved_module.start()], owner, "HF", layered=False)
+                continue
+            _validate_unparsed_key_owner(key, owner, "HF")
+            raise KeyError(f"unsupported key {key} from HF LoRA weights")
+        _validate_owner_prefix(key, m.group(1), owner, "HF")
         layer_idx = int(m.group(2))
         expert_idx = m.group(6)
         if expert_idx is not None:
@@ -156,6 +219,26 @@ def iterate_hf_lora(
         else:
             inout_or_mag = "magnitude"
 
+        trtllm_module = (
+            hf_modules_to_trtllm_modules[hf_module]
+            if hf_modules_to_trtllm_modules is not None
+            else hf_module
+        )
+        module_destination = (trtllm_module, layer_idx)
+        previous_is_moe, previous_key = module_representations.setdefault(
+            module_destination, (is_moe, key)
+        )
+        if previous_is_moe != is_moe:
+            raise ValueError(
+                f"LoRA keys '{previous_key}' and '{key}' mix flat and expert-indexed weights "
+                f"for destination {module_destination} and selected owner 'decoder' "
+                f"(module path '{owner.module_path or '<root>'}')."
+            )
+        _check_duplicate_destination(
+            destinations, (trtllm_module, layer_idx, expert_idx, inout_or_mag), key, owner
+        )
+        if component is not None and component not in m.group(1):
+            continue
         iter_fn(layer_idx, hf_module, expert_idx, inout_or_mag, weights)
         if not is_moe:
             all_weights[layer_idx][hf_module][inout_or_mag] = weights
@@ -166,7 +249,12 @@ def iterate_hf_lora(
 
 
 def get_all_hf_lora_weights(
-    lora_weights: Dict[str, torch.Tensor], hf_modules: Set[str], component: Optional[str] = None
+    lora_weights: Dict[str, torch.Tensor],
+    hf_modules: Set[str],
+    component: Optional[str] = None,
+    *,
+    owner: DecoderLoraOwner = DecoderLoraOwner(),
+    hf_modules_to_trtllm_modules: Optional[Dict[str, str]] = None,
 ):
     """Extract and organize all HuggingFace LoRA weights by layer and module.
 
@@ -174,6 +262,8 @@ def get_all_hf_lora_weights(
         lora_weights: Dictionary mapping weight keys to tensors from HF checkpoint
         hf_modules: Set of supported HF module names
         component: Optional component name to filter by (e.g., 'decoder')
+        owner: Decoder module and accepted checkpoint prefixes
+        hf_modules_to_trtllm_modules: Canonical destinations for detecting HF alias collisions
 
     Returns:
         Nested dictionary organizing weights by layer, module, and potentially expert
@@ -187,16 +277,37 @@ def get_all_hf_lora_weights(
             all_weights[layer_idx][hf_module][expert_idx][inout] = weights
 
     all_weights = defaultdict(lambda: defaultdict(dict))
-    iterate_hf_lora(iter_fn, lora_weights, hf_modules, component)
+    iterate_hf_lora(
+        iter_fn,
+        lora_weights,
+        hf_modules,
+        component,
+        owner=owner,
+        hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
+    )
     return all_weights
 
 
-def get_hf_target_modules(lora_weights, hf_modules):
+def get_hf_target_modules(
+    lora_weights,
+    hf_modules,
+    *,
+    owner: DecoderLoraOwner = DecoderLoraOwner(),
+    hf_modules_to_trtllm_modules: Optional[Dict[str, str]] = None,
+):
+    """Validate ownership and return supported HF targets present in the checkpoint."""
+
     def iter_fn(layer_idx, hf_module, expert_idx, inout, weights):
         hf_target_modules.add(hf_module)
 
     hf_target_modules = set()
-    iterate_hf_lora(iter_fn, lora_weights, hf_modules)
+    iterate_hf_lora(
+        iter_fn,
+        lora_weights,
+        hf_modules,
+        owner=owner,
+        hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
+    )
     return hf_target_modules
 
 
@@ -231,7 +342,8 @@ def norm_dora_magnitude(
 
 
 class HfLoraLoader:
-    def __init__(self, lora_dirs: List[str]):
+    def __init__(self, lora_dirs: List[str], *, owner: DecoderLoraOwner = DecoderLoraOwner()):
+        self.owner = owner
         self.lora_target_modules = []
         self.is_valid = False
         self.lm_head = None
@@ -276,20 +388,25 @@ class HfLoraLoader:
             hf_target_modules = get_hf_target_modules(
                 self.lora_weight,
                 hf_modules=set(hf_modules_to_trtllm_modules.keys()),
+                owner=self.owner,
+                hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
             )
             for m in hf_target_modules:
                 trtllm_module = hf_modules_to_trtllm_modules[m]
                 lora_target_modules.add(trtllm_module)
         return list(lora_target_modules)
 
-    def get_dense_lora_dtype(self) -> Optional[torch.dtype]:
-        """Return the common input/output dtype for dense LoRA modules."""
+    def get_lora_dtype(self) -> Optional[torch.dtype]:
+        """Return the common input/output dtype across all LoRA modules."""
         lora_dtypes = set()
         for key, weight in self.lora_weight.items():
             match = HF_LORA_PATTERN.match(key)
-            if match is not None and match.group(6) is None and match.group(8) in ("A", "B"):
+            if match is not None and match.group(8) in ("A", "B"):
                 lora_dtypes.add(weight.dtype)
-        return next(iter(lora_dtypes)) if len(lora_dtypes) == 1 else None
+        if len(lora_dtypes) > 1:
+            dtype_names = ", ".join(sorted(str(dtype) for dtype in lora_dtypes))
+            raise ValueError(f"LoRA checkpoint weights must have one dtype; found {dtype_names}.")
+        return next(iter(lora_dtypes)) if lora_dtypes else None
 
 
 @lru_cache(maxsize=128)
@@ -362,7 +479,7 @@ def find_nemo_files(lora_dirs: List[str]) -> List[str]:
 
 
 class NemoLoraLoader:
-    def __init__(self, lora_dirs: List[str]):
+    def __init__(self, lora_dirs: List[str], *, owner: DecoderLoraOwner = DecoderLoraOwner()):
         """Initialize NemoLoraLoader with paths to .nemo files or directories.
 
         Args:
@@ -374,6 +491,8 @@ class NemoLoraLoader:
               directories and files. This is a design flaw that should be fixed
               in a future version (e.g., rename to 'lora_paths').
         """
+        self.owner = owner
+        self.lora_dirs = lora_dirs
         self.lora_target_modules = []
         self.is_valid = False
 
@@ -397,6 +516,12 @@ class NemoLoraLoader:
             List[str]: List of target module names supported by NeMo LoRA
         """
         return self.lora_target_modules
+
+    def validate_weights(self) -> None:
+        """Reject unsupported owners and ambiguous destinations in each archive."""
+        for model_file in find_nemo_files(self.lora_dirs):
+            _, weights = unpack_nemo_weights(model_file)
+            get_all_nemo_lora_weights(weights, owner=self.owner)
 
 
 def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:

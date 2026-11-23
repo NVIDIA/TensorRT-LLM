@@ -1,0 +1,7 @@
+/* A modeling_v2 family library exports nothing: its torch ops register from
+ * static initializers when the library is loaded, and keeping every symbol
+ * local lets two family libraries define the same C++ names in one process.
+ * See cpp/cmake/modules/modeling_v2.cmake. */
+{
+  local: *;
+};

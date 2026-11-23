@@ -13,9 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tensorrt_llm.inputs.utils import apply_chat_template
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _DummyTokenizer:
@@ -484,3 +488,27 @@ def test_deepseek_v4_server_chat_template_path_leaves_pending_media_alone():
         assert message["media"][0]["data"] is pending
     finally:
         pending.close()
+
+
+def test_deepseek_v4_tools_argument_joins_the_leading_system_message():
+    """Tools render on the leading system or developer message, after its content."""
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    for role in ("system", "developer"):
+        conversation = [{"role": role, "content": "Be brief."}, {"role": "user", "content": "hi"}]
+
+        prompt = tokenizer.apply_chat_template(conversation, tools=tools, tokenize=False)
+
+        assert prompt.count("## Tools") == 1
+        assert prompt.index("Be brief.") < prompt.index("## Tools")
+        assert "tools" not in conversation[0]

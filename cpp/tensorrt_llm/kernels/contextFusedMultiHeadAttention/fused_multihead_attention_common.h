@@ -72,7 +72,9 @@ enum class ContextAttentionMaskType
     // Bidirectional sliding window attention.
     BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
-    CUSTOM_MASK
+    CUSTOM_MASK,
+    // Per-query inclusive left and right KV-token bounds.
+    VARIABLE_WINDOW
 };
 
 enum class AttentionInputLayout
@@ -173,6 +175,7 @@ struct MHARunnerFixedParams
         case ContextAttentionMaskType::CAUSAL: output += "causal"; break;
         case ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL: output += "sliding_or_chunked_causal"; break;
         case ContextAttentionMaskType::CUSTOM_MASK: output += "custom_mask"; break;
+        case ContextAttentionMaskType::VARIABLE_WINDOW: output += "variable_window"; break;
         default: output += std::to_string(static_cast<int>(attentionMaskType)) + " (unknown)"; break;
         }
 
@@ -285,6 +288,8 @@ struct MHARunnerParams
     void const* kPtr;
     // The V buffer ptr (for separate V input).
     void const* vPtr;
+    // Physical V token stride for separate Q, K, V input; zero derives it from the layout.
+    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The paged kv cache array for scaling factor.
@@ -320,6 +325,9 @@ struct MHARunnerParams
     void const* cuKvSeqLenPtr;
     // The cumulative packed mask rows.
     void const* cuMaskRowsPtr;
+    // Per-query inclusive left and right KV-token bounds.
+    int32_t const* variableWindowTokenStartsPtr = nullptr;
+    int32_t const* variableWindowTokenEndsPtr = nullptr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
     // Scratch buffer (partialO + partialStats) for MultiCtasKv mode in trtllm-gen generation-style kernels.

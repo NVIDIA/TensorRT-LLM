@@ -56,6 +56,7 @@ enum class CacheTier : int
     GPU_MEM = 0,
     HOST_MEM = 1,
     DISK = 2,
+    REMOTE = 3,
 };
 
 // PageIndexMode — how converted page indices relate to layers within a layer group.
@@ -78,7 +79,6 @@ enum class PageIndexMode : int
 using CacheLevel = StrongIndex<int, struct CacheLevelTag, 0>;
 // The kernel-facing hot level; colder levels may also use GPU memory.
 inline constexpr CacheLevel kHotLevel{0};
-inline constexpr CacheLevel kSparseHistoryLevel{1}; // Sparse history requires HOST_MEM at this level.
 
 // Opaque request identifier shared with the rest of the batch manager.
 using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;
@@ -95,6 +95,12 @@ using LayerId = int;
 
 // Raw CUDA stream handle (CUstream cast to uintptr_t).
 using CudaStream = uintptr_t;
+
+// Row of a Batch: the seat a member occupies while it is stepped. Its arena lease and its
+// page table are both found by it, and it is the Batch's alone -- a row of one Batch names
+// nothing in another.
+using BatchRow = StrongIndex<int, struct BatchRowTag, -1>;
+inline constexpr BatchRow kNoBatchRow{};
 
 // Index of a beam in beam-search.
 using BeamIndex = StrongIndex<int, struct BeamIndexTag, 0>;
@@ -113,6 +119,9 @@ inline constexpr FileDescriptor kBadFileDescriptor = -1;
 // Index into a page table.
 using PageIndex = StrongIndex<int, struct PageIndexTag, -1>;
 inline constexpr PageIndex kBadPageIndex{-1};
+
+// Index of a GPU locality domain.
+using LocalityDomainId = StrongIndex<int, struct LocalityDomainIdTag>;
 
 // Eviction priority (0 = highest priority to evict, 100 = lowest).
 using Priority = int;

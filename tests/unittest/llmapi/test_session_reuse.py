@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-logic tests for automatic MPI session reuse — no MPI, no GPU."""
 
+import contextlib
+import multiprocessing
+import subprocess
+import sys
+
 import pytest
 from test_common import session_reuse
 from test_common.session_reuse import SessionReuseCache
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _FakePool:
@@ -53,8 +60,8 @@ def reuse_cache(monkeypatch):
             pool, self.shadow = self.shadow, None
             return pool
 
-        def schedule_shadow(self, n, env_overlay=None):
-            self.restocks.append((n, env_overlay))
+        def schedule_shadow(self, n):
+            self.restocks.append(n)
 
     cache.prefetch = _FakePrefetcher()
     monkeypatch.setattr(session_reuse, "_prefetcher", lambda: cache.prefetch)
@@ -108,14 +115,13 @@ def test_cached_handover_reaps_in_flight_retires(reuse_cache):
 def test_cache_miss_takes_prefetched_shadow(reuse_cache):
     # A shadow armed at the PREVIOUS miss is consumed instantly on this one
     # (no synchronous spawn), and a replacement is restocked for the next
-    # miss with the worker-side weight-cache overlay.
-    shadow = _FakePool(2, wait_shutdown=True, env_overrides={"TRTLLM_HF_WEIGHT_CACHE": "1"})
+    # miss.
+    shadow = _FakePool(2, wait_shutdown=True)
     reuse_cache.prefetch.shadow = shadow
     s = reuse_cache.acquire(_FakePool, 2)
     assert s._real is shadow
     assert s._real._reuse_uses == 0  # adopted as a cache-managed pool
-    n, overlay = reuse_cache.prefetch.restocks[-1]
-    assert n == 2 and overlay.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
+    assert reuse_cache.prefetch.restocks == [2]
 
 
 def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
@@ -135,7 +141,6 @@ def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
     reuse_cache.prefetch.schedule_shadow = _record_schedule
     s = reuse_cache.acquire(_OrderedPool, 2)  # nothing armed: sync spawn
     assert isinstance(s._real, _FakePool) and s._real.wait_shutdown
-    assert s._real.env_overrides.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
     assert reuse_cache.prefetch.restocks  # shadow armed for the NEXT miss
     assert events == ["sync pool ready", "shadow scheduled"]
 
@@ -273,21 +278,20 @@ def test_disabled_under_xdist(monkeypatch):
     assert not SessionReuseCache().enabled
 
 
-def test_weight_cache_env_scoped_to_spawn(reuse_cache, monkeypatch):
-    import os
-
+def test_weight_cache_left_at_default(reuse_cache, monkeypatch):
+    # Reused pools load checkpoints as production does: nothing turns the HF
+    # weight cache on for their workers.
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
     s = reuse_cache.acquire(_FakePool, 2)
-    # Workers froze the cache env at spawn...
-    assert s._real.spawn_env_weight_cache == "1"
-    # ...but the suite's environment is untouched afterwards.
-    assert "TRTLLM_HF_WEIGHT_CACHE" not in os.environ
+    assert not s._real.env_overrides
+    assert s._real.spawn_env_weight_cache is None
 
 
-def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch):
-    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "0")
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch, value):
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", value)
     s = reuse_cache.acquire(_FakePool, 2)
-    assert s._real.spawn_env_weight_cache == "0"  # explicit user value wins
+    assert s._real.spawn_env_weight_cache == value  # explicit user value wins
 
 
 def test_abort_after_release_never_kills_cached_pool(reuse_cache):
@@ -519,11 +523,11 @@ def test_failed_item_fences_cached_pools(reuse_cache, monkeypatch):
     assert s2._real is not real  # fresh pool, no reuse across the failure
 
 
-class _FakeBarrierSession:
+class _FakeProbeSession:
     """Fakes MpiPoolSession.submit for master-side submit_sync_per_worker tests.
 
-    Worker-side behaviour (the barrier itself) needs real MPI and is covered
-    by the multi-GPU validation runs; here each entry stands for one worker's
+    Worker-side behaviour needs real MPI and is covered by the multi-GPU
+    validation runs; here each entry stands for one worker's
     future: a (rank, result) tuple, an Exception, or None (never completes,
     i.e. a wedged worker).
     """
@@ -548,14 +552,14 @@ class _FakeBarrierSession:
 def test_probe_returns_results_ordered_by_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(2, "c"), (0, "a"), (1, "b")])
+    session = _FakeProbeSession([(2, "c"), (0, "a"), (1, "b")])
     assert submit_sync_per_worker(session, lambda: None) == ["a", "b", "c"]
 
 
 def test_probe_times_out_on_wedged_worker():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), None])  # rank 1 never returns
+    session = _FakeProbeSession([(0, "a"), None])  # rank 1 never returns
     with pytest.raises(RuntimeError, match="timed out"):
         submit_sync_per_worker(session, lambda: None, timeout=0.2)
 
@@ -563,7 +567,7 @@ def test_probe_times_out_on_wedged_worker():
 def test_probe_propagates_worker_exception():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), ValueError("worker died")])
+    session = _FakeProbeSession([(0, "a"), ValueError("worker died")])
     with pytest.raises(ValueError, match="worker died"):
         submit_sync_per_worker(session, lambda: None)
 
@@ -571,7 +575,7 @@ def test_probe_propagates_worker_exception():
 def test_probe_flags_missing_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), (0, "a")])  # rank 1 never covered
+    session = _FakeProbeSession([(0, "a"), (0, "a")])  # rank 1 never covered
     with pytest.raises(RuntimeError, match=r"ranks \[1\]"):
         submit_sync_per_worker(session, lambda: None)
 
@@ -595,6 +599,66 @@ def test_passing_item_keeps_reuse(reuse_cache, monkeypatch):
 
     s2 = reuse_cache.acquire(_FakePool, 2)
     assert s2._real is real  # pool survived and was reused
+
+
+class _PlainItem:
+    nodeid = "test_e2e.py::test_ptp_quickstart_advanced"
+
+    @staticmethod
+    def get_closest_marker(name):
+        return None
+
+
+@pytest.fixture
+def cached_pool_hooks(reuse_cache, monkeypatch):
+    """The hooks bound to ``reuse_cache``, which holds one idle 4-worker pool."""
+    from test_common import session_reuse_hooks as hooks
+
+    monkeypatch.setattr(hooks, "REUSE", reuse_cache)
+    monkeypatch.setattr(reuse_cache, "install_pool_factory_if_loaded", lambda: None)
+    s = reuse_cache.acquire(_FakePool, 4)
+    s.shutdown()
+    yield hooks, s._real
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_child_process_drains_cached_pools(cached_pool_hooks, capfd):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert pool.shut
+    assert "draining before child process" in capfd.readouterr().out
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_multiprocessing_child_drains_cached_pools(cached_pool_hooks):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    process = multiprocessing.get_context("spawn").Process(target=int)
+    process.start()
+    process.join()
+    assert pool.shut
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_device_query_keeps_cached_pools(cached_pool_hooks):
+    # The skip-marker fixtures run nvidia-smi before most multi-GPU tests.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run("nvidia-smi -L", shell=True, capture_output=True)
+    with contextlib.suppress(FileNotFoundError):  # no driver on this host
+        subprocess.run(["nvidia-smi", "-L"], capture_output=True)
+    hooks.pytest_runtest_teardown(_PlainItem())
+    assert not pool.shut
+
+
+def test_spawn_after_teardown_keeps_cached_pools(cached_pool_hooks):
+    # Finalizer cleanup commands must not cost the next test its pool.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    hooks.pytest_runtest_teardown(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert not pool.shut
 
 
 def test_seam_shim_is_isinstance_transparent():

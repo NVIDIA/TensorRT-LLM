@@ -139,6 +139,18 @@ the Multimodal Model Family.
 
 ## Development Guide
 
+Executor host-upload buffers must keep stable device addresses across capture and replay. Their internal
+`DeviceCopyBuffer` owns the tensor and last-uploaded host snapshot; every cached writer must use the same
+owner's `update(host)` method. A Mamba metadata CUDA alias shares its cache manager's owner, rather than
+creating another cache over the same storage. Returned tensors are borrowed views, not immutable tensors;
+writing them directly bypasses the cached-upload contract.
+
+Changed updates use independent host staging, pinned according to the owner's configuration, and write only
+the supplied prefix. Shorter updates preserve the device tail and its cached values; unchanged prefixes
+enqueue no upload. The C++ Mamba manager uses `force=True` to retain its unconditional-upload behavior while
+keeping aliases' shared snapshot coherent. `TLLM_DEBUG_MODE=1` verifies skipped values outside CUDA graph
+capture; capture does not add a device synchronization for this check.
+
 ### Background Knowledge
 
 Currently, TRT-LLM mainly relies on torch.compile **fullgraph** mode to enable Piecewise CUDA Graph feature, which means all the operations in the model must be recognized by torch.compile.

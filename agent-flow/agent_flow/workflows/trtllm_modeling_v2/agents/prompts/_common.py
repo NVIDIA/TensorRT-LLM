@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared doctrine and run-scoped prompt context."""
+
+from __future__ import annotations
+
+import re
+from typing import Sequence
+
+from ...operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
+from ._render import render_template
+
+
+def tidy(text: str) -> str:
+    """Collapse the blank-line runs that composing blocks leaves behind."""
+    return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+
+
+MODELING_V2_LAYOUT = render_template(
+    "common/modeling_v2_layout.md.j2",
+    MODELING_V2_PACKAGE=MODELING_V2_PACKAGE,
+    CATALOG_TESTS_DIR=CATALOG_TESTS_DIR,
+)
+MODELING_V2_SWITCH = render_template("common/modeling_v2_switch.md.j2")
+SOURCE_BOUNDARY = render_template("common/source_boundary.md.j2")
+EVIDENCE_DISCIPLINE = render_template("common/evidence_discipline.md.j2")
+CITATION_DISCIPLINE = render_template("common/citation_discipline.md.j2")
+
+
+def decision_file_block(agent: str, extra: Sequence[str] = ()) -> str:
+    """Render the decision-file protocol; decisions come from the role's ending section."""
+    return render_template("common/decision_file.md.j2", agent=agent, extra=extra)
+
+
+def notes_block(notes: str) -> str:
+    """Render the task's notes: the user's own guidance, verbatim, to every role."""
+    if not notes or not notes.strip():
+        return ""
+    return render_template("common/notes.md.j2", notes=notes.strip())
+
+
+def scope_block(scope: str) -> str:
+    """Render the target's scope when it is narrower than the checkpoint."""
+    if scope != "text_only":
+        return ""
+    return render_template("common/text_only.md.j2")
+
+
+__all__ = [
+    "CITATION_DISCIPLINE",
+    "EVIDENCE_DISCIPLINE",
+    "MODELING_V2_LAYOUT",
+    "MODELING_V2_SWITCH",
+    "SOURCE_BOUNDARY",
+    "decision_file_block",
+    "notes_block",
+    "scope_block",
+    "tidy",
+]

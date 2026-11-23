@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSeek-V4.1-Flash NVFP4 on one 4xGB300 tray, 8k/1k, embedded DSpark k=5.
+# Two shapes, the same ones the CI accuracy gate
+# TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4 / nvfp4-dp4] runs: TEP4
+# (attention TP) at low concurrency and DEP4 (attention DP) at high
+# concurrency. Engine settings follow that gate: TRTLLM MoE, NCCL all-reduce,
+# CSA2 sparse attention, FP8 KV cache, V4.1 chat renderer.
+# The accepted draft length is pinned to 2.51 of 5 (acceptance length 3.51,
+# the DSpark k=5 golden value with thinking on), as in the AgentX recipe, so
+# the numbers measure the runtime rather than draft quality on random prompts.
+metadata:
+  model_name: deepseek_v41_flash_nvfp4_dspark
+  supported_gpus:
+  - GB300
+hardware:
+  gpus_per_node: 4
+server_configs:
+  # 8k1k - TEP4 (attention TP4, MoE EP4), DSpark k=5, low concurrency
+  - name: "v41_flash_nvfp4_tep4_dspark5_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51"
+    model_name: "deepseek_v41_flash_nvfp4_dspark"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 16
+    max_num_tokens: 8192
+    max_seq_len: 9344
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    custom_tokenizer: "deepseek_v41"
+    allreduce_strategy: "NCCL"
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4, 8, 16]
+    moe_config:
+      backend: 'TRTLLM'
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    sparse_attention_config:
+      algorithm: csa2
+    speculative_config:
+      decoding_type: 'DSpark'
+      max_draft_len: 5
+      block_size: 5
+      speculative_model: DeepSeek-V4.1-Flash-NVFP4
+    client_configs:
+      - name: "con8_iter10_8k1k"
+        concurrency: 8
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+
+  # 8k1k - DEP4 (attention DP4, MoE EP4), DSpark k=5, high concurrency
+  - name: "v41_flash_nvfp4_dep4_dspark5_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51"
+    model_name: "deepseek_v41_flash_nvfp4_dspark"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 64
+    max_num_tokens: 8192
+    max_seq_len: 9344
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    custom_tokenizer: "deepseek_v41"
+    allreduce_strategy: "NCCL"
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+    moe_config:
+      backend: 'TRTLLM'
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    sparse_attention_config:
+      algorithm: csa2
+    speculative_config:
+      decoding_type: 'DSpark'
+      max_draft_len: 5
+      block_size: 5
+      speculative_model: DeepSeek-V4.1-Flash-NVFP4
+    client_configs:
+      - name: "con256_iter5_8k1k"
+        concurrency: 256
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        backend: "openai"

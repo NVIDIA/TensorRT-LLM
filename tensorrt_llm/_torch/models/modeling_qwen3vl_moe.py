@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Dict, List
 
 import torch
@@ -45,6 +48,8 @@ from .modeling_utils import ModelConfig, register_auto_model, register_vision_en
     ),
 )
 class Qwen3MoeVLModel(Qwen3VLModelBase):
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
+
     supports_encoder_cache = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):

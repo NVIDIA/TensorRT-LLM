@@ -25,6 +25,8 @@ The BF16, block-FP8, and NVFP4 checkpoints support the same feature set:
 
 The KV-cache dtype and the GDN recurrent-state dtype are selected independently of the model weight precision, through `kv_cache_config.dtype` and `kv_cache_config.mamba_ssm_cache_dtype`.
 
+With an FP8 KV cache, QSA sparse attention selects the PrimTS kernel on SM100/SM103/SM107 when the inputs qualify, and Triton otherwise (small decode batches, unsupported shapes, or PrimTS unavailable). PrimTS converts the BF16 queries to FP8 (unit scale, clamped to the E4M3 range) and attends against the FP8 cache; Triton upcasts K/V to BF16 instead. The two differ at FP8 rounding level: full GSM8K on B300 at TP1 scores 95.45 with either kernel.
+
 ## Prerequisites
 
 * GPU: NVIDIA Blackwell architecture. The BF16 checkpoint also runs on Hopper.
@@ -141,7 +143,7 @@ kv_cache_config:
     periodic_snapshot_interval: 256
 ```
 
-Block reuse stays on only if `mamba_state_config` sets at least one snapshot placement: `periodic_snapshot_interval`, `additional_snapshot_offsets_from_start`, or `additional_snapshot_offsets_from_end`. `enable_branch_snapshot` refines where snapshots land but does not by itself keep reuse enabled. The same settings apply in disaggregated serving; configure them on both workers. A snapshot restores the PLE short-convolution state and n-gram context along with the GDN state, because they share one recurrent page. Check the effective LLM arguments and the per-request `num_reused_blocks` metric rather than assuming the submitted setting took effect.
+Block reuse stays on only if `mamba_state_config` sets at least one snapshot placement: `periodic_snapshot_interval`, `additional_snapshot_offsets_from_start`, or `additional_snapshot_offsets_from_end`. `block_reuse_config.enable_branch_snapshot` refines where snapshots land but does not by itself keep reuse enabled. The same settings apply in disaggregated serving; configure them on both workers. A snapshot restores the PLE short-convolution state and n-gram context along with the GDN state, because they share one recurrent page. Check the effective LLM arguments and the per-request `num_reused_blocks` metric rather than assuming the submitted setting took effect.
 
 ### Launch the TensorRT LLM Server
 

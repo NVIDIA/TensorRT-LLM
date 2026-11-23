@@ -241,3 +241,45 @@ def test_kimi_k3_fine_m_tuning_uses_hybrid_buckets():
         512,
         512,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(getSMVersion() not in (100, 103, 107), reason="needs SM100/SM103/SM107")
+@pytest.mark.parametrize("m", [1, 16, 17, 64, 96, 97, 256])
+def test_forward_nvfp4_matches_gemm_then_fp4_quantize(m):
+    """latent_down's NVFP4 output: where the projection emits it (SM107 only), the routed
+    experts' NVFP4 input of the low-M GEMM at the route's tactic, bit for bit."""
+    import tensorrt_llm._torch.custom_ops  # noqa: F401  (registers the trtllm ops)
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
+
+    _, linear = _make(3584, 7168, seed=m)
+    linear.post_load_weights()
+    # The model's own gate is the kernel's route check: SM107 with the Rubin-capable
+    # CuTe DSL build (a build without it serves no NVFP4 output even on SM107).
+    expected_max_m = 256 if IS_CUTLASS_DSL_RUBIN_AVAILABLE and getSMVersion() == 107 else 0
+    assert linear.emits_nvfp4(m) == (m <= expected_max_m)
+    assert not linear.emits_nvfp4(expected_max_m + 1)
+    if not linear.emits_nvfp4(m):
+        return
+    x = torch.randn((m, 7168), device="cuda", dtype=torch.bfloat16)
+    global_sf = torch.tensor([448.0 * 6 / 8.0], device="cuda")
+    codes, scales = linear.forward_nvfp4(x, global_sf)
+
+    tactic = low_m.nvfp4_out_tactic(m, 3584, 7168)
+    y = torch.empty((m, 3584), device="cuda", dtype=torch.bfloat16)
+    low_m.run_low_m_gemm(x, linear.weight, linear._low_m_weight_scale, y, tactic=tactic)
+    ref_codes, ref_scales = torch.ops.trtllm.fp4_quantize(y, global_sf, 16, False, False)
+    assert torch.equal(codes, ref_codes)
+    assert torch.equal(scales.view(-1), ref_scales.view(-1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@RUBIN
+@pytest.mark.parametrize("rows", [1, 64, 128, 129, 170, 256])
+def test_takes_prequantized_input_caps_at_one_scale_block(rows):
+    """``takes_prequantized_input`` hands over at most one 128-row R128c4 scale block: the
+    prequantized kernel's folded scale load does not advance to a second row block, so a
+    wider forward keeps handing BF16 rows to ``forward``."""
+    _, linear = _make(3584, 7168, seed=11)
+    expected = 1 <= rows <= min(128, linear._low_m.kernel_max_m)
+    assert linear.takes_prequantized_input(rows) == expected

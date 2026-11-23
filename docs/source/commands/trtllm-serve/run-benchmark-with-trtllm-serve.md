@@ -353,7 +353,7 @@ The following is a list of common performance switches.
 
 &emsp;&emsp;**Default**: CUTLASS
 
-### `attention_backend`
+### `attn_backend`
 
 &emsp;**Description**: The backend to use for attention calculations.
 

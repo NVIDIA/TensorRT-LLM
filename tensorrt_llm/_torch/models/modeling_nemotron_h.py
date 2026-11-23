@@ -14,12 +14,13 @@
 # limitations under the License.
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from torch import nn
 from transformers import AutoConfig, NemotronHConfig, PretrainedConfig
@@ -40,19 +41,23 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
+from ..modules.mamba.replay_metadata import ReplayMamba2Metadata
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..recurrent_state_spec import (RecurrentStateSpec,
+                                    recurrent_state_spec_from_mamba_params)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model
+from .modeling_utils import (DecoderModel, moe_experts_quant_config,
+                             register_auto_model)
 
 
-class NemotronHPuzzleConfig(PretrainedConfig):
+class NemotronHPuzzleConfig(NemotronHConfig):
     model_type = "nemotron_h_puzzle"
 
 
@@ -254,34 +259,10 @@ class NemotronHMOE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
-        # For MIXED_PRECISION models, the global quant_config has quant_algo=MIXED_PRECISION
-        # which maps to QuantMode(0) (no quant). This would cause the MoE backend to select
-        # UnquantizedFusedMoEMethod and allocate BF16 weight buffers, causing a shape mismatch
-        # when loading NVFP4/W4A8_NVFP4_FP8 quantized expert weights.
-        # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
-        override_quant_config = None
-        if model_config.quant_config_dict is not None:
-            experts_prefix = f"{module_prefix}.mixer.experts"
-            for key, cfg in model_config.quant_config_dict.items():
-                if key == experts_prefix or key.startswith(experts_prefix +
-                                                           "."):
-                    override_quant_config = cfg
-                    break
-
-        # Last, so it overrides the per-layer entry above: an override is
-        # authoritative over anything __post_init__ wrote, so this stands in
-        # for both quantization passes and exclusion runs second. Otherwise an
-        # excluded layer keeps the per-layer format and loads quantized weights
-        # the checkpoint left in bf16. No trailing dot -- unlike the weight-form
-        # keys above, exclusion matches module names.
-        from tensorrt_llm.models.modeling_utils import QuantConfig
-
-        global_quant_config = model_config.quant_config
-        if (global_quant_config is not None
-                and global_quant_config.is_module_excluded_from_quantization(
-                    f"{module_prefix}.mixer.experts")):
-            override_quant_config = QuantConfig(
-                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+        # MIXED_PRECISION's global quant_algo reads as unquantized, so the
+        # experts' own format has to be named here.
+        override_quant_config = moe_experts_quant_config(
+            model_config, f"{module_prefix}.mixer.experts")
 
         # Setup MoE experts.
         self.experts = create_moe(
@@ -813,6 +794,9 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                                                        NemotronHConfig
                                                        | NemotronHPuzzleConfig]
                            ):
+    # The Mamba2 layers' metadata, with the replay slots and work items their
+    # replay kernel reads, whichever cache manager serves the model.
+    mamba_metadata_cls = ReplayMamba2Metadata
 
     def __init__(
         self,
@@ -966,6 +950,21 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                                           | None = None) -> Literal["PYTHON"]:
         """Use the Python transceiver for hybrid-state transfers."""
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
+    ) -> RecurrentStateSpec:
+        """Declare the Mamba2 state of the ``M`` layers of the hybrid pattern."""
+        from ..modules.mamba.cache_manager import get_nemotron_cache_params
+
+        params = get_nemotron_cache_params(pretrained_config,
+                                           quant_config=quant_config)
+        return recurrent_state_spec_from_mamba_params(params,
+                                                      conv_sections="x_b_c")
 
     @staticmethod
     def lora_config(model_dir: str):

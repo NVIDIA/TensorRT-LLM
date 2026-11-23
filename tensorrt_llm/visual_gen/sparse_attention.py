@@ -23,6 +23,10 @@ from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
+# Token orderings a model may apply around its block stack; see
+# tensorrt_llm._torch.visual_gen.token_order.
+TokenOrder = Literal["native", "morton", "hilbert"]
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.params import SolParams
 
@@ -298,6 +302,21 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
             "Layer indices forced dense regardless of the dense prefix, e.g. "
             "[0, 2, 3]. Evaluated per layer at construction time; no pipeline "
             "wiring required."
+        ),
+    )
+
+    token_order: TokenOrder = PydanticField(
+        "native",
+        description=(
+            "Order of the video tokens seen by the routing blocks. 'morton' applies "
+            "a Z-order permutation over the (frames, height, width) latent grid "
+            "around the transformer block stack so that each 64-token block covers "
+            "a compact 3D neighborhood instead of a run along width; 'hilbert' uses "
+            "the Hilbert curve, a continuous path with no octant jumps. Dense attention "
+            "is permutation-equivariant in exact arithmetic; in bf16 the reordered "
+            "sums round differently, so the output is not bit-identical to native "
+            "order. Supported by the Wan pipelines; other pipelines reject a "
+            "non-native order."
         ),
     )
 

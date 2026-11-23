@@ -166,7 +166,6 @@ class ViTPatchGenerator(nn.Module):
                 bias=patch_bias,
                 temporal_patch_size=temporal_patch_size,
             )
-        self._video_embedder_loaded = False
 
         self.pos_embed = None
         if abs_pos:
@@ -221,11 +220,6 @@ class ViTPatchGenerator(nn.Module):
             Embedded patches with temporal compression applied,
             shape [num_tubelets, seq_per_tubelet, embed_dim].
         """
-        if not self._video_embedder_loaded:
-            raise ValueError(
-                "Temporal compression (video_temporal_patch_size > 1) requires "
-                "video_embedder weights, but they were never loaded. "
-                "Ensure the checkpoint was trained with temporal compression.")
         T = self.temporal_patch_size
         input_size = x.shape[2:]
 
@@ -565,6 +559,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
     """
 
+    encoder_cuda_graph_modality = "vision"
+
     def __init__(
         self,
         img_size: int = 224,
@@ -769,7 +765,11 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # order.
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
-    def setup_attn_metadata(self, max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override the default to add `kv_layout="NHD"` for FlashInfer.
         # FlashInfer's original default is "NHD"; TRT-LLM switched the default
         # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
@@ -777,8 +777,10 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # always in NHD format ([tokens, heads, dim]).
         # Floor the request capacity at the same legacy fallback as the mixin
         # default while allowing one attention segment per encoder token.
-        capacities = self.get_encoder_attention_metadata_capacity(
-            max_num_tokens)
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
         metadata_kwargs = dict(
             max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
@@ -787,27 +789,6 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         if self._attn_backend == "FLASHINFER":
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
-
-    def enable_blocks_cuda_graph(
-        self,
-        config: "MultimodalEncoderCudaGraphConfig",
-        *,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        """Build the block-stack runner from `config` and capture startup graphs.
-
-        The caller must ensure the model parameters already live on `device`
-        (or on a CUDA device discoverable from `self.parameters()`); captures
-        are recorded immediately.
-        """
-        if self._blocks_graph_runner is not None:
-            return
-
-        graph_runner = self._build_blocks_graph_runner(config)
-        if device is None:
-            device = next(self.parameters()).device
-        graph_runner.capture_all(device)
-        self._blocks_graph_runner = graph_runner
 
     def prepare_attn_metadata(
             self, batch_size: int, seq_lengths: List[int],
@@ -938,7 +919,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         return x
 
 
-class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
+class _VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetadata]
+                                     ):
     """Bridges the multimodal encoder graph runner to the model's eager metadata path.
 
     `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
@@ -1298,6 +1280,7 @@ class RADIOVisionModel(PreTrainedModel):
             inter_feature_normalizer=inter_feature_normalizer,
             model_config=self.model_config,
         )
+        self.radio_model.model.encoder_cuda_graph_config = encoder_cuda_graph_config
 
     def load_weights(self, weights):
         # Load radio_model weights for pytorch modules.
@@ -1315,6 +1298,12 @@ class RADIOVisionModel(PreTrainedModel):
             unexpected_keys.remove("input_conditioner.norm_std")
         # Partial model.blocks weights will loaded in the following step.
         for m in missing_keys:
+            if m.startswith('model.patch_generator.video_embedder.'):
+                raise ValueError(
+                    f"Missing key: {m}. Temporal compression "
+                    "(video_temporal_patch_size > 1) requires video_embedder "
+                    "weights. Ensure the checkpoint was trained with temporal "
+                    "compression.")
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
@@ -1327,14 +1316,6 @@ class RADIOVisionModel(PreTrainedModel):
                     'model.patch_generator.video_embedder',
             )):
                 raise ValueError(f"Unexpected key: {u}")
-
-        # Mark video_embedder as loaded only when the submodule exists and its weights were actually
-        # present in the checkpoint (i.e. not reported as unexpected).
-        patch_gen = self.radio_model.model.patch_generator
-        if (getattr(patch_gen, 'video_embedder', None) is not None
-                and 'model.patch_generator.video_embedder.weight'
-                not in unexpected_keys):
-            patch_gen._video_embedder_loaded = True
 
         # Load weights for vision transformer module.
         model_weights = {

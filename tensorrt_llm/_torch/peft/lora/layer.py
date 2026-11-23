@@ -206,8 +206,8 @@ class LoraModuleType(IntEnum):
 
 # Canonical routed-expert MoE LoRA module set and module->kernel-slot mapping,
 # shared by the MoE factory/validator (create_moe.py, validation.py), the
-# adapter-layout helpers (moe_layout.py), and the CUTLASS MoE backend
-# (fused_moe_cutlass.py). Keep this the single source of truth.
+# adapter-layout helpers (moe_layout.py), and the CUTLASS MoE LoRA mixin
+# (moe/fused_moe/cutlass/lora.py). Keep this the single source of truth.
 #
 # Slot convention (see loraFC1 / doActivationKernel in moe_kernels.cu): the
 # kernel applies the "fc1" LoRA to the gate (SiLU) half of the packed FC1

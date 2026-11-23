@@ -66,6 +66,7 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.mlp import MLP
+from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 from .modeling_utils import PostInitCaller, register_auto_model
 
 if TYPE_CHECKING:
@@ -163,6 +164,7 @@ class WhisperCrossAttention(CrossAttention):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class WhisperEncoderLayer(nn.Module):
     """Whisper encoder layer (pre-norm): LN → self-attn → add → LN → MLP → add."""
 
@@ -238,6 +240,7 @@ class WhisperEncoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class WhisperDecoderLayer(nn.Module):
     """Whisper decoder layer (pre-norm): self-attn → cross-attn → MLP."""
 
@@ -429,6 +432,7 @@ class WhisperLogMelFrontend(nn.Module):
         return (log_spec + 4.0) / 4.0
 
 
+@nccl_window_tensor_scoped_module
 class WhisperEncoder(nn.Module):
     """Whisper audio encoder: log-mel front-end + 2x Conv1d stem + positions +
     self-attn layers."""
@@ -501,6 +505,7 @@ class WhisperEncoder(nn.Module):
         return hidden_states
 
 
+@nccl_window_tensor_scoped_module
 class WhisperDecoder(nn.Module):
     """Whisper text decoder: token + positional embedding + decoder layers."""
 
@@ -593,6 +598,13 @@ class WhisperInputProcessor(InputProcessor):
     # Marks this model as feature-driven for the encoder side: prompts
     # without audio cannot be served and are rejected at submission.
     requires_encoder_features = True
+    # The text prompt selects the decoder language/task; pre-tokenized prompt
+    # IDs are not consumed by this processor.
+    supports_token_ids_input = False
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        return frozenset({"audio"})
 
     def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
         self.model_path = model_path
@@ -628,6 +640,9 @@ class WhisperInputProcessor(InputProcessor):
                 f"positions, but config.max_source_positions is "
                 f"{self.config.max_source_positions}."
             )
+        # Encoder positions every request produces; requests carry it and the
+        # cross-KV pool is sized from it.
+        self.encoder_output_len = encoder_positions
         self._decoder_prompt = self._build_decoder_prompt()
 
     # The decoder prompt contains no multimodal placeholder tokens (the audio
@@ -788,7 +803,7 @@ class WhisperInputProcessor(InputProcessor):
                     "encoder_input_features": input_features.contiguous(),
                     # Post-conv position count (mel frames // 2): the cross-KV
                     # capacity every downstream consumer sizes against.
-                    "encoder_output_len": int(self.config.max_source_positions),
+                    "encoder_output_len": self.encoder_output_len,
                 }
             }
         }
@@ -853,6 +868,9 @@ class WhisperModel(nn.Module):
 @register_auto_model("WhisperForConditionalGeneration")
 class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
     """Whisper encoder-decoder model with LM head."""
+
+    # The native audio path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"audio": frozenset()}
 
     def __init__(self, model_config: ModelConfig[WhisperConfig]):
         super().__init__()

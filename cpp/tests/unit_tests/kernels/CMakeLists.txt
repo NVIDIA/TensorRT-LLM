@@ -13,9 +13,53 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
-add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
-add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
+add_tllm_gtest(
+  logitsBitmaskTest
+  OWNER
+  kernel
+  SOURCES
+  logitsBitmaskTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_logits
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;logits;gpu")
+add_tllm_gtest(
+  cascadeAttentionKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  LABELS
+  "unit;kernels;cascade-attention;gpu")
+add_tllm_gtest(
+  cascadeAttentionNumericsTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionNumericsTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  tllm::kernel_mmha
+  LABELS
+  "unit;kernels;cascade-attention;gpu")
+add_tllm_gtest(
+  minimaxM3Prob1AgreementTest
+  OWNER
+  kernel
+  SOURCES
+  minimaxM3Prob1AgreementTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;kernels;minimax-m3;host")
+target_include_directories(
+  minimaxM3Prob1AgreementTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/../tensorrt_llm/_torch/modeling_v2/models)
+target_compile_definitions(minimaxM3Prob1AgreementTest
+                           PRIVATE TRTLLM_MV2_SCOPE=minimax_m3::shared)
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
@@ -30,6 +74,7 @@ add_gtest(mixtureOfExpertsTest moe/mixtureOfExpertsTest.cu)
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_link_libraries(mixtureOfExpertsTest PRIVATE moe_gemm_src)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
@@ -39,89 +84,248 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
                             USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
-add_gtest(ropeTest ropeTest.cu)
-add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
-add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
-add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
-add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
+add_tllm_gtest(
+  ropeTest
+  OWNER
+  kernel
+  SOURCES
+  ropeTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;gpu")
+add_tllm_gtest(
+  shiftKCacheKernelTest
+  OWNER
+  kernel
+  SOURCES
+  shiftKCacheKernelTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;gpu")
+add_tllm_gtest(
+  mlaPreprocessTest
+  OWNER
+  kernel
+  SOURCES
+  mlaPreprocessTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_mla
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;mla;gpu")
+add_tllm_gtest(
+  sparseAttentionKernelsTest
+  OWNER
+  kernel
+  SOURCES
+  sparseAttentionKernelsTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_sparse_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;sparse-attention;gpu")
 
-add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
+add_tllm_gtest(
+  cudaCoreGemmKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cudaCoreGemm/cudaCoreGemmKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cuda_core_gemm
+  ${CUBLASLT_LIB}
+  LABELS
+  "unit;kernels;cuda-core-gemm;gpu")
 
-add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
+add_tllm_gtest(
+  mlaChunkedPrefillTest
+  OWNER
+  kernel
+  SOURCES
+  mlaChunkedPrefillTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_mla_chunked_prefill
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;mla-chunked-prefill;gpu")
 
-add_gtest(fusedMoeCommKernelTest moe/fusedMoeCommKernelTest.cpp)
+add_tllm_gtest(
+  fusedMoeCommKernelTest
+  OWNER
+  kernel
+  SOURCES
+  moe/fusedMoeCommKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_communication
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-communication;gpu")
 
-add_gtest(
-  gemmSwigluRunnerTest
-  fused_gated_gemm/gemmSwigluRunnerTest.cu
-  ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/kernels/fused_gated_gemm/gemm_swiglu_e4m3.cu
-  NO_GTEST_MAIN)
-add_gtest(gemmSwigluKernelTestSm90Fp8
-          fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu NO_GTEST_MAIN
-          NO_TLLM_LINKAGE)
+add_tllm_gtest(
+  routingKernelsTest
+  OWNER
+  kernel
+  SOURCES
+  moe/routing/routingTest.cpp
+  moe/routing/routingLlama4Test.cpp
+  moe/routing/routingCustomTest.cpp
+  moe/routing/routingDeepSeekTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_trtllm_gen_moe_routing
+  tllm::runtime_buffers
+  Python3::Python
+  LABELS
+  "unit;kernels;moe-routing;gpu")
 
-foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
-  set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_tllm_gtest(
+  blockScaleMoeActivationTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeActivationTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
+add_tllm_gtest(
+  blockScaleMoeFinalizeTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeFinalizeTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
 
-  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    # No kernels should be parsed, unless hopper is specified. This is a build
-    # time improvement
-    target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
-    target_compile_definitions(${target_name}
-                               PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
-  endif()
-
-  # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has
-  # changed in GCC 4.6 This note appears for kernels using TMA and clutters the
-  # compilation output.
-  if(NOT WIN32)
-    target_compile_options(
-      ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
-  endif()
-endforeach()
-
-set(ROUTING_KERNEL_TEST_SRC
-    moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp
-    moe/routing/routingCustomTest.cpp moe/routing/routingDeepSeekTest.cpp)
-add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
-target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
-
-add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
-add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
-
-add_gtest(moeLoadBalanceKernelTest moe/moeLoadBalanceKernelTest.cpp)
+add_tllm_gtest(
+  moeLoadBalanceKernelTest
+  OWNER
+  kernel
+  SOURCES
+  moe/moeLoadBalanceKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_load_balance
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-load-balance;gpu")
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  add_gtest(moeLoraPointerExpandTest moe/moeLoraPointerExpandTest.cu)
-  add_gtest(moeLoraProblemBuilderTest moe/moeLoraProblemBuilderTest.cu)
-  add_gtest(moeLoraSlotExpandTest moe/moeLoraSlotExpandTest.cu)
+  add_tllm_gtest(
+    moeLoraPointerExpandTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraPointerExpandTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu")
+  add_tllm_gtest(
+    moeLoraProblemBuilderTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraProblemBuilderTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu")
+  add_tllm_gtest(
+    moeLoraSlotExpandTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraSlotExpandTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu")
 endif()
 
-add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
-add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
-add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  sparseKvCacheTest
+  OWNER
+  kernel
+  SOURCES
+  sparseKvCacheTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;sparse-kv-cache;gpu")
+add_tllm_gtest(
+  prepareCustomMaskTest
+  OWNER
+  kernel
+  SOURCES
+  prepareCustomMaskTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_attention_mask
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;attention-mask;gpu")
+add_tllm_gtest(
+  fmhaDsv4EpilogueFusionTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDsv4EpilogueFusionTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_trtllm_gen_fmha
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;fmha;gpu")
+set(fmha_test_sources ../../../tensorrt_llm/kernels/fmhaDispatcher.cpp)
+set(fmha_test_libraries context_attention_src trtllm_gen_fmha ${CUDA_DRV_LIB}
+                        tllm::common_environment tllm::common_logging)
+if(TRTLLM_BUILD_CPP_TEST_BUNDLE)
+  add_library(tllm_test_fmha SHARED EXCLUDE_FROM_ALL ${fmha_test_sources})
+  target_compile_features(tllm_test_fmha PRIVATE cxx_std_20)
+  target_link_libraries(
+    tllm_test_fmha
+    PRIVATE ${fmha_test_libraries}
+    PUBLIC trtllm_gen_fmha_interface CUDA::cudart)
+  set(fmha_test_sources)
+  set(fmha_test_libraries tllm_test_fmha)
+endif()
+add_tllm_gtest(
+  fmhaHead104Test
+  OWNER
+  kernel
+  SOURCES
+  fmhaHead104Test.cpp
+  ${fmha_test_sources}
+  LINK_LIBRARIES
+  ${fmha_test_libraries}
+  LABELS
+  "unit;kernels;fmha;gpu")
+add_tllm_gtest(
+  fmhaDispatcherTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDispatcherTest.cpp
+  ${fmha_test_sources}
+  LINK_LIBRARIES
+  ${fmha_test_libraries}
+  LABELS
+  "unit;kernel;host")
 
-set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
-    nvfp4ColdPageKernelsTest.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMemBacking.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.cpp
-    # ~HostMem reports a failed cleanup through the poison latch, so this target
-    # needs the latch itself: NO_TLLM_LINKAGE means nothing else supplies it.
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/logger.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/stringUtils.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/tllmException.cpp)
-add_gtest(nvfp4ColdPageKernelsTest "${NVFP4_COLD_PAGE_KERNEL_TEST_SRC}"
-          NO_TLLM_LINKAGE)
-target_include_directories(
+add_tllm_gtest(
   nvfp4ColdPageKernelsTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-# numa: the backing places pages with mbind and the topology detector reads the
-# node layout through libnuma.
-target_link_libraries(nvfp4ColdPageKernelsTest PRIVATE CUDA::cudart
-                                                       CUDA::cuda_driver numa)
+  OWNER
+  kernel
+  SOURCES
+  nvfp4ColdPageKernelsTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_nvfp4_cold_page
+  tllm::kv_cache_host_memory
+  LABELS
+  "unit;kernels;nvfp4-cold-page;gpu")

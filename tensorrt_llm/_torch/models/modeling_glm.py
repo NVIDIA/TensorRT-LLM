@@ -13,7 +13,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -47,6 +47,7 @@ from .modeling_utils import (
     EagerFusionConfig,
     duplicate_kv_weight,
     filter_weights,
+    layerwise_moe_quant_config,
     register_auto_model,
 )
 
@@ -375,9 +376,12 @@ class Glm4MoE(nn.Module):
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
+        experts_quant_config = layerwise_moe_quant_config(
+            model_config.quant_config_dict, f"model.layers.{layer_idx}.mlp.experts"
         )
+        if experts_quant_config is None:
+            return model_config.quant_config
+        return experts_quant_config
 
     def compute_routed_output(
         self,
@@ -391,7 +395,7 @@ class Glm4MoE(nn.Module):
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
         # TODO: Move this model-agonostic part to MoE
-        if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
+        if self.use_dp and self.mapping.tp_size > 1 and is_sm_120f():
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states, (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0])
@@ -843,6 +847,9 @@ class Glm4DecoderLayer(DecoderLayer):
 
 
 class Glm4MTP(Glm4DecoderLayer):
+    # forward takes ``pick_rows`` (see speculative.interface.draft_layer_picks_rows).
+    supports_pick_rows = True
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -899,8 +906,16 @@ class Glm4MTP(Glm4DecoderLayer):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         lora_params: Optional[dict] = None,
+        pick_rows: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """With ``pick_rows`` (indices into the input rows) the attention runs on
+        every input row and the rest of the layer, which is per-token, on
+        ``pick_rows`` only; the output then has ``len(pick_rows)`` rows and
+        ``all_rank_num_tokens`` counts those rows."""
+        # LoRA params describe every input row; the draft workers pass none to MTP layers.
+        assert pick_rows is None or lora_params is None, "pick_rows does not support LoRA"
+
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  # emdedding
 
@@ -937,6 +952,11 @@ class Glm4MTP(Glm4DecoderLayer):
             lora_params=lora_params,
             **kwargs,
         )
+        if pick_rows is not None:
+            # Row-wise: a TP partial sum not yet all-reduced (PRE_MOE_FUSION)
+            # picks the same as the reduced rows.
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
