@@ -110,6 +110,13 @@ slurm_install_setup() {
             rm -f "$lock_file"
         fi
 
+        # Configure apt once per node, including containers with preinstalled wheels.
+        if [[ -n "${TRTLLM_UBUNTU_MIRROR_SCRIPT:-}" ]]; then
+            if ! bash "$TRTLLM_UBUNTU_MIRROR_SCRIPT"; then
+                echo "Ubuntu mirror setup failed; continuing with the available apt configuration."
+            fi
+        fi
+
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
             # Fat sqsh: source tree and packages are already in the container at /tmp/TensorRT-LLM/.
