@@ -148,8 +148,10 @@ at::Tensor minimaxM31FcShardGemm(at::Tensor const& x, at::Tensor const& w, std::
         setCfg<uint16_t>(algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, cfg[7], "INNER_SHAPE_ID");
         setCfg<uint16_t>(algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, cfg[8], "CLUSTER_SHAPE_ID");
         cublasLtMatmulHeuristicResult_t result{};
-        checkLt(cublasLtMatmulAlgoCheck(st.handle, st.desc, lay.a, lay.b, lay.c, lay.c, &algo, &result),
-            "cublasLtMatmulAlgoCheck");
+        auto const status = cublasLtMatmulAlgoCheck(st.handle, st.desc, lay.a, lay.b, lay.c, lay.c, &algo, &result);
+        TORCH_CHECK_NOT_IMPLEMENTED(status != CUBLAS_STATUS_NOT_SUPPORTED && status != CUBLAS_STATUS_ARCH_MISMATCH,
+            "minimax_m31_fc_shard_gemm: the pinned algo is not supported for this shape");
+        checkLt(status, "cublasLtMatmulAlgoCheck");
         TORCH_CHECK(result.workspaceSize <= static_cast<size_t>(kWorkspaceBytes),
             "minimax_m31_fc_shard_gemm: the pinned algo needs more workspace than ", kWorkspaceBytes);
         it = st.algos.emplace(key, algo).first;
