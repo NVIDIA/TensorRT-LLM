@@ -524,11 +524,13 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
     assert joint and len(joint) < len(backends)
     assert all(type(b) is DeCoAttention for b in backends.values())
 
-    planned, launched = [], []
+    planned, padding, launched = [], [], []
     real_plan = DeCoAttention._plan
 
     def plan(self, key_padding_mask, valid_seq_len, token_tags, *shape):
         planned.append(token_tags)
+        if token_tags is not None:
+            padding.append((key_padding_mask, valid_seq_len))
         return real_plan(self, key_padding_mask, valid_seq_len, token_tags, *shape)
 
     def launch(self, q, k, v, rows=None, valid_seq_lens=None, order=None):
@@ -538,6 +540,7 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
 
     def forward(token_tags=None):
         planned.clear()
+        padding.clear()
         launched.clear()
         if token_tags is not None:
             inputs["token_tags"] = token_tags
@@ -556,8 +559,11 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
     tagged = [tags for tags in planned if tags is not None]
     assert len(tagged) == len(joint) and len(planned) == len(backends)
     assert all(torch.equal(tags, inputs["token_tags"]) for tags in tagged)
+    assert all(mask is None and length is None for mask, length in padding)
 
+    # The backend takes a mask and a length: the model hands it the mask.
     forward(torch.tensor([1, 0, 2, -1], device="cuda"))
+    assert padding and all(mask is not None and length is None for mask, length in padding)
     assert launched and all(order is None for _, _, order in launched)
     assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in launched)
     # The tags mark the padding: the batch shares one draw, from the tokens.
@@ -1032,15 +1038,15 @@ def test_transformer_block_is_fullgraph_compile_safe(
         ("FLASHINFER", True, False, False),
         ("CUTEDSL", False, False, False),
         ("CUDNN", False, False, False),
-        ("DECO", True, False, False),
+        ("DECO", True, True, False),
     ],
 )
 def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
     backend: str, mask: bool, length: bool, trailing: bool, require_deco_kernels
 ) -> None:
-    """The model reads from the backend class how padding reaches it: as a key padding mask,
-    as the length of the valid prefix, or not at all. DECO is CUTEDSL under a DeCo-Attention
-    recipe."""
+    """The model reads from the backend class what it takes for padding: a key padding mask,
+    the length of the valid prefix, both or neither, and whether the padding must follow the
+    tokens. DECO is CUTEDSL under a DeCo-Attention recipe."""
     config = _make_model_config()
     if backend == "DECO":
         require_deco_kernels()
@@ -1050,12 +1056,12 @@ def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
         config.attention = AttentionConfig(backend=backend)
     model = h3.MiniMaxH3Transformer3DModel(config)
 
-    assert model._passes_key_padding_mask is mask
-    assert model._passes_valid_seq_len is length
-    assert model._supports_key_padding_mask is (mask or length)
+    assert model._supports_key_padding_mask is mask
+    assert model._supports_valid_seq_len is length
+    assert model._supports_padding is (mask or length)
     assert model._requires_trailing_padding is trailing
-    assert model.token_refiner._passes_key_padding_mask is mask
-    assert model.token_refiner._supports_key_padding_mask is (mask or length)
+    assert model.token_refiner._supports_key_padding_mask is mask
+    assert model.token_refiner._supports_padding is (mask or length)
 
 
 @requires_cuda
@@ -1070,7 +1076,7 @@ def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
     # The VANILLA model honours the mask, so it runs.
     model(**inputs)
 
-    model._supports_key_padding_mask = False
+    model._supports_padding = False
     model._attn_backend = "CUTEDSL"
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
         model(**inputs)
@@ -1576,8 +1582,8 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
         refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
         nn.Module.__init__(refiner)
         refiner._attn_backend = backend
-        refiner._supports_key_padding_mask = True
-        refiner._passes_key_padding_mask = backend != "TRTLLM"
+        refiner._supports_padding = True
+        refiner._supports_key_padding_mask = backend != "TRTLLM"
         refiner.sharder = RankSharder()
         refiner.refiner_blocks = nn.ModuleList([MaskedBlock()])
         refiner.final_norm = nn.Identity()
@@ -1678,8 +1684,8 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
             torch.testing.assert_close(args[2], full_timesteps.chunk(world_size)[rank])
 
         model._attn_backend = backend
-        model._passes_key_padding_mask = backend != "TRTLLM"
-        model._passes_valid_seq_len = backend == "TRTLLM"
+        model._supports_key_padding_mask = backend != "TRTLLM"
+        model._supports_valid_seq_len = backend == "TRTLLM"
         model.sharder = RankSharder()
         model.transformer_blocks = nn.ModuleList([CaptureBlock()])
         handle = model.norm_out.register_forward_pre_hook(check_norm_indices)
@@ -1694,7 +1700,7 @@ def test_refiner_rejects_padding_without_mask_support() -> None:
     refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
     nn.Module.__init__(refiner)
     refiner._attn_backend = "CUTEDSL"
-    refiner._supports_key_padding_mask = False
+    refiner._supports_padding = False
     refiner.sharder = SimpleNamespace(size=2)
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
         refiner(torch.zeros(1, 3, 4))

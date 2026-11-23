@@ -332,7 +332,7 @@ def test_deco_delegates_short_calls(require_deco_kernels, monkeypatch: pytest.Mo
 def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -> None:
     """With the token tags of a packed sequence the preparation takes half of its rows from the
     text and audio tokens and none from the padding; the rows are drawn once per tags tensor
-    and prefix length. With ``valid_seq_len`` they come from the tokens of the prefix."""
+    and ``valid_seq_len``. With a ``valid_seq_len`` they come from the tokens of the prefix."""
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 1, 4096, 2
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
@@ -437,7 +437,7 @@ def test_deco_valid_seq_len_attends_the_prefix(require_deco_kernels, v_dtype: st
         attn.forward(q, k, v, key_padding_mask=positions < 800, valid_seq_len=valid_seq_len),
         expected,
     )
-    # Newest first: a prefix with a prefix length, no padding, a prefix.
+    # Newest first: a prefix mask with a valid_seq_len, a mask without padding, a prefix mask.
     plans = state["deco_plans"]
     assert [plan.valid_seq_lens is None for plan in plans] == [False, True, False]
     assert all(plan.order is None for plan in plans)

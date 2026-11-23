@@ -246,8 +246,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                 )
             if vgm.ulysses_size > 1:
                 # Ulysses pads the packed sequence to a multiple of its size.
-                passes_mask, passes_length, _ = _padding_support(pipeline_config)
-                if not (passes_mask or passes_length):
+                supports_mask, supports_length, _ = _padding_support(pipeline_config)
+                if not (supports_mask or supports_length):
                     raise NotImplementedError(
                         "MiniMax-H3 Ulysses requires an attention backend that takes "
                         "key_padding_mask or valid_seq_len for the padded packed rows, such "

@@ -640,21 +640,10 @@ class HunyuanVideo15Attention(Attention):
             key = torch.cat([key, encoder_key], dim=1)
             value = torch.cat([value, encoder_value], dim=1)
 
-        batch_size, seq_len, *_ = query.shape
-        key_padding_mask = None
-        if attention_mask is not None:
-            # A mask of the joint sequence is passed on as it is: the layers of a forward
-            # hand one tensor to the backend. A mask of the context rows is extended over the
-            # rows before them.
-            key_padding_mask = attention_mask
-            if attention_mask.shape[1] != seq_len:
-                key_padding_mask = torch.nn.functional.pad(
-                    attention_mask, (seq_len - attention_mask.shape[1], 0), value=True
-                )
-            key_padding_mask = key_padding_mask.bool()
-
+        # The mask covers the joint sequence; the transformer builds it once per forward, a
+        # bool tensor that every layer hands to the backend.
         hidden_states = self._attn_impl(
-            query, key, value, key_padding_mask=key_padding_mask, token_tags=token_tags
+            query, key, value, key_padding_mask=attention_mask, token_tags=token_tags
         )
 
         # hidden_states = hidden_states.flatten(2, 3)
@@ -900,8 +889,10 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
             num_layers=num_refiner_layers,
             model_config=model_config,
         )
-        # The tags of the joint sequence of the last forward, with the row counts they are for.
-        self._joint_token_tags: Optional[
+        # A tensor handed to the attention backend, kept as (key, tensor) so that the layers
+        # and steps of a request pass one tensor object: backends key their caches on it.
+        # The key of the tags is the row counts of the joint sequence and the device.
+        self._cached_token_tags: Optional[
             Tuple[Tuple[int, int, int, torch.device], torch.Tensor]
         ] = None
         self.context_embedder_2 = HunyuanVideo15ByT5TextProjection(
@@ -1100,14 +1091,16 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         num_image = 0 if is_t2v else encoder_hidden_states_3.shape[1]
         joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
         tags_key = (num_video, num_image, num_context, hidden_states.device)
-        if self._joint_token_tags is None or self._joint_token_tags[0] != tags_key:
+        cached = self._cached_token_tags
+        if cached is None or cached[0] != tags_key:
             # 0 video or image, positive text; the mask says which rows are padding.
             token_tags = torch.ones(
                 num_video + num_context, dtype=torch.int32, device=hidden_states.device
             )
             token_tags[: num_video + num_image] = 0
-            self._joint_token_tags = (tags_key, token_tags)
-        token_tags = self._joint_token_tags[1]
+            cached = (tags_key, token_tags)
+            self._cached_token_tags = cached
+        token_tags = cached[1]
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:

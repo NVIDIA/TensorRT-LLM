@@ -85,12 +85,12 @@ def supported_v_dtypes() -> tuple[str, ...]:
 @dataclass(eq=False)
 class _Plan:
     """The result of ``DeCoAttention._plan`` for one tags tensor, mask tensor (with its version
-    counter) and prefix length, and whether a CUDA graph was captured with the rows."""
+    counter) and ``valid_seq_len``, and whether a CUDA graph was captured with the rows."""
 
     tags: torch.Tensor | None
     mask: torch.Tensor | None
     mask_version: int | None
-    prefix_len: int | None
+    valid_seq_len: int | None
     rows: torch.Tensor | None
     valid_seq_lens: torch.Tensor | None
     order: torch.Tensor | None
@@ -296,12 +296,12 @@ class DeCoAttention(AttentionBackend):
         are not a prefix, the order ``[B, S]`` that puts them first (None otherwise).
 
         Drawing the rows and telling a prefix from other padding read back to the host, so the
-        component state keeps one plan per tags tensor, mask tensor and prefix length, and the
-        layers and steps of a request that pass the same tensors reuse it. The mask is kept
+        component state keeps one plan per tags tensor, mask tensor and ``valid_seq_len``, and
+        the layers and steps of a request that pass the same tensors reuse it. The mask is kept
         with its version counter; an inference tensor has none, so its content must not change
         in place while it is passed. Under CUDA graph capture nothing is read back: the counts
         and the order are computed inside the graph, and the rows are those of a plan with the
-        same tags and prefix length, which is then kept for the replays.
+        same tags and ``valid_seq_len``, which is then kept for the replays.
         """
         if valid_seq_len is not None and valid_seq_len >= seq_len:
             valid_seq_len = None
@@ -331,7 +331,7 @@ class DeCoAttention(AttentionBackend):
         plans: list[_Plan] = self._state.setdefault("deco_plans", [])
         rows = None
         for plan in plans:
-            if plan.tags is not token_tags or plan.prefix_len != valid_seq_len:
+            if plan.tags is not token_tags or plan.valid_seq_len != valid_seq_len:
                 continue
             if capturing:
                 # The graph reads these rows on every replay.
