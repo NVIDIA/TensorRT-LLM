@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host side of the preparation chains of the sm_120 kernels. The chain of a kernel package is its host function
-(<kernel package>/prep.py: the basis launch and the V pass with the V operands of its PV format, the Q'/K' pass and
-the encode launch); what the chains share is here: the compile of a host function per device and chain form, the
-sizes of the launches, the scratch and the call."""
+"""Host side that the preparation chains of the sm_120 kernels share: compile, launch sizes, scratch and the call.
+
+The chain of a kernel package is its host function (<kernel package>/prep.py): basis launch, V pass, Q'/K' pass, encode.
+"""
 
 import inspect
 
@@ -30,12 +30,11 @@ from .encode import ENCODE_THREADS
 
 
 def _compile(host, cache, device, fused, lens):
-    """The host function of a chain compiled for a device and a chain form (fused: the V pass in the basis launch;
-    lens: the kernels read valid prefix lengths), kept in the cache of its kernel package."""
+    """Return the host function of a chain compiled for a device and a chain form (fused: the V pass in the basis
+    launch; lens: the kernels read valid prefix lengths), kept in the cache of its kernel package."""
     fn = cache.get((device.index, fused, lens))
     if fn is None:
-        # placeholders of the host function's run-time parameters (Int64 addresses, Int32 sizes), then the stream and
-        # the switches
+        # placeholders of the run-time parameters (Int64 addresses, Int32 sizes), then the stream and the switches
         args = [
             Int64(0) if p.annotation is Int64 else Int32(1)
             for p in inspect.signature(host).parameters.values()
@@ -47,8 +46,8 @@ def _compile(host, cache, device, fused, lens):
 
 
 def _grids(nsm, B, S, H):
-    """The SM-count dependent sizes of the launches: spare CTAs of the basis launch, and the item and CTA counts of
-    the Q/K pass, the V pass and the encode launch."""
+    """Return the SM-count dependent sizes of the launches: spare CTAs of the basis launch, and the item and CTA counts
+    of the Q/K pass, the V pass and the encode launch."""
     BH = B * H
     T = (S + 127) // 128
     nspare = max(nsm - BH, 16)
@@ -63,10 +62,11 @@ def _grids(nsm, B, S, H):
 
 
 def scratch(B, S, H, nsm):
-    """The scratch of a chain at this shape on a device of nsm SMs, name -> (dtype, shape): the bases U^T, the V-scan
-    slots (one float32 each), the group maxima and the provisional block scales, which every call writes before it
-    reads them, and the two counters of the basis launch (the V-scan barrier and the V-pass tile counter), which
-    must be zero when it starts."""
+    """Return the scratch of a chain at this shape on a device of nsm SMs, name -> (dtype, shape).
+
+    * ut, vmax, gmax, prov: the bases U^T, the V-scan slots, the group maxima, the provisional block scales.
+    * Only done, the two counters of the basis launch (V-scan barrier, V-pass tile counter), must be zero at its start.
+    """
     nspare, _, nqk_cta, _, _, _ = _grids(nsm, B, S, H)
     BH, T = B * H, (S + 127) // 128
     return {
@@ -81,15 +81,16 @@ def scratch(B, S, H, nsm):
 def run(
     host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers, lens=None, map_rows=False
 ):
-    """The launches of a chain on the current stream, from raw BF16 q, k, v [B, S, H, 128] into the buffers of the
-    call. host: the host function of the kernel package, cache: its compile cache, host_buffers: the buffers whose
-    addresses the host function takes after q, k, v, the rows and the rotation, in its order, min_score_log2: log2
-    of the score-scale floor of the attention. qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows). lens:
-    None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place: every pass then
-    takes the tokens of a batch element below its length only. qk_rows is then, with map_rows, the default draw over
-    the padded sequence, which the eigensolver maps into each valid prefix, and otherwise the caller's rows, [n]
-    shared by the batch or [B, n] per batch element, taken as given (a row at or past a length stands for the last
-    valid token)."""
+    """Run the launches of a chain on the current stream: raw BF16 q, k, v [B, S, H, 128] into the buffers of the call.
+
+    * host, cache, host_buffers: the host function of the kernel package, its compile cache and the buffers whose
+      addresses it takes after q, k, v, the rows and the rotation, in its order.
+    * min_score_log2: log2 of the score-scale floor; qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows).
+    * lens: None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place: every pass
+      then takes the tokens of a batch element below its length only.
+    * qk_rows with lens: with map_rows the default draw over the padded sequence, which the eigensolver maps into each
+      valid prefix; else the caller's rows [n] or [B, n] as given (a row at or past a length: the last valid token).
+    """
     B, S, H, _ = q.shape
     T = (S + 127) // 128
     dev = q.device
@@ -118,8 +119,7 @@ def run(
         nv_items,
         nv_cta,
         nenc_cta,
-        # the rows mode of the eigensolver: the mapped default draw, the caller's shared rows, or its rows per batch
-        # element
+        # rows mode of the eigensolver: 0 the mapped default draw, 1 the caller's shared rows, 2 its rows per element
         0 if map_rows else qk_rows.dim(),
         current_stream(dev),
     )

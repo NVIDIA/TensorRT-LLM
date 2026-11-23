@@ -12,23 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Softmax warpgroups of the attention kernel: S_j(i) -> P_j(i) for the KV tiles i of a work tile, one 128-row Q tile
-per warpgroup (a thread per row).
+"""Softmax warpgroups of the attention kernel: S_j(i) -> P_j(i) for the KV tiles i of a work tile.
 
-Skip correction: a row keeps its anchor m (the running row maximum) unless the tile maximum exceeds it by more than
-T = RESCALE_THRESHOLD binades; only then is O_j rescaled. P is pre-scaled by s_P = 2^P_PRESCALE_LOG2 = 2^floor(log2
-448 - T) = 16, so P = s_P 2^(c (s - m)) stays below the largest E4M3 value while the anchor lags by up to T binades.
-
-I-ExpCast: c, the multiplier of the raw scores in log2 units, is a power of two of at least 2^MIN_SCORE_LOG2 (the
-preparation's score scale). c SUBNORMAL_ULPS 2^-149 is then an f32 subnormal, and each score pair lands with one
-fma.rn.f32x2 on the subnormal grid at SUBNORMAL_ULPS ulps per log2 unit, where one saturating u16 pack reads the f16
-bits of 2^t, without an exponential instruction. Two pairs become four E4M3 codes with two converts.
-
-The row sum of P is not formed here: the PV MMA accumulates the sums of P over each KV tile in the columns of O_j
-after V (mma.py). V smoothing reads them back: after every batch of vs_tiles KV tiles a thread loads its row's eight
-tile sums, writes them as BF16 into its row of the warpgroup's means A operand, zeroes the columns for the next batch
-and adds them to the row sum it keeps in a register. At the end of the work tile it leaves that row sum in column 128
-of O_j for the epilogue."""
+One 128-row Q tile per warpgroup, a thread per row.
+Skip correction:
+    * A row keeps its anchor m (the running row maximum) unless the tile maximum exceeds it by more than
+      T = RESCALE_THRESHOLD binades; only then is O_j rescaled.
+    * P is pre-scaled by s_P = 2^P_PRESCALE_LOG2 = 2^floor(log2 448 - T) = 16, so P = s_P 2^(c (s - m)) stays below
+      the largest E4M3 value while the anchor lags by up to T binades.
+I-ExpCast:
+    * c, the multiplier of the raw scores in log2 units, is a power of two of at least 2^MIN_SCORE_LOG2 (the
+      preparation's score scale); c SUBNORMAL_ULPS 2^-149 is then an f32 subnormal.
+    * Each score pair lands with one fma.rn.f32x2 on the subnormal grid at SUBNORMAL_ULPS ulps per log2 unit, where
+      one saturating u16 pack reads the f16 bits of 2^t, without an exponential instruction. Two pairs become four
+      E4M3 codes with two converts.
+Row sum of P and V smoothing:
+    * The row sum is not formed here: the PV MMA accumulates the sums of P over each KV tile in the columns of O_j
+      after V (mma.py).
+    * After every batch of vs_tiles KV tiles a thread loads its row's eight tile sums, writes them as BF16 into its
+      row of the warpgroup's means A operand, zeroes the columns for the next batch and adds them to the row sum it
+      keeps in a register. At the end of the work tile it leaves that row sum in column 128 of O_j for the epilogue.
+"""
 
 import math
 from typing import Tuple
@@ -53,9 +57,8 @@ from ..tmem import ld_tmem_f32, st_tmem_f32
 
 # P pre-scale: s_P = 2^floor(log2(largest finite E4M3) - T)
 P_PRESCALE_LOG2 = int(math.log2(E4M3_MAX) - RESCALE_THRESHOLD)
-# The score-scale floor of this family: log2 of the smallest multiplier of the raw scores the landing takes exactly.
-# Its fma.rn.f32x2 multiplier is the multiplier x SUBNORMAL_ULPS x 2^-149, an f32 subnormal for a power of two from
-# 1 / SUBNORMAL_ULPS up; the preparation raises the score scale to at least this.
+# The score-scale floor of this family: log2 of the smallest multiplier of the raw scores the landing takes exactly,
+# a power of two from 1 / SUBNORMAL_ULPS up (I-ExpCast above); the preparation raises the score scale to at least it.
 MIN_SCORE_LOG2 = -(SUBNORMAL_ULPS.bit_length() - 1)
 
 
@@ -64,9 +67,9 @@ class SoftmaxRole:
 
     @cute.jit
     def exp_cast(self, tTMEM_LOADrS, tTMEM_STORErS_x4, fma_ab):
-        """I-ExpCast of a tile's scores: each score pair lands on the f16 bits of P with one fma.rn.f32x2 and one
-        saturating pack ((t + 15) * 2^-139 = S * a + b from the raw scores, straight onto the subnormal grid), and two
-        landed pairs become four E4M3 codes of the P store registers."""
+        """I-ExpCast of a tile's scores into the E4M3 codes of the P store registers: each score pair lands with one
+        fma.rn.f32x2 ((t + 15) * 2^-139 = S * a + b from the raw scores, straight onto the subnormal grid; fma_ab =
+        (a, b)) and one saturating pack, and two landed pairs become four E4M3 codes."""
         p8 = cute.recast_tensor(tTMEM_STORErS_x4, Int32)
         for q in cutlass.range_constexpr(cute.size(tTMEM_LOADrS) // 4):
             e01 = ex2_sub_f16x2(tTMEM_LOADrS[4 * q], tTMEM_LOADrS[4 * q + 1], fma_ab[0], fma_ab[1])
@@ -87,9 +90,7 @@ class SoftmaxRole:
         tensor_args: Tuple,
         vs: Tuple,
     ):
-        """One KV tile of a softmax warpgroup: S_j(i) -> P_j(i). stats_args: (anchor, row sum of P so far); vs:
-        (vs_row, i, first KV tile of the work tile): when tile i - 1 ended a means batch, its block sums go from O_j
-        into the means A operand once PV_j(i - 1) completed."""
+        """One KV tile of a softmax warpgroup: S_j(i) -> P_j(i); stats_args: (anchor, row sum of P so far)."""
         row_max, row_sum = stats_args
         vs_row, step, kv_begin = vs
         cS, is_last_iter = iter_args
@@ -162,9 +163,8 @@ class SoftmaxRole:
             tTMEM_STORErS_x4,
             (scale_sub, subnormal_anchor_bias(row_max_safe, scale_sub, P_PRESCALE_LOG2)),
         )
-        # Rare: the anchor moved for a row of this warp -> rescale O_j once PV_j(i-1) has landed,
-        # before P_j(i) is published (PV_j(i) accumulates on top of the rescaled O_j). The factor is
-        # only formed on that path (rows that kept their anchor, or start a work tile, use 1).
+        # Rare: the anchor moved for a row of this warp -> rescale O_j once PV_j(i-1) has landed, before P_j(i) is
+        # published (PV_j(i) accumulates on top of it). Rows that kept their anchor, or start a work tile, use 1.
         need_rescale = moved & (old_row_max != -Float32.inf)
         if cute.arch.vote_ballot_sync(need_rescale) != 0:
             acc_scale = Float32(1.0)
@@ -181,10 +181,12 @@ class SoftmaxRole:
         # PV_j(i-1) has finished reading P_j: its own P-empty commit
         pi_handle = pi_mma_producer.acquire_and_advance()
         tile = kv_begin + step - 1
+        # tile i - 1 ended a means batch (PV_j(i - 1) completed: the credit above); never in a work tile's first step
+        # (column 128 may still hold the previous row sum for the epilogue)
         take = (step >= 1) & (tile & (self.vs_tiles - 1) == self.vs_tiles - 1)
         if cutlass.const_expr(self.vs_batched):
-            # once per batch (tile i - 1 ended it): its block sums from O_j (PV_j(i - 1) completed: the credit above)
-            # into the means A operand and the row sum, and the columns zeroed before PV_j(i) adds to them
+            # once per batch: its block sums from O_j into the means A operand and the row sum, and the columns
+            # zeroed before PV_j(i) adds to them
             if take:
                 tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
                 sums = self.vs_load(vs_row)
@@ -194,10 +196,8 @@ class SoftmaxRole:
                 cute.arch.fence_view_async_shared()
                 row_sum = row_sum + tree_sum(sums)
         else:
-            # the block sums the PVs of a batch left in O_j (PV_j(i - 1) completed: the credit above), loaded here,
-            # ahead of the P stores. The columns PV_j(i) adds to start at zero: stored here, ahead of the P stores
-            # (not between them and the P-full commit), while no PV_j runs (a PV writes all its columns), and never
-            # in a work tile's first step (column 128 may still hold the previous row sum for the epilogue)
+            # the block sums of a batch are loaded and the columns PV_j(i) adds to are zeroed here, ahead of the P
+            # stores (not between them and the P-full commit), while no PV_j runs (a PV writes all its columns)
             tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
             sums = self.vs_load(vs_row)
             if take:
@@ -273,8 +273,7 @@ class SoftmaxRole:
 
     @cute.jit
     def rescale_o(self, pv_thr_mma, tOtO, acc_scale):
-        """O_j rows *= acc_scale (rows whose anchor did not move pass acc_scale = 1), over all of O_j's columns: V
-        and the block sums of P after it."""
+        """O_j rows *= acc_scale (1 where the anchor stayed) over all columns: V and the block sums of P after it."""
         cO = cute.make_identity_tensor((self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
         tOcO = pv_thr_mma.partition_C(cO)
         chunk_cols = 16
@@ -345,9 +344,7 @@ class SoftmaxRole:
         sched_args: Tuple,
         vs_row: Tuple,
     ):
-        """Softmax warpgroup `stage` over its work tiles. vs_row: the shared addresses of K slots 0..7 and 8..15 of
-        this thread's row of its warpgroup's means A operand and the TMEM address of its lane's O_j columns from 128
-        on."""
+        """Softmax warpgroup `stage` over its work tiles; the operands are those of kernel._run_softmax."""
         tStS, sVecWG, tOtOi, pv_thr_mma, o_done_ptr, p_tail_ptr = tensor_args
         p_tail_stage_ptr = p_tail_ptr + stage
         mma_si_consumer, si_epi_producer, pi_mma_producer = pipeline_args

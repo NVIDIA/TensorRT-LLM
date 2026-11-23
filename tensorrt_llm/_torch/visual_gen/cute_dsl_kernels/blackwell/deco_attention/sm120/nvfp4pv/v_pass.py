@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""V pass of the sm_120 NVFP4-PV kernel: V' = V minus its BF16 means of every 16 keys, NVFP4 along the keys in V's
-own 128 channels (E2M1 codes with one UE4M3 scale per channel and 16 keys, under the power-of-two tensor scale
-v4_scale of max|v - vbar| / 2688), and v_mean = vbar / v4_scale.
+"""V pass of the sm_120 NVFP4-PV kernel: V' = V minus its BF16 means of every 16 keys, in NVFP4 along the keys.
 
-The pass shares the basis launch (prep/basis.py): the launch's spare CTAs scan V for max|v - vbar| (the tensor scale
-is needed before any code is formed) and, when the launch has room for it, run the pass on the tiles a counter hands
-out (_vpass); v_kernel is the pass as its own launch otherwise."""
+* V' is in V's own 128 channels: E2M1 codes with one UE4M3 scale per channel and 16 keys, under the power-of-two
+  tensor scale v4_scale of max|v - vbar| / 2688; v_mean = vbar / v4_scale.
+* The pass shares the basis launch (prep/basis.py): the launch's spare CTAs scan V for max|v - vbar| (the tensor
+  scale is needed before any code is formed) and, when the launch has room for it, run the pass on the tiles a
+  counter hands out (_vpass); v_kernel is the pass as its own launch otherwise.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -325,7 +326,6 @@ def _vpass(
         if nix < ntiles:
             stage_rows(v_p, vin, st, ntiles - 1 - nix, S, H, T, lens_p)
         cute.arch.cp_async_commit_group()
-        # with lengths: a tile without a valid key is skipped
         live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
         if live:
             # the mean of the 16-key group; v_mean = vbar / v4_scale (exact)
@@ -484,7 +484,6 @@ def v_kernel(
         base = (
             v_p + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 256 + Int64(cc * 16)
         )
-        # with lengths: a tile without a valid key is skipped
         live = cutlass.const_expr(lens_p is None) or tile * 128 < nk
         if live:
             wv = cute.make_rmem_tensor((64,), Uint32)

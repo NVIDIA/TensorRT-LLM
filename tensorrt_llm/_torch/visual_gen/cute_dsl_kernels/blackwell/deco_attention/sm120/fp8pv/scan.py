@@ -12,10 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The scan launch of the sm_120 FP8-PV attention: one flag per (batch, head, key tile) for a non-finite value in V
-or v_mean. The attention skips the PV and the means MMAs of key ranges whose P is zero, which is exact only for
-finite V: 0 * NaN must stay NaN. A head with a flag set takes every MMA (head_v_nan). The flags are rebuilt by every
-call."""
+"""The scan launch of the sm_120 FP8-PV attention: one flag per (batch, head, key tile) for a non-finite V or v_mean."""
 
 import cutlass
 import cutlass.cute as cute
@@ -38,9 +35,11 @@ def v_tile_nan_kernel(
     H: cutlass.Constexpr,
     lens_ptr,
 ):
-    """Scan every V byte and v_mean element once, with four warps per (batch, head, key tile): one flag per tile, set
-    for a NaN in V (E4M3FN: exactly the bytes 0x7f and 0xff) or a non-finite v_mean (BF16 exponent all ones).
-    lens_ptr: None, or the valid prefix lengths: a tile without a valid key is not read and its flag is zero."""
+    """Scan every V byte and v_mean element once, four warps per (batch, head, key tile), and write the tile's flag.
+
+    * Set for a NaN in V (E4M3FN: exactly the bytes 0x7f and 0xff) or a non-finite v_mean (BF16 exponent all ones).
+    * The flags are rebuilt by every call; with lengths a tile without a valid key is not read and its flag is zero.
+    """
     tx, _, _ = cute.arch.thread_idx()
     kt, hh, bb = cute.arch.block_idx()
     tidx, tile, head, batch = Int32(tx), Int32(kt), Int32(hh), Int32(bb)
@@ -84,7 +83,7 @@ def v_tile_nan_kernel(
 
 @cute.jit
 def head_v_nan(vflags, tidx, nT: cutlass.Constexpr):
-    """This thread's OR of the head's per-tile flags (combined across the CTA by a barrier reduction)."""
+    """Return the OR of the flags of the head that this thread reads; a head with a flag set takes every MMA."""
     bad = Int32(0)
     for part in cutlass.range_constexpr((nT + NTHR - 1) // NTHR):
         tile = tidx + part * NTHR

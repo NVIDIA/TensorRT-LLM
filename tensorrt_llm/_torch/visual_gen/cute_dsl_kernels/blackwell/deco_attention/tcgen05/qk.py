@@ -13,20 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The QK of the attention kernel: S = Q' K'^T over the QK channels of NVFP4, both operands staged in shared memory.
-Q' and K' are rows of 256 E2M1 codes (128 bytes: the 128 rotated head channels, then the 2 x rank compensation
-channels, 192 codes used at rank 32 and all 256 at rank 64) with one UE4M3 scale factor per 16 channels. One class per
-MMA width of the compile target holds the operand layouts, the TMA atoms of Q', K' and their scale factors, the load
-warp's copies and the MMA warp's scale-factor staging (SMEM -> TMEM) and QK issue:
 
-  sm_103a  QkK96    two K = 96 MMAs
-  sm_100a  QkK64    three K = 64 MMAs
-  sm_107a  QkK128   one K = 128 MMA (head channels) and one K = 64 MMA (compensation channels), Q' in TMEM; at rank
-                    64 two K = 128 MMAs (head channels, compensation channels)
-
+Operands:
+    * Q' and K': rows of 256 E2M1 codes (128 bytes), the 128 rotated head channels and then the 2 x rank compensation
+      channels; 192 codes are used at rank 32 and all 256 at rank 64. One UE4M3 scale factor per 16 channels.
+    * The scale factors are read as the preparation wrote them: its power-of-two score scale in log2 units is the
+      softmax multiplier itself, so no per-call pass touches them.
+Classes, one per MMA width of the compile target (the operand layouts, the TMA atoms of Q', K' and their scale
+factors, the load warp's copies and the MMA warp's scale-factor staging SMEM -> TMEM and QK issue):
+    sm_103a  QkK96    two K = 96 MMAs
+    sm_100a  QkK64    three K = 64 MMAs
+    sm_107a  QkK128   one K = 128 MMA (head channels) and one K = 64 MMA (compensation channels), Q' in TMEM; at rank
+                      64 two K = 128 MMAs (head channels, compensation channels)
 Rank 64 is offered where the target has the K = 128 instruction and the TMEM columns for the wider Q' (ranks).
-
-The scale factors are read as the preparation wrote them: its power-of-two score scale in log2 units is the softmax
-multiplier itself, so no per-call pass touches them."""
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -44,24 +44,20 @@ ROW_ELEMS = 256  # E2M1 codes of a Q' / K' row: 128 bytes, the first qk_channels
 
 
 def ranks():
-    """The compensation ranks of the compile target's QK: every rank where the target has the K = 128 instruction,
-    else the default rank alone."""
+    """Return the ranks of the compile target's QK: all with the K = 128 instruction, else the default rank alone."""
     return RANKS if target.has_k128_fp4_mma() else (DEFAULT_RANK,)
 
 
-# ------------------------------------------------------------------------------------------------
-# Layouts of the block-scaled operands and their scale factors
-# ------------------------------------------------------------------------------------------------
+# ------------------------------------------- Layouts of the block-scaled operands and their scale factors
 def k128_mma(n, a_source, cta_group=tcgen05.CtaGroup.ONE):
-    """The K = 128 kind::mxf4nvf4 MMA (SM107MmaMXF4NVF4Op): M = 128, N = n, UE4M3 scales per 16 elements."""
+    """Return the K = 128 kind::mxf4nvf4 MMA (SM107MmaMXF4NVF4Op): M = 128, N = n, UE4M3 scales per 16 elements."""
     return cute.make_tiled_mma(
         tcgen05.SM107MmaMXF4NVF4Op(cutlass.Float8E4M3FN, 16, (128, n, 128), cta_group, a_source)
     )
 
 
 def k128_view(mma128, tiler, x):
-    """The staged E2M1 tiles x of a K = 64 MMA's shared-memory B layout as the B operand of the K = 128 MMA mma128
-    (K blocks 0 and 1 of the K = 64 layout lie as the K = 128 operand does), with the stage mode of x."""
+    """Return the staged tiles x of a K = 64 B layout as the K = 128 B operand of mma128, with the stage mode of x."""
     view = cute.slice_(
         sm100_utils.make_smem_layout_b(mma128, tiler, cutlass.Float4E2M1FN, 1).outer,
         (None, None, None, 0),
@@ -79,12 +75,12 @@ def sm103_ab_layout(rows, stages):
 
 
 def s2t_partition(sSF, tSF, sf_dtype, iter_view=False):
-    """The SMEM -> TMEM copy of the scale factors sSF into the TMEM view tSF: (tiled copy, source descriptors,
-    destination). With iter_view the tiled copy is built from the view of tSF's first instruction iteration (one
-    scale-factor buffer, its iteration modes reduced to one each); the destination keeps tSF's iteration modes."""
+    """Return (tiled copy, source descriptors, destination) of the SMEM -> TMEM copy of the scale factors into tSF."""
     tCsSF_compact = cute.filter_zeros(sSF)
     tCtSF_compact = cute.filter_zeros(tSF)
     copy_view = tCtSF_compact
+    # with iter_view the tiled copy is built from the view of tSF's first instruction iteration (one scale-factor
+    # buffer, its iteration modes reduced to one each); the destination keeps tSF's iteration modes
     if iter_view:
         copy_view = cute.make_tensor(
             tCtSF_compact.iterator,
@@ -102,13 +98,14 @@ def s2t_partition(sSF, tSF, sf_dtype, iter_view=False):
     return tiled, src, dst
 
 
-# ------------------------------------------------------------------------------------------------
-# The QK component
-# ------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------- The QK component
 class QkK96:
-    """Q' and K' as byte rows in 128B-swizzled SMEM (one K = 96 instruction start every three 16-byte blocks), their
-    UE4M3 scale-factor tiles staged into TMEM per QK: one Q tile (Q0's or Q1's, re-copied before each QK) and one K
-    tile shared by both QKs of a KV step, four columns per 64 channels each (12 at rank 32)."""
+    """The QK of sm_103a: two K = 96 MMAs.
+
+    * Q' and K': byte rows in 128B-swizzled SMEM, one K = 96 instruction start every three 16-byte blocks.
+    * Scale factors: UE4M3 tiles staged into TMEM per QK, four columns per 64 channels each (12 at rank 32): one Q
+      tile (Q0's or Q1's, re-copied before each QK) and one K tile shared by both QKs of a KV step.
+    """
 
     sf_dtype = cutlass.Float8E4M3FN
     k_smem_dtype = cutlass.Uint8
@@ -150,7 +147,7 @@ class QkK96:
         return q, k, q_sf, k_sf
 
     def make_tiled_mma(self, cta_group):
-        """Build the SM103 widened-K NVFP4 QK MMA (K=96)."""
+        """Return the SM103 widened-K NVFP4 QK MMA (K = 96)."""
         return sm100_utils.sm103_make_blockscaled_trivial_tiled_mma(
             self.sf_dtype,
             self.sf_vec_size,
@@ -178,8 +175,7 @@ class QkK96:
         return cute.append(cute.group_modes(part1, 0, cute.rank(part1)), part2)
 
     def smem_layouts(self, tiled_mma, q_stage, kv_stage):
-        """(staged Q layout, one K stage, (staged Q-SF layout, staged K-SF layout)); Q' and K' as K-major 128-byte rows
-        of eight 16-byte blocks (sm103_ab_layout)."""
+        """Return the staged Q layout (sm103_ab_layout), one K stage and the (staged Q-SF, staged K-SF) layouts."""
         q_smem_layout_staged = sm103_ab_layout(self.mma_tiler_mnk[0], q_stage)
         k_smem_layout_staged = sm103_ab_layout(self.mma_tiler_mnk[1], kv_stage)
         q_sf_smem_layout_staged = blockscaled_utils.sm103_make_smem_layout_sfa(
@@ -218,9 +214,8 @@ class QkK96:
         h,
         b,
     ):
-        """TMA atoms and coordinate tensors of Q', K' and their scale factors (K' and K-SF multicast along the cluster)
-        and the bytes one Q tile and one K tile land: ((atom_q, mQ, (atom_qsf, mQSF), atom_k, mK, (atom_ksf, mKSF)),
-        q bytes, k bytes)."""
+        """Return (TMA atoms and tensors of Q', K' and their scale factors, bytes of a Q tile, bytes of a K tile); K'
+        and K-SF are multicast along the cluster."""
         q, k, q_sf, k_sf = tensors
         q_sf_smem_layout_staged, k_sf_smem_layout_staged = sf_layouts
         h_r = 1
@@ -289,7 +284,7 @@ class QkK96:
         return atoms, q_copy_size + q_sf_copy_size, k_copy_size + k_sf_copy_size
 
     def storage_fields(self, q_smem_layout_staged, sK_cosize, sf_layouts, align):
-        """Shared-memory fields of the QK operands, in the order they follow the O staging tiles."""
+        """Return the shared-memory fields of the QK operands, in the order they follow the O staging tiles."""
         q_sf_smem_layout_staged, k_sf_smem_layout_staged = sf_layouts
         MemRange, Align = cute.struct.MemRange, cute.struct.Align
         return dict(
@@ -301,7 +296,7 @@ class QkK96:
 
     # -------------------------------------------------------------------------------- kernel: all warps
     def smem_tensors(self, storage, q_smem_layout_staged, k_smem_layout_staged, sf_layouts):
-        """(sQ, sK, (sQSF, sKSF)): the staged Q tiles and the K ring of the CTA's shared memory."""
+        """Return (sQ, sK, (sQSF, sKSF)): the staged Q tiles and the K ring of the CTA's shared memory."""
         q_sf_smem_layout_staged, k_sf_smem_layout_staged = sf_layouts
         sQ = storage.sQ.get_tensor(q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner)
         sQSF = storage.sQSF.get_tensor(q_sf_smem_layout_staged)
@@ -406,7 +401,7 @@ class QkK96:
         )
 
     def copy_q(self, partitions, q_coord, q_handle):
-        """Q tile q_coord and its scale factors into the handle's Q stage."""
+        """Copy Q tile q_coord and its scale factors into the handle's Q stage."""
         tma_atom_q, tQsQ, tQgQ, _, tma_atom_q_sf, tQsQSF, tQgQSF, _, _ = partitions[0]
         cute.copy(
             tma_atom_q,
@@ -422,7 +417,7 @@ class QkK96:
         )
 
     def copy_k(self, partitions, kv_coord, k_handle, kv_mcast_mask):
-        """K tile kv_coord and its scale factors into the handle's ring slot."""
+        """Copy K tile kv_coord and its scale factors into the handle's ring slot."""
         tma_atom_k, tKsK, tKgK, tma_atom_k_sf, tKsKSF, tKgKSF = partitions[1]
         cute.copy(
             tma_atom_k,
@@ -457,9 +452,7 @@ class QkK96:
 
     # -------------------------------------------------------------------------------- kernel: MMA warp
     def mma_setup(self, tiled_mma, tmem_ptr, sQ, sK, sf_smem, sf_layouts):
-        """The MMA warp's QK state: the TMEM scale-factor views (copy and instruction shapes) and their SMEM -> TMEM
-        copies (both QKs of a step use the one Q slot); Q' and K' stay byte tensors, from which descs forms the K = 96
-        descriptors."""
+        """Return the QK state: Q' / K' byte tensors for descs, the TMEM scale-factor views and their S2T copies."""
         sQSF, sKSF = sf_smem
         q_sf_smem_layout_staged, k_sf_smem_layout_staged = sf_layouts
         q_sf_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -485,7 +478,6 @@ class QkK96:
         k_sf_tmem_layout_mma = blockscaled_utils.make_tmem_layout_sfb(
             tiled_mma, self.layout_tiler, self.sf_vec_size, sf_iter
         )
-        # each scale-factor slot takes 12 TMEM columns (128 rows, the 192 channels of this QK)
         qsf_ptr = cute.recast_ptr(tmem_ptr + self.tmem_qsf_offset, dtype=self.sf_dtype)
         ksf_ptr = cute.recast_ptr(tmem_ptr + self.tmem_ksf_offset, dtype=self.sf_dtype)
         tCtQSF_copy = cute.make_tensor(qsf_ptr, q_sf_tmem_layout)
@@ -497,7 +489,7 @@ class QkK96:
         return tiled_mma, sQ, sK, q_sf, k_sf
 
     def q_operand(self, qk_mma, q_stage):
-        """The Q stage's SMEM tile (descriptors are built from it per QK)."""
+        """Return the Q stage's SMEM tile (descriptors are built from it per QK)."""
         return qk_mma[1][None, None, None, q_stage]
 
     def k_operand(self, qk_mma, k_stage):
@@ -515,7 +507,7 @@ class QkK96:
         cute.copy(q_sf[0], q_sf[1][(None, None, None, None, q_stage)], q_sf[2])
 
     def descs(self, sA, sB):
-        """SMEM descriptors of one QK (two K = 96 instructions), built before the S-empty wait."""
+        """Return the SMEM descriptors of one QK (two K = 96 instructions), built before the S-empty wait."""
         a_next = sA[(None, 0, 0)]
         b_next = sB[(None, 0, 0)]
         descs = []
@@ -556,10 +548,12 @@ class QkK96:
 
 
 class QkK64(QkK96):
-    """The same operands on sm_100a (K = 64 instructions): Q' and K' as E2M1 tiles in the standard 128B-swizzled
-    K-major layout over the padded 256-channel rows (the channels past the QK's are zero and unused), scale factors
-    in the standard (32, 4) atoms (the same bytes the sm_103a path reinterprets), and one K = 64 block-scaled MMA per
-    64 channels of the QK (three at rank 32). The TMEM scale-factor slots are as large as on sm_103a."""
+    """The QK of sm_100a: the same operands, one K = 64 block-scaled MMA per 64 channels of the QK (three at rank 32).
+
+    * Q' and K': E2M1 tiles in the standard 128B-swizzled K-major layout over the padded 256-channel rows (the
+      channels past the QK's are zero and unused).
+    * Scale factors: the standard (32, 4) atoms, the bytes the sm_103a path reinterprets; TMEM slots as on sm_103a.
+    """
 
     k_smem_dtype = cutlass.Float4E2M1FN
 
@@ -776,7 +770,7 @@ class QkK64(QkK96):
         )
 
     def copy_k(self, partitions, kv_coord, k_handle, kv_mcast_mask):
-        """K tile kv_coord (multicast) and this CTA's copy of its scale factors into the handle's ring slot."""
+        """Copy K tile kv_coord (multicast) and this CTA's copy of its scale factors into the handle's ring slot."""
         tma_atom_k, tKsK, tKgK, tma_atom_k_sf, tKsKSF, tKgKSF = partitions[1]
         cute.copy(
             tma_atom_k,
@@ -793,8 +787,7 @@ class QkK64(QkK96):
         )
 
     def mma_setup(self, tiled_mma, tmem_ptr, sQ, sK, sf_smem, sf_layouts):
-        """Q'/K' fragments over the staged tiles, the scale-factor slots and their S2T copies (both QKs of a step use
-        the one Q slot)."""
+        """Return the QK state: Q' / K' fragments over the staged tiles, the scale-factor slots and their S2T copies."""
         sQSF, sKSF = sf_smem
         q_sf_tmem = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + self.tmem_qsf_offset, dtype=self.sf_dtype),
@@ -819,7 +812,7 @@ class QkK64(QkK96):
         return tiled_mma, tiled_mma.make_fragment_A(sQ), tiled_mma.make_fragment_B(sK), q_sf, k_sf
 
     def descs(self, sA, sB):
-        """The operand fragments themselves (cute.gemm forms the descriptors per k-block)."""
+        """Return the operand fragments themselves (cute.gemm forms the descriptors per k-block)."""
         return sA, sB
 
     def issue_qk(self, qk_mma, j, d, descs, si_handle, k0=0):
@@ -837,14 +830,15 @@ class QkK64(QkK96):
 
 
 class QkK128(QkK64):
-    """The K = 64 operands on targets with the K = 128 instruction (sm_107a): the 128 head channels in one K = 128
-    block-scaled MMA (SM107MmaMXF4NVF4Op), the compensation channels in one K = 64 MMA at rank 32 (64 channels) and
-    in a second K = 128 MMA at rank 64 (128 channels). All read the same K' stages and scale-factor slots: a pair of
-    K blocks of the K = 64 layouts lies as a K = 128 operand does.
+    """The QK of targets with the K = 128 instruction (sm_107a): the K = 64 operands, Q' read from TMEM.
 
-    The MMAs read Q' from TMEM: the MMA warp copies each Q stage into its slot (eight channels per column, past the
-    kernel's 512 columns and within cute.arch.get_max_tmem_alloc_cols of the target: two slots of 24 columns at rank
-    32, of 32 at rank 64) once per work tile."""
+    * Head channels (128): one K = 128 block-scaled MMA (SM107MmaMXF4NVF4Op). Compensation channels: one K = 64 MMA
+      at rank 32 (64 channels), a second K = 128 MMA at rank 64 (128 channels).
+    * All read the same K' stages and scale-factor slots: a pair of K blocks of the K = 64 layouts lies as a K = 128
+      operand does.
+    * Q' in TMEM: the MMA warp copies each Q stage into its slot once per work tile. A slot has eight channels per
+      column (two slots of 24 columns at rank 32, of 32 at rank 64) and lies past the kernel's 512 columns.
+    """
 
     q_tmem = True
     tmem_q_offset = 512  # Q' slots 0 and 1 (eight E2M1 codes per column)
@@ -858,13 +852,15 @@ class QkK128(QkK64):
             raise ValueError("the Q' slots exceed the TMEM columns of this target")
 
     def q_slot(self, j):
-        """First TMEM column of Q' slot j."""
+        """Return the first TMEM column of Q' slot j."""
         return self.tmem_q_offset + j * (self.head_dim // 8)
 
     def mma_setup(self, tiled_mma, tmem_ptr, sQ, sK, sf_smem, sf_layouts):
-        """The K = 64 scale-factor setup, then the TMEM-A forms of the K = 64 and the K = 128 MMA, their K' fragments
-        over the same stages (the stage mode of sK kept: the K ring interleaves with V) and the views of the two Q'
-        slots in the K = 64 and the K = 128 layout."""
+        """Return the QK state with Q' in TMEM: the K = 64 scale-factor setup, then the TMEM-A MMAs and their operands.
+
+        The K' fragments of both MMAs lie over the same stages (the stage mode of sK kept: the K ring interleaves with
+        V); each of the two Q' slots has a view in the K = 64 and in the K = 128 layout.
+        """
         qk_mma = super().mma_setup(tiled_mma, tmem_ptr, sQ, sK, sf_smem, sf_layouts)
         cta_group = tiled_mma.op.cta_group
         a_tmem = tcgen05.OperandSource.TMEM
@@ -891,16 +887,18 @@ class QkK128(QkK64):
         )
 
     def q_operand(self, qk_mma, q_stage):
-        """None: issue_qk reads Q' slot j."""
+        """Return None: issue_qk reads Q' slot j."""
         return None
 
     def k_operand(self, qk_mma, k_stage):
         return super().k_operand(qk_mma, k_stage), qk_mma[5][2][None, None, None, k_stage]
 
     def q_to_tmem(self, tmem_base, j, sq_addr, q_stage):
-        """Q' of Q stage q_stage (sq_addr: the shared address of stage 0) into TMEM slot j: one 128 x 32-byte
-        tcgen05.cp per 64-channel K block. The copies run in order with the MMAs issued after them; the caller makes
-        sure that no MMA issued before them still reads the slot."""
+        """Copy Q' of Q stage q_stage into TMEM slot j: one 128 x 32-byte tcgen05.cp per 64-channel K block.
+
+        The copies run in order with later MMAs; the caller makes sure that no MMA issued before them still reads the
+        slot. sq_addr: the shared address of stage 0.
+        """
         taddr = tmem_base + self.q_slot(j)
         q_addr = sq_addr + q_stage * self.q_stage_bytes
         with cute.arch.elect_one():
@@ -915,8 +913,11 @@ class QkK128(QkK64):
                 )
 
     def issue_qk(self, qk_mma, j, d, descs, si_handle):
-        """The K = 128 MMAs over the K-block pairs (0, 1) and, at rank 64, (2, 3), then the K = 64 MMA over a last
-        single block (the K = 64 issue from that block: block 2 at rank 32, none at rank 64); all read Q' slot j."""
+        """Issue QK_j from Q' slot j and commit its S credit.
+
+        K = 128 MMAs over the K-block pairs (0, 1) and, at rank 64, (2, 3); then the K = 64 issue from the block
+        after them, block 2 at rank 32 and none at rank 64.
+        """
         mma128 = qk_mma[5][0]
         sfA, sfB = qk_mma[3][3], qk_mma[4][3]
         (sA, sA128), (sB, sB128) = qk_mma[5][1][j], descs[1]
@@ -930,8 +931,7 @@ class QkK128(QkK64):
 
 
 def for_target(mma_tiler, rank):
-    """The QK of the compile target at a compensation rank it takes (one of ranks()): two K = 96 MMAs where the
-    target has them, else K = 128 MMAs and a last K = 64 where it has the K = 128 instruction, else three K = 64."""
+    """Return the QK of the compile target at a compensation rank it takes (one of ranks()): QkK96, QkK128 or QkK64."""
     if target.has_k96_fp4_mma():
         return QkK96(mma_tiler, rank)
     if target.has_k128_fp4_mma():

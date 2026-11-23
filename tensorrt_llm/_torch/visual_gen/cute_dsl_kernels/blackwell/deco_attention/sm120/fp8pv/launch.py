@@ -14,12 +14,13 @@
 # limitations under the License.
 """Host entry of the sm_120 FP8-PV attention: the launch plan of a call, its scratch and the compile cache.
 
-With at least one full key tile (S >= 128) a call is up to three launches on the current stream: the scan of V and
-v_mean for non-finite values (scan.py), the attention kernel (kernel.py) over the whole units (query tile, head,
-batch) followed by the key-range pieces of the split tail, and the merge of the pieces (epilogue.py). The host
-function builds the TMA atoms of K', V, the K' scales and v_mean. A shorter sequence is one launch of the single-tile
-kernel (small.py). The kernels are specialized on the shape, so each (device, shape, SM count) compiles once per
-process."""
+Launches of a call, on the current stream; each (device, shape, SM count) compiles once per process:
+    * The scan of V and v_mean for non-finite values (scan.py).
+    * The attention kernel (kernel.py) over the whole units (query tile, head, batch), then the key-range pieces of
+      the split tail; its host function builds the TMA atoms of K', V, the K' scales and v_mean.
+    * The merge of the pieces (epilogue.py).
+    * For fewer than 128 keys instead: one launch of the single-tile kernel (small.py).
+"""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -38,8 +39,7 @@ MAX_SPLIT = 6  # key-range pieces per unit of the split tail, at most
 
 
 def split_plan(units, nT, nsm):
-    """(whole units, split units, pieces per split unit): the last units % nsm + nsm // 2 units of the grid (nsm: the
-    SM count of the device) run as key-range pieces after all whole units."""
+    """Return (whole units, split units, pieces per unit); the last units % nsm + nsm // 2 units run as pieces."""
     parts = min(MAX_SPLIT, nT // 2)
     tail = min(units, units % nsm + nsm // 2)
     if parts < 2:
@@ -187,9 +187,7 @@ def small_launch(
 
 
 def scratch(B, S, H, nsm):
-    """The scratch of the attention at this shape on a device of nsm SMs, name -> (dtype, shape), which every call
-    writes before it reads it: the FP32 partials of the split tail's pieces and the per-tile flags of the scan launch
-    (none for fewer than 128 keys, whose kernel needs none)."""
+    """Return the scratch of the attention, name -> (dtype, shape), which every call writes before it reads it."""
     if S < KT:
         return {}
     nT = (S + KT - 1) // KT
@@ -204,10 +202,9 @@ _compiled = {}
 
 
 def run(buffers, o, lens=None):
-    """BF16 o [B, S, H, 128] = (P V' + S M) * v8_scale / l from the operands of the preparation (buffers: the buffers
-    of the call, the layout of this package) on the current stream. Nothing here reads a device value or allocates.
-    lens: None, or the int32 valid prefix lengths [B] of the preparation, read in place by the kernel variants with
-    lengths; the launch plan follows the padded sequence either way."""
+    """Write BF16 o [B, S, H, 128] = (P V' + S M) * v8_scale / l from the buffers of the call, on the current stream.
+    Nothing here reads a device value or allocates. lens: None, or the int32 valid prefix lengths [B] of the
+    preparation, read in place by the kernel variants with lengths; the launch plan follows the padded sequence."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device

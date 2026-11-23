@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Preparation passes that the kernels of the sm_120 family share (the chain of a kernel launches them:
-<kernel package>/prep.py, with the V pass of its PV format: <kernel package>/v_pass.py).
+"""Preparation passes that the kernels of the sm_120 family share.
 
-  basis.py    the basis launch: the eigensolver of the rank-32 compensation basis, and the CTA body in which the
-              other CTAs run the V scan and the V pass of a kernel
-  qk_pass.py  rotation, NVFP4 quantization and compensation channels of Q and K
-  encode.py   the encode launch: UE4M3 scale factors of Q' and K', score scale
-  chain.py    the host side that the chains share: compile cache, launch sizes, scratch, the call"""
+The chain of a kernel launches them (<kernel package>/prep.py), with the V pass of its PV format (v_pass.py there):
+    basis.py    the basis launch: the eigensolver of the rank-32 compensation basis, with a kernel's V scan and V pass
+    qk_pass.py  rotation, NVFP4 quantization and compensation channels of Q and K
+    encode.py   the encode launch: UE4M3 scale factors of Q' and K', score scale
+    chain.py    the host side that the chains share: compile cache, launch sizes, scratch, the call
+"""

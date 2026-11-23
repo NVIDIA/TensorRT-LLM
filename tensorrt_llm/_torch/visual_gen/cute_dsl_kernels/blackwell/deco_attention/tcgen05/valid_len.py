@@ -22,9 +22,8 @@ from ..common.mem import gptr, load_invariant
 
 
 def valid_len(lens_addr, b, s, invariant=True):
-    """The valid prefix length of batch element b, clamped to [0, s]: the int32 word b at the global address
-    lens_addr. invariant: the load is one of data that no thread writes (load_invariant); without it, a load of its
-    own at this point."""
+    """Return the valid prefix length of batch element b, clamped to [0, s]: the int32 word b at the global address
+    lens_addr. invariant: a load of data that no thread writes (load_invariant); without it, a load of its own here."""
     addr = Int64(lens_addr) + Int64(b) * Int64(4)
     n = load_invariant(Int32, addr) if invariant else cute.arch.load(gptr(Int32, addr), Int32)
     return cutlass.max(cutlass.min(n, Int32(s)), Int32(0))

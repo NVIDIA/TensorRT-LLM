@@ -14,11 +14,11 @@
 # limitations under the License.
 """Host entry of the sm_120 attention: the launch plan of a call, its scratch and the compile cache.
 
-A call is two launches on the current stream: the re-layout of K', V' and their scales into per-tile images
-(layout.py), then the attention kernel (kernel.py), one CTA per (query tile, head, batch) unit. The last units % nsm
-units of the grid (nsm: the SM count of the device) run as two key halves each, merged by the half that finishes
-second through records in global memory. The kernels are specialized on the shape, so each (device, shape, SM count)
-compiles once per process."""
+* A call is two launches on the current stream: the re-layout of K', V' and their scales into per-tile images
+  (layout.py), then the attention kernel (kernel.py), one CTA per (query tile, head, batch) unit.
+* The last units % nsm units of the grid (nsm: the SM count of the device) run as two key halves each (split_plan).
+* The kernels are specialized on the shape, so each (device, shape, SM count) compiles once per process.
+"""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -77,8 +77,9 @@ def attn_launch(
 
 
 def split_plan(S, H, B, nsm):
-    """Units (query tile, head, batch) are equal; the last R = units mod nsm of them (nsm: the SM count of the device)
-    run as two key halves each (split at a multiple of 4 tiles). Returns (full units, split units, split tile)."""
+    """Return (full units, split units, split tile). The units (query tile, head, batch) are equal; the last
+    R = units mod nsm of them (nsm: the SM count of the device) run as two key halves each, split at a multiple of 4
+    tiles and merged by the half that finishes second through records in global memory."""
     nT = (S + 127) // 128
     n = nT * H * B
     r = n % nsm
@@ -93,11 +94,11 @@ RECORD_BYTES = 2 * NTHREADS * PART_BYTES
 
 
 def scratch(B, S, H, nsm):
-    """The scratch of the attention at this shape on a device of nsm SMs, name -> (dtype, shape): the tile images of
-    the operand re-layout, which every call writes before it reads them, and the split units' records followed by
-    their arrival counters (empty for a shape without split units, whose kernel does not use it). The records are
-    written before they are read; the counters must be zero when the launch starts: each unit's two halves arrive
-    once per call and the half that merges returns the counter to zero."""
+    """Return the scratch of the attention at this shape on a device of nsm SMs, name -> (dtype, shape).
+
+    * img: the tile images of the operand re-layout; split: the split units' records, then their arrival counters.
+    * Only the counters must be zero when the launch starts; the half of a unit that merges returns its counter to zero.
+    """
     nT = (S + 127) // 128
     _, rsplit, _ = split_plan(S, H, B, nsm)
     return {
@@ -107,7 +108,7 @@ def scratch(B, S, H, nsm):
 
 
 def split_counters(split):
-    """The arrival counters in the split scratch: its bytes after the records of all units."""
+    """Return the arrival counters in the split scratch: its bytes after the records of all units."""
     return split[split.numel() // (RECORD_BYTES + 4) * RECORD_BYTES :]
 
 
@@ -115,10 +116,9 @@ _compiled = {}
 
 
 def run(buffers, o, lens=None):
-    """BF16 o [B, S, H, 128] from the operands of the preparation (buffers: the buffers of the call, the layout of
-    this package) on the current stream: the re-layout launch, then the attention launch. Nothing here reads a device
-    value or allocates. lens: None, or the int32 valid prefix lengths [B] of the preparation, read in place by the
-    kernel variant with lengths; the launch plan follows the padded sequence either way."""
+    """Run the attention on the current stream (the re-layout launch, then the attention launch): BF16 o [B, S, H, 128]
+    from the operands in the buffers of the call. Nothing here reads a device value or allocates. lens: None, or the
+    int32 valid prefix lengths [B], read in place by the kernel variant with lengths; the plan follows the padded S."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device

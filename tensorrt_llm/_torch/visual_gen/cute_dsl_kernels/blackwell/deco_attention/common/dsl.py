@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The experimental primitives of the CuTe DSL that the kernels call (cutlass.experimental.primitives). This module
-alone imports them, each by name, and the kernels import them from here: the experimental interface may change
-between releases of the DSL, and a release without one of the names fails here, on import, with the installed
-version and the validated ones."""
+alone imports them, each by name, and the kernels import them from here: the interface may change between releases
+of the DSL, and a release without one of the names fails here, on import, with the installed and validated versions."""
 
 import cutlass
 

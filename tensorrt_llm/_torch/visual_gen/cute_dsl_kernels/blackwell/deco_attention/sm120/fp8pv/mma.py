@@ -14,19 +14,21 @@
 # limitations under the License.
 # O is the output accumulator and l the row sum of P.
 # ruff: noqa: E741
-"""MMA phases of the sm_120 FP8-PV attention kernel: per warp and phase, O += P V of a key tile on the FP8 MMA, the
-means term O += S M on the BF16 MMA, and S = Q' K'^T of the next tile on the block-scaled NVFP4 MMA.
+"""MMA phases of the sm_120 FP8-PV attention kernel: per warp and phase PV, the means term, and QK of the next tile.
 
-The PV and the means MMA run transposed, so that the S accumulators of the QK, landed and packed by the softmax, are
-their B fragments without a shuffle: O^T += V^T P^T takes A = V^T by ldmatrix.trans of the staged V (m16n8k32 E4M3:
-16 channels x 8 queries per MMA), and O^T += M^T S^T takes the v_mean rows as A and the 16-key block sums of P as B
-(BF16 m16n8k16 over the 16 blocks of a step pair, m16n8k8 for an unpaired last step). A thread holds O^T as 16 x 4
-accumulators: O[4 (2 ct + h) + k] for channel tile ct (16 channels) and query n-tile h.
-
-The fragments of a phase are loaded DIST steps ahead of the MMAs that consume them (mma_phase). A tile whose P is zero
-in some 32-key quarters skips the V loads and MMAs of those quarters (pv_sparse_quarters), and a step pair with zero P
-its means MMAs (means_pair_guarded), both behind warp-uniform indexed branches (brx.idx.uni) that skip the loads and
-MMAs."""
+* PV: O += P V of a key tile on the FP8 MMA, transposed: O^T += V^T P^T takes A = V^T by ldmatrix.trans of the
+  staged V (m16n8k32 E4M3: 16 channels x 8 queries per MMA).
+* Means: O += S M on the BF16 MMA, transposed: O^T += M^T S^T takes the v_mean rows as A and the 16-key block sums
+  of P as B (m16n8k16 over the 16 blocks of a step pair, m16n8k8 for an unpaired last step).
+* QK: S = Q' K'^T of the next tile on the block-scaled NVFP4 MMA. Its S accumulators, landed and packed by the
+  softmax, are the B fragments of the transposed MMAs without a shuffle.
+* A thread holds O^T as 16 x 4 accumulators: O[4 (2 ct + h) + k] for channel tile ct (16 channels) and query
+  n-tile h.
+* The fragments of a phase are loaded DIST steps ahead of the MMAs that consume them (mma_phase).
+* A tile whose P is zero in some 32-key quarters skips the V loads and MMAs of those quarters
+  (pv_sparse_quarters), a step pair with zero P its means MMAs (means_pair_guarded): both behind warp-uniform
+  indexed branches (brx.idx.uni).
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -42,7 +44,7 @@ DIST = 3  # ldmatrix lookahead in MMA steps (tuning constant)
 
 
 def warp_mma(op, a, b, c):
-    """D = A B + C by the warp-level MMA op: a and b the 32-bit fragment words of A and B, c the four f32 of C."""
+    """Return D = A B + C by the warp-level MMA op: a, b the 32-bit fragment words of A and B, c the four f32 of C."""
     atom = cute.make_mma_atom(op)
     frag_a = cute.make_rmem_tensor(
         cute.make_layout((len(a) * 32 // op.ab_dtype.width, 1, 1)), op.ab_dtype
@@ -64,12 +66,12 @@ def warp_mma(op, a, b, c):
 
 
 def mma_fp8(a, b0, b1, c):
-    """D = A B + C, m16n8k32 E4M3 x E4M3 with f32 accumulation."""
+    """Return D = A B + C, m16n8k32 E4M3 x E4M3 with f32 accumulation."""
     return warp_mma(warp.MmaFP8Op(Float8E4M3FN, Float32, (16, 8, 32)), a, [b0, b1], c)
 
 
 def mma_bf16_k8(a0, a1, b, c):
-    """D = A B + C, m16n8k8 BF16 x BF16 with f32 accumulation."""
+    """Return D = A B + C, m16n8k8 BF16 x BF16 with f32 accumulation."""
     return warp_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 8)), [a0, a1], [b], c)
 
 
@@ -92,13 +94,15 @@ def mma_phase(
     vmoff=None,
     means=None,
 ):
-    """One MMA phase of a warp: O += P V of the current tile (if vst is not None: the stage's V), O += S M, the means
-    term of a step pair (if means is not None: the pair's v_mean buffer), then S = Q' K'^T of the next tile (if kst is
-    not None: the stage's K', its scale atoms at sfst), returned as 16 x 4 accumulators. The fragments are loaded dist
-    steps ahead of the MMAs that consume them. swait, kwait = (full barrier, parity): the stage's barrier to wait for
-    before the first load, or before the K' scale words; turn = (take, pass, early): the first fragments are loaded
-    before take() waits for this warp's turn to issue MMAs, and pass() hands the turn over early steps before the
-    end."""
+    """Run one MMA phase of a warp, [PV, means, QK], each part with its operand; return S as 16 x 4 accumulators.
+
+    * vst (the V of the stage): O += P V of the current tile. means (the v_mean buffer of the pair): O += S M, the
+      means term of a step pair. kst (the K' of the stage, its scale atoms at sfst): S = Q' K'^T of the next tile.
+    * The fragments are loaded dist steps ahead of the MMAs that consume them. swait, kwait = (full barrier, parity):
+      the barrier of the stage to wait for before the first load, or before the K' scale words.
+    * turn = (take, pass, early): the first fragments are loaded before take() waits for the turn of this warp to
+      issue MMAs, and pass() hands the turn over early steps before the end.
+    """
     steps = []
     if vst is not None:
         for i in range(4):
@@ -192,7 +196,7 @@ def mma_phase(
 
 @cute.jit
 def pv_sparse_quarters(P, O, vst, voff, mask):
-    """PV of the 32-key quarters whose bit is set in mask (the tiles with zero and nonzero quarters)."""
+    """Run the PV of the 32-key quarters whose bit is set in mask (the tiles with zero and nonzero quarters)."""
     vrow = vst + voff
     vaddrs = [vrow ^ (ct * 16) for ct in range(8)]
     out = mma_pv_quarters_branch([O[j] for j in range(64)], [P[j] for j in range(16)], vaddrs, mask)
@@ -201,9 +205,7 @@ def pv_sparse_quarters(P, O, vst, voff, mask):
 
 
 def means_pair_body(P, O, vmb, vmoff):
-    """The means term of a step pair: O += M^T S^T as 16 BF16 m16n8k16 (channel tiles x query n-tiles), A = the v_mean
-    rows of both steps (pair buffer vmb: slot 0 the first step, K slots 0-7; slot 1 the second, K slots 8-15) by one
-    ldmatrix.x4.trans per channel tile, B = their block sums (P[18 + h]: first step, P[16 + h]: second)."""
+    """Add the means of a step pair: 16 BF16 m16n8k16, A = the v_mean rows of both steps, B = P[18 + h], P[16 + h]."""
     mb = vmb + vmoff[2]
     frags = [ldsm_b16_x4_trans(mb, (t & 3) * 32, (t >> 2) * 1024) for t in range(2)]
     for t in range(8):
@@ -221,8 +223,7 @@ def means_pair_body(P, O, vmb, vmoff):
 
 
 def means_pair_guarded(cond, P, O, vmb, vmoff):
-    """The means MMAs of a step pair (block sums P[18..19] first, P[16..17] second) behind one indexed branch, taken
-    when cond != 0."""
+    """Add the means of a step pair (block sums P[18..19] first, P[16..17] second) behind one indexed branch on cond."""
     out = mma_means_branch(
         [O[j] for j in range(64)], [P[18], P[16], P[19], P[17]], vmb + vmoff[2], cond
     )
@@ -232,22 +233,21 @@ def means_pair_guarded(cond, P, O, vmb, vmoff):
 
 @cute.jit
 def means_pair(cond, P, O, vmb, vmoff):
-    """means_pair_body when cond != 0 (an even phase whose step pair has a nonzero P, or a non-finite V / v_mean)."""
+    """Run means_pair_body when cond != 0: an even phase whose step pair has a nonzero P, or a non-finite V / v_mean."""
     if cond != 0:
         means_pair_body(P, O, vmb, vmoff)
 
 
 @cute.jit
 def means_single(cond, P, O, vmb, vmoff):
-    """The means term of the unpaired last step (its block sums in P[16 + h], v_mean in slot 0 of vmb)."""
+    """Add the means term of the unpaired last step when cond != 0: block sums in P[16 + h], v_mean in slot 0 of vmb."""
     if cond != 0:
         means_only(P, O, vmb, vmoff)
 
 
 @cute.jit
 def means_last(pair, pvl, nzp, P, O, vmb, stb, vmoff):
-    """The means MMAs of the last phase: of the last step pair (pair != 0) or of the unpaired last step (its v_mean
-    rows in the stage's K' region stb). pvl, nzp: nonzero P (or non-finite V / v_mean) of the last two steps."""
+    """Add the means of the last phase: the last step pair (pair != 0) or the unpaired last step (v_mean at stb)."""
     if pair != 0:
         means_pair(pvl | nzp, P, O, vmb, vmoff)
     else:
@@ -255,7 +255,7 @@ def means_last(pair, pvl, nzp, P, O, vmb, stb, vmoff):
 
 
 def means_only(P, O, vmst, vmoff):
-    """The means term of a tile alone (the unpaired last step): 4 ldmatrix.x4.trans of v_mean, 16 BF16 m16n8k8."""
+    """Add the means term of a tile alone (the unpaired last step): 4 ldmatrix.x4.trans of v_mean, 16 BF16 m16n8k8."""
     frags = [ldsm_b16_x4_trans(vmst + vmoff[cp & 1] + (cp >> 1) * 1024) for cp in range(2)]
     for cp in range(4):
         if cp + 2 < 4:
@@ -275,7 +275,7 @@ def means_only(P, O, vmst, vmoff):
 
 
 def store64(A, acc):
-    """The 64 QK accumulator words into the rmem tensor A."""
+    """Store the 64 QK accumulator words into the rmem tensor A."""
     for i in range(64):
         A[i] = acc[i // 4][i % 4]
 
@@ -295,8 +295,7 @@ def load_q(
     H: cutlass.Constexpr,
     nT: cutlass.Constexpr,
 ):
-    """The Q' A fragments of the warp's rows g, g + 8 in query tile qt (clamped to the last query) and their scale
-    words, loaded once."""
+    """Return the Q' fragments and scale words of rows g, g + 8 of the warp in tile qt, clamped to the last query."""
     r0 = warp * 16 + g
     qi0 = qt * QT + r0
     qi1 = qi0 + 8

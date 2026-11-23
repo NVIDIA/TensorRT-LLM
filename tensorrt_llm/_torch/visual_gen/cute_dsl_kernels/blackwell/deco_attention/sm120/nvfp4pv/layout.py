@@ -12,24 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tile images of the sm_120 attention kernel: the operand layout its shared-memory stages take, and the re-layout
-launch that writes it.
+"""Tile images of the sm_120 attention kernel: the operand layout of its shared-memory stages, and the re-layout launch.
 
 The preparation stores K' per key, V' per channel and their scales and means in their own tensors. The attention
 kernel reads a 128-key tile of all of them with one or two TMA bulk copies, in the order the warp-level MMAs take
-their B fragments (ldmatrix.x4 over 16-byte rows, scale words per lane). So a first launch (relayout_kernel, one CTA
-per (batch, head, key tile)) packs every tile into one image of STAGE bytes:
+their B fragments (ldmatrix.x4 over 16-byte rows, scale words per lane).
 
-- K' codes, the B operand of the QK MMA (m16n8k64: n = keys, k = channels): one 16-byte row per key and 32-channel
-  chunk, the rows of an array in n-tile order. Key r = 64 s + 32 h + 8 t + 2 i + e of the tile is column 2 t + e of
-  n-tile 8 s + 4 h + i.
-- K' scales: the three 512-byte atoms of k_sf as stored (the four UE4M3 bytes of key r and 64-channel step a at
-  512 a + 16 (r % 32) + 4 (r // 32)).
-- V' codes, the B operand of the PV MMA (n = channels, k = keys): one 16-byte row per channel and 32-key chunk.
-- V' scales: per MMA lane (channel 32 u + 8 t + g at lane 4 g + t) one 128-bit vector of the scales of two adjacent
-  32-channel groups.
-- v_mean, the B operand of the means MMA (BF16 m16n8k16: n = channels, k = the sixteen 16-key blocks of a tile pair):
-  only in the image of the pair's odd tile, or of an unpaired last tile (its second half zero).
+A first launch (relayout_kernel, one CTA per (batch, head, key tile)) packs every tile into one image of STAGE bytes:
+    * K' codes, the B operand of the QK MMA (m16n8k64: n = keys, k = channels): one 16-byte row per key and 32-channel
+      chunk, the rows of an array in n-tile order. Key r = 64 s + 32 h + 8 t + 2 i + e of the tile is column 2 t + e
+      of n-tile 8 s + 4 h + i.
+    * K' scales: the three 512-byte atoms of k_sf as stored (the four UE4M3 bytes of key r and 64-channel step a at
+      512 a + 16 (r % 32) + 4 (r // 32)).
+    * V' codes, the B operand of the PV MMA (n = channels, k = keys): one 16-byte row per channel and 32-key chunk.
+    * V' scales: per MMA lane (channel 32 u + 8 t + g at lane 4 g + t) one 128-bit vector of the scales of two
+      adjacent 32-channel groups.
+    * v_mean, the B operand of the means MMA (BF16 m16n8k16: n = channels, k = the sixteen 16-key blocks of a tile
+      pair): only in the image of the pair's odd tile, or of an unpaired last tile (its second half zero).
 """
 
 import cutlass
@@ -63,10 +62,9 @@ def relayout_kernel(
     H: cutlass.Constexpr,
     lens_ptr,
 ):
-    """The image of one key tile of one (batch, head): CTA = (batch, head, tile), 256 threads, every thread a few
-    16-byte chunks (K' rows of keys past S are zero). lens_ptr: None, or the valid prefix lengths: the tiles of a
-    batch element then end with the one that holds its last valid key (the unpaired last tile, when its index is
-    even), and the CTAs of the tiles after it write nothing."""
+    """Write the image of one key tile of one (batch, head): CTA = (batch, head, tile), 256 threads; K' rows of keys
+    past S are zero. lens_ptr: None, or the valid prefix lengths: the tiles of a batch element then end with the one
+    that holds its last valid key (the unpaired last tile, when its index is even); the CTAs after it write nothing."""
     nT = (S + 127) // 128
     SP2 = 64 * nT
     SP16 = 8 * nT

@@ -14,12 +14,22 @@
 # limitations under the License.
 """Compensation basis of the DeCo preparation: the clear launch and the eigensolver launch.
 
-The clear launch (one CTA) zeroes the per-call words of gmax, in which the later launches accumulate their maxima and
-count their CTAs. The eigensolver launch runs one 288-thread CTA per (batch, head): it accumulates the Gram matrices
-of the sampled q and k rows (the tokens of qk_rows, in 256-row chunks) with tcgen05 MMAs, normalizes each by its trace
-and writes the eigenvectors of the `rank` largest eigenvalues (32 or 64) of Gq0 / tr + Gk0 / tr of the unrotated tokens
-as U^T with U = Hd^T V / sqrt(128) (G = Hd^T G0 Hd / 128 has the eigenvectors Hd^T V / sqrt(128) when G0 has V, since
-Hd Hd^T = 128 I): the shared basis of the 2 x rank compensation channels of Q' and K'."""
+* The clear launch (one CTA) zeroes the per-call words of gmax, in which the later launches accumulate their maxima
+  and count their CTAs.
+* The eigensolver launch (one 288-thread CTA per (batch, head)) accumulates the Gram matrices of the sampled q and k
+  rows (the tokens of qk_rows, in 256-row chunks) with tcgen05 MMAs and normalizes each by its trace.
+* It writes the eigenvectors V of the `rank` largest eigenvalues (32 or 64) of Gq0 / tr + Gk0 / tr of the unrotated
+  tokens as U^T: the shared basis of the 2 x rank compensation channels of Q' and K'.
+* U = Hd^T V / sqrt(128): G = Hd^T G0 Hd / 128 has the eigenvectors Hd^T V / sqrt(128) when G0 has V (Hd Hd^T = 128 I).
+* The eigensolver CTA (_eig_body) has eight row warps and a pivot warp: the Householder tridiagonalization of the whole
+  matrix, then, for the RANK largest eigenvalues with 256 / RANK threads each, the Sturm multisection, the eigenvectors
+  by twisted factorization, the cluster repair of nearly repeated eigenvalues and the back-transform.
+
+Per-call words of gmax (float32, cleared by the clear launch):
+    0..2, 3..5  maxima of the three scale groups of Q' and of K' (head channels, first and second compensation half)
+    6           maximum of |V - mean| of the V pass
+    8           count of the V pass's CTAs that have added their maximum (7 and 9 are not used)
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -44,9 +54,7 @@ from ..tmem import ld_tmem_f32_x32_wait, tc_commit, tc_mma
 from ..valid_len import valid_len
 
 EIG_THREADS = 288  # eigensolver CTA: eight row warps and the pivot warp
-# The per-call words of gmax (float32, cleared by the clear launch): 0..2 the maxima of the three scale groups of Q'
-# (head channels, first and second compensation half), 3..5 those of K', 6 the maximum of |V - mean| of the V pass
-# and 8 the count of the V pass's CTAs that have added their maximum; the words 7 and 9 are not used
+# The per-call words of gmax (module docstring)
 GMAX_WORDS = 10
 
 
@@ -55,7 +63,7 @@ GMAX_WORDS = 10
 
 @cute.kernel
 def clear_kernel(gmax: cute.Tensor):
-    """One warp zeroes the per-call words of gmax. The launch is the programmatic primary of the eigensolver launch,
+    """Zero the per-call words of gmax, by one warp. The launch is the programmatic primary of the eigensolver launch,
     which it releases at once: that launch waits for this grid."""
     tidx, _, _ = cute.arch.thread_idx()
     if tidx < GMAX_WORDS:
@@ -79,12 +87,13 @@ def _gram(
     NCQ: Int32,
     lens,
 ):
-    """The Gram matrices of the sampled q and k rows of (batch, head) bh, 256 rows per chunk, and their sum, each
-    normalized by its trace, staged in VH. All 288 threads participate; eight warps stage, four read TMEM rows. The
-    step has barriers of its own; its last one publishes the staged matrix. lens: None, or (the global address of
-    the valid prefix lengths, rows per sample, mapped rows): with rows per sample qk_rows is [B, NQK] and the batch
-    element uses its own row; a row r of a batch element of n valid tokens stands for token floor(r n / S) with
-    mapped rows and for token min(r, n - 1) otherwise (token 0 when n is 0)."""
+    """Stage in VH the sum of the trace-normalized Gram matrices of the sampled q and k rows of bh, 256 rows per chunk.
+
+    * All 288 threads participate (eight warps stage, four read TMEM rows); the step's last barrier publishes VH.
+    * lens: None, or (the global address of the valid prefix lengths, rows per sample, mapped rows). With rows per
+      sample qk_rows is [B, NQK] and the batch element uses its own row; a row r of a batch element of n valid tokens
+      stands for token floor(r n / S) with mapped rows and for token min(r, n - 1) otherwise (token 0 when n is 0).
+    """
     sRed = st.sRed
     if st.tidx == 0:
         cute.arch.mbarrier_init(sptr(Int64, st.mbar), 1)
@@ -212,20 +221,14 @@ def _gram(
 
 # ---------------------------------------------------------------- eigensolver
 
-# Eigensolver CTA of 288 threads, one CTA per eigenproblem: eight row warps and a pivot warp, two CTA barriers per
-# Householder step, eight segments of 16 steps, two matrix rows per thread in registers and two reflectors per pass of
-# the back-transform. The tridiagonalization is that of the whole matrix; the eigenvalue search, the eigenvectors
-# and the back-transform take the RANK largest eigenvalues, with 256 / RANK threads each. The Sturm counts are
-# division-free, with e^2 floored and the pair rescaled every four steps; the twisted factorization of an eigenvalue
-# is split over two threads, its pivots floored at pivmin; nearly repeated eigenvalues go through the cluster repair.
 _ZS = (
     130  # row stride (floats) of the padded L / z buffer (ylb); the D- buffer (dmb) has rows of 128
 )
 
 
 def _eig_state(tidx, RANK):
-    """The state that the steps of the eigensolver CTA share: the coordinates of the thread, the trace-time constants
-    of the rank and the addresses of the shared-memory arrays."""
+    """Return the state that the steps of the eigensolver CTA share: the coordinates of the thread, the trace-time
+    constants of the rank and the addresses of the shared-memory arrays."""
     # threads per eigenvalue and per eigenvector of the 256 that search and back-transform them, and the row groups
     # of an eigenvector in the back-transform
     tpe = 256 // RANK
@@ -286,8 +289,7 @@ def _eig_state(tidx, RANK):
         twb=Int32(tw_p.toint()),
         mbar=Int32(gram_mb_p.toint()),
         hold=Int32(gram_hold_p.toint()),
-        # typed views of the arrays that scalar loads and stores index; the 8- and 16-byte vector loads and stores
-        # of the same arrays take the addresses above
+        # typed views for the scalar loads and stores; the 8- and 16-byte vector ones take the addresses above
         sTau=cute.make_tensor(tau_p, cute.make_layout(128)),
         sD=cute.make_tensor(dd_p, cute.make_layout(128)),
         sE=cute.make_tensor(ee_p, cute.make_layout(128)),
@@ -310,7 +312,7 @@ def _eig_state(tidx, RANK):
 
 
 def _sel4(e, x):
-    """x[e] for a runtime e in 0..3."""
+    """Return x[e] for a runtime e in 0..3."""
     return Float32(
         cutlass.select_(
             e == 0,
@@ -321,8 +323,8 @@ def _sel4(e, x):
 
 
 def _pivot(st, kr, x):
-    """Pivot warp: reflector kr from row kr (x = elements 4 lane .. 4 lane + 3 of row kr of A^(kr)).
-    v (support > kr) -> VH[kr]; returns tau, d_kr = x[kr] and e_kr (alpha)."""
+    """Pivot warp: reflector kr from row kr (x = elements 4 lane .. 4 lane + 3 of row kr of A^(kr)): v (support > kr)
+    goes to VH[kr]; returns tau, d_kr = x[kr] and e_kr (alpha)."""
     j0 = st.lane * 4
     sg = Float32(0.0)
     for e in range(4):
@@ -355,13 +357,13 @@ def _pivot(st, kr, x):
 
 @cute.jit
 def _load_row_pairs(st):
-    """Row warps: thread (rp, q) loads its 4-column blocks of the rows r0 = 2 rp and r0 + 1 of the matrix that _gram
-    staged in VH, undoing the staging swizzle; the threads of rp = 0 publish rows 0 and 1 in rb for the pivot warp.
-    Returns the registers and coordinates of the thread's row pair. VH takes its reflector layout only after the
-    barrier that follows, when every thread has loaded its tiles."""
-    # thread (rp, q) of the row warps: rows r0 = 2 rp, r1 = 2 rp + 1 (rp = 8 warp + lane / 4) and the 4-column
-    # blocks 4 m + q (columns 16 m + 4 q + e). The update rereads the reflector from shared memory instead of holding
-    # its 32 values across the step barrier
+    """Row warps: load the thread's row pair of the matrix that _gram staged in VH, undoing the staging swizzle.
+
+    * Thread (rp, q), rp = 8 warp + lane / 4, takes the 4-column blocks 4 m + q (columns 16 m + 4 q + e) of the rows
+      r0 = 2 rp and r1 = 2 rp + 1; the threads of rp = 0 publish rows 0 and 1 in rb for the pivot warp.
+    * The update rereads the reflector from shared memory instead of holding its 32 values across the step barrier.
+      VH takes its reflector layout only after the barrier that follows, when every thread has loaded its tiles.
+    """
     a0 = cute.make_rmem_tensor((32,), Float32)
     a1 = cute.make_rmem_tensor((32,), Float32)
     a0.fill(0.0)
@@ -394,8 +396,7 @@ def _load_row_pairs(st):
 
 @cute.jit
 def _first_reflector(st):
-    """Pivot warp: reflector 0 from row 0 of A, which the barrier before published in rb -> VH[0], tau_0, d_0 and
-    e_0."""
+    """Pivot warp: reflector 0 from row 0 of A, which the barrier before published in rb -> VH[0], tau_0, d_0, e_0."""
     sTau, sD, sE = st.sTau, st.sD, st.sE
     if st.tidx >= 256:
         x4 = load_vector(sptr(Uint32, st.rbb + 512 + st.lane * 16, 16), 4)
@@ -469,8 +470,7 @@ def _row_pair_products(st, rows, k, ko: cutlass.Constexpr):
 
 @cute.jit
 def _reflector_dot(st):
-    """Every thread: v . p of the step, the sum of the eight warp partials that the barrier before published in
-    part."""
+    """Every thread: v . p of the step, the sum of the eight warp partials that the barrier before published in part."""
     pr0 = load_vector(sptr(Uint32, st.partb, 16), 4)
     pr1 = load_vector(sptr(Uint32, st.partb + 16, 16), 4)
     return ((u2f(pr0[0]) + u2f(pr0[1])) + (u2f(pr0[2]) + u2f(pr0[3]))) + (
@@ -555,8 +555,7 @@ def _next_reflector(st, ksum, k):
     p4 = load_vector(sptr(Uint32, st.pbb + st.lane * 16, 16), 4)
     v4 = load_vector(sptr(Uint32, vk + st.lane * 16, 16), 4)
     xs = [u2f(r4[e]) - vk1 * u2f(p4[e]) - c1 * u2f(v4[e]) for e in range(4)]
-    # Publish disjoint four-element segments and their norms;
-    # lane 0 finishes the reflector without a shuffle chain.
+    # Publish disjoint four-element segments and their norms; lane 0 finishes the reflector without a shuffle chain.
     kr = k + 1
     j0 = st.lane * 4
     xm = [Float32(cutlass.select_(j0 + e > kr, xs[e], Float32(0.0))) for e in range(4)]
@@ -616,8 +615,7 @@ def _square_offdiagonal(st):
 
 
 def _sturm_rounds(tpe):
-    """Multisection rounds of tpe threads per eigenvalue (2 tpe + 1 sections each) that refine an interval 17^3 times
-    or more."""
+    """Return the rounds of multisection (2 tpe + 1 sections each) that refine an interval 17^3 times or more."""
     rounds = 1
     while (2 * tpe + 1) ** rounds < 17**3:
         rounds += 1
@@ -625,19 +623,20 @@ def _sturm_rounds(tpe):
 
 
 def pow2_inv_scale(a, b):
-    """2^(126 - e), e the larger biased exponent of the f32 a and b: the power of two that brings max(|a|, |b|) to
-    [0.5, 1)."""
+    """Return 2^(126 - e), e the larger biased exponent of the f32 a and b: it brings max(|a|, |b|) to [0.5, 1)."""
     e = cutlass.max(f2u(a) & Uint32(0x7F800000), f2u(b) & Uint32(0x7F800000))
     return u2f(Uint32(0x7E800000) - e)
 
 
 @cute.jit
 def _sturm2(st, xa: Float32, xb: Float32):
-    """Eigenvalue counts below xa and below xb (packed pair): sign changes of
-    P_{i+1} = (d_i - x) P_i - e2_{i-1} P_{i-1}, P_0 = 1, P_{-1} = 0. Division-free; every fourth step the pair
-    (P_i, P_{i-1}) is rescaled by a power of two so the larger lies in [0.5, 1). e2n holds -max(e_{i-1}^2, 1e-15),
-    which keeps the pair away from underflow over four steps. A sign change is the sign bit of P_{i+1} * P_i (IEEE
-    keeps the sign of a zero or flushed product)."""
+    """Return the eigenvalue counts below xa and below xb (packed pair), from the Sturm sequence of T.
+
+    * A count is the number of sign changes of P_{i+1} = (d_i - x) P_i - e2_{i-1} P_{i-1}, P_0 = 1, P_{-1} = 0; a sign
+      change is the sign bit of P_{i+1} * P_i (IEEE keeps the sign of a zero or flushed product).
+    * Division-free: every fourth step the pair (P_i, P_{i-1}) is rescaled by a power of two so the larger lies in
+      [0.5, 1); e2n holds -max(e_{i-1}^2, 1e-15), which keeps the pair away from underflow over four steps.
+    """
     nxa = -xa
     nxb = -xb
     pc0 = Float32(1.0)
@@ -833,9 +832,8 @@ def _twisted_sweeps(st, twist, pivmin):
 
 @cute.jit
 def _twist_candidates(st, twist):
-    """Active threads, after the barrier that publishes D- and L: the smallest gamma of the thread's half of the rows
-    and its row r -> tw. gamma_0 = |D-_0|, gamma_{ii+1} = |D-_{ii+1} - L_ii e_ii|; side 0 scans r < 64, side 1
-    r >= 64."""
+    """Active threads, after the barrier that publishes D- and L: the smallest gamma of a thread's half of the rows and
+    its row r -> tw. gamma_0 = |D-_0|, gamma_{ii+1} = |D-_{ii+1} - L_ii e_ii|; side 0 scans r < 64, side 1 r >= 64."""
     sGamma, sTwistRow = st.sGamma, st.sTwistRow
     side, tslot = twist.side, twist.tslot
     best = Float32(0.0)
@@ -915,22 +913,18 @@ def _normalize_halves(st, twist):
 
 # ---------------------------------------------------------------- eigensolver: eigencluster repair
 
-# Eigencluster repair helpers: rejected duplicate vectors of nearly repeated eigenvalues are replaced by deterministic
-# seeds, refined with inverse iteration where needed and orthogonalized against the kept vectors, which are
-# orthonormalized among themselves first.
-
 
 @cute.jit
 def _degen_pivot_floor(value: Float32, floor: Float32) -> Float32:
-    # Preserve pivot sign in the indefinite shifted tridiagonal solve.
+    """Floor |value| at floor; the pivot sign is preserved in the indefinite shifted tridiagonal solve."""
     safe = Float32(cutlass.select_(value < Float32(0.0), -floor, floor))
     return Float32(cutlass.select_(cute.math.abs(value) < floor, safe, value))
 
 
 @cute.jit
 def _degen_filter(st, slot: Int32, shift: Float32, pmin: Float32):
-    # One independent shifted LDL/Thomas solve. Each thread owns one column
-    # of both scratch matrices; no inter-thread synchronization is needed.
+    """Run one independent shifted LDL/Thomas solve on column `slot` of z and normalize it. Each thread owns one
+    column of both scratch matrices; no inter-thread synchronization is needed."""
     sZ, sDm = st.sZ, st.sDm
     dp = _degen_pivot_floor(st.sD[0] - shift, pmin)
     rhs = sZ[0, slot]
@@ -975,11 +969,13 @@ def _degen_filter(st, slot: Int32, shift: Float32, pmin: Float32):
 
 @cute.jit
 def _orthogonalize_replaced(st, REPS: cutlass.Constexpr = 2, KEPT: cutlass.Constexpr = False):
-    """Classical Gram-Schmidt of the replaced slots (flagged in e2), largest eigenvalue first: each projected REPS
-    times against every kept slot and every replaced slot before it, then normalized. KEPT takes the kept slots
-    instead, each against the kept slots before it. One thread per slot forms the coefficients and one thread per row
-    applies them, two partial sums each; the D- buffer holds the coefficients and the norm partials. The step has
-    barriers of its own: one follows each of its phases."""
+    """Orthogonalize the replaced slots (flagged in e2) by classical Gram-Schmidt, largest eigenvalue first.
+
+    * Each slot is projected REPS times against every kept slot and every replaced slot before it, then normalized.
+      KEPT takes the kept slots instead, each against the kept slots before it.
+    * One thread per slot forms the coefficients and one thread per row applies them, two partial sums each; the D-
+      buffer holds the coefficients and the norm partials. The step has barriers of its own: one follows each phase.
+    """
     sZ, sCoef = st.sZ, st.sCoef
     nslot = Int32(st.RANK)
     mine = Int32(0)
@@ -1043,13 +1039,17 @@ def _orthogonalize_replaced(st, REPS: cutlass.Constexpr = 2, KEPT: cutlass.Const
 
 @cute.jit
 def _cluster_repair(st, span: Float32):
-    """Cluster MGS with one warp per cluster, after the barrier that publishes the normalized z. Clusters (chains of
-    consecutive gaps <= 2e-5 span) are found with ballots; each warp orthogonalizes the members of its clusters in
-    slot order (twice) and flags degenerate members in e2. A chain with a bitwise repeated eigenvalue would get
-    identical twisted vectors, so it is replaced whole, without its MGS. Replaced members become seeds. The kept
-    vectors are first orthonormalized among themselves in eigenvalue order: those of close eigenvalues are not
-    orthogonal enough for the last seeds, which fill what is left of the complement. Four rounds follow, each a
-    shifted solve and then the orthogonalization. The step has barriers of its own; its last one publishes z."""
+    """Repair the eigenvectors of nearly repeated eigenvalues, after the barrier that publishes the normalized z.
+
+    * Clusters (chains of consecutive gaps <= 2e-5 span) are found with ballots. Cluster MGS with one warp per cluster:
+      each warp orthogonalizes the members of its clusters in slot order (twice) and flags degenerate members in e2.
+    * A chain with a bitwise repeated eigenvalue would get identical twisted vectors, so it is replaced whole, without
+      its MGS. Replaced members become deterministic seeds.
+    * The kept vectors are first orthonormalized among themselves in eigenvalue order: those of close eigenvalues are
+      not orthogonal enough for the last seeds, which fill what is left of the complement.
+    * Four rounds follow, each a shifted solve (the inverse iteration that refines the seeds) and then the
+      orthogonalization against the kept vectors. The step has barriers of its own; its last one publishes z.
+    """
     sE2, sRed, sZ = st.sE2, st.sRed, st.sZ
     nslot = Int32(st.RANK)
     tolc = span * Float32(2e-5)
@@ -1304,9 +1304,8 @@ def _back_transform(st):
 
 @cute.jit
 def _write_basis(st, uT: cute.Tensor, bh: Int32):
-    """Threads < 256, after the barrier that publishes the back-transformed z: U = Hd^T Z / sqrt(128) -> uT of
-    (batch, head) bh; Hd is in the D- buffer. A thread takes 16 rotated channels of one basis vector out of every
-    32."""
+    """Threads < 256, after the barrier that publishes the back-transformed z: write U = Hd^T Z / sqrt(128) to uT of bh
+    (Hd is in the D- buffer); a thread takes 16 rotated channels of one basis vector out of every 32."""
     if st.tidx < 256:
         for part in cutlass.range_constexpr(st.RANK // 32):
             rr_ = st.lane  # basis vector (U^T row)
@@ -1338,23 +1337,24 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
 
 @cute.jit
 def _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
-    """One eigenproblem per CTA, CTA bh that of (batch, head) bh: the Q/K basis U of RANK directions, U^T [B, H, RANK,
-    128]. The launch is a programmatic dependent of the clear launch and releases its own dependent at once: the V
-    pass launched beside it touches only the original V, its own outputs and its words of gmax. The body is the
-    schedule of the CTA: each step runs on the threads its docstring names, and each sync_threads is the CTA barrier
-    that publishes what the steps since the barrier before it wrote to shared memory. _gram and _cluster_repair have
-    barriers of their own, the last of which publishes their result. st is the state that every step shares; rows,
-    search and twist hold the registers and coordinates of the thread in one phase, built where that phase begins.
-    lens: None, or the lengths argument of _gram."""
+    """Solve one eigenproblem per CTA: CTA bh writes the Q/K basis U of (batch, head) bh, U^T [B, H, RANK, 128].
+
+    * The launch is a programmatic dependent of the clear launch and releases its own dependent at once: the V pass
+      launched beside it touches only the original V, its own outputs and its words of gmax.
+    * The body is the schedule of the CTA: each step runs on the threads its docstring names; each sync_threads is the
+      CTA barrier that publishes what the steps since the barrier before it wrote to shared memory (_gram and
+      _cluster_repair have barriers of their own, the last of which publishes their result).
+    * st is the state that every step shares; rows, search and twist hold the registers and coordinates of the thread
+      in one phase, built where that phase begins. lens: None, or the lengths argument of _gram.
+    """
     # the preceding launch on this stream clears the per-call words that the launches after this one read
     cute.arch.griddepcontrol_wait()
     tidx, _, _ = cute.arch.thread_idx()
     bh, _, _ = cute.arch.block_idx()
     cute.arch.griddepcontrol_launch_dependents()
     st = _eig_state(tidx, RANK)
-    # DMB/YLB hold aligned Gram operand images until TC completion. The normalized
-    # matrix is then staged in VH, whose first reflector is written only after
-    # all paired-row math threads have loaded their register tiles.
+    # DMB/YLB hold aligned Gram operand images until TC completion. The normalized matrix is then staged in VH, whose
+    # first reflector is written only after all paired-row math threads have loaded their register tiles.
     _gram(st, qtens, ktens, qk_rows, bh, S, H, NQK, NCQ, lens)
 
     # Householder tridiagonalization: the reflectors in VH, tau, and the tridiagonal matrix (d, e)
@@ -1420,7 +1420,7 @@ def eig_kernel(
     NCQ: Int32,
     RANK: cutlass.Constexpr,
 ):
-    """The eigensolver CTA (_eig_body) of a call whose batch elements are all full: qk_rows [NQK] are tokens."""
+    """Run the eigensolver CTA (_eig_body) of a call whose batch elements are all full: qk_rows [NQK] are tokens."""
     _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, None)
 
 
@@ -1440,9 +1440,8 @@ def eig_kernel_lens(
     ROWS_PER_SAMPLE: cutlass.Constexpr,
     MAP_ROWS: cutlass.Constexpr,
 ):
-    """The eigensolver CTA (_eig_body) of a call with valid prefix lengths lens [B] (int32): qk_rows is [B, NQK]
-    with ROWS_PER_SAMPLE, else [NQK]; with MAP_ROWS they are positions in the padded sequence that _gram maps into
-    each valid prefix."""
+    """Run the eigensolver CTA (_eig_body) of a call with valid prefix lengths lens, int32 [B]: qk_rows is [B, NQK] with
+    ROWS_PER_SAMPLE, else [NQK]; with MAP_ROWS _gram maps them from the padded sequence into each valid prefix."""
     _eig_body(
         qtens,
         ktens,

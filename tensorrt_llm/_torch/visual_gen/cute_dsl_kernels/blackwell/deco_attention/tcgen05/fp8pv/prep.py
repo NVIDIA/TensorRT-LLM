@@ -12,19 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host entry of the preparation of the tcgen05 FP8-PV kernel: run turns raw BF16 q, k, v into its operands. One
-TVM-FFI host function per device launches the kernel chain on the current stream (_make_host); its scratch is
-part of the buffers of the call (scratch). Nothing reads a device value back, so the chain captures into a CUDA
-graph.
+"""Host entry of the preparation of the tcgen05 FP8-PV kernel: run turns raw BF16 q, k, v into its operands.
 
-  clear launch        zeroes the per-call words of gmax                                   basis.clear_kernel
-  eigensolver launch  one CTA per (batch, head): the compensation basis U of Q' and K'    basis.eig_kernel
-  V pass              E4M3 V minus its 128-key means (v8, v_mean), beside the eigensolver  v_pass.v_kernel
-  Q/K pass            Hadamard rotation, NVFP4 codes and compensation channels (q4, k4)   qk_pass.qk_kernel
-  encode launch       UE4M3 scale factors (q_sf, k_sf), score_scale and v8_scale          encode.encode_kernel
+One TVM-FFI host function per device launches the kernel chain on the current stream (_make_host); its scratch is
+part of the buffers of the call (scratch). Nothing reads a device value back, so the chain captures into a CUDA graph.
+
+    clear launch        zeroes the per-call words of gmax                                    basis.clear_kernel
+    eigensolver launch  one CTA per (batch, head): the compensation basis U of Q' and K'     basis.eig_kernel
+    V pass              E4M3 V minus its 128-key means (v8, v_mean), beside the eigensolver  v_pass.v_kernel
+    Q/K pass            Hadamard rotation, NVFP4 codes and compensation channels (q4, k4)    qk_pass.qk_kernel
+    encode launch       UE4M3 scale factors (q_sf, k_sf), score_scale and v8_scale           encode.encode_kernel
 
 The first three are chained by programmatic dependent launch: the eigensolver waits for the clear launch, and the V
-pass starts beside the eigensolver CTAs and ends with a wait for them, so the plain launches after it see the basis."""
+pass starts beside the eigensolver CTAs and ends with a wait for them, so the plain launches after it see the basis.
+"""
 
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
@@ -45,7 +46,7 @@ from .v_pass import V_BLOCK, V_CTAS_PER_SM, V_THREADS, v_kernel, v_kernel_lens
 
 
 def gemm_view(t):
-    """[B, S, H, D] -> (S, D, (H, B))."""
+    """Return the view (S, D, (H, B)) of a tensor [B, S, H, D]."""
     return cute.make_tensor(
         t.iterator, cute.group_modes(cute.select(t.layout, mode=[1, 3, 2, 0]), 2, 4)
     )
@@ -84,9 +85,7 @@ def _launch_chain(
     rank,
     lens,
 ):
-    """The launches of the chain of compensation rank `rank` on `stream`. lens: None, or (the valid prefix lengths
-    [B], rows per sample, mapped rows): the eigensolver, the V pass and the Q/K pass are then their variants with
-    lengths."""
+    """Issue the launches of the chain; lens: None, or (the valid prefix lengths [B], rows per sample, mapped rows)."""
     min_prod = HEAD_DIM * 2.0**MIN_SCORE_LOG2
     clear_kernel(gmax).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     if lens is None:
@@ -131,13 +130,15 @@ def _launch_chain(
 
 
 def _make_host(rank, rows_per_sample=None, map_rows=False):
-    """The host function launching the chain of compensation rank `rank` on `stream`. The score prescale log2(e) /
-    sqrt(128) is folded into Q' (QPRE), so the multiplier of the raw scores in log2 units is the score scale (group
-    scale product / 128) itself, a power of two, which the encode launch raises to at least 2^MIN_SCORE_LOG2, the
-    floor of the attention's landing (softmax.py), by shrinking the Q' and K' block scales. rows_per_sample: None for
-    a call whose batch elements are all full; otherwise the host function takes the valid prefix lengths [B] after
-    the buffers, with qk_rows [B, NQK] (True) or [NQK] (False); map_rows: the eigensolver maps the rows into each
-    valid prefix (the default draw)."""
+    """Return the host function that launches the chain of compensation rank `rank` on its `stream` argument.
+
+    * The score prescale log2(e) / sqrt(128) is folded into Q' (QPRE), so the multiplier of the raw scores in log2
+      units is the score scale (group scale product / 128) itself, a power of two; the encode launch raises it to at
+      least 2^MIN_SCORE_LOG2, the floor of the attention's landing (softmax.py), by shrinking the Q' / K' block scales.
+    * rows_per_sample: None for a call whose batch elements are all full; otherwise the host function takes the
+      valid prefix lengths [B] after the buffers, with qk_rows [B, NQK] (True) or [NQK] (False). map_rows: the
+      eigensolver maps the rows into each valid prefix (the default draw).
+    """
     if rows_per_sample is None:
 
         @cute.jit
@@ -308,12 +309,11 @@ _HOST_BUFFERS = (
 
 
 def scratch(B, S, H, rank):
-    """The scratch of the chain at this shape and compensation rank, name -> (dtype, shape), which every call
-    rewrites before it reads it: the per-call words (maxima and the V pass's CTA count), U^T and the provisional Q' /
-    K' block scales."""
+    """Return the scratch of the chain at this shape and rank, name -> (dtype, shape); every call rewrites it first."""
     NB = (S + 127) // 128
     atoms = qk_scale_atoms(rank)
     return {
+        # the per-call words (maxima and the V pass's CTA count), U^T and the provisional Q' / K' block scales
         "gmax": (torch.float32, (GMAX_WORDS,)),
         "uT": (torch.float32, (B, H, rank, HEAD_DIM)),
         "q_sfv": (torch.bfloat16, (B, H, NB, atoms, 512)),
@@ -322,15 +322,15 @@ def scratch(B, S, H, rank):
 
 
 def run(q, k, v, qk_rows, buffers, rank, lens=None, map_rows=False):
-    """Fill the operands (buffers: the buffers of the call, the layout of this package) from raw BF16 q, k, v [B, S,
-    H, 128]: q4, k4 rows of packed E2M1 (the rotated head channels and the 2 x rank compensation channels), q_sf, k_sf
-    their UE4M3 scale factors, v8 E4M3 (V minus the BF16 mean of its block of 128 keys, over v8_scale), v_mean BF16
-    (row j: the mean of block j over v8_scale) and the one-element float32 score_scale and v8_scale. qk_rows: int32
-    indices of the tokens whose q and k rows estimate the compensation basis (inputs.sample_rows). The score prescale
-    log2(e) / sqrt(128) is folded into Q', and score_scale is the multiplier of the raw scores in log2 units, a power
-    of two of at least 2^MIN_SCORE_LOG2. lens: None, or the int32 valid prefix lengths [B] on the device, which the
-    kernels read in place; qk_rows is then [NQK] for every batch element or [B, NQK] per batch element: positions in
-    the padded sequence that the eigensolver maps into each valid prefix with map_rows, tokens otherwise."""
+    """Fill the operands of a call (buffers: the buffers of the call, the layout of this package) from raw BF16 q, k, v.
+
+    * Operands: see layout. score_scale is the multiplier of the raw scores in log2 units, a power of two of at
+      least 2^MIN_SCORE_LOG2 (_make_host); v8 and v_mean (row j: the mean of block j) are over v8_scale (v_pass.py).
+    * qk_rows: int32 indices of the tokens whose q and k rows estimate the compensation basis (inputs.sample_rows).
+    * lens: None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place. qk_rows is
+      then [NQK] for every batch element or [B, NQK] per batch element: positions in the padded sequence that the
+      eigensolver maps into each valid prefix with map_rows, tokens otherwise.
+    """
     B, S, H, _ = q.shape
     NB = (S + 127) // 128
     NQK = qk_rows.shape[-1]

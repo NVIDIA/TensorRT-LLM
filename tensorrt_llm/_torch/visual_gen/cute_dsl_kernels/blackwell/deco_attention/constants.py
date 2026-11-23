@@ -17,29 +17,27 @@ uses (thread counts, ring depths, tilers, schedule constants) stays in its modul
 
 # The releases of nvidia-cutlass-dsl the kernels are validated with
 VALIDATED_DSL_VERSIONS = ("4.8.0", "4.8.1")
-# Every buffer of a workspace starts at a multiple of ALIGN bytes of the workspace, whose own address is a multiple
-# of ALIGN: the alignment that the launches assume of their pointers
+# The alignment the launches assume of their pointers: of the address of a workspace and of every buffer offset in it
 ALIGN = 256
-# The default draw of the rows that estimate the compensation basis takes one token in SAMPLE_FRAC (and at least
-# twice the rank)
+# The default draw of the rows of the compensation basis takes one token in SAMPLE_FRAC, and at least twice the rank
 SAMPLE_FRAC = 256
 
 HEAD_DIM = 128  # channels of q, k, v and o per head
-# Rank of the compensation basis: Q' and K' carry 2 x rank compensation channels after the rotated head channels.
-# RANKS are the ranks a kernel may be built for; a family's ranks() names those a target offers. DEFAULT_RANK is the
-# rank every target has, and the default of the rank arguments
+# The ranks of the compensation basis a kernel may be built for; a family's ranks() names those a target offers. Q'
+# and K' carry 2 x rank compensation channels after the rotated head channels
 RANKS = (32, 64)
+# The rank every target has, and the default of the rank arguments
 DEFAULT_RANK = 32
 QK_ROW_BYTES = 128  # a packed token row of Q' / K': room for 256 E2M1 codes, the first qk_channels(rank) of them used
 
 
 def qk_channels(rank):
-    """Channels of Q' and K' at a rank: the rotated head channels, then the compensation channels."""
+    """Return the channels of Q' and K' at a rank: the rotated head channels, then the compensation channels."""
     return HEAD_DIM + 2 * rank
 
 
 def qk_scale_atoms(rank):
-    """512-byte atoms of the Q' / K' scale factors of a tile at a rank, one per 64 channels."""
+    """Return the 512-byte atoms of the Q' / K' scale factors of a tile at a rank, one per 64 channels."""
     return qk_channels(rank) // 64
 
 

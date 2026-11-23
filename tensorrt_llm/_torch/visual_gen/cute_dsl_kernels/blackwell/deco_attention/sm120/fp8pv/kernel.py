@@ -16,36 +16,39 @@
 # ruff: noqa: E741
 """NVFP4 QK + FP8 PV attention for sm_120a (RTX PRO 6000), built on the warp-level MMAs (mma.sync).
 
-A CTA takes 128 query rows of one (batch, head) (8 warps x 16 rows) over tiles of 128 keys: S = Q' K'^T over the 192
-channels of Q' and K' on the block-scaled NVFP4 MMA (kind::mxf4nvf4, m16n8k64, UE4M3 scales); the online softmax of
-softmax.py (log2 units, lazy rescale at T = 4, I-ExpCast into E4M3 P, the row sum of the quantized P summed in the
-softmax); O += P V on the FP8 MMA (m16n8k32), V being the E4M3 V minus its means of every 128 keys; and the means
-term, the block sums of P times v_mean on BF16 MMAs. o = (P V + S M) * v8_scale / l. v_mean holds one row per 16
-keys, a tile's mean in all 8 of its rows, and the means MMA weights the rows by the 16-key block sums of P, which
-add up to the tile's.
-
-Schedule. The warps are paired (w, w + 4); the two warps of a pair alternate in issuing MMAs under a named barrier of
-64 threads: one issues its MMA phase k = [PV(k - 1), means, QK(k)] while the other runs the softmax of its scores; the
-four pairs run independently. The means of the step pair (2m, 2m + 1) take phase 2m + 2, those of an unpaired last
-step the last phase.
-
-Ring. Stage k % 3 of the TMA ring holds exactly what phase k reads (K' and its scale atoms of step k, V of step
-k - 1, and for an even phase the v_mean rows of its step pair in one of two pair buffers) under one full barrier,
-which a warp waits for before its first fragment loads and its turn, so that a phase starts only when all of its
-operands are in shared memory. The softmax keeps the scores in registers, so a warp's reads of a stage end with its
-MMA phase: it counts its release then, and the eighth warp to do so refills the stage with K' of step k + 3 and V of
-step k + 2. No warp waits for the others.
-
-Key tiles run diagonal first: the query tile's own key tile, then onward, wrapping, and the partial last tile last.
-
-Zero-P skipping is exact: a warp-uniform mask of the 32-key quarters with a nonzero packed P byte picks the dense
-phase, the QK-only phase or, for a mixed tile, one indexed branch per quarter around its V loads and MMAs. A scan of V
-and v_mean before the attention (scan.py) flags the heads with a non-finite value, which take every quarter (0 * NaN
-must propagate).
-
-Split tail. One launch holds the whole units (query tile, head, batch) followed by the key-range pieces of the last
-units % nsm + nsm // 2 units of the grid (nsm: the SM count of the device; launch.split_plan); a merge launch combines
-the FP32 partials of the pieces (epilogue.py)."""
+o = (P V + S M) * v8_scale / l. A CTA takes 128 query rows of one (batch, head) (8 warps x 16 rows) over tiles of 128
+keys; per key tile:
+    * QK: S = Q' K'^T over the 192 channels of Q' and K' on the block-scaled NVFP4 MMA (kind::mxf4nvf4, m16n8k64,
+      UE4M3 scales).
+    * Softmax (softmax.py): online, log2 units, lazy rescale at T = 4, I-ExpCast into E4M3 P, row sum of quantized P.
+    * PV: O += P V on the FP8 MMA (m16n8k32), V being the E4M3 V minus its means of every 128 keys.
+    * Means term: the block sums of P times v_mean on BF16 MMAs. v_mean holds one row per 16 keys, a tile's mean in
+      all 8 of its rows; the means MMA weights the rows by the 16-key block sums of P, which add up to the tile's.
+Schedule:
+    * MMA phase k = [PV(k - 1), means, QK(k)], k = 0 .. n (n: the key tiles of the CTA).
+    * The warps are paired (w, w + 4) and the four pairs run independently. The two warps of a pair alternate in
+      issuing MMAs under a named barrier of 64 threads, w first: one issues its MMA phase while the other runs the
+      softmax of its scores.
+    * The means of the step pair (2m, 2m + 1) take phase 2m + 2: 16 BF16 m16n8k16 (8 channel tiles x 2 query
+      n-tiles), their v_mean rows in pair buffer m % 2. Those of an unpaired last step take the last phase, n.
+    * Key tiles run diagonal first: the query tile's own key tile, then onward, wrapping; the partial last tile last.
+Ring:
+    * Stage k % 3 of the TMA ring holds exactly what phase k reads, under one full barrier: K' and its scale atoms of
+      step k, V of step k - 1 and, for an even phase, the v_mean rows of its step pair in one of two pair buffers.
+    * A warp waits for the barrier before its first fragment loads and its turn, so that a phase starts only when all
+      of its operands are in shared memory. No warp waits for the others.
+    * The softmax keeps the scores in registers, so the reads of a stage by a warp end with its MMA phase: it counts
+      its release then, and the eighth warp to do so refills the stage with K' of step k + 3 and V of step k + 2.
+Zero-P skipping, exact:
+    * A warp-uniform mask of the 32-key quarters with a nonzero packed P byte picks the dense phase, the QK-only
+      phase or, for a mixed tile, one indexed branch per quarter around its V loads and MMAs.
+    * A scan of V and v_mean before the attention (scan.py) flags the heads with a non-finite value, which take
+      every quarter (0 * NaN must propagate).
+Split tail:
+    * One launch holds the whole units (query tile, head, batch) followed by the key-range pieces of the last
+      units % nsm + nsm // 2 units of the grid (nsm: the SM count of the device; launch.split_plan).
+    * A merge launch combines the FP32 partials of the pieces (epilogue.py).
+"""
 
 import math
 
@@ -95,41 +98,39 @@ EARLY = 4  # MMA steps before the end of a phase at which the warp hands the tur
 
 
 # ------------------------------------------------------------------------------------------------ CTA state
-# The steps of a CTA body share one State st (common/state.py), built by cta_state and completed by start_ring and
-# load_operands; no step assigns a field after that. Its fields:
-#   tidx, warp, lane, g, q, grp     the thread: its rows are g = lane / 4 and g + 8 of the warp, q = lane % 4 its place
-#                                   in the quad; grp 0: warps 0-3 (rows 0-63), 1: warps 4-7 (rows 64-127)
-#   qt, hh, bb                      the unit: query tile, head, batch
-#   bid_wait, bid_pass              the turn barriers of the warp pair (w, w + 4): this warp's and its partner's
-#   turn, turn_held                 the turn of an MMA phase as mma_phase takes it: (take, pass, EARLY)
-#   sp, smem, fbar                  shared memory: its pointer, its address, the address of the stages' full barriers
-#   dist                            the ldmatrix lookahead of the MMA phases
-#   tma, vnan                       start_ring: the TMA views, the non-finite flag of the head
-#   sc, vsc, lz                     load_operands: the score scale, v8_scale, the per-lane zero of the release count
-#   mma, voff, vmoff                load_operands: the thread's operands of mma_phase in its order (the Q' fragments
-#                                   and scale words, the per-lane offsets of the K' rows, K' scale words and V row,
-#                                   the lookahead), and the per-lane offsets of the V row and the v_mean rows
-#   O, P                            load_operands: the register tensors of the O accumulators and of the packed P with
-#                                   its block sums and quarter mask (softmax.py)
 
 
 def pass_turn(st):
-    """Hand the turn of the warp pair to the partner warp: an arrival on its turn barrier. The turn barriers use the
-    non-aligned form because the warps of an MMA phase reach them from two code paths (the dense and the zero-P
-    branches)."""
+    """Hand the turn of the warp pair to the partner warp: an arrival on its turn barrier."""
+    # non-aligned: the warps of an MMA phase reach the turn barriers from two code paths (dense and zero-P branches)
     cute.arch.barrier_arrive(barrier_id=st.bid_pass, number_of_threads=64, aligned=False)
 
 
 def take_turn(st, sw):
-    """The start of an MMA phase without lookahead loads: wait for the stage's full barrier sw = (barrier, parity),
-    then for this warp's turn (the pair's 64 threads: this warp's sync and its partner's pass_turn)."""
+    """Start an MMA phase without lookahead loads: wait for the full barrier sw = (barrier, parity), then the turn."""
     mbar_wait(sw[0], sw[1])
     barrier_cta_sync(st.bid_wait, thread_count=64)
 
 
 def cta_state(tidx, qt, hh, bb, dist):
-    """The state of thread tidx of the CTA of unit (query tile qt, head hh, batch bb): the thread coordinates, the
-    turn of its warp pair and the shared memory. dist: the lookahead of its MMA phases."""
+    """Return the state st of thread tidx of the CTA of unit (query tile qt, head hh, batch bb); dist: its lookahead.
+
+    The steps of a CTA body share st; start_ring and load_operands complete it, then no step assigns a field. Fields:
+        tidx, warp, lane, g, q, grp   the thread: its rows are g = lane / 4 and g + 8 of the warp, q = lane % 4 its
+                                      place in the quad; grp 0: warps 0-3 (rows 0-63), 1: warps 4-7 (rows 64-127)
+        qt, hh, bb, dist              the unit (query tile, head, batch) and the ldmatrix lookahead of the MMA phases
+        bid_wait, bid_pass            the turn barriers of the warp pair (w, w + 4): this warp's and its partner's
+        turn, turn_held               the turn of an MMA phase as mma_phase takes it: (take, pass, EARLY)
+        sp, smem, fbar                shared memory: its pointer, its address, the address of the stages' full barriers
+        tma, vnan                     start_ring: the TMA views, the non-finite flag of the head
+        sc, vsc, lz                   load_operands: the score scale, v8_scale, the per-lane zero of the release count
+        mma, voff, vmoff              load_operands: the thread's operands of mma_phase in its order (the Q' fragments
+                                      and scale words, the per-lane offsets of the K' rows, K' scale words and V row,
+                                      the lookahead), and the per-lane offsets of the V row and the v_mean rows
+        O, P                          load_operands: the register tensors of the O accumulators and of the packed P
+                                      with its block sums and quarter mask (softmax.py)
+        piece, parts                  body_lens: the key-range piece of the CTA and the pieces of its unit
+    """
     warp = tidx >> 5
     lane = tidx & 31
     g = lane >> 2
@@ -150,10 +151,7 @@ def cta_state(tidx, qt, hh, bb, dist):
 
 @cute.jit
 def start_ring(st, ops, H: cutlass.Constexpr, nT: cutlass.Constexpr):
-    """The ring of the CTA before its first load: the TMA views of the unit's (batch, head) (st.tma), the stages'
-    full barriers and release counters, which thread 0 initializes, and st.vnan, the OR of the head's scan flags
-    over the CTA. The barrier of that reduction is the one behind which every thread sees the initialized barriers and
-    counters."""
+    """Set up the ring of the CTA before its first load: st.tma, the stage barriers and counters (thread 0), st.vnan."""
     _, _, _, flags_ptr, tiles = ops
     vflags = flags_ptr.toint() + Int64((st.bb * H + st.hh) * nT) * 4
     st.tma = make_tma_views(st.sp, *tiles, st.hh, st.bb)
@@ -162,7 +160,8 @@ def start_ring(st, ops, H: cutlass.Constexpr, nT: cutlass.Constexpr):
             cute.arch.mbarrier_init(sptr(Int64, st.fbar + stage * 8), 1)
             cute.arch.store(sptr(Int32, st.smem + CNT_OFF + stage * 4), Int32(0))
         cute.arch.mbarrier_init_fence()
-    # a non-finite V or v_mean anywhere in this (batch, head) disables zero-P skipping for the head
+    # a non-finite V or v_mean anywhere in this (batch, head) disables zero-P skipping for the head; behind the barrier
+    # of this reduction every thread sees the initialized barriers and counters
     st.vnan = cute.arch.make_warp_uniform(
         Int32(
             barrier_cta_red(
@@ -173,10 +172,7 @@ def start_ring(st, ops, H: cutlass.Constexpr, nT: cutlass.Constexpr):
 
 
 def load_operands(st, ops, S, H, nT, vs_ptr=None):
-    """What a thread keeps in registers over the key sequence: the Q' fragments and scale words of its rows (load_q),
-    the score scale, v8_scale (with vs_ptr: the body that writes the output rows), the per-lane zero of the release
-    count, the per-lane offsets of the B fragments (lane_offsets), the O accumulators (zero) and the P words (zero
-    block sums)."""
+    """Load what a thread keeps in registers over the key sequence; v8_scale only in the body that writes the rows."""
     q_ptr, qsf_ptr, ss_ptr, _, _ = ops
     qa, sfq = load_q(
         q_ptr.toint(), qsf_ptr, st.qt, st.warp, st.lane, st.g, st.q, st.bb, st.hh, S, H, nT
@@ -198,8 +194,7 @@ def load_operands(st, ops, S, H, nT, vs_ptr=None):
 
 
 def release_count(st, stage):
-    """Count this warp's release of stage `stage` (its last read of the stage is behind it): the counter before the
-    increment, on every lane."""
+    """Count the release of `stage` by this warp (its last read is behind it); return the old count on every lane."""
     cute.arch.sync_warp()
     return cute.arch.shuffle_sync(
         atom_add_shared_u32_lane0(st.smem + CNT_OFF + stage * 4 + st.lz * 4, st.lane), 0
@@ -208,7 +203,7 @@ def release_count(st, stage):
 
 @cute.jit
 def rot_tile(k, rot, nm1: cutlass.Constexpr):
-    """Key tile of step k < nm1 in the diagonal-first order: (k + rot) mod nm1 (the partial last tile stays last)."""
+    """Return the key tile of step k < nm1, diagonal first: (k + rot) mod nm1; the partial last tile stays last."""
     t = k + rot
     if t >= nm1:
         t = t - nm1
@@ -216,23 +211,23 @@ def rot_tile(k, rot, nm1: cutlass.Constexpr):
 
 
 def step_tile(j, rot, nT):
-    """Key tile of step j of a whole unit, j known at trace time (a step before the first counts as step 0): rot_tile
-    for the full tiles, the partial last tile nT - 1 for the last step."""
+    """Return the key tile of step j of a whole unit (j at trace time; below 0 counts as 0): rot_tile, then nT - 1."""
     return Int32(nT - 1) if j >= nT - 1 else rot_tile(Int32(max(j, 0)), rot, nT - 1)
 
 
 def pair_buffer(st, k):
-    """The pair buffer with the v_mean rows that phase k reads (an even k: those of the step pair (k - 2, k - 1))."""
+    """Return the pair buffer of the v_mean rows that phase k reads (even k: those of the step pair (k - 2, k - 1))."""
     return st.smem + VMP_OFF + (((k - 1) >> 1) & 1) * (2 * VM_BYTES)
 
 
 @cute.jit
 def issue_tile(st, stage, ktile, vtile, has_k, has_v, vma, vmb, nvm, vbuf):
-    """Stage `stage` of phase j holds what the phase reads: K' (three atom columns and the three scale atoms) of step
-    j for QK(j) and V of step j - 1 for PV(j - 1); for an even phase j the same full barrier also covers the v_mean
-    rows of the step pair (j - 2, j - 1) (tiles vma, vmb; nvm = 2) in pair buffer vbuf (read by phase j), and for an
-    odd last phase those of the unpaired last step (tile vma; nvm = 1) in the stage's unused K' region. The expected
-    bytes are those issued."""
+    """Issue the TMA copies of what phase j reads into its stage, under the full barrier of the stage.
+
+    * K' (three atom columns and the three scale atoms) of step j for QK(j) and V of step j - 1 for PV(j - 1).
+    * nvm = 2, an even phase j: the v_mean rows of the step pair (j - 2, j - 1) (tiles vma, vmb) into pair buffer vbuf.
+    * nvm = 1, an odd last phase: those of the unpaired last step (tile vma) into the unused K' region of the stage.
+    """
     (
         tma_atom_k,
         tKgK,
@@ -269,11 +264,13 @@ def issue_tile(st, stage, ktile, vtile, has_k, has_v, vma, vmb, nvm, vbuf):
 
 @cute.jit
 def first_stages(st, tile, n, n_min: cutlass.Constexpr):
-    """The first loads of a CTA over n key tiles, issued by warp 4; tile(j): the key tile of step j. Stage j (phases
-    0 .. 2, as far as the CTA has a phase j): K' of step j (j < n) and V of step j - 1; phase 2 takes the v_mean rows
-    of the step pair (0, 1), a last phase 1 (n == 1) those of step 0. n is known at trace time (a whole unit) or at
-    run time with the trace-time lower bound n_min (a key-range piece: 2; a range with lengths: 1): what the bound
-    decides is decided at trace time."""
+    """Issue the first loads of a CTA over n key tiles (warp 4); tile(j): the key tile of step j.
+
+    * Stage j of the phases 0 .. 2, as far as the CTA has a phase j: K' of step j (j < n) and V of step j - 1; phase 2
+      takes the v_mean rows of the step pair (0, 1), a last phase 1 (n == 1) those of step 0.
+    * n is known at trace time (a whole unit) or at run time with the trace-time lower bound n_min (a key-range piece:
+      2; a range with lengths: 1): what the bound decides is decided at trace time.
+    """
     static = isinstance(n, int)
     for tl in cutlass.range_constexpr(STAGES):
         # the CTA has a phase tl; step tl has a tile; a single step brings its own v_mean rows in stage 1
@@ -300,16 +297,14 @@ def first_stages(st, tile, n, n_min: cutlass.Constexpr):
 
 @cute.jit
 def refill_if_last(st, old, ktile, vtile, has_k, vma, vmb, nvm):
-    """After softmax_tile counted this warp's release of stage 0 (old: the counter before it): the eighth warp
-    refills the stage for phase 3, with the tiles and v_mean rows issue_tile takes (a V tile, pair buffer 1)."""
+    """Refill stage 0 for phase 3 (issue_tile with a V tile and pair buffer 1) when the eighth warp has released it."""
     if (old & 7) == 7:
         cute.arch.fence_proxy("async.shared", space="cta")
         issue_tile(st, 0, ktile, vtile, has_k, Int32(1), vma, vmb, nvm, Int32(1))
 
 
 def refill_full0(st, old, rot, nT, vt2):
-    """The refill of stage 0 for phase 3 of a whole unit (nT > 2): K' of step 3, V of step 2 (tile vt2) and, for an
-    unpaired last step 2 (nT == 3), its v_mean rows."""
+    """Refill stage 0 for phase 3 of a whole unit: K' of step 3, V of step 2, the v_mean rows of an unpaired step 2."""
     refill_if_last(
         st,
         old,
@@ -324,9 +319,9 @@ def refill_full0(st, old, rot, nT, vt2):
 
 @cute.jit
 def refill_loop_full(st, old, k, stage, rot, nT: cutlass.Constexpr):
-    """refill_if_last for a loop phase k of the full body with a phase k + 3 to load (k + 2 < nT), the tiles of the
-    refill computed by the refilling warp only: K' of step k + 3, V of step k + 2 and, for odd k, the v_mean rows of
-    the pair (k + 1, k + 2) (an unpaired last step k + 2 = nT - 1 for even k)."""
+    """Refill the stage of loop phase k of the full body for phase k + 3 (k + 2 < nT), as refill_if_last.
+    The refilling warp alone computes the tiles: K' of step k + 3, V of step k + 2 and the v_mean rows of the pair
+    (k + 1, k + 2) for odd k, of an unpaired last step k + 2 = nT - 1 for even k."""
     if k + 2 < nT:
         if (old & 7) == 7:
             kt = Int32(nT - 1)
@@ -352,7 +347,7 @@ def refill_loop_full(st, old, k, stage, rot, nT: cutlass.Constexpr):
 
 @cute.jit
 def refill_loop_part(st, old, k, stage, t0, nK):
-    """refill_loop_full for the key-range pieces (tiles t0 + step; a phase k + 3 to load: k + 2 < nK)."""
+    """Refill as refill_loop_full, for a key-range piece: tiles t0 + step; a phase k + 3 to load when k + 2 < nK."""
     if k + 2 < nK:
         if (old & 7) == 7:
             hk = Int32(0)
@@ -381,7 +376,7 @@ def refill_loop_part(st, old, k, stage, t0, nK):
 
 @cute.jit
 def refill_part0(st, old, t0, nK):
-    """The refill of stage 0 for phase 3 of a piece (nK > 2)."""
+    """Refill stage 0 for phase 3 of a piece (nK > 2)."""
     if 2 < nK:
         hk0 = Int32(0)
         if 3 < nK:
@@ -398,14 +393,13 @@ def refill_part0(st, old, t0, nK):
 
 
 def valid_keys(st):
-    """With lengths: the valid tokens of the unit's batch element, from its word of shared memory (thread 0 writes it
-    before the barrier of start_ring), where the epilogue reads the bound of its zero rows."""
+    """Return the valid tokens of the batch element (with lengths), stored by thread 0 before the start_ring barrier."""
     return cute.arch.load(sptr(Int32, st.smem + LEN_OFF), Int32)
 
 
 @cute.jit
 def lens_tile(j, rng):
-    """Key tile of step j (a step past the last counts as the last) of the range."""
+    """Return the key tile of step j of the range rng; a step past the last counts as the last."""
     n = rng[1]()
     t = n - 1
     if j < n - 1:
@@ -415,7 +409,7 @@ def lens_tile(j, rng):
 
 @cute.jit
 def refill_lens0(st, old, rng):
-    """The refill of stage 0 for phase 3 of the range (n > 2), as refill_full0."""
+    """Refill stage 0 for phase 3 of the range (n > 2), as refill_full0."""
     if (old & 7) == 7:
         n = rng[1]()
         if 2 < n:
@@ -437,7 +431,7 @@ def refill_lens0(st, old, rng):
 
 @cute.jit
 def refill_loop_lens(st, old, k, stage, rng):
-    """refill_loop_full for the range (a phase k + 3 to load: k + 2 < n)."""
+    """Refill as refill_loop_full, for the range: a phase k + 3 to load when k + 2 < n."""
     if (old & 7) == 7:
         n = rng[1]()
         if k + 2 < n:
@@ -466,25 +460,23 @@ def refill_loop_lens(st, old, k, stage, rng):
 
 
 # ------------------------------------------------------------------------------------------------ phases
-# MMA phase k = [PV(k - 1), means, QK(k)], k = 0 .. n (n: the key tiles of the CTA); the warps of a pair alternate (w
-# first). The means of the step pair (2m, 2m + 1) take phase 2m + 2: 16 BF16 m16n8k16 (8 channel tiles x 2 query
-# n-tiles), their v_mean rows in pair buffer m % 2; an unpaired last step's take phase n. Stage k % 3 holds what phase
-# k reads (V of step k - 1, K' of step k; for even k the pair's v_mean rows); the eighth warp to release it after
-# phase k refills it for phase k + 3.
 
 
 def qk_phase(st, base, kwait, turn):
-    """The MMA phase [QK] of this thread on the stage at shared address base: S = Q' K'^T of the stage's K', returned
-    as 16 x 4 accumulators. kwait: the stage's (full barrier, parity) to wait for before the K' scale words, or None
-    when the warp is past it; turn: st.turn, or st.turn_held when the warp holds the turn (mma_phase)."""
+    """Run the MMA phase [QK] of this thread on the stage at base: S = Q' K'^T of its K', as 16 x 4 accumulators.
+
+    * kwait: the stage's (full barrier, parity) to wait for before the K' scale words; None when the warp is past it.
+    * turn: st.turn, or st.turn_held when the warp holds the turn (mma_phase).
+    """
     return mma_phase(st.P, st.O, None, base, base + SF_OFF, *st.mma, kwait=kwait, turn=turn)
 
 
 def pv_qk_phase(st, base, swait, means=None):
-    """The dense MMA phase [PV, means, QK] of this thread on the stage at shared address base: O += P V of the
-    stage's V, the means MMAs of the pair buffer `means` (None: an odd phase, without), then the QK of the stage's K',
-    returned as 16 x 4 accumulators. swait: the stage's (full barrier, parity), waited for before the first fragment
-    loads and the turn (mma_phase)."""
+    """Run the dense MMA phase [PV, means, QK] of this thread on the stage at base; return S as 16 x 4 accumulators.
+
+    * swait: the stage's (full barrier, parity), waited for before the first fragment loads and the turn (mma_phase).
+    * means: the pair buffer of the means MMAs; None in an odd phase, which has none.
+    """
     return mma_phase(
         st.P,
         st.O,
@@ -500,28 +492,29 @@ def pv_qk_phase(st, base, swait, means=None):
 
 
 def softmax_init():
-    """The softmax state of a thread's rows g and g + 8 before the first tile, as the steps pass it on: the anchors
-    (-inf), the quad's partial row sums (0) and the landing path (1: both -inf anchors require the safe I-ExpCast
-    path)."""
+    """Return the initial softmax state: anchors -inf, row sums 0, path 1 (-inf anchors need the safe landing path)."""
     return Float32(-math.inf), Float32(-math.inf), Float32(0.0), Float32(0.0), Int32(1)
 
 
 def softmax_step(st, acc, sm, lim, mask_tail=None, stage=None, refill=None):
-    """softmax_tile of the scores acc of this thread's tile from the softmax state sm (softmax_init): P and its block
-    sums into st.P, a rescale into st.O; returns the next state. lim, mask_tail: the tile's valid keys and the
-    run-time switch of their mask. stage: the stage whose release by this warp the softmax counts (release_count)
-    before the landing, the count going to refill after it; None: the phase releases no stage."""
+    """Run softmax_tile on the scores of the tile from the state sm (softmax_init); return the next state.
+
+    * lim, mask_tail: the valid keys of the tile and the run-time switch of their mask.
+    * stage: the softmax counts its release by this warp (release_count), the count going to refill; None: no release.
+    """
     release = (lambda: release_count(st, stage)) if stage is not None else None
     return softmax_tile(acc, st.O, st.P, *sm, st.sc, st.q, lim, mask_tail, release, refill)
 
 
 @cute.jit
 def loop_phase(st, k, stage, ph, nzp, sm, refill):
-    """Phase k of 1 .. n - 2 on stage `stage` = k % 3 (ph: the parity of its full barrier): PV(k - 1), for an even k
-    the means of the step pair (k - 2, k - 1), and QK(k), in the form the quarter mask of P picks; then the softmax of
-    tile k, which counts the warp's release of the stage and lets the eighth warp refill it (refill(count)). nzp:
-    step k - 2's P had a nonzero byte (or V / v_mean a non-finite value). Returns that flag of step k - 1 and the
-    softmax state."""
+    """Run phase k of 1 .. n - 2 on its stage, k % 3 (ph: the parity of its full barrier), then the softmax of tile k.
+
+    * PV(k - 1), for an even k the means of the step pair (k - 2, k - 1), and QK(k), in the form the quarter mask of P
+      picks; the softmax counts the release of the stage and lets the eighth warp refill it (refill(count)).
+    * nzp: the P of step k - 2 had a nonzero byte (or V / v_mean a non-finite value); returned for step k - 1 with
+      the softmax state.
+    """
     P = st.P
     O = st.O
     stk = st.smem + stage * STAGE_BYTES
@@ -557,19 +550,15 @@ def loop_phase(st, k, stage, ph, nzp, sm, refill):
             means_pair_guarded(mcond, P, O, mbase, st.vmoff)
             store64(A2, qk_phase(st, stk, None, st.turn_held))
         acc2 = [[A2[4 * n + e] for e in range(4)] for n in range(16)]
-    # this warp is past its reads of stage k % 3 (its MMA phase): the softmax counts the release and the last of
-    # the eight refills it with K' of step k + 3, V of step k + 2 and, for odd k, the v_mean rows of the pair
-    # (k + 1, k + 2) (or of an unpaired last step k + 2)
     sm = softmax_step(st, acc2, sm, KT, stage=stage, refill=refill)
     return nz, sm
 
 
 @cute.jit
 def last_qk_phase_full(st, kl: cutlass.Constexpr, nzp, sm, lim: cutlass.Constexpr):
-    """Phase kl = nT - 1 >= 1 of a whole unit: PV(kl - 1), for an even kl the means of the step pair (kl - 2, kl - 1)
-    (behind their branch on nzp when P is zero), and QK(kl); then the softmax of the last tile, its keys from lim on
-    masked. No phase reuses the stage, so the softmax counts no release. Returns the nonzero-P flag of step kl - 1
-    and the softmax state."""
+    """Run phase kl = nT - 1 >= 1 of a whole unit, then the softmax of the last tile with its keys from lim on masked.
+    PV(kl - 1), for an even kl the means of the step pair (kl - 2, kl - 1) (behind their branch on nzp when P is zero),
+    and QK(kl). No phase reuses the stage, so the softmax counts no release. Returns as loop_phase."""
     stk = st.smem + (kl % STAGES) * STAGE_BYTES
     sw = (st.fbar + (kl % STAGES) * 8, Int32((kl // STAGES) & 1))
     acc3 = [[Float32(0.0)] * 4 for _ in range(16)]
@@ -588,9 +577,8 @@ def last_qk_phase_full(st, kl: cutlass.Constexpr, nzp, sm, lim: cutlass.Constexp
 
 @cute.jit
 def last_qk_phase_part(st, kl, nzp, sm, lim: cutlass.Constexpr, piece, split: cutlass.Constexpr):
-    """Phase kl = nK - 1 >= 1 of a key-range piece, kl known at run time or at trace time: as last_qk_phase_full, the
-    parity of kl behind a branch. The softmax masks the keys from lim on in the last piece (piece == split - 1),
-    whose last tile is the partial one."""
+    """Run phase kl = nK - 1 >= 1 of a key-range piece as last_qk_phase_full, the parity of kl behind a branch. The
+    softmax masks the keys from lim on in the last piece (piece == split - 1), whose last tile is the partial one."""
     P = st.P
     O = st.O
     stk = st.smem + (kl % STAGES) * STAGE_BYTES
@@ -615,10 +603,9 @@ def last_qk_phase_part(st, kl, nzp, sm, lim: cutlass.Constexpr, piece, split: cu
 
 @cute.jit
 def last_pv_phase(st, n, nzp):
-    """Phase n, the last of a CTA with n key tiles (n known at run time or at trace time): PV(n - 1) from stage n % 3,
-    skipped for a zero P, and the means of the last step pair (even n; nzp: the nonzero-P flag of its first step) or
-    of the unpaired last step, whose v_mean rows are in the stage's K' region. The warp waits for the stage and for
-    its turn first."""
+    """Run phase n, the last of a CTA with n key tiles, after the wait for stage n % 3 and for the turn.
+    PV(n - 1) from the stage, skipped for a zero P, and the means of the last step pair (even n; nzp: the nonzero-P
+    flag of its first step) or of the unpaired last step, whose v_mean rows are in the K' region of the stage."""
     take_turn(st, (st.fbar + (n % STAGES) * 8, (n // STAGES) & 1))
     pvl = packed_pv_needed(st.P, st.vnan)
     if pvl != 0:
@@ -640,9 +627,8 @@ def last_pv_phase(st, n, nzp):
 def store_unit_rows(
     st, f, o_ptr, nT: cutlass.Constexpr, S: cutlass.Constexpr, H: cutlass.Constexpr
 ):
-    """store_rows of this warp's 16 rows of a whole unit (f: inv_row_sums), staged in a stage that no warp reads any
-    more (every thread is past the CTA barrier of the body): the warps 0-3 stage their rows in the stage of tile
-    nT - 2, the warps 4-7 in that of tile nT - 3."""
+    """Store the 16 rows of this warp of a whole unit (store_rows; f: inv_row_sums) through a stage no warp still reads.
+    Every thread is past the CTA barrier: warps 0-3 use the stage of tile nT - 2, warps 4-7 that of tile nT - 3."""
     epi_a = st.smem + ((nT - 2) % STAGES if nT >= 2 else 1) * STAGE_BYTES
     epi_b = st.smem + (nT % STAGES if nT >= 3 else 2) * STAGE_BYTES
     ep = epi_a
@@ -669,8 +655,7 @@ def store_unit_rows(
 # ------------------------------------------------------------------------------------------------ CTA bodies
 @cute.jit
 def full_body(ops, vs_ptr, o_ptr, S: cutlass.Constexpr, H: cutlass.Constexpr, unit):
-    """Query tile `unit` (linear over (tile, head, batch)) over all key tiles: the final bf16 rows. ops: the operands
-    of attn_kernel that both bodies read."""
+    """Run query tile `unit` (linear over (tile, head, batch)) over all key tiles and store its final bf16 rows."""
     nT = (S + KT - 1) // KT
     LIM = S - (nT - 1) * KT  # valid keys of the last tile
     tidx = Int32(cute.arch.thread_idx()[0])
@@ -691,7 +676,6 @@ def full_body(ops, vs_ptr, o_ptr, S: cutlass.Constexpr, H: cutlass.Constexpr, un
     # ---- phase 0: QK(0)
     acc = qk_phase(st, st.smem, (st.fbar, Int32(0)), st.turn)
     if cutlass.const_expr(nT > 2):
-        # the softmax counts this warp's release of stage 0 (the scores stay in registers); the eighth warp refills it
         vt2 = step_tile(2, rot, nT)
         sm = softmax_step(
             st, acc, sm, KT, stage=0, refill=lambda old: refill_full0(st, old, rot, nT, vt2)
@@ -736,8 +720,7 @@ def partial_body(
     unit0: cutlass.Constexpr,
     bid,
 ):
-    """Piece bid % split of the key tiles of query tile unit0 + bid / split: its FP32 partials for the merge launch
-    (epilogue.merge_partial_kernel). ops: the operands of attn_kernel that both bodies read."""
+    """Run piece bid % split of the key tiles of query tile unit0 + bid / split; its FP32 partials go to the merge."""
     nT = (S + KT - 1) // KT
     LIM = S - (nT - 1) * KT  # valid keys of the last tile
     tidx = Int32(cute.arch.thread_idx()[0])
@@ -784,16 +767,15 @@ def partial_body(
         # warp w + 4 takes the last turn of its pair
         pass_turn(st)
 
-    # O with its means term
     anc0, anc1, l0, l1, _ = sm
     store_partials(part_ptr, bid, st.tidx, st.O, anc0, anc1, l0, l1)
 
 
 @cute.jit
 def lens_phases(st, ops, rng, S: cutlass.Constexpr, H: cutlass.Constexpr, vs_ptr=None):
-    """The phases of a CTA of a call with lengths over the key tiles of the range rng (see lens_tile), the
-    keys of the last tile from its valid count on masked: the ring and the operands as in full_body, the phases as in
-    partial_body, a single tile going from its QK straight to the last phase. Returns the softmax state."""
+    """Run the phases of a CTA of a call with lengths over the key tiles of the range rng; return the softmax state.
+    The ring and the operands are as in full_body, the phases as in partial_body; the keys of the last tile are masked
+    from its valid count on, and a single tile goes from its QK straight to the last phase."""
     nT = (S + KT - 1) // KT
     start_ring(st, ops, H, nT)
     if st.warp == 4:
@@ -829,7 +811,7 @@ def lens_phases(st, ops, rng, S: cutlass.Constexpr, H: cutlass.Constexpr, vs_ptr
 
 
 def _picker(whole):
-    """pick(a, b): a for a whole unit and b for a piece, by a select when whole is known at run time only."""
+    """Return pick(a, b): a for a whole unit and b for a piece, by a select when whole is known at run time only."""
     if isinstance(whole, bool):
         return lambda a, b: a if whole else b
     return lambda a, b: Int32(cutlass.select_(whole, a, b))
@@ -849,11 +831,13 @@ def body_lens(
     n_tail: cutlass.Constexpr,
     bid,
 ):
-    """The CTA body of a call with lengths, of a whole unit (bid < n_full) or of a key-range piece: the key tiles of
-    the unit's batch element end with the one that holds its last valid key. A whole unit runs them in its order and
-    stores its rows, those from the length on as zeros; a piece runs those of its tiles among them and leaves its
-    partials, or an anchor of -inf and zeros when it has none. A whole unit without a valid query row stores zeros
-    without the phases; its pieces return at once (the merge launch stores the zeros of that unit)."""
+    """Run the CTA body of a call with lengths: a whole unit (bid < n_full) or a key-range piece.
+
+    The key tiles of the batch element of the unit end with the one that holds its last valid key.
+    * A whole unit runs them in its order and stores its rows, those from the length on as zeros.
+    * A piece runs those of its tiles among them and leaves its partials, or an anchor of -inf and zeros without any.
+    * Without a valid query row a whole unit stores zeros without the phases, a piece returns (the merge stores zeros).
+    """
     nT = (S + KT - 1) // KT
     tidx = Int32(cute.arch.thread_idx()[0])
     # whole: this CTA takes a whole unit, known at trace time for a launch without pieces or without whole units
@@ -938,10 +922,12 @@ def attn_kernel(
     split: cutlass.Constexpr,
     lens_ptr,
 ):
-    """One launch: CTAs 0 .. n_full - 1 take whole query tiles; the CTAs after them take the key-range pieces (split
-    per unit) of the last n_tail units of the grid (launch.split_plan). ss_ptr, vs_ptr: the score scale and v8_scale;
-    part_ptr: the pieces' partials; flags_ptr: the per-tile flags of the scan launch. lens_ptr: None, or the valid
-    prefix lengths, which select the bodies with lengths."""
+    """Run the attention: CTAs 0 .. n_full - 1 take whole query tiles, the others key-range pieces of the split tail.
+
+    * The pieces: split per unit, of the last n_tail units of the grid (launch.split_plan); part_ptr: their partials.
+    * ss_ptr, vs_ptr: the score scale and v8_scale; flags_ptr: the per-tile flags of the scan launch.
+    * lens_ptr: None, or the valid prefix lengths, which select the bodies with lengths.
+    """
     bid_, _, _ = cute.arch.block_idx()
     bid = Int32(bid_)
     # what both bodies read: Q', its scales, the score scale, the scan flags, and the TMA atoms and tensors of K', V,

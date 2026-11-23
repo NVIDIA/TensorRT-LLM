@@ -12,15 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""V pass of the sm_120 FP8-PV kernel: E4M3 V with smoothing over the 128 keys of a tile. Every key tile of a (batch,
-head) loses its mean over its keys below S (rounded to BF16) before the E4M3 cast, so the cast spends its range on
-the variation inside a tile: v8 = E4M3((V - vbar) / v8_scale) and v_mean = vbar / v8_scale, with v8_scale the power
-of two at or above max|V - vbar| / 448 of the call. v_mean holds one row per 16 keys, a tile's mean in all 8 of its
-rows: the rows the attention's means MMA weights by the 16-key block sums of P.
+"""V pass of the sm_120 FP8-PV kernel: E4M3 V with smoothing over the 128 keys of a tile.
 
-The pass shares the basis launch (prep/basis.py): the launch's spare CTAs scan V for max|V - vbar| (the tensor scale
-needs it before any byte is cast) and, when the launch has room for it, run the pass on the tiles a counter hands
-out (_vpass); v_kernel is the pass as its own launch otherwise."""
+* Every key tile of a (batch, head) loses its mean over its keys below S (rounded to BF16) before the E4M3 cast,
+  so the cast spends its range on the variation inside a tile: v8 = E4M3((V - vbar) / v8_scale) and
+  v_mean = vbar / v8_scale, with v8_scale the power of two at or above max|V - vbar| / 448 of the call.
+* v_mean holds one row per 16 keys, a tile's mean in all 8 of its rows: the rows that the means MMA of the
+  attention weights by the 16-key block sums of P.
+* The pass shares the basis launch (prep/basis.py): its spare CTAs scan V for max|V - vbar| (the tensor scale
+  needs it before any byte is cast) and, when the launch has room for it, run the pass on the tiles a counter
+  hands out (_vpass); v_kernel is the pass as its own launch otherwise.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -39,7 +41,7 @@ V_THREADS = 128
 
 
 def sum8(xs, n):
-    """xs and the count n summed over the 8 lanes 8 j .. 8 j + 7 (butterfly 1, 2, 4)."""
+    """Return xs and the count n summed over the 8 lanes 8 j .. 8 j + 7 (butterfly 1, 2, 4)."""
     nf = Float32(n)
     for m in (1, 2, 4):
         xs = [x + cute.arch.shuffle_sync_bfly(x, offset=m) for x in xs]
@@ -57,10 +59,7 @@ def tensor_scale(
     NT: cutlass.Constexpr,
     SYNC: cutlass.Constexpr,
 ):
-    """The power-of-two v8_scale from the max|v - vbar| of all nspare scan slots, the range of the smoothed V: the NT
-    threads load the slots by stride (cop: the cache operator of the loads, "cg" for slots written by CTAs of this
-    launch) and reduce by warp, then across the warps through red (SYNC: wait for the CTA's earlier readers of red
-    first)."""
+    """Return the power-of-two v8_scale from the max|v - vbar| of all nspare scan slots, the range of the smoothed V."""
     c = Float32(0.0)
     for i in cutlass.range(tid, nspare, NT, unroll=1):
         c = cute.arch.fmax(
@@ -79,9 +78,7 @@ def tensor_scale(
 
 
 def tile_mean(sums, cnt):
-    """vbar of the thread's channels over its tile, BF16 values as f32 (sums: their f32 sums over the cnt valid keys
-    of the thread's 16-key group; the tile's 8 groups sit in lanes 8 j .. 8 j + 7): the tile sums divided by the key
-    count, as the scan that sets v8_scale divides them."""
+    """Return vbar of the thread's channels over its tile, BF16 values as f32: the tile sums over the key count."""
     sums, nf = sum8(sums, cnt)
     fc = cute.arch.fmax(nf, Float32(1.0))
     mbw = [
@@ -95,9 +92,7 @@ def tile_mean(sums, cnt):
 
 
 def _tile_fold(sums, vmx, vmn, cnt, mx):
-    """mx updated with max|v - vbar| over the thread's 8 channels, vbar the BF16 mean of the valid keys of the lane's
-    tile (sums, vmx, vmn: the sums, maxima and minima of its 16-key group; cnt: its valid keys). Only the sums and
-    counts are added across the tile's lanes, the maxima fold in the block's maximum."""
+    """Return mx updated with max|v - vbar| of the thread's 8 channels; only sums and counts cross the tile's lanes."""
     sums, nf = sum8(sums, cnt)
     fc = cute.arch.fmax(nf, Float32(1.0))
     any_ = Int32(cnt > 0)
@@ -117,7 +112,7 @@ def _tile_fold(sums, vmx, vmn, cnt, mx):
 
 @cute.jit
 def _store_slot(mx: Float32, tid: Int32, sb: Int32, vmax_p: Int64, slot: Int32):
-    """The block's max|v - vbar| into V-scan slot `slot`."""
+    """Store the max|v - vbar| of the block into V-scan slot `slot`."""
     mx = warp_max(mx)
     red = sb + SM_RED
     if (tid & 31) == 0:
@@ -144,10 +139,8 @@ def _vscan(
     sb: Int32,
     lens_p,
 ):
-    """max|v - vbar| (vbar = BF16 tile means) over the 128-key tiles [lo, hi) (flat over (batch, head, tile)); four
-    tiles at a time, thread = (8-channel chunk, 16-key group), the groups of a chunk in lanes 8 j .. 8 j + 7. Writes
-    slot sp. lens_p: None, or the global address of the valid prefix lengths: the keys of a batch element then end
-    at its length."""
+    """Scan the 128-key tiles [lo, hi) (flat over (batch, head, tile)) for max|v - vbar| and write slot sp.
+    Four tiles at a time; thread = (8-channel chunk, 16-key group), the groups of a chunk in lanes 8 j .. 8 j + 7."""
     u = tid & 127
     grp = u & 7
     cc = u >> 3
@@ -190,9 +183,9 @@ def _vscan_gs(
     sb: Int32,
     lens_p,
 ):
-    """max|v - vbar| over all of V, grid-stride: item = (batch, tile, head, 8-channel chunk, 16-key group), the 8
-    groups of a tile in lanes 8 j .. 8 j + 7 (a warp takes 32 consecutive items, so its lanes run the same
-    iterations). Writes slot cta. lens_p: as in _vscan."""
+    """Scan all of V for max|v - vbar|, grid-stride, and write slot cta.
+    Item = (batch, tile, head, 8-channel chunk, 16-key group), the 8 groups of a tile in lanes 8 j .. 8 j + 7: a warp
+    takes 32 consecutive items, so its lanes run the same iterations."""
     T = (S + 127) >> 7
     nitems = B * T * H * 128
     mx = Float32(0.0)
@@ -237,11 +230,13 @@ def _vpass(
     sb: Int32,
     lens_p,
 ):
-    """The V pass in the basis launch, tiles handed out by a counter in descending order to two 256-thread halves per
-    CTA, thread = (16-key group, 4-channel quad), the 8 groups of a quad in lanes 8 j .. 8 j + 7: the E4M3 V - vbar of
-    the keys below S and v_mean = vbar / v8_scale in the tile's 8 rows. lens_p: None, or the global address of the
-    valid prefix lengths: the mean of a tile is then over the keys below the length of its batch element, the keys
-    from there on get zero codes, and a tile without a valid key is left as it is."""
+    """Run the V pass in the basis launch: the E4M3 V - vbar of the keys below S and v_mean in the 8 rows of the tile.
+
+    * A counter hands out the tiles in descending order to two 256-thread halves per CTA; thread = (16-key group,
+      4-channel quad), the 8 groups of a quad in lanes 8 j .. 8 j + 7.
+    * With lengths the mean of a tile is over the keys below the length of its batch element, the keys from there on
+      get zero codes, and a tile without a valid key is left as it is.
+    """
     red = sb + SM_RED
     # the tensor scale from all scan slots (written by this launch's scan CTAs: cop "cg"; red was the scan's)
     v8s = tensor_scale(vmax_p, nspare, tid, red, "cg", EIG_THREADS, True)
@@ -375,8 +370,7 @@ def basis_kernel(
     lens_p,
     rows_mode,
 ):
-    """The basis launch of the FP8-PV kernel: basis_cta with the scan and the pass of the smoothed V. lens_p,
-    rows_mode: None, or the global address of the valid prefix lengths and the rows mode of the eigensolver."""
+    """Run the basis launch of the FP8-PV kernel: basis_cta with the scan and the pass of the smoothed V."""
     basis_cta(
         q_p,
         k_p,
@@ -415,9 +409,9 @@ def v_kernel(
     ncta: Int32,
     lens_p,
 ):
-    """One 128-key tile of one (batch, head) per iteration: thread (16-key group, 8-channel chunk), the tile's groups
-    in lanes 8 j .. 8 j + 7, loads 16 x 16 bytes and stores the E4M3 V - vbar of the keys below S and its row of
-    v_mean. lens_p: as in _vpass."""
+    """Run the V pass as its own launch, one 128-key tile of one (batch, head) per iteration; lens_p as in _vpass.
+    Thread = (16-key group, 8-channel chunk), the groups of the tile in lanes 8 j .. 8 j + 7: 16 x 16 bytes
+    per thread."""
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     smem = SmemAllocator()

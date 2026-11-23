@@ -14,14 +14,16 @@
 # limitations under the License.
 # l is the elimination multiplier of the inverse iteration.
 # ruff: noqa: E741
-"""Basis launch of the sm_120 preparation: one CTA per (batch, head) eigenproblem, the compensation basis of Q' and K'
-(Gram of the sampled q, k tokens, Householder tridiagonalization, multisection bisection of the top 32 eigenvalues,
-inverse iteration, MGS, back transform, U^T = (Hd^T V / sqrt(128))^T in BF16); the other CTAs scan V for the range
-of what the kernel's PV format casts (the maxima that set its tensor scale). When the launch has room for it (FUSED),
-the scan CTAs then run the kernel's V pass on the tiles a counter hands out, joined by the eigensolver CTAs as
-basis_cta describes; the V pass is a launch of its own otherwise. The scan and the pass are those of the kernel
-package (<kernel package>/v_pass.py), whose basis kernel is basis_cta with them; the helpers both V passes share
-are here (bf16_f32, group16, stage_rows)."""
+"""Basis launch of the sm_120 preparation: the compensation basis of Q' and K', and the scan of V.
+
+* One CTA per (batch, head) eigenproblem: Gram of the sampled q, k tokens, Householder tridiagonalization, multisection
+  bisection of the top 32 eigenvalues, inverse iteration, MGS, back transform, U^T = (Hd^T V / sqrt(128))^T in BF16.
+* The other CTAs scan V for the range of what the kernel's PV format casts (the maxima that set its tensor scale).
+  When the launch has room for it (FUSED), they then run the kernel's V pass on the tiles a counter hands out, joined
+  by the eigensolver CTAs as basis_cta describes; the V pass is a launch of its own otherwise.
+* The scan and the pass are those of the kernel package (<kernel package>/v_pass.py), whose basis kernel is basis_cta
+  with them; the helpers both V passes share are here (bf16_f32, group16, stage_rows).
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -80,11 +82,9 @@ def _uhh_off(k: Int32) -> Int32:
 
 
 # ------------------------------------------------------------------------------------------------ eigensolver steps
-# The steps of _eig, in the order it runs them. st is the state of the thread (State) that _eig builds: the thread
-# coordinates, the addresses of the shared-memory regions and the typed views of the regular arrays among them (sIdx,
-# sRed, sG, sU, sP, sD, sE, sE2, sLam, sZ, sPiv, sScl, sHd), by name. No step contains a CTA barrier: _eig places
-# them between the steps, and a step reads from shared memory what the steps before the last barrier wrote. acc, A,
-# uu, za and zbv are the register tensors of _eig.
+# The steps of _eig, in the order it runs them, on its thread state st and its register tensors acc, A, uu, za, zbv.
+# No step contains a CTA barrier: _eig places them between the steps, and a step reads from shared memory what the
+# steps before the last barrier wrote.
 @cute.jit
 def sampled_token(st, sidx):
     """The token of sample sidx of this batch element, from rows_p. With lengths (st.lens = (address of the lengths,
@@ -129,8 +129,7 @@ def preloaded_token(st, sidx):
 
 @cute.jit
 def chunk_src(st, mat, tok, chk):
-    """The global address of 16-byte chunk chk of the row of token tok of q (mat 0) or k (mat 1) of this (batch,
-    head)."""
+    """Global address of 16-byte chunk chk of the row of token tok of q (mat 0) or k (mat 1) of this (batch, head)."""
     return (
         Int64(cutlass.select_(mat != 0, st.k_p, st.q_p))
         + ((st.rowoff + Int64(tok)) * Int64(st.H) + Int64(st.h)) * 256
@@ -254,8 +253,7 @@ def normalize_gram(st, acc):
 
 @cute.jit
 def stage_gram_half(st, acc, half: cutlass.Constexpr):
-    """The warps that hold rows 64 half .. 64 half + 63 of G write their entries to SM_WORK as f32 [64][128]. The
-    barrier before it: every thread is done with what SM_WORK held."""
+    """The warps that hold rows 64 half .. 64 half + 63 of G write their entries to SM_WORK as f32 [64][128]."""
     sG = st.sG
     if (st.mi >> 2) == half:
         for n in cutlass.range_constexpr(8):
@@ -703,16 +701,19 @@ def _eig(
     sb: Int32,
     lens,
 ):
-    """The eigensolver CTA of (batch, head) bh (thread tid of EIG_THREADS, shared memory at sb with the map SM_*): the
-    compensation basis U^T [32][128] in BF16 at ut_p [bh], from the NQK tokens of q and k that rows_p samples and the
-    Hadamard matrix at had_p. The body is the sequence of the steps above, by phase. Every CTA barrier of the
-    eigensolver is in this body, with what it publishes, and every thread reaches it: none is under a condition, and
-    the loops around them have the same trip count in all threads. The state st gets the coordinates, the region
-    addresses and the typed views of a phase where the phase begins. A view (s...) covers a region that is a regular
-    array of one scalar type, for the scalar loads and stores that index it; the 16-byte vector loads and stores of
-    the same arrays, the asynchronous copies, ldmatrix and the predicated loads take the region addresses. lens: None,
-    or (the global address of the valid prefix lengths, the rows mode of sampled_token): the sampled tokens then lie
-    in the valid prefix of the batch element."""
+    """Run the eigensolver CTA of (batch, head) bh (thread tid of EIG_THREADS, shared memory at sb with the map SM_*).
+
+    * Result: the compensation basis U^T [32][128] in BF16 at ut_p [bh], from the NQK tokens of q and k that rows_p
+      samples and the Hadamard matrix at had_p.
+    * The body is the sequence of the steps above, by phase. Every CTA barrier of the eigensolver is in this body,
+      with what it publishes, and every thread reaches it: none is under a condition, and the loops around them have
+      the same trip count in all threads.
+    * st gets the coordinates, the region addresses and the typed views of a phase where the phase begins. A view
+      (s...) covers a regular array of one scalar type, for the scalar loads and stores that index it; the 16-byte
+      vector loads and stores, the asynchronous copies, ldmatrix and the predicated loads take the region addresses.
+    * lens: None, or (the global address of the valid prefix lengths, the rows mode of sampled_token): the sampled
+      tokens then lie in the valid prefix of the batch element.
+    """
     st = State(tid=tid, sb=sb, NQK=NQK, H=H, q_p=q_p, k_p=k_p, rows_p=rows_p, lens=lens)
     st.lane = tid & 31
     st.warp = tid >> 5
@@ -731,8 +732,7 @@ def _eig(
     st.sRed = cute.make_tensor(sptr(Float32, sb + SM_RED), cute.make_layout(32))
 
     # ------------------------------------------------ Gram matrices: rounds of 48 sampled rows in two cp.async
-    # buffers (one round in flight while the previous one is multiplied; ldmatrix.trans, bf16 mma.sync, fp32
-    # accumulation); rows staged at 272-byte stride; token indices preloaded (beyond 512: read per copy)
+    # buffers, one round in flight while the previous one is multiplied (stage_first_rounds, gram_round, refill)
     # the warp's blocks of the two matrices: rows 16 mi .. 16 mi + 15, columns 8 nb .. 8 nb + 63
     st.mi = st.warp & 7
     st.nb = (st.warp >> 3) * 8

@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""V pass of the DeCo preparation: E4M3 V with smoothing over V_BLOCK keys. Every block of V_BLOCK keys of a (batch,
-head) loses its mean (rounded to BF16) before the E4M3 cast, so the cast spends its range on the variation inside a
-block; the attention adds the means back through a BF16 MMA over the block sums of P. The kernel writes v8 = E4M3((V -
-mean) / s) and v_mean = mean / s, with s the power-of-two scale of the largest |V - mean| of the call (the encode
-launch writes it to v8_scale). The launch is a programmatic dependent of the eigensolver launch and runs beside it."""
+"""V pass of the DeCo preparation: E4M3 V with smoothing over V_BLOCK keys.
+
+* Every block of V_BLOCK keys of a (batch, head) loses its mean (rounded to BF16) before the E4M3 cast, so the cast
+  spends its range on the variation inside a block; a BF16 MMA of the attention over the block sums of P adds it back.
+* The launch is a programmatic dependent of the eigensolver launch and runs beside it.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -71,13 +72,8 @@ def _grid_inv8(
 
 @cute.jit
 def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
-    """E4M3 V minus its BF16 means of every V_BLOCK keys. Unit u = (batch u // nblk, block u % nblk of V_BLOCK keys)
-    over every head; a CTA takes units bidx, bidx + gdim, ... and its threads the same 16-byte chunks (8 channels of
-    a head) of a unit in both passes. Pass 1: per chunk the sum, minimum and maximum over the block's valid keys, the
-    BF16 mean mu into v_mean (row = block) and max(max - mu, mu - min) into the grid's maximum (byte 24 of gmax,
-    behind the counter at byte 32: all CTAs of the grid run at once). Pass 2: E4M3((V - mu) / s), s the power-of-two
-    scale of that maximum (the encode launch's v8_scale), and mu / s into v_mean (exact). v_mean is [B, H, NB, 128].
-    lens: None, or the global address of the valid prefix lengths: the valid keys of a block are then those below the
+    """E4M3 V minus its BF16 means of every V_BLOCK keys, in two passes over the same 16-byte chunks per thread. lens:
+    None, or the global address of the valid prefix lengths: the valid keys of a block are then those below the
     length of its batch element, the keys after them get zero codes and a block without valid keys a zero mean."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -96,6 +92,8 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
     row_bytes = Int64(H) * Int64(256)
     acc = Float32(0.0)
 
+    # pass 1: per chunk (8 channels of a head) the sum, minimum and maximum over the block's valid keys, the BF16
+    # mean mu into v_mean (row = block) and max(max - mu, mu - min) into the grid's maximum (_grid_inv8)
     u = bidx
     while u < nunits:
         b = u // nblk
@@ -150,6 +148,8 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
 
     inv8 = _grid_inv8(acc, maxima, gb, tidx, lane, warp, gdim)
 
+    # pass 2: v8 = E4M3((V - mu) / s), s the power-of-two scale of that maximum (the encode launch's v8_scale), and
+    # v_mean = mu / s (exact)
     u = bidx
     while u < nunits:
         b = u // nblk

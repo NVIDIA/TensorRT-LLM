@@ -12,17 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host entry of the preparation of the sm_120 NVFP4-PV kernel (the passes of ../prep and this kernel's V pass): raw
-BF16 q, k, v into the operands of the attention kernel (kernel.py), launched through one host function per device and
-chain form (the host side that both kernel packages share is ../prep/chain.py).
+"""Host entry of the preparation of the sm_120 NVFP4-PV kernel: raw BF16 q, k, v into the operands of kernel.py.
 
-Launches, on the current stream: the basis launch (prep/basis.py with the V scan of v_pass.py: per (batch, head) the
-Gram matrices of the sampled q and k tokens and their top-32 eigenvectors; the other CTAs scan V for max|v - vbar|
-and, when the launch has room for it, run the V pass), the V pass otherwise (v_pass.v_kernel), the Q'/K' pass
-(qk_pass.py: rotation, body and compensation channels in NVFP4, provisional block scales, group maxima) and the
-encode launch (encode.py: group scales, the score-scale floor, score_scale, UE4M3 block scales). Every launch takes
-the shape at run time, so each of the two forms of the chain (the V pass in the basis launch or on its own) compiles
-once.
+Launches on the current stream, by one host function per device and chain form (shared host side: ../prep/chain.py):
+    * Basis launch (prep/basis.py with the V scan of v_pass.py): per (batch, head) the Gram matrices of the sampled q
+      and k tokens and their top-32 eigenvectors; the other CTAs scan V for max|v - vbar| and, when the launch has
+      room for it, run the V pass. Otherwise the V pass is its own launch (v_pass.v_kernel).
+    * Q'/K' pass (qk_pass.py): rotation, NVFP4 body and compensation channels, provisional block scales, group maxima.
+    * Encode launch (encode.py): group scales, the score-scale floor, score_scale, UE4M3 block scales.
+Every launch takes the shape at run time, so each of the two forms of the chain (the V pass in the basis launch or on
+its own) compiles once.
 """
 
 import cuda.bindings.driver as cuda
@@ -144,10 +143,11 @@ scratch = chain.scratch
 
 
 def run(q, k, v, qk_rows, buffers, lens=None, map_rows=False):
-    """The operands of the attention kernel (buffers: the buffers of the call, the layout of this package) from raw
-    BF16 q, k, v [B, S, H, 128]: Q'/K' (q4, k4, q_sf, k_sf), score_scale (floored at 2^MIN_SCORE_LOG2) and V' in V's
-    own 128 channels (v4, v4_sf, v_mean, v4_scale). qk_rows: the sampled tokens of the Q/K basis
-    (inputs.sample_rows). lens, map_rows: the valid prefix lengths and the rows switch of chain.run."""
+    """Fill the operands of the attention kernel from raw BF16 q, k, v [B, S, H, 128], in the buffers of the call.
+
+    * Q'/K' (q4, k4, q_sf, k_sf), score_scale (floored at 2^MIN_SCORE_LOG2), V' (v4, v4_sf, v_mean, v4_scale).
+    * qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows); lens, map_rows: as in chain.run.
+    """
     chain.run(
         _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, qk_rows, buffers, lens, map_rows
     )

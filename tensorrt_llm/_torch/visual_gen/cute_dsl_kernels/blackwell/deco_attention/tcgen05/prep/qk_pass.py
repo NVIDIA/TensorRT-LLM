@@ -12,29 +12,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Q'/K' pass of the DeCo preparation. Every 128-token tile of q and k is rotated by the Hadamard matrix (BF16 MMA) and
-quantized to NVFP4 in 16-channel blocks; the quantization residual dq and the body x - dq are projected on the
-compensation basis U of RANK directions (TF32 MMAs) and quantized the same way into the 2 x RANK compensation
-channels: Q' = [x - dq | dq U | (x - dq) U] and K' = [x - dq | (x - dq) U | dq U], so that Q' K'^T adds the two
-first-order error terms dq (k - dk)^T and (q - dq) dk^T, projected on U, to the product of the quantized bodies. The
-E2M1 codes go to q4 / k4 (128 + 2 RANK channels per token); the block scales go, as BF16, to a write-coalesced tile
-layout that the Q/K scale encoding (encode.py) converts to UE4M3, and the maxima of the three scale groups of each
-tensor to gmax. QPRE, the score prescale log2(e) / sqrt(128), multiplies the rotated Q before its quantization, so the
-scores arrive in the log2 units the attention exponentiates while the score scale stays a power of two.
+"""Q'/K' pass of the DeCo preparation: rotation, NVFP4 quantization and compensation channels of every 128-token tile.
 
-The TMEM columns of a CTA: two rotated tiles (2 x 128), the residual dq as the A operand of the projections (128) and
-the projections [dq U | (x - dq) U] (2 RANK columns per buffer). At rank 32 two projection buffers alternate, so the
-MMA warp projects a tile while the compensation warps still read the previous one; the 512 columns hold one buffer at
-rank 64, which the MMA warp reuses once the compensation warps have loaded it.
+* A tile of q or k is rotated by the Hadamard matrix (BF16 MMA) and quantized to NVFP4 in 16-channel blocks; the
+  quantization residual dq and the body x - dq are projected on the compensation basis U of RANK directions (TF32
+  MMAs) and quantized the same way into the 2 x RANK compensation channels.
+* Q' = [x - dq | dq U | (x - dq) U] and K' = [x - dq | (x - dq) U | dq U]: Q' K'^T adds the two first-order error
+  terms dq (k - dk)^T and (q - dq) dk^T, projected on U, to the product of the quantized bodies.
+* Out: E2M1 codes to q4 / k4 (128 + 2 RANK channels per token); block scales, as BF16, in a write-coalesced tile layout
+  that the Q/K scale encoding (encode.py) converts to UE4M3; the maxima of each tensor's three scale groups to gmax.
+* QPRE, the score prescale log2(e) / sqrt(128), multiplies the rotated Q before its quantization: the scores arrive
+  in the log2 units the attention exponentiates while the score scale stays a power of two.
 
-The kernel body (qk_kernel) is the setup of the CTA and one role per warp, each a function of this module: the load
-warp, the MMA warp, the compensation warps and the math warps. A CTA takes a contiguous range of tiles in the order
-(batch, head), 128-token block, q then k; every role walks that range with its own copy of the tile iterator
-(_first_tile, _next_tile), and the roles meet on the mbarriers listed below. With valid prefix lengths the CTAs share
-the live tiles, those that hold a token below the length of their batch element, in the same order: the iterator walks
-only them, and the load warp stores zero block scales for the other tiles of the CTA's range of all tiles. The state
-object of the kernel holds what the roles share: the thread's warp and lane, the shared-memory and TMEM addresses, the
-tile range and the trace-time constants."""
+TMEM columns of a CTA:
+    * Two rotated tiles (2 x 128), the residual dq as the A operand of the projections (128) and the projections
+      [dq U | (x - dq) U] (2 RANK columns per buffer).
+    * Rank 32: two projection buffers alternate, so the MMA warp projects a tile while the compensation warps still
+      read the previous one. Rank 64: one buffer in the 512 columns; the MMA warp reuses it once those warps loaded it.
+
+Kernel body (qk_kernel): the setup of the CTA and one role per warp, each a function of this module.
+    * A CTA takes a contiguous range of tiles in the order (batch, head), 128-token block, q then k; every role walks
+      that range with its own copy of the tile iterator (_first_tile, _next_tile).
+    * With valid prefix lengths the CTAs share the live tiles in the same order (_live_tiles), and the load warp
+      stores zero block scales for the other tiles (_zero_scales).
+    * The state object holds what the roles share: the thread's warp and lane, the shared-memory and TMEM addresses,
+      the tile range and the trace-time constants.
+
+Mbarriers, on which the roles meet. A full barrier completes when its producer has published the data, an empty barrier
+when its consumers have released it; the arrivals of a phase are in parentheses.
+    XFULL, XEMPTY    per X ring stage: the tile is copied (the TMA bytes); the rotation that read it is done (MMA warp)
+    XRFULL, XREMPTY  per rotated tile buffer: the rotation is done (MMA warp); the projections that read the buffer are
+                     done (MMA warp)
+    AFULL, AEMPTY    the residual dq, and the prescaled values of a Q tile, are in TMEM (the 16 math warps); the
+                     projections that read them are done (MMA warp)
+    DFULL, DEMPTY    per projection buffer: the projections are done (MMA warp); their last channels are in registers
+                     (the 4 compensation warps)
+    UFULL, UEMPTY    per U operand stage: the basis of a (batch, head) is staged (load warp); the last projection that
+                     reads the stage is done (MMA warp)
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -62,17 +77,7 @@ from .quant import quant16, quant16_dq_knownmax
 QK_THREADS = 22 * 32  # 16 math warps, load warp 16, MMA warp 17, compensation warps 18-21
 X_STAGES = 3  # input tile ring depth
 TM_XR, TM_AD1, TM_D = 0, 256, 384
-# mbarrier slots. A full barrier completes when its producer has published the data, an empty barrier when its
-# consumers have released it; the arrivals of a phase are in parentheses.
-#   XFULL, XEMPTY    per X ring stage: the tile is copied (the TMA bytes); the rotation that read it is done (MMA warp)
-#   XRFULL, XREMPTY  per rotated tile buffer: the rotation is done (MMA warp); the projections that read the buffer are
-#                    done (MMA warp)
-#   AFULL, AEMPTY    the residual dq, and the prescaled values of a Q tile, are in TMEM (the 16 math warps); the
-#                    projections that read them are done (MMA warp)
-#   DFULL, DEMPTY    per projection buffer: the projections are done (MMA warp); their last channels are in registers
-#                    (the 4 compensation warps)
-#   UFULL, UEMPTY    per U operand stage: the basis of a (batch, head) is staged (load warp); the last projection that
-#                    reads the stage is done (MMA warp)
+# mbarrier slots (module docstring: Mbarriers)
 B_XFULL, B_XEMPTY, B_XRFULL, B_XREMPTY = 0, X_STAGES, 2 * X_STAGES, 2 * X_STAGES + 2
 B_AFULL, B_AEMPTY, B_DFULL, B_DEMPTY = (
     2 * X_STAGES + 4,
@@ -85,19 +90,18 @@ QK_NBARS = 2 * X_STAGES + 14
 
 
 def _d_buffer(parity, stages):
-    """The projection buffer of a tile of this parity in the ring of `stages` buffers (two or one)."""
+    """Return the projection buffer of a tile of this parity in the ring of `stages` buffers (two or one)."""
     return parity if stages == 2 else 0
 
 
 def _d_rounds(i, stages):
-    """The earlier uses of tile i's projection buffer in the ring of `stages` buffers."""
+    """Return the earlier uses of tile i's projection buffer in the ring of `stages` buffers."""
     return i >> 1 if stages == 2 else i
 
 
 # ------------------------------------------------------------------------------------------------ setup
 def _init_barriers(bars):
-    """Thread 0: every mbarrier of the CTA, with the arrivals of one phase (16 math warps on AFULL, 4 compensation
-    warps on each DEMPTY, one arrival on the others)."""
+    """Thread 0: every mbarrier of the CTA, with the arrivals of one phase (16 on AFULL, 4 on each DEMPTY, else one)."""
     for i in range(X_STAGES):
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_XFULL + i)), 1)
         cute.arch.mbarrier_init(sptr(Int64, bars + 8 * (B_XEMPTY + i)), 1)
@@ -115,9 +119,8 @@ def _init_barriers(bars):
 
 @cute.jit
 def _stage_hadamard(hadamard, tidx, ht_base):
-    """Every thread: its 16-byte chunks (tidx, tidx + QK_THREADS, ... of the 2048) of the Hadamard matrix into the B
-    operand of the rotation at the shared address ht_base: element (k, n) = hadamard[k, n] at row n, column k (K-major,
-    SW128)."""
+    """Every thread: stage its 16-byte chunks (tidx, tidx + QK_THREADS, ...) of the Hadamard matrix as the B operand of
+    the rotation at the shared address ht_base: element (k, n) = hadamard[k, n] at row n, column k (K-major, SW128)."""
     had = Int64(hadamard.iterator.toint())
     hws = []
     for it in cutlass.range_constexpr(4):
@@ -142,21 +145,19 @@ def _stage_hadamard(hadamard, tidx, ht_base):
 
 # ------------------------------------------------------------------------------------------------ steps of the roles
 def _tile_origin(st):
-    """(bh, rem) of the CTA's first tile t0: its (batch, head) and its position among the 2 NB tiles of that (batch,
-    head)."""
+    """Return (bh, rem) of the CTA's first tile t0: its (batch, head) and its position among that bh's 2 NB tiles."""
     bh = st.t0 // st.nb2
     return bh, st.t0 - bh * st.nb2
 
 
 def _live_blocks(st, b):
-    """With lengths: the 128-token blocks of batch element b that hold a valid token (those of the last element for
-    a b past it)."""
+    """With lengths: the 128-token blocks of batch element b (clamped to the last one) that hold a valid token."""
     return (valid_len(st.lens, cutlass.min(b, st.B - 1), st.S) + 127) >> 7
 
 
 def _first_tile(st):
-    """The CTA's first tile as the iterator (kind, sblk, bh, h, b), fastest first: kind 0 for the q tile of a block and
-    1 for its k tile, 128-token block sblk, (batch, head) index bh = b H + h, head h, batch b."""
+    """Return the CTA's first tile as the iterator (kind, sblk, bh, h, b), fastest first: kind 0 for the q tile of a
+    block and 1 for its k tile, 128-token block sblk, (batch, head) index bh = b H + h, head h, batch b."""
     if st.lens is not None:
         return st.first
     bh, rem = _tile_origin(st)
@@ -169,9 +170,9 @@ def _first_tile(st):
 
 @cute.jit
 def _next_tile(st, kind, sblk, bh, h, b):
-    """The tile after (kind, sblk, bh, h, b): the k tile of the block, then the q tile of the next block, of the next
-    head, of the next batch. The iterator advances without divisions. With lengths a head ends with the last live block
-    of its batch element, and the batch elements without a valid token are passed over."""
+    """Return the tile after (kind, sblk, bh, h, b): the k tile of the block, then the q tile of the next block, of the
+    next head, of the next batch. The iterator advances without divisions. With lengths a head ends with the last live
+    block of its batch element, and the batch elements without a valid token are passed over."""
     kind = kind ^ 1
     if kind == 0:
         sblk = sblk + 1
@@ -194,7 +195,7 @@ def _next_tile(st, kind, sblk, bh, h, b):
 
 @cute.jit
 def _warp_arrive(st, slot):
-    """One arrival of the warp on mbarrier `slot`, by lane 0 once every lane of the warp has reached this point."""
+    """Arrive once for the warp on mbarrier `slot`: by lane 0, once every lane of the warp has reached this point."""
     cute.arch.sync_warp()
     if st.lane == 0:
         cute.arch.mbarrier_arrive(sptr(Int64, st.bars + 8 * slot))
@@ -202,8 +203,8 @@ def _warp_arrive(st, slot):
 
 @cute.jit
 def _tile_outputs(st, codes, scales, rstride, kind, sblk, b, h):
-    """Where the results of a tile go: the global addresses of its tensor's code rows and scale tiles (kind 0: Q, 1:
-    K; codes: the addresses of q4 and k4, scales: of q_sfv and k_sfv) and the offset of the code row of the tile's
+    """Return where the results of a tile go: the global addresses of its tensor's code rows and scale tiles (kind 0:
+    Q, 1: K; codes: the addresses of q4 and k4, scales: of q_sfv and k_sfv) and the offset of the code row of the tile's
     first token at head h. A code row is the 128 bytes of a (token, head); rstride: the bytes of a token, 128 H."""
     code_base = codes[0]
     scale_base = scales[0]
@@ -215,16 +216,16 @@ def _tile_outputs(st, codes, scales, rstride, kind, sblk, b, h):
 
 
 def _scale_tile(st, bh, sblk):
-    """The index of the first BF16 scale of a tile among the scale tiles of its tensor. A tile holds sfv_tile scales:
-    1024 of the body, (32-channel group, token, 16-channel block), then the 128 tokens of each 16-channel block of the
-    compensation channels."""
+    """Return the index of the first BF16 scale of a tile among the scale tiles of its tensor. A tile holds sfv_tile
+    scales: 1024 of the body, (32-channel group, token, 16-channel block), then the 128 tokens of each 16-channel
+    block of the compensation channels."""
     return (Int64(bh) * Int64(st.NB) + Int64(sblk)) * Int64(st.sfv_tile)
 
 
 @cute.jit
 def _reduce_maxima(st, gmax, maxima):
-    """maxima: (word of gmax, the thread's maximum) pairs. Each maximum is reduced over the warp and, by lane 0, into
-    its word of gmax (gmax: its global address) across the CTAs."""
+    """Reduce each maximum over the warp and, by lane 0, into its word of gmax across the CTAs. maxima: (word of gmax,
+    the thread's maximum) pairs; gmax: its global address."""
     reduced = [(word, warp_max(value)) for word, value in maxima]
     if st.lane == 0:
         # the maxima are non-negative floats: the unsigned maximum of their bits orders them
@@ -243,8 +244,8 @@ def _reduce_maxima(st, gmax, maxima):
 
 # ------------------------------------------------------------------------------------------------ load warp
 def _x_views(st, tma, tiles):
-    """The views of the TMA copy of a tile into the X ring: (the ring by stage, `tiles` by block and (head, batch));
-    tiles: the 128-token tiles of the tensor of tma (q or k)."""
+    """Return the views of the TMA copy of a tile into the X ring: (the ring by stage, `tiles` by block and (head,
+    batch)); tiles: the 128-token tiles of the tensor of tma (q or k)."""
     return cpasync.tma_partition(
         tma.atom,
         0,
@@ -256,9 +257,9 @@ def _x_views(st, tma, tiles):
 
 @cute.jit
 def _stage_basis(st, ut_base, bh, ucount):
-    """Load warp: the basis of (batch, head) bh, U^T (FP32 [RANK][128]) at the global address ut_base, into U stage
-    ucount & 1 as the K-major SW128 TF32 B operand of the projections: 4 K-boxes of RANK rows x 128 B. Waits UEMPTY of
-    the stage and arrives on its UFULL."""
+    """Load warp: stage the basis of (batch, head) bh, U^T (FP32 [RANK][128]) at the global address ut_base, into U
+    stage ucount & 1 as the K-major SW128 TF32 B operand of the projections: 4 K-boxes of RANK rows x 128 B. Waits
+    UEMPTY of the stage and arrives on its UFULL."""
     us = ucount & 1
     mbar_wait_bounded(st.bars + 8 * (B_UEMPTY + us), ((ucount >> 1) + 1) & 1)
     for half_ in cutlass.range_constexpr(st.RANK // 16):
@@ -294,11 +295,11 @@ def _stage_basis(st, ut_base, bh, ucount):
 
 @cute.jit
 def _load_warp(st, ut_base, scales):
-    """Load warp (16): stages the basis of each (batch, head) of the CTA's tiles as the U operand (ut_base: the global
-    address of the basis uT) and copies the q and k tiles into the X ring.
+    """Load warp (16): stage the U operand of each (batch, head) from the basis at ut_base; copy tiles to the X ring.
 
-    Handshake: _stage_basis waits UEMPTY and arrives on UFULL at the first tile of a (batch, head). A tile waits XEMPTY
-    of its ring stage (the rotation that read the stage is done) and its TMA copy completes XFULL of the stage."""
+    * _stage_basis waits UEMPTY and arrives on UFULL at the first tile of a (batch, head).
+    * A tile waits XEMPTY of its ring stage (the rotation that read the stage is done); its TMA copy completes XFULL.
+    """
     gQ = cute.local_tile(st.tma_q.tma_tensor, (128, 128), (None, 0, None))
     gK = cute.local_tile(st.tma_k.tma_tensor, (128, 128), (None, 0, None))
     tQs, tQg = _x_views(st, st.tma_q, gQ)
@@ -339,9 +340,8 @@ def _load_warp(st, ut_base, scales):
 
 @cute.jit
 def _zero_scales(st, scales):
-    """Load warp, with lengths: zero block scales for the tiles without a valid token among the CTA's range of all
-    tiles (t0_all, n_all), which no role visits. scales: the global addresses of (q_sfv, k_sfv); a lane stores its
-    share of the 16-byte chunks of a tile's BF16 scales."""
+    """Load warp, with lengths: store zero block scales for the tiles without a valid token among the CTA's range of
+    all tiles (t0_all, n_all), which no role visits. scales: the global addresses of (q_sfv, k_sfv)."""
     z = Uint32(0)
     end = st.t0_all + st.n_all
     # per (batch, head) of the range: its tiles from the first block without a valid token on
@@ -362,7 +362,7 @@ def _zero_scales(st, scales):
 
 # ------------------------------------------------------------------------------------------------ MMA warp
 def _qk_rotation(st, j, idesc):
-    """MMA warp: rotation of tile j, xr[j & 1] = X[j % X_STAGES] * Hd. Waits XFULL of the ring stage and XREMPTY of the
+    """MMA warp: rotate tile j, xr[j & 1] = X[j % X_STAGES] * Hd. Waits XFULL of the ring stage and XREMPTY of the
     rotated tile buffer; commits XRFULL of the buffer and XEMPTY of the stage."""
     xs = j % X_STAGES
     s = j & 1
@@ -407,13 +407,13 @@ def _qk_projections(st, p, dp, us, idesc, idesc_neg):
 
 @cute.jit
 def _mma_warp(st):
-    """MMA warp (17): the rotation of every tile, issued one tile ahead of the projections, so the math warps work on
-    tile i + 1 while the compensation warps work on tile i.
+    """MMA warp (17): rotate every tile and project it on the basis.
 
-    Handshake: _qk_rotation waits XFULL and XREMPTY and commits XRFULL and XEMPTY. The projections of tile i wait
-    UFULL at the first tile of a (batch, head), AFULL (the math warps have stored the residual) and DEMPTY of the
-    tile's projection buffer; they commit DFULL, AEMPTY and XREMPTY, and UEMPTY after the last tile of the (batch,
-    head) or of the CTA."""
+    * The rotation (_qk_rotation) runs one tile ahead: the math warps work on tile i + 1, the compensation warps on i.
+    * The projections of tile i wait UFULL at the first tile of a (batch, head), AFULL (the math warps have stored the
+      residual) and DEMPTY of the tile's projection buffer; they commit DFULL, AEMPTY and XREMPTY, and UEMPTY after
+      the last tile of the (batch, head) or of the CTA.
+    """
     idesc1 = Int32(idesc_bf16(128, 128))
     idesc2 = Int32(idesc_tf32(128, st.RANK))
     idesc2n = Int32(idesc_tf32(128, st.RANK) | (1 << 13))
@@ -462,13 +462,13 @@ def _mma_warp(st):
 # ------------------------------------------------------------------------------------------------ compensation warps
 @cute.jit
 def _compensation_warps(st, codes, scales, gmax):
-    """Compensation warps (18-21), one per TMEM lane quadrant: a thread takes the full row of the 2 RANK projected
-    channels of its token ([dq U | (x - dq) U] in D; K stores the halves swapped), loaded 32 channels at a time, and
-    stores their NVFP4 codes and block scales; the maxima of the scales of each half go to gmax. codes, scales, gmax:
-    the global addresses of (q4, k4), of (q_sfv, k_sfv) and of gmax.
+    """Compensation warps (18-21), one per TMEM lane quadrant: quantize the projected channels of every tile to NVFP4.
 
-    Handshake: a tile waits DFULL of its projection buffer; the warp arrives on DEMPTY of the buffer once the tile's
-    last channels are in registers."""
+    * A thread takes the full row of the 2 RANK projected channels of its token ([dq U | (x - dq) U] in D; K stores the
+      halves swapped), loaded 32 channels at a time, and stores their NVFP4 codes and block scales; the maxima of the
+      scales of each half go to gmax. codes, scales, gmax: the global addresses of (q4, k4), (q_sfv, k_sfv) and gmax.
+    * A tile waits DFULL of its projection buffer; the warp arrives on DEMPTY once its last channels are in registers.
+    """
     q2 = st.warp & 3
     row = q2 * 32 + st.lane
     tl = (q2 * 32) << 16
@@ -538,7 +538,7 @@ def _compensation_warps(st, codes, scales, gmax):
 
 # ------------------------------------------------------------------------------------------------ math warps
 def _prescaled(x, am0, am1):
-    """The 32 values x and the maxima of their two blocks, each times the score prescale QPRE."""
+    """Return the 32 values x and the maxima of their two blocks, each times the score prescale QPRE."""
     pre = Float32(QPRE)
     xs = []
     for j in range(0, 32, 2):
@@ -549,20 +549,19 @@ def _prescaled(x, am0, am1):
 
 @cute.jit
 def _math_warps(st, codes, scales, gmax):
-    """Math warps (0-15): a thread takes 32 channels of a token of the rotated tile, quantizes them to NVFP4 in two
-    16-channel blocks, writes the quantization residual to the A columns of the projections and stores the codes and
-    the block scales; the maxima of the scales go to gmax. codes, scales, gmax: the global addresses of (q4, k4), of
-    (q_sfv, k_sfv) and of gmax.
+    """Math warps (0-15): quantize the rotated tiles to NVFP4 and write the residual for the projections.
 
-    Handshake: a tile waits XRFULL of its rotated tile buffer, and AEMPTY (the projections of the tile before are
-    done) before the residual is overwritten; the warp arrives on AFULL once its residual, and the prescaled values of
-    a Q tile, are in TMEM."""
+    * A thread takes 32 channels of a token of the rotated tile, quantizes them to NVFP4 in two 16-channel blocks,
+      writes the quantization residual to the A columns of the projections and stores the codes and the block scales;
+      the maxima of the scales go to gmax. codes, scales, gmax: as in _compensation_warps.
+    * A tile waits XRFULL of its rotated buffer, and AEMPTY (the projections of the tile before are done) before the
+      residual is overwritten; the warp arrives on AFULL once its residual and a Q tile's prescaled values are in TMEM.
+    """
     lq = st.warp & 3
     row_half = (st.warp >> 2) & 1
     n_pair = st.warp >> 3
-    # TMEM accesses use the 16x32bx2 shape: lanes 0..15 and 16..31 read the same 16 rows at two column bases, so
-    # every thread keeps contiguous 16-channel blocks, so its code stores are contiguous. Each warp stays inside its own
-    # 32 TMEM lanes (row_half selects the first or second 16 rows).
+    # 16x32bx2 TMEM shape: lanes 0..15 and 16..31 read the same 16 rows at two column bases, so a thread keeps
+    # contiguous 16-channel blocks and code stores. row_half: the first or second 16 rows of the warp's 32 TMEM lanes.
     row_lane = row_half * 16 + (st.lane & 15)
     row = lq * 32 + row_lane
     cq = n_pair * 2 + (st.lane >> 4)
@@ -578,9 +577,8 @@ def _math_warps(st, codes, scales, gmax):
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
         xr = st.tm + tl + TM_XR + s * 128 + n_pair * 64
         x, am0, am1 = ld_tmem_16x32bx2_f32_x32_absmax_wait(xr, target.has_tmem_ld_red())
-        # Q tiles carry the score prescale: the rotated values are scaled before the quantization and the scaled
-        # tile goes back to TMEM, where the compensation MMAs read it (the AFULL arrive below orders the store
-        # before them)
+        # Q tiles carry the score prescale: the rotated values are scaled before the quantization, and the scaled tile
+        # goes back to TMEM, where the compensation MMAs read it (the AFULL arrive below orders the store before them)
         if kind == 0:
             x, am0, am1 = _prescaled(x, am0, am1)
             st_tmem_16x32bx2_f32_x32_wait(xr, x)
@@ -623,10 +621,12 @@ def _math_warps(st, codes, scales, gmax):
 def _qk_body(
     tiled_mma, tma_q, tma_k, hadamard, uT, q4, k4, q_sfv, k_sfv, gmax, S, H, NB, ntiles, RANK, lens
 ):
-    """The Q'/K' pass of the CTA's share of the ntiles tiles: the setup of the CTA, the role of the thread's warp, then
-    the release of the TMEM columns. RANK: the directions of the basis uT [B, H, RANK, 128]. lens: None, or the global
-    address of the valid prefix lengths: the block scales of the tokens past the length of their batch element are
-    then zero and stay out of the maxima, and the CTAs share the tiles that hold a valid token (_live_tiles)."""
+    """Run the Q'/K' pass of the CTA's share of the ntiles tiles: the setup, the role of the thread's warp, the release.
+
+    * RANK: the directions of the basis uT [B, H, RANK, 128].
+    * lens: None, or the global address of the valid prefix lengths: the block scales of the tokens past the length of
+      their batch element are then zero and stay out of the maxima, and the CTAs share the live tiles (_live_tiles).
+    """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
@@ -712,8 +712,7 @@ def _qk_body(
         tma_k=tma_k,
         thr_mma=thr_mma,
     )
-    # One role per warp. A role takes the global addresses it reads or writes; each is read from its tensor here, in
-    # the branch of the role.
+    # One role per warp; the global addresses a role reads or writes are read from the tensors in its branch.
     if warp == 16:
         _load_warp(
             st,
@@ -748,9 +747,9 @@ def _qk_body(
 
 @cute.jit
 def _live_tiles(lens, S, H, batch, bidx, gdim):
-    """With lengths: (the number of live tiles of CTA bidx of gdim, its first one as the tile iterator). The live
-    tiles, in the order of all tiles, are the q and k tiles of the blocks that hold a valid token, in every head of
-    their batch element; the CTAs take contiguous ranges of them of the same size."""
+    """With lengths: return (the number of live tiles of CTA bidx of gdim, its first one as the tile iterator). The
+    live tiles, in the order of all tiles, are the q and k tiles of the blocks that hold a valid token, in every head
+    of their batch element; the CTAs take contiguous ranges of them of the same size."""
     total = Int32(0)
     for b in cutlass.range(batch):
         total = total + H * 2 * ((valid_len(lens, b, S) + 127) >> 7)
@@ -788,7 +787,7 @@ def qk_kernel(
     ntiles: Int32,
     RANK: cutlass.Constexpr,
 ):
-    """The Q'/K' pass (_qk_body) of a call whose batch elements are all full."""
+    """Run the Q'/K' pass (_qk_body) of a call whose batch elements are all full."""
     _qk_body(
         tiled_mma,
         tma_q,
@@ -828,7 +827,7 @@ def qk_kernel_lens(
     ntiles: Int32,
     RANK: cutlass.Constexpr,
 ):
-    """The Q'/K' pass (_qk_body) of a call with valid prefix lengths lens [B] (int32)."""
+    """Run the Q'/K' pass (_qk_body) of a call with valid prefix lengths lens, int32 [B]."""
     _qk_body(
         tiled_mma,
         tma_q,

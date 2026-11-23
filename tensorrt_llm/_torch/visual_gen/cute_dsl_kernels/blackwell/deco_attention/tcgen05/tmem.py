@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tensor memory and tensor core operations in CuTe DSL operations, the experimental primitives of common/dsl.py:
-tcgen05.ld and tcgen05.st of register values in the 32x32b and 16x32bx2 shapes, with their waits and the reducing
-load; tcgen05.mma and tcgen05.commit from an elected lane. The tcgen05 operations that are inline PTX are in
-tcgen05/ptx.py."""
+"""Tensor memory and tensor core operations in CuTe DSL operations, the experimental primitives of common/dsl.py.
+
+tcgen05.ld and tcgen05.st of register values with their waits, tcgen05.mma and tcgen05.commit from an elected lane;
+the tcgen05 operations that are inline PTX are in tcgen05/ptx.py.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -39,14 +40,13 @@ from ..common.mem import sptr
 
 
 def ld_tmem_f32(addr, n):
-    """i32 TMEM address addr -> n f32: tcgen05.ld in the 32x32b shape, n columns of the TMEM lane of the thread."""
+    """Return n f32 by tcgen05.ld in the 32x32b shape: n columns of the thread's TMEM lane at the TMEM address addr."""
     values = tcgen05_ld(Tcgen05LdStShape.SHAPE_32X32B, make_tmem_ptr(addr, Float32), num=n)
     return [values[i] for i in range(n)]
 
 
 def st_tmem_f32(addr, values):
-    """i32 TMEM address addr, a list of f32: tcgen05.st in the 32x32b shape, the values into that many columns of the
-    TMEM lane of the thread."""
+    """Store a list of f32 by tcgen05.st in the 32x32b shape: that many columns of the thread's TMEM lane at addr."""
     if len(values) == 1:
         data = Float32(values[0]).bitcast(Int32)
     else:
@@ -55,26 +55,25 @@ def st_tmem_f32(addr, values):
 
 
 def ld_tmem_f32_x32_wait(addr):
-    """i32 TMEM address addr -> 32 f32: tcgen05.ld in the 32x32b shape and the wait for the load, so the values are
-    ready on return."""
+    """Return 32 f32 by tcgen05.ld in the 32x32b shape and the wait for the load: the values are ready on return."""
     values = tcgen05_ld(Tcgen05LdStShape.SHAPE_32X32B, make_tmem_ptr(addr, Float32), num=32)
     tcgen05_wait(Tcgen05Wait.LOAD)
     return [values[i] for i in range(32)]
 
 
 def st_tmem_16x32bx2_f32_x32_wait(addr, values):
-    """i32 TMEM address addr, 32 f32: tcgen05.st in the 16x32bx2 shape (the second column base 32 columns on) and
-    the wait for the store."""
+    """Store 32 f32 by tcgen05.st in the 16x32bx2 shape (second column base 32 columns on) and wait for the store."""
     data = cutlass.Vector.from_elements(tuple(values), Float32)
     tcgen05_st(Tcgen05LdStShape.SHAPE_16X32BX2, make_tmem_ptr(addr, Float32), data, offset=32)
     tcgen05_wait(Tcgen05Wait.STORE)
 
 
 def ld_tmem_16x32bx2_f32_x32_absmax_wait(addr, ld_red: bool):
-    """i32 TMEM address addr -> 32 f32 and two f32 maxima: two tcgen05.ld in the 16x32bx2 shape of 16 columns each, 16
-    columns apart, each with the max |x| of its 16 values, and one wait for both. With ld_red (the target has the
-    reducing load, tcgen05.ld.red with max.abs) the maxima come from the loads; without it, from a tree of maxima of
-    the absolute values after the wait."""
+    """Return 32 f32 from tensor memory and the max |x| of each half of 16: (values, maximum, maximum).
+
+    Two tcgen05.ld in the 16x32bx2 shape of 16 columns each, 16 columns apart, and one wait for both. The maxima come
+    from the loads with ld_red (tcgen05.ld.red with max.abs), else from a tree of maxima of |x| after the wait.
+    """
     shape = Tcgen05LdStShape.SHAPE_16X32BX2
     halves, maxima = [], []
     if ld_red:
@@ -106,9 +105,8 @@ def ld_tmem_16x32bx2_f32_x32_absmax_wait(addr, ld_red: bool):
 
 
 def tc_mma(d_addr, a, b_desc, idesc, acc, kind: str, a_tmem: bool):
-    """i32 TMEM address d_addr (D), A as a: an i32 TMEM address with a_tmem, an i64 shared-memory descriptor without;
-    i64 shared-memory descriptor b_desc (B), i32 instruction descriptor idesc, i32 acc: the lane elect_one picks issues
-    tcgen05.mma of cta_group 1 and kind `kind` ("f16" or "tf32"), D += A B when acc != 0 and D = A B otherwise."""
+    """Issue tcgen05.mma (cta_group 1, kind "f16" or "tf32") from an elected lane: D += A B if acc != 0, else D = A B.
+    a: the TMEM address of A with a_tmem, its shared-memory descriptor without."""
     with cute.arch.elect_one():
         tcgen05_mma(
             Tcgen05MMAKind(kind),
@@ -122,7 +120,7 @@ def tc_mma(d_addr, a, b_desc, idesc, acc, kind: str, a_tmem: bool):
 
 
 def tc_commit(addr):
-    """i32 shared address of an mbarrier: the lane elect_one picks issues tcgen05.commit, an arrival on the mbarrier
-    once the tcgen05 operations that thread issued before have completed."""
+    """Issue tcgen05.commit from an elected lane on the mbarrier at the shared address addr: an arrival on the
+    mbarrier once the tcgen05 operations that thread issued before have completed."""
     with cute.arch.elect_one():
         tcgen05.commit(sptr(Int64, addr))

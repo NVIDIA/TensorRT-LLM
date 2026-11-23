@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Epilogue of the attention kernel, run by the epilogue warpgroup (a thread per row): O_j times v_scale over the row
-sum of P (column 128 of O_j), as BF16 into a shared-memory staging tile that the store warp stores by TMA.
+"""Epilogue of the attention kernel, run by the epilogue warpgroup (a thread per row).
 
-Main launch (epilogue_tile): one O tile at a time. Split launch (epilogue_split): the units of the last partial
-wave are split along KV into pieces that run on different SMs, each with its own anchor. A piece that does not merge
-an O tile publishes its unnormalized rows, anchor and row sum to global memory and sets a ready flag; the merging
-piece waits for the flags, brings every piece to the largest anchor and normalizes the sum."""
+O_j times v_scale over the row sum of P (column 128 of O_j), as BF16 into a shared-memory staging tile that the store
+warp stores by TMA. Main launch (epilogue_tile): one O tile at a time. Split launch (epilogue_split): the units of
+the last partial wave are split along KV into pieces that run on different SMs, each with its own anchor, and the
+pieces of an O tile are merged through global memory.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -33,8 +33,7 @@ from .sched import SplitTileScheduler, TileScheduler
 
 
 def _merge_slot(slot_base, j, merger, stage):
-    """Merge slot of O tile `stage` of the j-th piece other than its merging piece `merger`: piece j + (j >= merger)
-    of the unit whose slots start at slot_base."""
+    """Merge slot of O tile `stage` of the j-th piece other than `merger`: piece j + (j >= merger) of the unit."""
     return (slot_base + j + cutlass.select_(j >= merger, 1, 0)) * 2 + stage
 
 
@@ -91,12 +90,14 @@ class EpilogueRole:
         score_scale,
         live_rows=None,
     ):
-        """Split launch epilogue for both O tiles of a KV piece. O tile s is merged by piece s % nparts; every other
-        piece publishes its unnormalized O rows, anchor and row sum into its (unit, piece, tile) slot and then sets
-        the slot's ready flag. All publishes come first, so the two merges (on different SMs) run in parallel. The
-        flags are zero on entry (the host zeroes them before the launches of a call) and on exit: the merger returns
-        each flag it waited for to zero. live_rows: with lengths, the rows of the work tile's 256 below the length
-        of its batch element; the rows after them are stored as zeros."""
+        """Split launch epilogue for both O tiles of a KV piece: all publishes, then the merges.
+
+        * O tile s is merged by piece s % nparts; every other piece publishes its unnormalized O rows, anchor and row
+          sum into its (unit, piece, tile) slot and then sets the slot's ready flag. All publishes come first, so
+          the two merges (on different SMs) run in parallel.
+        * The merger waits for the flags, brings every piece to the largest anchor and normalizes the sum. The flags
+          are zero on entry (the host zeroes them before the launches of a call) and on exit.
+        """
         tOtO0, tOtO1, vec0, vec1, sO = tensor_args
         s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer = pipeline_args
         part, nparts, slot_base = split_info
@@ -294,9 +295,7 @@ class EpilogueRole:
     def epilogue_tile(
         self, thr_mma, tensor_args, pipeline_args, scale_output, stage: int, live_rows=None
     ):
-        """Main launch epilogue of O tile `stage`: O times v_scale over the row sum (column 128), BF16 into its SMEM
-        staging tile for the store warp's TMA store. live_rows: with lengths, the rows of the work tile's 256 below
-        the length of its batch element; the rows after them are stored as zeros."""
+        """Main launch epilogue of O tile `stage`: O times v_scale over the row sum, as BF16 into its staging tile."""
         tOtO, dest_O = tensor_args
         si_epi_consumer, mma_epi_consumer, epi_store_producer = pipeline_args
         chunk_cols = 32 * 8 // self.o_dtype.width
@@ -343,8 +342,7 @@ class EpilogueRole:
 
     @cute.jit
     def store_warp(self, mO_qdl, tma_atom_o, sO, epi_store_consumer, sched_args):
-        """The store warp over its work tiles: the TMA stores of both staged O tiles of a work tile (in the split
-        launch, of the tiles this KV piece merges)."""
+        """Store warp: TMA stores of the staged O tiles of a work tile (split launch: the tiles its piece merges)."""
         tile_sched, work_tile = sched_args
         while work_tile.is_valid_tile:
             curr_block_coord = work_tile.tile_idx
@@ -389,11 +387,12 @@ class EpilogueRole:
 
     @cute.jit
     def zero_rows(self, tile_sched_params, lens_addr, o_addr, seqlen, tidx):
-        """The idle warp of a launch with valid prefix lengths: zeros in the O rows of the units that no role runs,
-        those without a query row below the length of their batch element (with CTA pairs: whose pair has none). The
-        warp walks the units of the CTA's share of the static schedule (in the split launch the work of the CTA,
-        where the first piece of a unit stores its rows) and each thread stores its share of the 16-byte chunks of a
-        unit's rows. lens_addr, o_addr: the global addresses of the lengths and of O [B, S, H, 128]."""
+        """The idle warp of a launch with valid prefix lengths: zeros in the O rows of the units that no role runs.
+
+        * Those units have no query row below the length of their batch element (with CTA pairs: their pair has none).
+        * The warp walks the units of the CTA's share of the static schedule (in the split launch the work of the
+          CTA, where the first piece of a unit stores its rows); each thread stores its share of the 16-byte chunks.
+        """
         lane = tidx % self.threads_per_warp
         heads = tile_sched_params.problem_shape_mhb[1]
         group = self.cluster_shape_mn[0]

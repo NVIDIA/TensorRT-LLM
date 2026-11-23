@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inline PTX that the tcgen05 family alone issues (B200, GB300, Rubin), through asm of common/ptx.py, whose module
-docstring states the contract and the names of the wrappers.
+"""Inline PTX that the tcgen05 family alone issues (B200, GB300, Rubin), through asm of common/ptx.py.
 
-Here: the encodings of the shared-memory matrix descriptors and of the instruction descriptors; tcgen05.mma of
-kind::f8f6f4 with A in tensor memory and the means MMA of the attention; the bounded mbarrier wait of the Q/K pass,
-tcgen05.commit; E2M1 decoding, an opaque identity; the load of the score scale by the epilogue warpgroup of the
-attention."""
+The module docstring of common/ptx.py states the contract and the names of the wrappers. Here:
+    * the encodings of the shared-memory matrix descriptors and of the instruction descriptors;
+    * tcgen05.mma of kind::f8f6f4 with A in tensor memory and the means MMA of the attention;
+    * the bounded mbarrier wait of the Q/K pass and tcgen05.commit; E2M1 decoding and an opaque identity;
+    * the load of the score scale by the epilogue warpgroup of the attention.
+"""
 
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
@@ -28,12 +29,12 @@ from ..common.ptx import asm, i32, i64, u32
 
 # -------------------------------------------------------------------------------- MMA and descriptors
 def smem_desc_hi(sbo_bytes: int, layout: int) -> int:
-    """High word of a tcgen05 shared-memory matrix descriptor: SBO (16B units), version 1, layout."""
+    """Return the high word of a tcgen05 shared-memory matrix descriptor: SBO (16B units), version 1, layout."""
     return ((sbo_bytes >> 4) & 0x3FFF) | (1 << 14) | (layout << 29)
 
 
 def smem_desc_sw128(addr):
-    """K-major SWIZZLE_128B UMMA shared-memory descriptor (8-row groups 1024 B apart)."""
+    """Return the K-major SWIZZLE_128B UMMA shared-memory descriptor of addr (8-row groups 1024 B apart)."""
     return (
         Int64((addr >> 4) & 0x3FFF)
         | Int64(1 << 16)
@@ -44,7 +45,7 @@ def smem_desc_sw128(addr):
 
 
 def smem_desc_mn_sw128(addr):
-    """MN-major SW128: 64 channels by 8 tokens per 1024-byte atom."""
+    """Return the MN-major SW128 shared-memory descriptor of addr: 64 channels by 8 tokens per 1024-byte atom."""
     return (
         Int64((addr >> 4) & 0x3FFF)
         | Int64(64 << 16)
@@ -55,20 +56,18 @@ def smem_desc_mn_sw128(addr):
 
 
 def idesc_bf16(m, n):
-    """kind::f16 instruction descriptor: BF16 x BF16 -> F32, both K-major."""
+    """Return the kind::f16 instruction descriptor of an M = m, N = n MMA: BF16 x BF16 -> F32, both K-major."""
     return (1 << 4) | (1 << 7) | (1 << 10) | ((n >> 3) << 17) | ((m >> 4) << 24)
 
 
 def idesc_tf32(m, n):
-    """kind::tf32 instruction descriptor: TF32 x TF32 -> F32, both K-major."""
+    """Return the kind::tf32 instruction descriptor of an M = m, N = n MMA: TF32 x TF32 -> F32, both K-major."""
     return (1 << 4) | (2 << 7) | (2 << 10) | ((n >> 3) << 17) | ((m >> 4) << 24)
 
 
 @dsl_user_op
 def tc_mma_f8f6f4(d_addr, a_addr, b_desc, idesc, acc, collector: str, *, loc=None, ip=None):
-    """i32 TMEM addresses d_addr (D) and a_addr (A), i64 shared-memory descriptor b_desc (B), i32 instruction descriptor
-    idesc, i32 acc: tcgen05.mma.cta_group::1.kind::f8f6f4 with the A-collector qualifier `collector`, D += A B when acc
-    != 0 and D = A B otherwise. The caller issues it from one elected thread."""
+    """tcgen05.mma of kind::f8f6f4, A in TMEM, from the caller's elected thread: D += A B if acc != 0, else D = A B."""
     asm(
         "{\n"
         "  .reg .pred p;\n"
@@ -98,12 +97,13 @@ def tc_mma_means(
     loc=None,
     ip=None,
 ) -> None:
-    """i32 TMEM address d_addr (D), i32 shared address smem, i32 stage: the means MMA of the attention, D += A B with A
-    the K16 BF16 block sums at the shared address smem + a_off and B the v_mean ring stage `stage` at smem + b_off +
-    4096 stage (4 KB stages), issued by the lane elect.sync picks as tcgen05.mma.cta_group::1.kind::f16. a_desc and
-    b_desc are the 64-bit shared-memory descriptors of A and B without the address field (the low 14 bits take the
-    address >> 4), idesc is the instruction descriptor. The descriptors are built inside the block from the base
-    address and the constants."""
+    """Issue the means MMA of the attention, D += A B, as tcgen05.mma.cta_group::1.kind::f16 from an elected lane.
+
+    * D: the TMEM address d_addr. A: the K16 BF16 block sums at the shared address smem + a_off. B: the v_mean ring
+      stage `stage` at smem + b_off + 4096 stage (4 KB stages).
+    * a_desc, b_desc: the 64-bit shared-memory descriptors of A and B without the address field; the block builds the
+      descriptors from them and the address (the low 14 bits take the address >> 4).
+    """
 
     def desc(name, addr, const):
         return (
@@ -138,8 +138,8 @@ def tc_mma_means(
 # -------------------------------------------------------------------------------- Barriers and waits
 @dsl_user_op
 def mbar_wait_bounded(addr, parity, *, loc=None, ip=None):
-    """i32 shared address of an mbarrier, i32 parity: loops on mbarrier.try_wait.parity.shared::cta.b64 until the phase
-    of that parity has completed; trap after 2^25 failed tries. The Q/K pass waits with it."""
+    """Wait for the phase of parity `parity` of the mbarrier at the shared address addr by mbarrier.try_wait probes;
+    trap after 2^25 failed tries. The Q/K pass waits with it."""
     asm(
         "{\n .reg .pred p;\n .reg .u32 c;\n mov.u32 c, 0;\n LAB_WAIT:\n"
         " mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n @p bra LAB_DONE;\n add.u32 c, c, 1;\n"
@@ -153,8 +153,7 @@ def mbar_wait_bounded(addr, parity, *, loc=None, ip=None):
 
 @dsl_user_op
 def tc_commit_means(smem, stage, bar_off: int, *, loc=None, ip=None) -> None:
-    """i32 shared address smem, i32 stage: the lane elect.sync picks issues tcgen05.commit (cta_group::1,
-    mbarrier::arrive::one) on the mbarrier at smem + bar_off + 8 stage, the empty barrier of the v_mean ring stage."""
+    """Issue tcgen05.commit from an elected lane on the v_mean ring's empty barrier at smem + bar_off + 8 stage."""
     asm(
         "{\n"
         "  .reg .pred e;\n"
@@ -175,8 +174,8 @@ def tc_commit_means(smem, stage, bar_off: int, *, loc=None, ip=None) -> None:
 # -------------------------------------------------------------------------------- Conversions and packed arithmetic
 @dsl_user_op
 def e2m1x8_to_f32x8(w, *, loc=None, ip=None):
-    """u32 word of four E2M1 code bytes -> eight f32, the code values unscaled (cvt.rn.f16x2.e2m1x2 per byte,
-    cvt.f32.f16); no side effects."""
+    """Return eight f32, the code values unscaled, from a u32 word of four E2M1 code bytes (cvt.rn.f16x2.e2m1x2 per
+    byte, cvt.f32.f16); no side effects."""
     return asm(
         "{ .reg .b8 b0, b1, b2, b3; .reg .b32 h0, h1, h2, h3;\n"
         " .reg .f16 l0, u0, l1, u1, l2, u2, l3, u3;\n"
@@ -196,16 +195,15 @@ def e2m1x8_to_f32x8(w, *, loc=None, ip=None):
 
 @dsl_user_op
 def opaque_i32(x, *, loc=None, ip=None) -> Int32:
-    """i32 x -> i32 x by mov.b32, declared with side effects. Callers use it to keep an address computation at the
-    statement that uses it."""
+    """Return x by mov.b32, declared with side effects: keeps an address computation at the statement that uses it."""
     return asm("mov.b32 $0, $1;", [i32(x)], Int32, side_effects=True, loc=loc, ip=ip)
 
 
 # -------------------------------------------------------------------------------- Memory access
 @dsl_user_op
 def ld_global_nc_f32(addr, *, loc=None, ip=None):
-    """i64 global address -> f32 by ld.global.nc.f32: a per-call scalar written by an earlier kernel of the stream
-    (read-only for this kernel). The epilogue warpgroup of the attention kernel reads its score scale with it
+    """Return the f32 at a global address by ld.global.nc.f32: a per-call scalar written by an earlier kernel of the
+    stream (read-only for this kernel). The epilogue warpgroup of the attention kernel reads its score scale with it
     (fp8pv/kernel.py)."""
     return asm(
         "ld.global.nc.f32 $0, [$1];", [i64(addr)], Float32, side_effects=True, loc=loc, ip=ip

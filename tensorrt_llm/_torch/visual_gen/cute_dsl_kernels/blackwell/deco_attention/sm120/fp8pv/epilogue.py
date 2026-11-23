@@ -14,13 +14,15 @@
 # limitations under the License.
 # O is the output accumulator and l the row sum of P.
 # ruff: noqa: E741
-"""Epilogues of the sm_120 FP8-PV attention: the output rows of a whole unit, the FP32 partials of a key-range piece
-of the split tail, and the merge launch that combines the pieces of a unit.
+"""Epilogues of the sm_120 FP8-PV attention: output rows, FP32 partials of the split tail and their merge launch.
 
-A thread holds O transposed (mma.py): its accumulators are those of the queries 2q, 2q + 1 (row g of the warp's quads
-2q, 2q + 1) and 8 + 2q, 9 + 2q (row g + 8), while its anchors are those of its own rows g and g + 8 and its row
-sums the quad's partial sums of those rows. So the factors of a row (1 / l, or the rescale of a merge) are reduced
-over the quad and fetched from the lanes that own the rows."""
+A thread holds, with O transposed (mma.py):
+    * the accumulators of the queries 2q, 2q + 1 (row g of the quads 2q, 2q + 1 of the warp) and 8 + 2q, 9 + 2q
+      (row g + 8);
+    * the anchors of its own rows g and g + 8, and the partial sums of the quad of their row sums.
+So the factors of a row (1 / l, or the rescale of a merge) are reduced over the quad and fetched from the lanes that
+own the rows.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -36,8 +38,7 @@ PART_N = 68  # FP32 words per thread of a piece's partials: 64 of O, 2 anchors, 
 
 
 def inv_row_sums(l0, l1, q):
-    """1 / l of the O^T fragment columns (as in rescale_o), l the row sums of rows g, g + 8 from the quad's partial
-    sums l0, l1: every lane divides for its own rows, then fetches the reciprocals of its columns."""
+    """Return 1 / l of the O^T columns of the lane from the partial row sums l0, l1 of the quad (module docstring)."""
     l0 = l0 + cute.arch.shuffle_sync_bfly(l0, offset=1)
     l1 = l1 + cute.arch.shuffle_sync_bfly(l1, offset=1)
     l0 = l0 + cute.arch.shuffle_sync_bfly(l0, offset=2)
@@ -70,10 +71,11 @@ def store_rows(
     H: cutlass.Constexpr,
     nv=None,
 ):
-    """The warp's 16 output rows o = O f v8_scale as BF16 (f = inv_row_sums: normalized first, as v8_scale / l may
-    underflow where (O / l) v8_scale does not), staged in shared memory at ep (rows EP bytes apart), then 16-byte
-    global stores of the rows below S (query QT qt + 16 warp + row). nv: with lengths, the valid tokens of the batch
-    element: the rows from there on are stored as zeros."""
+    """Store the 16 output rows of the warp, o = O f v8_scale as BF16, staged in shared memory at ep (EP bytes apart).
+
+    * f = inv_row_sums: O is normalized first, as v8_scale / l may underflow where (O / l) v8_scale does not.
+    * 16-byte global stores of the rows below S (query QT qt + 16 warp + row), as zeros from nv on (with lengths).
+    """
     fa, fb, fc, fd = f
     for ct in cutlass.range_constexpr(8):
         for h in cutlass.range_constexpr(2):
@@ -112,7 +114,7 @@ def store_rows(
 
 @cute.jit
 def store_zero_rows(lane, warp, qt, ob, bb, hh, S: cutlass.Constexpr, H: cutlass.Constexpr):
-    """The warp's 16 output rows of a unit without a valid query row: zeros, in the global stores of store_rows."""
+    """Store zeros as the 16 output rows of the warp of a unit without a valid query row (the stores of store_rows)."""
     for it in cutlass.range_constexpr(8):
         oq = qt * QT + warp * 16 + 2 * it + (lane >> 4)
         if oq < S:
@@ -121,8 +123,7 @@ def store_zero_rows(lane, warp, qt, ob, bb, hh, S: cutlass.Constexpr, H: cutlass
 
 
 def store_partials(part_ptr, bid, tidx, O, anc0, anc1, l0, l1):
-    """Piece bid's FP32 state for merge_partial_kernel, element-major for coalesced writes: O in its transposed
-    fragment mapping, the anchors and the row sums (partial over the quad)."""
+    """Store the FP32 state of piece bid (O transposed, anchors, partial row sums), element-major (coalesced writes)."""
     pbase = part_ptr.toint() + Int64(bid * PART_N) * (NTHR * 4) + tidx * 4
     for i in range(64):
         dst = pbase + i * (NTHR * 4)
@@ -151,8 +152,7 @@ def _merge_rows(
     H: cutlass.Constexpr,
     nv,
 ):
-    """The merge of the pieces of one unit (merge_partial_kernel): the partials brought to their common anchor and
-    summed, the rows normalized and stored as in a whole unit, those from nv on as zeros."""
+    """Merge the pieces of one unit (merge_partial_kernel) and store its rows, those from nv on as zeros."""
     pb = [
         part_ptr.toint() + Int64((bid * split + p) * PART_N) * (NTHR * 4) + tidx * 4
         for p in range(split)
@@ -174,8 +174,7 @@ def _merge_rows(
         a1 = cute.arch.exp2(an1[p] - m1)
         l0 = cute.math.fma(load_invariant(Float32, pb[p] + 66 * (NTHR * 4)), a0, l0, rounding=RN)
         l1 = cute.math.fma(load_invariant(Float32, pb[p] + 67 * (NTHR * 4)), a1, l1, rounding=RN)
-        # the factors belong to the rows g, g + 8 of a quad; the transposed O holds the queries 2q, 2q + 1, 8 + 2q,
-        # 9 + 2q
+        # the factors of rows g, g + 8 go to the queries 2q, 2q + 1, 8 + 2q, 9 + 2q of the transposed O
         fa = cute.arch.shuffle_sync(a0, 8 * q)
         fb = cute.arch.shuffle_sync(a0, 8 * q + 4)
         fc = cute.arch.shuffle_sync(a1, 8 * q)
@@ -206,11 +205,11 @@ def merge_partial_kernel(
     unit0: cutlass.Constexpr,
     lens_ptr,
 ):
-    """The merge of the split key-range pieces of unit unit0 + CTA index, in the thread mapping of the attention: the
-    partials of the pieces are brought to their common anchor (the anchors are in log2 units already) and summed, then
-    the rows are normalized and stored as in a whole unit. lens_ptr: None, or the valid prefix lengths: the rows
-    from the length of the batch element on are zeros (a piece without a valid key tile has left an anchor of -inf
-    and zeros; a unit without a valid query row has no partials and stores zeros without reading any)."""
+    """Merge the split key-range pieces of unit unit0 + CTA index, in the thread mapping of the attention.
+
+    * The partials are brought to their common anchor and summed; the rows are normalized and stored as in a whole unit.
+    * With lengths the rows from the length on are zeros; a piece without a valid key tile left -inf anchors and zeros.
+    """
     bid_, _, _ = cute.arch.block_idx()
     tidx_, _, _ = cute.arch.thread_idx()
     bid = Int32(bid_)

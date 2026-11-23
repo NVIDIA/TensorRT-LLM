@@ -14,32 +14,35 @@
 # limitations under the License.
 # O is the output accumulator and l the row sum of P.
 # ruff: noqa: E741
-"""Online softmax of the sm_120 attention kernel, in log2 units, one 128-key tile at a time: from the raw scores of a
-tile to the NVFP4 P of the PV MMA.
+"""Online softmax of the sm_120 attention kernel, in log2 units: from the raw scores of a 128-key tile to its NVFP4 P.
 
-Every thread holds 8 scores of each of 8 blocks of 16 keys (4 blocks x its rows g and g + 8); the XOR-1 lane holds the
-other 8 scores of the same blocks. With c the score scale (the multiplier of the raw scores in log2 units), per row:
-
-- anchor: the running row max of c s, moved only when a tile's max exceeds it by more than T = RESCALE_THRESHOLD
-  (lazy rescale: a move rescales O and the row sum by 2^(old - new), anchor_update); the P block scales carry T
-  binades of headroom.
-- block scale: a = UE4M3(448 * 2^(c bm - anchor - T)) with bm the exact max of the block's 16 scores, encoded and
-  read back (block_scales2). The decoded scale is what the MMA multiplies by, so the elements are coded against it.
-- elements (I-ExpCast): E2M1(6 * 2^(c (s - bm) + d)), d the log2 of the unrounded scale over the decoded one. The
-  exponential is a cast: z = c (s - bm) + d lands on the f32 subnormal grid as K0 + z * 2^10 ulps, K0 the f16 bit
-  pattern of 6, so the low 16 bits are the f16 pattern of a piecewise-linear 6 * 2^z (the exponent field counts the
-  binades, the mantissa interpolates); a saturating pack flushes everything below the grid to +0 and
-  cvt.rn.satfinite.e2m1x2.f16x2 codes the elements (land32_sum).
-- sums: the 16-key block sums of the unquantized P (the f16 element values times the decoded block scale), which are
-  the operand of the means MMA and add up to the row sum.
-
-The landing has three forms. Folded (the default): one FMA per score pair, s * M + (K0 - bm M + d 2^-139) with the
-subnormal multiplier M = c 2^-139; it needs the block offsets on the fine subnormal grid, which the warp's fold-safety
-flag guarantees (anchors within +-7900 and c <= 1/16, anchor_update). Subtract first (flag clear): the scores minus
-their block max, then the same FMA with the offset K0 + d 2^-139 (prepare_land64_flag picks between the two behind a
-warp-uniform branch). Two-step (the copy of the tile loop the kernel takes for a score scale below 2^-10 or with
-c 2^-139 inexact): a normal-domain FMA c (s - bm) + (17.5 + d), then the multiply by 2^-139 onto the grid.
-
+Scores of a thread (Sacc):
+    * 8 scores of each of 8 blocks of 16 keys (4 blocks x its rows g and g + 8); the XOR-1 lane holds the other 8
+      scores of the same blocks. A 16-key block is (s, h, t // 2): the lanes t and t ^ 1 hold its two halves.
+    * Sacc[8 s + 4 h + i]: the four accumulators of n-tile i of the 32-key group (s, h), elements 2 rr + e of row
+      g + 8 rr, key 64 s + 32 h + 8 t + 2 i + e of the tile.
+Per row, with c the score scale (the multiplier of the raw scores in log2 units):
+    * anchor: the running row max of c s, moved only when a tile's max exceeds it by more than T = RESCALE_THRESHOLD
+      (lazy rescale: a move rescales O and the row sum by 2^(old - new), anchor_update); the P block scales carry T
+      binades of headroom.
+    * block scale: a = UE4M3(448 * 2^(c bm - anchor - T)) with bm the exact max of the block's 16 scores, encoded and
+      read back (block_scales2). The decoded scale is what the MMA multiplies by, so the elements are coded against it.
+    * elements (I-ExpCast): E2M1(6 * 2^(c (s - bm) + d)), d the log2 of the unrounded scale over the decoded one.
+    * sums: the 16-key block sums of the unquantized P (the f16 element values times the decoded block scale), which
+      are the operand of the means MMA and add up to the row sum.
+I-ExpCast, the exponential as a cast (land32_sum):
+    * z = c (s - bm) + d lands on the f32 subnormal grid as K0 + z * 2^10 ulps, K0 the f16 bit pattern of 6, so the
+      low 16 bits are the f16 pattern of a piecewise-linear 6 * 2^z (the exponent field counts the binades, the
+      mantissa interpolates).
+    * A saturating pack flushes everything below the grid to +0 and cvt.rn.satfinite.e2m1x2.f16x2 codes the elements.
+Landing forms:
+    * Folded (the default): one FMA per score pair, s * M + (K0 - bm M + d 2^-139) with the subnormal multiplier
+      M = c 2^-139; it needs the block offsets on the fine subnormal grid, which the warp's fold-safety flag
+      guarantees (anchors within +-7900 and c <= 1/16, anchor_update).
+    * Subtract first (flag clear): the scores minus their block max, then the same FMA with the offset K0 + d 2^-139
+      (prepare_land64_flag picks between the two behind a warp-uniform branch).
+    * Two-step (the copy of the tile loop the kernel takes for a score scale below 2^-10 or with c 2^-139 inexact):
+      a normal-domain FMA c (s - bm) + (17.5 + d), then the multiply by 2^-139 onto the grid.
 The PTX blocks (need_vote, anchor_update, rescale64_loop, block_scales2, prepare_land64_flag, land32_sum) are in
 ../ptx/nvfp4pv.py; this module holds the flow of a tile around them.
 """
@@ -61,20 +64,16 @@ from ..ptx.nvfp4pv import (
 # The score-scale floor of this family: the preparation raises the score scale to a power of two of at least
 # 2^MIN_SCORE_LOG2 (its encode launch grows the Q group scales up to it), inside the range of the folded landing
 MIN_SCORE_LOG2 = -6
-# the P block scales carry T = RESCALE_THRESHOLD binades of headroom, UE4M3(448 * 2^(c bm - m - T)): the anchor m
-# (running max) only moves, and O is only rescaled, when a tile max exceeds it by more than T
 
 RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
 
 
 # ------------------------------------------------------------------------------------------------ softmax of one tile
-# A thread's scores of a tile: Sacc[8 s + 4 h + i] = the four accumulators of n-tile i of the 32-key group (s, h),
-# elements 2 rr + e of row g + 8 rr, key 64 s + 32 h + 8 t + 2 i + e of the tile. A 16-key block is (s, h, t // 2):
-# the lanes t and t ^ 1 hold its two halves. Straight-line emitters (plain Python, unrolled at trace time).
+# Straight-line emitters (plain Python, unrolled at trace time) on a thread's scores Sacc (layout: module docstring).
 def emit_block_max(Sacc, masked, floor=None):
-    """16-key block maxima of the raw scores: bm[s][h] = (row g, row g + 8); the pair (t, t ^ 1) holds one block.
-    masked: the tile has keys past the sequence (scores -inf), whose blocks keep a finite max. floor: with lengths,
-    the run-time lower bound of the maxima (-1e30 for the last tile of the keys, else -inf)."""
+    """Return the 16-key block maxima of the raw scores, bm[s][h] = (row g, row g + 8); the pair (t, t ^ 1) holds one
+    block. masked: the tile has keys past the sequence (scores -inf), whose blocks keep a finite max. floor: with
+    lengths, the run-time lower bound of the maxima (-1e30 for the last tile of the keys, else -inf)."""
     bm = [[None, None], [None, None]]
     for s_ in range(2):
         for h_ in range(2):
@@ -102,7 +101,7 @@ def emit_block_max(Sacc, masked, floor=None):
 
 
 def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
-    """NVFP4 P of the tile into st.Pst (codes [4 s + 2 h + rr], scale words [8 + s]), the block sums of the
+    """Emit the NVFP4 P of the tile into st.Pst (codes [4 s + 2 h + rr], scale words [8 + s]), the block sums of the
     unquantized P as the BF16 operand of the means MMA into ma_dst[ma_off] and ma_dst[ma_off + 1], and the row-sum
     update."""
     par = st.par
@@ -155,8 +154,7 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
                 else:
                     gi = 4 * s_ + 2 * h_ + rr
                     vals.extend(prepared[8 * gi : 8 * gi + 8])
-                    # the shift of the decoded scale, on the subnormal grid of the folded offset (K0 - bm M, or K0
-                    # after the subtraction)
+                    # the scale's shift, on the grid of the folded offset (K0 - bm M, or K0 after the subtraction)
                     offsets.append(
                         cute.math.fma(dsh[s_][h_][rr], u2f(0x400), prepared[64 + gi], rounding=RN)
                     )
@@ -183,18 +181,19 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
 def softmax_phase(
     st, Sacc, masked: cutlass.Constexpr, cur_odd: cutlass.Constexpr, two_step: cutlass.Constexpr
 ):
-    """Softmax of the current tile (scores Sacc), without an MMA: NVFP4 P into st.Pst, its means operand into st.Mlo
-    (even tile) or st.Pst[10..11] (odd tile), the row sums; an anchor move rescales O (after the burst's PV, behind a
-    warp-uniform branch) and the pending means operand of the even tile. masked, cur_odd "lens": a tile of a range
-    that ends at a run-time tile, with the floor of its block maxima in st.mask[1] and its parity in st.odd."""
+    """Run the softmax of the current tile (scores Sacc), without an MMA.
+
+    * NVFP4 P into st.Pst, its means operand into st.Mlo (even tile) or st.Pst[10..11] (odd tile), the row sums.
+    * An anchor move rescales O (after the burst's PV, behind a warp-uniform branch) and the even tile's pending means.
+    * masked, cur_odd "lens": a tile of a range that ends at a run-time tile; block-max floor st.mask[1], parity st.odd.
+    """
     if cutlass.const_expr(masked == "lens"):
         bm = emit_block_max(Sacc, False, st.mask[1])
     else:
         bm = emit_block_max(Sacc, masked)
     bml = [bm[s_][h_][rr] for s_ in range(2) for h_ in range(2) for rr in range(2)]
     anchor, thr, safe, lsum = st.anchor, st.thr, st.safe, st.lsum
-    # Raw thresholds round down: no skipped anchor move even for a non-power-of-two c.
-    # Full row reductions, correction exp2s and guard votes run only on a possible move.
+    # Full row reductions, correction exp2s and guard votes run only on a possible move (need_vote, anchor_update).
     vneed = need_vote(bml, thr[0], thr[1])
     a0, a1, f0, f1, t0, t1, s0, s1, sf = anchor_update(
         vneed, bml, anchor[0], anchor[1], thr[0], thr[1], lsum[0], lsum[1], safe[0], st.c

@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inline PTX that the NVFP4-PV kernel of the sm_120 family alone issues (sm120/nvfp4pv/): one of the three modules
-of the package, see its docstring. The sections:
+"""Inline PTX that the NVFP4-PV kernel of the sm_120 family alone issues (sm120/nvfp4pv/).
 
-  barriers and waits                  the turn barrier of a warp pair
-  conversions and packed arithmetic   the E4M3 decoding, and the blocks of the softmax (nvfp4pv/softmax.py): the
-                                      anchor update, the rescale of O, the block scales, the landing with the
-                                      sums of P
-  memory access                       predicated global loads, the atomic of the release count, TMA bulk copies"""
+One of the three modules of the package, see its docstring. Sections:
+    barriers and waits                  the turn barrier of a warp pair
+    conversions and packed arithmetic   the E4M3 decoding, and the blocks of the softmax (nvfp4pv/softmax.py): anchor
+                                        update, rescale of O, block scales, landing with the sums of P
+    memory access                       predicated global loads, the atomic of the release count, TMA bulk copies
+"""
 
 import math
 
@@ -128,9 +128,8 @@ def anchor_update(need, bm, a0, a1, th0, th1, ls0, ls1, safe, c, *, loc=None, ip
         "sub.u32 iu, 0x7f000000, cu;",
         "mov.b32 ic, iu;",
     ]
-    # The thresholds are rounded down, so they are conservative for every positive finite c: a raw max at or below its
-    # threshold cannot exceed RN(anchor + T) once scaled and rounded, and a false positive rechecks that comparison
-    # here. A sum and the correction factor of its rows change together; an anchor that stays has the factor one.
+    # The thresholds are rounded down, conservative for every positive finite c (need_vote); a false positive rechecks
+    # the move here. A sum and the correction factor of its rows change together; an anchor that stays has factor one.
     for r in range(2):
         aa, ff, tt, ss = (f"${i + r}" for i in (ai, fi, thresh_i, lsi))
         body += [
@@ -147,9 +146,8 @@ def anchor_update(need, bm, a0, a1, th0, th1, ls0, ls1, safe, c, *, loc=None, ip
             f"@!cpow2 div.rm.f32 {tt}, x, ${ci};",
         ]
     # The fold guard, kept until the next update: every anchor of the warp within [-7900, 7900] and c <= 1/16. Until a
-    # move is requested the tile maxima are at most anchor + T; the blocks with nonzero F16 scales are within 30
-    # binades below the anchor, so their folded offsets stay on the fine subnormal grid; the bound on c also keeps the
-    # landing of the other blocks finite.
+    # move is requested the tile maxima are at most anchor + T and the blocks with nonzero F16 scales within 30 binades
+    # below the anchor: their folded offsets stay on the fine subnormal grid; c <= 1/16 keeps the other landings finite.
     body += [
         f"abs.f32 x, ${ai};",
         f"abs.f32 a, ${ai + 1};",
@@ -326,14 +324,15 @@ def prepare_land64_flag(scores, maxima, m, safe, *, loc=None, ip=None):
 def land32_sum(scores, offsets, m, sch, par, kofs=None, *, loc=None, ip=None):
     """32 f32 scores (the four groups of eight of one h-block: (s0, row 0), (s0, row 1), (s1, row 0), (s1, row 1)),
     four f32 offsets, f32 m, i32 sch (the two decoded block scales as f16), i32 par, optionally four f32 kofs -> four
-    i32 words of eight E2M1 codes (nibble i = score i) and the two f32 16-key sums this lane owns. Each score lands as
-    s m + offset on the f32 subnormal grid (fma.rn.f32x2), whose bits are the f16 pattern of its element; the
-    saturating pack (cvt.pack.sat.u16.s32) flushes everything below 2^-15, and -inf, to +0, and
-    cvt.rn.satfinite.e2m1x2.f16x2 codes the elements. The f16x2 sums of the landed elements of a row meet those of the
-    XOR-1 lane (shfl.sync.bfly.b32; each lane keeps the half of its parity par) and enter f32 times the decoded block
-    scale of sch (fma.rn.f32.f16). With kofs (the two-step landing) the offset is subtracted first, the FMA adds the
-    constant kofs of the group (17.5 plus the shift of its decoded scale) and a second multiply scales the result onto
-    the grid."""
+    i32 words of eight E2M1 codes (nibble i = score i) and the two f32 16-key sums this lane owns.
+
+    * A score lands as s m + offset on the f32 subnormal grid (fma.rn.f32x2), its bits the f16 pattern of its element;
+      cvt.pack.sat.u16.s32 flushes everything below 2^-15, and -inf, to +0; cvt.rn.satfinite.e2m1x2.f16x2 codes them.
+    * The f16x2 sums of the landed elements of a row meet those of the XOR-1 lane (shfl.sync.bfly.b32; each lane keeps
+      the half of its parity par) and enter f32 times the decoded block scale of sch (fma.rn.f32.f16).
+    * With kofs (the two-step landing) the offset is subtracted first, the FMA adds the constant kofs of the group
+      (17.5 plus the shift of its decoded scale) and a second multiply scales the result onto the grid.
+    """
     two_step = kofs is not None
     # $0 .. $3: the P words; then the results sumi (the sums); then the operands: the scores (si), m, the offsets, sch,
     # par and kofs

@@ -14,12 +14,12 @@
 # limitations under the License.
 """Compile targets and the hardware capabilities the kernels branch on at trace time.
 
-The target is the architecture the running compilation produces code for: CUTE_DSL_ARCH when set (offline builds),
-else that of CUDA device 0. Kernels never test architecture names directly; they ask for a capability, so a further
-target is added by its row in the tables below and an implementation of each capability that differs. sm_107a runs
-the same kernels with the capabilities of the tables below. sm_120a (RTX PRO 6000) kernels use warp-level MMAs and
-form their own family (deco_attention/sm120), which kernel_family() names. The tables name the architecture-specific
-targets (sm_100a, sm_103a, sm_107a, sm_120a), those the kernels are built and validated for.
+* The target is the architecture the running compilation produces code for: CUTE_DSL_ARCH when set (offline builds),
+  else that of CUDA device 0.
+* Kernels never test architecture names directly; they ask for a capability. A further target is added by its row in
+  the tables below and an implementation of each capability that differs; sm_107a runs the same kernels that way.
+* sm_120a (RTX PRO 6000) kernels use warp-level MMAs and form their own family, deco_attention/sm120 (kernel_family()).
+* The tables name the architecture-specific targets, those the kernels are built and validated for.
 """
 
 import functools
@@ -29,7 +29,7 @@ from cutlass.cutlass_dsl import BaseDSL
 
 
 def _archs(*names):
-    """The architectures of these names that the installed CuTe DSL defines."""
+    """Return the architectures of these names that the installed CuTe DSL defines."""
     return frozenset(getattr(Arch, n) for n in names if hasattr(Arch, n))
 
 
@@ -52,8 +52,8 @@ _FAMILY = {**{a: "tcgen05" for a in _NAMES}, **{a: "sm120" for a in _archs("sm_1
 
 @functools.cache
 def arch():
-    """The architecture enum of the current compilation (NotImplementedError for a target without DeCo kernels: the
-    one error a caller may answer with another implementation); cached, as the target is fixed per process."""
+    """Return the architecture enum of the current compilation (NotImplementedError for a target without DeCo kernels:
+    the one error a caller may answer with another implementation); cached, as the target is fixed per process."""
     a = BaseDSL._get_dsl().get_arch_enum()
     if a not in _FAMILY:
         raise NotImplementedError(f"no DeCo attention kernels for {a}")
@@ -62,13 +62,13 @@ def arch():
 
 @functools.cache
 def kernel_family():
-    """The kernel family of the current target, deco_attention/<family>: "tcgen05" (B200, GB300, Rubin) or "sm120"
-    (warp-level MMAs: RTX PRO 6000); cached, as the target is fixed per process."""
+    """Return the kernel family of the current target, deco_attention/<family>: "tcgen05" (B200, GB300, Rubin) or
+    "sm120" (warp-level MMAs: RTX PRO 6000); cached, as the target is fixed per process."""
     return _FAMILY[arch()]
 
 
 def arch_name():
-    """The family name CuTe's TMEM helpers take ("sm_100", "sm_103", "sm_107"); tcgen05 targets only."""
+    """Return the family name CuTe's TMEM helpers take ("sm_100", "sm_103", "sm_107"); tcgen05 targets only."""
     return _NAMES[arch()]
 
 

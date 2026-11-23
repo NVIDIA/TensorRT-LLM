@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Schedule constants of the tcgen05 attention kernel per compile target (target.arch_name(): "sm_100", "sm_103",
-"sm_107"). What follows from an instruction a target has (the QK and PV MMA widths, the reducing TMEM load) is asked
-of deco_attention.target where it is used, not listed here."""
+"""Schedule constants of the tcgen05 attention kernel per compile target (target.arch_name()).
+
+What follows from an instruction a target has (the QK and PV MMA widths, the reducing TMEM load) is asked of
+deco_attention.target where it is used, not listed here.
+"""
 
 from typing import NamedTuple
 
@@ -34,13 +36,11 @@ class Tuning(NamedTuple):
     # The softmax step does the bookkeeping of a means batch (block-sum read-back, zeroing, A-operand store, row-sum
     # add) in one branch on the step after the batch ended.
     vs_batched: bool
-    # The warp roles (among load, mma, softmax, epilogue, store) that read the valid prefix lengths with loads of
-    # their own in a main launch with lengths (kernel.py, _role_work); the other roles read them as data that no
-    # thread writes.
+    # The warp roles (among load, mma, softmax, epilogue, store) that read the valid prefix lengths with loads of their
+    # own in a main launch with lengths (kernel.py, _role_work); the others read them as data that no thread writes.
     lens_own_loads: tuple
 
 
-# The values of the schedule constants per compile target (fields: Tuning).
 TUNING = {
     "sm_100": Tuning(
         load_sleep_ns=32,
@@ -71,5 +71,5 @@ KV_STAGE = 3
 
 
 def tuning():
-    """The schedule constants of the current compile target."""
+    """Return the schedule constants of the current compile target."""
     return TUNING[target.arch_name()]

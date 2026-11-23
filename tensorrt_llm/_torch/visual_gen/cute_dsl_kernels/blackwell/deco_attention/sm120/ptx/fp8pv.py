@@ -12,16 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inline PTX that the FP8-PV kernel of the sm_120 family alone issues (sm120/fp8pv/): one of the three modules of
-the package, see its docstring. The sections:
+"""Inline PTX that the FP8-PV kernel of the sm_120 family alone issues (sm120/fp8pv/).
 
-  MMA and descriptors                 mma.sync of E4M3 (the PV of the 32-key quarters) and of BF16 (the means
-                                      term), each with its ldmatrix loads behind an indexed branch
-  conversions and packed arithmetic   the comparison, a per-lane zero, the step of a ring stage, and the
-                                      blocks of the softmax (fp8pv/softmax.py, fp8pv/small.py): the I-ExpCast
-                                      landing, the E4M3 words, row sums, block sums and flags of P
-  memory access                       the transposed ldmatrix of bytes, predicated streaming stores, the predicated
-                                      atomic of the release count"""
+One of the three modules of the package, see its docstring. Sections:
+    MMA and descriptors                 mma.sync of E4M3 (the PV of the 32-key quarters) and of BF16 (the means
+                                        term), each with its ldmatrix loads behind an indexed branch
+    conversions and packed arithmetic   the comparison, a per-lane zero, the step of a ring stage, and the
+                                        blocks of the softmax (fp8pv/softmax.py, fp8pv/small.py): the I-ExpCast
+                                        landing, the E4M3 words, row sums, block sums and flags of P
+    memory access                       transposed byte ldmatrix, predicated streaming stores, the release-count atomic
+"""
 
 from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import dsl_user_op
@@ -34,11 +34,9 @@ from .shared import f32_literal, ldsm
 # -------------------------------------------------------------------------------- MMA and descriptors
 @dsl_user_op
 def mma_pv_quarters_branch(c, p, vaddrs, mask, *, loc=None, ip=None):
-    """64 f32 c (the O words; tied to the results), 16 i32 words p (the packed P), 8 i32 shared addresses vaddrs (the
-    V row of the lane per channel group), i32 mask -> 64 f32: the PV of the 32-key quarters whose bit is set in mask,
-    each behind a warp-uniform indexed branch (brx.idx.uni) that skips the quarter's V loads and MMAs. A quarter is
-    eight ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8, each four channel tiles ahead of its MMAs, and sixteen
-    mma.sync.aligned.kind::f8f6f4.m16n8k32 (E4M3 x E4M3, f32 accumulation)."""
+    """Add to the O words c (tied to the results) the PV of the 32-key quarters of P whose bit is set in mask.
+    Each quarter is behind a warp-uniform indexed branch (brx.idx.uni) that skips its V loads and MMAs: eight ldmatrix
+    (vaddrs: the V row of the lane per channel group), each four channel tiles ahead of its sixteen E4M3 MMAs."""
     # $0 .. $63: the O words; then the operands p, vaddrs and mask
     pi, vaddri, maski = 64, 80, 88
     body = ["{", ".reg .b32 v<32>, index;"]
@@ -85,11 +83,11 @@ def mma_pv_quarters_branch(c, p, vaddrs, mask, *, loc=None, ip=None):
 
 @dsl_user_op
 def mma_means_branch(o, b, addr, idx, *, loc=None, ip=None):
-    """64 f32 o (the O words; tied to the results), four i32 words b (the BF16 block sums of the first and of the second
-    step, of query n-tile 0, then of n-tile 1), i32 shared address addr, i32 idx -> 64 f32: the means term of a step
-    pair when idx is 1, behind one warp-uniform indexed branch (brx.idx.uni; idx 0 skips the loads and the MMAs of the
-    pair). Eight ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 of the v_mean rows of the pair (channel tile ct at
-    (addr ^ 32 (ct % 4)) + 1024 (ct / 4)), then sixteen mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32."""
+    """Add to the O words o (tied to the results) the means term of a step pair when idx is 1, behind an indexed branch.
+
+    * b: the BF16 block sums of the first and of the second step, of query n-tile 0, then of n-tile 1.
+    * addr: the v_mean rows of the pair; channel tile ct is loaded at (addr ^ 32 (ct % 4)) + 1024 (ct / 4).
+    """
     # $0 .. $63: the O words; then the operands b, addr and idx
     bi, addri, idxi = 64, 68, 69
     body = [
@@ -130,8 +128,7 @@ def mma_means_branch(o, b, addr, idx, *, loc=None, ip=None):
 # -------------------------------------------------------------------------------- Conversions and packed arithmetic
 @dsl_user_op
 def compare(a, b, op: str, dtype, *, loc=None, ip=None):
-    """a, b of class dtype -> i32 1 when a <op> b, else 0, for an op of setp ("gt", "lt"): setp.<op>.f32 for Float32,
-    setp.<op>.s32 for Int32, then selp.s32; no side effects."""
+    """Return 1 when a <op> b, else 0, for an op of setp ("gt", "lt") and dtype Float32 or Int32; no side effects."""
     return asm(
         "{\n.reg .pred p;\nsetp."
         + f"{op}.{'f32' if dtype is Float32 else 's32'}"
@@ -146,8 +143,7 @@ def compare(a, b, op: str, dtype, *, loc=None, ip=None):
 
 @dsl_user_op
 def lane_zero(sc, lane, *, loc=None, ip=None):
-    """f32 sc, i32 lane -> i32 (the sign bit of sc) & lane (mov.b32, shr.u32 by 31, and.b32); no side effects. The
-    value is 0 on every lane, since score_scale is positive; it is computed per lane at run time."""
+    """Return (sign bit of sc) & lane at run time: 0 on every lane, since score_scale is positive; no side effects."""
     return asm(
         "{\n.reg .b32 t;\nmov.b32 t, $1;\nshr.u32 t, t, 31;\nand.b32 $0, t, $2;\n}",
         [f32(sc), i32(lane)],
@@ -160,9 +156,7 @@ def lane_zero(sc, lane, *, loc=None, ip=None):
 
 @dsl_user_op
 def stage_next(sk, ph, stages: int, *, loc=None, ip=None):
-    """i32 sk, ph -> two i32: sk + 1, or 0 when that equals `stages` (add.s32, setp.eq.s32, selp.b32), and ph, flipped
-    (xor.b32 with 1) on that wrap; no side effects. The ring stage after sk (0 .. stages - 1) and the full-barrier
-    parity of its next use."""
+    """Return the ring stage after sk and its full-barrier parity ph, flipped when the stage wraps; no side effects."""
     return asm(
         "{\n.reg .pred w;\n.reg .b32 t, f;\nadd.s32 t, $2, 1;\nsetp.eq.s32 w, t, %d;\n"
         "selp.b32 $0, 0, t, w;\nxor.b32 f, $3, 1;\nselp.b32 $1, f, $3, w;\n}" % stages,
@@ -175,18 +169,18 @@ def stage_next(sk, ph, stages: int, *, loc=None, ip=None):
 
 
 def _landed_bits(t):
-    """The f16 bit pattern of 2^t, which a score that lands on 2^t has as its f32 bits: SUBNORMAL_ULPS per log2 unit
-    above the f16 exponent bias."""
+    """Return the f16 bit pattern of 2^t, which a score that lands on 2^t has as its f32 bits."""
     return int((15 + t) * SUBNORMAL_ULPS)
 
 
 # the blocks of the softmax (fp8pv/softmax.py, fp8pv/small.py), down to expcast_transpose4
 @dsl_user_op
 def expcast_guard(sc, anchor0, anchor1, *, loc=None, ip=None):
-    """f32 sc, anchor0, anchor1 -> i32 warp-uniform landing path of land_pack (vote.sync.any.pred), valid until either
-    anchor changes: 1, the exact two-FMA path, if on any lane sc * 2^-139 (mul.rn.f32) is not exact on the f32
-    subnormal grid or an anchor is infinite or NaN; else 0, the path of one FMA per pair, which needs that multiplier
-    exact (sc a multiple of 2^-10, as the power-of-two scales of the preparation are) and finite anchors."""
+    """Return the warp-uniform landing path of land_pack, valid until either anchor changes.
+
+    * 1, the exact two-FMA path: on some lane sc * 2^-139 is not exact on the subnormal grid or an anchor is not finite.
+    * 0, one FMA per pair: it needs the multiplier exact (sc a multiple of 2^-10, as the scales of the preparation are).
+    """
     sci, m0i, m1i = 1, 2, 3
     return asm(
         "{\n.reg .f32 a, r, a0, a1;\n.reg .pred bad, b0, b1, wb;\n"
@@ -212,12 +206,13 @@ def expcast_guard(sc, anchor0, anchor1, *, loc=None, ip=None):
 
 @dsl_user_op
 def land_pack(acc, sc, anchor0, anchor1, path, *, loc=None, ip=None):
-    """64 f32 scores acc[n][e], f32 sc, anchor0, anchor1, i32 path (warp-uniform, taken by brx.idx.uni) -> 32 i32 words
-    of two u16; no side effects. The scores of the tile of the warp landed on the f32 subnormal grid (fma.rn.f32x2: the
-    f16 pattern of 2^t, t = s - anchor + T, T = RESCALE_THRESHOLD) and packed by pairs of n-tiles
-    (cvt.pack.sat.u16.s32): x[8 i + 2 e + j] = f16x2 of (n-tile 4 i + 2 j, 4 i + 2 j + 1) at element e, saturating
-    (t < -15, -inf -> +0; overflow and NaN -> 0xFFFF). Path 0: one FMA per score (exact multiplier); path 1: d = x sc -
-    anchor, then a second FMA."""
+    """Return the scores of the tile of the warp landed on the f32 subnormal grid and packed by pairs; no side effects.
+
+    * Landing: the f16 pattern of 2^t, t = s - anchor + T, T = RESCALE_THRESHOLD. The warp-uniform path picks one FMA
+      per score (0, exact multiplier) or d = x sc - anchor and a second FMA (1).
+    * Pack: x[8 i + 2 e + j] = f16x2 of (n-tile 4 i + 2 j, 4 i + 2 j + 1) at element e, saturating (t < -15 and -inf
+      -> +0; overflow and NaN -> 0xFFFF).
+    """
     inputs = [acc[n][e] for n in range(16) for e in range(4)] + [sc, anchor0, anchor1]
     # $0 .. $31: the packed words; then the operands: the scores, sc, the anchors and path
     acci, sci, m0i, m1i, pathi = 32, 96, 97, 98, 99
@@ -289,11 +284,13 @@ def land_pack(acc, sc, anchor0, anchor1, path, *, loc=None, ip=None):
 
 @dsl_user_op
 def landed_flags(xs, *, loc=None, ip=None):
-    """32 i32 words xs of two u16 (the landed tile of land_pack) -> i32 warp-uniform flags from their maximum (a
-    max.u16x2 tree, vote.sync.any.pred and vote.sync.all.pred). Bit 0: on some lane a landed score exceeds the f16
-    pattern of 2^(2 T) (t > 2 T, that is s > anchor + T, T = RESCALE_THRESHOLD), is saturated or is NaN: the anchor may
-    have to move, so the exact tile max decides. Bit 1, exclusive with bit 0: every landed value is at most 2^-10 (f16
-    0x1400), which E4M3 rounds to zero: the P of the tile, its block sums and its row-sum terms are all zero."""
+    """Return the warp-uniform flags of a landed tile (land_pack), from the maximum of its values.
+
+    * Bit 0: on some lane a landed score exceeds the f16 pattern of 2^(2 T) (t > 2 T, that is s > anchor + T,
+      T = RESCALE_THRESHOLD), is saturated or is NaN. The anchor may have to move, so the exact tile max decides.
+    * Bit 1, exclusive with bit 0: every landed value is at most 2^-10 (f16 0x1400), which E4M3 rounds to zero: the P
+      of the tile, its block sums and its row-sum terms are all zero.
+    """
     xi = 1
     body = ["{", ".reg .b32 m<31>, t, u;", ".reg .pred p, wp, z, wz;"]
     vals = [f"${xi + k}" for k in range(32)]
@@ -322,7 +319,7 @@ def landed_flags(xs, *, loc=None, ip=None):
 
 
 def _block_sums_decl():
-    """PTX declarations of the registers of _block_sums_ptx, for the block that holds its lines."""
+    """Return the PTX declarations of the registers of _block_sums_ptx, for the block that holds its lines."""
     return [
         ".reg .b32 bs_u, bs_k, bs_s, bs_r, bs_t, bs_z<4>;",
         ".reg .b16 bs_l, bs_h;",
@@ -332,9 +329,12 @@ def _block_sums_decl():
 
 
 def _block_sums_ptx(y, outs, qsel):
-    """PTX lines of the quad reduce-scatter of the 16-key block sums: y[4 r + i] holds this lane's partial sums (f16x2)
-    of blocks 2 i (low) and 2 i + 1 (high) of row r; lane q of the quad ends with the full sums of blocks 2 q, 2 q + 1
-    of row r as a BF16 pair in outs[r]: the B fragment (k = 2 q, 2 q + 1) of the means MMA for query n-tile r."""
+    """Return the PTX lines of the quad reduce-scatter of the 16-key block sums.
+
+    * y[4 r + i]: the partial sums of this lane (f16x2) of blocks 2 i (low) and 2 i + 1 (high) of row r.
+    * outs[r]: lane q of the quad ends with the full sums of blocks 2 q, 2 q + 1 of row r as a BF16 pair, the B
+      fragment (k = 2 q, 2 q + 1) of the means MMA for query n-tile r.
+    """
     body = [
         f"and.b32 bs_u, {qsel}, 2;",
         "setp.ne.u32 bs_p1, bs_u, 0;",
@@ -365,13 +365,14 @@ def _block_sums_ptx(y, outs, qsel):
 
 @dsl_user_op
 def land_finish(xs, l0, l1, qsel, *, loc=None, ip=None):
-    """32 i32 words xs of two f16 (the landed tile of land_pack), f32 l0, l1 (the row sums; tied to their results), i32
-    qsel -> 16 i32 words of four E4M3 bytes, the two f32 sums, two i32 words of two BF16 and an i32 mask. The B words of
-    the PV, P[4 i + e] (bytes: n-tiles 4 i .. 4 i + 3 at element e), by cvt.rn.satfinite.e4m3x2.f16x2; the row sums
-    with those of that quantized P added (E4M3 pairs back to f16x2, exact; f16x2 trees per row grouped by 16-key
-    block, added to the f32 sums); the block sums of the means MMA (the per-block nodes of the trees through the quad
-    reduce-scatter of _block_sums_ptx, BF16 pairs); and the warp OR (redux.sync.or.b32) of the 4-bit mask of the
-    quarters with a nonzero byte."""
+    """Return the E4M3 P of a landed tile (land_pack), its row sums, its block sums and its quarter mask.
+
+    * P[4 i + e]: the B words of the PV, n-tiles 4 i .. 4 i + 3 at element e.
+    * Row sums (l0, l1, tied to their results): those of that quantized P are added. The E4M3 pairs go back to f16x2
+      (exact) into f16x2 trees per row, grouped by 16-key block.
+    * Block sums of the means MMA, BF16 pairs: the per-block nodes of the trees through _block_sums_ptx.
+    * Mask: the warp OR of the 4-bit mask of the quarters with a nonzero byte.
+    """
     # $0 .. $15: the P words; then the results: the sums (li), the block sums (bsi) and the mask; then the operands:
     # xs (xi) and, behind the two tied sums, qsel
     li, bsi, maski, xi, qseli = 16, 18, 20, 21, 55
@@ -437,9 +438,7 @@ def land_finish(xs, l0, l1, qsel, *, loc=None, ip=None):
 
 @dsl_user_op
 def block_sums_of_p(P, qsel, *, loc=None, ip=None):
-    """16 i32 words P of four E4M3 bytes, i32 qsel -> two i32 words of two BF16: the B fragments of the means MMA, the
-    sums of P over the 16-key blocks 2 q and 2 q + 1 of each of the two rows (cvt.rn.f16x2.e4m3x2, add.rn.f16x2, the
-    quad reduce-scatter of _block_sums_ptx)."""
+    """Return the B fragments of the means MMA: the BF16 sums of P over the 16-key blocks 2 q, 2 q + 1 per row."""
     # $0, $1: the block sums; then the operands P and qsel
     pi, qseli = 2, 18
     body = ["{", ".reg .b16 hl, hh;", ".reg .b32 a, b, y<8>;"] + _block_sums_decl()
@@ -472,10 +471,11 @@ def block_sums_of_p(P, qsel, *, loc=None, ip=None):
 
 @dsl_user_op
 def packed_pv_needed(P, v_nan, *, loc=None, ip=None):
-    """16 i32 words P, i32 v_nan -> i32 warp-uniform 1 if any of the 17 operands is nonzero on any lane (a lop3.b32 OR
-    tree, vote.sync.any.pred), else 0: whether the tile needs its PV MMAs, for a nonzero packed P byte or for v_nan,
-    the flag of a non-finite value in the V or the v_mean of the head (rebuilt from V every call). An E4M3 NaN of
-    either sign in P counts: skipping 0 * NaN would change the propagation."""
+    """Return warp-uniform 1 if a word of P or v_nan is nonzero on any lane, else 0: whether the tile needs its PV MMAs.
+
+    * v_nan: the flag of a non-finite value in the V or the v_mean of the head (rebuilt from V every call).
+    * An E4M3 NaN of either sign in P counts: skipping 0 * NaN would change the propagation.
+    """
     pi, vnani = 1, 17
     body = ["{", ".reg .b32 u<8>;", ".reg .pred p, wp;"]
     for i in range(5):
@@ -501,14 +501,15 @@ def packed_pv_needed(P, v_nan, *, loc=None, ip=None):
 
 @dsl_user_op
 def expcast_transpose4(acc, base: int, sc, anchor0, anchor1, sum0, sum1, *, loc=None, ip=None):
-    """16 f32 scores acc[base .. base + 3], f32 sc, anchor0, anchor1, f32 sum0, sum1 (the row sums of rows g and g + 8;
-    tied to their results) -> four i32 words of four E4M3 bytes and the two f32 sums; no side effects. Four n-tiles of
-    I-ExpCast on the bit grid of FP32, packed directly as P^T: d = fma(s, sc, -anchor) in one rounding, so that one
-    path serves every positive score scale; (d + 127 + T) 2^23 converted to u32 (cvt.rzi.u32.f32) is the bit pattern
-    of the FP32 2^(d + T) with a linear mantissa (T = RESCALE_THRESHOLD), which cvt.rn.satfinite.e4m3x2.f32 takes
-    directly; the sums get the values of the quantized P (E4M3 back to f32, exact). The conversion to u32 clamps
-    negative values, -inf (the masked keys) and NaN to zero; the anchor is the tile max, so a finite d is at most 0 and
-    P at most 2^T: this path has no positive overflow."""
+    """Return four n-tiles (acc[base .. base + 3]) of I-ExpCast on the bit grid of FP32 as P^T words; no side effects.
+
+    * d = fma(s, sc, -anchor) in one rounding, so that one path serves every positive score scale.
+    * (d + 127 + T) 2^23 converted to u32 is the bit pattern of the FP32 2^(d + T) with a linear mantissa
+      (T = RESCALE_THRESHOLD), which cvt.rn.satfinite.e4m3x2.f32 takes directly.
+    * The conversion clamps negative values, -inf (the masked keys) and NaN to zero. The anchor is the tile max, so a
+      finite d is at most 0 and P at most 2^T: no positive overflow on this path.
+    * sum0, sum1 (rows g, g + 8; tied to their results) get the values of the quantized P (E4M3 back to f32, exact).
+    """
     inputs = [acc[base + n][e] for n in range(4) for e in range(4)] + [sc, anchor0, anchor1]
     # $0 .. $3: the P words; then the results sumi (the sums); then the operands: the scores, sc and the anchors
     sumi, acci, sci, m0i, m1i = 4, 6, 22, 23, 24
@@ -562,15 +563,13 @@ def expcast_transpose4(acc, base: int, sc, anchor0, anchor1, sum0, sum1, *, loc=
 # -------------------------------------------------------------------------------- Memory access
 @dsl_user_op
 def ldsm_b8_x2_trans(addr, x=None, off=0, *, loc=None, ip=None):
-    """i32 shared address addr (the row address of the lane), optionally Python ints x and off -> four i32 words by
-    ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 at addr, or at (addr ^ x) + off with x (see ldsm): two 16x16 8-bit
-    matrices, transposed, the rows of matrix 0 from lanes 0-15 and of matrix 1 from lanes 16-31."""
+    """As ldsm_b16_x4_trans for bytes (m16n16.x2.trans.shared.b8): two 16x16 matrices, rows of lanes 0-15 and 16-31."""
     return ldsm("m16n16.x2.trans.shared.b8", addr, x, off, loc, ip)
 
 
 @dsl_user_op
 def st_global_cs_b32_pred(addr, x, pred, *, loc=None, ip=None):
-    """i64 global address, u32 x, i32 pred: st.global.cs.b32 (streaming) when pred != 0."""
+    """Store u32 x at the i64 global address addr by st.global.cs.b32 (streaming) when i32 pred != 0."""
     asm(
         "{ .reg .pred q; setp.ne.s32 q, $2, 0; @q st.global.cs.b32 [$0], $1; }",
         [i64(addr), u32(x), i32(pred)],
@@ -582,7 +581,7 @@ def st_global_cs_b32_pred(addr, x, pred, *, loc=None, ip=None):
 
 @dsl_user_op
 def st_global_cs_b32_v2_pred(addr, x, y, pred, *, loc=None, ip=None):
-    """i64 global address, u32 x, y, i32 pred: st.global.cs.v2.b32 (8 bytes, streaming) when pred != 0."""
+    """Store u32 x, y (8 bytes) at the i64 global address addr by st.global.cs.v2.b32 (streaming) when i32 pred != 0."""
     asm(
         "{ .reg .pred q; setp.ne.s32 q, $3, 0; @q st.global.cs.v2.b32 [$0], {$1, $2}; }",
         [i64(addr), u32(x), u32(y), i32(pred)],
@@ -594,9 +593,7 @@ def st_global_cs_b32_v2_pred(addr, x, y, pred, *, loc=None, ip=None):
 
 @dsl_user_op
 def atom_add_shared_u32_lane0(addr, lane, *, loc=None, ip=None):
-    """i32 shared address, i32 lane -> i32: on lane 0, atom.acq_rel.cta.shared::cta.add.u32 of 1 (the atomic is
-    predicated), returning the old value; 0 on the other lanes. The caller passes addr with the per-lane value of
-    lane_zero added (0 on every lane)."""
+    """On lane 0 add 1 to the shared u32 at addr (plus the caller's lane_zero) and return the old value; 0 elsewhere."""
     return asm(
         "{\n.reg .pred p;\nsetp.eq.s32 p, $2, 0;\nmov.u32 $0, 0;\n"
         "@p atom.acq_rel.cta.shared::cta.add.u32 $0, [$1], 1;\n}",

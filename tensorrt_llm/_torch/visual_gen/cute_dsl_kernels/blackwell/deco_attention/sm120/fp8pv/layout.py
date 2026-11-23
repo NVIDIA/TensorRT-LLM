@@ -12,21 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared-memory layout of the sm_120 FP8-PV attention kernel: the stages of its TMA ring, the key order of a tile and
-the per-lane addresses of the B fragments.
+"""Shared-memory layout of the sm_120 FP8-PV attention kernel: ring stages, key order, per-lane B-fragment addresses.
 
-A stage holds what one MMA phase reads: K' of a key tile as three 32-byte atom columns (64 channels each, the three
-k-steps of the QK MMA over the 192 channels of Q' and K'; 32-byte TMA swizzle), V of the tile before it (128 keys x
-128 bytes, 128-byte swizzle) and the three scale atoms of K'. After the stages come two buffers of v_mean rows, one
-per pair of steps (two tiles of 8 rows x 256 bytes, 128-byte swizzle within each 1 KB half); the rows of an unpaired
-last step go to the K' region of its stage, which that phase leaves unread. The swizzles keep every ldmatrix and
-scale-word read free of bank conflicts.
-
-Key order. The MMAs take the 128 keys of a tile as four quarters of 32 keys, and n-tile s of a quarter covers the
-keys 8 key_grp(s) + (column ^ key_rot(s)): n-tiles 0 and 2 hold the quarter's first 16-key block and 1 and 3 its
-second, so every f16x2 pair of P that the softmax packs (n-tiles 2j, 2j + 1) holds one key of either block, and the
-block sums of the means MMA fall out of the row-sum tree. The same permutation addresses the K' rows and scale words
-of the QK and the V rows of the PV, so the S fragments become PV fragments without shuffles."""
+Stage, what one MMA phase reads; the swizzles keep every ldmatrix and scale-word read free of bank conflicts:
+    * K' of a key tile as three 32-byte atom columns (64 channels each, the three k-steps of the QK MMA over the 192
+      channels of Q' and K'; 32-byte TMA swizzle), with its three scale atoms.
+    * V of the tile before it: 128 keys x 128 bytes, 128-byte swizzle.
+After the stages:
+    * Two buffers of v_mean rows, one per pair of steps: two tiles of 8 rows x 256 bytes, 128-byte swizzle within
+      each 1 KB half. The rows of an unpaired last step go to the K' region of its stage, which that phase leaves
+      unread.
+Key order:
+    * The MMAs take the 128 keys of a tile as four quarters of 32 keys; n-tile s of a quarter covers the keys
+      8 key_grp(s) + (column ^ key_rot(s)).
+    * n-tiles 0 and 2 hold the first 16-key block of the quarter, 1 and 3 its second: every f16x2 pair of P that the
+      softmax packs (n-tiles 2j, 2j + 1) holds one key of either block, and the block sums of the means MMA fall out
+      of the row-sum tree.
+    * The same permutation addresses the K' rows and scale words of the QK and the V rows of the PV, so the S
+      fragments become PV fragments without shuffles.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -66,21 +70,17 @@ LEN_BYTES = 16
 
 
 def key_rot(s):
-    """The key rotation of row group s of a 32-key step, 0, 3, 4, 7: column n of QK n-tile (s, i) is key
-    32 i + 8 key_grp(s) + (n ^ key_rot(s)), which keeps the ldmatrix and scale-word reads bank-conflict free."""
+    """Return the key rotation of n-tile s of a 32-key quarter: 0, 3, 4, 7 (Key order of the module docstring)."""
     return (s & 1) * 3 + (s >> 1) * 4
 
 
 def key_grp(s):
-    """The 8-key group of n-tile s within its 32-key quarter, 0, 2, 1, 3: n-tiles 0 and 2 hold the quarter's first
-    16-key block, 1 and 3 its second, so each f16x2 pair of P (n-tiles 2j, 2j + 1) holds one key of either block."""
+    """Return the 8-key group of n-tile s within its 32-key quarter: 0, 2, 1, 3 (Key order of the module docstring)."""
     return (s & 1) * 2 + (s >> 1)
 
 
 def lane_offsets(lane):
-    """Per-lane shared-memory offsets of the B-fragment loads (keys of n-tile s of a quarter: 8 key_grp(s) +
-    (column ^ key_rot(s))): the K' rows of the even and odd n-tile pairs, the K' scale words, the V row, and the
-    v_mean rows [of the two channel halves of an unpaired step, of a step pair]."""
+    """Return the per-lane offsets of the B-fragment loads in a stage: K' rows, K' scale words, V row, v_mean rows."""
     q = lane & 3
     g = lane >> 2
     # K' ldmatrix.x4 of n-tile pair p: matrix m = lane / 8 is n-tile 2p + m / 2, k-chunk m % 2; row = lane % 8; each
@@ -105,9 +105,9 @@ def lane_offsets(lane):
     # swizzle within each 1 KB half: chunk ^= row)
     vr = lane & 7
     vm0 = vr * 128 + ((m ^ vr) * 16)
-    # the pair layout: matrix m = lane / 8 is slot m / 2 (the pair's first or second step), channels 8 (m % 2) .. + 7
-    # of the tile, block row lane % 8: one ldmatrix.x4.trans is the m16n8k16 A fragment of a 16-channel tile (tile
-    # 4 hf + j at (buffer + vmp) ^ 32 j + 1024 hf)
+    # v_mean of a step pair: matrix m = lane / 8 is slot m / 2 (first or second step), channels 8 (m % 2) .. + 7 of a
+    # 16-channel tile, block row lane % 8. One ldmatrix.x4.trans is the m16n8k16 A fragment of such a tile: tile
+    # 4 hf + j is at (buffer + vmp) ^ 32 j + 1024 hf.
     vmp = (m >> 1) * VM_BYTES + vr * 128 + (((m & 1) ^ vr) * 16)
     vmoff = [vm0, vm0 ^ 64, vmp]
     return koff_e, koff_o, sfoff, voff, vmoff
@@ -116,9 +116,7 @@ def lane_offsets(lane):
 def make_tma_views(
     sp, tma_atom_k, tma_k, tma_atom_v, tma_v, tma_atom_s, tma_s, tma_atom_m, tma_m, hh, bb
 ):
-    """TMA views of a CTA: the K', V, K' scale and v_mean tiles of its (batch, head) in global memory and their
-    places in the shared memory at sp (the stages, the pair buffers of v_mean and, for an unpaired last step, the K'
-    region of a stage), with the stages' full barriers: the tma tuple the ring's copies take."""
+    """Return the tma tuple of the ring copies: per operand its atom, global and shared views; then the barriers."""
     sK = cute.make_tensor(
         sp,
         cute.make_composed_layout(

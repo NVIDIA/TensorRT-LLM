@@ -12,17 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Q'/K' pass of the sm_120 preparation: per 16-token warp tile, the Hadamard rotation, NVFP4 of the 8 body blocks,
-the projections of q1 (the dequantized body) and dq (its quantization residual) on the basis U (their A fragments
-come from the accumulators of the rotation), NVFP4 of the 4 compensation blocks; codes through a per-warp smem stage,
-provisional (unencoded) block scales as BF16 in the final atom layout, per-CTA group maxima (the encode launch turns
-them into the group scales and the UE4M3 bytes).
+"""Q'/K' pass of the sm_120 preparation: rotation, NVFP4 body and compensation channels, per 16-token warp tile.
 
-A fragments come straight from 8-byte global loads: k-step a (16 channels 16a..16a+15) maps logical k = 2t + e to
-channel 16a + 4t + e and k = 2t + 8 + e to channel 16a + 4t + 2 + e, for both the general rotation (B fragments of
-Hd from smem) and the fast path. Fast path (Hd verified on device to be diag(s) x Sylvester H128 = H8 (x) H16): one
-MMA per 16-channel block against diag(s_a) H16 (= Hd[16a.., 0..15]), then an 8-point FWHT across the blocks in
-registers (every thread holds the same in-block positions of all eight blocks)."""
+* Per tile: the Hadamard rotation, NVFP4 of the 8 body blocks, the projections of q1 (the dequantized body) and dq
+  (its quantization residual) on the basis U (their A fragments come from the accumulators of the rotation), NVFP4
+  of the 4 compensation blocks.
+* Outputs: codes through a per-warp smem stage, provisional (unencoded) block scales as BF16 in the final atom
+  layout, per-CTA group maxima (the encode launch turns them into the group scales and the UE4M3 bytes).
+* A fragments come straight from 8-byte global loads: k-step a (16 channels 16a..16a+15) maps logical k = 2t + e to
+  channel 16a + 4t + e and k = 2t + 8 + e to channel 16a + 4t + 2 + e, for both the general rotation (B fragments of
+  Hd from smem) and the fast path.
+* Fast path (Hd verified on device to be diag(s) x Sylvester H128 = H8 (x) H16): one MMA per 16-channel block against
+  diag(s_a) H16 (= Hd[16a.., 0..15]), then an 8-point FWHT across the blocks in registers (every thread holds the
+  same in-block positions of all eight blocks).
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -161,8 +164,7 @@ def qk_kernel(
 
     if tid == 0:
         cute.arch.store(sptr(Uint32, flag), Uint32(1))
-    # Hd^T into smem: row j (output channel), 8-byte slot c/4 of input channels (c = input channel), slot ^ 4 (j & 3);
-    # check Hd == diag(s) x Sylvester (s = column 0)
+    # Hd^T into smem (row j = output channel, slot (c / 4) ^ 4 (j & 3) for input channel c); check Hd == diag(s) x H128
     ok = Uint32(1)
     for it in cutlass.range_constexpr(8):
         idx = it * QK_THREADS + tid  # 2048 chunks of 8 output channels
@@ -271,7 +273,6 @@ def qk_kernel(
             afn[4 * a + 1] = wa[1]
             afn[4 * a + 2] = wb[0]
             afn[4 * a + 3] = wb[1]
-        # with lengths: a tile whose tokens are all past the length of its batch element is skipped
         live = cutlass.const_expr(lens_p is None) or tile * 128 < valid_len(lens_p, bb, S)
         if live:
             if bhs != cur:
@@ -406,7 +407,6 @@ def qk_kernel(
                         "evict_last",
                     )
             cute.arch.sync_warp()
-    # group maxima of this CTA
     for i in cutlass.range_constexpr(6):
         mv = warp_max(gm[i])
         if lane == 0:

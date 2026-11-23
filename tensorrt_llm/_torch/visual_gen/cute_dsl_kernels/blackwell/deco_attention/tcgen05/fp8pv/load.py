@@ -14,11 +14,12 @@
 # limitations under the License.
 """Load warp of the attention kernel: the TMA loads of a work tile's Q' tiles, of the K/V ring and of the v_mean rows.
 
-A ring slot holds K'(i) with its scale factors and V(i-1): the QK of KV tile i and the PV of tile i - 1 are issued in
-the same step of the MMA warp, so both operands arrive on one barrier (the first slot of a work tile has only K', and
-a last slot only V). K', its scale factors and V are multicast to both CTAs of a cluster. The v_mean rows of a batch
-of vs_tiles KV tiles go to a ring of two stages of the means MMA's B operand and complete on the barrier of the K/V
-slot they are loaded with."""
+* A ring slot holds K'(i) with its scale factors and V(i-1): the QK of KV tile i and the PV of tile i - 1 are issued
+  in the same step of the MMA warp, so both operands arrive on one barrier (the first slot of a work tile has only
+  K', and a last slot only V). K', its scale factors and V are multicast to both CTAs of a cluster.
+* The v_mean rows of a batch of vs_tiles KV tiles go to a ring of two stages of the means MMA's B operand and
+  complete on the barrier of the K/V slot they are loaded with.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -32,8 +33,7 @@ from .mma import MEANS_TILER
 
 @cute.jit
 def poll_slot(producer, empty_ptr, sleep_ns: cutlass.Constexpr):
-    """Wait for the producer's next free ring slot by try_wait probes with a fixed nanosleep between them, instead
-    of the pipeline's blocking wait."""
+    """Wait for the producer's next free slot by try_wait probes sleep_ns apart, not the pipeline's blocking wait."""
     state = producer._PipelineProducer__state
     bar = empty_ptr + state.index
     done = cutlass.select_(cute.arch.mbarrier_try_wait(bar, state.phase), Int32(1), Int32(0))
@@ -60,9 +60,7 @@ class LoadRole:
     def load_warp(
         self, qk_args, v_args, vm_args, pipeline_args, cluster_args, sched_args, n_kv_tiles, tidx
     ):
-        """The load warp over its work tiles. qk_args, v_args: the TMA atoms, global tensors and shared-memory stages
-        of Q' / K' and of V; vm_args: those of the v_mean ring, the shared address of the means B operand and the
-        ring's empty barriers; pipeline_args: the Q and K/V producers and the K/V ring's empty barriers."""
+        """The load warp over its work tiles; the operands are those of kernel._run_load_warp."""
         (
             tma_atom_q,
             mQ_qdl,
@@ -90,8 +88,7 @@ class LoadRole:
             cute.group_modes(gVM, 0, 2),
         )
         vm_load = (tma_atom_vm, tVMgVM, tVMsVM, vm_empty)
-        # the TMA fills K rows 0..vs_rows - 1 of a B stage: the others stay zero (K slots the A operand leaves
-        # zero)
+        # the TMA fills K rows 0..vs_rows - 1 of a B stage: the others stay zero (K slots the A operand leaves zero)
         z = Int32(0)
         half = 64 * MEANS_TILER[2] * 2  # bytes of a 64-channel atom of a stage
         for st in cutlass.range_constexpr(2):
@@ -192,6 +189,7 @@ class LoadRole:
                         k_handle.barrier,
                     )
                 kv_coord += 1
+            # the last V (a slot with only V)
             self.poll_empty(load_kv_producer, kv_empty_ptr)
             v_handle = load_kv_producer.acquire_and_advance(
                 True, expected_tx=self.tma_copy_v_bytes + self.tma_copy_vm_bytes
@@ -219,8 +217,7 @@ class LoadRole:
 
     @cute.jit
     def poll_empty(self, producer, empty_ptr):
-        """Wait for the producer's next free slot. With load_sleep_ns = 0 by test_wait (spin_slot); otherwise by
-        try_wait probes with a fixed nanosleep between them (poll_slot)."""
+        """Wait for the producer's next free slot: spin_slot with load_sleep_ns = 0, poll_slot otherwise."""
         if cutlass.const_expr(self.load_sleep_ns == 0):
             spin_slot(producer, empty_ptr)
         else:
@@ -228,9 +225,11 @@ class LoadRole:
 
     @cute.jit
     def load_vm(self, vm_load, par, batch, head, bar):
-        """TMA of the v_mean rows of means batch `batch` (head coordinate `head`) into ring stage batch % 2, once the
-        means MMAs of the batch before in that stage released it (par: the stages' wait parities), completing on the
-        K/V slot barrier `bar` (whose expected bytes include it); returns par with the stage's bit flipped."""
+        """TMA of the v_mean rows of means batch `batch` (head coordinate `head`) into ring stage batch % 2.
+
+        Issued once the means MMAs of the batch before in that stage released it (par: the stages' wait parities);
+        completes on the K/V slot barrier `bar`, whose expected bytes include it. Returns par, the stage's bit flipped.
+        """
         tma_atom_vm, tVMgVM, tVMsVM, vm_empty = vm_load
         stage = batch & 1
         cute.arch.mbarrier_wait(vm_empty + stage, (par >> stage) & 1)

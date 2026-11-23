@@ -12,9 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inputs of the DeCo preparation besides q, k and v, the same for every kernel family: the sampled tokens whose q
-and k rows estimate the compensation basis (1/256 of the sequence, at least twice the rank; on packed multimodal
-sequences half of them from the text and audio tokens) and the sign-randomized Hadamard rotation of Q and K. Both
+"""Inputs of the DeCo preparation besides q, k and v, the same for every kernel family: sample_rows and hadamard. Both
 are built on first use and kept: the rows per sequence length, rank and device, the rotation per device. Building them
 is not capturable, so a first use under CUDA graph capture raises: a capture follows one eager call of the shape."""
 
@@ -26,12 +24,12 @@ from .constants import DEFAULT_RANK, HEAD_DIM, SAMPLE_FRAC
 
 
 def sample_count(s, rank=DEFAULT_RANK):
-    """The number of sampled tokens for a sequence of s tokens and a basis of `rank` directions."""
+    """Return the number of sampled tokens for a sequence of s tokens and a basis of `rank` directions."""
     return max(s // SAMPLE_FRAC, 2 * rank)
 
 
 def _indexed(device):
-    """The device with its index ("cuda" means the current CUDA device), so that cached tensors stay per device."""
+    """Return the device with its index ("cuda": the current CUDA device), so that cached tensors stay per device."""
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
         return torch.device("cuda", torch.cuda.current_device())
@@ -48,15 +46,16 @@ def _not_under_capture(device, what):
 
 
 def sample_rows(s, device="cuda", token_tags=None, rank=DEFAULT_RANK):
-    """int32 indices of the tokens that estimate the compensation basis of `rank` directions: the default draw (a
-    permutation from a CUDA generator seeded 0), so every call on the same sequence length and rank uses the same
-    tokens (built once per length, rank and device). token_tags (integer [s]) marks the modality of every token of a
-    packed multimodal sequence: 0 video, positive text or audio, negative padding (never drawn). With it, the draw
-    takes half its rows from the text and audio tokens and the rest from the video tokens, so both groups weigh
-    equally in the basis where the video tokens would otherwise leave the others almost unsampled; a group with fewer
-    tokens than its share gives them all and the other group fills the draw. The tagged draw reads the token counts
-    back to the host and is not cached: callers keep the rows of a sequence and draw them outside CUDA graph
-    capture."""
+    """Return the default draw of the tokens that estimate the compensation basis of `rank` directions: int32 indices.
+
+    * A permutation from a CUDA generator seeded 0, built once per length, rank and device: the same tokens every call.
+    * token_tags (integer [s]) marks the modality of every token of a packed multimodal sequence: 0 video, positive
+      text or audio, negative padding (never drawn). The draw then takes half its rows from the text and audio tokens,
+      so both groups weigh equally in the basis where the video tokens would otherwise leave the others almost
+      unsampled; a group with fewer tokens than its share gives them all and the other group fills the draw.
+    * The tagged draw reads the token counts back to the host and is not cached: callers keep the rows of a sequence
+      and draw them outside CUDA graph capture.
+    """
     device = _indexed(device)
     if token_tags is None:
         return _sample_rows(s, device, rank)
@@ -82,9 +81,9 @@ def _sample_rows(s, device, rank):
 
 @functools.cache
 def hadamard(device):
-    """BF16 [HEAD_DIM, HEAD_DIM] Hadamard matrix with rows scaled by random signs (H H^T = HEAD_DIM I, exact in BF16;
-    the signs of a generator seeded 0), built once per device (its host-to-device copy synchronizes). device: that
-    of a tensor, which carries its index."""
+    """Return the rotation of Q and K: the BF16 [HEAD_DIM, HEAD_DIM] Hadamard matrix with rows scaled by random signs
+    (H H^T = HEAD_DIM I, exact in BF16; the signs of a generator seeded 0), built once per device (its host-to-device
+    copy synchronizes). device: that of a tensor, which carries its index."""
     _not_under_capture(device, "rotation matrix")
     h = torch.ones(1, 1)
     while h.shape[0] < HEAD_DIM:

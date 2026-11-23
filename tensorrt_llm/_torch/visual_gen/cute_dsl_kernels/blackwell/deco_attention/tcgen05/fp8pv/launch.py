@@ -12,15 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host entry of the attention kernel: the launch plan of a call, the scratch of its split launch and the compile
-cache.
+"""Host entry of the attention kernel: the launch plan of a call, the scratch of its split launch, the compile cache.
 
-The work units of a call are the (256-row Q block pair, head, batch) triples, one per persistent CTA at a time. The
-main launch covers the whole waves of units (a wave: one unit per SM). The units of a last partial wave run as a
-second, split launch: each is split along KV into pieces so that every SM stays busy, and the pieces are merged in
-the epilogue through scratch in global memory (epilogue.py). The split launch is a programmatic dependent of the
-main launch: it reads only the inputs and writes other rows of O. Each (device, compensation rank, cluster shape,
-launch kind) compiles once per process."""
+* Work units: the (256-row Q block pair, head, batch) triples of a call, one per persistent CTA at a time.
+* Main launch: the whole waves of units (a wave: one unit per SM).
+* Split launch: the units of a last partial wave, each split along KV into pieces so that every SM stays busy; the
+  pieces are merged in the epilogue through scratch in global memory (epilogue.py). It is a programmatic dependent
+  of the main launch: it reads only the inputs and writes other rows of O.
+* Each (device, compensation rank, cluster shape, launch kind) compiles once per process.
+"""
 
 import cutlass
 import torch
@@ -31,14 +31,14 @@ from .kernel import PingPongAttention
 
 
 def split_plan(s, h, b, sm_count):
-    """(work units, units of the main launch, KV pieces per unit of the split launch) at this shape. The main launch
-    takes the whole waves of sm_count units; the units of a last partial wave are split into as many KV pieces as
-    keep every SM busy, of at least four KV tiles each. A wave that cannot be split goes to the main launch."""
+    """Return (work units, units of the main launch, KV pieces per unit of the split launch) at this shape."""
     n_units = ((s + 255) // 256) * h * b
     n_kv = (s + 127) // 128
     n_full = (n_units // sm_count) * sm_count
     rem = n_units - n_full
     n_parts = 1
+    # the units of a last partial wave are split into as many KV pieces as keep every SM busy, of at least four KV
+    # tiles each; a wave that cannot be split goes to the main launch
     if rem > 0:
         n_parts = max(1, min(sm_count // rem, n_kv // 4))
     if n_parts == 1:
@@ -47,10 +47,11 @@ def split_plan(s, h, b, sm_count):
 
 
 def scratch(b, s, h, sm_count):
-    """The merge scratch of the split launch at this shape on a device of sm_count SMs, name -> (dtype, shape): the
-    unnormalized O rows and the (anchor, row sum) pairs of every merge slot, which the pieces write before they are
-    read, and the slots' ready flags, which must be zero when the launch starts (the merging CTAs return them to
-    zero). A merge slot is a (tail unit, KV piece, O tile) triple. Empty when the shape has no split launch."""
+    """Return the merge scratch of the split launch at this shape, name -> (dtype, shape); empty without one.
+
+    A merge slot is a (tail unit, KV piece, O tile) triple. The pieces write its unnormalized O rows and (anchor, row
+    sum) pairs before they are read; its ready flag must be zero when the launch starts (the mergers zero it again).
+    """
     n_units, n_full, n_parts = split_plan(s, h, b, sm_count)
     n_slots = (n_units - n_full) * n_parts * 2
     if not n_slots:
@@ -87,7 +88,6 @@ def _make_args(
         Int32(s),
         Int32(h),
         Int32(b),
-        # the scales stay on the device: the log2-domain softmax multiplier and v_scale are read in place
         Int64(score_scale.data_ptr()),
         Int64(v_scale.data_ptr()),
         Int32(n_valid),
@@ -102,13 +102,14 @@ def _make_args(
 
 @torch.no_grad()
 def run(buffers, o, rank, lens=None):
-    """NVFP4 Q'K' + FP8 PV attention on the operands of the preparation at compensation rank `rank` (buffers: the
-    buffers of the call, the layout of this package) into BF16 o [B, S, H, 128]. score_scale is the multiplier of the
-    raw scores in log2 units, a power of two of at least 2^softmax.MIN_SCORE_LOG2, and stays on the device like
-    v8_scale. The main launch covers the whole waves and the split launch the last partial wave. Nothing here reads a
-    device value or allocates (graph-capturable, no host sync); every launch goes to the current stream. lens: None,
-    or the int32 valid prefix lengths [B] of the preparation, read in place by the kernel variant with lengths; the
-    launch plan follows the padded sequence either way."""
+    """Run the NVFP4 Q'K' + FP8 PV attention on the operands of the preparation into BF16 o [B, S, H, 128].
+
+    * buffers: the buffers of the call, the layout of this package. score_scale is the multiplier of the raw scores
+      in log2 units, a power of two of at least 2^softmax.MIN_SCORE_LOG2, and stays on the device like v8_scale.
+    * Every launch goes to the current stream; nothing here reads a device value or allocates (graph-capturable).
+    * lens: None, or the int32 valid prefix lengths [B] of the preparation, read in place by the kernel variant with
+      lengths; the launch plan follows the padded sequence either way.
+    """
     q4, k4, q_sf, k_sf, v8, v_mean, score_scale, v8_scale = (
         buffers[n] for n in ("q4", "k4", "q_sf", "k_sf", "v8", "v_mean", "score_scale", "v8_scale")
     )
@@ -136,8 +137,7 @@ def run(buffers, o, rank, lens=None):
         )
         _get_compiled(args, dev, sm_count, rank, cluster_m, False, True, lens is not None)(*args)
     if "split_flags" in buffers:
-        # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM), merged in
-        # the epilogue
+        # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM)
         ws = (buffers["split_o"], buffers["split_ml"], buffers["split_flags"])
         args = _make_args(
             qk_ptrs,

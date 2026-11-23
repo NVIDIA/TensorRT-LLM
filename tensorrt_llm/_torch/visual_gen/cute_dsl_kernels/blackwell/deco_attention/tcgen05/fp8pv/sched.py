@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Work distribution of the attention kernel inside a launch: the static tile scheduler over (Q tile pair, head,
-batch) and the split-KV scheduler that walks the KV pieces of the units of the last partial wave (launch.py plans the
-two launches). A launch with valid prefix lengths distributes the live units, those with a query row below the length
-of their batch element: its main launch walks them through LiveTileScheduler, in the order of the static scheduler,
-and its split launch runs the KV pieces that hold a valid key."""
+"""Work distribution of the attention kernel inside a launch (launch.py plans the two launches).
+
+TileScheduler       the static tile scheduler over (Q tile pair, head, batch)
+SplitTileScheduler  the split-KV scheduler: walks the KV pieces of the units of the last partial wave
+LiveTileScheduler   the live units of a main launch with valid prefix lengths, in the order of the static scheduler
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -91,16 +92,15 @@ class TileScheduler:
 
 
 class LiveTileScheduler(TileScheduler):
-    """The scheduler of a main launch with valid prefix lengths: the CTAs share the live units of the launch as the
-    static scheduler shares all its units, the CTA at position c of the grid taking the live units c, c + grid, ...
-    in the order (batch, head, Q block pair). Batch element b of n valid tokens has the live Q block pairs
-    m < ceil(n / 256), rounded up to a multiple of `group` (2 where CTA pairs share K/V: both units of a pair are
-    then live together), in every head; the launch holds the first n_valid units of the static order, so the last
-    head it reaches may hold fewer. lens: (the global address of the lengths, the padded sequence length, group).
+    """The scheduler of a main launch with valid prefix lengths: the CTAs share the live units of the launch.
 
-    The state is the live index of the current unit with the batch element that holds it and the live index of
-    that element's first unit; start() and advance_to_next_work() move the element forward to the current unit.
-    The work tile carries the valid length of its batch element after the coordinates of the unit."""
+    * The CTA at position c of the grid takes the live units c, c + grid, ... in the order (batch, head, Q block pair).
+    * Batch element b of n valid tokens has the live Q block pairs m < ceil(n / 256), rounded up to a multiple of
+      `group` (2 where CTA pairs share K/V: both units of a pair are then live together), in every head; the launch
+      holds the first n_valid units of the static order, so the last head it reaches may hold fewer.
+    * lens: (the global address of the lengths, the padded sequence length, group). State: the live index of the
+      current unit, its batch element and that element's first live index (start, advance_to_next_work move it).
+    """
 
     def __init__(self, params, current_work_linear_idx, grid_shape, lens, batch=None, base=None):
         super().__init__(params, current_work_linear_idx, grid_shape)
@@ -121,8 +121,7 @@ class LiveTileScheduler(TileScheduler):
         )
 
     def _live(self, b):
-        """(live Q block pairs per head, heads the launch holds whole, live pairs of the head it holds in part) of
-        batch element b."""
+        """Batch element b: (live Q block pairs per head, whole heads of the launch, live pairs of its partial head)."""
         m_all, h_all, _ = self._params.problem_shape_mhb
         group = self._lens[2]
         n = self._valid_len(b)
@@ -137,7 +136,7 @@ class LiveTileScheduler(TileScheduler):
 
     @cute.jit
     def _locate(self):
-        """Moves the batch element forward until it holds the current live index (or past the last element)."""
+        """Move the batch element forward until it holds the current live index (or past the last element)."""
         b, base = self._batch, self._base
         n_batch = self._params.problem_shape_mhb[2]
         m_live, heads, m_part = self._live(b)
@@ -191,8 +190,7 @@ class LiveTileScheduler(TileScheduler):
 
 
 class SplitTileSchedParams(TileSchedParams):
-    """Work items: n_full whole (Q-block pair, head, batch) units, then the remaining (tail) units each split into
-    n_parts contiguous KV ranges, so the last wave keeps every SM busy; the split parts are merged in the epilogue."""
+    """Work items: n_full whole (Q-block pair, head, batch) units, then the tail units, each in n_parts KV ranges."""
 
     def __init__(self, problem_shape_mhb, n_full, n_parts, n_kv):
         self.problem_shape_mhb = problem_shape_mhb
@@ -205,11 +203,13 @@ class SplitTileSchedParams(TileSchedParams):
 
 
 class SplitTileScheduler(TileScheduler):
-    """lens: None, or (the global address of the valid prefix lengths, the padded sequence length): a unit of n valid
-    tokens then has the KV tiles below ceil(n / 128), its live pieces are those that hold one of them (they come
-    first, and take the place of the unit's piece count in the work tile), its last live piece ends at the last of
-    them, and the work of a piece that is not live, or of a unit without a query row below n, is not valid. The
-    work tile carries n after the coordinates."""
+    """The split-KV scheduler: the whole units, then the KV pieces of the tail units.
+
+    * lens: None, or (the global address of the valid prefix lengths, the padded sequence length). A unit of n valid
+      tokens then has the KV tiles below ceil(n / 128); its live pieces are those that hold one of them (they come
+      first, and take the place of the unit's piece count in the work tile), the last one ending at the last of them.
+    * The work of a piece that is not live, or of a unit without a query row below n, is not valid.
+    """
 
     def __init__(self, params, current_work_linear_idx, grid_shape, lens=None):
         super().__init__(params, current_work_linear_idx, grid_shape)

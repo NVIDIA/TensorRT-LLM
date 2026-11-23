@@ -17,26 +17,29 @@
 """NVFP4 QK + NVFP4 PV attention for sm_120a (RTX PRO 6000), built on the warp-level MMAs (mma.sync).
 
 One CTA per work unit (128 query rows of one (batch, head)) runs the whole key sequence, a tile of 128 keys at a time:
-S = Q' K'^T over the 192 channels of Q' and K' on the block-scaled NVFP4 MMA (kind::mxf4nvf4, m16n8k64); the online
-softmax of softmax.py (log2 units, lazy rescale at T = 4, I-ExpCast, NVFP4 P coded against its decoded block scales);
-O += P V' on the same MMA, with V' = V minus its 16-key means in V's own 128 channels (key-contiguous E2M1 codes,
-UE4M3 scales per channel and 16 keys); and the means term, the 16-key block sums of the unquantized P times v_mean on
-BF16 MMAs (m16n8k16, one k per block of a tile pair). o = (P V' + means) * v4_scale / (row sum).
-
-Schedule. Eight query warps of 16 rows keep Q', P, the scores and O in registers. The warps w and w + 4 form a pair
-and alternate their MMA bursts [QK(kt), PV(kt - 1), means] under a turn barrier, so that each warp runs its softmax
-while its partner issues MMAs. The key tiles come from the packed images of layout.py through a ring of NST = 4
-shared-memory stages (K' and V' codes and scales) and two means slots (one per tile pair), filled by TMA bulk copies:
-a full mbarrier per stage signals the landing, and an empty mbarrier with a release counter lets the last warp that
-leaves a stage refill it, so no warp waits for the others. The tile loop is unrolled over the four stages (static
-stage addresses, one phase toggle of the barriers per cycle). An unpaired last tile shares its means slot with the
-pair that ends three tiles before it: its means copy is deferred until the last reader of that pair has left, and
-completes the same full-barrier phase as its codes.
-
-The last tile is masked past the sequence. The score scale selects one of two copies of the tile loop at run time:
-the folded P landing, or the two-step landing for score scales below 2^-10 or not exact on the subnormal grid. The
-last units % nsm units (query tile, head, batch) of the grid (nsm: the SM count of the device) run as two CTAs over
-half of the keys each, and the half that finishes second merges them in key order (split_plan, epilogue_partial).
+    * QK: S = Q' K'^T over the 192 channels of Q' and K' on the block-scaled NVFP4 MMA (kind::mxf4nvf4, m16n8k64).
+    * Softmax (softmax.py): log2 units, lazy rescale at T = 4, I-ExpCast, NVFP4 P coded against its decoded scales.
+    * PV: O += P V' on the same MMA, with V' = V minus its 16-key means in V's own 128 channels (key-contiguous E2M1
+      codes, UE4M3 scales per channel and 16 keys).
+    * Means: the 16-key block sums of the unquantized P times v_mean on BF16 MMAs (m16n8k16, one k per block of a
+      tile pair). o = (P V' + means) * v4_scale / (row sum).
+Schedule:
+    * Eight query warps of 16 rows keep Q', P, the scores and O in registers. The warps w and w + 4 form a pair and
+      alternate their MMA bursts [QK(kt), PV(kt - 1), means] under a turn barrier, so that each warp runs its softmax
+      while its partner issues MMAs.
+    * The key tiles come from the packed images of layout.py through a ring of NST = 4 shared-memory stages (K' and
+      V' codes and scales) and two means slots (one per tile pair), filled by TMA bulk copies.
+    * A full mbarrier per stage signals the landing, and an empty mbarrier with a release counter lets the last warp
+      that leaves a stage refill it, so no warp waits for the others. The tile loop is unrolled over the four stages
+      (static stage addresses, one phase toggle of the barriers per cycle).
+    * An unpaired last tile shares its means slot with the pair that ends three tiles before it: its means copy is
+      deferred until the last reader of that pair has left, and completes the same full-barrier phase as its codes.
+Variants:
+    * The last tile is masked past the sequence.
+    * The score scale selects one of two copies of the tile loop at run time: the folded P landing, or the two-step
+      landing for score scales below 2^-10 or not exact on the subnormal grid.
+    * The last units % nsm units (query tile, head, batch) of the grid (nsm: the SM count) run as two CTAs over half
+      of the keys each; the half that finishes second merges them in key order (split_plan, epilogue_partial).
 """
 
 import math
@@ -118,9 +121,8 @@ def load_tile(st, kt, stage, initial: cutlass.Constexpr):
         bulk_complete(vm, src + IMG_NOVM, MEANS_STAGE, mb)
     else:
         if kt == (valid_tiles(st) if cutlass.const_expr(st.lens) else st.nT) - 1:
-            # The barrier counts the means bytes too. In a short initial range there is no older pair in the
-            # means slot and the means are copied here; otherwise the slot still contains the means of odd tile
-            # kt - 3, and its last releaser contributes the means bytes.
+            # The barrier counts the means bytes too. A short initial range has no older pair in the means slot and
+            # copies them here; otherwise the last releaser of odd tile kt - 3, whose means the slot holds, does.
             cute.arch.mbarrier_arrive_and_expect_tx(sptr(Int64, mb), IMG_NOVM + MEANS_STAGE)
             bulk_complete(dst, src, IMG_NOVM, mb)
             if cutlass.const_expr(initial):
@@ -349,10 +351,9 @@ def iter_step(
 
 @cute.jit
 def run_range(st, k0: cutlass.Constexpr, k1: cutlass.Constexpr, two_step: cutlass.Constexpr):
-    """The key tiles k0..k1 - 1 (k0 a multiple of 4; all initial full barriers begin in relative phase zero).
+    """Run the key tiles k0..k1 - 1 (k0 a multiple of 4; all initial full barriers begin in relative phase zero).
     Iteration kt runs the burst [QK(kt), PV(kt - 1) (+ means of the pair kt - 2, kt - 1 for an odd kt - 1)] in its
-    turn, then the softmax of kt; the two warps of a pair (w, w + 4) alternate their bursts (warp w first), so that
-    each warp runs its softmax while its partner issues MMAs. The last tile of the sequence (nT - 1) is masked."""
+    turn (warp w of a pair first), then the softmax of kt. The last tile of the sequence (nT - 1) is masked."""
     nT = st.nT
     n = k1 - k0
     if st.tidx == 0:
@@ -421,10 +422,9 @@ def iter_step_lens(st, kt, kend, k0: cutlass.Constexpr, two_step: cutlass.Conste
 
 @cute.jit
 def run_range_lens(st, k0: cutlass.Constexpr, two_step: cutlass.Constexpr):
-    """run_range for the key tiles from k0 to the last valid one of a call with lengths (k0 a multiple of 4, the end
-    known at run time): the first iteration, the cycles of four unmasked iterations and the last burst as there; the
-    up to four iterations after the cycles, the last of them masked from the valid keys of its tile on, take their
-    stage at run time (iter_step_lens)."""
+    """run_range for the key tiles from k0 (a multiple of 4) to the last valid one of a call with lengths, an end known
+    at run time: the up to four iterations after the cycles of four unmasked ones take their stage at run time
+    (iter_step_lens), the last of them masked from the valid keys of its tile on."""
     n = valid_tiles(st) - k0
     if st.tidx == 0:
         for s in cutlass.range_constexpr(NST):
@@ -652,7 +652,7 @@ def attn_kernel(
         else:
             run_dispatch(st, part, unit, NFULL, RSPLIT, KMID, False)
     else:
-        # the valid tokens of the batch element, its key tiles, the last of them and its valid keys
+        # with lengths: a unit with a valid query row runs, any other unit stores zeros
         if qt * 128 < valid_keys(st):
             if (c < Float32(2.0**-10)) | (restored_c != c):
                 run_dispatch(st, part, unit, NFULL, RSPLIT, KMID, True)
@@ -770,8 +770,7 @@ def epilogue_partial(st, slot, part):
         other = st.ws + Int64((slot * 2 + (2 - part)) * NTHREADS + st.tidx) * PART_BYTES
         w = [load_vector(gptr(Int32, other + 16 * i, 16), 4, cop="cg") for i in range(17)]
         # the halves combine in key order (part 1, then part 2) whichever of them merges: the products contract into
-        # FMAs, which round differently with the halves swapped, so an order that followed which half finishes second
-        # would make the output depend on it
+        # FMAs, which round differently with the halves swapped: an order by arrival would make the output depend on it
         is_part1 = Int32(2) - part
         f1 = []
         f2 = []

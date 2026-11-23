@@ -12,27 +12,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The attention kernel of the tcgen05 targets (sm_100a, sm_103a, sm_107a): NVFP4 Q'K' + FP8 P x E4M3 V with BF16
-output, in a ping-pong schedule. Persistent warp-specialized CTAs hold two 128-row Q tiles (one softmax warpgroup
-each) that share one physical S tile in TMEM, with independent FP8 P tiles and O accumulators:
+"""The attention kernel of the tcgen05 targets (sm_100a, sm_103a, sm_107a), in a ping-pong schedule.
 
-  warps 0-3, 4-7   softmax warpgroups 0 and 1: S_j -> P_j (softmax.py)
-  warps 8-11       epilogue warpgroup: the epilogue of both O tiles (epilogue.py)
-  warp 12          MMA warp: QK0, PV0, QK1, PV1 per KV tile (../qk.py, mma.py), K(i) and V(i-1) from one ring slot
-  warp 13          load warp: the TMA loads of Q', K', V and the v_mean rows
-  warp 14          store warp: the TMA stores of O
-  warp 15          idle (it hands its registers to the softmax warpgroups); with valid prefix lengths it stores the
-                   zero rows of the units no role runs (epilogue.py)
+NVFP4 Q'K' + FP8 P x E4M3 V with BF16 output. Persistent warp-specialized CTAs hold two 128-row Q tiles (one softmax
+warpgroup each) that share one physical S tile in TMEM, with independent FP8 P tiles and O accumulators.
 
-This module holds the kernel object: its configuration (PingPongAttention.__init__), the host-side setup of a launch
-(__call__: operand layouts, TMA atoms, the CTA's shared memory) and the CTA body (kernel: the setup of the CTA, then
-one branch per warp role; the _run_* methods give the load, MMA and softmax roles their operands, the epilogue's loop
-over the work tiles is in its branch, and the roles' loops and steps are the role methods of load.py, mma.py,
-softmax.py and epilogue.py). The host entry is launch.py; the per-target schedule constants are in tuning.py.
-
-The QK is the compile target's (../qk.py); the PV is issued in K phases of pv_k keys (mma.py). The PV runs with N =
-144 against [V | ones], so the columns of O_j after V take the sums of P over each KV tile: the row sum of exactly the
-P that the PV multiplies, and the weights of the means of V smoothing (mma.py)."""
+Warp roles:
+    warps 0-3, 4-7   softmax warpgroups 0 and 1: S_j -> P_j (softmax.py)
+    warps 8-11       epilogue warpgroup: the epilogue of both O tiles (epilogue.py)
+    warp 12          MMA warp: QK0, PV0, QK1, PV1 per KV tile (../qk.py, mma.py), K(i) and V(i-1) from one ring slot
+    warp 13          load warp: the TMA loads of Q', K', V and the v_mean rows
+    warp 14          store warp: the TMA stores of O
+    warp 15          idle (it hands its registers to the softmax warpgroups); with valid prefix lengths it stores the
+                     zero rows of the units no role runs (epilogue.py)
+Kernel object (PingPongAttention):
+    __init__   configuration
+    __call__   host-side setup of a launch: operand layouts, TMA atoms, the CTA's shared memory
+    kernel     the CTA body: the setup of the CTA, then one branch per warp role
+    _run_*     the operands of the load, MMA and softmax roles; the epilogue's loop over the work tiles is in its branch
+Elsewhere: the roles' loops and steps (load.py, mma.py, softmax.py, epilogue.py), the host entry (launch.py), the
+per-target schedule constants (tuning.py).
+MMAs:
+    * QK: the compile target's (../qk.py). PV: issued in K phases of pv_k keys (mma.py), N = 144 against [V | ones].
+    * The columns of O_j after V take the sums of P over each KV tile: the row sum of exactly the P that the PV
+      multiplies, and the weights of the means of V smoothing (mma.py).
+"""
 
 import dataclasses
 from typing import Tuple
@@ -72,12 +76,12 @@ from .softmax import SoftmaxRole
 
 
 def _rebase_mbar_array(arr, off):
-    """The same mbarrier array shifted by off barriers (no re-initialization)."""
+    """Return the same mbarrier array shifted by off barriers (no re-initialization)."""
     return arr.__new_from_mlir_values__([arr.barrier_storage + off])
 
 
 def _rebase_pipe(pipe, off):
-    """A pipeline over the barriers off entries after pipe's (its full and empty arrays shift together)."""
+    """Return a pipeline over the barriers off entries after pipe's (its full and empty arrays shift together)."""
     return dataclasses.replace(
         pipe,
         sync_object_full=_rebase_mbar_array(pipe.sync_object_full, off),
@@ -114,16 +118,14 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         tune = tuning.tuning()
         # the roles of a main launch with lengths that read the lengths with loads of their own (_role_work)
         self.own_loads = tune.lens_own_loads
-        # the QK component of the target at this compensation rank
         self.qk = qk.for_target(mma_tiler, rank)
         self.load_sleep_ns = tune.load_sleep_ns
         self.s_probe = tune.s_probe
         self.rescale_loop = tune.rescale_loop
         self.vs_batched = tune.vs_batched
         self.kv_stage = tuning.KV_STAGE
-        # V smoothing: the PV leaves the sum of P over KV tile t in column 128 + t % 8 of O_j, read once per batch of
-        # vs_tiles tiles. The sums become K slots of the means MMA's A operand (K slot = column), whose B takes the
-        # batch's vs_rows v_mean rows from a ring of two stages
+        # V smoothing (mma.py): a means batch has vs_tiles KV tiles and vs_rows v_mean rows. The sum of P over KV tile
+        # t is in column 128 + t % 8 of O_j and becomes K slot t % 8 of the means MMA's A operand (K slot = column)
         self.vs_tiles = 8
         self.vs_shift = self.vs_tiles.bit_length() - 1
         self.vs_rows = 8
@@ -173,14 +175,12 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         self.vs_bar_id = 10  # + stage
         self.vs_bar_threads = self.threads_per_warp * 5
 
-        # One physical S tile is alternated between the two logical score pipelines: each softmax warpgroup drains all
-        # four 32-column chunks before releasing its logical pipeline, and the MMA warp consumes that next-empty
-        # credit before overwriting S.
+        # One physical S tile alternates between the two logical score pipelines: each softmax warpgroup drains it
+        # before releasing its logical pipeline, and the MMA warp consumes that next-empty credit before overwriting S.
         self.tmem_s_offset = 0
         self.tmem_o0_offset = 224
         self.tmem_o1_offset = 368
-        # Independent FP8 P tiles (32 columns each), followed by the QK component's scale factors
-        # (columns 192..223).
+        # Independent FP8 P tiles (32 columns each), followed by the QK component's scale factors (columns 192..223).
         self.tmem_p0_offset = 128
         self.tmem_p1_offset = 160
         # Each O_j accumulator is 144 columns: the PV MMA runs with N = 144 against [V | ones], so the columns from
@@ -201,9 +201,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         self.epi_stage = 2
 
     def _shared_storage(self, o_smem_layout_staged, qk_fields, vs_layouts):
-        """The CTA's shared memory: pipeline barriers, the split launch's softmax -> epilogue exchange, the O staging
-        tiles, the QK component's operand fields, then the constant block of the PV B operand's ones columns and the
-        means MMA's barriers and operands (vs_layouts: their A and B layouts)."""
+        """Return the struct of the CTA's shared memory; vs_layouts: the A and B layouts of the means MMA's operands."""
         MemRange, Align = cute.struct.MemRange, cute.struct.Align
         sMA_l, sMB_l = vs_layouts
         fields = dict(
@@ -278,6 +276,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         )
         o = cute.make_tensor(o_ptr, o_layout)
 
+        # work units and grid
         o_shape = cute.shape((s, dv, ((h_r, h), b)))
         problem_shape_mhb = (
             cute.ceil_div(cute.size(o_shape[0]), self.cta_tiler[0]),
@@ -298,6 +297,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         self.v_major_mode = OperandMajorMode.MN
         self.o_layout = utils.LayoutEnum.from_tensor(o)
 
+        # MMAs: the QK of the target; the PV with P from TMEM
         cta_group = tcgen05.CtaGroup.ONE
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = OperandMajorMode.K
@@ -320,6 +320,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         )
         self.epi_tile = self.pv_mma_tiler[:2]
 
+        # shared-memory layouts: the Q' stages, the K/V ring, the O staging tiles
         q_smem_layout_staged, k_stage_layout, qk_sf_smem_layouts = self.qk.smem_layouts(
             qk_tiled_mma, self.q_stage, self.kv_stage
         )
@@ -355,6 +356,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             self.o_dtype, self.o_layout, self.epi_tile, self.epi_stage
         )
 
+        # TMA atoms: Q', K' and their scale factors (QK component), V, O
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_kv_load_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, qk_tiled_mma.thr_id
@@ -486,20 +488,20 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         )
 
     def _make_pipelines(self, storage, cluster_layout_vmnk):
-        """The pipelines of the CTA on the barrier arrays of the shared storage, as an object with one attribute per
-        participant the roles use. The three *_pipe attributes are whole pipelines: the softmax role rebases those of
-        warpgroup 0 to its own warpgroup; `epilogue` is the tuple of the epilogue warpgroup's participants (the
-        consumers of s0_epi, s1_epi and mma_epi, the producer of epi_store).
+        """Return the pipelines of the CTA on the barrier arrays of the shared storage, one attribute per participant.
 
-          load_q, load_kv     load warp (TMA) -> MMA warp: the Q' stages and the K/V ring
-          mma_s0, mma_s1      MMA warp (QK_j) -> softmax warpgroup j: S
-          p0_mma, p1_mma      softmax warpgroup j -> MMA warp (PV_j): P_j
-          s0_epi, s1_epi      softmax warpgroup j -> epilogue warpgroup: the final row statistics
-          mma_epi             MMA warp (last PV_j) -> epilogue warpgroup: O_j
-          epi_store           epilogue warpgroup -> store warp: the staged O tiles
-
-        Every pipeline defers the synchronization of its barrier initialization to the kernel (pipeline_init_arrive,
-        pipeline_init_wait)."""
+            load_q, load_kv     load warp (TMA) -> MMA warp: the Q' stages and the K/V ring
+            mma_s0, mma_s1      MMA warp (QK_j) -> softmax warpgroup j: S
+            p0_mma, p1_mma      softmax warpgroup j -> MMA warp (PV_j): P_j
+            s0_epi, s1_epi      softmax warpgroup j -> epilogue warpgroup: the final row statistics
+            mma_epi             MMA warp (last PV_j) -> epilogue warpgroup: O_j
+            epi_store           epilogue warpgroup -> store warp: the staged O tiles
+        * The three *_pipe attributes are whole pipelines: the softmax role rebases those of warpgroup 0 to its own
+          warpgroup. `epilogue` is the tuple of the epilogue warpgroup's participants (the consumers of s0_epi,
+          s1_epi and mma_epi, the producer of epi_store).
+        * Every pipeline defers the synchronization of its barrier initialization to the kernel
+          (pipeline_init_arrive, pipeline_init_wait).
+        """
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.q_stage,
             producer_group=thread_group(1),
@@ -603,10 +605,9 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         )
 
     def _smem_tensors(self, storage, q_layout, k_layout, qk_sf_layouts, v_layout, o_layout):
-        """The tensors of the shared storage by their staged layouts: the Q' stages, the K' halves of the K/V ring
-        slots, the QK component's scale factors, the V halves of the ring slots (V sits kv_half_bytes after K in a
-        slot), the O staging tiles and, in the split launch, the anchor exchange (row, 2 values, stage, warpgroup)."""
+        """Return the tensors of the shared storage by their staged layouts: sQ, sK, QK scale factors, sV, sO, sVec."""
         sQ, sK, qk_sf_smem = self.qk.smem_tensors(storage, q_layout, k_layout, qk_sf_layouts)
+        # sK and sV are the K' and V halves of the K/V ring slots: V sits kv_half_bytes after K in a slot
         sV_ptr = cute.recast_ptr(
             cute.recast_ptr(storage.sK.data_ptr() + self.kv_half_bytes, dtype=self.v_dtype),
             v_layout.inner,
@@ -615,21 +616,20 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         sO = storage.sO.get_tensor(o_layout.outer, swizzle=o_layout.inner)
         sVec = None
         if cutlass.const_expr(self.split):
+            # the anchor exchange of the split launch: (row, 2 values, stage, warpgroup)
             sVec = storage.sVec.get_tensor(
                 cute.make_layout((128, 2, 2, 2), stride=(2, 1, 256, 512))
             )
         return sQ, sK, qk_sf_smem, sV, sO, sVec
 
     def _role_storage(self, st):
-        """The shared storage as the calling role's own instance: its field pointers are derived at this call, in the
-        branch of the role."""
+        """The shared storage as the calling role's own instance: its field pointers are derived in its branch."""
         return self.shared_storage(st.storage.base)
 
     def _tile_scheduler(self, tile_sched_params, lens=None):
-        """The scheduler of the work tiles of this CTA; in the split launch its work items come after the n_full whole
-        units of the main launch. lens: None, or (the global address of the valid prefix lengths, the padded sequence
-        length): the scheduler of the live work of a launch with lengths."""
+        """Return the tile scheduler of this CTA; lens: None, or (address of the lengths, padded sequence length)."""
         if cutlass.const_expr(self.split):
+            # the work items of the split launch come after the n_full whole units of the main launch
             return SplitTileScheduler(
                 tile_sched_params,
                 cute.arch.block_idx()[0] + tile_sched_params.n_full,
@@ -672,9 +672,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         vs_args: Tuple,
     ):
         """The CTA body: the setup every thread runs (cluster, shared storage, pipelines, barriers, TMEM, shared-memory
-        tensors, the tile scheduler), then the role of the thread's warp over the work tiles of the CTA. The roles
-        read what the setup made from one state object: the _run_* methods assemble the arguments of the load, MMA
-        and softmax roles from it, and the epilogue's steps take it."""
+        tensors, the tile scheduler), then the role of the thread's warp over the work tiles of the CTA."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         if cutlass.const_expr(not self.split):
@@ -760,6 +758,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         seqlen_k = mK_kdl.shape[0]
         n_kv_tiles = cute.ceil_div(seqlen_k, self.qk_mma_tiler[1])
 
+        # what the setup made, as one state object: the _run_* methods assemble the arguments of the load, MMA and
+        # softmax roles from it, and the epilogue's steps take it
         st = State(
             warp_idx=warp_idx,
             tidx=tidx,
@@ -782,9 +782,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             cta_coord_vmnk=cta_coord_vmnk,
             kv_cta_layout=kv_cta_layout,
             kv_mcast_mask=kv_mcast_mask,
-            # shared memory: the storage (a role reads its fields from its own instance, _role_storage), its
-            # pipelines and P-tail barriers, the operand stages, the O staging tiles, the split launch's anchor
-            # exchange, the means MMA's operands and the v_mean ring's empty barriers
+            # shared memory: the storage (a role reads its fields from its own instance, _role_storage), pipelines,
+            # P-tail barriers, operand stages, O staging tiles, anchor exchange, means operands, v_mean barriers
             storage=storage,
             pipes=pipes,
             p_tail_ptr=p_tail_ptr,
@@ -858,9 +857,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
 
     @cute.jit
     def _run_load_warp(self, st):
-        """The load warp (load.py) with its operands: the TMA atoms, global tensors and shared-memory stages of Q', K'
-        and V, the v_mean ring, the Q and K/V producers with the K/V ring's empty barriers, and the CTA's place in
-        its cluster for the K/V multicast."""
+        """Run the load warp (load.py) with its operands from the state."""
         storage = self._role_storage(st)
         tile_sched, work_tile = self._role_work("load", st.tile_sched, st.work_tile)
         self.load_warp(
@@ -891,9 +888,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
 
     @cute.jit
     def _run_mma_warp(self, st):
-        """The MMA warp (mma.py) with its operands: the QK component's MMA setup on the S tile, the TMEM addresses of
-        O_j and P_j, the shared addresses the PV and means MMAs take, the ones block, and the pipelines the warp
-        produces into and consumes from."""
+        """Run the MMA warp (mma.py) with its operands from the state."""
         storage, pipes = self._role_storage(st), st.pipes
         tmem_ptr = st.tmem.retrieve_ptr(self.qk_acc_dtype)
         tStS = cute.make_tensor(tmem_ptr + self.tmem_s_offset, st.s_tmem_layout)
@@ -941,9 +936,11 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
 
     @cute.jit
     def _run_softmax(self, st):
-        """The softmax warpgroup of the thread's warp (softmax.py). Both softmax warpgroups run one traced body: the
-        warpgroup's S/P/stats pipelines are the S0/P0/stats0 ones rebased by the stage at runtime (the stage-1
-        barriers sit right after the stage-0 ones in SMEM), and so are its P/O TMEM columns."""
+        """Run the softmax warpgroup of the thread's warp (softmax.py): both warpgroups run one traced body.
+
+        The warpgroup's S/P/stats pipelines are the S0/P0/stats0 ones rebased by the stage at runtime (the stage-1
+        barriers sit right after the stage-0 ones in SMEM), and so are its P/O TMEM columns.
+        """
         storage, pipes = self._role_storage(st), st.pipes
         # log2-domain softmax multiplier of the raw scores, a device scalar (the score scale from the
         # preparation); never read on the host
@@ -994,9 +991,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         )
 
     def _epilogue_operands(self, st, tmem):
-        """What the epilogue warpgroup reads for every work tile: the device scalars (score scale, output scale), the
-        TMEM base (retrieved from tmem, the allocator), the O_0 and O_1 accumulators and, in the split launch, this
-        thread's rows of the anchor exchange of softmax warpgroups 0 and 1."""
+        """Return what the epilogue warpgroup reads for every work tile; tmem: the TMEM allocator."""
         score_scale = ld_global_nc_f32(st.score_scale_addr)
         scale_output = load_invariant(Float32, st.v_scale_addr)
         tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
@@ -1004,6 +999,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         tOtO1 = cute.make_tensor(tmem_ptr + self.tmem_o1_offset, st.o_tmem_layout)
         vec0 = vec1 = None
         if cutlass.const_expr(self.split):
+            # this thread's rows of the anchor exchange of softmax warpgroups 0 and 1
             thread_idx = st.tidx % (self.threads_per_warp * len(self.epilogue_warp_ids))
             vec0 = st.sVec[thread_idx, None, None, 0]
             vec1 = st.sVec[thread_idx, None, None, 1]
@@ -1019,11 +1015,10 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
 
     @cute.jit
     def _epilogue_work_tile(self, st, epi, epi_pipes, work_tile):
-        """The epilogue of both O tiles of a work tile (epilogue.py), with the operands of _epilogue_operands (epi).
-        epi_pipes: the consumers of the row statistics of softmax warpgroups 0 and 1 and of O, and the producer of the
-        staged O tiles; returns them as they are after the work tile."""
+        """Run the epilogue of both O tiles of a work tile (epilogue.py); return epi_pipes as they are after it."""
         s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer = epi_pipes
-        # with lengths: the rows of the work tile's 256 below the length of its batch element
+        # with lengths: the rows of the work tile's 256 below the length of its batch element; the epilogue stores
+        # the rows after them as zeros
         live_rows = None
         if cutlass.const_expr(self.lens):
             live_rows = self.valid_keys(work_tile) - work_tile.tile_idx[0] * self.cta_tiler[0]
@@ -1067,23 +1062,23 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         return s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer
 
     def _role_work(self, role, tile_sched, work_tile):
-        """The scheduler and the first work of a warp role: those of the CTA, or, for the roles of own_loads in a
-        main launch with lengths, a scheduler at the same work that reads the lengths with loads of its own."""
+        """Return the scheduler and the first work of a warp role: those of the CTA, or a scheduler of its own."""
+        # the roles of own_loads in a main launch with lengths: a scheduler at the same work with loads of its own
         if self.lens and not self.split and role in self.own_loads:
             tile_sched = tile_sched.own_loads()
             work_tile = tile_sched.get_current_work()
         return tile_sched, work_tile
 
     def kv_range(self, work_tile, n_kv_tiles):
-        """(first KV tile, KV tile count) of a work item: the whole row, or one KV piece of a split unit. With
-        lengths the row ends with the KV tile that holds the last valid key of the batch element (and so does the
-        last live piece of a split unit: sched.py)."""
+        """Return (first KV tile, KV tile count) of a work item: the whole row, or one KV piece of a split unit."""
         if cutlass.const_expr(self.split):
             return work_tile.tile_idx[3], work_tile.tile_idx[4]
+        # with lengths the row ends with the KV tile that holds the last valid key of the batch element (and so does
+        # the last live piece of a split unit: sched.py)
         if cutlass.const_expr(self.lens):
             return 0, cute.ceil_div(self.valid_keys(work_tile), self.qk_mma_tiler[1])
         return 0, n_kv_tiles
 
     def valid_keys(self, work_tile):
-        """The valid prefix length of the batch element of a work item of a launch with lengths."""
+        """Return the valid prefix length of the batch element of a work item of a launch with lengths."""
         return work_tile.tile_idx[8 if self.split else 3]

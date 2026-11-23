@@ -16,13 +16,16 @@
 # ruff: noqa: E741
 """The sm_120 FP8-PV attention for fewer than 128 keys: one key tile, one CTA per (batch, head).
 
-Two groups of 4 warps (16 query rows per warp) take turns in issuing MMAs under the named barriers 1 and 2: the
-QK of the tile, its softmax, then the PV with the means term, a group running its softmax while the other
-issues its MMAs. The second group copies K', V, the K' scale atoms and the tile's 8 v_mean rows into shared
-memory by cp.async (keys past S zero-filled) and arrives on the tile's mbarrier when the copies have landed. The key
-order, the transposed PV and means MMAs and the output rows are those of the main kernel (layout.py, mma.py,
-epilogue.py). With one tile the anchor of a row is its tile max, so the landing needs no lazy rescale:
-expcast_transpose4 (../ptx/fp8pv.py) forms c s - anchor in one FMA and casts it on the bit grid of FP32."""
+* Two groups of 4 warps (16 query rows per warp) take turns in issuing MMAs under the named barriers 1 and 2: the
+  QK of the tile, its softmax, then the PV with the means term; a group runs its softmax while the other issues
+  its MMAs.
+* The second group copies K', V, the K' scale atoms and the 8 v_mean rows of the tile into shared memory by
+  cp.async (keys past S zero-filled) and arrives on the mbarrier of the tile when the copies have landed.
+* The key order, the transposed PV and means MMAs and the output rows are those of the main kernel (layout.py,
+  mma.py, epilogue.py).
+* With one tile the anchor of a row is its tile max, so the landing needs no lazy rescale: expcast_transpose4
+  (../ptx/fp8pv.py) forms c s - anchor in one FMA and casts it on the bit grid of FP32.
+"""
 
 import math
 
@@ -59,10 +62,12 @@ SMALL_SMEM_BYTES = SBAR_OFF + 8
 def small_issue_tile(
     sbase, kb, vb, kvsrc, kvsrc0, ksfb, t, S: cutlass.Constexpr, H: cutlass.Constexpr, vmb
 ):
-    """Thread t of the second group: cp.async of the key tile into shared memory at sbase as one commit group, 16
-    rows per instruction step: thread t copies chunk t % 8 of rows 16 it + t / 8 (K' rows: their used chunks only),
-    so each warp instruction covers four whole 128-byte rows; then the K' scale chunk t (32 per atom) and the 16-byte
-    chunk t of the tile's 8 v_mean rows (at vmb), after the scale atoms. Keys >= S are zero-filled."""
+    """Copy the key tile into shared memory at sbase by cp.async as one commit group; thread t of the second group.
+
+    * 16 rows per instruction step: thread t copies chunk t % 8 of rows 16 it + t / 8 (K' rows: their used chunks
+      only), so each warp instruction covers four whole 128-byte rows. Keys >= S are zero-filled.
+    * Then the K' scale chunk t (32 per atom) and the 16-byte chunk t of the 8 v_mean rows of the tile (at vmb).
+    """
     c = t & 7
     r16 = t >> 3
     for it in cutlass.range_constexpr(KT // 16):
@@ -104,10 +109,7 @@ def small_mma_phase(
     vmst=None,
     vmoff=None,
 ):
-    """One MMA phase of a warp: O += P V of the tile (if vst is not None), then the means term O += S M (if vmst is
-    not None: the tile's v_mean rows at vmst, its block sums in P[16..17]), then S = Q' K'^T (if kst is not None).
-    The fragments are loaded DIST steps ahead of the MMAs that consume them (each step is one ldmatrix and two MMAs, a
-    means step four)."""
+    """Run one MMA phase of a warp as mma.mma_phase, without turns: PV (vst), the means of the tile (vmst), QK (kst)."""
     steps = []
     if vst is not None:
         for i in range(4):
@@ -133,7 +135,7 @@ def small_mma_phase(
         return ldsm_b16_x4(kst + koff + (st[2] // 2) * 32 * KP + st[1] * 32)
 
     def k_ready():
-        # the next tile's K' and scales have landed (its full barrier); then its scale words
+        # the tile's K' and scales have landed (its mbarrier); then its scale words
         if kwait is not None:
             mbar_wait(kwait[0], kwait[1])
         return [load_vector(sptr(Int32, sfst + a * 512 + sfoff, 16), 4) for a in range(K_STEPS)]
@@ -189,9 +191,7 @@ def small_mma_phase(
 
 @cute.jit
 def small_softmax(acc, P, sc, q, lim: cutlass.Constexpr):
-    """Softmax of the single tile (rows g and g + 8 of the warp): tile max as the anchor (keys >= lim masked, lim <
-    KT, or a run-time count with lengths), P = E4M3(2^(s - anchor + 4)) into P[4 i + r], the row sums of the
-    quantized P and its block sums (P[16], P[17])."""
+    """Run the softmax of the single tile with the tile max as the anchor, keys >= lim masked; return the row sums."""
     for nt in cutlass.range_constexpr(16):
         s = nt % 4
         i = nt // 4
@@ -234,9 +234,7 @@ def small_kernel(
     H: cutlass.Constexpr,
     lens_ptr,
 ):
-    """Grid (1, H, B), NTHR threads: the S < 128 queries of one (batch, head) against its S keys. ss_ptr, vs_ptr: the
-    score scale and v8_scale. lens_ptr: None, or the valid prefix lengths: the keys from the length of the batch
-    element on are masked and its query rows from there on are zero in o."""
+    """Run the S < 128 queries of one (batch, head) against its S keys; grid (1, H, B), NTHR threads."""
     tidx_, _, _ = cute.arch.thread_idx()
     _, hh_, bb_ = cute.arch.block_idx()
     tidx = Int32(tidx_)

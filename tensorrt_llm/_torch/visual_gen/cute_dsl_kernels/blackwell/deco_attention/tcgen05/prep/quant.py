@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""E2M1 block quantizers of the preparation passes. An NVFP4 block holds 16 values with a UE4M3 scale, max |x| / 6
-rounded to three mantissa bits (round_m3)."""
+"""E2M1 block quantizers of the preparation passes: NVFP4 blocks of 16 values with a UE4M3 scale."""
 
 import cutlass.cute as cute
 from cutlass import Float32
@@ -24,7 +23,7 @@ from ..ptx import e2m1x8_to_f32x8
 
 
 def _mul2_list(x, s):
-    """[x_j * s] with packed FP32x2 multiplies."""
+    """Return [x_j * s], by packed FP32x2 multiplies."""
     out = []
     for j in range(0, len(x), 2):
         p = cute.arch.mul_packed_f32x2((x[j], x[j + 1]), (s, s))
@@ -33,7 +32,7 @@ def _mul2_list(x, s):
 
 
 def _absmax(x):
-    """max |x_j| as a chain of maxima with the absolute values."""
+    """Return max |x_j|, as a chain of maxima with the absolute values."""
     am = cute.math.abs(x[0])
     for j in range(1, len(x)):
         am = cute.arch.fmax(am, cute.math.absf(x[j]))
@@ -41,7 +40,8 @@ def _absmax(x):
 
 
 def _nvfp4_codes(x, am):
-    """The UE4M3 scale of a 16-value block whose max |x| is am, and the block's two words of E2M1 codes."""
+    """Return the UE4M3 scale of a 16-value block whose max |x| is am (am / 6 rounded to three mantissa bits, round_m3)
+    and the block's two words of E2M1 codes."""
     sc = round_m3(am * Float32(0.16666667163372040))
     inv = rcp_or_zero(sc)
     y = _mul2_list(x, inv)
@@ -49,8 +49,8 @@ def _nvfp4_codes(x, am):
 
 
 def quant16_dq_knownmax(x, am):
-    """NVFP4 block of 16 values whose max |x| is am: the UE4M3 scale, two words of E2M1 codes and the quantization
-    residual x - dequantized x (one FMA per value)."""
+    """Quantize an NVFP4 block of 16 values whose max |x| is am: return the UE4M3 scale, two words of E2M1 codes and
+    the quantization residual x - dequantized x (one FMA per value)."""
     sc, w0, w1 = _nvfp4_codes(x, am)
     vals = e2m1x8_to_f32x8(w0) + e2m1x8_to_f32x8(w1)
     nsc = -sc
@@ -62,5 +62,5 @@ def quant16_dq_knownmax(x, am):
 
 
 def quant16(x):
-    """NVFP4 block of 16 values: the UE4M3 scale and two words of E2M1 codes."""
+    """Quantize an NVFP4 block of 16 values: return the UE4M3 scale and two words of E2M1 codes."""
     return _nvfp4_codes(x, _absmax(x))

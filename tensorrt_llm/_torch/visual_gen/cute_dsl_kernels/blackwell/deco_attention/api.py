@@ -18,20 +18,23 @@
     out = torch.empty_like(q)
     attention(prepare(q, k, v, workspace), out)     # BF16 [B, S, H, 128] in and out
 
-The caller owns the workspace, one flat buffer in which a call keeps the operands of the attention and its scratch,
-and may hand the same buffer to calls of any shape that fits: a call depends on nothing the buffer held before.
-prepare returns the operands as views into the workspace, and they hold until the workspace is written again.
+Workspace:
+    * One flat buffer owned by the caller; a call keeps the operands of the attention and its scratch in it.
+    * A call depends on nothing the buffer held before: one buffer serves calls of any shape that fits.
+    * prepare returns the operands as views into it; they hold until the workspace is written again.
 
-The kernels of the current GPU's family run (target.kernel_family()): "tcgen05" on B200, GB300 and Rubin, "sm120" on
-RTX PRO 6000. A family holds one kernel per PV format it offers, selected by `pv`, one of pv_formats() ("fp8": NVFP4
-QK and FP8 PV, the kernel of tcgen05; "nvfp4": NVFP4 QK and NVFP4 PV, on sm120, where it is the default; None: the
-family's default). `rank` is the rank of the QK compensation, one of ranks(): 32 (the default) on every target, 64
-where ranks() lists it. A family package deco_attention/<family> exports pv_formats, ranks, workspace_size, prepare
-and attention; the functions here check the caller's arguments and forward to it.
+Kernels:
+    * Family of the current GPU (target.kernel_family()): "tcgen05" on B200, GB300 and Rubin, "sm120" on RTX PRO 6000.
+    * pv, one of pv_formats(): "fp8" (NVFP4 QK, FP8 PV) or "nvfp4" (NVFP4 QK, NVFP4 PV; on sm120, where it is the
+      default); None is the family's default.
+    * rank, one of ranks(): the rank of the QK compensation; 32 (the default) on every target, 64 where listed.
+    * A family package deco_attention/<family> exports pv_formats, ranks, workspace_size, prepare and attention; the
+      functions here check the caller's arguments (ValueError) and forward to it.
 
-Every scale stays on the device, nothing reads device data back to the host and a call allocates nothing, so a
-caller can capture prepare and attention into a CUDA graph. The first call of a shape compiles its kernels and the
-first call on a device builds the rotation and the default rows: make it outside a capture.
+CUDA graphs:
+    * prepare and attention can be captured: every scale stays on the device, nothing is read back or allocated.
+    * The first call of a shape compiles its kernels and the first call on a device builds the rotation and the
+      default rows: make it outside a capture.
 """
 
 import functools
@@ -63,20 +66,17 @@ def _family():
 
 
 def pv_formats():
-    """The PV formats of the kernels that the current target offers: "fp8" (NVFP4 QK and FP8 PV), "nvfp4" (NVFP4 QK
-    and NVFP4 PV)."""
+    """Return the PV formats of the kernels of the current target, among "fp8" and "nvfp4" (module docstring)."""
     return _family().pv_formats()
 
 
 def ranks():
-    """The compensation ranks that the kernels of the current target offer (among constants.RANKS; the default rank
-    is one of them on every target)."""
+    """Return the compensation ranks of the current target: among constants.RANKS, always with the default rank."""
     return _family().ranks()
 
 
 def _kernel(pv, rank):
-    """The family of the target and the PV format of its kernel for pv (None: the family's default); ValueError for
-    a PV format or a rank that the target does not offer."""
+    """Check pv and rank; return the target's family and the PV format of its kernel (pv, or the family's default)."""
     family = _family()
     if pv is None:
         pv = family.DEFAULT_PV
@@ -94,8 +94,8 @@ def _kernel(pv, rank):
 
 
 def _check(shape, device, **tensors):
-    """The caller's tensors (name=tensor) are contiguous BF16 tensors of one shape [B, S, H, HEAD_DIM] (shape, or
-    that of the first tensor for None) on one device (device, or that of the first tensor); returns both."""
+    """Check that the caller's tensors (name=tensor) are contiguous BF16 tensors of one shape [B, S, H, HEAD_DIM]
+    (shape, or that of the first tensor for None) on one device (device, or that of the first tensor); return both."""
     for name, x in tensors.items():
         if (
             not torch.is_tensor(x)
@@ -116,30 +116,31 @@ def _check(shape, device, **tensors):
 
 
 def workspace_size(batch, seq_len, heads, device="cuda", pv=None, rank=DEFAULT_RANK):
-    """Bytes of workspace that one call of this shape needs on `device` (whose SM count sets the launch plans): the
-    operands, the scratch of the preparation and the scratch of the attention. pv: the PV format of the kernel (one of
-    pv_formats(); None: the family's default); rank: the rank of the QK compensation (one of ranks()). ValueError for
-    a PV format or a rank that the target does not offer."""
+    """Return the bytes of workspace that one call of this shape needs on `device`, whose SM count sets the launch
+    plans: the operands, the scratch of the preparation and the scratch of the attention."""
     family, pv = _kernel(pv, rank)
     return family.workspace_size(batch, seq_len, heads, device, pv, rank)
 
 
 def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq_lens=None):
-    """The preparation: the operands of the attention from BF16 q, k, v [B, S, H, 128] (contiguous, on one device),
-    written into the workspace. workspace: a 1-D uint8 tensor on that device of at least workspace_size(B, S, H,
-    device, pv, rank) bytes whose address is a multiple of 256, with any content. rows: int32 indices of the tokens the
-    compensation basis is estimated on, one-dimensional, on that device and not empty; a caller's draw should hold at
-    least 2 * rank tokens where the sequence has that many, the floor of the default draw (a packed multimodal sequence
-    passes the draw of its token tags, sample_rows(seq_len, device, token_tags, rank), which holds fewer when fewer
-    tokens are not padding); the kernels clamp a row outside [0, S) to the sequence. None: the default draw,
-    sample_rows(seq_len, device, rank=rank). valid_seq_lens: None (every batch element is full), or an int32 tensor [B]
-    on that device: batch element b has valid tokens on its first n = clamp(valid_seq_lens[b], 0, S) positions and
-    padding after them; it attends only its valid keys, its output rows from n on are zero, and what q, k and v hold
-    from n on has no influence. The kernels read the tensor in place, also in the attention (it must hold until then),
-    and nothing reads it on the host. With lengths, the default draw is mapped into each valid prefix (its row r stands
-    for token floor(r n / S)); rows given by the caller are taken as given, one-dimensional [m] for every batch element
-    or two-dimensional [B, m] per batch element, and a row from n on stands for token n - 1. Returns the operands for
-    attention, views into the workspace."""
+    """Run the preparation: write the operands of the attention into the workspace and return them (views into it).
+
+    Args:
+        q, k, v: BF16 [B, S, H, 128], contiguous, on one device.
+        workspace: uint8 [>= workspace_size(B, S, H, device, pv, rank)] on that device, 256-byte aligned, any content.
+        rows: int32 [m] on that device, not empty: the tokens the compensation basis is estimated on.
+            * None is the default draw, sample_rows(seq_len, device, rank=rank); a packed multimodal sequence passes
+              sample_rows(seq_len, device, token_tags, rank), which holds fewer when fewer tokens are not padding.
+            * A caller's draw should hold at least 2 * rank tokens where the sequence has that many, the floor of the
+              default draw; the kernels clamp a row outside [0, S) to the sequence.
+        valid_seq_lens: None (every batch element is full), or int32 [B] on that device.
+            * Batch element b has valid tokens on its first n = clamp(valid_seq_lens[b], 0, S) positions: it attends
+              only its valid keys, its output rows from n on are zero, and q, k and v from n on have no influence.
+            * The kernels read the tensor in place, also in the attention (it must hold until then); nothing reads it
+              on the host.
+            * The default draw is mapped into each valid prefix (row r stands for token floor(r n / S)); rows of the
+              caller, [m] or [B, m] per batch element, are taken as given, and a row from n on stands for token n - 1.
+    """
     family, pv = _kernel(pv, rank)
     shape, device = _check(None, None, q=q, k=k, v=v)
     if (
@@ -189,8 +190,7 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
 
 
 def attention(operands, out):
-    """The attention on the operands of prepare: fills and returns `out`, a contiguous BF16 tensor [B, S, H, 128] on
-    the device of the operands."""
+    """Run the attention on operands of prepare: fill and return out, contiguous BF16 [B, S, H, 128] on their device."""
     if not isinstance(operands, Operands):
         raise ValueError("operands is not a result of prepare")
     device = next(iter(operands.buffers.values())).device

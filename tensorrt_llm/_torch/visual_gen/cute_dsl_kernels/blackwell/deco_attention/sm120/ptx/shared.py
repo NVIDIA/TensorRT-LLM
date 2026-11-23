@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inline PTX of the sm_120 family that both of its kernel packages issue, or the preparation of Q and K
-(sm120/prep/): one of the three modules of the package, see its docstring. The sections:
+"""Inline PTX of the sm_120 family that both of its kernel packages issue, or the preparation of Q and K (sm120/prep/).
 
-  MMA and descriptors                 mma.sync of BF16 and of block-scaled NVFP4 (kind::mxf4nvf4)
-  conversions and packed arithmetic   E2M1 conversions
-  memory access                       the predicated vector load of shared memory, ldmatrix, and the global loads
-                                      and the global store under an L2 cache policy"""
+One of the three modules of the package, see its docstring. Sections:
+    MMA and descriptors                 mma.sync of BF16 and of block-scaled NVFP4 (kind::mxf4nvf4)
+    conversions and packed arithmetic   E2M1 conversions
+    memory access                       the predicated vector load of shared memory, ldmatrix, and the global loads
+                                        and the global store under an L2 cache policy
+"""
 
 import struct
 
@@ -31,8 +32,7 @@ from ...common.ptx import asm, f32, i32, i64, u32
 # -------------------------------------------------------------------------------- MMA and descriptors
 @dsl_user_op
 def mma_bf16(c, a, b, *, loc=None, ip=None):
-    """Four u32 words a (the A fragment, 16x16 BF16), two u32 words b (the B fragment, 16x8 BF16), four f32 c -> four
-    f32 D = A B + C by mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32; no side effects."""
+    """Return f32 D = A B + C by mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32; no side effects."""
     return asm(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {$0, $1, $2, $3}, {$4, $5, $6, $7}, "
         "{$8, $9}, {$10, $11, $12, $13};",
@@ -46,9 +46,11 @@ def mma_bf16(c, a, b, *, loc=None, ip=None):
 
 @dsl_user_op
 def mma_nvf4(c, a, b, sfa, sfb, tidb: int, *, loc=None, ip=None):
-    """Four f32 c, four i32 words a, two i32 words b, i32 scale words sfa and sfb -> four f32 D = (A sfa) (B sfb) + C by
-    mma.sync.aligned.m16n8k64 kind::mxf4nvf4: E2M1 x E2M1 with UE4M3 scales per 16 k (scale_vec::4X); no side effects.
-    The A scales come from lanes 4g (row g) and 4g + 1 (row g + 8), the B scales from lane 4g + tidb (column g)."""
+    """Return f32 D = (A sfa) (B sfb) + C by mma.sync.aligned.m16n8k64 kind::mxf4nvf4; no side effects.
+
+    * E2M1 x E2M1 with UE4M3 scales per 16 k (scale_vec::4X).
+    * The A scales come from lanes 4g (row g) and 4g + 1 (row g + 8), the B scales from lane 4g + tidb (column g).
+    """
     return asm(
         "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
         "{$0, $1, $2, $3}, {$8, $9, $10, $11}, {$12, $13}, {$4, $5, $6, $7}, $14, {0, 0}, $15, {0, %d};"
@@ -64,8 +66,7 @@ def mma_nvf4(c, a, b, sfa, sfb, tidb: int, *, loc=None, ip=None):
 # -------------------------------------------------------------------------------- Conversions and packed arithmetic
 @dsl_user_op
 def f32x4_to_e2m1x4(a, b, c, d, *, loc=None, ip=None):
-    """f32 a, b, c, d -> u32 with four E2M1 codes in its low 16 bits, byte 0 = (b << 4) | a and byte 1 = (d << 4) | c
-    (cvt.rn.satfinite.e2m1x2.f32 per pair: round to nearest even, saturating); no side effects."""
+    """Return the E2M1 codes of a, b, c, d in a u32: byte 0 = (b << 4) | a, byte 1 = (d << 4) | c; no side effects."""
     return asm(
         "{ .reg .b8 x0, x1; .reg .b32 w0, w1;\n cvt.rn.satfinite.e2m1x2.f32 x0, $2, $1;\n"
         " cvt.rn.satfinite.e2m1x2.f32 x1, $4, $3;\n cvt.u32.u8 w0, x0;\n cvt.u32.u8 w1, x1;\n"
@@ -80,8 +81,7 @@ def f32x4_to_e2m1x4(a, b, c, d, *, loc=None, ip=None):
 
 @dsl_user_op
 def e2m1x2_to_f32x2(byte, *, loc=None, ip=None):
-    """u32 byte -> two f32, the values of the E2M1 codes in the low and in the high nibble of its low byte
-    (cvt.rn.f16x2.e2m1x2, cvt.f32.f16); no side effects."""
+    """Return the f32 values of the E2M1 codes in the low and in the high nibble of the low byte; no side effects."""
     return asm(
         "{ .reg .b8 x; .reg .b32 h; .reg .f16 l, u; .reg .b16 s;\n cvt.u16.u32 s, $2;\n"
         " cvt.u8.u16 x, s;\n cvt.rn.f16x2.e2m1x2 h, x;\n mov.b32 {l, u}, h;\n"
@@ -95,16 +95,14 @@ def e2m1x2_to_f32x2(byte, *, loc=None, ip=None):
 
 
 def f32_literal(x):
-    """x rounded to f32, as a PTX literal (0f and the eight hex digits of its bit pattern): the constants of the
-    softmax blocks of fp8pv.py and nvfp4pv.py."""
+    """Return x rounded to f32 as a PTX literal: 0f and the eight hex digits of its bit pattern."""
     return "0f%08X" % struct.unpack("<I", struct.pack("<f", x))[0]
 
 
 # -------------------------------------------------------------------------------- Memory access
 @dsl_user_op
 def ld_shared_f32_v4_pred(addr, pred, *, loc=None, ip=None):
-    """i32 shared address, i32 pred -> four f32 by ld.shared.v4.f32 when pred != 0 (the load is predicated), zeros
-    otherwise."""
+    """Return four f32 by ld.shared.v4.f32 when pred != 0 (the load is predicated), zeros otherwise."""
     return asm(
         "{ .reg .pred q; setp.ne.s32 q, $5, 0;\n mov.f32 $0, 0f00000000;\n mov.f32 $1, 0f00000000;\n"
         " mov.f32 $2, 0f00000000;\n mov.f32 $3, 0f00000000;\n @q ld.shared.v4.f32 {$0, $1, $2, $3}, [$4]; }",
@@ -117,9 +115,9 @@ def ld_shared_f32_v4_pred(addr, pred, *, loc=None, ip=None):
 
 
 def ldsm(form, addr, x, off, loc, ip):
-    """The statement of the ldsm_* wrappers (this module and fp8pv.py): i32 shared address addr -> four i32 words by
-    ldmatrix.sync.aligned.<form> at addr or, with the Python int x, at (addr ^ x) + off (a swizzled row address formed
-    inside the block from the lane's base address)."""
+    """Emit the statement of the ldsm_* wrappers (this module and fp8pv.py): ldmatrix.sync.aligned.<form> at addr.
+    With the Python int x the load is at (addr ^ x) + off, a swizzled row address formed inside the block from the
+    base address of the lane."""
     text = f"ldmatrix.sync.aligned.{form} {{$0, $1, $2, $3}}, [$4];"
     if x is not None:
         text = (
@@ -131,24 +129,20 @@ def ldsm(form, addr, x, off, loc, ip):
 
 @dsl_user_op
 def ldsm_b16_x4(addr, *, loc=None, ip=None):
-    """i32 shared address addr (the row address of the lane) -> four i32 words by
-    ldmatrix.sync.aligned.m8n8.x4.shared.b16: four 8x8 16-bit matrices, matrix m from the row addresses of lanes 8 m ..
-    8 m + 7."""
+    """Return four 8x8 16-bit matrices (m8n8.x4.shared.b16): matrix m from the row addresses of lanes 8 m .. 8 m + 7."""
     return ldsm("m8n8.x4.shared.b16", addr, None, 0, loc, ip)
 
 
 @dsl_user_op
 def ldsm_b16_x4_trans(addr, x=None, off=0, *, loc=None, ip=None):
-    """i32 shared address addr (the row address of the lane), optionally Python ints x and off -> four i32 words by
-    ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 at addr, or at (addr ^ x) + off with x (see ldsm): four 8x8 16-bit
-    matrices, transposed, matrix m from the row addresses of lanes 8 m .. 8 m + 7."""
+    """As ldsm_b16_x4, transposed (m8n8.x4.trans.shared.b16); with x the load is at (addr ^ x) + off (see ldsm)."""
     return ldsm("m8n8.x4.trans.shared.b16", addr, x, off, loc, ip)
 
 
 @dsl_user_op
 def ld_global_nc_b32_hint_pred(addr, pred, policy, n: int, *, loc=None, ip=None):
-    """i64 global address, i32 pred -> n u32 words (n 2 or 4) by ld.global.nc.L1::no_allocate.L2::cache_hint.v<n>.b32
-    (4 n bytes) under the L2 cache policy `policy` (createpolicy.fractional) when pred != 0, zeros otherwise."""
+    """Return n u32 words (n 2 or 4) by ld.global.nc.L1::no_allocate.L2::cache_hint.v<n>.b32 when pred != 0, else zeros.
+    The load is under the L2 cache policy `policy` (createpolicy.fractional)."""
     words = ", ".join(f"${i}" for i in range(n))
     return asm(
         f"{{ .reg .pred q; .reg .b64 pol; setp.ne.s32 q, ${n + 1}, 0;\n"
@@ -165,8 +159,7 @@ def ld_global_nc_b32_hint_pred(addr, pred, policy, n: int, *, loc=None, ip=None)
 
 @dsl_user_op
 def st_global_b32_v2_hint(addr, x, y, policy, *, loc=None, ip=None):
-    """i64 global address, u32 x, y: st.global.L2::cache_hint.v2.b32 (8 bytes) under the L2 cache policy `policy`
-    (createpolicy.fractional)."""
+    """Store x, y by st.global.L2::cache_hint.v2.b32 under the L2 cache policy `policy` (createpolicy.fractional)."""
     asm(
         f"{{ .reg .b64 pol; createpolicy.fractional.L2::{policy}.b64 pol, 1.0;\n"
         " st.global.L2::cache_hint.v2.b32 [$0], {$1, $2}, pol; }",

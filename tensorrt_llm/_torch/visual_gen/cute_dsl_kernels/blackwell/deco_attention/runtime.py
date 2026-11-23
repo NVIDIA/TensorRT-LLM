@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-side helpers of the kernel launches: the buffers of a call in the caller's workspace, global-memory pointers,
-the current stream, the SM count and the compile cache."""
+"""Host-side helpers of the kernel launches: workspace buffers, pointers, the stream, SM count and compile cache."""
 
 import functools
 import math
@@ -31,16 +30,17 @@ def _aligned_bytes(dtype, shape):
 
 
 def workspace_bytes(layout):
-    """Bytes of a workspace that holds the buffers of a layout (name -> (dtype, shape), a dict in the order of the
-    buffers in the workspace)."""
+    """Return the bytes of a workspace that holds the buffers of a layout, name -> (dtype, shape) in workspace order."""
     return sum(_aligned_bytes(dtype, shape) for dtype, shape in layout.values())
 
 
 def carve(workspace, layout):
-    """The buffers of a layout as views of a workspace, name -> tensor of the buffer's dtype and shape: the 1-D uint8
-    tensor is read through one view per dtype, and each buffer is the contiguous block of that view at its offset.
-    The content of the workspace is left as it is. ValueError for a workspace that is too small or whose address is
-    not a multiple of ALIGN."""
+    """Return the buffers of a layout as views of a workspace: name -> tensor of the buffer's dtype and shape.
+
+    * The 1-D uint8 workspace is read through one view per dtype; each buffer is the contiguous block of that view at
+      its offset. The content of the workspace is left as it is.
+    * ValueError for a workspace that is too small or whose address is not a multiple of ALIGN.
+    """
     sizes = [_aligned_bytes(dtype, shape) for dtype, shape in layout.values()]
     total = sum(sizes)
     if workspace.numel() < total or workspace.data_ptr() % ALIGN:
@@ -66,12 +66,12 @@ def carve(workspace, layout):
 
 
 def gmem_ptr(dtype, t, align=256):
-    """Pointer to tensor t's data, assumed aligned to `align` bytes."""
+    """Return a pointer to tensor t's data, assumed aligned to `align` bytes."""
     return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
 
 def current_stream(device):
-    """The current PyTorch stream of `device` as a driver stream: every launch goes there."""
+    """Return the current PyTorch stream of `device` as a driver stream: every launch goes there."""
     return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
@@ -81,7 +81,7 @@ def num_sms(device):
 
 
 def compiled(cache, key, make, *args, **kwargs):
-    """cache[key], compiled for args from make() on first use (make builds the kernel object, or returns the jit
+    """Return cache[key], compiled for args from make() on first use (make builds the kernel object, or returns the jit
     function, only on a miss)."""
     fn = cache.get(key)
     if fn is None:
