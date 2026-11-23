@@ -363,6 +363,8 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
     )
     kv_fp4_only = 'unittest/disaggregated/test_deepseek_v4_kv_transfer.py -k "NVFP4"'
     loader_py_param = 'unittest/test_loader.py -k "model.py"'
+    dir_py_param = 'unittest/loader_dir -k "model.py"'
+    repeated_k = "unittest/test_rep.py -k slow -k=fast"
     (test_db / "l0_b200.yml").write_text(
         yaml.safe_dump(
             {
@@ -370,19 +372,32 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
                 "l0_b200": [
                     {
                         "condition": pre_cond,
-                        "tests": [kv_dir_batch, kv_file_subset, kv_fp4_only, loader_py_param],
+                        "tests": [
+                            kv_dir_batch,
+                            kv_file_subset,
+                            kv_fp4_only,
+                            loader_py_param,
+                            dir_py_param,
+                            repeated_k,
+                        ],
                     }
                 ],
             },
             sort_keys=False,
         )
     )
-    rule_fp4 = WaivesRule(YAMLIndex.load(test_db), stages)
+    idx_multi = YAMLIndex.load(test_db)
+    assert idx_multi.find_matches_for_waive("unittest/test_rep.py::test_slow[p]") is None
+    assert idx_multi.find_matches_for_waive("unittest/test_rep.py::test_fast[p]") is not None
+
+    rule_fp4 = WaivesRule(idx_multi, stages)
     unwaive_func_diff = (
-        "@@ -1,4 +1,1 @@\n"
+        "@@ -1,6 +1,1 @@\n"
         "-unittest/disaggregated/test_deepseek_v4_kv_transfer.py::"
         "test_deepseek_v4_native_sparse_host_transfer SKIP (https://nvbugs/4)\n"
         "-unittest/test_loader.py::test_load SKIP (https://nvbugs/5)\n"
+        "-unittest/loader_dir/test_fast.py::test_load SKIP (https://nvbugs/7)\n"
+        "-unittest/test_rep.py::test_fast[p] SKIP (https://nvbugs/8)\n"
         "-unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::"
         "TestSparseUnitCopy::test_a_contiguous_unit_lands_at_its_entry SKIP (https://nvbugs/6)\n"
     )
@@ -397,6 +412,34 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
         kv_file_subset,
         kv_fp4_only,
         loader_py_param,
+        dir_py_param,
+        repeated_k,
+    ]
+
+    # Exact class node-id registration stops lookup at the class and omits the sibling directory batch.
+    kv_class_entry = (
+        "unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::"
+        "TestTeardownWithoutCudaContext"
+    )
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_b200": [{"condition": pre_cond, "tests": [kv_dir_batch, kv_class_entry]}],
+            },
+            sort_keys=False,
+        )
+    )
+    rule_cls = WaivesRule(YAMLIndex.load(test_db), stages)
+    teardown_diff = f"@@ -1,2 +1,1 @@\n-{kv_class_entry}::test_no_ctx SKIP (https://nvbugs/9)\n"
+    res_cls = rule_cls.apply(
+        PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: teardown_diff})
+    )
+    assert res_cls is not None and res_cls.affected_stages == {"DGX_B200-PyTorch-1"}
+    filtered_cls = tmp_path / "filtered_cls"
+    write_filtered_test_db(test_db, filtered_cls, res_cls.block_filters)
+    assert yaml.safe_load((filtered_cls / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
+        kv_class_entry
     ]
 
 

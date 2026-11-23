@@ -144,19 +144,27 @@ _K_RESERVED_WORDS = {"and", "or", "not"}
 
 
 def _extract_k_keyword(entry: str) -> Optional[str]:
-    """Return the `-k` keyword expression (quoted or bare, matching `shlex.split`), or None."""
+    """Return the last `-k` keyword expression (matching pytest's `action="store"`), or None."""
     norm = normalize_test_id(entry)
     try:
         tokens = shlex.split(norm)
     except ValueError:
-        m = _K_VALUE_RE.search(norm)
-        return m.group(1) if m else None
-    for idx, tok in enumerate(tokens[1:], start=1):
+        matches = list(_K_VALUE_RE.finditer(norm))
+        return matches[-1].group(1) if matches else None
+    last: Optional[str] = None
+    idx = 1
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--":
+            break
         if tok == "-k" and idx + 1 < len(tokens):
-            return tokens[idx + 1]
+            last = tokens[idx + 1]
+            idx += 2
+            continue
         if tok.startswith("-k="):
-            return tok[3:]
-    return None
+            last = tok[3:]
+        idx += 1
+    return last
 
 
 def _entry_excludes_waive(entry: str, waive_id: str) -> bool:
@@ -229,7 +237,10 @@ def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
     if "[" not in norm_waive and not (
         not entry_target.endswith(".py")
         and waive_file.endswith(".py")
-        and all(t.lower().endswith(".py") for t in real)
+        and all(
+            t.lower().rsplit("/", 1)[-1].startswith("test_") and t.lower().endswith(".py")
+            for t in real
+        )
     ):
         return True  # unparameterized waive may match `-k` via unseen `[params]`
     waive_lower = norm_waive.lower()
