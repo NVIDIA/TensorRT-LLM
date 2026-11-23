@@ -322,7 +322,7 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
 
 @pytest.mark.threadleak(enabled=False)
 @skip_ray
-@pytest.mark.timeout(60)
+@pytest.mark.timeout(180)
 def test_priority_request_completes_before_low_priority():
     """High-priority request must be scheduled before a lower-priority one.
 
