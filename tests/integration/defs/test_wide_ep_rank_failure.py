@@ -389,6 +389,9 @@ class Request:
     token_ids: List[int] = field(default_factory=list)
     text: str = ""
     completion_tokens: Optional[int] = None
+    # A non-streamed request's usage: its prompt tokens and the cached tokens it reports.
+    prompt_tokens: Optional[int] = None
+    cached_tokens: Optional[int] = None
     error: Optional[str] = None
 
     def spans(self, t: float) -> bool:
@@ -503,7 +506,12 @@ class Clients:
                     choice = result["choices"][0]
                     request.token_ids = choice.get("token_ids") or []
                     request.text = choice.get("text") or ""
-                    request.completion_tokens = result["usage"]["completion_tokens"]
+                    usage = result["usage"]
+                    request.completion_tokens = usage["completion_tokens"]
+                    request.prompt_tokens = usage["prompt_tokens"]
+                    request.cached_tokens = (usage.get("prompt_tokens_details") or {}).get(
+                        "cached_tokens", 0
+                    )
         except urllib.error.HTTPError as error:
             request.error = f"HTTP {error.code}: {_error_body(error).decode(errors='replace')}"
         except (OSError, http.client.HTTPException, ValueError, LookupError, TypeError) as error:
@@ -798,6 +806,25 @@ class Run:
                 f"cycle {index}: no {'streamed' if stream else 'non-streamed'} request "
                 "in flight at the failure completed",
             )
+        # The eval requests share their few-shot context, so with block reuse their first prefill
+        # finds part of the prompt in the KV cache. The survivors recompute the requests in flight
+        # at the failure, and the recompute prefill finds the prompt and the generated tokens
+        # too, so a request that reported the recompute's hit would report its whole prompt.
+        recomputed = [
+            r
+            for r in self.clients.requests
+            if r.question is not None and r.spans(t_fail) and r.error is None
+        ]
+        self.check(
+            any(r.cached_tokens for r in recomputed),
+            f"cycle {index}: no eval request in flight at the failure reported cached tokens",
+        )
+        whole_prompt = [r for r in recomputed if r.cached_tokens >= r.prompt_tokens]
+        self.check(
+            not whole_prompt,
+            f"cycle {index}: {len(whole_prompt)} eval requests in flight at the failure report "
+            "their whole prompt as cached, the recompute prefill's hit, not their first prefill's",
+        )
         self.check(
             _active_ranks(failover, world) == survivors,
             f"cycle {index}: record after the failover: {failover}",
