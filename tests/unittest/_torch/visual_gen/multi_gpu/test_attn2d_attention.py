@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.backends import Attention2DAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
     _flash_attn_fwd as _fa4_fwd,
@@ -904,6 +905,70 @@ class TestFlashAttn4Forward:
         out = inner.forward(q=q, k=k, v=v)
         assert out.shape == q.shape, f"Expected {q.shape}, got {out.shape}"
         assert torch.isfinite(out).all(), "Output contains non-finite values"
+
+
+def _logic_attn2d_cudnn_vs_standard(rank, world_size, *, row_size, col_size):
+    """Attention2D with the BF16 cuDNN inner backend matches SDPA.
+
+    The row merge reads cuDNN's LSE as [B, H, S]; peaked logits make each partial output
+    differ, so a mis-laid-out LSE gives a visibly wrong merge.
+    """
+    batch, num_heads, head_dim = 2, 8, 128
+    seq_per_rank = 128
+    seq_full = seq_per_rank * world_size
+    device = torch.device(f"cuda:{rank}")
+    row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
+    attn = Attention2DAttention(
+        CuDNNAttention(num_heads=num_heads, head_dim=head_dim), row_pg, col_pg
+    )
+
+    g = torch.Generator(device=device).manual_seed(42)
+
+    def randn(scale=1.0):
+        """Seeded [B, S, H, D] BF16 tensor, equal on every rank."""
+        shape = (batch, seq_full, num_heads, head_dim)
+        return (torch.randn(shape, device=device, generator=g) * scale).bfloat16()
+
+    q_full, k_full, v_full = randn(3.0), randn(), randn()
+    rows = slice(rank * seq_per_rank, (rank + 1) * seq_per_rank)
+    output = attn(
+        q_full[:, rows].contiguous(),
+        k_full[:, rows].contiguous(),
+        v_full[:, rows].contiguous(),
+        batch_size=batch,
+    )
+    ref = F.scaled_dot_product_attention(
+        q_full.transpose(1, 2).float(),
+        k_full.transpose(1, 2).float(),
+        v_full.transpose(1, 2).float(),
+    ).transpose(1, 2)
+    torch.testing.assert_close(
+        output.float(),
+        ref[:, rows],
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"Rank {rank}: cuDNN Attention2D output differs from standard attention",
+    )
+
+
+def _logic_attn2d_cudnn_2x2(rank, world_size):
+    _logic_attn2d_cudnn_vs_standard(rank, world_size, row_size=2, col_size=2)
+
+
+def _logic_attn2d_cudnn_4x1(rank, world_size):
+    _logic_attn2d_cudnn_vs_standard(rank, world_size, row_size=4, col_size=1)
+
+
+class TestAttn2DAttentionCuDNN:
+    """Attention2DAttention with the BF16 cuDNN inner backend."""
+
+    def test_attn2d_cudnn_2x2_mesh(self):
+        """cuDNN inner backend, 2x2 mesh: the LSE row merge of 2 partials matches SDPA."""
+        run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_cudnn_2x2, use_cuda=True)
+
+    def test_attn2d_cudnn_4x1_mesh(self):
+        """cuDNN inner backend, 4x1 mesh: the LSE row merge of 4 partials matches SDPA."""
+        run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_cudnn_4x1, use_cuda=True)
 
 
 class TestAttn2DAttentionFlashAttn4:

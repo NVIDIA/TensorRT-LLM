@@ -877,8 +877,9 @@ class CuDNNAttention(AttentionBackend):
 
         self._execute_graph(bundle, tensor_map, device)
 
-        # Stats is packed [B, H, S, 1]; other backends expose LSE as [B, S, H].
-        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
+        # Stats is packed [B, H, S, 1]; LSE is [B, H, S] like the other backends, which is the
+        # layout Attention2D and Ring merge.
+        lse = None if stats is None else stats.squeeze(-1)
         return output, lse
 
     def forward(
@@ -931,7 +932,7 @@ class CuDNNAttention(AttentionBackend):
 
         Returns:
             output: ``[B, S_q, H, D_v]``
-            lse: ``[B, S_q, H]`` float32
+            lse: ``[B, H, S_q]`` float32
         """
         if kwargs.get("kv") is not None:
             raise NotImplementedError("forward_with_lse does not support a K/V cache.")
