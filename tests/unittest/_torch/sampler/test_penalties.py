@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from utils.util import assert_no_cuda_sync
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions
 from tensorrt_llm._torch.pyexecutor.sampler.penalties import (
@@ -841,19 +842,27 @@ def test_seed_prompt_matches_reference(
     state = meta.penalty_state
     slot = 1
     prompt = _seed_prompt_tokens(vocab_size, dtype)
-    # Seed twice into one slot: counts accumulate and mask bits OR into existing ones.
+    # A second prompt with every in-vocab id moved up by one: its ignored ids share
+    # words with the first prompt's but set different bits in them.
+    shifted = [(i + 1) % vocab_size if 0 <= i < vocab_size else i for i in prompt.tolist()]
+    other = torch.tensor(shifted, dtype=dtype, pin_memory=True)
+    # Seed both into one slot: counts accumulate and mask bits OR into existing ones.
     seed_prompt(meta, slot, prompt, ignore_length)
-    seed_prompt(meta, slot, prompt, ignore_length)
+    seed_prompt(meta, slot, other, ignore_length)
     # Invalid slots (padding row, negative) and an empty prompt are no-ops.
     seed_prompt(meta, state.dummy_row, prompt, ignore_length)
     seed_prompt(meta, -1, prompt, ignore_length)
     seed_prompt(meta, 0, torch.empty(0, dtype=dtype), ignore_length)
 
     counts, seen = _seed_reference(prompt.tolist(), ignore_length, vocab_size)
+    other_counts, other_seen = _seed_reference(shifted, ignore_length, vocab_size)
     rows = torch.tensor([slot], device="cuda")
-    torch.testing.assert_close(state.counts[slot].cpu(), 2 * counts, rtol=0, atol=0)
+    torch.testing.assert_close(state.counts[slot].cpu(), counts + other_counts, rtol=0, atol=0)
     torch.testing.assert_close(
-        _unpack_prompt_mask(state.prompt_mask, rows, vocab_size)[0].cpu(), seen, rtol=0, atol=0
+        _unpack_prompt_mask(state.prompt_mask, rows, vocab_size)[0].cpu(),
+        seen | other_seen,
+        rtol=0,
+        atol=0,
     )
     # Padding bits past vocab_size stay clear, and every other row is untouched.
     unpacked = (
@@ -871,13 +880,8 @@ def test_seed_prompt_does_not_synchronize(ignore_length: int) -> None:
     meta = _seed_metadata(vocab_size)
     prompt = _seed_prompt_tokens(vocab_size)
     seed_prompt(meta, 0, prompt, ignore_length)  # warm up allocations outside the check
-    torch.cuda.synchronize()
-    previous = torch.cuda.get_sync_debug_mode()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
+    with assert_no_cuda_sync():
         seed_prompt(meta, 1, prompt, ignore_length)
-    finally:
-        torch.cuda.set_sync_debug_mode(previous)
 
 
 def test_seed_prompt_reads_prompt_freed_while_copy_is_queued() -> None:
@@ -887,14 +891,21 @@ def test_seed_prompt_reads_prompt_freed_while_copy_is_queued() -> None:
     state = meta.penalty_state
     prompt = _seed_prompt_tokens(vocab_size)
     expected_counts, expected_seen = _seed_reference(prompt.tolist(), ignore_length, vocab_size)
+    # Load seed_prompt's kernels first (from device memory, leaving the pinned pool
+    # alone): a cold first call can outlast the blocker below.
+    seed_prompt(meta, 1, prompt.cuda(), ignore_length)
+    torch.cuda.synchronize()
     # Hold the stream so the copy is still queued when the host releases the prompt
     # and refills a pinned buffer of the same size.
     torch.cuda._sleep(200_000_000)
     seed_prompt(meta, 0, prompt, ignore_length)
+    copy_done = torch.cuda.Event()
+    copy_done.record()
     num_tokens = prompt.numel()
     del prompt
     scribble = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
     scribble.fill_(vocab_size - 1)
+    assert not copy_done.query(), "the copy finished before the prompt was released"
     torch.cuda.synchronize()
 
     rows = torch.tensor([0], device="cuda")

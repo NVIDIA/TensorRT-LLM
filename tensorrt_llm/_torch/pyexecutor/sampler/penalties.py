@@ -1000,13 +1000,13 @@ def _or_prompt_bits(mask_row: torch.Tensor, ids: torch.Tensor, valid: torch.Tens
     nothing here waits for the device.
     """
     num_bits = mask_row.numel() * 32
-    present = torch.zeros(num_bits + 1, dtype=torch.int64, device=mask_row.device)
+    present = torch.zeros(num_bits + 1, dtype=torch.int32, device=mask_row.device)
     present.index_fill_(0, torch.where(valid, ids, num_bits), 1)
-    shifts = torch.arange(32, dtype=torch.int64, device=mask_row.device)
-    words = (present[:num_bits].view(-1, 32) << shifts).sum(-1)
-    # ``words`` is the unsigned 32-bit pattern; re-express bit 31 as the int32 sign.
-    words = words - ((words >> 31) << 32)
-    mask_row.bitwise_or_(words.to(torch.int32))
+    shifts = torch.arange(32, dtype=torch.int32, device=mask_row.device)
+    # In int32, bit 31 is INT32_MIN and the other bits sum to at most INT32_MAX, so
+    # no partial sum overflows and the result is the packed word itself.
+    words = (present[:num_bits].view(-1, 32) << shifts).sum(-1, dtype=torch.int32)
+    mask_row.bitwise_or_(words)
 
 
 def seed_prompt(
