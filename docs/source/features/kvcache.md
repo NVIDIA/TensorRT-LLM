@@ -362,7 +362,9 @@ prompt = TextPrompt(
 - **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
 - **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
 
-**Items without a content hash:** An item gets a random digest instead when its content is not hashed (hashing is off or fails for the request, or embeddings are attached without hashes). No other request reuses its KV cache blocks then, even for the same input; a supplied UUID is still reported in events. When the prompt span of an item is not found either (for example, the input processor cannot count the tokens of its modality, or it attaches embeddings without item spans), the request gets a cache salt of its own, added to its `cache_salt`. Such a request reuses no KV cache blocks at all, not even a shared text prefix, and events that report the salt show the combined one.
+**Items without a content hash** get a fresh digest when hashing is off, hashing fails, or embeddings arrive without hashes. With known item spans, events can still report the supplied UUIDs. If the processor cannot locate the spans, it salts the whole prompt, including the text prefix. The private salt belongs to the prepared input. Submitting that input again under a different caller salt selects a different namespace. Events that expose the cache salt report the effective value. This combines the private multimodal salt with the caller’s `cache_salt`, using a BLAKE3 digest of the caller salt when the combination would exceed 256 UTF-8 bytes or the caller salt starts with the reserved `blake3:` prefix.
+
+For disaggregated media requests, context-first dispatch carries the effective salt to decode. In generation-first HTTP serving, the router supplies a shared fallback before dispatch. If you schedule the two LLM API calls yourself, create one fallback with `new_mm_cache_salt(cache_salt)` from `tensorrt_llm.inputs.multimodal`. Pass it as `DisaggregatedParams.multimodal_cache_salt` on both workers with the same caller salt. Requests without item spans use this value for their KV keys.
 
 **UUID Format:**
 

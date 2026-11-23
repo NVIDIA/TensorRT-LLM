@@ -43,6 +43,7 @@ from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -2574,7 +2575,9 @@ class OpenAIServer(_VideoRoutesMixin):
             # prompt_token_ids further below.
             resolve_media = not (disaggregated_params is not None
                                  and disaggregated_params.request_type
-                                 == "generation_only" and
+                                 == "generation_only"
+                                 and disaggregated_params.schedule_style
+                                 != DisaggScheduleStyle.GENERATION_FIRST and
                                  (request.prompt_token_ids is not None
                                   or request.prompt_token_ids_b64))
 

@@ -44,7 +44,7 @@ from .._startup_errors import (classify_startup_error, log_startup_error,
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
@@ -976,24 +976,37 @@ class BaseLLM:
                     DisaggregatedParams(request_type="context_and_generation"),
                     multimodal_input_layout=encoder_layout)
 
-        if is_gen_only and disaggregated_params.multimodal_cache_salt is not None:
-            context_salt = disaggregated_params.multimodal_cache_salt
-            # The random per-request suffix contains no slash. Restore the
-            # markers so retention and KV sharing also skip the generation leg.
+        gen_first = ((is_ctx_only or is_gen_only)
+                     and disaggregated_params.schedule_style
+                     == DisaggScheduleStyle.GENERATION_FIRST)
+        shared_salt = (disaggregated_params.multimodal_cache_salt
+                       if is_gen_only or gen_first else None)
+        if gen_first:
+            if multimodal_params is not None and multimodal_params.multimodal_input is not None:
+                # Both workers already have per-item cache keys.
+                shared_salt = None
+            elif shared_salt is None and request_cache_salt(
+                    None, multimodal_params) is not None:
+                raise ValueError(
+                    "Generation-first media without item spans requires the same "
+                    "multimodal_cache_salt on both workers. Use context-first "
+                    "scheduling or allocate the salt before dispatch.")
+        if shared_salt is not None:
+            # Preserve the private namespace across both workers, including decode from token IDs.
             if multimodal_params is None:
                 multimodal_params = MultimodalParams()
             data = dict(multimodal_params.multimodal_data or {})
-            data[MULTIMODAL_CACHE_SALT_KEY] = context_salt.rsplit("/", 1)[-1]
+            data[MULTIMODAL_CACHE_SALT_KEY] = shared_salt.rsplit("/", 1)[-1]
             data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
             multimodal_params = replace(multimodal_params,
                                         multimodal_input=None,
                                         multimodal_data=data)
             if (cache_salt is not None
-                    and cache_salt != context_salt and request_cache_salt(
-                        cache_salt, multimodal_params) != context_salt):
+                    and cache_salt != shared_salt and request_cache_salt(
+                        cache_salt, multimodal_params) != shared_salt):
                 raise ValueError(
                     "cache_salt differs from the context request's cache salt")
-            cache_salt = context_salt
+            cache_salt = shared_salt
         else:
             cache_salt = request_cache_salt(cache_salt, multimodal_params)
             if is_ctx_only:

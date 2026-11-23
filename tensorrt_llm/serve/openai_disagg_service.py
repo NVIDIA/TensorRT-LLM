@@ -21,6 +21,7 @@ from typing import Callable, Optional
 from fastapi import HTTPException
 
 from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
+from tensorrt_llm.inputs.multimodal import new_mm_cache_salt
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
     DisaggServerConfig,
@@ -51,6 +52,7 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
 from tensorrt_llm.serve.output_length_predictor import RECORD_FLUSH_S, OutputLengthPriority
+from tensorrt_llm.serve.render.chat import _has_media
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
@@ -73,6 +75,31 @@ def _ctx_handoff_slots(response: UCompletionResponse) -> list:
     if isinstance(response, ResponsesResponse):
         return [response]
     return list(response.choices)
+
+
+def _has_disagg_media(request: UCompletionRequest) -> bool:
+    if isinstance(request, ChatCompletionRequest):
+        messages = request.messages
+    elif isinstance(request, ResponsesRequest) and isinstance(request.input, list):
+        messages = request.input
+    else:
+        return False
+    found = False
+    for item in messages:
+        message = item if isinstance(item, dict) else item.model_dump()
+        key = (
+            "output"
+            if message.get("type") in ("function_call_output", "custom_tool_call_output")
+            else "content"
+        )
+        parts = message.get(key)
+        if parts is None or isinstance(parts, str):
+            continue
+        if not isinstance(parts, list):
+            # Pydantic can expose chat content as a single-use iterator.
+            parts = message[key] = list(parts)
+        found = found or _has_media([{"content": parts}])
+    return found
 
 
 def _ctx_usage_info(response: UCompletionResponse) -> Optional[UsageInfo]:
@@ -648,6 +675,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
         need_ctx = not (await self._check_gen_only_disagg(request))
+        has_media = need_ctx and _has_disagg_media(request)
         ctx_server, gen_server = None, None
         ctx_server_info = None
         ctx_req, gen_req = None, None
@@ -670,6 +698,11 @@ class OpenAIDisaggregatedService(OpenAIService):
             disagg_request_id=disagg_request_id,
             ctx_server_info=ctx_server_info,
         )
+        if has_media:
+            # Workers use this private identity when preprocessing finds no item spans.
+            salt = new_mm_cache_salt(getattr(request, "cache_salt", None))
+            ctx_req.disaggregated_params.multimodal_cache_salt = salt
+            gen_req.disaggregated_params.multimodal_cache_salt = salt
         self._strip_gen_subagent_affinity(gen_req)
         # No orig_elapsed_s before the context phase: GEN admission keeps it FCFS.
 

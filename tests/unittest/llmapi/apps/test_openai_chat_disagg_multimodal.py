@@ -186,6 +186,20 @@ def test_generation_only_drops_relayed_media(route_client, media_kind):
     assert "mm_item_order" not in prompt
 
 
+def test_generation_first_loads_media_with_client_token_ids(route_client):
+    from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+
+    prompt = _post(
+        route_client,
+        "image_url",
+        {
+            "request_type": "generation_only",
+            "schedule_style": DisaggScheduleStyle.GENERATION_FIRST,
+        },
+    )
+    assert "image" in prompt["multi_modal_data"]
+
+
 def test_generation_only_never_loads_relayed_media(route_client):
     """The media is not loaded at all, rather than loaded and then dropped.
 

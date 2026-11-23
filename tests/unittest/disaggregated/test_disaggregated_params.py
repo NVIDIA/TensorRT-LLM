@@ -181,24 +181,11 @@ def test_multimodal_spans_round_trip_through_openai_json():
     assert restored == original
 
 
-@pytest.mark.parametrize("caller_salt", ["tenant/가", "가" * 80], ids=["caller", "long_caller"])
-def test_generation_reuses_context_block_keys_without_item_spans(caller_salt):
+@pytest.fixture
+def handoff_llm():
     from tensorrt_llm.executor.request import GenerationRequest
     from tensorrt_llm.executor.result import GenerationResult
-    from tensorrt_llm.inputs import prompt_inputs
-    from tensorrt_llm.inputs.multimodal import (
-        MULTIMODAL_CACHE_SALT_KEY,
-        MULTIMODAL_NO_CONTENT_HASHES_KEY,
-        MultimodalParams,
-        isolate_mm_request,
-    )
-    from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
-    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as WireParams
-    from tensorrt_llm.serve.openai_protocol import (
-        to_disaggregated_params,
-        to_llm_disaggregated_params,
-    )
+    from tensorrt_llm.llmapi.llm import BaseLLM
 
     def submit(*args, **kwargs):
         request = GenerationRequest(*args, **kwargs)
@@ -208,18 +195,51 @@ def test_generation_reuses_context_block_keys_without_item_spans(caller_salt):
     llm._encode_only = llm.args.mm_encoder_only = llm.args.return_perf_metrics = False
     llm._executor.is_shutdown.return_value = llm._is_encoder_decoder_model.return_value = False
     llm._prepare_sampling_params.return_value = SamplingParams(max_tokens=4)
-    llm._prepare_prompt_inputs.side_effect = prompt_inputs
+    llm._prepare_prompt_inputs.side_effect = lambda *args, **kwargs: BaseLLM._prepare_prompt_inputs(
+        llm, *args, **kwargs
+    )
     llm._preprocess.side_effect = lambda *args: BaseLLM._preprocess(llm, *args)
     llm._executor.generate_async.side_effect = submit
+    return llm
+
+
+def _block_keys(result):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
+
+    request = result._generation_request
+    return [
+        key
+        for block, key in sequence_to_blockchain_keys(
+            4, ReuseScope(salt=request.cache_salt), request.prompt_token_ids
+        )
+        if block
+    ]
+
+
+@pytest.mark.parametrize("caller_salt", ["tenant/가", "가" * 80], ids=["caller", "long_caller"])
+def test_generation_reuses_context_block_keys_without_item_spans(handoff_llm, caller_salt):
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_CACHE_SALT_KEY,
+        MULTIMODAL_NO_CONTENT_HASHES_KEY,
+        MultimodalParams,
+        isolate_mm_request,
+    )
+    from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as WireParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
 
     data = {}
     isolate_mm_request(data, "processor", ["audio"], "no item spans")
     tokens = list(range(8))
+    prepared = PreprocessedInputs(
+        prompt_token_ids=tokens, multimodal_params=MultimodalParams(multimodal_data=data)
+    )
     context = BaseLLM.generate_async(
-        llm,
-        PreprocessedInputs(
-            prompt_token_ids=tokens, multimodal_params=MultimodalParams(multimodal_data=data)
-        ),
+        handoff_llm,
+        prepared,
         disaggregated_params=DisaggregatedParams(request_type="context_only"),
         cache_salt=caller_salt,
     )
@@ -227,27 +247,85 @@ def test_generation_reuses_context_block_keys_without_item_spans(caller_salt):
     handoff = to_llm_disaggregated_params(WireParams.model_validate_json(encoded))
     handoff.request_type = "generation_only"
 
-    def block_keys(result):
-        request = result._generation_request
-        return [
-            key
-            for block, key in sequence_to_blockchain_keys(
-                4, ReuseScope(salt=request.cache_salt), request.prompt_token_ids
-            )
-            if block
-        ]
-
-    context_keys = block_keys(context)
+    context_keys = _block_keys(context)
     assert len(context_keys) == 2
     for overrides in ({}, {"cache_salt": caller_salt}):
-        generation = BaseLLM.generate_async(llm, tokens, disaggregated_params=handoff, **overrides)
-        assert block_keys(generation) == context_keys
+        generation = BaseLLM.generate_async(
+            handoff_llm, tokens, disaggregated_params=handoff, **overrides
+        )
+        assert _block_keys(generation) == context_keys
         gen_data = generation._generation_request.multimodal_params.multimodal_data
         assert gen_data[MULTIMODAL_CACHE_SALT_KEY] == data[MULTIMODAL_CACHE_SALT_KEY]
         assert gen_data[MULTIMODAL_NO_CONTENT_HASHES_KEY]
     assert handoff.multimodal_cache_salt == context._generation_request.cache_salt
+    other_caller = "b" * 225
+    other = BaseLLM.generate_async(handoff_llm, prepared, cache_salt=other_caller)
+    assert not set(_block_keys(other)).intersection(context_keys)
     with pytest.raises(ValueError, match="cache_salt differs"):
-        BaseLLM.generate_async(llm, tokens, disaggregated_params=handoff, cache_salt="other")
+        BaseLLM.generate_async(
+            handoff_llm, tokens, disaggregated_params=handoff, cache_salt=other_caller
+        )
+
+
+def test_generation_first_requires_shared_identity_without_item_spans(handoff_llm):
+    from dataclasses import replace
+
+    from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+    from tensorrt_llm.inputs.multimodal import (
+        MultimodalInput,
+        MultimodalParams,
+        isolate_mm_request,
+        new_mm_cache_salt,
+    )
+    from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
+
+    tokens = list(range(8))
+    keys = []
+    for request_id in (42, 43):
+        data = {}
+        isolate_mm_request(data, "processor", ["audio"], "no item spans")
+        media = MultimodalParams(multimodal_data=data)
+        prepared = PreprocessedInputs(prompt_token_ids=tokens, multimodal_params=media)
+        context = DisaggregatedParams(
+            request_type="context_only",
+            schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+            disagg_request_id=request_id,
+        )
+        with pytest.raises(ValueError, match="multimodal_cache_salt"):
+            BaseLLM.generate_async(
+                handoff_llm, prepared, disaggregated_params=context, cache_salt="tenant"
+            )
+        context.multimodal_cache_salt = new_mm_cache_salt("tenant")
+        generation = replace(context, request_type="generation_only")
+        gen = BaseLLM.generate_async(
+            handoff_llm, tokens, disaggregated_params=generation, cache_salt="tenant"
+        )
+        ctx = BaseLLM.generate_async(
+            handoff_llm, prepared, disaggregated_params=context, cache_salt="tenant"
+        )
+        gen_keys = _block_keys(gen)
+        assert len(gen_keys) == 2
+        assert gen_keys == _block_keys(ctx)
+        local = BaseLLM.generate_async(
+            handoff_llm, prepared, disaggregated_params=generation, cache_salt="tenant"
+        )
+        assert gen_keys == _block_keys(local)
+        keys.append(gen_keys)
+    assert keys[0] != keys[1]
+
+    # Workers that already know the spans keep their per-item keys and caller salt.
+    identity = MultimodalInput(
+        multimodal_hashes=[[1] * 8], multimodal_positions=[1], multimodal_lengths=[3]
+    )
+    prepared = PreprocessedInputs(
+        prompt_token_ids=tokens, multimodal_params=MultimodalParams(multimodal_input=identity)
+    )
+    for params in (context, generation):
+        result = BaseLLM.generate_async(
+            handoff_llm, prepared, disaggregated_params=params, cache_salt="tenant"
+        )
+        assert result._generation_request.cache_salt == "tenant"
+        assert result._generation_request.multimodal_params.multimodal_input == identity
 
 
 def test_embedding_handles_without_hashes_get_a_random_hash_each() -> None:
