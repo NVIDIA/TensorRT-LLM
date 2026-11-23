@@ -26,7 +26,7 @@
 
 import contextlib
 import threading
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -141,6 +141,9 @@ def _error_handling_executor(events, *, fatal, attention_dp=False, world_size=1)
     executor.active_requests = []
     executor._pending_transfer_responses = []
     executor._pending_response_terminations = []
+    executor._publish_responses_and_terminate = MethodType(
+        pe.PyExecutor._publish_responses_and_terminate, executor
+    )
     executor._enqueue_responses.side_effect = lambda *_: events.append("responses")
     return executor
 
