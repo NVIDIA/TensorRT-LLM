@@ -135,7 +135,6 @@ _RANK_INFO_CHALLENGE_TTL_S = 10.0
 # Control-plane message authentication (ZMQMessenger FrameSigner).
 _NATIVE_CTL_AUTH_CONTEXT = b"trtllm-native-disagg-ctl-v1\0"
 _NATIVE_SUBKEY_CONTEXT = b"trtllm-native-auth-subkey-v1\0"
-_NATIVE_CTL_KEY_ID = 0
 
 
 def _validate_native_auth_key(key: Optional[bytes]) -> Optional[bytes]:
@@ -162,9 +161,7 @@ def _make_native_frame_signer(master_key: Optional[bytes]) -> Optional[FrameSign
     if master_key is None:
         return None
     return FrameSigner(
-        {_NATIVE_CTL_KEY_ID: _derive_native_auth_key(master_key, b"control-plane")},
-        _NATIVE_CTL_KEY_ID,
-        _NATIVE_CTL_AUTH_CONTEXT,
+        _derive_native_auth_key(master_key, b"control-plane"), _NATIVE_CTL_AUTH_CONTEXT
     )
 
 

@@ -9,7 +9,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from threading import Event, Lock, Thread
-from typing import Callable, Mapping, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import zmq
 
@@ -90,7 +90,6 @@ class FrameAuthenticationError(PermissionError):
 
 
 class SignedHeader(NamedTuple):
-    key_id: int
     flow: int
     seq: int
     stream_id: bytes
@@ -103,18 +102,16 @@ class FrameSigner:
     A signed message is the payload frames followed by a header frame and a
     32-byte MAC frame: ``[*payload, header, mac]``. The MAC covers, each with a
     4-byte length prefix so frame boundaries cannot be shifted: the caller's
-    context string, the header (key id, flow, seq, stream id, sender id), the
+    context string, the header (flow, seq, stream id, sender id), the
     recipient id, and every payload frame. ROUTER identity frames are added and
     consumed by ZMQ, never seen by the peer, and are therefore not signed.
 
-    The signer holds only key material and the context string, so one instance
+    The signer holds only the key and the context string, so one instance
     can be shared by every socket of a component. Identities and flow are
     supplied per message by ``ZMQMessenger``.
 
     Args:
-        keys: Accepted keys by key id (0-255). Verification accepts any of
-            them, so a rotation can roll out "accept new" before "send new".
-        active_key_id: Key id used for signing; must be present in ``keys``.
+        key: Key for signing and verification, at least ``MIN_KEY_SIZE`` bytes.
         context: Domain-separation string chosen by the caller. Two protocols
             sharing a key must use different contexts, otherwise a frame valid
             in one verifies in the other.
@@ -130,34 +127,23 @@ class FrameSigner:
     FLOW_TO_DEALER = 1
 
     _VERSION = 1
-    _HEADER = struct.Struct("!BBBQ16sH")
+    _HEADER = struct.Struct("!BBQ16sH")
     _LEN = struct.Struct("!I")
 
-    def __init__(self, keys: Mapping[int, bytes], active_key_id: int, context: bytes) -> None:
-        if not keys:
-            raise ValueError("FrameSigner requires at least one key")
-        for key_id, key in keys.items():
-            if not 0 <= key_id <= 255:
-                raise ValueError(f"Key id {key_id} is outside 0-255")
-            if not isinstance(key, bytes) or len(key) < self.MIN_KEY_SIZE:
-                raise ValueError(
-                    f"Key {key_id} must be bytes of at least {self.MIN_KEY_SIZE} bytes"
-                )
-        if active_key_id not in keys:
-            raise ValueError(f"Active key id {active_key_id} is not among the accepted keys")
+    def __init__(self, key: bytes, context: bytes) -> None:
+        if not isinstance(key, bytes) or len(key) < self.MIN_KEY_SIZE:
+            raise ValueError(f"Key must be bytes of at least {self.MIN_KEY_SIZE} bytes")
         if not context:
             raise ValueError("FrameSigner requires a non-empty context")
-        self._active_key_id = active_key_id
         self._context = bytes(context)
-        # One HMAC state per key with the context already absorbed: each
-        # message continues from a copy instead of re-keying the hash.
-        self._mac_bases = {key_id: self._new_mac_base(key) for key_id, key in keys.items()}
+        # HMAC state with the context already absorbed: each message
+        # continues from a copy instead of re-keying the hash.
+        self._mac_base = hmac.new(key, digestmod=hashlib.sha256)
+        self._mac_base.update(self._LEN.pack(len(self._context)))
+        self._mac_base.update(self._context)
 
     def __repr__(self) -> str:
-        return (
-            f"FrameSigner(key_ids={sorted(self._mac_bases)}, "
-            f"active_key_id={self._active_key_id}, context={self._context!r})"
-        )
+        return f"FrameSigner(context={self._context!r})"
 
     def sign(
         self,
@@ -186,14 +172,8 @@ class FrameSigner:
         """
         if len(stream_id) != self.STREAM_ID_SIZE:
             raise ValueError(f"stream_id must be {self.STREAM_ID_SIZE} bytes")
-        header = (
-            self._HEADER.pack(
-                self._VERSION, self._active_key_id, flow, seq, stream_id, len(sender_id)
-            )
-            + sender_id
-        )
-        mac = self._mac(self._active_key_id, header, recipient_id, frames)
-        return [header, mac]
+        header = self._HEADER.pack(self._VERSION, flow, seq, stream_id, len(sender_id)) + sender_id
+        return [header, self._mac(header, recipient_id, frames)]
 
     def verify(
         self, frames: list[bytes], *, recipient_id: bytes, flow: int
@@ -209,42 +189,33 @@ class FrameSigner:
 
         Raises:
             FrameAuthenticationError: The message is malformed, has no payload
-                frame, uses an unknown key id, was sent on the other flow or to
-                another recipient, has a frame of 4 GiB or more, or its MAC
-                does not match.
+                frame, was sent on the other flow or to another recipient, has
+                a frame of 4 GiB or more, or its MAC does not match.
         """
         if len(frames) < 3:
             raise FrameAuthenticationError("Message carries no payload or no authentication frames")
         payload, header, mac = frames[:-2], frames[-2], frames[-1]
         # Cheap structural checks first; the MAC is computed only for
-        # well-formed headers that name a known key.
+        # well-formed headers.
         if len(mac) != self.MAC_SIZE or len(header) < self._HEADER.size:
             raise FrameAuthenticationError("Malformed authentication frames")
-        version, key_id, msg_flow, seq, stream_id, sender_len = self._HEADER.unpack_from(header)
+        version, msg_flow, seq, stream_id, sender_len = self._HEADER.unpack_from(header)
         if version != self._VERSION or len(header) != self._HEADER.size + sender_len:
             raise FrameAuthenticationError("Malformed authentication header")
         if msg_flow != flow:
             raise FrameAuthenticationError("Message was sent on the other flow")
-        if key_id not in self._mac_bases:
-            raise FrameAuthenticationError(f"Unknown key id {key_id}")
         try:
-            expected_mac = self._mac(key_id, header, recipient_id, payload)
+            expected_mac = self._mac(header, recipient_id, payload)
         except struct.error as e:
             # The length of each MAC input is packed into 4 bytes.
             raise FrameAuthenticationError("Frame is too large to authenticate") from e
         if not hmac.compare_digest(mac, expected_mac):
             raise FrameAuthenticationError("MAC mismatch")
         sender_id = header[self._HEADER.size :]
-        return list(payload), SignedHeader(key_id, msg_flow, seq, stream_id, sender_id)
+        return list(payload), SignedHeader(msg_flow, seq, stream_id, sender_id)
 
-    def _new_mac_base(self, key: bytes) -> hmac.HMAC:
-        base = hmac.new(key, digestmod=hashlib.sha256)
-        base.update(self._LEN.pack(len(self._context)))
-        base.update(self._context)
-        return base
-
-    def _mac(self, key_id: int, header: bytes, recipient_id: bytes, frames: list[bytes]) -> bytes:
-        mac = self._mac_bases[key_id].copy()
+    def _mac(self, header: bytes, recipient_id: bytes, frames: list[bytes]) -> bytes:
+        mac = self._mac_base.copy()
         for part in (header, recipient_id, *frames):
             mac.update(self._LEN.pack(len(part)))
             mac.update(part)

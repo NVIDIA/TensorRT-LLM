@@ -6,7 +6,7 @@ import socket
 import threading
 import time
 import unittest
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any, Optional
 
 import pytest
@@ -164,12 +164,8 @@ _CONTEXT = b"trtllm-test-ctl-v1\0"
 _MessengerPair = tuple[ZMQMessenger, ZMQMessenger]
 
 
-def _signer(
-    keys: Optional[Mapping[int, bytes]] = None,
-    active_key_id: int = 1,
-    context: bytes = _CONTEXT,
-) -> FrameSigner:
-    return FrameSigner(keys or {1: _KEY}, active_key_id, context)
+def _signer(key: bytes = _KEY, context: bytes = _CONTEXT) -> FrameSigner:
+    return FrameSigner(key, context)
 
 
 def _signed(
@@ -206,7 +202,6 @@ def test_frame_signer_round_trip() -> None:
     payload, header = _verify(_signed([b"KV_AGENT_RESULT", b"prefix", b""]))
     assert payload == [b"KV_AGENT_RESULT", b"prefix", b""]
     assert header.sender_id == b"sender"
-    assert header.key_id == 1
     assert header.flow == FrameSigner.FLOW_TO_ROUTER
 
 
@@ -238,8 +233,8 @@ def test_frame_signer_rejects_dropped_or_appended_frames() -> None:
 @pytest.mark.parametrize(
     "verifier_kwargs, match",
     [
-        ({"signer": FrameSigner({1: _OTHER_KEY}, 1, _CONTEXT)}, "MAC mismatch"),
-        ({"signer": FrameSigner({1: _KEY}, 1, b"another-protocol-v1\0")}, "MAC mismatch"),
+        ({"signer": _signer(_OTHER_KEY)}, "MAC mismatch"),
+        ({"signer": _signer(context=b"another-protocol-v1\0")}, "MAC mismatch"),
         ({"recipient_id": b"someone-else"}, "MAC mismatch"),
         ({"flow": FrameSigner.FLOW_TO_DEALER}, "other flow"),
     ],
@@ -290,30 +285,16 @@ def test_frame_signer_rejects_frame_of_4_gib() -> None:
         _verify(message)
 
 
-def test_frame_signer_rotation_accepts_every_configured_key() -> None:
-    old = _signer({1: _KEY}, 1)
-    rolling = _signer({1: _KEY, 2: _OTHER_KEY}, 2)
-    new = _signer({2: _OTHER_KEY}, 2)
-    from_old = _signed([b"TAG"], signer=old)
-    assert _verify(from_old, signer=rolling)[1].key_id == 1
-    assert _verify(_signed([b"TAG"], signer=rolling), signer=rolling)[1].key_id == 2
-    with pytest.raises(FrameAuthenticationError, match="Unknown key id"):
-        _verify(from_old, signer=new)
-
-
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        ({"keys": {}, "active_key_id": 1}, "at least one key"),
-        ({"keys": {1: b"short"}, "active_key_id": 1}, "at least 16 bytes"),
-        ({"keys": {256: _KEY}, "active_key_id": 256}, "outside 0-255"),
-        ({"keys": {1: _KEY}, "active_key_id": 2}, "not among"),
-        ({"keys": {1: _KEY}, "active_key_id": 1, "context": b""}, "non-empty context"),
+        ({"key": b"short"}, "at least 16 bytes"),
+        ({"context": b""}, "non-empty context"),
     ],
 )
 def test_frame_signer_rejects_invalid_configuration(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(ValueError, match=match):
-        FrameSigner(**{"context": _CONTEXT, **kwargs})
+        _signer(**kwargs)
 
 
 def test_frame_signer_repr_omits_key_material() -> None:
@@ -403,7 +384,7 @@ def test_signed_listener_drops_messages_failing_verification_and_keeps_running(
     wrong_key = ZMQMessenger(
         "DEALER",
         router.endpoint,
-        signer=_signer({1: _OTHER_KEY}),
+        signer=_signer(_OTHER_KEY),
         identity="tcp://127.0.0.1:40002",
     )
     try:
