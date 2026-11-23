@@ -9,8 +9,8 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MTPDecodingConfig,
@@ -38,7 +38,7 @@ def _on_sm103(monkeypatch):
     """Route as if this were a GB300, wherever the test actually runs."""
     # Routing selects a class; these synthetic CPU configs do not construct it.
     module = ModuleType(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
         "glm_5_2_nvfp4__sm_107__low_latency.modeling"
     )
     module.ModelingV2Glm52Nvfp4Sm107LowLatency = type(
@@ -173,3 +173,152 @@ def test_glm52_unsupported_kv_cache_does_not_match(_on_sm107, checkpoint_algo, d
     assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
     with pytest.raises(ValueError, match="KV cache"):
         modeling_v2_resolve(config, _llm_args("require", **args))
+
+
+_GLM52_HIGH_THROUGHPUT_TARGET = (
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__high_throughput.modeling."
+    "ModelingV2Glm52Nvfp4Sm107HighThroughput"
+)
+_DEP16 = dict(world_size=16, tp_size=16, moe_ep_size=16, moe_tp_size=1, enable_attention_dp=True)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("draft_len", [None, 5, 7])
+@pytest.mark.parametrize("world_size", [4, 16])
+def test_glm52_high_throughput_matches(_on_sm107, monkeypatch, mode, draft_len, world_size):
+    # Exercise the real routing predicates on CPU without requiring the target's
+    # native library. Native loading and execution are covered by GPU tests.
+    _stub_target(monkeypatch, _GLM52_HIGH_THROUGHPUT_TARGET)
+    config = _model_config(
+        _glm52_config(index_n_heads=32),
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len is not None else None,
+        **dict(_DEP16, world_size=world_size, tp_size=world_size, moe_ep_size=world_size),
+    )
+    config.moe_backend = "MEGAMOE_CUTEDSL"
+    args = _llm_args(mode, kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+    assert _qualified(modeling_v2_resolve(config, args)) == _GLM52_HIGH_THROUGHPUT_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_overrides, kv_dtype, backend, index_n_heads, missed",
+    [
+        (dict(enable_attention_dp=False), "nvfp4", "MEGAMOE_CUTEDSL", 32, "attention_dp=False"),
+        (dict(moe_ep_size=1, moe_tp_size=16), "nvfp4", "MEGAMOE_CUTEDSL", 32, r"moe_ep=1\b"),
+        (
+            dict(world_size=8, tp_size=8, moe_ep_size=8),
+            "nvfp4",
+            "MEGAMOE_CUTEDSL",
+            32,
+            "world_size=8",
+        ),
+        (dict(), "fp8", "MEGAMOE_CUTEDSL", 32, r"KV cache .*FP8"),
+        (dict(), "nvfp4", "CUTLASS", 32, "moe_backend=CUTLASS"),
+        (dict(), "nvfp4", "MEGAMOE_CUTEDSL", 64, "index_n_heads=64"),
+    ],
+    ids=[
+        "no-attention-dp",
+        "no-expert-parallel",
+        "dep8",
+        "fp8-kv",
+        "other-backend",
+        "other-index-heads",
+    ],
+)
+def test_glm52_high_throughput_near_misses(
+    _on_sm107,
+    mapping_overrides: dict,
+    kv_dtype: str,
+    backend: str,
+    index_n_heads: int,
+    missed: str,
+) -> None:
+    config = _model_config(
+        _glm52_config(index_n_heads=index_n_heads), **dict(_DEP16, **mapping_overrides)
+    )
+    config.moe_backend = backend
+    kwargs = dict(kv_cache_config=KvCacheConfig(dtype=kv_dtype))
+    assert modeling_v2_resolve(config, _llm_args("auto", **kwargs)) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require", **kwargs))
+
+
+def test_glm52_high_throughput_declines_sm103() -> None:
+    config = _model_config(_glm52_config(index_n_heads=32), **_DEP16)
+    config.moe_backend = "MEGAMOE_CUTEDSL"
+    args = _llm_args("auto", kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+    assert modeling_v2_resolve(config, args) is None
+    with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
+        modeling_v2_resolve(
+            config, _llm_args("require", kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+        )
+
+
+_TP8_TARGET = "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tp8.modeling.ModelingV2Glm52Nvfp4Sm103Tp8"
+
+
+def _stub_target(monkeypatch, qualified_name):
+    """Route to ``qualified_name`` on CPU without loading the target's native ops."""
+    module_name, class_name = qualified_name.rsplit(".", 1)
+    stub = ModuleType(f"tensorrt_llm._torch.modeling_v2.{module_name}")
+    setattr(stub, class_name, type(class_name, (), {"__module__": stub.__name__}))
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+
+
+def _glm53_tp8_config(**changes):
+    """GLM-5.3-NVFP4 on tp8 with MTP5: its MIXED_PRECISION export has NVFP4 routed experts in
+    layers 3-77 and FP8 dense MLPs before them. ``changes`` maps a module to an algorithm, or
+    to None to drop it."""
+    layers = {"model.layers.0.mlp.gate_up_proj": {"quant_algo": "FP8"}}
+    layers.update({f"model.layers.{i}.mlp.experts": {"quant_algo": "NVFP4"} for i in range(3, 78)})
+    for name, algo in changes.items():
+        if algo is None:
+            layers.pop(name)
+        else:
+            layers[name] = {"quant_algo": algo}
+    quantization = {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+        "producer": {"name": "modelopt"},
+        "ignore": ["model.layers.78*"],
+        "quantized_layers": layers,
+    }
+    pretrained = _glm52_config(
+        quantization_config=quantization,
+        num_attention_heads=64,
+        index_topk=2048,
+        first_k_dense_replace=3,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+    )
+    return _model_config(
+        pretrained,
+        spec_config=MTPDecodingConfig(max_draft_len=5),
+        world_size=8,
+        tp_size=8,
+        moe_ep_size=1,
+        moe_tp_size=8,
+    )
+
+
+def test_tp8_matches_glm53(monkeypatch):
+    _stub_target(monkeypatch, _TP8_TARGET)
+    config = _glm53_tp8_config()
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _TP8_TARGET
+
+
+@pytest.mark.parametrize(
+    "changes, missed",
+    [
+        ({"model.layers.10.mlp.shared_experts.gate_up_proj": "NVFP4"}, "shared_experts"),
+        ({"model.layers.10.mlp.experts": None}, r"routed experts in layers \[10\]"),
+        ({"model.layers.78.mlp.experts": "NVFP4"}, "MTP layer quantized"),
+        ({"model.layers.10.mlp.experts": "FP8"}, r"'model\.layers\.10\.mlp\.experts' as FP8"),
+        ({"model.layers.10.self_attn.q_a_proj": "FP8"}, "self_attn.q_a_proj"),
+        ({"lm_head": "FP8"}, "'lm_head'"),
+    ],
+    ids=["shared-experts", "missing-experts", "mtp-layer", "fp8-experts", "attention", "lm-head"],
+)
+def test_tp8_declines_other_mixed_precision(monkeypatch, changes, missed):
+    _stub_target(monkeypatch, _TP8_TARGET)
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(_glm53_tp8_config(**changes), _llm_args("require"))

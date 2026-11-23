@@ -17,7 +17,7 @@ checks run with the unit's spec overlaid with the variant's switches::
         note: KV cache stored as FP8
 
 Each check is named by the variant (``kv_fp8:accuracy[gsm8k]@tep4``), so its
-verdicts, per-prompt baselines and findings are its own, never the unit's.
+verdicts are its own, never the unit's.
 ``checks/check_config.variant_spec`` applies and materializes the overlay.
 """
 

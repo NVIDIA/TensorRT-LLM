@@ -28,6 +28,10 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+//! Whether (headDim, residualDim) selects the inline-scale record of FlashInfer PrimTS D576
+//! "nvfp4.fp8rope", which keeps its block scales in the data pool and has no scale pool.
+bool isNvFp4MlaRecordLayout(int32_t headDim, int32_t residualDim);
+
 void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
     int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream = 0);

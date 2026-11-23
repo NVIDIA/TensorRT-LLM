@@ -21,7 +21,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.speculative import spec_sampler_base as sampler_ops
 from tensorrt_llm._torch.speculative.spec_sampler_base import (
     SampleStateSpec,
     SampleStateTensorsSpec,
@@ -41,16 +40,20 @@ def _request(slot: Optional[int], state=LlmRequestState.GENERATION_IN_PROGRESS):
         state=state,
         py_draft_tokens=[99] * DRAFT_LEN,
         py_decoding_iter=0,
+        py_end_id=-1,
+        py_stop_words_list=None,
+        py_orig_prompt_len=0,
+        py_max_new_tokens=128,
         tokens=[],
     )
     request.add_new_token = lambda token, beam_idx: request.tokens.append(token)
+    request.get_num_tokens = lambda beam_idx: len(request.tokens)
     return request
 
 
 @pytest.mark.parametrize("verify_lens", [None, [3, 2, 1, 2]])
-def test_update_requests_reads_each_request_slot_row(monkeypatch, verify_lens):
+def test_update_requests_reads_each_request_slot_row(verify_lens):
     """Rows of scattered slots in a larger store must reach the request that owns them."""
-    monkeypatch.setattr(sampler_ops, "handle_stop_criteria", lambda *args, **kwargs: False)
     sampler = SpecSampler.__new__(SpecSampler)
     sampler.draft_len = DRAFT_LEN
     sampler.max_accepted_path_len = PATH_LEN

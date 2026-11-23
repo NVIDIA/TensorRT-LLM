@@ -50,6 +50,12 @@ MODEL_PATH_DICT = {
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     "nemotron_3_super_120b_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "nemotron_3_super_120b_nvfp4_mtp": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    "nemotron_3_super_120b_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
+    "nemotron_3_nano_30b": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "nemotron_3_nano_30b_fp8": "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    "nemotron_3_nano_30b_fp4": "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+    "nemotron_3_nano_4b": "NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "nemotron_3_nano_4b_fp8": "NVIDIA-Nemotron-3-Nano-4B-FP8",
     # Nemotron-3-Nano-Omni-30B (text + image multimodal)
     "nemotron_3_nano_omni_nvfp4": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
     "nemotron_3_nano_omni_nvfp4_image": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
@@ -74,6 +80,9 @@ MODEL_PATH_DICT = {
     "qwen3.8_flash_next_fp4_mtp": "Inferact-Qwen3.8-Flash-Next-NVFP4",
     # The NVFP4 checkpoint the CI accuracy gates load.
     "qwen3.8_flash_next_fp4": "Qwen3.8-Flash-Next-NVFP4",
+    "qwen3.8_flash_next_fp8": "Qwen3.8-Flash-Next-FP8",
+    "qwen3.8_27b": "Qwen3.8-27B",
+    "qwen3.8_27b_fp4": "Qwen3.8-27B-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
     "deepseek_v4_pro_base_fp8": "DeepSeek-V4-Pro-Base",
@@ -97,6 +106,7 @@ MODEL_PATH_DICT = {
     "glm_5.3_flash_fp8": "GLM-5.3-Flash",
     "glm_5.3_flash_fp8_mtp": "GLM-5.3-Flash",
     "glm_5.3_flash_nvfp4": "GLM-5.3-Flash-NVFP4",
+    "glm_5.3_flash_nvfp4_mtp": "GLM-5.3-Flash-NVFP4",
     # MiniMax-M3 NVFP4: MXFP8 base layers with NVFP4 routed experts
     # (the MXFP8 checkpoint is registered as "minimax_m3_mxfp8" above).
     "minimax_m3_fp4": "MiniMax-M3-NVFP4",

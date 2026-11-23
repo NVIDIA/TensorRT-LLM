@@ -15,6 +15,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 import triton
 from utils.util import getSMVersion
 
@@ -306,6 +307,150 @@ class TestRMSNormBasic:
             outputs[launch_with_pdl] = output
 
         assert torch.equal(outputs[True], outputs[False])
+
+    @pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
+    @pytest.mark.parametrize("with_fp8", [False, True])
+    def test_token_major_groups_launch_is_bitwise_invariant(
+        self, gate_activation: str, with_fp8: bool
+    ) -> None:
+        """From _MULTIROW_GROUPS_MIN_ROWS rows a program runs _MULTIROW_GROUPS
+        tiles; every output bit must equal the one-tile-per-program launch,
+        including a partial last group."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        heads, N = 24, 128
+        rows_per_program = layernorm_gated._MULTIROW_ROWS * layernorm_gated._MULTIROW_GROUPS
+        num_tokens = (
+            triton.cdiv(layernorm_gated._MULTIROW_GROUPS_MIN_ROWS, heads * rows_per_program)
+            * rows_per_program
+            + 3
+        )
+        num_rows = num_tokens * heads
+        assert layernorm_gated._MULTIROW_GROUPS > 1
+        assert num_rows >= layernorm_gated._MULTIROW_GROUPS_MIN_ROWS
+        assert num_rows % rows_per_program != 0
+        torch.manual_seed(5)
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        wide = torch.randn(num_tokens, heads * N + 128, device=device, dtype=dtype)
+        z = wide[:, 128:].view(num_tokens, heads, N)
+        fp8_scale = torch.tensor(0.13, device=device, dtype=torch.float32) if with_fp8 else None
+
+        actual = rms_norm_gated_token_major(
+            x, z, weight, 1e-6, fp8_scale=fp8_scale, gate_activation=gate_activation
+        )
+        expected = torch.empty_like(actual)
+        layernorm_gated._rms_norm_gated_fwd_multirow_kernel[
+            (triton.cdiv(num_rows, layernorm_gated._MULTIROW_ROWS),)
+        ](
+            x,
+            expected,
+            weight,
+            z,
+            None,
+            fp8_scale,
+            x.stride(0),
+            expected.stride(0),
+            z.stride(0),
+            num_rows,
+            1e-6,
+            N=N,
+            ROWS=layernorm_gated._MULTIROW_ROWS,
+            HEADS_PER_TOK=heads,
+            GATE_SIGMOID=gate_activation == "sigmoid",
+            WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=False,
+            GROUPS=1,
+            num_warps=layernorm_gated._MULTIROW_NUM_WARPS,
+        )
+
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    @pytest.mark.parametrize("layout", ["dense", "aligned", "sliced"])
+    @pytest.mark.parametrize("heads", [1, 6])
+    def test_multirow_kernel_reuses_the_compiled_variant_across_batches(
+        self, heads: int, layout: str
+    ) -> None:
+        """No row count compiles a new variant of the multi-row kernel after warmup.
+
+        Serving sees row counts that warmup did not run, so a variant keyed on
+        the rows (M on == 1 and % 16, EVEN, or PDL chosen from the grid) would
+        compile mid-serving. heads=1 is the RMSNorm module path (SiLU gate),
+        heads=6 the token-major path (sigmoid gate), whose largest inputs run
+        several row tiles per program.
+
+        ``layout`` gives the gate whole (dense) or as a column slice of a wider
+        projection whose row stride is a multiple of 16 (aligned) or not
+        (sliced). Sliced also makes x a column slice on the module path, so a
+        one-token batch, which PyTorch views with dense strides, keys other
+        variants.
+        """
+        from _torch.helpers import triton_num_compiled
+
+        kernel = layernorm_gated._rms_norm_gated_fwd_multirow_kernel
+        while isinstance(kernel, triton.runtime.Heuristics):
+            kernel = kernel.fn  # the compiled variants live on the inner JITFunction
+
+        def clear_compiled() -> None:
+            # Start from no compiled variants, as a server process does, so that
+            # those of earlier runs cannot stand in for the ones warmup compiles.
+            for cache in getattr(kernel, "device_caches", {}).values():
+                cache[0].clear()
+            layernorm_gated._multirow_variants_with_siblings.clear()
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        N = 128
+        eps = 1e-6
+        torch.manual_seed(12)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        norm = RMSNorm(N, eps=eps).to(device=device, dtype=dtype)
+        norm.weight.data.copy_(weight)
+
+        pad = {"dense": 0, "aligned": 128, "sliced": 24}[layout]
+
+        def check(num_tokens: int) -> None:
+            if layout == "sliced" and heads == 1:
+                x = torch.randn(num_tokens, N + pad, device=device, dtype=dtype)[:, pad:]
+            else:
+                x = torch.randn(num_tokens * heads, N, device=device, dtype=dtype)
+            wide = torch.randn(num_tokens, heads * N + pad, device=device, dtype=dtype)
+            z = wide[:, pad:].view(num_tokens, heads, N)
+            if heads == 1:
+                out = norm(x, z=z.reshape(num_tokens, N))
+                gate = F.silu(z.reshape(-1, N).float())
+            else:
+                out = layernorm_gated.rms_norm_gated_token_major(
+                    x, z, weight, eps, gate_activation="sigmoid"
+                )
+                gate = torch.sigmoid(z.reshape(-1, N).float())
+            xf = x.float()
+            ref = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float() * gate
+            torch.testing.assert_close(out, ref.to(dtype), rtol=1e-2, atol=1e-2)
+
+        # Warmups: one batch per tile count, as a warmup's decode and largest
+        # prefill batches would run, and where the largest prefill runs grouped
+        # tiles, that prefill alone, as for a model whose decode fuses the norm
+        # into another kernel.
+        warmups = [[4096]]
+        grouped = []
+        if heads > 1:
+            min_tokens = triton.cdiv(layernorm_gated._MULTIROW_GROUPS_MIN_ROWS, heads)
+            warmups = [[4096, min_tokens], [min_tokens]]
+            grouped = [min_tokens + 1, min_tokens + 5]
+        for warmup in warmups:
+            clear_compiled()
+            for num_tokens in warmup:
+                check(num_tokens)
+            compiled = triton_num_compiled(kernel)
+            # Then one token, row counts that are multiples of 16 and of the
+            # tile or neither, grids below and above one wave of programs, and
+            # grouped tiles with and without a partial last group.
+            for num_tokens in (1, 2, 3, 16, 17, 64, 100, 333, 1000, 4095, *grouped):
+                check(num_tokens)
+            assert triton_num_compiled(kernel) == compiled, f"warmup {warmup}"
 
 
 @skip_no_cuda

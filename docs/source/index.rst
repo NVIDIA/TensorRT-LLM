@@ -70,8 +70,10 @@ Welcome to TensorRT LLM's Documentation!
    features/disagg-serving.md
    features/subagent-routing.md
    features/embeddings.md
+   features/reranking.md
    features/kvcache.md
    features/kv-hints.md
+   features/locality-domains.md
    features/kv-cache-compression.md
    features/long-sequence.md
    features/lora.md
@@ -82,6 +84,7 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/watermarking.md
+   features/beam-search-shared-prefix-attention.md
    features/additional-outputs.md
    features/post-processor-hook.md
    features/guided-decoding.md
@@ -89,6 +92,7 @@ Welcome to TensorRT LLM's Documentation!
    features/checkpoint-loading.md
    features/model-express.md
    features/sleep-wakeup.md
+   features/memory-monitor.md
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md

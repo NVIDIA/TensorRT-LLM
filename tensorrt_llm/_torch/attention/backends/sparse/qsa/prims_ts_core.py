@@ -4,6 +4,7 @@
 
 import bisect
 import functools
+import re
 import threading
 
 import torch
@@ -26,14 +27,22 @@ _PREFILL_ROUTE_BUCKET = 256
 _PREFILL_ROW_BUCKET = 64
 # Query rows (requests x query tokens per request, so MTP counts draft tokens)
 # below which Triton is faster under CUDA graphs (Rubin SM107 and B300, 32K
-# context, TP2): the core ties at one row, the indexer until ~32 rows.
+# context, TP2): the core ties at one row, the indexer until ~32 rows. On
+# Rubin the Triton decode scorer runs at the K-bar streaming rate and the
+# PrimTS scorer ties it at 32-64 rows and trails by 5-11% from 256 rows, so
+# decode batches stay on Triton there.
 _MIN_DECODE_ROWS = 2
 _MIN_INDEXER_DECODE_ROWS = 32
+_INDEXER_DECODE_PRIMTS_CAPABILITIES = ((10, 0), (10, 3))
 _KV_BLOCK_SIZE = 4
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
 _FP8_MAX = 448.0
+# Positional arguments the vendored metadata plan passes to run_fixed. A
+# flashinfer wheel whose metadata csrc is older or newer than the vendored
+# tree fails the TVM-FFI arity check at the first run instead of launching.
+_METADATA_RUN_FIXED_ARGS = 15
 
 
 @functools.cache
@@ -57,6 +66,26 @@ def prims_ts_available() -> bool:
     return _prims_ts_api() is not None
 
 
+@functools.cache
+def _metadata_module_reason() -> str | None:
+    from ...prims_ts import q_token_kv_block_sparse_metadata as metadata
+
+    try:
+        module = metadata._get_prims_ts_q_token_kv_block_sparse_metadata_module()
+    except Exception as error:
+        return f"the metadata module is unavailable: {error}"
+    try:
+        # Zero arguments never launch; TVM-FFI reports the bound arity.
+        module.run_fixed()
+    except (TypeError, RuntimeError) as error:
+        arity = re.search(r"Expected (\d+) but got", str(error))
+        if arity is None:
+            return f"the metadata module is unavailable: {error}"
+        if int(arity.group(1)) != _METADATA_RUN_FIXED_ARGS:
+            return f"the flashinfer metadata module does not match the vendored tree: {error}"
+    return None
+
+
 def _unsupported_reason(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -76,7 +105,7 @@ def _unsupported_reason(
         return f"page size {page_size} is not a multiple of the sparse block size 4"
     if q.shape[-1] not in (64, 128, 256):
         return f"unsupported head_dim {q.shape[-1]}"
-    return None
+    return _metadata_module_reason()
 
 
 @functools.cache
@@ -99,15 +128,23 @@ def use_prims_ts_indexer(
 
     Follows ``sparse_core_backend`` unless ``indexer_backend`` is set:
     ``triton`` never, ``prims_ts`` always (raising if unsupported), ``auto``
-    when the device and inputs qualify and decode batches are large enough.
+    when the device and inputs qualify and decode batches are large enough on
+    a part where the PrimTS scorer wins them.
     """
     backend = params.indexer_backend
     if backend == "follow":
         backend = params.sparse_core_backend
     if backend == "triton":
         return False
-    if backend == "auto" and is_decode and q.shape[0] < _MIN_INDEXER_DECODE_ROWS:
-        return False
+    if backend == "auto" and is_decode:
+        if q.shape[0] < _MIN_INDEXER_DECODE_ROWS:
+            return False
+        if (
+            q.is_cuda
+            and torch.cuda.get_device_capability(q.device)
+            not in _INDEXER_DECODE_PRIMTS_CAPABILITIES
+        ):
+            return False
     reason = None
     if not q.is_cuda:
         reason = "requires CUDA tensors"
@@ -252,13 +289,14 @@ class _PrimsTSSparseCore:
         v_cache: torch.Tensor,
         block_table: torch.Tensor,
         block_ids: torch.Tensor,
-        request_indices: torch.Tensor,
-        query_positions: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+        query_positions: torch.Tensor | None = None,
         *,
         page_size: int,
         max_seq_len_kv: int,
         softmax_scale: float,
         is_decode: bool,
+        seq_lens: torch.Tensor | None = None,
         request_boundaries: tuple[int, ...] | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -276,23 +314,39 @@ class _PrimsTSSparseCore:
             # Triton path, which upcasts K/V.
             q = q.clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
 
-        request_indices = request_indices.to(torch.int32).contiguous()
         q = q.contiguous()
-        padded_rows = rows if is_decode else -(-rows // _PREFILL_ROW_BUCKET) * _PREFILL_ROW_BUCKET
-        if padded_rows != rows:
-            # Padding rows select no blocks and are sliced off the output.
-            q = _pad_rows(q, padded_rows, 0)
-            block_ids = _pad_rows(block_ids, padded_rows, -1)
-            request_indices = _pad_rows(request_indices, padded_rows, 0)
-            query_positions = _pad_rows(query_positions, padded_rows, 0)
         if is_decode:
-            route_q = q.view(rows, 1, 1, num_qo_heads, head_dim)
+            if seq_lens is None:
+                raise ValueError("QSA PrimTS decode needs per-request seq_lens")
+            num_requests = seq_lens.numel()
+            if rows % num_requests:
+                raise ValueError(
+                    f"{rows} decode rows are not request-aligned over {num_requests} requests"
+                )
+            padded_rows = rows
+            # The kernel derives request IDs and positions from seq_lens.
+            route_q = q.view(num_requests, rows // num_requests, 1, num_qo_heads, head_dim)
             qo_indptr = None
             group_size = 1
             num_routes = rows
             split_kv = True
+            metadata_args = (("seq_lens", seq_lens),)
         else:
+            if request_indices is None or query_positions is None:
+                raise ValueError("QSA PrimTS prefill needs request_indices and query_positions")
+            request_indices = request_indices.to(torch.int32).contiguous()
+            padded_rows = -(-rows // _PREFILL_ROW_BUCKET) * _PREFILL_ROW_BUCKET
+            if padded_rows != rows:
+                # Padding rows select no blocks and are sliced off the output.
+                q = _pad_rows(q, padded_rows, 0)
+                block_ids = _pad_rows(block_ids, padded_rows, -1)
+                request_indices = _pad_rows(request_indices, padded_rows, 0)
+                query_positions = _pad_rows(query_positions, padded_rows, 0)
             route_q = q
+            metadata_args = (
+                ("request_indices", request_indices),
+                ("query_positions", query_positions),
+            )
             if request_boundaries is None:
                 # Host readback; callers with host sequence lengths pass the
                 # boundaries to keep the stream running.
@@ -311,7 +365,7 @@ class _PrimsTSSparseCore:
             q.device.index,
             k_cache.data_ptr(),
             v_cache.data_ptr(),
-            padded_rows,
+            tuple(route_q.shape[:-2]),
             num_routes,
             group_size,
             is_decode,
@@ -374,8 +428,7 @@ class _PrimsTSSparseCore:
                 ("q", route_q),
                 ("block_ids", block_ids),
                 ("block_table", block_table),
-                ("request_indices", request_indices),
-                ("query_positions", query_positions),
+                *metadata_args,
                 ("out", run_out),
             )
             try:
@@ -386,6 +439,7 @@ class _PrimsTSSparseCore:
                     block_ids,
                     request_indices,
                     query_positions,
+                    seq_lens=seq_lens,
                     qo_indptr=qo_indptr,
                     sm_scale=softmax_scale,
                     out=run_out,
@@ -416,23 +470,29 @@ def prims_ts_sparse_gqa(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     block_ids: torch.Tensor,
-    request_indices: torch.Tensor,
-    query_positions: torch.Tensor,
+    request_indices: torch.Tensor | None = None,
+    query_positions: torch.Tensor | None = None,
     *,
     page_size: int,
     max_seq_len_kv: int,
     softmax_scale: float,
     is_decode: bool,
+    seq_lens: torch.Tensor | None = None,
     request_boundaries: tuple[int, ...] | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse GQA over HND paged K/V from compact indexer block IDs.
 
     ``block_ids`` is the ``[rows, block_topk]`` Int32 Top-K output; the causal
-    tail is added by the kernel. Decode rows use the fixed ``[rows,1,1,Hq,D]``
-    layout with split-KV; prefill packs rows into request-safe groups of four,
-    using host ``request_boundaries`` (row offsets of request starts plus the
-    row count) when given. ``out``, when given, receives the result in place.
+    tail is added by the kernel. Decode rows are request-aligned: every request
+    contributes the same number of consecutive rows ending at its KV length,
+    ``seq_lens`` holds those lengths and ``block_table`` has one row per
+    request, so the fixed ``[requests, rows_per_request, 1, Hq, D]`` layout
+    with split-KV needs no per-row metadata. Prefill packs rows into
+    request-safe groups of four from ``request_indices`` and
+    ``query_positions``, using host ``request_boundaries`` (row offsets of
+    request starts plus the row count) when given. ``out``, when given,
+    receives the result in place.
     """
     return _CORE.run(
         q,
@@ -446,6 +506,7 @@ def prims_ts_sparse_gqa(
         max_seq_len_kv=max_seq_len_kv,
         softmax_scale=softmax_scale,
         is_decode=is_decode,
+        seq_lens=seq_lens,
         request_boundaries=request_boundaries,
         out=out,
     )

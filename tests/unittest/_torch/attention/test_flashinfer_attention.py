@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import random
 import unittest
 from collections import defaultdict
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from typing import List, Optional, Union
 from unittest import mock
 
+import pytest
 import torch
 from parameterized import parameterized
 
@@ -26,9 +28,23 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_rejects_swa_scratch_before_buffer_allocation() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = True
+    metadata = object.__new__(FlashInferAttentionMetadata)
+    metadata.kv_cache_manager = manager
+    with pytest.raises(
+            ValueError,
+            match="FlashInfer attention does not support SWA scratch reuse"):
+        metadata.__post_init__()
 
 
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
@@ -53,13 +69,14 @@ class Scenario:
     num_kv_heads: Union[int, List[Optional[int]]]
     head_dim: int
     dtype: torch.dtype
+    full_page_table: bool = False
 
     def __repr__(self) -> str:
         if isinstance(self.num_kv_heads, int):
             num_kv_heads_str = str(self.num_kv_heads)
         else:
             num_kv_heads_str = '_'.join(map(str, self.num_kv_heads))
-        return f"num_layers:{self.num_layers}-num_heads:{self.num_heads}-num_kv_heads:{num_kv_heads_str}-head_dim:{self.head_dim}-dtype:{self.dtype}"
+        return f"num_layers:{self.num_layers}-num_heads:{self.num_heads}-num_kv_heads:{num_kv_heads_str}-head_dim:{self.head_dim}-dtype:{self.dtype}{'-full_page_table' if self.full_page_table else ''}"
 
 
 @dataclass
@@ -479,6 +496,180 @@ class TestFlashInferAttention(unittest.TestCase):
         finally:
             kv_cache_manager.shutdown()
 
+    # 5 tokens per request (4 drafts + 1 bonus). The FP8 cases use a cast (scale 1.0) cache.
+    @parameterized.expand([(head_dim, fp8_kv) for head_dim in (256, 512)
+                           for fp8_kv in (False, True)])
+    def test_xqa_target_verify(self, head_dim: int, fp8_kv: bool):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+        if torch.cuda.get_device_capability()[0] not in (9, 10, 12):
+            self.skipTest("FlashInfer XQA requires SM90, SM100 or SM120")
+
+        num_heads, num_kv_heads, tokens_per_gen = 8, 2, 5
+        num_drafts = tokens_per_gen - 1
+        cached = [59, 75]
+        kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=512),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=32,
+            max_seq_len=256,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=(tensorrt_llm.bindings.DataType.FP8
+                   if fp8_kv else tensorrt_llm.bindings.DataType.BF16),
+            spec_config=MTPDecodingConfig(max_draft_len=num_drafts),
+        )
+        try:
+            kv_cache_manager.add_dummy_requests(
+                [0, 1], [c + tokens_per_gen + num_drafts for c in cached],
+                is_gen=True,
+                max_num_draft_tokens=num_drafts)
+            buf = kv_cache_manager.get_buffers(0)
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(0)
+            randn = functools.partial(torch.randn,
+                                      dtype=torch.bfloat16,
+                                      device="cuda",
+                                      generator=generator)
+            buf.copy_(randn(buf.shape).to(buf.dtype))
+            initial_kv = buf.clone()
+
+            def make_layer(quant_algo):
+                return FlashInferAttention(
+                    layer_idx=0,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    num_kv_heads=num_kv_heads,
+                    quant_config=(QuantConfig(quant_algo=quant_algo,
+                                              kv_cache_quant_algo=QuantAlgo.FP8)
+                                  if fp8_kv else None))
+
+            layer = make_layer(QuantAlgo.FP8)
+            num_tokens = 2 * tokens_per_gen
+            q = randn(num_tokens, num_heads * head_dim)
+            k = randn(num_tokens, num_kv_heads * head_dim)
+            v = randn(k.shape)
+            # SM90 XQA runs an FP8 cache with head_dim <= 256 on FP8 MMAs, rounding Q and the
+            # softmax weights to e4m3: allow one e4m3 step (2**-4) on the O(1) outputs.
+            fp8_mma = (fp8_kv and head_dim <= 256
+                       and torch.cuda.get_device_capability()[0] == 9)
+            tol = dict(atol=2**-4 if fp8_mma else 2e-2, rtol=2e-2)
+            out_scale = torch.tensor([4.0], device="cuda")
+
+            def run(num_cached,
+                    offsets=None,
+                    metadata=None,
+                    backend=layer,
+                    **forward_kwargs):
+                # Undo the previous run's K/V append.
+                buf.copy_(initial_kv)
+                kv_cache_params = KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=num_cached,
+                    use_full_generation_page_table=True,
+                )
+                if metadata is None:
+                    metadata = FlashInferAttentionMetadata(
+                        seq_lens=torch.full((2, ),
+                                            tokens_per_gen,
+                                            dtype=torch.int32),
+                        num_contexts=0,
+                        kv_cache_params=kv_cache_params,
+                        max_num_requests=2,
+                        max_num_tokens=num_tokens,
+                        kv_cache_manager=kv_cache_manager,
+                        request_ids=[0, 1],
+                    )
+                else:
+                    metadata.kv_cache_params = kv_cache_params
+                metadata.prepare()
+                if offsets is not None:
+                    metadata.apply_spec_decode_kv_lens_offsets(
+                        torch.tensor(offsets, dtype=torch.int32, device="cuda"),
+                        num_generations=2,
+                        tokens_per_generation=tokens_per_gen,
+                    )
+                return backend.forward(q, k, v, metadata,
+                                       **forward_kwargs), metadata
+
+            def reference_attention(window):
+                """fp32 attention over each request's cached K/V and this step's K/V."""
+                buf.copy_(initial_kv)
+                cache = kv_cache_manager.get_buffers(0, kv_layout="HND")
+                pages = kv_cache_manager.get_batch_cache_indices([0, 1])
+                out = []
+                for i, (num_cached, ids) in enumerate(zip(cached, pages)):
+                    rows = slice(i * tokens_per_gen, (i + 1) * tokens_per_gen)
+                    # [2, tokens, num_kv_heads, head_dim]
+                    cached_kv = cache[torch.tensor(ids)].permute(1, 0, 3, 2, 4)
+                    cached_kv = cached_kv.flatten(1, 2)[:, :num_cached]
+                    new_kv = torch.stack(
+                        (k[rows], v[rows])).view(2, tokens_per_gen,
+                                                 num_kv_heads, head_dim)
+                    kv = torch.cat((cached_kv, new_kv.to(cache.dtype)), dim=1)
+                    key, value = kv.float().repeat_interleave(num_heads //
+                                                              num_kv_heads,
+                                                              dim=2)
+                    query = q[rows].float().view(tokens_per_gen, num_heads,
+                                                 head_dim)
+                    scores = torch.einsum("qhd,khd->hqk", query,
+                                          key) / head_dim**0.5
+                    key_pos = torch.arange(num_cached + tokens_per_gen,
+                                           device="cuda")
+                    query_pos = key_pos[num_cached:, None]
+                    masked = key_pos > query_pos
+                    if window is not None:
+                        masked |= key_pos <= query_pos - window
+                    probs = scores.masked_fill(masked,
+                                               float("-inf")).softmax(-1)
+                    out.append(
+                        torch.einsum("hqk,khd->qhd", probs,
+                                     value).reshape(tokens_per_gen, -1))
+                return torch.cat(out).to(q.dtype)
+
+            # Sliding-window and windowless layers must both match the reference. The windowless
+            # case runs last: the overlap checks below reuse its reference and metadata.
+            for window in (48, None):
+                reference = reference_attention(window)
+                exact, metadata = run(cached, attention_window_size=window)
+                # The full page table routes this generation-only step to XQA.
+                self.assertTrue(metadata._xqa_target.in_use)
+                torch.testing.assert_close(exact, reference, **tol)
+                if fp8_kv:
+                    # With an FP8 cache XQA writes the FP8 input of an FP8 o_proj: the output
+                    # times out_scale (o_proj's inverse input scale), cast to FP8.
+                    fp8_out, _ = run(cached,
+                                     attention_window_size=window,
+                                     out_scale=out_scale)
+                    self.assertEqual(fp8_out.dtype, torch.float8_e4m3fn)
+                    torch.testing.assert_close(fp8_out.float() / 4.0,
+                                               exact.float(),
+                                               atol=1e-2,
+                                               rtol=7e-2)
+                    # An NVFP4 o_proj also passes out_scale but takes no FP8 input.
+                    nvfp4_out, _ = run(cached,
+                                       attention_window_size=window,
+                                       backend=make_layer(QuantAlgo.NVFP4),
+                                       out_scale=out_scale)
+                    torch.testing.assert_close(nvfp4_out, exact)
+
+            # Overlap: the host assumed all drafts of request 0 were accepted; the device
+            # offset rewinds it, so the step appends and attends exactly as the reference. The
+            # first run builds the XQA inputs inside forward, after the offsets; the second
+            # rebuilds them in prepare(), before the offsets.
+            for prepared in (None, metadata):
+                corrected, overlap = run([cached[0] + num_drafts, cached[1]],
+                                         [-num_drafts, 0],
+                                         metadata=prepared)
+                # Request 0 reserves three pages, though the corrected length fills only two.
+                self.assertEqual(overlap.num_blocks[0], 3)
+                torch.testing.assert_close(corrected, reference, **tol)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
@@ -626,9 +817,24 @@ class TestFlashInferAttention(unittest.TestCase):
                  num_kv_heads=[8, None, 16],
                  head_dim=64,
                  dtype=torch.float16),
+        Scenario(num_layers=1,
+                 num_heads=32,
+                 num_kv_heads=8,
+                 head_dim=128,
+                 dtype=torch.bfloat16,
+                 full_page_table=True),
+        Scenario(num_layers=3,
+                 num_heads=32,
+                 num_kv_heads=[8, None, 16],
+                 head_dim=64,
+                 dtype=torch.float16,
+                 full_page_table=True),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     def test_flashinfer_attention(self, scenario: Scenario):
+        if (scenario.full_page_table
+                and torch.cuda.get_device_capability()[0] not in (9, 10, 12)):
+            self.skipTest("FlashInfer XQA requires SM90, SM100 or SM120")
         num_layers = scenario.num_layers
         num_heads = scenario.num_heads
         num_kv_heads = scenario.num_kv_heads
@@ -759,7 +965,9 @@ class TestFlashInferAttention(unittest.TestCase):
                 seq_lens=seq_lens,
                 num_contexts=len(context_sequence_lengths),
                 kv_cache_params=KVCacheParams(
-                    use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
+                    use_cache=True,
+                    num_cached_tokens_per_seq=past_seen_tokens,
+                    use_full_generation_page_table=scenario.full_page_table),
                 max_num_requests=4,
                 max_num_tokens=8192,
                 kv_cache_manager=kv_cache_manager,
@@ -829,6 +1037,8 @@ class TestFlashInferAttention(unittest.TestCase):
                         gen_vs[gen_seq_id].view(-1, num_kv_heads, head_dim))
 
                 results_1.append(result_1)
+                if scenario.full_page_table:
+                    self.assertTrue(attn_metadata._xqa_target.in_use)
                 del cache_buf
 
             for plan_params in attn_metadata._plan_params_to_wrappers.keys():
@@ -858,7 +1068,8 @@ class TestFlashInferAttention(unittest.TestCase):
                 num_contexts=1,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
-                    num_cached_tokens_per_seq=num_cached_tokens_per_seq),
+                    num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                    use_full_generation_page_table=scenario.full_page_table),
                 max_num_requests=2,
                 max_num_tokens=8192,
                 kv_cache_manager=kv_cache_manager,
@@ -907,7 +1118,8 @@ class TestFlashInferAttention(unittest.TestCase):
                 num_contexts=1,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
-                    num_cached_tokens_per_seq=num_cached_tokens_per_seq),
+                    num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                    use_full_generation_page_table=scenario.full_page_table),
                 max_num_requests=2,
                 max_num_tokens=8192,
                 kv_cache_manager=kv_cache_manager,
@@ -1387,6 +1599,7 @@ def _refresh_wrappers(page_tuple):
     return FlashInferWrappers(is_planned=True, fa2_plan_num_blocks=page_tuple)
 
 
+@pytest.mark.cpu_only
 def test_page_table_change_replans_every_recorded_wrapper():
     """The multi-wrapper (variable sliding window) case the fix was written for.
 
@@ -1410,6 +1623,7 @@ def test_page_table_change_replans_every_recorded_wrapper():
     assert all(w.is_planned for w in cache.values())
 
 
+@pytest.mark.cpu_only
 def test_an_unchanged_page_table_does_not_replan():
     """The plan and its stream sync run only on a page-count change."""
     params = _FakePlanParams()
@@ -1422,6 +1636,7 @@ def test_an_unchanged_page_table_does_not_replan():
     assert cache[params].is_planned is True
 
 
+@pytest.mark.cpu_only
 def test_no_generations_clears_the_recorded_page_tuple():
     """A context-only step has no decode plan to keep current."""
     params = _FakePlanParams()

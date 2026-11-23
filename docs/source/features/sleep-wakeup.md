@@ -212,6 +212,13 @@ POST /resume_memory
 GET  /memory_status
 ```
 
+The [GPU memory monitor's](memory-monitor.md#asking-for-a-report)
+`GET /memory_report` uses the same request signing but not sleep mode. It is
+served only when the monitor runs in full mode (`memory_monitor_config.mode:
+full` or `TLLM_MEM_MONITOR=1`), the key is set, and the server has a single
+frontend (`num_serve_frontends: 1`); otherwise the route does not exist and
+requests get 404. See [Asking for a report](memory-monitor.md#asking-for-a-report).
+
 The POST body is optional. An omitted body or `{}` selects the defaults
 described in the Python API. To select specific resources, send
 `{"tags":["model","model_weights"]}`.
@@ -355,7 +362,7 @@ Principal implementation locations are:
 - Workers: `tensorrt_llm/executor/base_worker.py` and
   `tensorrt_llm/executor/ray/gpu_worker.py`
 - Allocation tagging: `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py`
-  and `tensorrt_llm/_torch/pyexecutor/model_loader.py`
+  and `tensorrt_llm/_torch/models/checkpoints/memory_init.py`
 - Python VMM wrapper: `tensorrt_llm/_torch/virtual_memory.py`
 - CUDA VMM: `cpp/tensorrt_llm/runtime/virtualMemory.cpp` and
   `cpp/include/tensorrt_llm/runtime/virtualMemory.h`

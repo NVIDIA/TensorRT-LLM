@@ -12,14 +12,17 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.profiling import ProfileController, load_iteration_indexes
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     PyExecutor,
     PyExecutorResources,
     _ExecutorExecutionConfig,
 )
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 pytestmark = pytest.mark.cpu_only
 
@@ -44,9 +47,13 @@ def executor(monkeypatch):
 
     engine.release_executor_resources = Mock(side_effect=release_engine_resources)
     cache = SimpleNamespace(shutdown=lambda: events.append("cache"))
-    transceiver = SimpleNamespace(shutdown=lambda: events.append("unregister"))
+    transceiver = SimpleNamespace(
+        prepare_shutdown=lambda: events.append("drain"),
+        shutdown=lambda: events.append("unregister"),
+    )
     ex = object.__new__(PyExecutor)
     ex._closed = False
+    ex._perf_metrics = PerfMetricsCollector()
     ex.enable_attention_dp = False
     ex._kv_connector_failed = False
     ex._resources_released = False
@@ -85,8 +92,9 @@ def executor(monkeypatch):
     ex.dense_dwdp_manager = None
     ex.pending_encoder_steps = [object()]
     ex.active_requests = [object()]
-    ex.responses = {17: object()}
-    ex.result_wait_queues = {17: object()}
+    ex._response_channel = ResponseChannel()
+    ex._response_channel.responses[17] = [object()]
+    ex._response_channel.register([17], object())
     ex._pending_transfer_responses = [object()]
     ex._pending_response_terminations = [object()]
     ex.request_accumulated = [object()]
@@ -138,9 +146,10 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
         "graphs",
         "draft_graphs",
         "synchronize",
-        "unregister",
+        "drain",
         "slots",
         "cache",
+        "unregister",
     ]
     assert ex.draft_model_engine is draft_engine
     assert draft_engine.attn_metadata is None
@@ -152,7 +161,11 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
     assert ex.scheduler is None
     assert ex.kv_cache_transceiver is None
     assert ex.hang_detector is None  # Drops the old transceiver's status-provider reference.
-    assert not ex.responses and not ex.active_requests and not ex.result_wait_queues
+    assert (
+        not ex._response_channel.responses
+        and not ex.active_requests
+        and not ex._response_channel.result_wait_queues
+    )
     assert not ex.pending_encoder_steps
     assert not ex.request_accumulated and not ex.control_requests
     assert ex.waiting_queue is None and ex._pending_adp_dummy_request is None
@@ -175,7 +188,7 @@ def test_release_exits_a_bound_dwdp_manager_after_the_caches(
 
     ex.release_resources()
 
-    assert events[-2:] == ["cache", field]
+    assert events[-3:] == ["cache", "unregister", field]
     assert getattr(ex, field) is None
     ex.shutdown()
     manager.__exit__.assert_called_once_with(None, None, None)
@@ -186,7 +199,7 @@ def test_release_before_worker_start_does_not_wait_for_shutdown(executor):
     ex.worker_started = False
     ex.shutdown_event.clear()
     ex.release_resources()
-    assert events == ["graphs", "synchronize", "unregister", "cache"]
+    assert events == ["graphs", "synchronize", "drain", "cache", "unregister"]
     ex.worker_thread.join.assert_not_called()
 
 
@@ -235,12 +248,12 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     create_waiting_queue = Mock(wraps=executor_module.create_waiting_queue)
     monkeypatch.setattr(executor_module, "create_waiting_queue", create_waiting_queue)
     monkeypatch.setenv("TLLM_PROFILE_START_STOP", "2-4")
-    executor_module._load_iteration_indexes.cache_clear()
+    load_iteration_indexes.cache_clear()
     monkeypatch.setattr(torch.cuda, "Stream", Mock())
     monkeypatch.setattr(torch.cuda, "Event", Mock())
     monkeypatch.setattr(torch.cuda, "current_stream", Mock())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(executor_module, "_distributed_warmup_guard", lambda *args: nullcontext())
+    monkeypatch.setattr(executor_module, "distributed_warmup_guard", lambda *args: nullcontext())
     monkeypatch.setattr(executor_module.ADPRouter, "create", Mock())
     monkeypatch.setattr(executor_module, "HangDetector", Mock())
     monkeypatch.setattr(executor_module, "ExecutorRequestQueue", Mock())
@@ -277,6 +290,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         resource_governor_queue=None,
         hang_detection_timeout=None,
         enable_kv_pool_rebalance=False,
+        defer_generation_only_release=True,
     )
     ex.model_engine.enable_attention_dp = False
     ex.model_engine.mm_encoder_item_scheduling_enabled = False
@@ -299,10 +313,12 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         enable_iter_req_stats=False,
         iter_perf_stats_interval=1,
         stream_interval=1,
+        return_perf_metrics=False,
         attention_dp_config=None,
         batch_wait_timeout_ms=0,
         batch_wait_timeout_iters=0,
         batch_wait_max_tokens_ratio=0,
+        enable_client_io_during_gpu_wait=False,
     )
     cache = Mock(
         event_buffer_max_size=0,
@@ -326,8 +342,15 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     )
     ex.iter_counter = 42
     ex._ctx_mla_kv_len_cap = None
-    ex.profile_start_iters = {99}
-    ex.profile_stop_iters = set()
+    ex._profile_controller = ProfileController(
+        rank=0,
+        current_iteration=lambda: ex.iter_counter,
+        is_warmup=lambda: False,
+        broadcast_start=Mock(),
+        broadcast_stop=Mock(),
+    )
+    ex._profile_controller.profile_start_iters = {99}
+    ex._profile_controller.profile_stop_iters = set()
     old_shutdown_event = ex.shutdown_event
     engine, stream = ex.model_engine, ex.execution_stream
     sample_stream, sample_event = ex.sample_stream, ex.finish_sample_event
@@ -356,8 +379,8 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     try:
         ex.rebind_resources(resources)
         assert ex.iter_counter == 0
-        assert ex.profile_start_iters == {2}
-        assert ex.profile_stop_iters == {4}
+        assert ex._profile_controller.profile_start_iters == {2}
+        assert ex._profile_controller.profile_stop_iters == {4}
         assert ex._ctx_mla_kv_len_cap == "unset"
         assert ex._disagg_coordinator is None
         assert not ex.worker_started
@@ -366,13 +389,15 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         for name in bound_fields:
             assert getattr(ex, name) is getattr(resources, name), name
         create_waiting_queue.assert_called_once_with(
-            resources.waiting_queue_policy, gen_admission=ex._gen_admission
+            resources.waiting_queue_policy, gen_admission=ex._gen_admission, max_wait_s=None
         )
         engine.register_beam_histories_callable.assert_called_once_with(
             ex.sampler.start_beam_histories
         )
         assert ex.max_num_active_requests == engine.get_max_num_sequences.return_value
         assert ex.kv_cache_manager is cache
+        # Only KV cache manager V2 defers the close; this manager is not one.
+        assert ex._defer_generation_only_release is False
         assert ex.model_engine is engine and ex.execution_stream is stream
         assert ex.sample_stream is sample_stream
         assert ex.finish_sample_event is sample_event
@@ -380,7 +405,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         engine.warmup.assert_called_once_with(resources.resource_manager)
         ex.start_worker.assert_not_called()
     finally:
-        executor_module._load_iteration_indexes.cache_clear()
+        load_iteration_indexes.cache_clear()
 
 
 def test_failed_rebind_cannot_be_retried_over_partial_resources(executor):
@@ -422,13 +447,15 @@ def test_hung_worker_does_not_release_live_resources(executor):
     assert slots.slot_manager.get_slot(17) is not None
 
 
-def test_transfer_shutdown_failure_keeps_cache_owned(executor):
+def test_transfer_drain_failure_keeps_cache_owned(executor):
     ex, events = executor
     manager = ex.resource_manager
     slots = manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
-    ex.kv_cache_transceiver.shutdown = Mock(side_effect=RuntimeError("DMA still active"))
+    ex.kv_cache_transceiver.prepare_shutdown = Mock(side_effect=RuntimeError("DMA still active"))
+
     with pytest.raises(RuntimeError, match="DMA still active"):
         ex.release_resources()
+    assert "unregister" not in events
     assert "cache" not in events
     assert ex.resource_manager is manager
     assert slots.slot_manager.get_slot(17) is not None
@@ -456,3 +483,11 @@ def test_release_stops_pipeline_progress_before_gpu_teardown(executor):
     assert ex._pp_mpi_progress_quiesced.is_set()
     assert ex._mpi_progress_thread is None
     assert ex._mpi_progress_thread_exit_hook is None
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_both_release_paths_unmap_before_deregistration(executor, terminal):
+    """Profiling and terminal release must use the same two-phase order."""
+    ex, events = executor
+    assert ex._release_execution_resources(release_model_owned_graphs=terminal)
+    assert events.index("drain") < events.index("cache") < events.index("unregister")

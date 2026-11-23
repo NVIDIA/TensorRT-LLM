@@ -19,13 +19,16 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple,
+                    TypeVar, Union)
 
 import msgspec
+import torch
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -37,6 +40,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
@@ -51,13 +55,14 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
-from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.llm import LLM, PreprocessedInputs, RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
@@ -65,6 +70,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
+from tensorrt_llm.metrics.perf_utils import (_record_input_processing,
+                                             _start_input_processing,
+                                             _time_input_processing)
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -86,7 +95,8 @@ from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
+                                                resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request,
     validate_subagent_affinity)
@@ -108,14 +118,17 @@ from tensorrt_llm.serve.openai_protocol import (
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
+    RerankDocument, RerankRequest, RerankResponse, RerankResult,
+    RerankUsageInfo, RerankV2Request, RerankV2Response, RerankV2Result,
     ResponseFormat, ResponsesRequest, ResponsesResponse,
     RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    TokenizeResponse, UpdateWeightsRequest, UsageInfo, VideoGenerationRequest,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
+                                             _input_processing_context,
                                              build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -130,6 +143,8 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
                                        render_conversation)
+from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
+                                         rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
@@ -145,11 +160,15 @@ from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
 from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
+from tensorrt_llm.serve.tokenization_owners import (TokenizationOwners,
+                                                    start_tokenization_owners)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
-                                                 parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import (check_path_response_policy,
+                                                 parse_visual_gen_params,
+                                                 path_response_is_disabled,
+                                                 request_reads_files)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -161,7 +180,15 @@ from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
-    from tensorrt_llm.visual_gen import VisualGen
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+
+
+def _preprocess_in_conversation(
+        routing_id: Optional[str],
+        preprocess_fn: Callable[[], PreprocessedInputs]) -> PreprocessedInputs:
+    """Run ``preprocess_fn`` with its prompt tagged as conversation ``routing_id``."""
+    with tokenization_routing_key(routing_id):
+        return preprocess_fn()
 
 
 def _is_visual_gen_instance(obj) -> bool:
@@ -574,6 +601,9 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     return getattr(spec_config, "max_draft_len", None)
 
 
+_InputProcessingResult = TypeVar("_InputProcessingResult")
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -653,9 +683,11 @@ class OpenAIServer(_VideoRoutesMixin):
         load_builtin_extensions()
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
-        self._embedding_max_queue_delay = embedding_max_queue_delay
-        self._embedding_max_queue_size = embedding_max_queue_size
-        self.embedding_batcher: Optional[EncodeBatcher] = None
+        # Keep the established embedding_* constructor keywords for API
+        # compatibility; the underlying batcher is shared by encode-only roles.
+        self._encode_max_queue_delay = embedding_max_queue_delay
+        self._encode_max_queue_size = embedding_max_queue_size
+        self.encode_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
         # Attached frontends serve the launcher's port: only it registers.
         self._registers_server = (multi_frontend_serving is None
@@ -677,6 +709,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     merged.setdefault(modality, {}).update(kw)
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
+        if self._is_visual_gen:
+            check_path_response_policy()
+
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
@@ -684,16 +719,16 @@ class OpenAIServer(_VideoRoutesMixin):
         self._enable_runtime_control_endpoints = enable_runtime_control_endpoints
         self._runtime_control_api_key = runtime_control_api_key
         self._runtime_control_replay_cache = RuntimeControlReplayCache()
+        # The gather in flight for GET /memory_report, shared by concurrent requests.
+        self._memory_report_task: Optional[asyncio.Future] = None
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
         self.port = None
 
-        # Dedicated thread pools for the chat / completion path. Keeping
-        # multimodal preprocessing and decode work off the asyncio default
-        # executor avoids contention with unrelated `to_thread` callers and
-        # lets the two stages be sized independently.
+        # Dedicated thread pools keep input and multimodal preprocessing off
+        # the asyncio default executor and let the stages be sized independently.
         self._input_proc_executor = ThreadPoolExecutor(
             max_workers=input_processor_workers,
             thread_name_prefix="trtllm_inputproc",
@@ -754,6 +789,10 @@ class OpenAIServer(_VideoRoutesMixin):
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
+        self._tokenization_owners: Optional[
+            TokenizationOwners] = start_tokenization_owners(
+                multi_frontend_serving,
+                getattr(generator, "input_processor", None))
         self._shared_clock_offset: Optional[SharedClockOffset] = (
             SharedClockOffset(
                 os.path.dirname(multi_frontend_serving.launcher_uds))
@@ -848,10 +887,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
-            # Start the encode dynamic batcher (embedding server only). It must be
-            # started inside the running event loop, hence here rather than __init__.
-            if self.embedding_batcher is not None:
-                await self.embedding_batcher.start()
+            # The encode batcher must start inside the running event loop,
+            # hence here rather than __init__.
+            if self.encode_batcher is not None:
+                await self.encode_batcher.start()
                 logger.info("Started encode dynamic batcher")
 
             yield
@@ -866,8 +905,10 @@ class OpenAIServer(_VideoRoutesMixin):
                         pass
             if self._launcher_forwarder is not None:
                 await self._launcher_forwarder.close()
-            if self.embedding_batcher is not None:
-                await self.embedding_batcher.shutdown()
+            if self._tokenization_owners is not None:
+                await asyncio.to_thread(self._tokenization_owners.close)
+            if self.encode_batcher is not None:
+                await self.encode_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
 
             # Stop background iteration stats collector
@@ -887,6 +928,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # down; the /metrics handler already treats that as no stats.
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
+            BaseMediaIO.clear_executor(self._media_load_executor)
+            self._media_load_executor.shutdown(wait=False, cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
@@ -927,21 +970,28 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.generator, MultimodalEncoder
             ), "generator must be a MultimodalEncoder for multimodal encoder"
             self.register_mm_encoder_routes()
-        elif self.server_role is ServerRole.EMBEDDING:
+        elif self.server_role in (ServerRole.EMBEDDING, ServerRole.RERANK):
             assert getattr(self.generator.args, "encode_only", False), (
-                "generator must be an encode_only=True LLM for the embedding "
-                "server")
-            self._init_embedding_batcher()
-            self.register_embedding_routes()
+                "generator must be an encode_only=True LLM for an embedding "
+                "or rerank server")
+            self._init_encode_batcher()
+            if self.server_role is ServerRole.EMBEDDING:
+                self.register_embedding_routes()
+            else:
+                self.register_rerank_routes()
         else:
             self._register_launcher_forwarding_routes()
             self.register_routes()
 
         if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer,
-                                    adjusted_clock=self._adjusted_steady_clock)
+            self.app.add_middleware(
+                PerfMetricsMiddleware,
+                expose_headers=self._expose_perf_metrics,
+                writer=self._perf_metrics_writer,
+                adjusted_clock=self._adjusted_steady_clock,
+                input_processing_observer=(
+                    self.metrics_collector.log_input_processing
+                    if self.metrics_collector else None))
         self.app.add_middleware(ServerArrivalTimeMiddleware,
                                 adjusted_clock=self._adjusted_steady_clock)
 
@@ -1087,10 +1137,10 @@ class OpenAIServer(_VideoRoutesMixin):
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
 
     def _get_scheduling_params(
-            self, request: ChatCompletionRequest,
+            self, request: Union[ChatCompletionRequest, CompletionRequest],
             raw_request: Optional[Request]) -> SchedulingParams:
         return SchedulingParams(
-            agent_hierarchy=request.agent_hierarchy,
+            agent_hierarchy=getattr(request, "agent_hierarchy", None),
             subagent_affinity_id=validate_subagent_affinity(
                 getattr(self, "_internal_disagg_auth_key", None), request,
                 getattr(self, "server_role", None),
@@ -1224,10 +1274,10 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def _check_health(self) -> bool:
-        # An embedding server's requests flow through the batcher worker; if it
-        # has exited the engine is up but every /v1/embeddings request hangs, so
+        # Encode-only requests flow through the batcher worker; if it has
+        # exited the engine is up but every embedding/rerank request hangs, so
         # report unhealthy rather than a misleading 200.
-        batcher = self.embedding_batcher
+        batcher = self.encode_batcher
         if batcher is not None and not batcher.is_alive():
             return False
         if hasattr(self.generator, '_check_health'):
@@ -1351,6 +1401,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["POST"])
 
         self._register_runtime_control_routes()
+        self._register_memory_report_route()
         self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
@@ -1395,6 +1446,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        if self.generator.args.return_perf_metrics:
+            self.mount_metrics()
 
     async def _require_rl_control_auth(self, raw_request: Request) -> None:
         body = await raw_request.body()
@@ -1425,6 +1478,47 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.UNAUTHORIZED,
                 detail=str(error),
             ) from error
+
+    def _register_memory_report_route(self) -> None:
+        """Serve ``GET /memory_report`` in the GPU memory monitor's full mode.
+
+        A report exposes process IDs, other processes' device usage and, in
+        stack mode, source paths, and each request makes every rank build a
+        report next to its executor loop. The route therefore takes the
+        runtime-control request signing, like ``/memory_status``, and exists
+        only when ``memory_monitor_config`` selects full mode (the
+        arguments fold ``TLLM_MEM_MONITOR`` into it) and a runtime-control
+        key is set. Sleep mode is not needed. The key is the
+        server's ``runtime_control_api_key`` or, failing that,
+        ``TRTLLM_RUNTIME_CONTROL_API_KEY``. With several frontends the route
+        is not served, since each frontend keeps its own replay cache. The
+        frontend is rank 0 and serves every rank's report, so
+        ``TLLM_MEM_MONITOR_RANKS`` does not decide whether it exists.
+        """
+        from tensorrt_llm._torch.memory.monitor.settings import full_mode_in
+
+        args = self.generator.args
+        if not full_mode_in(getattr(args, "memory_monitor_config", None)):
+            return
+        api_key = (self._runtime_control_api_key
+                   or os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY"))
+        if not api_key:
+            logger.info(
+                "GET /memory_report is not served: set "
+                "TRTLLM_RUNTIME_CONTROL_API_KEY to serve it with signed "
+                "requests. LLM.get_memory_report() returns the same reports.")
+            return
+        if args.num_serve_frontends > 1:
+            logger.info(
+                "GET /memory_report is not served with num_serve_frontends > "
+                "1: request signing keeps its replay cache per frontend.")
+            return
+        self._runtime_control_api_key = api_key
+        self.app.add_api_route(
+            "/memory_report",
+            self.memory_report,
+            methods=["GET"],
+            dependencies=[Depends(self._require_runtime_control_auth)])
 
     def _register_runtime_control_routes(self) -> None:
         if not self._enable_runtime_control_endpoints:
@@ -1462,11 +1556,11 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["POST"],
                                dependencies=dependencies)
 
-    def _init_embedding_batcher(self):
-        """Create the encode dynamic batcher for the embedding server.
+    def _init_encode_batcher(self):
+        """Create the dynamic batcher shared by encode-only servers.
 
-        The batcher coalesces concurrent /v1/embeddings requests into a single
-        `llm.encode()` call. `encode()` is synchronous; the batcher runs it in
+        The batcher coalesces concurrent requests into a single `llm.encode()`
+        call. `encode()` is synchronous; the batcher runs it in
         the default executor so the event loop stays responsive.
         """
 
@@ -1481,11 +1575,11 @@ class OpenAIServer(_VideoRoutesMixin):
         # would leave the batcher's seq-len/token-budget guards inert (typed 400s
         # would never fire) and could let it form a batch encode() then rejects.
         encoder_executor = self.generator._encoder_executor
-        self.embedding_batcher = EncodeBatcher(
+        self.encode_batcher = EncodeBatcher(
             encode_fn,
             max_batch_size=encoder_executor.max_batch_size,
-            max_queue_delay=self._embedding_max_queue_delay,
-            max_queue_size=self._embedding_max_queue_size,
+            max_queue_delay=self._encode_max_queue_delay,
+            max_queue_size=self._encode_max_queue_size,
             max_num_tokens=encoder_executor.max_num_tokens,
             max_seq_len=encoder_executor.max_seq_len,
         )
@@ -1553,16 +1647,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 token_ids_list.append(token_ids)
 
             try:
-                # Validate every input's length up front so an oversize item fails
-                # the whole request before any item is enqueued — otherwise gather()
-                # cancels the awaiters but their already-queued inputs still run
-                # encode() (wasted GPU work).
-                for token_ids in token_ids_list:
-                    self.embedding_batcher.validate_input(token_ids)
-                results = await asyncio.gather(*[
-                    self.embedding_batcher.submit(token_ids)
-                    for token_ids in token_ids_list
-                ])
+                results = await self.encode_batcher.submit_many(token_ids_list)
             except InputTooLongError as e:
                 return self.create_error_response(
                     str(e), status_code=HTTPStatus.BAD_REQUEST)
@@ -1595,6 +1680,127 @@ class OpenAIServer(_VideoRoutesMixin):
                 str(e),
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def register_rerank_routes(self) -> None:
+        self.app.add_api_route("/health", self.health, methods=["GET"])
+        self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        self.app.add_api_route("/rerank", self.rerank, methods=["POST"])
+        self.app.add_api_route("/v1/rerank", self.rerank, methods=["POST"])
+        self.app.add_api_route("/v2/rerank", self.rerank_v2, methods=["POST"])
+
+    async def _rerank(self,
+                      request: RerankRequest | RerankV2Request) -> Response:
+        try:
+            if (isinstance(request, RerankV2Request) and request.priority != 0):
+                return self.create_error_response(
+                    "Only priority=0 is currently supported by the rerank "
+                    "server.",
+                    status_code=HTTPStatus.BAD_REQUEST)
+
+            if (self._encode_max_queue_size > 0
+                    and len(request.documents) > self._encode_max_queue_size):
+                return self.create_error_response(
+                    f"Number of documents ({len(request.documents)}) exceeds "
+                    f"max_queue_size ({self._encode_max_queue_size}). "
+                    "Split the documents into smaller requests.",
+                    status_code=HTTPStatus.BAD_REQUEST)
+
+            documents = [
+                doc if isinstance(doc, str) else doc.text
+                for doc in request.documents
+            ]
+            encoder_executor = self.generator._encoder_executor
+            max_prompt_length = min(encoder_executor.max_seq_len,
+                                    encoder_executor.max_num_tokens)
+            loop = asyncio.get_running_loop()
+            try:
+                input_builder = await loop.run_in_executor(
+                    self._input_proc_executor,
+                    functools.partial(
+                        Qwen3RerankInputBuilder,
+                        tokenizer=self.tokenizer,
+                        query=request.query,
+                        max_seq_len=max_prompt_length,
+                        instruction=request.instruction,
+                        max_tokens_per_doc=request.max_tokens_per_doc))
+                token_ids_list = await asyncio.gather(*[
+                    loop.run_in_executor(
+                        self._input_proc_executor,
+                        functools.partial(input_builder.build, document))
+                    for document in documents
+                ])
+            except ValueError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.BAD_REQUEST)
+
+            try:
+                for token_ids in token_ids_list:
+                    self.encode_batcher.validate_input(token_ids)
+                outputs = await asyncio.gather(*[
+                    self.encode_batcher.submit(token_ids)
+                    for token_ids in token_ids_list
+                ])
+            except InputTooLongError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.BAD_REQUEST)
+            except QueueFullError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.TOO_MANY_REQUESTS)
+
+            logits = []
+            for output in outputs:
+                if output.logits.numel() != 1:
+                    raise RuntimeError(
+                        "Reranker model must return exactly one logit per "
+                        f"document; got shape {tuple(output.logits.shape)}.")
+                logits.append(output.logits.reshape(()))
+            scored = [
+                (index, rerank_probability(logit))
+                for index, logit in enumerate(torch.stack(logits).tolist())
+            ]
+            scored.sort(key=lambda item: item[1], reverse=True)
+            if request.top_n is not None and request.top_n > 0:
+                scored = scored[:request.top_n]
+
+            if isinstance(request, RerankV2Request):
+                response = RerankV2Response(results=[
+                    RerankV2Result(index=index, relevance_score=score)
+                    for index, score in scored
+                ])
+                return JSONResponse(content=response.model_dump())
+
+            results = []
+            for index, score in scored:
+                document = (RerankDocument(text=documents[index])
+                            if request.return_documents else None)
+                results.append(
+                    RerankResult(index=index,
+                                 relevance_score=score,
+                                 document=document))
+            prompt_tokens = sum(len(token_ids) for token_ids in token_ids_list)
+            response = RerankResponse(model=self.model,
+                                      results=results,
+                                      usage=RerankUsageInfo(
+                                          prompt_tokens=prompt_tokens,
+                                          total_tokens=prompt_tokens))
+            return JSONResponse(content=response.model_dump(exclude_none=True))
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    async def rerank(self, request: RerankRequest,
+                     raw_request: Request) -> Response:
+        del raw_request
+        return await self._rerank(request)
+
+    async def rerank_v2(self, request: RerankV2Request,
+                        raw_request: Request) -> Response:
+        del raw_request
+        return await self._rerank(request)
 
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""
@@ -1688,7 +1894,8 @@ class OpenAIServer(_VideoRoutesMixin):
         if self.disagg_cluster_config:
             self.disagg_cluster_storage = create_cluster_storage_client(
                 self.disagg_cluster_config.cluster_uri,
-                self.disagg_cluster_config.cluster_name)
+                self.disagg_cluster_config.cluster_name,
+                **self.disagg_cluster_config.cluster_storage_options())
             self.disagg_cluster_worker = DisaggClusterWorker(
                 self.server_role, self.host, self.port,
                 self.disagg_cluster_config, self.disagg_cluster_storage)
@@ -1938,7 +2145,11 @@ class OpenAIServer(_VideoRoutesMixin):
             if record is not None and raw_request is not None:
                 raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:
-            if res.candidate_metrics:
+            records = getattr(res, "candidate_metric_records", None)
+            if records:
+                for record in records:
+                    self.metrics_collector.emit(record)
+            elif res.candidate_metrics:
                 for candidate_m in res.candidate_metrics:
                     self.metrics_collector.log_request_metrics_dict(candidate_m)
             elif res.metrics_dict:
@@ -2026,8 +2237,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
-                    logger.error(f"Error collecting iteration stats: {e}",
-                                 exc_info=True)
+                    logger.error(f"Error collecting iteration stats: {e}\n"
+                                 f"{traceback.format_exc()}")
                     # Brief sleep to avoid tight loop on persistent errors
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:
@@ -2059,11 +2270,31 @@ class OpenAIServer(_VideoRoutesMixin):
             self, "_spec_decode_num_spec_tokens", None)
 
     def _record_iteration_stat(self, llm_stat: dict) -> None:
-        self.metrics_collector.log_iteration_stats(llm_stat)
+        self.metrics_collector.emit(
+            PerfMetricsCollector.collect_iteration(llm_stat))
         # Tee into the /metrics snapshot buffer so the HTTP handler can serve
         # without competing for the engine queue (nvbug 6102381).
         if self._iteration_stats_buffer is not None:
             self._iteration_stats_buffer.append(llm_stat)
+
+    async def _run_input_processor(
+        self,
+        process: Callable[[], _InputProcessingResult],
+    ) -> _InputProcessingResult:
+        """Run preprocessing with separate thread queue and execution times."""
+        loop = asyncio.get_running_loop()
+        queued = _start_input_processing()
+        if queued is None:
+            return await loop.run_in_executor(self._input_proc_executor,
+                                              process)
+
+        def run() -> _InputProcessingResult:
+            _record_input_processing("processor_queue", queued)
+            with _time_input_processing("processor"):
+                return process()
+
+        return await loop.run_in_executor(self._input_proc_executor,
+                                          copy_context().run, run)
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
@@ -2107,6 +2338,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(traceback.format_exc())
                 raise
 
+        input_started = _start_input_processing()
         try:
             # Extension preprocessing, the required-tool check and tool dumping
             # are the first stage of the shared prompt-preparation pipeline.
@@ -2481,11 +2713,17 @@ class OpenAIServer(_VideoRoutesMixin):
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
-                loop = asyncio.get_event_loop()
-                generate_inputs = await loop.run_in_executor(
-                    self._input_proc_executor,
-                    functools.partial(preprocess_fn, prompt, sampling_params,
-                                      disaggregated_params))
+                preprocess = functools.partial(preprocess_fn, prompt,
+                                               sampling_params,
+                                               disaggregated_params)
+                if self._tokenization_owners is not None:
+                    # A disaggregated context worker gets the sub-agent's
+                    # parent id only from the signed header.
+                    preprocess = functools.partial(
+                        _preprocess_in_conversation,
+                        scheduling_params.subagent_affinity_id
+                        or get_request_conversation_id(request), preprocess)
+                generate_inputs = await self._run_input_processor(preprocess)
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -2503,6 +2741,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if raw_request is not None:
                 # The executor client id, which the perf metrics, the
@@ -2546,6 +2787,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -2727,7 +2970,16 @@ class OpenAIServer(_VideoRoutesMixin):
 
         raw_request = self._synthetic_request(
             chat_request.model_dump(exclude_none=True))
-        response = await self.openai_chat(chat_request, raw_request)
+        if self._collect_perf_metrics:
+            observer = (self.metrics_collector.log_input_processing
+                        if self.metrics_collector else None)
+            with _input_processing_context(raw_request.scope["state"],
+                                           observer):
+                response = await self.openai_chat(chat_request, raw_request)
+            for record in raw_request.state.perf_metrics_records:
+                self._perf_metrics_writer.submit(record)
+        else:
+            response = await self.openai_chat(chat_request, raw_request)
         if response is None:
             return "errored", {
                 "type": "api_error",
@@ -2857,9 +3109,16 @@ class OpenAIServer(_VideoRoutesMixin):
         async def create_mm_embedding_response(promise: RequestOutput):
             await promise.aresult()
             # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
-            mm_embedding_handles = (
-                promise.disaggregated_params.multimodal_embedding_handles
-                if promise.disaggregated_params else None)
+            params = promise.disaggregated_params
+            mm_embedding_handles = (params.multimodal_embedding_handles
+                                    if params else None)
+            # The response returns only the embedding handles; release the
+            # exports no caller can open.
+            if params is not None:
+                for handle in (params.mrope_position_ids_handle,
+                               params.mrope_position_deltas_handle):
+                    if handle is not None:
+                        SharedTensorContainer.release_dict(handle)
             if not mm_embedding_handles:
                 return self.create_error_response(
                     message="Multimodal embedding handle missing in response",
@@ -2893,6 +3152,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 ),
             )
 
+        input_started = _start_input_processing()
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -2953,9 +3213,13 @@ class OpenAIServer(_VideoRoutesMixin):
                                              mm_item_order)
 
             promise = self.generator.generate_async(inputs=prompt, )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
+            await self._extract_metrics(promise, raw_request)
             return JSONResponse(content=response.model_dump())
 
         except CppExecutorError:
@@ -2966,6 +3230,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
@@ -3075,6 +3341,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield output
             yield "data: [DONE]\n\n"
 
+        input_started = _start_input_processing()
         try:
             if isinstance(request.prompt, list) and not request.prompt:
                 return self.create_error_response("'prompt' must not be empty.")
@@ -3114,6 +3381,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 self._apply_spec_decode_stats_opt_in(postproc_args)
@@ -3133,9 +3402,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
-                    loop = asyncio.get_event_loop()
-                    prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
-                        self._input_proc_executor,
+                    prompt_token_ids, extra_processed_inputs = await self._run_input_processor(
                         functools.partial(self.generator.input_processor,
                                           prompt, sampling_params))
                     tokens_prompt = TokensPrompt(
@@ -3151,6 +3418,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
                     conversation_params=conversation_params,
+                    scheduling_params=scheduling_params,
                     trace_headers=trace_headers,
                     kv_hints=request.kv_hints,
                     priority=request.priority if request.priority is not None
@@ -3164,6 +3432,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 promises.append(promise)
                 postproc_params_collection.append(
                     None if self.postproc_worker_enabled else postproc_params)
+
+            _record_input_processing("total", input_started)
+            input_started = None
 
             if request.stream:
                 generators = [
@@ -3191,6 +3462,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
@@ -3227,6 +3500,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(traceback.format_exc())
                 raise
 
+        input_started = _start_input_processing()
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -3327,6 +3601,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
@@ -3350,6 +3627,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.debug("Error details: %s", traceback.format_exc())
             return self.create_error_response(message=str(e),
                                               err_type="internal_error")
+        finally:
+            _record_input_processing("total", input_started)
 
     def _responses_prompt_tokens_excluded_from_usage(
             self, request: ResponsesRequest) -> int:
@@ -3432,6 +3711,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     yield pp_res
             await self._extract_metrics(res, raw_request)
 
+        input_started = _start_input_processing()
         try:
             if request.background:
                 logger.warning(
@@ -3573,6 +3853,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             if not self.postproc_worker_enabled:
                 # Set by the executor only for postprocessing it runs itself.
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -3615,6 +3898,9 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+        finally:
+            _record_input_processing("total", input_started)
 
         return JSONResponse(content={"detail": "None"})
 
@@ -3777,12 +4063,12 @@ class OpenAIServer(_VideoRoutesMixin):
                                 "message": str(error)
                             }})
 
-    async def _call_runtime_memory_method(self, method: str,
-                                          tags: Optional[List[str]]) -> object:
+    async def _call_runtime_memory_method(self, method: str, *args:
+                                          object) -> object:
         operation = getattr(self.generator, method)
         if isinstance(self.generator, AsyncLLM):
-            return await operation(tags)
-        return await asyncio.to_thread(operation, tags)
+            return await operation(*args)
+        return await asyncio.to_thread(operation, *args)
 
     async def runtime_release_memory(
         self,
@@ -3812,17 +4098,35 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def runtime_memory_status(self) -> JSONResponse:
         try:
-            if isinstance(self.generator, AsyncLLM):
-                status = await self.generator.get_memory_status()
-            else:
-                status = await asyncio.to_thread(
-                    self.generator.get_memory_status)
+            status = await self._call_runtime_memory_method("get_memory_status")
         except Exception as error:
             return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                                 content={"error": {
                                     "message": str(error)
                                 }})
         return JSONResponse(content=status.model_dump(mode="json"))
+
+    async def memory_report(self) -> JSONResponse:
+        """Where each GPU worker's memory is going, as readable reports.
+
+        See ``LLM.get_memory_report``. Concurrent requests share one
+        in-flight gather rather than each asking every rank again.
+        """
+        task = self._memory_report_task
+        if task is None or task.done():
+            task = asyncio.ensure_future(
+                self._call_runtime_memory_method("get_memory_report"))
+            self._memory_report_task = task
+        try:
+            # Shielded: a client that disconnects must not cancel the
+            # gather other requests are waiting on.
+            reports = await asyncio.shield(task)
+        except Exception as error:
+            return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                                content={"error": {
+                                    "message": str(error)
+                                }})
+        return JSONResponse(content={"reports": reports})
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:
@@ -3891,6 +4195,13 @@ class OpenAIServer(_VideoRoutesMixin):
         if args is not None:
             if args.max_batch_size is not None:
                 content["max_batch_size"] = args.max_batch_size
+            # A pooled generation router bounds the seat wait by it; null (no
+            # timeout) is reported too, so the router can tell it from unset.
+            cache_transceiver_config = getattr(args, "cache_transceiver_config",
+                                               None)
+            if cache_transceiver_config is not None:
+                content[
+                    "kv_transfer_timeout_ms"] = cache_transceiver_config.kv_transfer_timeout_ms
             kv_cache_config = args.kv_cache_config
             if kv_cache_config is not None:
                 content[
@@ -3934,7 +4245,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -4091,21 +4402,38 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        Shares the switch with ``format='path'`` on the request side; see
-        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
+        See :func:`path_response_is_disabled`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        if local_media_path_is_disallowed():
+        if path_response_is_disabled():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
-                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
+                "(TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1); it returns "
                 "server-side filesystem paths and is only meaningful for "
                 "co-located clients.",
                 err_type="BadRequestError",
                 status_code=HTTPStatus.BAD_REQUEST,
             )
         return None
+
+    async def _parse_visual_gen_params(
+        self, request: Union[ImageGenerationRequest, ImageEditRequest,
+                             VideoGenerationRequest]
+    ) -> "VisualGenParams":
+        """Translate a VisualGen request with `parse_visual_gen_params`.
+
+        A request that reads files (a ``format='path'`` reference or an
+        upload) is parsed on the media-load pool, which bounds how many
+        requests read at once; a read keeps its worker until it finishes,
+        even after its request is cancelled. Any other request is parsed
+        inline.
+        """
+        if not request_reads_files(request):
+            return parse_visual_gen_params(request, self.generator)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._media_load_executor, parse_visual_gen_params, request,
+            self.generator)
 
     def _image_object(self, request: Union[ImageGenerationRequest,
                                            ImageEditRequest],
@@ -4192,7 +4520,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )

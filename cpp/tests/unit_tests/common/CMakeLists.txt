@@ -33,8 +33,16 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;common;gpu")
-add_tllm_gtest(attentionWorkspaceTest SOURCES attentionWorkspaceTest.cpp
-               FULL_STACK LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  attentionWorkspaceTest
+  OWNER
+  common
+  SOURCES
+  attentionWorkspaceTest.cpp
+  LINK_LIBRARIES
+  tllm::common_logging
+  LABELS
+  "unit;common;host")
 add_tllm_gtest(
   memoryUtilsTest
   OWNER
@@ -45,6 +53,17 @@ add_tllm_gtest(
   tllm::common_cuda
   LABELS
   "unit;common;host")
+add_tllm_gtest(
+  nativeMemoryTest
+  OWNER
+  common
+  SOURCES
+  nativeMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::common_native_memory
+  CUDA::cudart
+  LABELS
+  "unit;common;gpu")
 add_tllm_gtest(
   optionalRefTest
   OWNER

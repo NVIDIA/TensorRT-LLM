@@ -146,58 +146,25 @@ __device__ __forceinline__ uint16_t quantizeMinimaxM3Fp4x4(
     return static_cast<uint16_t>(fp32_vec_to_e2m1(quantValues));
 }
 
-// Perform per-head QK Norm and RoPE in a single kernel, reading a BF16 input and
-// writing to a (possibly different-dtype) output buffer.
+// Perform QK Norm and RoPE of one head of one token, reading a BF16 input and
+// writing to a (possibly different-dtype) output buffer. The 32 threads of a warp
+// process the head: vec holds this thread's input elements of the head, and
+// cos_vals/sin_vals the RoPE cos/sin of these elements for the token.
+// localHeadIdx: Q heads, then K heads, then V heads of the token.
 // head_dim: the dimension of each head
 // interleave: interleave=!is_neox.
 // OutT: output element type (__nv_bfloat16 or __nv_fp8_e4m3).
-template <int head_dim, bool interleave, typename OutT>
-__global__ void fusedQKNormRopeKernel(
-    __nv_bfloat16 const* qkv_in,   // Combined QKV input [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
-    OutT* qkv_out,                 // Output buffer, same layout as qkv_in
-    int const num_heads_q,         // Number of query heads
-    int const num_heads_k,         // Number of key heads
-    int const num_heads_v,         // Number of value heads
-    bool const process_v,          // Whether to copy-cast V heads into qkv_out
-    int const rotary_dim,          // Dimension for RoPE
-    float const eps,               // Epsilon for RMS normalization
-    __nv_bfloat16 const* q_weight, // RMSNorm weights for query
-    __nv_bfloat16 const* k_weight, // RMSNorm weights for key
-    float const base,              // Base for RoPE computation
-    int const* position_ids,       // Position IDs for RoPE
-    int const num_tokens,          // Number of tokens
-    // parameters for yarn
-    float factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
-    float low,    // threshold for high frequency
-    float high,   // threshold for low frequency
-    float attention_factor, // attention_factor applied on cos and sin
-    // stop of parameters for yarn
-    bool is_qk_norm, // Whether to apply QK norm
-    bool use_gemma,  // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
-    // parameters for interleaved mRoPE (use_mrope=false -> plain RoPE, single position per token)
-    bool use_mrope,     // Whether to use interleaved mRoPE position selection
-    int mrope_section1, // mrope_section[1] (height); section 0 (temporal) is implied
-    int mrope_section2  // mrope_section[2] (width)
-)
+template <int head_dim, bool interleave, typename OutT, typename vec_T>
+__device__ __forceinline__ void fusedQKNormRopeHead(vec_T vec, OutT* qkv_out, int const num_heads_q,
+    int const num_heads_k, int const num_heads_v, int const rotary_dim, float const eps, __nv_bfloat16 const* q_weight,
+    __nv_bfloat16 const* k_weight, float const attention_factor, bool const is_qk_norm, bool const use_gemma,
+    int const tokenIdx, int const localHeadIdx, float const (&cos_vals)[head_dim / 32],
+    float const (&sin_vals)[head_dim / 32])
 {
-    int const warpsPerBlock = blockDim.x / 32;
-    int const warpId = threadIdx.x / 32;
     int const laneId = threadIdx.x % 32;
-
-    // Calculate global warp index to determine which head/token this warp processes
-    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
 
     // Total number of attention heads (Q and K)
     int const total_qk_heads = num_heads_q + num_heads_k;
-    int const total_proc_heads = total_qk_heads + (process_v ? num_heads_v : 0);
-
-    // Determine which token and head this warp processes
-    int const tokenIdx = globalWarpIdx / total_proc_heads;
-    int const localHeadIdx = globalWarpIdx % total_proc_heads;
-
-    // Skip if this warp is assigned beyond the number of tokens
-    if (tokenIdx >= num_tokens)
-        return;
 
     bool const isQ = localHeadIdx < num_heads_q;
     bool const isV = localHeadIdx >= total_qk_heads;
@@ -222,14 +189,14 @@ __global__ void fusedQKNormRopeKernel(
     int const num_heads = num_heads_q + num_heads_k + num_heads_v;
 
     static_assert(head_dim % (32 * 2) == 0,
-        "head_dim must be divisible by 64 (each warp processes one head, and each thread gets even number of "
-        "elements)");
+        "head_dim must be divisible by 64 (the 32 threads of a warp process a head, and each thread gets even number "
+        "of elements)");
     constexpr int numElemsPerThread = head_dim / 32;
     float elements[numElemsPerThread];
     constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
     static_assert(elemSizeBytes % 4 == 0, "numSizeBytes must be a multiple of 4");
     constexpr int vecSize = elemSizeBytes / 4; // Use packed_as<uint, vecSize> to perform loading/saving.
-    using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
+    static_assert(sizeof(vec_T) == elemSizeBytes, "vec_T must hold this thread's elements of the head");
 
     int const offsetWarp = tokenIdx * num_heads * head_dim + segStart + headIdx * head_dim;
     int offsetThread = offsetWarp + laneId * numElemsPerThread;
@@ -239,7 +206,6 @@ __global__ void fusedQKNormRopeKernel(
 
     // Load.
     {
-        vec_T vec = *reinterpret_cast<vec_T const*>(&qkv_in[offsetThread]);
 #pragma unroll
         for (int i = 0; i < vecSize; i++)
         {
@@ -278,27 +244,9 @@ __global__ void fusedQKNormRopeKernel(
     }
     // Apply RoPE to normalized elements
     float elements2[numElemsPerThread]; // Additional buffer required for RoPE.
-    float cos_vals[numElemsPerThread];
-    float sin_vals[numElemsPerThread];
-
-    // pos_id is selected per rotary half-dim (interleaved mRoPE); for plain RoPE
-    // selectMRopePosId always returns position_ids[tokenIdx].
-
-    // Hoist log2(base) and the loop-invariant constants out of the per-thread
-    // per-elem loop. powf(base, -2*hd/rd) == exp2f(-2*hd/rd * log2(base)); base
-    // and rotary_dim are kernel-uniform, so one MUFU.LG2 per warp instead of
-    // one per (thread, iter). Uses the fast __log2f intrinsic (a few ULPs of
-    // error, absorbed by bf16 downcast at store time).
-    float const neg2_log2base_over_rd = -2.0f * __log2f(base) / static_cast<float>(rotary_dim);
-    // rotary_dim is even by contract; when it's also a power of 2 (always in
-    // practice — 64/128/256) '% rotary_dim' becomes '& (rotary_dim - 1)'.
-    // The bool is warp-uniform → predicated select, no branch divergence.
-    int const rd_mask = rotary_dim - 1;
-    bool const rd_is_pow2 = ((rotary_dim & rd_mask) == 0);
-    // TODO: cos sin calculation could be halved.
     if constexpr (interleave)
     {
-        // Perform interleaving. Fill cos_vals and sin_vals.
+        // Perform interleaving.
         for (int i = 0; i < numElemsPerThread; i++)
         {
             if (i % 2 == 0)
@@ -309,33 +257,6 @@ __global__ void fusedQKNormRopeKernel(
             {
                 elements2[i] = elements[i - 1];
             }
-
-            int dim_idx = laneId * numElemsPerThread + i;
-            int half_dim = dim_idx / 2;
-            float freq = exp2f(static_cast<float>(half_dim) * neg2_log2base_over_rd);
-
-            if (factor != 1.0f)
-            {
-                float inv_freq_extrapolation = freq;
-                float inv_freq_interpolation = freq / factor;
-
-                // linear_ramp_factor
-                if (fabsf(low - high) <= 1e-6f)
-                {
-                    high += 0.001; // Prevent singularity
-                }
-                float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
-                // clamp linear_func to [0.0f, 1.0f]
-                float ramp_func = fmin(fmax(linear_func, 0.0f), 1.0f);
-                float inv_freq_extrapolation_factor = 1.0f - ramp_func;
-                freq = inv_freq_interpolation * (1.0f - inv_freq_extrapolation_factor)
-                    + inv_freq_extrapolation * inv_freq_extrapolation_factor;
-            }
-
-            float pos_id = selectMRopePosId(
-                position_ids, tokenIdx, num_tokens, half_dim, use_mrope, mrope_section1, mrope_section2);
-            float theta = pos_id * freq;
-            __sincosf(theta, &sin_vals[i], &cos_vals[i]);
         }
     }
     else
@@ -343,7 +264,7 @@ __global__ void fusedQKNormRopeKernel(
         // Before data exchange with in warp, we need to sync.
         __syncwarp();
         int pairOffset = (rotary_dim / 2) / numElemsPerThread;
-        // Get the data from the other half of the warp. Fill cos_vals and sin_vals.
+        // Get the data from the other half of the warp.
         for (int i = 0; i < numElemsPerThread; i++)
         {
             elements2[i] = __shfl_xor_sync(0xffffffff, elements[i], pairOffset);
@@ -351,34 +272,6 @@ __global__ void fusedQKNormRopeKernel(
             {
                 elements2[i] = -elements2[i];
             }
-
-            int dim_idx = laneId * numElemsPerThread + i;
-            dim_idx = rd_is_pow2 ? ((dim_idx * 2) & rd_mask) : ((dim_idx * 2) % rotary_dim);
-            int half_dim = dim_idx / 2;
-            float freq = exp2f(static_cast<float>(half_dim) * neg2_log2base_over_rd);
-
-            if (factor != 1.0f)
-            {
-                float inv_freq_extrapolation = freq;
-                float inv_freq_interpolation = freq / factor;
-
-                // linear_ramp_factor
-                if (fabsf(low - high) <= 1e-6f)
-                {
-                    high += 0.001; // Prevent singularity
-                }
-                float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
-                // clamp linear_func to [0.0f, 1.0f]
-                float ramp_func = fmin(fmax(linear_func, 0.0f), 1.0f);
-                float inv_freq_extrapolation_factor = 1.0f - ramp_func;
-                freq = inv_freq_interpolation * (1.0f - inv_freq_extrapolation_factor)
-                    + inv_freq_extrapolation * inv_freq_extrapolation_factor;
-            }
-
-            float pos_id = selectMRopePosId(
-                position_ids, tokenIdx, num_tokens, half_dim, use_mrope, mrope_section1, mrope_section2);
-            float theta = pos_id * freq;
-            __sincosf(theta, &sin_vals[i], &cos_vals[i]);
         }
         // __shfl_xor_sync does not provide memfence. Need to sync again.
         __syncwarp();
@@ -407,6 +300,144 @@ __global__ void fusedQKNormRopeKernel(
 
     // Store.
     storeHeadElements<OutT, numElemsPerThread, vecSize>(qkv_out, offsetThread, elements);
+}
+
+// Perform per-head QK Norm and RoPE in a single kernel, reading a BF16 input and
+// writing to a (possibly different-dtype) output buffer.
+// Each warp processes heads_per_warp consecutive heads of one token. The RoPE
+// cos/sin of a thread's elements depend only on the token, so they are computed
+// once per warp and reused for every head the warp processes.
+// head_dim: the dimension of each head
+// interleave: interleave=!is_neox.
+// OutT: output element type (__nv_bfloat16 or __nv_fp8_e4m3).
+template <int head_dim, bool interleave, typename OutT>
+__global__ void fusedQKNormRopeKernel(
+    __nv_bfloat16 const* qkv_in,   // Combined QKV input [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    OutT* qkv_out,                 // Output buffer, same layout as qkv_in
+    int const num_heads_q,         // Number of query heads
+    int const num_heads_k,         // Number of key heads
+    int const num_heads_v,         // Number of value heads
+    bool const process_v,          // Whether to copy-cast V heads into qkv_out
+    int const rotary_dim,          // Dimension for RoPE
+    float const eps,               // Epsilon for RMS normalization
+    __nv_bfloat16 const* q_weight, // RMSNorm weights for query
+    __nv_bfloat16 const* k_weight, // RMSNorm weights for key
+    float const base,              // Base for RoPE computation
+    int const* position_ids,       // Position IDs for RoPE
+    int const num_tokens,          // Number of tokens
+    // parameters for yarn
+    float factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
+    float low,    // threshold for high frequency
+    float high,   // threshold for low frequency
+    float attention_factor, // attention_factor applied on cos and sin
+    // stop of parameters for yarn
+    bool is_qk_norm, // Whether to apply QK norm
+    bool use_gemma,  // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
+    // parameters for interleaved mRoPE (use_mrope=false -> plain RoPE, single position per token)
+    bool use_mrope,           // Whether to use interleaved mRoPE position selection
+    int mrope_section1,       // mrope_section[1] (height); section 0 (temporal) is implied
+    int mrope_section2,       // mrope_section[2] (width)
+    int const heads_per_warp, // Number of consecutive heads of one token processed by each warp
+    int const warps_per_token // ceil((num_heads_q + num_heads_k + (process_v ? num_heads_v : 0)) / heads_per_warp)
+)
+{
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+
+    // Calculate global warp index to determine which heads/token this warp processes
+    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+
+    // Total number of attention heads (Q and K)
+    int const total_qk_heads = num_heads_q + num_heads_k;
+    int const total_proc_heads = total_qk_heads + (process_v ? num_heads_v : 0);
+
+    // Determine which token and heads this warp processes
+    int const tokenIdx = globalWarpIdx / warps_per_token;
+    int const firstHeadIdx = (globalWarpIdx - tokenIdx * warps_per_token) * heads_per_warp;
+
+    // Skip if this warp is assigned beyond the number of tokens
+    if (tokenIdx >= num_tokens)
+        return;
+
+    int const endHeadIdx = min(firstHeadIdx + heads_per_warp, total_proc_heads);
+    int const num_heads = num_heads_q + num_heads_k + num_heads_v;
+
+    constexpr int numElemsPerThread = head_dim / 32;
+    using vec_T = typename tensorrt_llm::common::packed_as<uint, numElemsPerThread * sizeof(__nv_bfloat16) / 4>::type;
+
+    // Offset of this thread's elements of head 0 of the token; head h starts h * head_dim further.
+    int const offsetHead0 = tokenIdx * num_heads * head_dim + laneId * numElemsPerThread;
+
+    // Issue the first head's load before the RoPE math so that both overlap.
+    vec_T vec = *reinterpret_cast<vec_T const*>(&qkv_in[offsetHead0 + firstHeadIdx * head_dim]);
+
+    // RoPE cos/sin of this thread's elements, shared by all Q and K heads of the token.
+    float cos_vals[numElemsPerThread];
+    float sin_vals[numElemsPerThread];
+    if (firstHeadIdx < total_qk_heads)
+    {
+        // pos_id is selected per rotary half-dim (interleaved mRoPE); for plain RoPE
+        // selectMRopePosId always returns position_ids[tokenIdx].
+
+        // Hoist log2(base) and the loop-invariant constants out of the per-thread
+        // per-elem loop. powf(base, -2*hd/rd) == exp2f(-2*hd/rd * log2(base)); base
+        // and rotary_dim are kernel-uniform, so one MUFU.LG2 per warp instead of
+        // one per (thread, iter). Uses the fast __log2f intrinsic (a few ULPs of
+        // error, absorbed by bf16 downcast at store time).
+        float const neg2_log2base_over_rd = -2.0f * __log2f(base) / static_cast<float>(rotary_dim);
+        // rotary_dim is even by contract; when it's also a power of 2 (always in
+        // practice — 64/128/256) '% rotary_dim' becomes '& (rotary_dim - 1)'.
+        // The bool is warp-uniform → predicated select, no branch divergence.
+        int const rd_mask = rotary_dim - 1;
+        bool const rd_is_pow2 = ((rotary_dim & rd_mask) == 0);
+        for (int i = 0; i < numElemsPerThread; i++)
+        {
+            int dim_idx = laneId * numElemsPerThread + i;
+            if constexpr (!interleave)
+            {
+                dim_idx = rd_is_pow2 ? ((dim_idx * 2) & rd_mask) : ((dim_idx * 2) % rotary_dim);
+            }
+            int half_dim = dim_idx / 2;
+            float freq = exp2f(static_cast<float>(half_dim) * neg2_log2base_over_rd);
+
+            if (factor != 1.0f)
+            {
+                float inv_freq_extrapolation = freq;
+                float inv_freq_interpolation = freq / factor;
+
+                // linear_ramp_factor
+                if (fabsf(low - high) <= 1e-6f)
+                {
+                    high += 0.001; // Prevent singularity
+                }
+                float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
+                // clamp linear_func to [0.0f, 1.0f]
+                float ramp_func = fmin(fmax(linear_func, 0.0f), 1.0f);
+                float inv_freq_extrapolation_factor = 1.0f - ramp_func;
+                freq = inv_freq_interpolation * (1.0f - inv_freq_extrapolation_factor)
+                    + inv_freq_extrapolation * inv_freq_extrapolation_factor;
+            }
+
+            float pos_id = selectMRopePosId(
+                position_ids, tokenIdx, num_tokens, half_dim, use_mrope, mrope_section1, mrope_section2);
+            float theta = pos_id * freq;
+            __sincosf(theta, &sin_vals[i], &cos_vals[i]);
+        }
+    }
+
+    for (int localHeadIdx = firstHeadIdx; localHeadIdx < endHeadIdx; localHeadIdx++)
+    {
+        // Prefetch the next head of this warp while this one is processed.
+        vec_T nextVec = vec;
+        if (localHeadIdx + 1 < endHeadIdx)
+        {
+            nextVec = *reinterpret_cast<vec_T const*>(&qkv_in[offsetHead0 + (localHeadIdx + 1) * head_dim]);
+        }
+        fusedQKNormRopeHead<head_dim, interleave>(vec, qkv_out, num_heads_q, num_heads_k, num_heads_v, rotary_dim, eps,
+            q_weight, k_weight, attention_factor, is_qk_norm, use_gemma, tokenIdx, localHeadIdx, cos_vals, sin_vals);
+        vec = nextVec;
+    }
 }
 
 namespace
@@ -876,6 +907,43 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
         __VA_ARGS__                                                                                                    \
     }
 
+// Number of consecutive heads of one token that one warp of fusedQKNormRopeKernel processes. A warp computes the
+// RoPE cos/sin of its token once for all of its heads, so more heads per warp means less repeated RoPE math but
+// fewer warps. Use the largest divisor of the head count that keeps at least two warps per token and at least
+// kMinWarpsPerSm warps per SM. If no divisor fits (for example 17 heads), split the heads as evenly as possible over
+// the fewest warps that keep these limits; the last warp of a token then gets fewer heads. Small batches (decode)
+// keep one head per warp.
+static int fusedQKNormRopeHeadsPerWarp(int numTokens, int totalProcHeads, int smCount)
+{
+    constexpr int kMinWarpsPerSm = 16;
+    int64_t const minWarps = static_cast<int64_t>(smCount) * kMinWarpsPerSm;
+    auto const enoughWarps = [&](int headsPerWarp)
+    {
+        int const warpsPerToken = common::divUp(totalProcHeads, headsPerWarp);
+        return static_cast<int64_t>(numTokens) * warpsPerToken >= minWarps;
+    };
+    int headsPerWarp = 1;
+    for (int candidate = 2; candidate <= totalProcHeads / 2; ++candidate)
+    {
+        if (totalProcHeads % candidate == 0 && enoughWarps(candidate))
+        {
+            headsPerWarp = candidate;
+        }
+    }
+    if (headsPerWarp == 1)
+    {
+        for (int warpsPerToken = 2; warpsPerToken < totalProcHeads; ++warpsPerToken)
+        {
+            int const candidate = common::divUp(totalProcHeads, warpsPerToken);
+            if (enoughWarps(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
+    return headsPerWarp;
+}
+
 template <typename OutT>
 static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out, bool const process_v,
     int const num_tokens, int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim,
@@ -906,7 +974,10 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
 
     int const warpsPerBlock = blockSize / 32;
     int const totalProcHeads = num_heads_q + num_heads_k + (process_v ? num_heads_v : 0);
-    int const totalWarps = num_tokens * totalProcHeads;
+    static int const smCount = common::getMultiProcessorCount();
+    int const headsPerWarp = fusedQKNormRopeHeadsPerWarp(num_tokens, totalProcHeads, smCount);
+    int const warpsPerToken = common::divUp(totalProcHeads, headsPerWarp);
+    int const totalWarps = num_tokens * warpsPerToken;
 
     int const gridSize = common::divUp(totalWarps, warpsPerBlock);
     dim3 gridDim(gridSize);
@@ -921,7 +992,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
             fusedQKNormRopeKernel<64, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
                 num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
                 num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-                mrope_section2);
+                mrope_section2, headsPerWarp, warpsPerToken);
         });
         break;
     case 128:
@@ -929,7 +1000,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
             fusedQKNormRopeKernel<128, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
                 num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
                 num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-                mrope_section2);
+                mrope_section2, headsPerWarp, warpsPerToken);
         });
         break;
     case 256:
@@ -937,7 +1008,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
             fusedQKNormRopeKernel<256, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
                 num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
                 num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-                mrope_section2);
+                mrope_section2, headsPerWarp, warpsPerToken);
         });
         break;
     default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);

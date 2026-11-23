@@ -20,7 +20,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
+    K3MlaGeometry,
     k3_mla_decode_view,
 )
 
@@ -28,22 +29,27 @@ MAX_SEQS, MAX_PAGES, POOL_PAGES = 16, 32, 40
 
 
 def _attn(num_heads=6):
-    return SimpleNamespace(
-        num_heads=num_heads, kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128, q_scaling=1.0,
-        layer_idx=3, get_local_layer_idx=lambda meta: 1,
+    # Model layer 3 is the KV cache manager's local layer 1 (``layer_offsets`` below).
+    return K3MlaGeometry(
+        num_heads=num_heads, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64, q_scaling=1.0, layer_idx=3,
     )  # fmt: skip
 
 
 def _meta(num_generations, num_contexts=0, pool=None, **overrides):
     if pool is None:
         pool = torch.zeros(POOL_PAGES, 1, 64, 1, 576, dtype=torch.bfloat16)
+
+    def get_buffers(layer_idx):
+        assert layer_idx == 3, f"get_buffers takes the model layer index 3, got {layer_idx}"
+        return pool
+
     meta = SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
         beam_width=1,
         tokens_per_block=64,
         helix_position_offsets=None,
-        kv_cache_manager=SimpleNamespace(get_buffers=lambda layer_idx: pool),
+        kv_cache_manager=SimpleNamespace(get_buffers=get_buffers, layer_offsets={3: 1}),
         kv_cache_block_offsets=torch.arange(2 * MAX_SEQS * 2 * MAX_PAGES, dtype=torch.int32).view(
             2, MAX_SEQS, 2, MAX_PAGES
         ),

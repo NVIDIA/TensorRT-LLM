@@ -1247,9 +1247,9 @@ def test_tiny_transformer_matches_pinned_diffusers_golden(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_pinned_diffusers_golden_matches_live_hf_reference() -> None:
     parity_config = _TINY_CONFIG | {"num_layers": 1, "num_refiner_layers": 1}
-    reference = HFMiniMaxH3Transformer3DModel(**parity_config).to(
-        device="cuda", dtype=torch.bfloat16
-    )
+    reference = HFMiniMaxH3Transformer3DModel(**parity_config)
+    # pyrefly: ignore [missing-argument]
+    reference = reference.to(device="cuda", dtype=torch.bfloat16)
     for module_name in (
         "proj_in",
         "audio_proj_in",
@@ -1305,7 +1305,9 @@ def test_ref2va_bf16_matches_diffusers_rounding() -> None:
     _initialize_diffusers_golden_weights(target)
     reference = MiniMaxH3Transformer3DModel(
         **(_TINY_CONFIG | {"num_layers": 1, "num_refiner_layers": 1})
-    ).to(device="cuda", dtype=torch.bfloat16)
+    )
+    # pyrefly: ignore [missing-argument]
+    reference = reference.to(device="cuda", dtype=torch.bfloat16)
     for name in ("proj_in", "audio_proj_in", "time_embedder", "rope", "proj_out", "audio_proj_out"):
         getattr(reference, name).to(torch.float32)
     _copy_golden_parameters_to_hf(reference, target)

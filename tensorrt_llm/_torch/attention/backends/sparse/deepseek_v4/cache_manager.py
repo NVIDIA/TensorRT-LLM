@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
     get_scratch_entry,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
 from tensorrt_llm._utils import (
@@ -73,6 +74,7 @@ from .params import (
 )
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
+_ATTENTION_TYPE_ROLES = frozenset(str(t.role) for t in DeepseekV4AttentionType)
 KV_CACHE_COPY_ALIGNMENT = 16
 NVFP4_VECTOR_SIZE = 16
 
@@ -317,6 +319,7 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 
 class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     _supports_reuse_match_backoff = False
+    _supports_draft_reuse_match_backoff = False
 
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains one virtual attention-op pool per local
@@ -1131,6 +1134,13 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         # A compressed page holds tokens_per_block // ratio rows.
         return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
 
+    def _mixed_precision_layer_page(self, local_layer_idx: int) -> tuple[int, DataRole]:
+        # The high layer holds compressed rows, so it copies the COMPRESS page.
+        layer_id = self._layer_attn_to_layer_id[
+            self.pp_layers[local_layer_idx], DeepseekV4AttentionType.COMPRESS
+        ]
+        return int(layer_id), DeepseekV4AttentionType.COMPRESS.role
+
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
         Add DeepSeek-V4 layers and warmup constraints to the cache config.
@@ -1608,6 +1618,31 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         # The generic layers in the base config are replaced by
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
+
+    def page_table_spec(self) -> PageTableSpec:
+        """The cache of each attention type and the compressed cache's block scales hold MLA
+        latents of one KV head, which every tensor rank holds whole: split by that one head as the
+        base manager splits an MLA cache. Storage-only NVFP4 alignment pages hold no state a peer
+        needs and never move. FP8 pages carrying their own scales are quantized as
+        ``"fp8_ds_mla"``. NVFP4 KV compresses the compressed cache to NVFP4 with its block scales
+        and keeps the other caches in FP8; the spec names it ``"nvfp4"``, as configured. Every
+        window it keeps holds its draft tokens beyond the one attention reads
+        (``retention_margins``)."""
+        spec = super().page_table_spec()
+        head_split = (COMPRESS_BLOCK_SCALE_ROLE, *_ATTENTION_TYPE_ROLES)
+        if self.use_fp8_ds_mla:
+            quant_mode = "fp8_ds_mla"
+        elif self._use_nvfp4_compress:
+            quant_mode = "nvfp4"
+        else:
+            quant_mode = spec.quant_mode
+        return replace(
+            spec,
+            role_layouts={**spec.role_layouts, **{role: ByHead(total=1) for role in head_split}},
+            untransferred_roles=spec.untransferred_roles | self._disagg_ignored_roles,
+            quant_mode=quant_mode,
+            retention_margins=True,
+        )
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Exclude storage-only NVFP4 alignment pages from KV transfer."""

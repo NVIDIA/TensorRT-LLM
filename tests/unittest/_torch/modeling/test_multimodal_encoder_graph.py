@@ -327,6 +327,23 @@ def test_maybe_run_replays_captured_graph_and_slices_output():
     assert graph.replay_calls == 1
 
 
+def test_maybe_run_refreshes_metadata_under_inference_mode():
+    """Capture runs under inference_mode, so a backend may own inference tensors by replay time.
+    Refreshing them in place outside inference_mode is rejected."""
+    bucket = EncoderGraphKey(num_contexts=1, total_tokens=256)
+    runner = _make_logic_runner(buckets=[bucket])
+    _install_fake_captured_graph(runner, bucket)
+    seen = []
+    runner._metadata_provider.refresh_in_place = lambda metadata, padded_seq_lengths: seen.append(
+        torch.is_inference_mode_enabled()
+    )
+
+    with torch.no_grad():
+        runner.maybe_run(seq_lengths=[200], inputs={"x": torch.ones(200, 4)})
+
+    assert seen == [True]
+
+
 def test_replay_stats_disabled_does_not_log():
     runner = _make_logic_runner()
     assert runner._replay_stats_enabled is False

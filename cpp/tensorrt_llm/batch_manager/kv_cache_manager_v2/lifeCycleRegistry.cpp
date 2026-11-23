@@ -46,6 +46,15 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, in
         layer);
 }
 
+LifeCycle makeLifeCycle(RegionConfig const& region, int regionIndex)
+{
+    // RegionConfig::validate() admits request regions only; a token-block region would map
+    // to an AttnLifeCycle with the region's own window.
+    TLLM_CHECK_WITH_INFO(region.allocationUnit == RegionAllocationUnit::kRequest,
+        "Region '%s': only request regions are supported", region.name.c_str());
+    return SsmLifeCycle{region.reusePolicy, regionIndex};
+}
+
 // ---------------------------------------------------------------------------
 // LifeCycleRegistry
 // ---------------------------------------------------------------------------
@@ -72,7 +81,30 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
             registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
         }
     }
+    // The region index is part of a region's lifecycle, so each region registers a new one.
+    mRegionLifeCycleIds.reserve(config.regions.size());
+    for (size_t regionIndex = 0; regionIndex < config.regions.size(); ++regionIndex)
+    {
+        auto const& region = config.regions[regionIndex];
+        region.validate();
+        auto const lc = makeLifeCycle(region, static_cast<int>(regionIndex));
+        registerLifeCycle(lc);
+        auto const id = getId(lc);
+        mRegionLifeCycleIds.push_back(id);
+        TLLM_CHECK_WITH_INFO(mRegionLifeCycleIdByName.emplace(region.name, id).second,
+            "Region name '%s' is declared twice", region.name.c_str());
+    }
     check();
+}
+
+LifeCycleId LifeCycleRegistry::regionLifeCycleId(std::string const& name) const
+{
+    auto const it = mRegionLifeCycleIdByName.find(name);
+    if (it == mRegionLifeCycleIdByName.end())
+    {
+        throw std::out_of_range("LifeCycleRegistry: no region named '" + name + "'");
+    }
+    return it->second;
 }
 
 LifeCycle const& LifeCycleRegistry::operator[](LifeCycleId id) const
