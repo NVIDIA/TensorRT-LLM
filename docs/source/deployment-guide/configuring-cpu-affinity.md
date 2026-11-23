@@ -160,6 +160,7 @@ srun -l \
         bindpcie trtllm-llmapi-launch \
          trtllm-serve $LOCAL_MODEL \
             ${ADDITIONAL_OPTIONS}
+    "
 ```
 
 > [!NOTE]
