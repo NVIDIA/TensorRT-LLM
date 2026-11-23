@@ -62,6 +62,22 @@ from ._common import (
     skip_not_sm103,
 )
 
+# The reference rows are flexible-extract scores; the harness default averages it with
+# strict-match.
+_SCORES_FILTER = {"scores_filter": "exact_match,flexible-extract"}
+
+
+@pytest.fixture(autouse=True)
+def _score_flexible_extract(mocker):
+    """Score GSM8K by flexible-extract, the filter the reference rows were measured with.
+
+    Strict-match reads only a final ``#### N`` line, which this checkpoint seldom
+    writes: greedy at tep4 it scored 57.09 against flexible-extract's 90.14, so the
+    harness's default average of the two (73.62) would measure the answer format.
+    """
+    mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+
+
 # The layouts routing admits (the keys of routing.py's _LAYOUTS), with the
 # hardware each needs. tep8 spans two nodes, so its guard is the MPI world size.
 _LAYOUTS = [

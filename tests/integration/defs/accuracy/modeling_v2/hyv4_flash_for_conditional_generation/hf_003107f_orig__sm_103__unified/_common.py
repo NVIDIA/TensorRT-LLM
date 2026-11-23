@@ -24,7 +24,8 @@ which is part of those members' deployment rather than a separate one.
 
 GSM8K is the protocol the reference rows were measured under: the chat template
 with few-shot turns, ``reasoning_effort no_think``, 4096 prompt tokens, 1024
-output tokens, greedy (temperature 0), 1319 samples. The rows
+output tokens, greedy (temperature 0), 1319 samples, scored by flexible-extract
+(``test_accuracy.py`` sets the filter). The rows
 are keyed by the model name plus the resolved quantization
 (``FP8_BLOCK_SCALES``) and, where the member drafts, ``DFlash``.
 """
