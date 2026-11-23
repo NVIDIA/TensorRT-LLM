@@ -133,9 +133,10 @@ public:
         }
         auto const& result = mFut.get();
         return result.state == TransferState::kSUCCESS || result.remoteDrained
-            || (result.remoteDrain.valid()
-                && result.remoteDrain.wait_for(std::chrono::milliseconds(timeoutMs)) == std::future_status::ready
-                && result.remoteDrain.get());
+            || (result.remoteDrain != nullptr
+                && result.remoteDrain->result.wait_for(std::chrono::milliseconds(timeoutMs))
+                    == std::future_status::ready
+                && result.remoteDrain->result.get());
     }
 
     /// Failure cause recorded by the bounce transport (empty while in flight / on success).
@@ -1038,6 +1039,16 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
 #endif
     mRawAgent->invalidateRemoteMD(name);
+}
+
+bool NixlTransferAgent::peerSupportsBounce(std::string const& name) const
+{
+#ifdef TLLM_BOUNCE_V2
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    return mBounce && mBounce->transport && mBounce->transport->hasPeerHandshake(name);
+#else
+    return false;
+#endif
 }
 
 [[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)

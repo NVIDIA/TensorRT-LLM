@@ -172,6 +172,10 @@ class OlderReleaseRequestError(ValueError):
 class _DestinationDrainUnproven(RuntimeError):
     """A failed bounce write may still have a remote scatter."""
 
+    def __init__(self, detail: Optional[str], status: TransferStatus) -> None:
+        super().__init__(detail)
+        self.status = status
+
 
 class ReceiveAdmissionFenced(RuntimeError):
     """The agent closed receive admission before this destination was published."""
@@ -622,6 +626,7 @@ class _PendingSettlement:
     initial_report: Optional[list[bytes]]
     backend_done: bool = False
     report_error_logged: bool = False
+    bounce_status: Optional[TransferStatus] = None
 
 
 class SendTaskBase(_LogicalTask):
@@ -798,7 +803,8 @@ class Sender(SenderBase):
         # cancelled immutable ID until Sender teardown, not merely metadata TTL.
         self._pre_cancelled_rids: dict[int, bool] = {}
         self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
-        self._routed_cancels: set[int] = set()
+        self._routed_cancels: dict[int, float] = {}
+        self._expired_bounce_requests: dict[tuple[int, int], tuple[float, int, bytes]] = {}
         self._quiescence_closed = False
         # Sessions already cleared (completed, failed, cancelled or
         # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
@@ -828,7 +834,6 @@ class Sender(SenderBase):
             and not enforce_physical_ownership
             and not context_first_ownership
             and getattr(agent, "supports_handle_retirement", False) is True
-            and getattr(agent, "bounce_enabled", False) is not True
         )
         self._unreleased_statuses: list[tuple[TransferStatus, SendTaskBase, threading.Event]] = []
         self._ownership_poisoned: Optional[Exception] = None
@@ -943,17 +948,39 @@ class Sender(SenderBase):
                 if now - retired_at <= self._RETIRED_SESSION_TTL_S:
                     break
                 expired.append(rid)
+            routed = getattr(self, "_routed_cancels", {})
+            expired_routed = []
+            for rid, cancelled_at in routed.items():
+                if now - cancelled_at <= self._RETIRED_SESSION_TTL_S:
+                    break
+                expired_routed.append(rid)
             pending_rids = (
                 {rid for rid, _ in getattr(self, "_pending_session_quiescence", ())}
-                if expired
+                if expired or expired_routed
                 else set()
             )
+            for rid in expired_routed:
+                if (
+                    rid not in pending_rids
+                    and rid not in self._sessions
+                    and rid not in self._retired_rids
+                ):
+                    # The pre-cancel record still fences a late session or publication.
+                    routed.pop(rid, None)
+            proofs = getattr(self, "_expired_bounce_requests", {})
+            expired_proofs = []
+            for key, (expired_at, _, _) in proofs.items():
+                if now - expired_at <= self._RETIRED_SESSION_TTL_S:
+                    break
+                expired_proofs.append(key)
+            for key in expired_proofs:
+                del proofs[key]
             for rid in expired:
                 if rid in pending_rids:
                     continue
                 del self._retired_rids[rid]
                 if rid in getattr(self, "_routed_cancels", ()):
-                    self._routed_cancels.discard(rid)
+                    self._routed_cancels.pop(rid, None)
                     self._pre_cancelled_rids.pop(rid, None)
         with self._peer_requests_lock:
             stale_rids = [
@@ -964,17 +991,34 @@ class Sender(SenderBase):
         if not stale_rids:
             return
         orphaned_infos: list[RecvReqInfo] = []
+        bounce_infos: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
                     req_info_map = self._peer_requests.pop(rid)
                     self._peer_requests_timestamps.pop(rid, None)
-                    orphaned_infos.extend(
-                        info for info in req_info_map.values() if info.context_first
-                    )
+                    for info in req_info_map.values():
+                        if (
+                            getattr(info, "wants_no_submission_result", False)
+                            and rid not in self._retired_rids
+                        ):
+                            self._pre_cancelled_rids.setdefault(rid, True)
+                            self._routed_cancels.setdefault(rid, now)
+                            proofs = self.__dict__.setdefault("_expired_bounce_requests", {})
+                            proofs[(rid, info.instance_rank)] = (
+                                now,
+                                info.slice_id or 0,
+                                info.kv_result_report_token,
+                            )
+                            bounce_infos.append(info)
+                            continue
+                        if info.context_first:
+                            orphaned_infos.append(info)
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
         for info in orphaned_infos:
             self._fail_orphaned_receiver(info)
+        for info in bounce_infos:
+            self._send_no_submission(info, terminal=info.context_first)
 
     def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
         """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
@@ -989,6 +1033,22 @@ class Sender(SenderBase):
             f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
         )
         self._send_failed_result_to_receiver(info, defer_to_worker=True)
+
+    def _send_no_submission(self, info: RecvReqInfo, *, terminal: bool = True) -> None:
+        message = _make_kv_result_msg(
+            self._instance_rank,
+            info.unique_rid,
+            info.slice_id or 0,
+            terminal,
+            AgentResult.NOT_SUBMITTED,
+            kv_result_report_token=info.kv_result_report_token,
+        )
+        try:
+            endpoint = self._get_result_receiver_endpoint(info)
+        except (KeyError, RuntimeError, ValueError) as error:
+            logger.warning(f"Unable to route no-submission evidence for {info.unique_rid}: {error}")
+            return
+        self._route_result_messages_to_receiver(info, endpoint, [message], defer_to_worker=True)
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -1020,7 +1080,7 @@ class Sender(SenderBase):
                         raise RuntimeError("cannot replace an owned TxSession")
                     # Keep the fence for this immutable request ID after
                     # session cleanup, so delayed creation cannot reopen it.
-                    self._routed_cancels.discard(unique_rid)
+                    self._routed_cancels.pop(unique_rid, None)
                     with self._peer_requests_lock:
                         req_infos = list(self._peer_requests.get(unique_rid, {}).values())
                     self._sessions[unique_rid] = tx_session
@@ -1399,7 +1459,7 @@ class Sender(SenderBase):
                                 max(1, int(self._retirement_timeout_s * 1000))
                             )
                         ):
-                            raise _DestinationDrainUnproven(detail)
+                            raise _DestinationDrainUnproven(detail, status)
                         return False, detail
                 return True, None
             finally:
@@ -1539,12 +1599,18 @@ class Sender(SenderBase):
                         )
                 dealers.clear()
 
-    def _retain_in_doubt_transfer(self, write_meta: WriteMeta, initial_report: list[bytes]) -> None:
+    def _retain_in_doubt_transfer(
+        self,
+        write_meta: WriteMeta,
+        initial_report: list[bytes],
+        *,
+        bounce_status: Optional[TransferStatus] = None,
+    ) -> None:
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         key = (write_meta.task, write_meta.peer_rank)
         if key in self._pending_settlements[thread_idx]:
             return
-        pending = _PendingSettlement(write_meta, initial_report)
+        pending = _PendingSettlement(write_meta, initial_report, bounce_status=bounce_status)
         self._pending_settlements[thread_idx][key] = pending
         try:
             self._get_result_dealer(write_meta.peer_endpoint).send(initial_report)
@@ -1564,9 +1630,13 @@ class Sender(SenderBase):
                     dealer.send(pending.initial_report)
                     pending.initial_report = None
                 if not pending.backend_done:
-                    if not meta.task.poll_in_doubt_physical_operation(meta.peer_rank):
+                    pending.backend_done = (
+                        meta.task.poll_in_doubt_physical_operation(meta.peer_rank)
+                        if pending.bounce_status is None
+                        else pending.bounce_status.wait_for_bounce_scatter_drain(0)
+                    )
+                    if not pending.backend_done:
                         continue
-                    pending.backend_done = True
                 if meta.meta_type == WriteMetaType.AUX:
                     message = _make_aux_result_msg(
                         self._instance_rank, meta.unique_rid, AgentResult.FAILED_QUIESCED
@@ -1714,6 +1784,7 @@ class Sender(SenderBase):
         )
         submitted_and_completed = False
         backend_submitted = False
+        pending_bounce_status = None
         submission_callback: Optional[Callable[[], None]] = None
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
 
@@ -1791,7 +1862,9 @@ class Sender(SenderBase):
                     f"KV write for {write_meta.unique_rid} still lacks bounce drain evidence: {error}"
                 )
                 agent_result = AgentResult.FAILED
-                task.fail(error)
+                if write_meta.requires_destination_drain:
+                    pending_bounce_status = error.status
+                task.fail(RuntimeError(str(error)))
             except _TransferNotSubmittedError as error:
                 if getattr(session, "_routed_cancelled", False) is True:
                     return
@@ -1838,8 +1911,10 @@ class Sender(SenderBase):
             transfer_size=transfer_size,
             kv_result_report_token=write_meta.kv_result_report_token,
         )
-        if agent_result == AgentResult.IN_DOUBT:
-            self._retain_in_doubt_transfer(write_meta, result_msg)
+        if agent_result == AgentResult.IN_DOUBT or pending_bounce_status is not None:
+            self._retain_in_doubt_transfer(
+                write_meta, result_msg, bounce_status=pending_bounce_status
+            )
             return
         self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
 
@@ -2383,12 +2458,26 @@ class Sender(SenderBase):
             if self._shutdown_requested:
                 return
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
-            if not (
+            refresh_enabled = (
                 getattr(self, "_peer_refresh_enabled", False)
                 or getattr(self, "_recover_agent", None) is not None
+            )
+            peer_supports_bounce = getattr(self._agent, "peer_supports_bounce", None)
+            bounce_peer = (
+                getattr(self._agent, "bounce_enabled", False) is True
+                and agent_name in self._loaded_remote_agents
+                and (peer_supports_bounce is None or peer_supports_bounce(agent_name) is True)
+            )
+            if (
+                bounce_peer
+                and self._remote_agent_descriptors.get(agent_name) == ri.transfer_engine_info
             ):
+                return
+            if not refresh_enabled or bounce_peer:
                 self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
                 self._loaded_remote_agents.add(agent_name)
+                if refresh_enabled:
+                    self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
             else:
                 descriptor = ri.transfer_engine_info
                 pending = self._deferred_remote_agents.get(agent_name)
@@ -2412,6 +2501,7 @@ class Sender(SenderBase):
             peer = self._registrar.get_peer_rank_info(message[2].decode(), rank)
             marker = _SessionQuiescence(unique_rid, rank, peer.self_endpoint)
         unsubmitted = []
+        expired_proof = None
         with self._sessions_lock:
             session = self._get_session(unique_rid)
             owned = (
@@ -2420,14 +2510,22 @@ class Sender(SenderBase):
                 else self.ownership_enabled(context_first=False)
             )
             if routed and not owned:
-                self._routed_cancels.add(unique_rid)
+                self._routed_cancels.setdefault(unique_rid, time.monotonic())
             if session is None or owned or routed:
                 self._pre_cancelled_rids.setdefault(unique_rid, True)
             if marker is not None:
                 marker = self._reserve_session_quiescence_locked(marker)
-            if session is None and not owned and not routed:
+            if (
+                not owned
+                and unique_rid not in self._sessions
+                and unique_rid not in self._retired_rids
+            ):
                 with self._peer_requests_lock:
                     unsubmitted = list(self._peer_requests.get(unique_rid, {}).values())
+            if routed:
+                expired_proof = getattr(self, "_expired_bounce_requests", {}).get(
+                    (unique_rid, rank)
+                )
         try:
             if session is not None:
                 if owned:
@@ -2440,8 +2538,24 @@ class Sender(SenderBase):
             if marker is not None:
                 self._enqueue_session_quiescence(marker)
         for info in unsubmitted:
-            self._send_failed_result_to_receiver(
-                info, include_aux=info.aux_slot is not None and info.slice_id == 0
+            if getattr(info, "wants_no_submission_result", False):
+                self._send_no_submission(info)
+            elif not routed:
+                self._send_failed_result_to_receiver(
+                    info, include_aux=info.aux_slot is not None and info.slice_id == 0
+                )
+        if expired_proof is not None:
+            _, slice_id, token = expired_proof
+            message = _make_kv_result_msg(
+                self._instance_rank,
+                unique_rid,
+                slice_id,
+                True,
+                AgentResult.NOT_SUBMITTED,
+                kv_result_report_token=token,
+            )
+            self._send_task_queues[hash((unique_rid, rank)) % self._num_threads].put(
+                (peer.self_endpoint, message)
             )
 
     def _queue_session_quiescence(
@@ -2587,17 +2701,7 @@ class Sender(SenderBase):
             if rejected_publication:
                 # This receiver publication never entered the dispatch table.
                 # Echo its token so it cannot settle any earlier publication.
-                message = _make_kv_result_msg(
-                    self._instance_rank,
-                    info.unique_rid,
-                    info.slice_id or 0,
-                    True,
-                    AgentResult.NOT_SUBMITTED,
-                    kv_result_report_token=info.kv_result_report_token,
-                )
-                self._route_result_messages_to_receiver(
-                    info, self._get_result_receiver_endpoint(info), [message], defer_to_worker=True
-                )
+                self._send_no_submission(info)
                 return
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
@@ -4189,7 +4293,7 @@ class Receiver(ReceiverBase):
             return set()
         message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
         session = self._get_session(unique_rid)
-        if session is not None and getattr(session, "_uses_legacy_bounce", False) is not True:
+        if session is not None:
             rank_info = self._registrar.self_rank_info
             message.extend(
                 [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
@@ -4779,6 +4883,9 @@ class RxSession(RxSessionBase):
                 if peer_rank in task._writer_reports:
                     return
                 task._unsubmitted_writers.add(peer_rank)
+                if not is_last_slice:
+                    # An expired candidate can report quiescence while its ADP peer is still serving.
+                    return
                 task.fail(RuntimeError("CTX fenced this destination before submission"))
                 if self._terminal_status is None:
                     self._terminal_status = SessionStatus.ERROR
@@ -5063,6 +5170,8 @@ class RxSession(RxSessionBase):
     def _legacy_outstanding_writers(self, task: KVRecvTask) -> set[int]:
         reports = task._writer_reports.keys()
         if self._uses_legacy_bounce:
+            if task.status == TaskStatus.TRANSFERRED:
+                return set()
             reports = {rank for rank, succeeded in task._writer_reports.items() if succeeded}
         return (
             task._kv_result_report_tokens.keys()
@@ -5327,7 +5436,7 @@ class RxSession(RxSessionBase):
             with self.lock:
                 if getattr(self, "_closed", False):
                     return True
-                if (
+                if self.status != SessionStatus.TRANSFERRED and (
                     self._bounce_writers_pending()
                     or self._terminal_aux_awaits_writers()
                     or (

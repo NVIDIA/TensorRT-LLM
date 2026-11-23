@@ -259,8 +259,13 @@ def test_reciprocal_peer_refresh_keeps_unrelated_transfers_running(worker, task,
     sender._recover_agent.assert_not_called()
 
 
-def test_fallback_sender_refreshes_peer_after_submitted_write_drains(worker, task, monkeypatch):
+@pytest.mark.parametrize("local_bounce", [False, True])
+def test_fallback_sender_refreshes_peer_after_submitted_write_drains(
+    worker, task, monkeypatch, local_bounce
+):
     sender, agent = worker._sender, worker._agent
+    agent.bounce_enabled = local_bounce
+    agent.peer_supports_bounce.return_value = False
     sender._recover_agent = None
     sender._agent_failed = False
     sender._peer_refresh_enabled = True
@@ -289,11 +294,14 @@ def test_fallback_sender_refreshes_peer_after_submitted_write_drains(worker, tas
     agent.shutdown.assert_not_called()
 
 
+@pytest.mark.parametrize("local_bounce", [False, True])
 @pytest.mark.parametrize(
     ("backend", "enabled"),
     [(None, True), ("", True), ("UCX", True), ("unknown", True), ("LIBFABRIC", False)],
 )
-def test_peer_replacement_is_enabled_only_for_ucx(worker, monkeypatch, backend, enabled):
+def test_peer_replacement_is_enabled_only_for_ucx(
+    worker, monkeypatch, backend, enabled, local_bounce
+):
     if backend is None:
         monkeypatch.delenv("TRTLLM_NIXL_KVCACHE_BACKEND", raising=False)
     else:
@@ -302,7 +310,8 @@ def test_peer_replacement_is_enabled_only_for_ucx(worker, monkeypatch, backend, 
     monkeypatch.setattr(transfer.Sender, "_start_listener", Mock())
     monkeypatch.setattr(threading.Thread, "start", Mock())
     monkeypatch.setattr(transfer, "ZMQMessenger", Mock())
-    agent = Mock(supports_handle_retirement=True, bounce_enabled=False)
+    agent = Mock(supports_handle_retirement=True, bounce_enabled=local_bounce)
+    agent.peer_supports_bounce.return_value = False
     registrar = Mock(self_rank_info=SimpleNamespace(device_id=0, instance_rank=0))
     sender = transfer.Sender(registrar, agent)
     sender.shutdown = Mock()

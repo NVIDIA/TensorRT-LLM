@@ -1414,7 +1414,10 @@ void BounceSender::onDrainAck(std::string const& peer, BounceMsgHeader const& h)
     if (pending != mAwaitingDrain.end() && pending->second.peer == peer && h.payloadBytes == 0
         && !mPendingCancel.contains(h.requestId))
     {
-        pending->second.completion.set_value(true);
+        if (auto drain = pending->second.drain.lock())
+        {
+            drain->completion.set_value(true);
+        }
         mAwaitingDrain.erase(pending);
     }
 }
@@ -1499,16 +1502,7 @@ void BounceSender::checkTimeouts()
     std::vector<std::uint64_t> stuck;
     {
         std::lock_guard<std::mutex> lk(mReqMu);
-        for (auto it = mAwaitingDrain.begin(); it != mAwaitingDrain.end();)
-        {
-            if (now < it->second.deadline)
-            {
-                ++it;
-                continue;
-            }
-            it->second.completion.set_value(false);
-            it = mAwaitingDrain.erase(it);
-        }
+        std::erase_if(mAwaitingDrain, [](auto const& entry) { return entry.second.drain.expired(); });
         for (auto& [rid, req] : mRequests)
         {
             if (now - req.lastProgress > limit)
@@ -1677,9 +1671,8 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     BounceResult result{TransferState::kFAILURE, reason, !mayScatter};
     if (mayScatter)
     {
-        auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(mCtx.cfg.requestTimeoutMs);
-        auto const pending = mAwaitingDrain.try_emplace(rid, PendingDrain{req.peer, deadline, {}}).first;
-        result.remoteDrain = pending->second.completion.get_future().share();
+        result.remoteDrain = std::make_shared<BounceDrain>();
+        mAwaitingDrain.try_emplace(rid, PendingDrain{req.peer, result.remoteDrain});
     }
     bool deferredWrite = false;
     for (auto& p : req.posted)
@@ -1884,7 +1877,10 @@ void BounceSender::failAll()
     mPendingCancel.clear();
     for (auto& [rid, pending] : mAwaitingDrain)
     {
-        pending.completion.set_value(false);
+        if (auto drain = pending.drain.lock())
+        {
+            drain->completion.set_value(false);
+        }
     }
     mAwaitingDrain.clear();
 }

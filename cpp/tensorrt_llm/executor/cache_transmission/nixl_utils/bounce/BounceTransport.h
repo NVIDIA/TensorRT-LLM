@@ -118,14 +118,19 @@ enum class BounceFailReason : std::uint8_t
 
 [[nodiscard]] char const* toString(BounceFailReason reason);
 
-/// A bounce request's single result: the terminal state plus, on kFAILURE, its cause. The future
-/// is the ONE source of truth — no side channel to keep in sync.
+struct BounceDrain
+{
+    std::promise<bool> completion;
+    std::shared_future<bool> result{completion.get_future().share()};
+};
+
+/// Transfer outcome and, on failure, any remaining destination-drain evidence.
 struct BounceResult
 {
     TransferState state{TransferState::kFAILURE};
     BounceFailReason reason{BounceFailReason::kNone};
     bool remoteDrained{false};
-    std::shared_future<bool> remoteDrain{};
+    std::shared_ptr<BounceDrain> remoteDrain{};
 };
 
 /// Shared dependencies used by both roles. Holds the injected channel/agent/arena/exec (borrowed,
@@ -482,8 +487,7 @@ private:
     struct PendingDrain
     {
         std::string peer;
-        std::chrono::steady_clock::time_point deadline;
-        std::promise<bool> completion;
+        std::weak_ptr<BounceDrain> drain;
     };
 
     std::unordered_map<std::uint64_t, PendingDrain> mAwaitingDrain;

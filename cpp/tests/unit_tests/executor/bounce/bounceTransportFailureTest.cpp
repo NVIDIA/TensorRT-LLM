@@ -294,12 +294,15 @@ TEST(BounceTransportFailure, FailedWriteWaitsForDestinationScatter)
         EXPECT_EQ(result.get().state, kvc::TransferState::kFAILURE);
         EXPECT_EQ(result.get().reason, b::BounceFailReason::kNoProgressTimeout);
         EXPECT_FALSE(result.get().remoteDrained);
-        drain = result.get().remoteDrain;
+        if (result.get().remoteDrain)
+        {
+            drain = result.get().remoteDrain->result;
+        }
     }
     EXPECT_TRUE(drain.valid());
     if (drain.valid())
     {
-        EXPECT_EQ(drain.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+        EXPECT_EQ(drain.wait_for(std::chrono::milliseconds(c.requestTimeoutMs + 100)), std::future_status::timeout);
     }
     EXPECT_FALSE(bounce_test::verifyXferBufs(bufs));
     for (auto* ctx : held)

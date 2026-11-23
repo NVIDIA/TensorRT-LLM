@@ -312,6 +312,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             nb::call_guard<nb::gil_scoped_release>())
         // Programmatic bounce v2 observability (deployment checks and tests; no log parsing).
         .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
+        .def("peer_supports_bounce", &kvc::NixlTransferAgent::peerSupportsBounce, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount)
         .def_prop_ro("bounce_reject_count", &kvc::NixlTransferAgent::getBounceRejectCount)
         .def_prop_ro("bounce_reject_counts",

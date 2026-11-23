@@ -1292,7 +1292,7 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._num_threads = 1
     sender._pending_settlements = [{}]
     sender._pending_session_quiescence = {}
-    sender._routed_cancels = set()
+    sender._routed_cancels = {}
     sender._send_task_queues = [queue.Queue()]
     return sender
 
@@ -1731,6 +1731,115 @@ def test_routed_cancel_preserves_fence_during_ack_registration(retired) -> None:
 
 
 @pytest.mark.cpu_only
+def test_bounce_adp_success_closes_after_the_selected_group_finishes():
+    rid = 119
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    receiver._registrar = Mock()
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(
+            disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+        ),
+        receiver=receiver,
+    )
+    session.receive(_sole_piece())
+    _publish_report_tokens(session, ranks=(0, 1))
+    session._kv_tasks[0].expected_transfers = 1
+    session._aux_expected_writers = 1
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+
+    assert session.is_completed()
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._close_session_or_raise(session, rid, "completed")
+    slot = _OneSlotAllocator(rid)
+    slot.apply_reuse_decision(session._closed)
+    assert slot.is_reusable
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("evict_route", [False, True])
+def test_bounce_cancel_settles_parked_write_with_original_token(evict_route):
+    rid = 121
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    receiver._registrar = Mock()
+    session = _make_rx_session(receiver, rid)
+    session.receive(_sole_piece())
+    _publish_report_tokens(session, ranks=(0, 1) if evict_route else (1,))
+    receiver._get_session = lambda _: session
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._instance_rank = 1
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
+    )
+    info = transfer_mod.RecvReqInfo(
+        rid,
+        "gen",
+        0,
+        [],
+        rid,
+        wants_no_submission_result=True,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
+    sender._add_req_info(rid, 0, info)
+    if evict_route:
+        sender._peer_requests_timestamps[rid] -= sender._STALE_REQ_INFO_TTL_S + 1
+        sender.sweep_stale_req_infos()
+        assert rid not in sender._peer_requests
+        endpoint, evidence = sender._send_task_queues[0].get_nowait()
+        assert endpoint == "0"
+        assert not transfer_mod._KV_RESULT_FRAME.unpack(evidence[1])[3]
+        # Simulate the early evidence getting lost before the cancellation reaches this peer.
+
+    assert session.cancel()
+    message = [MessageType.CANCEL_SESSION, str(rid).encode()]
+    if evict_route:
+        message.extend([b"gen", b"0"])
+    sender._handle_cancel_session(message)
+    if evict_route:
+        marker = sender._send_task_queues[0].get_nowait()
+        assert isinstance(marker, transfer_mod._SessionQuiescence)
+    endpoint, evidence = sender._send_task_queues[0].get_nowait()
+    assert endpoint == "0"
+    assert (
+        transfer_mod._KV_RESULT_FRAME.unpack(evidence[1])[4]
+        == (transfer_mod._AGENT_RESULT_CODE[AgentResult.NOT_SUBMITTED])
+    )
+    Receiver._process_kv_agent_result(receiver, b"", evidence)
+    if evict_route:
+        assert not session.close()
+        session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    assert session.close()
+
+
+@pytest.mark.cpu_only
+def test_unclaimed_routed_cancel_reclaims_extra_state_but_keeps_the_fence(monkeypatch):
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
+    )
+    sender._get_or_connect_thread_dealer = Mock(return_value=Mock())
+    now = time.monotonic()
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now)
+    for rid in range(5):
+        sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
+        assert sender._send_session_quiesced(sender._send_task_queues[0].get_nowait())
+
+    now += sender._RETIRED_SESSION_TTL_S + 1
+    sender.sweep_stale_req_infos()
+    assert not sender._routed_cancels
+    assert set(sender._pre_cancelled_rids) == set(range(5))
+    session = transfer_mod.TxSession(4, DisaggregatedParams(disagg_request_id=4), sender)
+    assert session.has_failed()
+
+
+@pytest.mark.cpu_only
 def test_failed_legacy_bounce_receive_keeps_waiting_after_session_ack() -> None:
     receiver = _ReceiverProbe()
     receiver._enforce_physical_ownership = False
@@ -1746,10 +1855,14 @@ def test_failed_legacy_bounce_receive_keeps_waiting_after_session_ack() -> None:
     assert KvCacheTransceiverV2._retirement_blocked(session)
     dealer = Mock()
     listener = SimpleNamespace(
-        _get_session=lambda _: session, _get_or_connect_dealer=lambda _: dealer
+        _get_session=lambda _: session,
+        _get_or_connect_dealer=lambda _: dealer,
+        _registrar=SimpleNamespace(
+            self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
+        ),
     )
     Receiver.send_cancel_to_senders(listener, 112, {"sender"})
-    dealer.send.assert_called_once_with([MessageType.CANCEL_SESSION, b"112"])
+    dealer.send.assert_called_once_with([MessageType.CANCEL_SESSION, b"112", b"gen", b"0"])
 
 
 @pytest.mark.cpu_only
@@ -1800,6 +1913,16 @@ def test_bounce_sender_reports_physical_failure_only_after_drain(monkeypatch, sc
     code = transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])[4]
     expected = AgentResult.FAILED_QUIESCED if scatter_drained else AgentResult.FAILED
     assert transfer_mod._AGENT_RESULT_BY_CODE[code] is expected
+    if not scatter_drained:
+        thread = hash((73, 2)) % sender._num_threads
+        assert sender._pending_settlements[thread]
+        sender._poll_in_doubt_transfers(thread)
+        dealer.send.assert_called_once()
+        status.wait_for_bounce_scatter_drain.return_value = True
+        sender._poll_in_doubt_transfers(thread)
+        code = transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])[4]
+        assert transfer_mod._AGENT_RESULT_BY_CODE[code] is AgentResult.FAILED_QUIESCED
+        assert not sender._pending_settlements[thread]
 
 
 @pytest.mark.cpu_only

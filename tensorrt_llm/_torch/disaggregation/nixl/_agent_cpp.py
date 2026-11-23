@@ -224,6 +224,10 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         """Load a remote agent by connection info."""
         self._cpp_agent.load_remote_agent_by_connection(name, connection_info)
 
+    def peer_supports_bounce(self, name: str) -> bool:
+        supports = getattr(self._cpp_agent, "peer_supports_bounce", None)
+        return self.bounce_enabled if supports is None else supports(name)
+
     @property
     def bounce_enabled(self) -> bool:
         """Whether the NIXL bounce v2 fast path is active on this agent."""
