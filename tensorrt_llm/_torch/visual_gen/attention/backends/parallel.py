@@ -892,17 +892,6 @@ class UlyssesAttention(AttentionBackend):
     def support_fused_qkv(cls) -> bool:
         return True
 
-    def support_key_padding_mask(self) -> bool:
-        """The inner backend attends the whole sequence with the keywords of the call: this
-        and the two capabilities below are those of the wrapped backend, per instance."""
-        return self.inner_backend.support_key_padding_mask()
-
-    def requires_trailing_padding(self) -> bool:
-        return self.inner_backend.requires_trailing_padding()
-
-    def support_valid_seq_len(self) -> bool:
-        return self.inner_backend.support_valid_seq_len()
-
     def support_kv_cache(self) -> bool:
         return self.inner_backend.support_kv_cache()
 

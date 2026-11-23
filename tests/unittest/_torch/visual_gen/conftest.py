@@ -46,16 +46,17 @@ def isolated_cudnn_plans(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator[
 @pytest.fixture
 def require_deco_kernels() -> Callable[..., torch.device]:
     """Return a function that skips the test unless the GPU has a DeCo-Attention kernel for a
-    V format (``fp8`` by default; NVFP4 PV: SM120 only), and returns the device otherwise."""
+    V format (``fp8`` by default; NVFP4 PV: SM120 only), and returns the device otherwise. A
+    kernel package that does not import fails the test."""
 
     def require(v_dtype: str = "fp8") -> torch.device:
-        from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.deco import (
-            supported_v_dtypes,
-        )
+        from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import deco
 
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required for the DeCo-Attention kernels.")
-        if v_dtype not in supported_v_dtypes():
+        if deco._deco_import_error is not None:
+            pytest.fail(f"The DeCo-Attention kernels do not import: {deco._deco_import_error}")
+        if v_dtype not in deco.supported_v_dtypes():
             pytest.skip(f"DeCo-Attention with {v_dtype} PV has no kernel on this GPU.")
         return torch.device("cuda:0")
 

@@ -33,6 +33,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import get_padding_support
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
@@ -81,7 +82,7 @@ from .packing import (
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
-from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel, _padding_support
+from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 from .vsa import build_h3_vsa_metadata, set_h3_vsa_context
 
 if TYPE_CHECKING:
@@ -246,7 +247,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 )
             if vgm.ulysses_size > 1:
                 # Ulysses pads the packed sequence to a multiple of its size.
-                supports_mask, supports_length, _ = _padding_support(pipeline_config)
+                supports_mask, supports_length, _ = get_padding_support(pipeline_config.attention)
                 if not (supports_mask or supports_length):
                     raise NotImplementedError(
                         "MiniMax-H3 Ulysses requires an attention backend that takes "

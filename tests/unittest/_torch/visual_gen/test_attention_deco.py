@@ -14,11 +14,11 @@
 # limitations under the License.
 """Tests for the DeCo-Attention CuTe DSL backend of VisualGen.
 
-``require_deco_kernels`` (conftest.py) skips a test on a GPU without a kernel for its V format.
+``require_deco_kernels`` (conftest.py) skips a test on a GPU without a kernel for its V format
+and fails it when the kernel package does not import.
 """
 
 import itertools
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,7 +27,6 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.backends import (
     CuTeDSLAttention,
-    UlyssesAttention,
     create_attention,
     get_visual_gen_attention_backend,
 )
@@ -116,10 +115,9 @@ def _kernels(
     return deco_attention.attention(operands, torch.empty_like(q))
 
 
-def test_deco_selection_and_padding_capabilities() -> None:
-    """CUTEDSL keeps its dense backend unless the quantization recipe asks for DeCo-Attention.
-    The Ulysses wrapper answers the padding capabilities for the backend it wraps, per
-    instance, and the SOL CuTe DSL backend takes a key padding mask."""
+def test_deco_selection() -> None:
+    """CUTEDSL keeps its dense backend unless the quantization recipe asks for DeCo-Attention,
+    which takes the padding of a call as a key padding mask."""
     assert not QuantAttentionConfig().deco_attention
     plain = QuantAttentionConfig(qk_dtype="nvfp4")
     assert get_visual_gen_attention_backend("CUTEDSL") is CuTeDSLAttention
@@ -131,25 +129,9 @@ def test_deco_selection_and_padding_capabilities() -> None:
         get_visual_gen_attention_backend("CUTEDSL", quant_attention_config=_quant_config())
         is DeCoAttention
     )
-
-    sol = get_visual_gen_attention_backend("CUTEDSL", "sol_attn")
-    assert sol.__name__ == "SOLCuTeDSLAttention"
-    assert sol.support_key_padding_mask() and not sol.support_valid_seq_len()
-    for inner in (
-        get_visual_gen_attention_backend("VANILLA"),
-        get_visual_gen_attention_backend("FA4"),
-        get_visual_gen_attention_backend("TRTLLM"),
-        DeCoAttention,
-    ):
-        wrapper = UlyssesAttention.__new__(UlyssesAttention)
-        wrapper.inner_backend = SimpleNamespace(
-            support_key_padding_mask=inner.support_key_padding_mask,
-            requires_trailing_padding=inner.requires_trailing_padding,
-            support_valid_seq_len=inner.support_valid_seq_len,
-        )
-        assert wrapper.support_key_padding_mask() is inner.support_key_padding_mask()
-        assert wrapper.requires_trailing_padding() is inner.requires_trailing_padding()
-        assert wrapper.support_valid_seq_len() is inner.support_valid_seq_len()
+    assert DeCoAttention.support_key_padding_mask()
+    assert not DeCoAttention.requires_trailing_padding()
+    assert not DeCoAttention.support_valid_seq_len()
 
 
 def test_deco_layer_construction(require_deco_kernels) -> None:
@@ -282,7 +264,7 @@ def test_deco_delegates_unsupported_calls(
     assert not out[~key_padding_mask].any()
     assert _relative_error(out[key_padding_mask], ref[key_padding_mask]) < 2e-2
 
-    assert "deco_workspace" not in attn._state
+    assert "deco_workspace" not in attn._metadata_state
     # The layer notes once, whatever its later calls are delegated for.
     assert len(notes) == 1 and "torch.float32" in notes[0]
 
@@ -304,10 +286,10 @@ def test_deco_delegates_short_calls(require_deco_kernels, monkeypatch: pytest.Mo
     ref = _sdpa(q, k, v, attn_mask=key_padding_mask[:, None, None, :])
     assert not out[~key_padding_mask].any()
     assert _relative_error(out[key_padding_mask], ref[key_padding_mask]) < 2e-2
-    assert "deco_workspace" not in attn._state and not attn._noted_unquantized
+    assert "deco_workspace" not in attn._metadata_state and not attn._noted_unquantized
 
     attn.forward(*_random_qkv(1, MIN_SEQ_LEN, num_heads, device))
-    assert "deco_workspace" in attn._state
+    assert "deco_workspace" in attn._metadata_state
 
 
 def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -> None:

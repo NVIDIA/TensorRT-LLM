@@ -36,7 +36,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.attention.backends import get_visual_gen_attention_backend
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import get_padding_support
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
@@ -109,34 +109,6 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
     dense_config.attention = model_config.attention.model_copy(deep=True)
     dense_config.attention.sparse_attention_config = None
     return dense_config
-
-
-def _padding_support(model_config: DiffusionModelConfig) -> tuple[bool, bool, bool]:
-    """Return what the dense attention backend of the config takes for padding.
-
-    A backend that takes a mask gets the mask; one that takes only the length gets the
-    length; one that takes neither cannot attend a padded sequence.
-
-    Returns:
-        A tuple ``(supports_mask, supports_length, requires_trailing)``:
-
-        * supports_mask: The backend takes ``key_padding_mask``.
-        * supports_length: The backend takes ``valid_seq_len``.
-        * requires_trailing: The padding must follow the tokens; also true for a backend
-          that takes only the length.
-    """
-
-    attention = model_config.attention
-    backend_cls = get_visual_gen_attention_backend(
-        getattr(attention, "backend", "VANILLA"),
-        quant_attention_config=getattr(attention, "quant_attention_config", None),
-    )
-    supports_mask = backend_cls.support_key_padding_mask()
-    supports_length = backend_cls.support_valid_seq_len()
-    requires_trailing = backend_cls.requires_trailing_padding() or (
-        supports_length and not supports_mask
-    )
-    return supports_mask, supports_length, requires_trailing
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -570,7 +542,9 @@ class MiniMaxH3TokenRefiner(nn.Module):
     ) -> None:
         super().__init__()
         self._attn_backend = model_config.attention.backend.upper()
-        self._supports_key_padding_mask, supports_valid_seq_len, _ = _padding_support(model_config)
+        self._supports_key_padding_mask, supports_valid_seq_len, _ = get_padding_support(
+            model_config.attention
+        )
         self._supports_padding = self._supports_key_padding_mask or supports_valid_seq_len
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
@@ -794,7 +768,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             self._supports_key_padding_mask,
             self._supports_valid_seq_len,
             self._requires_trailing_padding,
-        ) = _padding_support(model_config)
+        ) = get_padding_support(model_config.attention)
         self._supports_padding = self._supports_key_padding_mask or self._supports_valid_seq_len
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.

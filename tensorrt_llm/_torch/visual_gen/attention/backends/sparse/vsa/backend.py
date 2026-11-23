@@ -195,12 +195,6 @@ class VSATrtllmAttention(TrtllmAttention):
     def support_fused_qkv(cls) -> bool:
         return True
 
-    @classmethod
-    def support_valid_seq_len(cls) -> bool:
-        """The sparse forward does not read the caller's ``valid_seq_len``: the predictor fills
-        the key validity bits of the block-sparse kernel for its own layout."""
-        return False
-
 
 class VSACuTeDSLAttention(CuTeDSLAttention):
     """CuTe DSL VSA backend reusing TRTLLM's predictor and post-processing."""

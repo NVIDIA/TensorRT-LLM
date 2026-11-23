@@ -156,9 +156,8 @@ class AttentionBackend(ABC):
         """Whether ``forward`` honours ``key_padding_mask`` on dense attention. A backend
         that does not drops the keyword through ``**kwargs`` and attends the padding.
 
-        A model asks this and the two capabilities below of the backend class before it
-        builds its layers (``get_visual_gen_attention_backend``). A wrapper such as
-        ``UlyssesAttention`` answers per instance, for the backend it wraps."""
+        A model asks this and the two capabilities below of the backend class of its config
+        before it builds its layers (``get_padding_support``)."""
         return False
 
     @classmethod

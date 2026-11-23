@@ -156,7 +156,7 @@ class DeCoAttention(AttentionBackend):
         self.num_kv_heads = num_kv_heads
         self.dtype = dtype
         self.quant_attention_config = quant_attention_config
-        self._state = attention_metadata_state
+        self._metadata_state = attention_metadata_state
         # A layer of another head dimension or K/V head count runs all its calls on VANILLA.
         kernel_head_dim = deco_attention.constants.HEAD_DIM
         self._kernel_geometry = head_dim == kernel_head_dim and num_kv_heads == num_heads
@@ -225,12 +225,12 @@ class DeCoAttention(AttentionBackend):
         """
         if torch.cuda.is_current_stream_capturing():
             return torch.empty(num_bytes, dtype=torch.uint8, device=device)
-        workspace = self._state.get("deco_workspace")
+        workspace = self._metadata_state.get("deco_workspace")
         if workspace is None or workspace.numel() < num_bytes or workspace.device != device:
             # Release the smaller buffer before allocating the larger one.
-            workspace = self._state["deco_workspace"] = None
+            workspace = self._metadata_state["deco_workspace"] = None
             workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
-            self._state["deco_workspace"] = workspace
+            self._metadata_state["deco_workspace"] = workspace
         return workspace
 
     @staticmethod
@@ -358,7 +358,7 @@ class DeCoAttention(AttentionBackend):
         if key_padding_mask is None and token_tags is None:
             return None, None, None
 
-        plans: list[_Plan] = self._state.setdefault("deco_plans", [])
+        plans: list[_Plan] = self._metadata_state.setdefault("deco_plans", [])
         if torch.cuda.is_current_stream_capturing():
             rows = None
             if token_tags is not None:

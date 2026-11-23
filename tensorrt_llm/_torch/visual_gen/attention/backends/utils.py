@@ -118,6 +118,33 @@ def get_visual_gen_attention_backend(
         return VanillaAttention
 
 
+def get_padding_support(attention_config: AttentionConfig) -> tuple[bool, bool, bool]:
+    """Return what the dense attention backend of a config takes for the padding of a sequence.
+
+    A model hands a backend that takes a mask the mask, and one that takes only the length the
+    length; a backend that takes neither cannot attend a padded sequence.
+
+    Returns:
+        A tuple ``(supports_mask, supports_length, requires_trailing)``:
+
+        * supports_mask: The backend takes ``key_padding_mask``.
+        * supports_length: The backend takes ``valid_seq_len``.
+        * requires_trailing: The padding must follow the tokens; also true for a backend
+          that takes only the length.
+    """
+    # A config object without the field carries no quantization recipe.
+    backend_cls = get_visual_gen_attention_backend(
+        attention_config.backend,
+        quant_attention_config=getattr(attention_config, "quant_attention_config", None),
+    )
+    supports_mask = backend_cls.support_key_padding_mask()
+    supports_length = backend_cls.support_valid_seq_len()
+    requires_trailing = backend_cls.requires_trailing_padding() or (
+        supports_length and not supports_mask
+    )
+    return supports_mask, supports_length, requires_trailing
+
+
 def create_attention(
     backend: str,
     layer_idx: int,
@@ -154,8 +181,7 @@ def create_attention(
             forward its quantization or sparsity configuration.
         attention_metadata_state: Optional per-component VisualGen attention state.
             It keeps shape-stable attention metadata alive across layers and
-            CUDA Graph captures. Required for TRTLLM and FlashInfer; forwarded to the
-            CuTe DSL classes, whose layers may share state through it.
+            CUDA Graph captures. Required for TRTLLM, FlashInfer and DeCo-Attention.
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -173,6 +199,11 @@ def create_attention(
     )
 
     backend_name = backend.upper()
+    is_deco = (
+        backend_name == "CUTEDSL"
+        and quant_attention_config is not None
+        and quant_attention_config.deco_attention
+    )
     attn_cls = get_visual_gen_attention_backend(
         backend_name, sparse_algorithm, quant_attention_config
     )
@@ -204,10 +235,13 @@ def create_attention(
                 "DiffusionModelConfig for shared workspace allocation."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
-    elif backend_name == "CUTEDSL":
-        # A CuTe DSL class takes the state when its layers share something through it.
-        if attention_metadata_state is not None:
-            kwargs["attention_metadata_state"] = attention_metadata_state
+    elif is_deco:
+        if attention_metadata_state is None:
+            raise ValueError(
+                "DeCo-Attention requires `attention_metadata_state` from "
+                "DiffusionModelConfig for shared workspace allocation."
+            )
+        kwargs["attention_metadata_state"] = attention_metadata_state
     return attn_cls(
         layer_idx=layer_idx,
         num_heads=num_heads,
