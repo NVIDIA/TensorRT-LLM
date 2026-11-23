@@ -193,6 +193,9 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
         args.extend(['--extra_llm_api_options', str(temp_file_path)])
         args.extend(['--num_postprocess_workers',
                      str(0)])  # disable postprocess workers to avoid OOM
+        # Smaller batch size reduces chance of OOM
+        args.extend(["--max_batch_size", "128"])
+        args.extend(["--max_num_tokens", "1024"])
 
         with RemoteOpenAIServer(model_path, args) as remote_server:
             yield remote_server
