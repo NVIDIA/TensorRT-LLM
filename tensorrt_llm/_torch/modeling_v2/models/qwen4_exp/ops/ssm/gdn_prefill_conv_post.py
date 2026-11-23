@@ -532,25 +532,51 @@ class _ConvPassKernel:
                             hi2 = mid
                     sq = lo2
                     s0 = mQsl[lo2]
-                slot = mSlot[sq]
-                init = cutlass.Int32(mInit[sq])
-                slot_base = st_base + cutlass.Int64(slot) * cutlass.Int64(st_s0) * 2
-                for v in cutlass.range_constexpr(_VEC):
-                    a = cutlass.Float32(0.0)
-                    for kk in cutlass.range_constexpr(4):
-                        pos = t - 3 + kk
-                        xv = win[(j + kk) % 4, v]
-                        if pos < s0:
-                            xv = cutlass.Float32(0.0)
-                            if init != 0:
-                                if slot != pad_slot_id:
-                                    xv = _ld_bf16(
-                                        slot_base
-                                        + cutlass.Int64((c0 + v) * st_s1 + (3 + pos - s0) * st_s2)
-                                        * 2
-                                    )
-                        a = _fma_rn(xv, w[v, kk], a)
-                    acc[v] = a
+                if t - s0 >= 3:
+                    # The window lies inside the token's own sequence: the straight-line
+                    # taps (the same fma.rn chain a channel, in pairs).
+                    for p in cutlass.range_constexpr(_VEC // 2):
+                        a0, a1 = _ffma2(
+                            win[j % 4, 2 * p],
+                            win[j % 4, 2 * p + 1],
+                            w[2 * p, 0],
+                            w[2 * p + 1, 0],
+                            cutlass.Float32(0.0),
+                            cutlass.Float32(0.0),
+                        )
+                        for kk in cutlass.range_constexpr(1, 4):
+                            a0, a1 = _ffma2(
+                                win[(j + kk) % 4, 2 * p],
+                                win[(j + kk) % 4, 2 * p + 1],
+                                w[2 * p, kk],
+                                w[2 * p + 1, kk],
+                                a0,
+                                a1,
+                            )
+                        acc[2 * p] = a0
+                        acc[2 * p + 1] = a1
+                else:
+                    slot = mSlot[sq]
+                    init = cutlass.Int32(mInit[sq])
+                    slot_base = st_base + cutlass.Int64(slot) * cutlass.Int64(st_s0) * 2
+                    for v in cutlass.range_constexpr(_VEC):
+                        a = cutlass.Float32(0.0)
+                        for kk in cutlass.range_constexpr(4):
+                            pos = t - 3 + kk
+                            xv = win[(j + kk) % 4, v]
+                            if pos < s0:
+                                xv = cutlass.Float32(0.0)
+                                if init != 0:
+                                    if slot != pad_slot_id:
+                                        xv = _ld_bf16(
+                                            slot_base
+                                            + cutlass.Int64(
+                                                (c0 + v) * st_s1 + (3 + pos - s0) * st_s2
+                                            )
+                                            * 2
+                                        )
+                            a = _fma_rn(xv, w[v, kk], a)
+                        acc[v] = a
             y0, y1 = _silu2(acc[0], acc[1])
             y2, y3 = _silu2(acc[2], acc[3])
             p01 = _bf16x2(y0, y1)
@@ -970,9 +996,11 @@ class GdnPrefillConvPost(OpWrapper):
     tokens of 4 channels, each element converted once; each thread finds its
     first token's sequence by a binary search of `query_start_loc`
     (sync-free, capture-safe), and a thread whose 16 tokens and windows lie
-    inside one sequence takes a straight-line branch, the rest read the pool
-    token by token (a carried column at the slot's 64-bit base address plus
-    its 32-bit in-slot offset, one `ld.global.u16`). The gates (Triton): one
+    inside one sequence takes a straight-line branch; in the other threads a
+    token whose window lies inside its own sequence takes the same taps, and
+    only a sequence's first three tokens read the pool (a carried column at
+    the slot's 64-bit base address plus its 32-bit in-slot offset, one
+    `ld.global.u16`). The gates (Triton): one
     row-coalesced `[8, 48]` tile a program (`exp(g)` with `linear_gate`,
     libdevice `expf`). Then a per-sequence window publish (Triton), after
     both, so no program reads a window another has already advanced.

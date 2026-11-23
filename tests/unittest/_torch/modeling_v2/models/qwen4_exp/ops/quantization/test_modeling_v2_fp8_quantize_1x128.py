@@ -13,6 +13,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.quantization import (
+    fp8_quantize_1x128 as entry,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     SCALE_ULP_GATE,
     block_scales,
@@ -202,6 +205,28 @@ def test_cuda_graph_capture_and_replay(rows):
     alt.synchronize()
     assert torch.equal(a_data.view(torch.uint8), e_data.view(torch.uint8))
     assert torch.equal(a_sf.view(torch.int32), e_sf.view(torch.int32))
+
+
+@pytest.mark.parametrize("rows", [8192, 16384, 8190])
+def test_the_triton_kernel_returns_the_cpp_ops_bits(rows, monkeypatch):
+    """From `TRTLLM_FP8_1X128_TRITON_MIN_ROWS` rows a plain-scale call runs the Triton kernel:
+    bitwise the C++ op's codes and scales in the same shapes, also at a row count that pads the
+    data allocation. A call under the threshold keeps the C++ op."""
+    x = _input(rows, 2560, seed=rows)
+    monkeypatch.setattr(entry, "_TRITON_MIN_ROWS", 0)
+    want = op(x)
+    took = []
+    kernel = entry._fp8_quantize_1x128_triton
+    monkeypatch.setattr(
+        entry, "_fp8_quantize_1x128_triton", lambda t: took.append(t.shape[0]) or kernel(t)
+    )
+    monkeypatch.setattr(entry, "_TRITON_MIN_ROWS", rows)
+    got = op(x)
+    op(x[: rows // 2])
+    assert took == [rows]
+    assert got[0].dtype == want[0].dtype and got[0].shape == want[0].shape
+    assert got[1].dtype == want[1].dtype and got[1].shape == want[1].shape
+    assert _same(got, want), "the Triton kernel's codes or scales differ from the C++ op's"
 
 
 def test_rejects_a_strided_input():
