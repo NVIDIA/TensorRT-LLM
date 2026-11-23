@@ -117,18 +117,13 @@ MODEL_PATHS = {
 def mpi_worker_pool(
         env: dict[str, str],
         mpi_info: MPI.Info | None = None) -> Iterator[MPIPoolExecutor]:
-    """Spawn the context and generation workers as TensorRT-LLM spawns its own.
+    """Spawn the context and generation workers through ``MpiPoolSession``.
 
     Unless ``FLASHINFER_WORKSPACE_BASE`` is set explicitly or
-    ``TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0`` turns isolation off,
-    ``MpiPoolSession`` gives every worker its own FlashInfer workspace, and
-    with ``FLASHINFER_CUBIN_DIR`` unset FlashInfer keeps each worker's
-    downloads there. The workers of a bare ``MPIPoolExecutor`` share
-    FlashInfer's default workspace: on a cold cache one worker waits on the
-    other's download of each FlashInfer artifact, and when a download outlasts
-    FlashInfer's 30-second lock wait, the waiting worker fails warmup with
-    ``flashInferMetaInfo.h not found``. An explicit ``FLASHINFER_CUBIN_DIR`` is
-    shared by both workers; populate it before they start.
+    ``TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0`` turns isolation off, each
+    worker gets its own FlashInfer workspace. An explicit
+    ``FLASHINFER_CUBIN_DIR`` is shared by both workers; populate it before
+    they start.
 
     Args:
         env: Variables to set in the workers, on top of those that
