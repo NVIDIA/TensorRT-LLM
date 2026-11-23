@@ -150,3 +150,21 @@ def test_ranks_split_variant_builds_only_over_one_cache_directory_of_one_host(
     assert scope(cache) == scope(tmp_path / "link")
     assert scope(cache) != scope(elsewhere)
     assert scope(cache) != scope(cache, host="node-1")
+
+
+def test_the_packaged_fmha_sm100_has_what_the_builds_ahead_use() -> None:
+    """The builds ahead reach fmha_sm100 through names of its own (``_Package``); a package that
+    lacks one keeps its kernels on their first use, with one warning. The package TensorRT-LLM
+    ships must keep them, so that a version of it that drops one fails here."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 (Blackwell) required")
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+    import fmha_sm100
+    from fmha_sm100 import api, jit
+
+    msa_kernel_builds._Package(fmha_sm100, api, jit)

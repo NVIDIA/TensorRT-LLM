@@ -2732,11 +2732,14 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(
     assert warnings == [], warnings
 
 
-def test_parallel_deals_only_profiles_every_rank_profiles(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    """Under PARALLEL a rank times its share of a profile's (runner, tactic) pairs only when
-    every rank of the group profiles it. With attention DP the ranks profile their own row
-    counts: a profile another rank does not profile is timed in full here."""
+def _parallel_rank1_timings(
+        monkeypatch: pytest.MonkeyPatch, op: str, config: TuningConfig,
+        rows: int,
+        peer_rows: int) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """What rank 1 of a PARALLEL group of two times in a tune-mode ``choose_one`` of ``rows``
+    rows while rank 0 tunes a call of ``peer_rows`` rows and has nothing cached: the tactics
+    it times for each profile (by row count), and the share of them a deal of that profile
+    gives it."""
 
     class FourTacticRunner(TunableRunner):
 
@@ -2746,51 +2749,75 @@ def test_parallel_deals_only_profiles_every_rank_profiles(
         def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
             return inputs[0]
 
-    timed = []
+    timed: dict[int, list[int]] = {}
 
-    def record_pair(self, runner, inputs, tactic, **kwargs):
-        timed.append(tactic)
+    def record_pair(self, runner: TunableRunner, inputs: List[torch.Tensor],
+                    tactic: int, **kwargs) -> float:
+        timed.setdefault(inputs[0].shape[0], []).append(tactic)
         return 1.0
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
-    op = "autotuner_test::parallel_deal_shared_profiles"
-    config = TuningConfig(
-        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
     tuner = autotuner.AutoTuner()
 
     class PeerDist:
-        """Rank 1's all-gathers in a group of two whose rank 0 profiles ``peer_rows`` rows
-        and has nothing cached."""
 
-        peer_rows = 0
-
-        def tp_cp_allgather(self, obj):
+        def tp_cp_allgather(self, obj: Any) -> list:
             # A tuple: the profiles each rank tunes and their cache hits.
             if isinstance(obj, tuple):
                 keys = [
                     p.get_opt_shapes() for p in tuner._optimization_profiles(
-                        config, [torch.zeros(self.peer_rows, 64)])
+                        config, [torch.zeros(peer_rows, 64)])
                 ]
                 return [(keys, [False] * len(keys)), obj]
             return [obj, obj]
 
-    dist = PeerDist()
     tuner.setup_distributed_state(Mapping(world_size=2, rank=1, tp_size=2),
-                                  dist=dist)
+                                  dist=PeerDist())
     tuner.is_tuning_mode = True
-    for rows, peer_rows in ((8, 8), (16, 24)):
-        dist.peer_rows = peer_rows
-        timed.clear()
-        inputs = [torch.zeros(rows, 64)]
-        tuner.choose_one(op, [FourTacticRunner()], config, inputs)
-        profile = tuner._optimization_profiles(config, inputs)[0]
-        share = tuner._maybe_parallelize_tactics(
+    inputs = [torch.zeros(rows, 64)]
+    tuner.choose_one(op, [FourTacticRunner()], config, inputs)
+    shares = {
+        p.get_opt_shapes()[0][0]:
+        tuner._maybe_parallelize_tactics(
             [0, 1, 2, 3],
             DistributedTuningStrategy.PARALLEL,
             offset=tuner._parallel_deal_start(
-                op, profile, DistributedTuningStrategy.PARALLEL))
-        expected = share if rows == peer_rows else [0, 1, 2, 3]
-        assert timed == expected and len(share) == 2, (rows, timed, share)
+                op, p, DistributedTuningStrategy.PARALLEL))
+        for p in tuner._optimization_profiles(config, inputs)
+    }
+    return timed, shares
+
+
+@pytest.mark.parametrize("rows,peer_rows", [(8, 8), (16, 24)])
+def test_parallel_deals_only_profiles_every_rank_profiles(
+        monkeypatch: pytest.MonkeyPatch, rows: int, peer_rows: int) -> None:
+    """Under PARALLEL a rank times its share of a profile's (runner, tactic) pairs only when
+    every rank of the group profiles it. With attention DP the ranks profile their own row
+    counts: a profile another rank does not profile is timed in full here."""
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    timed, shares = _parallel_rank1_timings(
+        monkeypatch, "autotuner_test::parallel_deal_shared_profiles", config,
+        rows, peer_rows)
+    assert len(shares[rows]) == 2, shares
+    expected = shares[rows] if rows == peer_rows else [0, 1, 2, 3]
+    assert timed == {rows: expected}, timed
+
+
+def test_parallel_deals_each_bucket_profile_on_its_own(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call with dynamic buckets tunes one profile per bucket, and each is dealt or timed in
+    full on its own: the buckets both ranks tune are dealt, and the row count only this rank
+    has (attention DP) is timed in full."""
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (8, 16)), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    timed, shares = _parallel_rank1_timings(
+        monkeypatch, "autotuner_test::parallel_deal_bucket_profiles", config,
+        24, 40)
+    assert sorted(shares) == [8, 16, 24], shares
+    assert len(shares[8]) == len(shares[16]) == 2, shares
+    assert timed == {8: shares[8], 16: shares[16], 24: [0, 1, 2, 3]}, timed
 
 
 def test_parallel_search_cache_picks_fastest_runner():

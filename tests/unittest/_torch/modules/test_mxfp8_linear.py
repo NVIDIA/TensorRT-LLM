@@ -15,6 +15,7 @@
 
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1187,21 +1188,46 @@ def test_mxfp8_loaded_tactic_primes_before_graph_capture(
 
 
 @pytest.mark.cpu_only
-def test_flashinfer_mxfp8_kernels_are_named_by_sm_count(monkeypatch):
-    """FlashInfer keys a CuTe DSL MXFP8 kernel by device index; its shared name uses the device's
-    SM count instead, so ranks on GPUs of one kind share it, and a key of another layout stays in
-    the process."""
-    sms = {0: 148, 1: 148, 2: 132}
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda index: SimpleNamespace(multi_processor_count=sms[index]),
+def test_flashinfer_mxfp8_kernels_are_named_by_cluster_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FlashInfer keys a CuTe DSL MXFP8 kernel by device index and compiles it for the max active
+    clusters of its launch cluster, which the GPU and the SMs sm_reserve() keeps out decide. Its
+    shared name holds that count instead of the device index: processes with another count do
+    not share it, a key of another layout stays in the process, and a kernel compiled or exported
+    for another count is neither exported nor loaded."""
+    clusters = {1: 148, 2: 74}
+    # The counts FlashInfer's cached get_max_active_clusters gives, without a GPU.
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.cute_dsl.utils",
+        SimpleNamespace(get_max_active_clusters=lambda size: clusters[size]),
     )
+    exported = []
+    monkeypatch.setattr(
+        jit_share, "_export_kernel", lambda kernel, *paths, extra=None: exported.append(extra)
+    )
+    monkeypatch.setattr(jit_share, "_exported_extra", lambda meta: 148)
+    monkeypatch.setattr(jit_share, "_load_kernel", lambda obj, name, meta: "kernel")
     cache = mxfp8_gemm_module._FlashInferKernelCache("owner")
     key = (32, (128, 64), (1, 1), True, False, True, torch.bfloat16, 1)
-    assert cache._shared_text((0, key)) == cache._shared_text((1, key)) is not None
-    assert cache._shared_text((2, key)) != cache._shared_text((0, key))
+    name = cache._shared_text((0, key))
+    assert name is not None
+    assert cache._shared_text((1, key)) == name
+    assert cache._shared_text((0, (*key[:2], (2, 1), *key[3:]))) not in (None, name)
     assert cache._shared_text(key) is None
+    assert cache._shared_text((0, key[:-1])) is None
+    cache._export((0, key), ("kernel", 148), "obj", "name", "meta")
+    assert exported == [148]
+    assert cache._load((0, key), "obj", "name", "meta") == ("kernel", 148)
+
+    clusters[1] = 140  # 8 SMs reserved
+    assert cache._shared_text((0, key)) not in (None, name)
+    with pytest.raises(ValueError):
+        cache._export((0, key), ("kernel", 148), "obj", "name", "meta")
+    with pytest.raises(ValueError):
+        cache._load((0, key), "obj", "name", "meta")
+    assert exported == [148]
 
 
 @pytest.mark.skipif(
@@ -1211,26 +1237,41 @@ def test_flashinfer_mxfp8_kernels_are_named_by_sm_count(monkeypatch):
     reason="Needs SM100/SM103 and FlashInfer's CuTeDSL MXFP8 kernels",
 )
 @torch.inference_mode()
-def test_mxfp8_flashinfer_cute_dsl_kernels_are_shared(monkeypatch, tmp_path):
-    """With shared JIT builds, a FlashInfer CuTe DSL MXFP8 kernel one process compiled is exported
-    to the share directory; another process (a new, empty cache here) loads it instead of
-    compiling it, and the loaded kernel gives the same bits."""
+def test_mxfp8_flashinfer_cute_dsl_kernels_are_shared(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With shared JIT builds, tuning the MXFP8 GEMM shares FlashInfer's CuTe DSL kernel cache: the
+    kernel one process compiled is exported to the share directory with its cluster count, and
+    another process (a new tuner and FlashInfer cache here) loads both instead of compiling it.
+    The loaded kernel gives the same bits."""
     from flashinfer.gemm import gemm_base
 
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
     monkeypatch.setenv(jit_share._LOG_ENV, "1")
-    monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", {})
-    monkeypatch.setattr(MXFP8GemmUnifiedRunner, "kernel_cache", MXFP8GemmUnifiedRunner.kernel_cache)
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    all_tactics = MXFP8GemmUnifiedRunner.get_valid_tactics
+    # One tactic: one kernel to compile, then to load.
+    monkeypatch.setattr(
+        MXFP8GemmUnifiedRunner,
+        "get_valid_tactics",
+        lambda self, *args, **kwargs: all_tactics(self, *args, **kwargs)[:1],
+    )
     inputs = _mxfp8_swapab_inputs(32, 256, 512)
-    runner = MXFP8GemmUnifiedRunner(torch.bfloat16, ("flashinfer_cute_dsl",))
-    tactic = runner.get_valid_tactics(inputs, None)[0]
-    with jit_share.sharing_kernels():
-        jit_share.share_kernel_caches([runner])
-        assert isinstance(gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE, jit_share.SharedKernelCache)
-        compiled = runner(inputs, tactic=tactic)
-        gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE = {}
-        jit_share.share_kernel_caches([runner])
-        loaded = runner(inputs, tactic=tactic)
+
+    def tune_in_a_new_process() -> tuple[torch.Tensor, dict]:
+        monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+        # FlashInfer's own cache, which tuning replaces by a shared one; the monkeypatch puts the
+        # original back after the test.
+        monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", {})
+        out = custom_ops_module.mxfp8_gemm_autotuned(
+            *inputs, torch.bfloat16, ("flashinfer_cute_dsl",), tune=True
+        )
+        cache = gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE
+        assert isinstance(cache, jit_share.SharedKernelCache)
+        return out, {key: value[1] for key, value in cache.items()}
+
+    compiled, compiled_clusters = tune_in_a_new_process()
+    loaded, loaded_clusters = tune_in_a_new_process()
     torch.cuda.synchronize()
     actions = [
         line.split()[2]
@@ -1238,6 +1279,9 @@ def test_mxfp8_flashinfer_cute_dsl_kernels_are_shared(monkeypatch, tmp_path):
         for line in log.read_text().splitlines()
     ]
     assert actions == ["cute-built", "cute-loaded"], actions
+    ((key, clusters),) = compiled_clusters.items()
+    assert loaded_clusters == compiled_clusters
+    assert clusters == mxfp8_gemm_module._max_active_clusters(key[1])
     assert torch.equal(loaded, compiled)
 
 

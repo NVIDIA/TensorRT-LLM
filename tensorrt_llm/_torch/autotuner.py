@@ -65,7 +65,9 @@ class DistributedTuningStrategy(enum.Enum):
         BROADCAST: One rank (rank 0) tunes and broadcasts results to others
         INDEPENDENT: Each rank tunes independently (default for non-comm ops)
         MERGE: All ranks participate in tuning and reach merge
-        PARALLEL: All ranks participate in tuning with partial tactics
+        PARALLEL: All ranks participate in tuning; each rank times its share of a profile's
+            (runner, tactic) pairs and the merge keeps the fastest. A rank times every pair of
+            a profile that some other rank of the group does not tune.
     """
     BROADCAST = "broadcast"
     INDEPENDENT = "independent"
@@ -172,7 +174,7 @@ class TuningConfig:
             each rank builds every kernel it needs. SHARED: when the ranks share JIT builds
             (tensorrt_llm._jit_share), each kernel is built by the rank that claims it and loaded
             by the others. For DeepGEMM kernels and CuTe DSL kernels kept in the runner class's
-            ``kernel_cache`` (or in a library's cache its ``share_kernel_caches()`` shares).
+            ``kernel_cache`` (or in a library's cache its ``share_library_kernel_caches()`` shares).
         cold_l2_flush_bytes (int): When > 0, every timed repeat first reads a buffer of this many
             bytes (evicting the operands, weights included, from L2) and each repeat is timed alone
             with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
@@ -272,6 +274,18 @@ class TunableRunner(ABC):
     # Whether ``build`` compiles from its inputs' shapes, strides and dtypes alone: in a worker
     # process (``TuningConfig.use_build_pool_in_warmup``) it then gets meta tensors of them.
     builds_from_shapes: bool = False
+    # Whether the runner compiles a tactic's kernels the first time it runs it: the autotuner then
+    # runs the tactics a loaded cache already holds once while it tunes, so that they compile
+    # there rather than when serving starts. A runner class that keeps its kernels in a
+    # ``kernel_cache`` dict counts as one without it.
+    primes_cached_tactics: bool = False
+
+    @classmethod
+    def share_library_kernel_caches(cls) -> None:
+        """Share the caches of the libraries whose CuTe DSL kernels the runner runs through
+        ``tensorrt_llm._jit_share``, so that the processes that share JIT builds compile each
+        kernel once (``jit_share.share_kernel_caches`` calls it). The runner class's own
+        ``kernel_cache`` is shared without it; this default shares nothing else."""
 
     @abstractmethod
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -1558,14 +1572,10 @@ class AutoTuner:
             undealt = set()
             if (self._needs_rank_agreement(strategy)
                     and strategy != DistributedTuningStrategy.BROADCAST):
-                keys = [p.get_opt_shapes() for p in profiles]
-                hits, everywhere = self._profile_hits_on_all_ranks(
+                hits, undealt = self._agree_profiles_across_ranks(
                     profiles, [is_cached(p) for p in profiles])
-                agreed_hits = dict(zip(keys, hits))
-                undealt = {
-                    key
-                    for key, shared in zip(keys, everywhere) if not shared
-                }
+                agreed_hits = dict(
+                    zip((p.get_opt_shapes() for p in profiles), hits))
 
             def is_pending(p: OptimizationProfile) -> bool:
                 if agreed_hits is not None:
@@ -1935,8 +1945,8 @@ class AutoTuner:
             return
         jit_classes = {
             type(r)
-            for r in runners
-            if isinstance(getattr(type(r), "kernel_cache", None), dict)
+            for r in runners if type(r).primes_cached_tactics
+            or isinstance(getattr(type(r), "kernel_cache", None), dict)
         }
         if not jit_classes:
             return
@@ -2029,9 +2039,10 @@ class AutoTuner:
     ) -> float:
         """Profile runners and select the best tactic.
 
-        For multi-rank profiling, only rank 0 performs the actual profiling
-        to avoid sync issues when different ranks select different tactics.
-        The results are then broadcasted to all other ranks.
+        Which ranks time which pairs follows the op's ``DistributedTuningStrategy``. Under
+        PARALLEL with ``deal``, this rank times only its share of the (runner, tactic) pairs,
+        possibly none, and the merge keeps the fastest of the group; without ``deal`` (a profile
+        that another rank of the group does not tune), it times them all.
         """
 
         min_time = float('inf')
@@ -3049,13 +3060,13 @@ class AutoTuner:
         """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
         return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
 
-    def _profile_hits_on_all_ranks(
-            self, profiles: List[OptimizationProfile],
-            hits: List[bool]) -> Tuple[List[bool], List[bool]]:
-        """Per profile, whether every rank that builds it has it cached, and whether every rank
-        builds it (one host all-gather).
+    def _agree_profiles_across_ranks(
+            self, profiles: list[OptimizationProfile],
+            hits: list[bool]) -> tuple[list[bool], set[tuple]]:
+        """Per profile, whether every rank that tunes it has it cached; and the shapes of the
+        profiles that some rank of the group does not tune (one host all-gather).
 
-        Ranks build their profiles from their own input shapes (attention DP), so the lists may differ.
+        Ranks make their profiles from their own input shapes (attention DP), so the lists may differ.
         """
         keys = [p.get_opt_shapes() for p in profiles]
         missed = set()
@@ -3065,8 +3076,7 @@ class AutoTuner:
             missed.update(key for key, hit in zip(rank_keys, rank_hits)
                           if not hit)
             everywhere.intersection_update(rank_keys)
-        return ([key not in missed
-                 for key in keys], [key in everywhere for key in keys])
+        return [key not in missed for key in keys], set(keys) - everywhere
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:

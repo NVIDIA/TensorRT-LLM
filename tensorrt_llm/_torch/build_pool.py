@@ -34,6 +34,7 @@ import faulthandler
 import functools
 import hashlib
 import importlib
+import inspect
 import os
 import pickle  # nosec B403 - messages between this process and its own workers
 import queue
@@ -79,6 +80,9 @@ _WORKER_ENDS = " (the worker's CUDA context is lost: the worker ends)"
 # A worker starts only while the rank's GPU has this much memory free: its CUDA context and
 # builds take about a GiB of it, and the rank's own warmup needs the rest.
 _MIN_FREE_GPU_BYTES = 8 << 30
+# What a worker's CUDA context takes: a worker's first build makes it, and reserves this much
+# beside its own need, so that workers starting together do not overcommit the GPU.
+_WORKER_CONTEXT_BYTES = 1 << 30
 
 # How a build ended (BuildResult.status): a worker built it; it was built before; another rank's
 # worker claimed it, and makes it; it failed; no worker took it.
@@ -139,13 +143,14 @@ class BuildResult(NamedTuple):
 
 class _Compiler(NamedTuple):
     """A ``process_built`` function's name for its kernels, its ``"module:qualname"``, whether
-    KernelBuilder's build mode builds its kernels on the workers, and its kernels compiled so far,
-    by arguments."""
+    KernelBuilder's build mode builds its kernels on the workers, its kernels compiled so far, by
+    arguments, and what makes a call's ``(args, kwargs)`` those arguments."""
 
     name: str
     where: str
     use_build_pool_in_warmup: bool
     memo: Dict[tuple, Any]
+    bind: Callable[[tuple, Dict[str, Any]], tuple]
 
 
 def process_built(
@@ -154,8 +159,10 @@ def process_built(
     """Memoize a CuTe DSL kernel compile function whose kernels worker processes can build.
 
     Use it in place of ``functools.cache`` on a function that compiles one kernel from hashable,
-    picklable positional arguments and returns the compiled kernel (what ``cute.compile``
-    returns). The function keeps ``cache_info()`` and ``cache_clear()``;
+    picklable arguments and returns the compiled kernel (what ``cute.compile`` returns). Its
+    parameters must be positional ones; a call may pass them by keyword or leave defaults out,
+    and gets the kernel of the same arguments either way. The function keeps ``cache_info()`` and
+    ``cache_clear()``;
     ``KernelBuilder.build_kernels`` compiles several of its kernels at a time. A call loads the
     kernel from the store when a worker built it, and compiles it here otherwise. In a worker, a
     call compiles the kernel and exports it to the store, so that its rank loads it. ``raw`` is
@@ -171,9 +178,32 @@ def process_built(
         memo: Dict[tuple, Any] = {}
         lock = threading.Lock()
         counts = {"hits": 0, "misses": 0}
+        signature = inspect.signature(raw)
+        positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        if any(p.kind not in positional for p in signature.parameters.values()):
+            raise TypeError(f"process_built: {raw.__qualname__} must take positional parameters")
+        num_params = len(signature.parameters)
+        # The arguments of the calls that leave defaults out, by the arguments they pass.
+        completed: Dict[tuple, tuple] = {}
+
+        def bind(args: tuple, kwargs: Dict[str, Any]) -> tuple:
+            """A call's arguments as positional ones with the defaults filled in: one key per
+            kernel, however the call passes them."""
+            if not kwargs:
+                if len(args) == num_params:
+                    return args
+                full = completed.get(args)
+                if full is not None:
+                    return full
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            if not kwargs:
+                completed[args] = bound.args
+            return bound.args
 
         @functools.wraps(raw)
-        def compiled(*args):
+        def compiled(*args, **kwargs):
+            args = bind(args, kwargs)
             kernel = memo.get(args)
             if kernel is None:
                 with lock:
@@ -202,7 +232,7 @@ def process_built(
         compiled.cache_info = cache_info
         compiled.cache_clear = cache_clear
         compiled._compiler = _Compiler(
-            name, f"{raw.__module__}:{raw.__qualname__}", use_build_pool_in_warmup, memo
+            name, f"{raw.__module__}:{raw.__qualname__}", use_build_pool_in_warmup, memo, bind
         )
         return compiled
 
@@ -255,14 +285,15 @@ class _Task:
     settled: bool = False
 
 
-def _gpu_has_room() -> bool:
-    """Whether the rank's GPU has room for one more worker (``_MIN_FREE_GPU_BYTES`` free)."""
+def _gpu_has_room(reserved: int = 0) -> bool:
+    """Whether the rank's GPU has room for one more worker: ``_MIN_FREE_GPU_BYTES`` free beside
+    ``reserved`` bytes that are not taken yet."""
     import torch
 
     if not torch.cuda.is_available() or not torch.cuda.is_initialized():
         return True
     free, _ = torch.cuda.mem_get_info()
-    return free >= _MIN_FREE_GPU_BYTES
+    return free - reserved >= _MIN_FREE_GPU_BYTES
 
 
 def _current_device() -> Optional[int]:
@@ -444,11 +475,19 @@ class BuildPool:
             return [BuildResult(REFUSED)] * len(kernels)
         results: List[BuildResult] = [BuildResult(PRESENT)] * len(kernels)
         builds, indices = [], []
+        # Pairs whose arguments name the kernel of an earlier pair: index -> that pair's build.
+        twins: Dict[int, int] = {}
+        first_build: Dict[str, int] = {}
         for index, (fn, args) in enumerate(kernels):
             compiler = fn._compiler
+            args = compiler.bind(tuple(args), {})
             _, paths = self._paths(compiler.name, args)
             if os.path.exists(paths.obj):
                 continue
+            if paths.obj in first_build:
+                twins[index] = first_build[paths.obj]
+                continue
+            first_build[paths.obj] = len(builds)
             claim = Claim(paths.claim, paths.obj, paths.failed) if self._shared else None
             builds.append(
                 Build(
@@ -459,7 +498,8 @@ class BuildPool:
                 )
             )
             indices.append(index)
-        for index, build, result in zip(indices, builds, self.build(builds)):
+        built = self.build(builds)
+        for index, build, result in zip(indices, builds, built):
             results[index] = result
             if result.status == FAILED:
                 error = result.error.splitlines()[0] if result.error else ""
@@ -468,6 +508,8 @@ class BuildPool:
                     f"here ({error})",
                     key=("build_pool", build.family, error),
                 )
+        for index, twin in twins.items():
+            results[index] = BuildResult(PRESENT) if built[twin].status == BUILT else built[twin]
         return results
 
     def load(self, name: str, args: tuple) -> Any:
@@ -591,13 +633,21 @@ class BuildPool:
                 from tensorrt_llm import _jit_share
 
                 store, shared = self._store, self._shared
+                if store is None and _jit_share.enabled():
+                    shared_store = os.path.join(os.environ[_jit_share.SHARE_DIR_ENV], "cute")
+                    try:
+                        os.makedirs(shared_store, exist_ok=True)
+                        store, shared = shared_store, True
+                    except OSError as e:
+                        # The workers still build into a store of this rank's own.
+                        logger.warning_once(
+                            f"[BuildPool] the shared store {shared_store} cannot be made "
+                            f"({type(e).__name__}: {e}): this rank's kernels are not shared",
+                            key=("build_pool", "shared_store"),
+                        )
                 if store is None:
-                    if _jit_share.enabled():
-                        store = os.path.join(os.environ[_jit_share.SHARE_DIR_ENV], "cute")
-                        shared = True
-                    else:
-                        store = tempfile.mkdtemp(prefix="tllm-build-pool-")
-                        atexit.register(shutil.rmtree, store, True)
+                    store = tempfile.mkdtemp(prefix="tllm-build-pool-")
+                    atexit.register(shutil.rmtree, store, True)
                 os.makedirs(store, exist_ok=True)
                 self._store, self._shared, self._store_ready = store, shared, True
             return self._store
@@ -640,7 +690,11 @@ class _Pool:
         memory allow; with no worker able to take it, refuse it at once."""
         with self._lock:
             if not self._stopping:
-                if self._idle == 0 and len(self._processes) < self._max and _gpu_has_room():
+                if (
+                    self._idle == 0
+                    and len(self._processes) < self._max
+                    and _gpu_has_room(self._reserved_bytes())
+                ):
                     try:
                         self._start_worker()
                     except OSError as e:
@@ -715,6 +769,10 @@ class _Pool:
             os.fdopen(task_write, "wb") as to_worker,
             os.fdopen(result_read, "rb") as from_worker,
         ):
+            # The worker makes its CUDA context in its first build, which reserves room for it
+            # (see _admit); once that build ends, the context is in the GPU's free memory.
+            cold = True
+            ended = False
             while True:
                 task = self.queue.get()
                 if task is None:
@@ -722,40 +780,59 @@ class _Pool:
                         _write(to_worker, pickle.dumps(None))
                     except OSError:
                         pass
-                    return
-                if not self._admit(task):
-                    self._owner._settle(
-                        task, BuildResult(REFUSED, 0.0, "the GPU has no room for the build")
-                    )
+                    break
+                try:
+                    if not self._admit(task, cold):
+                        self._owner._settle(
+                            task, BuildResult(REFUSED, 0.0, "the GPU has no room for the build")
+                        )
+                        with self._lock:
+                            self._idle += 1
+                        continue
+                    try:
+                        _write(to_worker, task.message)
+                        reply = _recv(from_worker)
+                    except (OSError, EOFError, pickle.UnpicklingError) as e:
+                        self._owner._settle(
+                            task,
+                            BuildResult(
+                                FAILED, 0.0, f"the worker process ended ({e!r}): {_tail(stderr)}"
+                            ),
+                        )
+                        self._release(task)
+                        ended = True
+                        self._ended()
+                        break
+                    cold = False
+                    result = BuildResult(*reply)
+                    # The result records the memory the build took, before the builds waiting
+                    # for room look again.
+                    self._owner._settle(task, result)
+                    self._release(task)
+                    if result.status == FAILED and result.error.endswith(_WORKER_ENDS):
+                        ended = True
+                        self._ended()
+                        break
                     with self._lock:
                         self._idle += 1
-                    continue
-                try:
-                    _write(to_worker, task.message)
-                    result = BuildResult(*_recv(from_worker))
-                except (OSError, EOFError, pickle.UnpicklingError) as e:
+                except Exception as e:  # noqa: BLE001 - a build left unsettled holds up its pass
+                    # The worker ends with this thread: leaving closes its pipes.
                     self._owner._settle(
                         task,
                         BuildResult(
-                            FAILED, 0.0, f"the worker process ended ({e!r}): {_tail(stderr)}"
+                            FAILED, 0.0, f"serving the build raised {type(e).__name__}: {e}"
                         ),
                     )
                     self._release(task)
-                    self._ended()
-                    return
-                # The result records the memory the build took, before the builds waiting for
-                # room look again.
-                self._owner._settle(task, result)
-                self._release(task)
-                if result.status == FAILED and result.error.endswith(_WORKER_ENDS):
-                    self._ended()
-                    return
-                with self._lock:
-                    self._idle += 1
+                    if not ended:
+                        ended = True
+                        self._ended()
+                    break
 
-    def _admit(self, task: _Task) -> bool:
+    def _admit(self, task: _Task, cold: bool = False) -> bool:
         """Wait until the GPU has room for ``task`` beside the builds running, and count it
-        running; False when it has none with no other build running."""
+        running; False when it has none with no other build running. The first build of a worker
+        (``cold``) also makes the worker's CUDA context, which it reserves room for."""
         with self._memory:
             while not self._stopping:
                 free = _free_gpu_bytes(self._device)
@@ -769,10 +846,11 @@ class _Pool:
                 ):
                     fits = False  # A kind of build not measured yet builds one at a time.
                 else:
+                    need = (need or 0) + (_WORKER_CONTEXT_BYTES if cold else 0)
                     taken = sum(nbytes for _, nbytes in self._running.values())
-                    fits = free - taken - (need or 0) >= _MIN_FREE_GPU_BYTES
+                    fits = free - taken - need >= _MIN_FREE_GPU_BYTES
                 if fits:
-                    self._running[id(task)] = (task.family, need or 0)
+                    self._running[id(task)] = (task.family, need)
                     return True
                 if not self._running:
                     return False
@@ -783,6 +861,11 @@ class _Pool:
         with self._memory:
             self._running.pop(id(task), None)
             self._memory.notify_all()
+
+    def _reserved_bytes(self) -> int:
+        """The memory the builds running reserved, which the GPU's free memory may not show yet."""
+        with self._memory:
+            return sum(nbytes for _, nbytes in self._running.values())
 
     def _ended(self) -> None:
         """A worker ended: with none left, refuse the builds still queued."""

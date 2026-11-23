@@ -9,6 +9,7 @@ The kernels are build_pool_targets.py's picklable stand-ins, so no GPU is needed
 import os
 import threading
 import time
+from pathlib import Path
 
 import build_pool_targets as targets
 import pytest
@@ -206,8 +207,27 @@ def test_a_worker_that_loses_its_cuda_context_ends_and_another_takes_the_builds(
     assert pool._workers_started == 2
 
 
+def test_an_error_serving_a_build_fails_it_and_ends_its_worker(
+    pool: BuildPool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An error in the thread that serves a worker, here reading the GPU's free memory after a
+    sticky CUDA error, fails the build it serves and ends the worker, whose queued builds are
+    refused: the pass does not wait for builds no thread serves."""
+
+    def sticky_error(device: object) -> int:
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(build_pool, "_free_gpu_bytes", sticky_error)
+    pool.max_workers = 1
+    with pool.pass_scope():
+        results = pool.build([_record(tmp_path / "a", 1), _record(tmp_path / "b", 2)])
+    assert [result.status for result in results] == ["failed", "refused"]
+    assert "serving the build raised RuntimeError" in results[0].error
+    assert not (tmp_path / "a").exists() and not (tmp_path / "b").exists()
+
+
 def test_no_worker_starts_while_the_gpu_lacks_room(pool, monkeypatch):
-    monkeypatch.setattr(build_pool, "_gpu_has_room", lambda: False)
+    monkeypatch.setattr(build_pool, "_gpu_has_room", lambda reserved=0: False)
     with pool.pass_scope():
         _build_kernels((5,))
     assert targets.compile_kernel(5).pid == os.getpid()
@@ -267,6 +287,66 @@ def test_a_kind_of_build_not_measured_yet_builds_one_at_a_time(pool, gpu, tmp_pa
     assert pool.peak_bytes("new") == 0
 
 
+def test_a_workers_first_build_also_needs_room_for_its_cuda_context(
+    pool: BuildPool, gpu: dict, tmp_path: Path
+) -> None:
+    """A worker makes its CUDA context in its first build: that build needs room for the context
+    beside the 8 GiB the rank keeps free, and the worker's later builds do not."""
+    pool.max_workers = 1
+    gpu["free"] = (8 << 30) + (1 << 29)
+    with pool.pass_scope():
+        [cold] = pool.build([_record(tmp_path / "a", 1)])
+    assert cold.status == "refused"
+    gpu["free"] = (9 << 30) + (1 << 29)
+    with pool.pass_scope():
+        [first] = pool.build([_record(tmp_path / "b", 2)])
+        gpu["free"] = (8 << 30) + (1 << 29)
+        [warm] = pool.build([_record(tmp_path / "c", 3)])
+    assert (first.status, warm.status) == ("built", "built")
+
+
+def test_new_workers_whose_contexts_do_not_fit_together_build_one_at_a_time(
+    pool: BuildPool, gpu: dict, tmp_path: Path
+) -> None:
+    # Room for one worker's context beside the 8 GiB the rank keeps free, not for two.
+    gpu["free"] = (9 << 30) + (1 << 29)
+    paths = [tmp_path / f"s{i}" for i in range(2)]
+    with pool.pass_scope():
+        results = pool.build([Build(_SPAN, (str(path), 0.5)) for path in paths])
+    assert [result.status for result in results] == ["built", "built"]
+    assert not _overlap(_spans(paths))
+    # Room for two: each build waits for the other to start, so both end only if run together.
+    gpu["free"] = (10 << 30) + (1 << 29)
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    with pool.pass_scope():
+        results = pool.build([Build(_HOLD, (a, b, 60.0)), Build(_HOLD, (b, a, 60.0))])
+    assert [result.status for result in results] == ["built", "built"]
+
+
+def test_a_kernel_is_the_same_however_a_call_passes_its_arguments(pool: BuildPool) -> None:
+    with pool.pass_scope():
+        # Two spellings of one kernel: one build.
+        results = pool.build_kernels(
+            [(targets.compile_kernel, (40,)), (targets.compile_kernel, (40, ""))]
+        )
+        assert [result.status for result in results] == ["built", "present"]
+        kernel = targets.compile_kernel(40)
+        assert targets.compile_kernel(40, "") is kernel
+        assert targets.compile_kernel(value=40) is kernel
+        assert targets.compile_kernel(40, in_worker="") is kernel
+    assert kernel.pid != os.getpid()
+    assert targets.compile_kernel.cache_info().currsize == 1
+    assert pool.counts() == {"built": 1}
+
+
+def test_process_built_takes_only_functions_of_positional_parameters() -> None:
+    def keyword_only(value: int, *, mode: str = "") -> int:
+        return value
+
+    with pytest.raises(TypeError):
+        build_pool.process_built("keyword_only")(keyword_only)
+
+
 def test_arguments_that_do_not_pickle_are_built_here(pool):
     with pool.pass_scope():
         assert pool.takes((1,)) and not pool.takes((lambda: 0,))
@@ -300,7 +380,8 @@ def test_ranks_sharing_a_store_build_each_kernel_once(share_dir, monkeypatch):
 
 def _claimed_elsewhere(rank, args):
     """Claim the kernel of ``args`` for another rank, which has not built it."""
-    _, paths = rank._paths(targets.NAME, args)
+    # The store names a kernel by its call's arguments with the defaults filled in.
+    _, paths = rank._paths(targets.NAME, targets.compile_kernel._compiler.bind(args, {}))
     os.makedirs(os.path.dirname(paths.claim), exist_ok=True)
     open(paths.claim, "w").close()
     return paths
@@ -366,14 +447,42 @@ def test_without_shared_builds_each_rank_keeps_a_store_of_its_own(
     assert _jit_share._cute_store() == os.path.join("/nonexistent-share-dir", "cute")
 
 
-@pytest.mark.parametrize("first", ["build", "build_kernels"])
-def test_a_store_that_cannot_be_made_leaves_every_build_here(
-    worker_env, monkeypatch, tmp_path, first
-):
+def test_a_shared_store_that_cannot_be_made_leaves_the_rank_a_store_of_its_own(
+    worker_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The workers still build where the directory the ranks share cannot hold the store: into
+    a store of this rank's own, from which it loads the kernels, which are not shared."""
     not_a_directory = tmp_path / "share"
     not_a_directory.write_text("")
     monkeypatch.setenv(_jit_share.SHARE_DIR_ENV, str(not_a_directory))
     monkeypatch.setattr(_jit_share, "enabled", lambda: True)
+    rank = BuildPool(workers=1, enabled=True)
+    monkeypatch.setattr(BuildPool, "_instance", rank)
+    try:
+        with rank.pass_scope():
+            _build_kernels((34,))
+            assert rank.accepting()
+            assert targets.compile_kernel(34).pid != os.getpid()
+    finally:
+        rank.stop()
+    assert rank.counts() == {"built": 1}
+    assert not rank._shared and not rank._store.startswith(str(not_a_directory))
+
+
+@pytest.mark.parametrize("first", ["build", "build_kernels"])
+def test_a_store_that_cannot_be_made_leaves_every_build_here(
+    worker_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first: str
+) -> None:
+    not_a_directory = tmp_path / "share"
+    not_a_directory.write_text("")
+    monkeypatch.setenv(_jit_share.SHARE_DIR_ENV, str(not_a_directory))
+    monkeypatch.setattr(_jit_share, "enabled", lambda: True)
+
+    def no_directory(*args: object, **kwargs: object) -> str:
+        raise OSError(28, "No space left on device")
+
+    # Nor can a store of the rank's own be made.
+    monkeypatch.setattr(build_pool.tempfile, "mkdtemp", no_directory)
     rank = BuildPool(workers=1, enabled=True)
     monkeypatch.setattr(BuildPool, "_instance", rank)
     try:
