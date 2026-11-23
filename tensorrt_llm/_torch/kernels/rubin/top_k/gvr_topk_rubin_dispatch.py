@@ -19,7 +19,7 @@ class _LowpTuning(NamedTuple):
     widen_crc: bool
     cr2: bool
     pcw_aligned: bool
-    routing_sm_version: int = 100
+    unsplit_aim: int | None
 
     def crc_geometry(self, block: int, vpt: int, cluster: int) -> tuple[int, int]:
         if self.widen_crc and block == 512 and cluster == 16:
@@ -36,6 +36,8 @@ def select_lowp_tuning(
     return _LowpTuning(
         widen_crc=rows * 32 <= num_sms,
         cr2=k != 2048 or rows > num_sms,
+        # Extra sampling headroom avoids retries on long unsplit rows.
+        unsplit_aim=4 * k if k == 1024 and rows > num_sms and n >= 65536 else None,
         # Keep the legacy filter on short rows where extra PCW instructions can outweigh the gain.
         pcw_aligned=npad % PCW_LEGACY_ROW_ELEMENTS == 0
         or (n > 2048 and npad % PCW_API_ROW_ELEMENTS == 0),

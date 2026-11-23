@@ -2648,11 +2648,7 @@ def _varlen_launcher(
         )
 
         lowp_tuning = select_lowp_tuning(num_rows, n_kernel, npad, k, num_sms, sm_version)
-        if lowp_tuning is not None:
-            # Tuned launcher options use the physical SM count; the family router
-            # uses the Blackwell decode wave from its routing profile.
-            wave = num_sms
-            sm_version = lowp_tuning.routing_sm_version
+    tuned_lowp_options = sm_version in _TUNED_SM_VERSIONS or lowp_tuning is not None
     cr_shift = 0 if cr == 1 else 2
     if _tallws_gate(num_rows, n_kernel, k, num_sms, sm_version, dtype, det):
         lc = _tallws_launcher(num_rows, npad, k, next_n, cr_shift, num_sms, dtype)
@@ -2762,7 +2758,7 @@ def _varlen_launcher(
         and _REG_CODE_RADIX_FORCE is not False
         and plan_free["kernel"] in ("reg", "reg_clus", "main", "clus")
         and n_kernel > k
-        and sm_version in _TUNED_SM_VERSIONS
+        and tuned_lowp_options
         else None
     )
     if crc is not None:
@@ -2999,7 +2995,7 @@ def _varlen_launcher(
                 dtype is torch.float16
                 and (lowp_tuning is None or lowp_tuning.cr2)
                 and reg_options["code_radix"]
-                and sm_version in _TUNED_SM_VERSIONS
+                and tuned_lowp_options
                 and (
                     n_kernel > 8448
                     or (num_rows > num_sms and not (n_kernel <= 2112 and num_rows <= 2 * num_sms))
@@ -3241,20 +3237,12 @@ def _varlen_launcher(
         if low:
             # FP32's register-path option rules, then the 16-bit overrides
             small_k_resident_16bit = (
-                k == 512
-                and num_rows > num_sms
-                and n_kernel > 4096
-                and sm_version in _TUNED_SM_VERSIONS
+                k == 512 and num_rows > num_sms and n_kernel > 4096 and tuned_lowp_options
             )
             stage_output = num_rows > num_sms and not (
                 k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
             )
-            if (
-                k == 2048
-                and n_kernel > k
-                and num_rows <= num_sms
-                and sm_version in _TUNED_SM_VERSIONS
-            ):
+            if k == 2048 and n_kernel > k and num_rows <= num_sms and tuned_lowp_options:
                 stage_output = True
             if (
                 dtype is torch.bfloat16
@@ -3269,7 +3257,7 @@ def _varlen_launcher(
                 and reg_options["code_radix"]
                 and n_kernel > k
                 and num_rows <= num_sms
-                and sm_version in _TUNED_SM_VERSIONS
+                and tuned_lowp_options
             ):
                 stage_output = True
             if reg_parts > 1:
@@ -3293,7 +3281,7 @@ def _varlen_launcher(
                     or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
                 )
                 and n_kernel > k
-                and sm_version in _TUNED_SM_VERSIONS
+                and tuned_lowp_options
                 else None
             )
             if (
@@ -3361,7 +3349,7 @@ def _varlen_launcher(
                 dense_bracket=k <= 512,
                 dense_lower_bound=k > 512 and n_kernel < 2 * k,
                 bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8256 else 1,
-                warp_rank=n_kernel > k and sm_version in _TUNED_SM_VERSIONS,
+                warp_rank=n_kernel > k and tuned_lowp_options,
                 parts=reg_parts,
                 pcw=pcw,
                 # the cluster only co-schedules a row's parts, which pays off on Blackwell only
@@ -3565,7 +3553,7 @@ def _varlen_launcher(
                     main_options["regsel"] = True
                 if dtype is torch.bfloat16:
                     main_options["envf"] = True
-                if dtype is torch.bfloat16 and sm_version in _TUNED_SM_VERSIONS:
+                if dtype is torch.bfloat16 and tuned_lowp_options:
                     main_options["warp_rank"] = True
                     # a compile-time K pays off on Hopper from K = 1024
                     if (
@@ -3706,6 +3694,8 @@ def _varlen_launcher(
             and not (16000 < n_kernel <= 16500)
         ):
             aim_base = 7 * k // 4 if (n_env <= 16400 or 65536 < n_env <= 131100) else 2 * k
+        if lowp_tuning is not None and r_const == 1 and lowp_tuning.unsplit_aim is not None:
+            aim_base = lowp_tuning.unsplit_aim
         sfac = split_sfac if r_const > 1 else 64 if k >= 1024 else 32
         sd_en = 1 if k > 1024 and not big else 0
         if dtype is torch.float16:

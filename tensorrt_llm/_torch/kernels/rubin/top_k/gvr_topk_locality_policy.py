@@ -7,24 +7,6 @@ import torch
 COSCHEDULED_SM_COUNT = 4
 
 
-def choose_backfill(
-    dtype: torch.dtype, k: int, n: int, rows: int, sms: int, sm_version: int
-) -> bool:
-    """Select FP32 backfill after allocation validation."""
-    if sm_version < 107 or sms < 1 or dtype != torch.float32 or k not in (512, 1024):
-        return False
-    reference_rows = (rows * 208 + sms - 1) // sms
-    if n < 131072 or reference_rows < 737:
-        return False
-    if n > 262143 or reference_rows > 4096:
-        return True
-    return (
-        737 <= reference_rows <= 832
-        or 921 <= reference_rows <= 1024
-        or 1473 <= reference_rows <= 1664
-    )
-
-
 # Inclusive (K, N range, resource-normalized row range, execution mode).
 # None denotes an open upper bound.
 _REGIONS: tuple[tuple[int, int, int | None, int, int | None, str], ...] = (

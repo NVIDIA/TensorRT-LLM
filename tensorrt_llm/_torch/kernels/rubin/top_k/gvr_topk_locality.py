@@ -12,7 +12,7 @@ from cuda.bindings import driver as cuda
 
 from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling_host as gvr
 
-from .gvr_topk_locality_policy import COSCHEDULED_SM_COUNT, choose_backfill, choose_locality
+from .gvr_topk_locality_policy import COSCHEDULED_SM_COUNT, choose_locality
 
 
 class _CudaError(RuntimeError):
@@ -20,6 +20,23 @@ class _CudaError(RuntimeError):
         super().__init__(f"{operation}: {status}")
         self.status = status
         self.operation = operation
+
+
+class LocalityCleanupError(RuntimeError):
+    """Construction rollback left live handles. Retry with ``executor.close()``."""
+
+    def __init__(self, executor: "LocalityDomainExecutor") -> None:
+        super().__init__("Locality cleanup incomplete; retry executor.close()")
+        self.executor = executor
+
+
+def _rollback_executor(executor: "LocalityDomainExecutor") -> None:
+    try:
+        executor.close()
+    except BaseException as error:
+        if executor.domains:
+            raise LocalityCleanupError(executor) from error
+        raise
 
 
 def _check(result: tuple, operation: str) -> object:
@@ -65,7 +82,7 @@ class LocalityDomainExecutor:
         coscheduled_sm_count: int = COSCHEDULED_SM_COUNT,
         sm_counts: tuple[int, ...] | None = None,
         *,
-        backfill: bool = False,
+        backfill: bool = True,
     ) -> None:
         self.device = device
         properties = torch.cuda.get_device_properties(device)
@@ -112,7 +129,7 @@ class LocalityDomainExecutor:
             resources, remainder = _check(
                 cuda.cuDevSmResourceSplit(count, resource, 0, params), "split SM resources"
             )
-            if backfill and sm_counts is None:
+            if backfill and sm_counts is None and remainder.sm.smCount > 0:
                 resources, remainder = self._try_backfill(resources, remainder, params)
             self.remainder_sms = int(remainder.sm.smCount)
             try:
@@ -120,7 +137,7 @@ class LocalityDomainExecutor:
                     self._add_domain(ordinal, partition)
             except BaseException as error:
                 try:
-                    self.close()
+                    _rollback_executor(self)
                 except BaseException as cleanup_error:
                     raise error from cleanup_error
                 raise
@@ -264,6 +281,15 @@ class _Bound:
             lc[1](x, out, out, self.ws, *lc[2], lengths, *lc[3])
 
 
+def _query_int(query, *args) -> int | None:
+    try:
+        result = query(*args)
+    except (TypeError, RuntimeError):
+        # Some bindings expose the enum but cannot marshal the query.
+        return None
+    return int(result[1]) if result[0] == cuda.CUresult.CUDA_SUCCESS else None
+
+
 def _allocation_rows(x: torch.Tensor, device: int) -> tuple[int, ...] | None:
     """Verify complete padded rows before selecting any locality policy."""
     if any(
@@ -286,14 +312,11 @@ def _allocation_rows(x: torch.Tensor, device: int) -> tuple[int, ...] | None:
     )
     if attribute is None or domain_attribute is None or location_type is None:
         return None
-    first = cuda.cuPointerGetAttribute(attribute, x.data_ptr())
-    if first[0] != cuda.CUresult.CUDA_SUCCESS or int(first[1]) < 0:
+    first = _query_int(cuda.cuPointerGetAttribute, attribute, x.data_ptr())
+    if first is None or first < 0:
         return None
-    capability = cuda.cuDeviceGetAttribute(domain_attribute, device)
-    if capability[0] != cuda.CUresult.CUDA_SUCCESS or int(capability[1]) < 1:
-        return None
-    domains = int(capability[1])
-    if int(first[1]) >= domains:
+    domains = _query_int(cuda.cuDeviceGetAttribute, domain_attribute, device)
+    if domains is None or first >= domains:
         return None
     prop = cuda.CUmemAllocationProp()
     prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
@@ -302,27 +325,25 @@ def _allocation_rows(x: torch.Tensor, device: int) -> tuple[int, ...] | None:
     unit = 0
     for ordinal in range(domains):
         prop.location.localized.localityDomainId = ordinal
-        granularity = cuda.cuMemGetAllocationGranularity(
-            prop, cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+        granularity = _query_int(
+            cuda.cuMemGetAllocationGranularity,
+            prop,
+            cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
         )
-        if granularity[0] != cuda.CUresult.CUDA_SUCCESS or int(granularity[1]) < 1:
+        if granularity is None or granularity < 1:
             return None
-        unit = gcd(unit, int(granularity[1]))
+        unit = gcd(unit, granularity)
     counts = [0] * domains
     previous = 0
     row_bytes = x.stride(0) * x.element_size()
     for row in range(x.shape[0]):
         begin = x.data_ptr() + row * row_bytes
         end = begin + row_bytes
-        result = cuda.cuPointerGetAttribute(attribute, begin)
-        if result[0] != cuda.CUresult.CUDA_SUCCESS:
-            return None
-        domain = int(result[1])
-        if domain < previous or domain >= domains:
+        domain = _query_int(cuda.cuPointerGetAttribute, attribute, begin)
+        if domain is None or domain < previous or domain >= domains:
             return None
         for address in (end - 1, *range(((begin // unit) + 1) * unit, end, unit)):
-            result = cuda.cuPointerGetAttribute(attribute, address)
-            if result[0] != cuda.CUresult.CUDA_SUCCESS or int(result[1]) != domain:
+            if _query_int(cuda.cuPointerGetAttribute, attribute, address) != domain:
                 return None
         counts[domain] += 1
         previous = domain
@@ -337,11 +358,12 @@ class PreparedRowTopK:
     Preparation never copies logits. Separate concurrent calls need separate instances.
     The upstream producer must allocate its logits output with complete padded rows
     in matching locality domains; ordinary producer outputs use tuned global execution.
-    Prepare and warm before capture; retain allocations and executor until graphs
-    are destroyed. Values and lengths may change, but addresses and ownership may not.
-    ``co_local=None`` or ``True`` probes ownership and falls back when ineligible;
-    ``False`` skips the probe. ``mode`` reports the selected execution path.
-    This opt-in API is not used by the model TopK module.
+    Use CUDA Graph replay for domain performance. Prepare and warm before capture.
+    Retain allocations and the executor until the graphs are destroyed. Values and
+    lengths may change while the addresses and row ownership stay fixed.
+    Set ``co_local=True`` to probe ownership for an explicit domain invocation.
+    The default uses tuned global execution until QK GEMM produces localized logits.
+    ``mode`` reports the selected execution path.
     Lengths are uncompressed token counts. Only ``next_n=1`` is supported.
     """
 
@@ -354,7 +376,7 @@ class PreparedRowTopK:
         max_seq_len,
         compress_ratio=1,
         row_counts=None,
-        co_local=None,
+        co_local=False,
         executor=None,
     ):
         self.executor = None
@@ -376,7 +398,7 @@ class PreparedRowTopK:
             self.closed = True
             if self.owns_executor and self.executor is not None:
                 try:
-                    self.executor.close()
+                    _rollback_executor(self.executor)
                 except BaseException as cleanup_error:
                     raise error from cleanup_error
             raise
@@ -444,7 +466,7 @@ class PreparedRowTopK:
         if counts is not None and (any(c < 0 for c in counts) or sum(counts) != rows):
             raise ValueError("row_counts must cover logits exactly")
         verified = None
-        if co_local is not False and sm >= 107:
+        if co_local is True and sm >= 107:
             verified = _allocation_rows(x, self.device)
         if verified is not None and counts is not None and counts != verified:
             verified = None
@@ -455,21 +477,11 @@ class PreparedRowTopK:
             if self.locality_allocation
             else None
         )
-        if choice is not None:
-            capability = cuda.cuDeviceGetAttribute(
-                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, self.device
-            )
-            if capability[0] != cuda.CUresult.CUDA_SUCCESS or int(capability[1]) < 1:
-                choice = None
         if choice is not None and counts is not None:
             mode, budget = choice
             if executor is None:
                 try:
-                    executor = LocalityDomainExecutor(
-                        self.device,
-                        budget,
-                        backfill=choose_backfill(logits.dtype, k, max_seq_len, rows, sms, sm),
-                    )
+                    executor = LocalityDomainExecutor(self.device, budget)
                 except _CudaError as error:
                     if not (
                         error.operation == "split SM resources"
@@ -602,6 +614,7 @@ class PreparedRowTopK:
         if self.parts:
             try:
                 torch.cuda.synchronize(self.device)
+                self.parts.clear()
             except RuntimeError as exc:
                 error = exc
         if self.owns_executor and self.executor is not None:
@@ -611,6 +624,5 @@ class PreparedRowTopK:
                 error = error or exc
             if not self.executor.domains:
                 self.owns_executor = False
-        self.parts.clear()
         if error is not None:
             raise error

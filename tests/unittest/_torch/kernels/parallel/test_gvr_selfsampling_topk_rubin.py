@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from math import gcd, lcm
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -66,7 +66,7 @@ def domain_executor() -> Iterator[locality.LocalityDomainExecutor]:
         pytest.skip("Locality domains are not supported by the driver")
     if int(_checked(result)) < 2:
         pytest.skip("Cross-domain row ownership requires at least two domains")
-    with locality.LocalityDomainExecutor(torch.cuda.current_device()) as executor:
+    with locality.LocalityDomainExecutor(torch.cuda.current_device(), backfill=False) as executor:
         yield executor
 
 
@@ -83,7 +83,7 @@ class _ByteView:
 @contextmanager
 def _localized_rows(
     rows: int, n: int, dtype: torch.dtype, executor: locality.LocalityDomainExecutor
-) -> Iterator[tuple[torch.Tensor, tuple[int, ...]]]:
+) -> Iterator[tuple[torch.Tensor, tuple[int, ...] | None]]:
     """Map contiguous row extents to queried domains without copying their allocation."""
     device = executor.device
     weights = [d.sm_count for d in executor.domains]
@@ -139,8 +139,17 @@ def _localized_rows(
         storage = torch.as_tensor(owner, device=f"cuda:{device}")
         assert storage.data_ptr() == base
         x = storage.view(dtype).reshape(rows, stride_bytes // element_size)
-        assert locality._allocation_rows(x, device) == tuple(counts)
-        yield x, tuple(counts)
+        try:
+            result = cuda.cuPointerGetAttribute(
+                cuda.CUpointer_attribute.CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL, base
+            )
+        except (TypeError, RuntimeError):
+            expected = None
+        else:
+            assert int(_checked(result)) == next(i for i, count in enumerate(counts) if count)
+            expected = tuple(counts)
+        assert locality._allocation_rows(x, device) == expected
+        yield x, expected
     finally:
         error = sys.exc_info()[1]
         try:
@@ -180,6 +189,8 @@ def _check_replay(
     out: torch.Tensor,
     n: int,
     cr: int = 1,
+    *,
+    replay_lengths: list[int] | None = None,
 ) -> None:
     original = x.clone()
     call()
@@ -192,11 +203,16 @@ def _check_replay(
             call()
         # Replay once with the prepared envelope, then with changed scores and lengths.
         for step in range(2):
-            valid = (
-                [n] * len(x)
-                if step == 0
-                else [(0, out.shape[1] - 3, out.shape[1] + 3, n - 11)[r % 4] for r in range(len(x))]
-            )
+            valid = [n] * len(x)
+            if step == 1:
+                valid = (
+                    replay_lengths
+                    if replay_lengths is not None
+                    else [
+                        (0, out.shape[1] - 3, out.shape[1] + 3, n - 11)[r % 4]
+                        for r in range(len(x))
+                    ]
+                )
             lengths.copy_(torch.tensor(valid, dtype=torch.int32, device=x.device) * cr)
             x.copy_(original if step == 0 else -original)
             for row, count in enumerate(valid):
@@ -287,7 +303,14 @@ def test_rubin_gvr_pcw_minimum_row_alignment() -> None:
         static_k=k,
         static_npad=npad,
     )
-    _check_replay(lambda: kernel(x, out, lengths, out, n, 0, 0, 0), x, lengths, out, n)
+    _check_replay(
+        lambda: kernel(x, out, lengths, out, n, 0, 0, 0),
+        x,
+        lengths,
+        out,
+        n,
+        replay_lengths=[k - 3, n - 11],
+    )
 
 
 @_rubin_gpu
@@ -344,10 +367,15 @@ def test_rubin_gvr_locality_graph(
             out,
             max_seq_len=n * cr,
             compress_ratio=cr,
+            co_local=True,
             row_counts=counts,
             executor=domain_executor,
         )
         try:
+            if counts is None:
+                assert prepared.mode == "tuned" and prepared.executor is None
+                _check_replay(prepared, x, lengths, out, n, cr)
+                return
             assert prepared.locality_allocation and prepared.mode == "local_preserve"
             assert len(prepared.parts) == sum(c > 0 for c in counts)
             plan = gvr._varlen_launcher(
@@ -403,17 +431,24 @@ def test_rubin_gvr_ordinary_allocation_falls_back(monkeypatch: pytest.MonkeyPatc
         prepared.close()
 
 
+@pytest.mark.parametrize("dtype", _DTYPES)
 @_rubin_gpu
-def test_rubin_gvr_automatic_backfill(domain_executor: locality.LocalityDomainExecutor) -> None:
-    rows = 1024 * domain_executor.physical_sm_count // 208
+def test_rubin_gvr_automatic_backfill(
+    domain_executor: locality.LocalityDomainExecutor, dtype: torch.dtype
+) -> None:
+    rows = (512 * domain_executor.physical_sm_count + 207) // 208
     n, k = 131075, 512
-    with _localized_rows(rows, n, torch.float32, domain_executor) as (x, _):
+    with _localized_rows(rows, n, dtype, domain_executor) as (x, counts):
         _fill(x, n)
         lengths = torch.full((rows,), n, dtype=torch.int32, device="cuda")
         out = torch.empty((rows, k), dtype=torch.int32, device="cuda")
-        prepared = locality.PreparedRowTopK(x, lengths, out, max_seq_len=n)
+        prepared = locality.PreparedRowTopK(x, lengths, out, max_seq_len=n, co_local=True)
         owned = prepared.executor
         try:
+            if counts is None:
+                assert prepared.mode == "tuned" and owned is None
+                _check_replay(prepared, x, lengths, out, n)
+                return
             assert prepared.mode == "local_preserve" and prepared.owns_executor
             assert owned is not None
             assert owned.backfill_requested
@@ -434,10 +469,12 @@ def test_rubin_gvr_complete_row_ownership(domain_executor: locality.LocalityDoma
     rows, n = sum(weights) // gcd(*weights), 4099
     with _localized_rows(rows, n, torch.float32, domain_executor) as (x, counts):
         assert locality._allocation_rows(x.reshape(1, -1), x.get_device()) is None
-        bad_counts = (counts[0] + 1, *counts[1:-1], counts[-1] - 1)
+        bad_counts = (rows,) + (0,) * (len(weights) - 1)
         out = torch.empty((rows, 512), dtype=torch.int32, device="cuda")
         lengths = torch.full((rows,), n, dtype=torch.int32, device="cuda")
-        prepared = locality.PreparedRowTopK(x, lengths, out, max_seq_len=n, row_counts=bad_counts)
+        prepared = locality.PreparedRowTopK(
+            x, lengths, out, max_seq_len=n, co_local=True, row_counts=bad_counts
+        )
         try:
             assert not prepared.locality_allocation and prepared.executor is None
         finally:
@@ -486,15 +523,7 @@ def test_rubin_gvr_backfill_resource_invariants(
 
 
 def test_rubin_gvr_policy_boundaries() -> None:
-    assert not policy.choose_backfill(torch.float32, 512, 131071, 1024, 208, 107)
-    assert policy.choose_backfill(torch.float32, 512, 131072, 1024, 208, 107)
-    assert not policy.choose_backfill(torch.float32, 512, 262143, 1025, 208, 107)
-    assert policy.choose_backfill(torch.float32, 512, 262144, 1025, 208, 107)
-    assert not policy.choose_backfill(torch.float32, 512, 131072, 4096, 208, 107)
-    assert policy.choose_backfill(torch.float32, 512, 131072, 4097, 208, 107)
-    for dtype in (torch.float16, torch.bfloat16):
-        assert not policy.choose_backfill(dtype, 512, 1 << 20, 8192, 208, 107)
-    for sms, rows in ((104, 256), (208, 512), (416, 1024)):
+    for sms, rows in ((104, 256), (208, 512), (212, 522), (416, 1024)):
         assert policy.choose_locality(torch.float32, 512, 131072, rows, sms, 107) == (
             "local_preserve",
             4,
@@ -545,7 +574,7 @@ def recorded_launcher(monkeypatch: pytest.MonkeyPatch) -> Callable:
     for name in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
         monkeypatch.setattr(gvr, name, {})
 
-    def launch(dtype, k, rows, n, *, tuned=True, npad=None):
+    def launch(dtype, k, rows, n, *, tuned=True, npad=None, sms=208):
         compile_spy.reset_mock()
         result = gvr._varlen_launcher(
             rows,
@@ -554,7 +583,7 @@ def recorded_launcher(monkeypatch: pytest.MonkeyPatch) -> Callable:
             n,
             1,
             1,
-            208,
+            sms,
             107,
             dtype=dtype,
             device_index=0,
@@ -615,13 +644,49 @@ def test_rubin_gvr_tuning_cache_and_wave(recorded_launcher: Callable) -> None:
     keys = list(gvr._VARLEN_CACHE_BF16)
     assert len(keys) == 2 and keys[1] == keys[0] + ("original_route",)
     assert keys[0][7] == gvr._pack_device_profile(208, 107)
-    profile = dispatch.select_lowp_tuning(1, 8195, 8256, 512, 208, 107)
-    assert profile.routing_sm_version == 100
-    _, inside = recorded_launcher(torch.float16, 2048, 160, 8195)
-    _, outside = recorded_launcher(torch.float16, 2048, 209, 8195)
+    _, inside = recorded_launcher(torch.float16, 2048, 148, 8195)
+    _, outside = recorded_launcher(torch.float16, 2048, 149, 8195)
     assert inside.kwargs["binproof"] and not outside.kwargs.get("binproof", False)
-    assert gvr.wave_sms(208, 107) == 148
-    assert gvr.wave_sms(208, profile.routing_sm_version) == 148
+
+
+@pytest.mark.parametrize("dtype,n", [(torch.float16, 131075), (torch.bfloat16, 65539)])
+def test_rubin_gvr_lowp_decode_wave(recorded_launcher, monkeypatch, dtype, n):
+    route = Mock(wraps=gvr._route_16bit)
+    stream = Mock(wraps=gvr._route_streaming_16bit)
+    monkeypatch.setattr(gvr, "_route_16bit", route)
+    monkeypatch.setattr(gvr, "_route_streaming_16bit", stream)
+    tall, compile_call = recorded_launcher(dtype, 1024, 1024, n, sms=212)
+    assert route.call_args.args[-2:] == (212, 107)
+    assert stream.call_args.args[-2:] == (212, 107)
+    assert tall[0] == "main" and compile_call.args[0][0] == 256 and tall[3][0] == 4096
+    short, compile_call = recorded_launcher(dtype, 1024, 64, n, sms=212)
+    assert short[0] == "clus" and compile_call.kwargs["wave_sms"] == gvr.wave_sms(212, 107) == 148
+
+
+def test_rubin_gvr_fp32_launch_staging(recorded_launcher):
+    for tuned, size in [(False, 28672), (True, 32768)]:
+        launcher, compiled = recorded_launcher(torch.float32, 1024, 64, 16384, tuned=tuned)
+        assert launcher[0] == "reg" and bool(compiled.kwargs.get("stage_output")) == tuned
+        assert launcher[2][-1] == size
+
+
+@pytest.mark.parametrize(
+    "k,n,rows,region,family,block",
+    [
+        (2048, 131087, 256, "blackwell_options", "main", 512),
+        (2048, 163775, 256, "blackwell_options", "main", 512),
+        (2048, 16399, 4, "reg", "reg", 1024),
+        (1024, 32771, 130, "reg", "reg", 1024),
+        (1024, 32771, 131, "main", "main", 512),
+    ],
+)
+def test_rubin_gvr_fp32_region_on_212_sms(recorded_launcher, k, n, rows, region, family, block):
+    tuning = dispatch.select_tuning(rows, n, k, 212, 107)
+    assert tuning is not None and tuning.family == region
+    launcher, compiled = recorded_launcher(torch.float32, k, rows, n, sms=212)
+    assert launcher[0] == family and compiled.args[0][0] == block
+    if family == "reg":
+        assert compiled.args[0][7] == (2048 if k == 1024 else 1024)
 
 
 def test_rubin_gvr_pcw_alignment_policy() -> None:
@@ -702,13 +767,18 @@ def test_rubin_gvr_prepared_cleanup_after_sync_error(
     prepared.device, prepared.executor, prepared.owns_executor = 0, executor, owned
     prepared.closed, prepared.parts = False, [object()]
     error = RuntimeError("synchronization failed")
-    monkeypatch.setattr(torch.cuda, "synchronize", Mock(side_effect=error))
+    sync = Mock(side_effect=[error, None])
+    monkeypatch.setattr(torch.cuda, "synchronize", sync)
     with pytest.raises(RuntimeError) as raised:
         prepared.close()
     assert raised.value is error
     assert close.call_count == int(owned)
-    assert prepared.closed and not prepared.parts
+    assert prepared.closed and len(prepared.parts) == 1
+    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    with pytest.raises(RuntimeError, match="closed"):
+        prepared()
     prepared.close()
+    assert not prepared.parts and sync.call_count == 2
     assert close.call_count == int(owned)
 
 
@@ -722,7 +792,7 @@ def test_rubin_gvr_prepared_cleanup_after_sync_error(
         cuda.CUresult.CUDA_ERROR_UNKNOWN,
     ],
 )
-def test_rubin_gvr_backfill_split(monkeypatch: pytest.MonkeyPatch, status) -> None:
+def test_rubin_gvr_backfill_split(monkeypatch: pytest.MonkeyPatch, status, mock_domain_api) -> None:
     executor = _test_executor()
 
     def resource(count):
@@ -782,7 +852,6 @@ def host_preparation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(torch.cuda, "synchronize", Mock())
     monkeypatch.setattr(locality, "_allocation_rows", lambda *_: (4, 4))
     monkeypatch.setattr(locality, "choose_locality", lambda *_: ("local_preserve", 4))
-    monkeypatch.setattr(cuda, "cuDeviceGetAttribute", lambda *_: (cuda.CUresult.CUDA_SUCCESS, 2))
     bound = Mock(
         side_effect=lambda *args, **kwargs: SimpleNamespace(cluster_size=1, launcher=("reg",))
     )
@@ -811,13 +880,13 @@ def test_rubin_gvr_implicit_split_fallback(
         operation == "split SM resources"
         and status == cuda.CUresult.CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION
     ):
-        prepared = locality.PreparedRowTopK(x, lengths, output, max_seq_len=32)
+        prepared = locality.PreparedRowTopK(x, lengths, output, max_seq_len=32, co_local=True)
         assert prepared.mode == "tuned" and prepared.executor is None
         assert not prepared.owns_executor and bound.call_count == 1
         prepared.close()
     else:
         with pytest.raises(locality._CudaError) as raised:
-            locality.PreparedRowTopK(x, lengths, output, max_seq_len=32)
+            locality.PreparedRowTopK(x, lengths, output, max_seq_len=32, co_local=True)
         assert raised.value is error and bound.call_count == 0
 
 
@@ -826,14 +895,24 @@ def test_rubin_gvr_bound_compile_failure_closes_owned_executor(host_preparation,
 
     x, lengths, output, bound = host_preparation
     executor = _test_executor()
-    executor.close = Mock()
+    success = (cuda.CUresult.CUDA_SUCCESS,)
+    monkeypatch.setattr(cuda, "cuStreamSynchronize", Mock(return_value=success))
+    destroy_stream = Mock(return_value=success)
+    destroy_context = Mock(side_effect=[(cuda.CUresult.CUDA_ERROR_UNKNOWN,), success, success])
+    monkeypatch.setattr(cuda, "cuStreamDestroy", destroy_stream)
+    monkeypatch.setattr(cuda, "cuGreenCtxDestroy", destroy_context)
     monkeypatch.setattr(locality, "LocalityDomainExecutor", Mock(return_value=executor))
     failure = DSLRuntimeError("bound compilation failed")
     bound.side_effect = failure
     with pytest.raises(DSLRuntimeError) as caught:
-        locality.PreparedRowTopK(x, lengths, output, max_seq_len=32)
+        locality.PreparedRowTopK(x, lengths, output, max_seq_len=32, co_local=True)
     assert caught.value is failure
-    executor.close.assert_called_once_with()
+    retry = caught.value.__cause__
+    assert isinstance(retry, locality.LocalityCleanupError) and retry.executor is executor
+    assert [d.ordinal for d in executor.domains] == [1]
+    retry.executor.close()
+    assert not executor.domains and destroy_stream.call_count == 2
+    assert destroy_context.call_args_list == [call("context1"), call("context0"), call("context1")]
 
 
 def test_rubin_gvr_preparation_alignment(host_preparation) -> None:
@@ -852,18 +931,66 @@ def test_rubin_gvr_preparation_alignment(host_preparation) -> None:
     prepared.close()
 
 
-@pytest.mark.parametrize("co_local", [None, True, False])
-def test_rubin_gvr_probe_semantics(host_preparation, monkeypatch, co_local) -> None:
+@pytest.mark.parametrize(
+    "options", [{}, {"co_local": None}, {"co_local": False}, {"co_local": True}]
+)
+def test_rubin_gvr_probe_semantics(host_preparation, monkeypatch, options) -> None:
     x, lengths, output, _ = host_preparation
     probe = Mock(return_value=None)
     create = Mock(side_effect=AssertionError("must not create resources"))
     monkeypatch.setattr(locality, "_allocation_rows", probe)
     monkeypatch.setattr(locality, "LocalityDomainExecutor", create)
-    prepared = locality.PreparedRowTopK(x, lengths, output, max_seq_len=32, co_local=co_local)
+    prepared = locality.PreparedRowTopK(x, lengths, output, max_seq_len=32, **options)
     assert prepared.mode == "tuned" and not prepared.locality_allocation
-    assert probe.call_count == (0 if co_local is False else 1)
+    assert probe.call_count == int(options.get("co_local") is True)
     create.assert_not_called()
     prepared.close()
+
+
+@pytest.mark.parametrize(
+    "query", ["first", "row_start", "last_byte", "interior", "domain_count", "granularity"]
+)
+@pytest.mark.parametrize("exception", [TypeError, RuntimeError])
+def test_rubin_gvr_optional_driver_query(monkeypatch, query, exception):
+    x = torch.empty((2, 32), dtype=torch.float32)
+    start = x.data_ptr()
+    stride = x.stride(0) * x.element_size()
+    success = cuda.CUresult.CUDA_SUCCESS
+    calls = 0
+
+    def ordinal(attr, ptr):
+        nonlocal calls
+        calls += 1
+        if (
+            (query == "first" and calls == 1)
+            or (query == "row_start" and ptr == start + stride)
+            or (query == "last_byte" and ptr == start + stride - 1)
+            or (query == "interior" and ptr == start + 16)
+        ):
+            raise exception("unsupported pointer query")
+        return success, int(ptr >= start + stride)
+
+    def attribute(kind, value):
+        if kind == query:
+            raise exception("unsupported device query")
+        return success, value
+
+    driver = SimpleNamespace(
+        CUresult=cuda.CUresult,
+        CUpointer_attribute=SimpleNamespace(CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL=1),
+        CUdevice_attribute=SimpleNamespace(CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT=2),
+        CUmemLocationType=SimpleNamespace(CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN=3),
+        CUmemAllocationType=cuda.CUmemAllocationType,
+        CUmemAllocationGranularity_flags=cuda.CUmemAllocationGranularity_flags,
+        CUmemAllocationProp=lambda: SimpleNamespace(
+            location=SimpleNamespace(localized=SimpleNamespace())
+        ),
+        cuPointerGetAttribute=ordinal,
+        cuDeviceGetAttribute=lambda *_: attribute("domain_count", 2),
+        cuMemGetAllocationGranularity=lambda *_: attribute("granularity", 16),
+    )
+    monkeypatch.setattr(locality, "cuda", driver)
+    assert locality._allocation_rows(x, 0) is None
 
 
 @pytest.mark.parametrize("invalid", ["closed", "device", "count"])
@@ -878,7 +1005,9 @@ def test_rubin_gvr_borrowed_executor_validation(host_preparation, invalid: str) 
         executor.domains.pop()
     executor.close = Mock()
     with pytest.raises(ValueError):
-        locality.PreparedRowTopK(x, lengths, output, max_seq_len=32, executor=executor)
+        locality.PreparedRowTopK(
+            x, lengths, output, max_seq_len=32, executor=executor, co_local=True
+        )
     executor.close.assert_not_called()
 
 
@@ -892,7 +1021,9 @@ def test_rubin_gvr_preserves_full_batch_plan(
         locality._Domain(i, count, Mock(), Mock(), Mock()) for i, count in enumerate(budgets)
     ]
     monkeypatch.setattr(locality, "_allocation_rows", lambda *_: counts)
-    prepared = locality.PreparedRowTopK(x, lengths, output, max_seq_len=32, executor=executor)
+    prepared = locality.PreparedRowTopK(
+        x, lengths, output, max_seq_len=32, executor=executor, co_local=True
+    )
     assert prepared.mode == "local_preserve"
     assert [call.args[0].shape[0] for call in bound.call_args_list] == list(counts)
     assert all(call.args[5:8] == (8, 208, 107) for call in bound.call_args_list)
@@ -909,6 +1040,9 @@ def test_rubin_gvr_failed_submission_join(
     first_done, second_done = Mock(), Mock()
     if event_failure:
         first_done.record.side_effect = RuntimeError("event failed")
+    order = Mock()
+    order.attach_mock(second_done.record, "record")
+    order.attach_mock(parent.wait_event, "wait")
     failure = KeyboardInterrupt("submission interrupted")
     prepared = locality.PreparedRowTopK.__new__(locality.PreparedRowTopK)
     prepared.device, prepared.executor, prepared.closed, prepared.mode = (
@@ -939,9 +1073,10 @@ def test_rubin_gvr_failed_submission_join(
     elif event_failure:
         first_stream.synchronize.assert_called_once()
     else:
-        assert [call.args[0] for call in parent.wait_event.call_args_list] == [
-            first_done,
-            second_done,
+        assert order.mock_calls == [
+            call.wait(first_done),
+            call.record(second_stream),
+            call.wait(second_done),
         ]
         first_stream.synchronize.assert_not_called()
         second_stream.synchronize.assert_not_called()
@@ -971,7 +1106,7 @@ def test_rubin_gvr_vmm_cleanup_all_mappings(monkeypatch, sync_failure: bool) -> 
 def test_rubin_gvr_initialization_preserves_error(monkeypatch, owned: bool) -> None:
     failure = ValueError("preparation failed")
     cleanup = RuntimeError("cleanup failed")
-    executor = SimpleNamespace(close=Mock(side_effect=cleanup))
+    executor = SimpleNamespace(domains=[object()], close=Mock(side_effect=[cleanup, None]))
 
     def initialize(prepared, *args, **kwargs):
         prepared.owns_executor, prepared.executor = owned, executor
@@ -982,10 +1117,36 @@ def test_rubin_gvr_initialization_preserves_error(monkeypatch, owned: bool) -> N
         locality.PreparedRowTopK(None, None, None, max_seq_len=32)
     assert raised.value is failure
     assert executor.close.call_count == int(owned)
-    assert raised.value.__cause__ is (cleanup if owned else None)
+    if owned:
+        retry = raised.value.__cause__
+        assert isinstance(retry, locality.LocalityCleanupError) and retry.__cause__ is cleanup
+        retry.executor.close()
+        assert executor.close.call_count == 2
+    else:
+        assert raised.value.__cause__ is None
 
 
-def test_rubin_gvr_executor_partial_creation_cleanup(monkeypatch) -> None:
+@pytest.fixture
+def mock_domain_api(monkeypatch):
+    monkeypatch.setattr(
+        cuda, "CUdevice_attribute", SimpleNamespace(CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT=1)
+    )
+    monkeypatch.setattr(cuda, "CU_DEV_SM_RESOURCE_GROUP_PARAMS", SimpleNamespace, raising=False)
+    monkeypatch.setattr(
+        cuda,
+        "CUdevSmResourceGroup_flags",
+        SimpleNamespace(
+            CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID=2, CU_DEV_SM_RESOURCE_GROUP_BACKFILL=4
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(cuda, "cuDevSmResourceSplit", Mock(), raising=False)
+
+
+@pytest.mark.parametrize("destroy_failure", [False, True])
+def test_rubin_gvr_executor_partial_creation_cleanup(
+    monkeypatch, mock_domain_api, destroy_failure
+) -> None:
     success = cuda.CUresult.CUDA_SUCCESS
     resource = SimpleNamespace(sm=SimpleNamespace(smCount=104))
     monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
@@ -1018,20 +1179,33 @@ def test_rubin_gvr_executor_partial_creation_cleanup(monkeypatch) -> None:
         lambda *_: (success, SimpleNamespace(sm=SimpleNamespace(smCount=104, localityDomainId=0))),
     )
     monkeypatch.setattr(cuda, "cuStreamSynchronize", lambda *_: (cuda.CUresult.CUDA_ERROR_UNKNOWN,))
-    stream_destroy = Mock(return_value=(success,))
+    stream_destroy = Mock(
+        side_effect=[(cuda.CUresult.CUDA_ERROR_UNKNOWN,), (success,)] if destroy_failure else None,
+        return_value=(success,),
+    )
     context_destroy = Mock(return_value=(success,))
     monkeypatch.setattr(cuda, "cuStreamDestroy", stream_destroy)
     monkeypatch.setattr(cuda, "cuGreenCtxDestroy", context_destroy)
     with pytest.raises(locality._CudaError) as raised:
         locality.LocalityDomainExecutor()
     assert raised.value.status == cuda.CUresult.CUDA_ERROR_OUT_OF_MEMORY
-    assert raised.value.__cause__.status == cuda.CUresult.CUDA_ERROR_UNKNOWN
+    cause = raised.value.__cause__
     stream_destroy.assert_called_once_with(20)
+    if destroy_failure:
+        assert isinstance(cause, locality.LocalityCleanupError)
+        assert [c.args[0] for c in context_destroy.call_args_list] == [11]
+        monkeypatch.setattr(cuda, "cuStreamSynchronize", lambda *_: (success,))
+        cause.executor.close()
+        assert not cause.executor.domains and stream_destroy.call_count == 2
+        cause = cause.__cause__
+    assert cause.status == cuda.CUresult.CUDA_ERROR_UNKNOWN
     assert [call.args[0] for call in context_destroy.call_args_list] == [11, 10]
 
 
 @pytest.mark.parametrize("invalid", ["counts", "alignment", "total"])
-def test_rubin_gvr_rejects_incompatible_backfill(monkeypatch, invalid: str) -> None:
+def test_rubin_gvr_rejects_incompatible_backfill(
+    monkeypatch, invalid: str, mock_domain_api
+) -> None:
     executor = _test_executor()
 
     def resource(count, alignment=4):
