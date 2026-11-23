@@ -5,7 +5,7 @@ import asyncio
 import atexit
 import contextlib
 import os
-import pickle
+import pickle  # nosec B403
 import queue
 import socket
 import sys
