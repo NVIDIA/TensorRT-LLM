@@ -1084,6 +1084,52 @@ def test_generate_async_submits_the_multimodal_cache_salt() -> None:
     assert submitted[1] == "user"
 
 
+@pytest.mark.parametrize("route", ["raw", "preprocessed", "processor_tensors"])
+def test_phi4mm_single_audio_encoder_inputs(route: str) -> None:
+    from tensorrt_llm._torch.models.modeling_phi4mm import (
+        HFPhi4MultimodalEncoder,
+        Phi4MMInputProcessor,
+    )
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    config = SimpleNamespace(model_type="phi4mm", vocab_size=200064, torch_dtype=torch.float32)
+    hf_processor = Mock(
+        spec=["image_processor", "audio_processor", "_convert_images_audios_text_to_inputs"]
+    )
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=hf_processor):
+        processor = Phi4MMInputProcessor("unused", config, Mock())
+    features = torch.tensor([[[2.0, 3.0]]])
+    audio = {"input_audio_embeds": features, "audio_embed_sizes": torch.tensor([1])}
+    hf_processor.audio_processor.return_value = audio
+    hf_processor._convert_images_audios_text_to_inputs.return_value = {
+        "input_ids": processor.get_mm_token_ids()[1:].reshape(1, 1).long(),
+        "input_image_embeds": torch.empty(0),
+        "image_sizes": torch.empty(0),
+        "image_attention_mask": torch.empty(0),
+        "audio_attention_mask": None,
+        **audio,
+    }
+    llm = _llm_with_mock_executor(processor)
+    llm.args.multimodal_config = None
+    inputs = {"prompt": "<|audio_1|>", "multi_modal_data": {"audio": [(np.zeros(320), 16000)]}}
+    if route == "preprocessed":
+        inputs = llm.preprocess(inputs)
+    elif route == "processor_tensors":
+        ids, extra = processor(inputs, None)
+        inputs = PreprocessedInputs(ids, MultimodalParams(**extra))
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(inputs)
+    params = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+    params.to_tensor("multimodal_data")
+
+    encoder = HFPhi4MultimodalEncoder.__new__(HFPhi4MultimodalEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.embed_tokens = torch.nn.Identity()
+    encoder.audio_embed = Mock(side_effect=lambda input_embeds, **kwargs: input_embeds)
+    (embedding,) = encoder._encoding_batch_request([params], processor.get_mm_token_ids())
+    torch.testing.assert_close(embedding, features[0])
+
+
 class _AttachWithoutSpansProcessor(_ProbeFakeProcessor):
     """Attaches embeddings as LLaVA-NeXT and Llama 4 do: no hashes and no item spans."""
 
@@ -1196,9 +1242,10 @@ def test_text_only_admission_of_preprocessed_media_and_decode_metadata() -> None
     from tensorrt_llm.llmapi.llm import PreprocessedInputs
 
     llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
-    params = MultimodalParams(multimodal_data={"multimodal_embedding": torch.zeros(2, 4)})
-    with pytest.raises(ValueError, match="supports text only"):
-        llm.generate_async(PreprocessedInputs([1, 2], params))
+    for embedding in (torch.zeros(2, 4), {"method_key": -1, "tensor_size": [0, 4]}):
+        params = MultimodalParams(multimodal_data={"multimodal_embedding": embedding})
+        with pytest.raises(ValueError, match="supports text only"):
+            llm.generate_async(PreprocessedInputs([1, 2], params))
     llm._executor.generate_async.assert_not_called()
 
     extra = {"multimodal_data": {"mrope_config": {"mrope_position_deltas": [0]}}}

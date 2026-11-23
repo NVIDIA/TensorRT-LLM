@@ -275,10 +275,12 @@ def test_prepared_embeddings_without_identity_get_private_block_keys(handoff_llm
     tokens = [1, 2, 99, 99, 99, 99, 3, 4]
     plain = BaseLLM.generate_async(handoff_llm, PreprocessedInputs(tokens), cache_salt=caller_salt)
     keys = _block_keys(plain)
-    for value in (1, 7):
-        params = MultimodalParams(
-            multimodal_data={"multimodal_embedding": torch.full((4, 4), value)}
-        )
+    for embeddings in (
+        torch.full((4, 4), 1),
+        torch.full((4, 4), 7),
+        [torch.empty(0, 4), torch.full((4, 4), 7)],
+    ):
+        params = MultimodalParams(multimodal_data={"multimodal_embedding": embeddings})
         prepared = PreprocessedInputs(tokens, params)
         for as_handle in (False, True):
             if as_handle:
@@ -302,7 +304,64 @@ def test_prepared_embeddings_without_identity_get_private_block_keys(handoff_llm
                 if as_handle:
                     params.release_handles()
 
-    assert len(set(keys)) == 10  # Two complete blocks for text and each of four attachments.
+    assert len(set(keys)) == 14  # Two complete blocks for text and each of six attachments.
+
+
+def test_zero_row_attachment_keeps_text_block_keys(handoff_llm):
+    from tensorrt_llm._torch.models.modeling_llava_next import LlavaNextInputProcessor
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    processor = object.__new__(LlavaNextInputProcessor)
+    processor._config = SimpleNamespace(
+        model_type="llava_next",
+        vocab_size=101,
+        image_token_index=99,
+        text_config=SimpleNamespace(hidden_size=4),
+    )
+    processor.image_token_index = 99
+    processor._processor = SimpleNamespace()
+    handoff_llm.input_processor = processor
+    handoff_llm._copy_prompt_inputs.side_effect = BaseLLM._copy_prompt_inputs
+    tokens = list(range(8))
+    text_keys = _block_keys(BaseLLM.generate_async(handoff_llm, tokens))
+    prepared = BaseLLM.preprocess(
+        handoff_llm,
+        {
+            "prompt_token_ids": [*tokens[:3], 99, *tokens[3:]],
+            "multi_modal_embeddings": {"image": torch.empty(0, 4, 4)},
+        },
+    )
+    try:
+        assert prepared.prompt_token_ids == tokens
+        handle = prepared.multimodal_params.multimodal_data["multimodal_embedding"]
+        assert handle["tensor_size"] == [0, 4]
+        assert len(text_keys) == 2
+        assert _block_keys(BaseLLM.generate_async(handoff_llm, prepared)) == text_keys
+    finally:
+        prepared.multimodal_params.release_handles()
+
+
+@pytest.mark.parametrize("as_list", [False, True])
+def test_text_only_accepts_zero_row_embedding_handle(handoff_llm, as_list):
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.inputs.registry import DefaultInputProcessor
+    from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
+
+    handoff_llm.input_processor = DefaultInputProcessor("unused", None, MagicMock())
+    tokens = list(range(8))
+    text_keys = _block_keys(BaseLLM.generate_async(handoff_llm, tokens))
+    empty = torch.empty(0, 4)
+    params = MultimodalParams(
+        multimodal_data={"multimodal_embedding": [empty] if as_list else empty}
+    )
+    params.to_handle("multimodal_data")
+    try:
+        result = BaseLLM.generate_async(handoff_llm, PreprocessedInputs(tokens, params))
+        assert _block_keys(result) == text_keys
+        # The worker must receive every IPC handle to consume the producer's reference.
+        assert result._generation_request.multimodal_params is params
+    finally:
+        params.release_handles()
 
 
 def test_generation_first_requires_shared_identity_without_item_spans(handoff_llm):

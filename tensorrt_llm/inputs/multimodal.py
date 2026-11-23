@@ -1073,7 +1073,8 @@ class MultimodalParams:
             )
         return metadata.item_refs, metadata.output_embedding_lengths
 
-    def _is_shared_tensor_dict(self, obj: Any) -> bool:
+    @staticmethod
+    def _is_shared_tensor_dict(obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
 
         Args:
@@ -1799,6 +1800,17 @@ def without_empty_mm_payloads(data: dict) -> dict:
     return data if len(nonempty) == len(data) else nonempty
 
 
+def _has_embedding_rows(embeddings: Any) -> bool:
+    if isinstance(embeddings, list):
+        return any(_has_embedding_rows(item) for item in embeddings)
+    if isinstance(embeddings, (torch.Tensor, np.ndarray)):
+        return 0 not in embeddings.shape
+    if MultimodalParams._is_shared_tensor_dict(embeddings):
+        shape = embeddings["tensor_size"]
+        return not isinstance(shape, (list, tuple)) or 0 not in shape
+    return embeddings is not None
+
+
 def _has_mm_payload_keys(py_multimodal_data: Optional[dict]) -> bool:
     """True iff py_multimodal_data contains vision/video/audio content keys.
 
@@ -1809,7 +1821,11 @@ def _has_mm_payload_keys(py_multimodal_data: Optional[dict]) -> bool:
     """
     if not py_multimodal_data:
         return False
-    return bool(set(py_multimodal_data.keys()) - _MM_METADATA_ONLY_KEYS)
+    payload_keys = py_multimodal_data.keys() - _MM_METADATA_ONLY_KEYS
+    if payload_keys == {"multimodal_embedding"}:
+        # Empty handles still travel to the worker so it can consume the IPC reference.
+        return _has_embedding_rows(py_multimodal_data["multimodal_embedding"])
+    return bool(payload_keys)
 
 
 # TODO(TRTLLM-11951): fold this gate into MultimodalRuntimeData.__post_init__

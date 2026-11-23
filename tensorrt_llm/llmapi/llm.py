@@ -966,6 +966,8 @@ class BaseLLM:
                     if not is_gen_only and any(m in nonempty
                                                for m in MEDIA_MODALITIES):
                         self._check_raw_media_encoder()
+                    # Encoders can require fields with empty tensors or None masks.
+                    nonempty = data
                     if (multimodal_params.multimodal_input is None and
                             nonempty.get(MULTIMODAL_CACHE_SALT_KEY) is None):
                         nonempty = dict(nonempty)
@@ -1257,10 +1259,11 @@ class BaseLLM:
                     prompt_token_ids, extra_processed_inputs,
                     cast(BaseMultimodalInputProcessor, self.input_processor))
                 if (extra_processed_inputs is not None and
-                        extra_processed_inputs.get("multimodal_input") is None):
+                        extra_processed_inputs.get("multimodal_input") is None
+                        and _has_mm_payload_keys(
+                            extra_processed_inputs.get("multimodal_data"))):
                     isolate_mm_request(
-                        extra_processed_inputs.setdefault(
-                            "multimodal_data", {}),
+                        extra_processed_inputs["multimodal_data"],
                         type(self.input_processor).__name__,
                         sorted(mm_embedding_info),
                         "embeddings attached without item spans")
