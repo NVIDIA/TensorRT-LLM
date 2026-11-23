@@ -1,0 +1,29 @@
+# AUTHORIZED SECURITY TEST — owner: weiminwang-nv (TRT-LLM infra).
+# Purpose: check whether a fork pull request can schedule a job onto the
+# repo's "blossom" self-hosted runner. Runs only harmless read-only commands
+# (hostname / whoami / id / uname). No secrets, no network calls, no checkout.
+# DO NOT MERGE. The PR will be closed and this file deleted after observation.
+
+name: SecTest Blossom Runner
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/sectest-blossom-runner.yml'
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: blossom
+    timeout-minutes: 10
+    steps:
+      - name: Show runner identity
+        run: |
+          echo "Authorized security test by weiminwang-nv (TRT-LLM infra owner)."
+          echo "Checking if a fork PR can land on the blossom self-hosted runner."
+          echo "host: $(hostname)"
+          echo "user: $(whoami)"
+          id
+          uname -a
+          echo "RUNNER_NAME=${RUNNER_NAME:-} RUNNER_OS=${RUNNER_OS:-}"
