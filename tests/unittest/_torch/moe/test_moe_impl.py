@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import ANY, MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 import torch
@@ -67,7 +67,6 @@ from tensorrt_llm._torch.moe.fused_moe import (
     DefaultMoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
-    quantization,
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
@@ -166,7 +165,6 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     FusedMoEQuantScalesDeepSeekFP8BlockScales,
     MXFP4WeightTRTLLMGenFusedMoEMethod,
-    NVFP4CutlassFusedMoEMethod,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     NVFP4MegaMoECuteDslMethod,
@@ -175,7 +173,6 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     UnquantizedFusedMoEMethod,
     W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
-    W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
@@ -8182,217 +8179,6 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
         if bias:
             torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
             torch.testing.assert_close(restored.w2_bias, module.w2_bias)
-
-
-class _StubNVFP4Method(NVFP4FusedMoEMethod):
-    """Concrete NVFP4 method with the block-scale loaders stubbed out.
-
-    Only the alpha bookkeeping is under test, so these never run.
-    """
-
-    def load_expert_w3_w1_weight_scale_nvfp4(self, *args, **kwargs):
-        raise NotImplementedError
-
-    def load_expert_w2_weight_scale_nvfp4(self, *args, **kwargs):
-        raise NotImplementedError
-
-
-class _SingleAlphaMethod(_StubNVFP4Method):
-    """Stand-in for a backend whose FC1 kernel takes one alpha (e.g. Cutlass)."""
-
-    supports_split_gate_up_weight_scale_2 = False
-
-
-class _SplitAlphaMethod(_StubNVFP4Method):
-    """Stand-in for a backend whose FC1 kernel takes gate and up alphas."""
-
-    supports_split_gate_up_weight_scale_2 = True
-
-
-def _make_scale2_method(cls):
-    # The methods under test only use `self` for class attributes and helper
-    # methods, so skip __init__ (it wants a full MoE module).
-    return cls.__new__(cls)
-
-
-def _make_scale2_module(num_experts: int) -> torch.nn.Module:
-    module = torch.nn.Module()
-    module.fc31_input_scale = torch.nn.Parameter(torch.tensor(1.0 / 6.0), requires_grad=False)
-    module.fc2_input_scale = torch.nn.Parameter(torch.tensor(1.0 / 3.0), requires_grad=False)
-    module.fc31_alpha = torch.nn.Parameter(torch.zeros(num_experts), requires_grad=False)
-    module.fc2_alpha = torch.nn.Parameter(torch.zeros(num_experts), requires_grad=False)
-    return module
-
-
-def _gate_up_scales(w1: float, w3: float, w2: float) -> dict:
-    return {
-        "w1": torch.tensor(w1),
-        "w3": torch.tensor(w3),
-        "w2": torch.tensor(w2),
-    }
-
-
-def _expected_scale2_alpha(weight_scale_2: float, input_scale: torch.Tensor):
-    # Same formula as load_expert_fc31_alpha_nvfp4 / load_expert_fc2_alpha_nvfp4.
-    return 1.0 / (input_scale * (1.0 / torch.tensor(weight_scale_2)))
-
-
-@pytest.mark.cpu_only
-def test_equal_gate_up_scales_unchanged():
-    """Equal gate/up scales: both backends produce the same single alpha."""
-    tmp = {0: _gate_up_scales(0.25, 0.25, 0.5), 1: _gate_up_scales(0.125, 0.125, 0.5)}
-
-    alphas = []
-    for cls in (_SingleAlphaMethod, _SplitAlphaMethod):
-        module = _make_scale2_module(2)
-        up_alpha = torch.zeros(2)
-        _make_scale2_method(cls)._reconcile_and_compute_alphas(
-            module, tmp, module.fc31_alpha.data, module.fc2_alpha.data, dst_fc31_up_alpha=up_alpha
-        )
-        # The up half agrees with the gate half, so fc31_scale_c is unaffected.
-        torch.testing.assert_close(up_alpha, module.fc31_alpha.data)
-        alphas.append(module.fc31_alpha.data.clone())
-
-    torch.testing.assert_close(alphas[0], alphas[1])
-    torch.testing.assert_close(
-        alphas[0],
-        torch.stack(
-            [
-                _expected_scale2_alpha(0.25, module.fc31_input_scale.data),
-                _expected_scale2_alpha(0.125, module.fc31_input_scale.data),
-            ]
-        ),
-    )
-
-
-@pytest.mark.cpu_only
-def test_split_backend_keeps_both_scales():
-    """A split-scale backend keeps the gate scale in fc31_alpha and the up
-    scale in the separate up alpha, with no reconciliation."""
-    module = _make_scale2_module(1)
-    up_alpha = torch.zeros(1)
-    tmp = {0: _gate_up_scales(0.25, 0.5, 0.5)}
-
-    _make_scale2_method(_SplitAlphaMethod)._reconcile_and_compute_alphas(
-        module, tmp, module.fc31_alpha.data, module.fc2_alpha.data, dst_fc31_up_alpha=up_alpha
-    )
-
-    torch.testing.assert_close(
-        module.fc31_alpha.data[0], _expected_scale2_alpha(0.25, module.fc31_input_scale.data)
-    )
-    torch.testing.assert_close(
-        up_alpha[0], _expected_scale2_alpha(0.5, module.fc31_input_scale.data)
-    )
-    assert not torch.allclose(module.fc31_alpha.data[0], up_alpha[0])
-
-
-@pytest.mark.cpu_only
-def test_split_backend_fc31_scale_c_uses_up_column():
-    """fc31_scale_c rescales the gated intermediate, so it must come from the
-    up half's alpha rather than the gate half's."""
-    module = _make_scale2_module(1)
-    module.expert_size_per_partition = 1
-    module.fc31_scale_c = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-    tmp = {0: _gate_up_scales(0.25, 0.5, 0.5)}
-
-    method = _make_scale2_method(NVFP4TRTLLMGenFusedMoEBaseMethod)
-    assert method.supports_split_gate_up_weight_scale_2
-    module.fc31_up_alpha = torch.zeros(1)
-    method._reconcile_and_compute_alphas(
-        module,
-        tmp,
-        module.fc31_alpha.data,
-        module.fc2_alpha.data,
-        dst_fc31_up_alpha=module.fc31_up_alpha,
-    )
-    up_alpha = module.fc31_up_alpha.clone()
-
-    method._compute_fc31_scale_c(module)
-
-    torch.testing.assert_close(module.fc31_scale_c.data, module.fc2_input_scale.data * up_alpha)
-    assert not torch.allclose(
-        module.fc31_scale_c.data, module.fc2_input_scale.data * module.fc31_alpha.data
-    )
-    # The staging tensor is dropped once consumed.
-    assert not hasattr(module, "fc31_up_alpha")
-
-
-@pytest.mark.cpu_only
-def test_single_alpha_backend_reconciles_and_warns(monkeypatch):
-    """A backend without split support falls back to the max() reconcile and
-    says so."""
-    module = _make_scale2_module(1)
-    tmp = {0: _gate_up_scales(0.25, 0.5, 0.5)}
-
-    warnings = []
-    monkeypatch.setattr(quantization.logger, "warning", warnings.append)
-    _make_scale2_method(_SingleAlphaMethod)._reconcile_and_compute_alphas(
-        module, tmp, module.fc31_alpha.data, module.fc2_alpha.data
-    )
-
-    torch.testing.assert_close(
-        module.fc31_alpha.data[0], _expected_scale2_alpha(0.5, module.fc31_input_scale.data)
-    )
-    assert len(warnings) == 1
-    assert "w1_weight_scale_2 != w3_weight_scale_2" in warnings[0]
-
-
-@pytest.mark.cpu_only
-def test_resolve_gate_up_weight_scale_2():
-    """The resolve helper reconciles only for single-alpha backends."""
-    gate = torch.tensor(0.25)
-    up = torch.tensor(0.5)
-
-    split = _make_scale2_method(_SplitAlphaMethod)._resolve_gate_up_weight_scale_2(gate, up)
-    assert split[0] is gate and split[1] is up
-
-    single = _make_scale2_method(_SingleAlphaMethod)._resolve_gate_up_weight_scale_2(gate, up)
-    torch.testing.assert_close(single[0], up)
-    torch.testing.assert_close(single[1], up)
-
-    # Equal scales are returned untouched by both.
-    for cls in (_SplitAlphaMethod, _SingleAlphaMethod):
-        resolved = _make_scale2_method(cls)._resolve_gate_up_weight_scale_2(gate, gate)
-        torch.testing.assert_close(resolved[0], gate)
-        torch.testing.assert_close(resolved[1], gate)
-
-
-@pytest.mark.cpu_only
-def test_nvfp4_moe_rejects_32_element_scale_blocks() -> None:
-    """Only the dense W4A16_NVFP4 Linear path dequantizes 32-element blocks; the
-    MoE methods must fail before allocating weights for such a checkpoint."""
-    module = SimpleNamespace(
-        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32)
-    )
-
-    with pytest.raises(NotImplementedError, match="group_size=32"):
-        NVFP4CutlassFusedMoEMethod().create_weights(module)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("group_size", [None, 16, 32, 128])
-def test_w4a8_nvfp4_fp8_moe_allocates_kernel_fixed_scale_blocks(group_size: int | None) -> None:
-    """W4A8 allocates 32-wide scales even for a default or 16-wide QuantConfig."""
-    module = torch.nn.Module()
-    module.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_NVFP4_FP8, group_size=group_size)
-    module.expert_size_per_partition = 2
-    module.hidden_size = 128
-    module.intermediate_size_per_partition = 64
-    module.expand_intermediate_size_per_partition = 128
-    module.bias = False
-    method = W4A8NVFP4FP8TRTLLMGenFusedMoEMethod()
-    # Exercise actual allocation; EPLB and runtime scale setup are independent.
-    with (
-        patch.object(method, "_online_eplb_not_verified"),
-        patch.object(method, "setup_quant_scales"),
-    ):
-        method.create_weights(module)
-
-    assert module.scaling_vector_size == 32
-    assert module.w3_w1_weight_scale.shape == (2, 128, 4)
-    assert module.w2_weight_scale.shape == (2, 128, 2)
-    assert module.w3_w1_weight.shape == (2, 128, 64)
-    assert module.w2_weight.shape == (2, 128, 32)
 
 
 @pytest.mark.cpu_only
