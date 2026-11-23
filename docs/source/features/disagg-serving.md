@@ -401,6 +401,27 @@ generation_servers:
 A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
 ```
 
+### DeepSeek-V4.1 DSpark context KV
+
+For ordinary native KV transfer, enable the same DSpark configuration on both
+context and generation workers, with KV cache manager V2 and the Python/NIXL
+transceiver:
+
+```yaml
+context_servers:
+  speculative_config: &dspark
+    decoding_type: DSpark
+    max_draft_len: 5
+generation_servers:
+  speculative_config: *dspark
+```
+
+The context worker computes draft KV and transfers it in request-private pages
+owned by the target's KV cache manager. A reused context prefix rebuilds the
+draft's retained suffix. Generation reads these pages directly. With no load
+balancer configured, the context worker also omits the draft head and MoE
+weights. This profile uses `bounded_replay_on_generation: false`, the default.
+
 ### DeepSeek-V4.1 context decoder weights
 
 Set `bounded_replay_on_generation: true` at the top level of the
