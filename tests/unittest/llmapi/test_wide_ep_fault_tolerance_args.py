@@ -42,6 +42,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     KvCacheConnectorConfig,
     KVEventsConfig,
+    MemoryMonitorConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
     PARDDecodingConfig,
@@ -95,6 +96,8 @@ def _args(**fields) -> TorchLlmArgs:
         # Whoever starts the executor checks the orchestrator, not the arguments.
         {"orchestrator_type": "rpc"},
         {"orchestrator_type": "ray"},
+        # The default memory monitor reports out-of-memory errors on each rank on its own.
+        {"memory_monitor_config": MemoryMonitorConfig(mode="oom")},
         # Without fault tolerance, nothing is checked.
         {
             "enable_wide_ep_fault_tolerance": False,
@@ -259,12 +262,23 @@ def test_supported_configuration_is_accepted(fields):
             {"enable_return_routed_experts": True},
             "no routed-expert capture (enable_return_routed_experts=False), because a step",
         ),
+        (
+            {"memory_monitor_config": MemoryMonitorConfig(mode="full")},
+            "no full memory monitor (memory_monitor_config.mode other than 'full'",
+        ),
     ],
 )
 def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+def test_full_memory_monitor_from_environment_rejected(monkeypatch):
+    """Refuse the full memory monitor that TLLM_MEM_MONITOR selects, as the configuration's."""
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    with pytest.raises(ValueError, match=re.escape("no full memory monitor")):
+        _args()
 
 
 def test_check_leaves_args_unchanged():

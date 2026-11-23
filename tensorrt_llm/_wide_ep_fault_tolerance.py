@@ -91,6 +91,9 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     load_balancer = llm_args.moe_config.load_balancer
     balancer_mode = None if load_balancer is None else load_balancer.mode
     warmup_placement = getattr(load_balancer, "warmup_placement", None)
+    # The TLLM_MEM_MONITOR variables are folded into the configuration before this check.
+    memory_monitor = llm_args.memory_monitor_config
+    memory_monitor_mode = None if memory_monitor is None else memory_monitor.mode
     adp_routing = [
         name
         for name in (
@@ -250,6 +253,12 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 not llm_args.enable_return_routed_experts,
                 "no routed-expert capture (enable_return_routed_experts=False), because a step "
                 "that a failure discards would leave its routes in the request's routes",
+            ),
+            (
+                memory_monitor_mode != "full",
+                "no full memory monitor (memory_monitor_config.mode other than 'full', and no "
+                "TLLM_MEM_MONITOR=1), because full mode duplicates the MPI world's communicator to "
+                "gather every rank's report, while each rank is its own MPI world",
             ),
         ]
     )
