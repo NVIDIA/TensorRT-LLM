@@ -16,14 +16,10 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from ....ops.common.k3_ull_decode_shapes import Choice, Path, rows_policy
 from ....ops.common.k3_ull_cute_host import fake, layout, prepare_shared_carveout, stream, to_cute
 from ...k3r_common.ull.policy import batch_table
 from .kernel import KdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
-from .verify_stream import KdaVerifyStream
-from .verify_stream3 import KdaVerifyStream3
-from .verify_wide import KdaVerifyHalves, KdaVerifyWide
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
 # TP16 6), from GB300 sweeps: early predecessor-independent loads (MMA gate modes only;
@@ -84,60 +80,8 @@ VERIFY_ROWS: dict[tuple[int, int], str] = {(10, 7): "8:2.1"}
 # TP16 B8 x q8, the same chain: 13.50 -> 12.49 us per call vs VERIFY_ROWS (one LDS.128
 # per operand per lane-token).
 VERIFY_COLS: dict[tuple[int, int], str] = {(10, 7): "8:1"}
-# Per compute capability: request counts whose plain (not prepared) verify runs one
-# 16-warp CTA per (request, head) (1: ``KdaVerifyWide``) or a cluster of two 8-warp
-# CTAs (2: ``KdaVerifyHalves``) instead of KdaSplit; both bitwise. 3 / 4: the chunked
-# verify (``KdaVerifyStream`` / ``KdaVerifyStream3``, q <= 4, BF16 state; not
-# bitwise). Rubin TP16, 1-GPU verify alone (69 layers, cold slots), us per layer
-# KdaSplit / Wide / Halves: q8 B16 9.60 / 10.62 / 8.93, B24 16.88 / 11.10 / 11.98,
-# B32 18.13 / 11.21 / 12.13, B48 24.76 / 21.51 / 19.75, B64 27.44 / 22.21 / 23.73; q4
-# B16 6.27 / 6.40 / 5.57, B24 10.57 / 6.82 / 7.27, B32 11.93 / 7.10 / 7.49, B48 16.76
-# / 13.58 / 12.58, B64 18.31 / 14.10 / 14.80 (Halves fill SMs where one CTA per head
-# leaves a short second wave).
-# B16 is Wide: beside its neighbours (1-GPU chain: AttnRes stand-in, in-projection,
-# verify, o-projection footprint; the o-projection's PDL wait returned, us after the
-# AttnRes) KdaSplit / Halves / Wide q8 21.74 / 22.61 / 21.52, q4 10.62 / 11.10 / 10.21;
-# Halves also trails Wide at B24 / B32 there (q8 +0.85 / +1.07, q4 +1.04 / +0.99).
-VERIFY_WIDE: dict[tuple[int, int], str] = {(10, 7): "16-32:1,33-48:2,49-64:1"}
-# Per compute capability and verify length q: rows read on top of DEVICE_SPEC_SCHEDULE
-# ({q: {heads: spec}}) and of VERIFY_ROWS / VERIFY_COLS / VERIFY_WIDE / VERIFY_LOAD_NORM
-# ({q: spec}), which key on the request count alone. A row here moves only that q's
-# kernels (the same request count runs other rows at other q).
-# Rubin TP16 q4 (DL3), from a 1-GPU sweep of the in-projection -> verify chain between
-# tail / AttnRes / o-projection stand-ins (o-projection PDL-wait release after the
-# AttnRes end, us per layer, every arm bitwise): 6 requests two CTAs per SM instead of
-# three (1.8.3.8 -> 1.8.2.8: 11.78 -> 10.46), 14 requests likewise (1.8.3.4 -> 1.8.2.4:
-# 14.53 -> 13.86); 12 requests on KdaVerifyWide (KdaSplit 1.8.3.8 16.19 -> 13.54).
-# 33-34 requests on KdaVerifyWide instead of VERIFY_WIDE's Halves (graph us per layer,
-# cuBLAS in-projection: 30.00 -> 28.90, 30.13 -> 29.03); Halves stays at 36-48 (Wide
-# +0.1..+0.5) and Wide at 50-64 (Halves +0.1..+2.0).
-# 36-256 requests on KdaVerifyStream3 (4: the chunked verify with tensor-core row dots;
-# not bitwise: u_t / o_t from dots against the step's base state, FP64-band checked)
-# instead of Wide / Halves / the default-geometry KdaSplit (no row above 64). 1-GPU
-# verify alone, 69 layers, own cold BF16 slots, us per layer, Wide / Halves / Stream3:
-# B33 6.27 / 7.08 / 6.70 (Wide: one wave of 198 CTAs), B36 10.92 / 11.21 / 8.94, B48
-# 11.66 / 12.38 / 9.27, B64 12.28 / 13.88 / 10.29, B96 18.65 / - / 16.26, B128 25.03 /
-# - / 19.44, B192 37.22 / - / 28.51, B256 49.13 / - / 37.25 (KdaSplit default at B96 /
-# 128 / 192: 36.38 / 47.60 / 69.85).
+# Per verify length overrides for the split-K schedule.
 DEVICE_SPEC_SCHEDULE_Q: dict = {(10, 7): {4: {6: "6:1.8.2.8,14:1.8.2.4"}}}
-VERIFY_Q: dict = {
-    "rows": {},
-    "cols": {},
-    "wide": {(10, 7): {4: "12:1,33-34:1,65-256:4"}},
-    "load_norm": {},
-}
-_VERIFY = {
-    "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
-    "load_norm": VERIFY_LOAD_NORM,
-}  # fmt: skip
-
-
-def verify_table(name, capability, tokens):
-    """The request-keyed verify table ``name`` ("rows", "cols", "wide", "load_norm")
-    at ``capability`` with VERIFY_Q's rows for verify length ``tokens`` on top."""
-    base = _VERIFY[name].get(capability, "")
-    extra = VERIFY_Q[name].get(capability, {}).get(tokens, "")
-    return batch_table(",".join(filter(None, (base, extra))))
 
 
 @cache
@@ -162,10 +106,9 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
     requests = batch // tokens
     options = (heads, requests, gate_mode, has_bias, schedule, tokens, bf16_state)
     kernel: KdaSplit
-    rows = verify_table("rows", capability, tokens).get(requests, 1)
+    rows = batch_table(VERIFY_ROWS.get(capability, "")).get(requests, 1)
     rows = rows if isinstance(rows, tuple) else (rows,)
-    cols = verify_table("cols", capability, tokens).get(requests)
-    wide = verify_table("wide", capability, tokens).get(requests)
+    cols = batch_table(VERIFY_COLS.get(capability, "")).get(requests)
     if prepared and cols is not None:  # the transposed recurrence
         kernel = KdaVerifyCols(*options, cols)
     elif (
@@ -174,12 +117,9 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
         kernel = KdaVerifyRows(*options, *rows)
     elif prepared:  # the gates and betas arrive activated (the in-projection epilogue)
         kernel = KdaVerifyPrepared(*options)
-    elif tokens > 1 and wide is not None:  # one or two CTAs per (request, head)
-        kinds = (KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3)
-        kernel = kinds[wide - 1](*options)
     else:
         lean = tokens > 1 and capability in LEAN_VERIFY
-        norm = verify_table("load_norm", capability, tokens).get(requests)
+        norm = batch_table(VERIFY_LOAD_NORM.get(capability, "")).get(requests)
         kernel = KdaSplit(*options, lean, bool(norm))
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     with torch.accelerator.device_index(device):
@@ -273,30 +213,3 @@ class PreparedKda:
         views = tuple(to_cute(t, 16) for t in tensors)
         kernel(*views[:13], *self.scalars, *views[13:], stream(self.device))
         return out
-
-
-# Verify shapes above the tuned rows (``runtime.wide``) whose KDA core runs the stock
-# KDA forward from the in-projection rows (seam S1) instead of KdaSplit, by q ("*":
-# any).
-# Set from in-graph A/Bs: generic KdaSplit at B32-64 sits 7.7-8.3x its byte floor
-# (sol5), the stock crossover is being measured (kdarec); empty: KdaSplit everywhere.
-STOCK_ROWS: dict = {"*": ""}
-
-
-def verify_kernel(requests, tokens, capability):
-    """The plain (not prepared) verify kernel ``executable`` builds for ``requests`` x
-    ``tokens`` (coverage notes): "wide", "halves" (VERIFY_WIDE) or "kdasplit"."""
-    wide = verify_table("wide", capability, tokens).get(requests)
-    kinds = ("kdasplit", "wide", "halves", "stream", "stream3")
-    return kinds[wide if tokens > 1 and wide else 0]
-
-
-def choose(shape, ctx):
-    """The KDA core of a wide decode shape (the runtime's family hook): KdaSplit (or
-    VERIFY_WIDE's KdaVerifyWide / Halves) at any requests and q (GENERIC), or the
-    stock KDA core (STOCK, seam S1)."""
-    if rows_policy(STOCK_ROWS, shape, default=0):
-        return Choice(Path.STOCK, note="S1")
-    capability = (10, 7) if ctx.arch == "rubin" else None
-    kernel = verify_kernel(shape.requests, shape.q, capability)
-    return Choice(Path.GENERIC, note=f"{kernel} {shape.requests}x{shape.q}")

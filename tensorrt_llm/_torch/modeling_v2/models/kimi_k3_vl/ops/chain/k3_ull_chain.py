@@ -1521,7 +1521,7 @@ class K3UllChain:
         self.tail_box = k.tail_runtime.MoeTailBox(*owner)
         twoshot = k.twoshot.TwoShot(*owner)
         self.front_box = k.oproj.OprojMailbox(*owner, (1, 64, LATENT + 2 * EXPERTS))
-        small_batch = k.small_batch.SmallBatchBox(*owner)
+        small_batch = k.small_batch.SmallBatchBox(self.device, self.tp)
         self.boxes = (mailbox, twoshot, small_batch)
         self.attention: Dict[int, object] = {}
         self.feed_forward: Dict[int, object] = {}

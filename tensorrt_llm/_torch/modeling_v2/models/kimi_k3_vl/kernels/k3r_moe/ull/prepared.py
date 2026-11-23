@@ -46,7 +46,6 @@ class PreparedMoE:
     def __init__(self, front, experts, tail, state, *, prefetch=None, layer_idx=None):
         self.front, self.experts, self.tail, self.state = front, experts, tail, state
         self.prefetch, self.layer_idx = prefetch, layer_idx
-        self.small_batch = None  # optional small-batch chain
         # Split batches whose routed experts launch beside the shared expert's
         # gate/up half instead of after it.
         self.join = batch_table(JOIN[state.tp])
@@ -78,8 +77,6 @@ class PreparedMoE:
         state, b = self.state, x.shape[0]
         if b > CAP:
             raise ValueError(f"MoE supports at most {CAP} token rows, got {b}")
-        if self.small_batch is not None and b in self.small_batch.batches:
-            return self.small_batch.run(out, consume)
         main = torch.cuda.current_stream(state.device)
         # The shared expert runs on the side stream beside the routed experts, or, when
         # the persistent expert grid spans every SM, beside the front only. Split: its

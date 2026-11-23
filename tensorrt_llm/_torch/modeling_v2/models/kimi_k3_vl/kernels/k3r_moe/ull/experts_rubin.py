@@ -121,31 +121,6 @@ def image_chunk(plan, token, chunk, words):
         store_words(dst, (word, Uint32(0), Uint32(0), Uint32(0)))
 
 
-class ImagePlanKernel:
-    """Standalone image-plan writer (benchmarks, tests): one CTA per token."""
-
-    def __init__(self, batch):
-        self.batch = batch
-
-    @cute.jit
-    def __call__(self, *args):
-        launch(self.kernel, args, self.batch, 256)
-
-    @cute.kernel
-    def kernel(self, args):
-        x, plan = args
-        tid, _, _, token = thread()
-        cute.arch.griddepcontrol_wait()
-        for i in cutlass.range_constexpr(2):
-            chunk = tid + 256 * i
-            if chunk < 448:
-                words = load_words(
-                    x.iterator + token * 3584 + chunk * 8, count=4, mutable=True
-                )
-                image_chunk(plan, token, chunk, words)
-        cute.arch.griddepcontrol_launch_dependents()
-
-
 # Named barrier: the MMA and epilogue warps' last tcgen05 operation (warp 3 then frees
 # the TMEM): warps 1, 3 and 4-11.
 TMEM_DONE = 7

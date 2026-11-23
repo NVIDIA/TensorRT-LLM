@@ -104,7 +104,7 @@ class ExpertsGeometry:
         # counters [slots] and unit counts [2], hidden images [2, 1024].
         self.ws_calls = self.ws_stage + 1024 * 3584 * 2
         self.ws_units = self.ws_calls + 1024
-        # Pregrouped unit table (``ExpertsGroupKernel``): header (units, call, grouped
+        # Pregrouped unit table: header (units, call, grouped
         # call), experts [1024], rows [1024, 8].
         self.ws_group = self.ws_units + 2 * 1024 * self.h_compact_bytes
         # FC2(B) tail claim counters [2 parities, slots] (``ExpertsKernel.steal``).
@@ -153,8 +153,8 @@ def mx_block(words):
     return packed, scale
 
 
-# Grouped expert plan, written before the experts run (by the routing kernel's copy
-# role, or ExpertsPlanKernel): MXFP8 rows [64, 3584] then scale words [64, 28, 16 B]
+# Grouped expert plan, written by the routing kernel before the experts run:
+# MXFP8 rows [64, 3584] then scale words [64, 28, 16 B]
 # (bytes 0-3 used), the layout of the experts' per-slot SMEM images.
 PLAN_XSF = 64 * 3584
 PLAN_BYTES = PLAN_XSF + 64 * 448
@@ -187,31 +187,6 @@ def plan_chunk(plan, token, chunk, words):
     if chunk % 16 == 0:
         dst = plan.iterator + PLAN_XSF + token * 448 + chunk // 16 * 16
         store_words(dst, (word, Uint32(0), Uint32(0), Uint32(0)))
-
-
-class ExpertsPlanKernel:
-    """Standalone plan writer (no routing kernel in front): one CTA per token."""
-
-    def __init__(self, batch):
-        self.batch = batch
-
-    @cute.jit
-    def __call__(self, *args):
-        launch(self.kernel, args, self.batch, 256)
-
-    @cute.kernel
-    def kernel(self, args):
-        x, plan = args
-        tid, _, _, token = thread()
-        cute.arch.griddepcontrol_wait()
-        for i in cutlass.range_constexpr(2):
-            chunk = tid + 256 * i
-            if chunk < 448:  # warp-uniform: chunks 256-447 are warps 0-5
-                words = load_words(
-                    x.iterator + token * 3584 + chunk * 8, count=4, mutable=True
-                )
-                plan_chunk(plan, token, chunk, words)
-        cute.arch.griddepcontrol_launch_dependents()
 
 
 @asm()
@@ -297,7 +272,7 @@ class ExpertsKernel(ExpertsGeometry):
     caller launches the experts only after the shared expert completed). Capacity > 8
     (grouped) takes the plan (``PLAN_BYTES``: MXFP8 x) in place of x. ``stream`` runs
     capacity <= 8 on the incremental producer and CTA-scoped waits (grouped always).
-    ``pregrouped`` (grouped) reads the unit table ``ExpertsGroupKernel`` left in the
+    ``pregrouped`` (grouped) reads the unit table from the
     workspace instead of grouping the routes itself.
     ``steal`` (grouped) balances the end: each CTA's last ``zone`` FC2(B) grains (TP8 a
     tile pair, TP16 three tiles) are claimed by the owner from the front and by the
@@ -1588,44 +1563,3 @@ class ExpertsKernel(ExpertsGeometry):
                     grouped[self.grid + cta] = generation + 1
                 if cta == 0:
                     grouped[self.slots + (generation & 1)] = distinct
-
-
-class ExpertsGroupKernel(ExpertsKernel):
-    """One CTA groups the routes into the workspace unit table that pregrouped
-    ``ExpertsKernel`` read (launched after routing, beside the shared expert). Every
-    experts call advances all slot call counters, so entry 0 stands for each CTA's."""
-
-    def __init__(self, *args, early=False, slots=160):
-        super().__init__(*args, slots=slots)
-        self.threads = 1024
-        # early: release the experts at entry, so their launch and prologue overlap
-        # this kernel's dependency wait and grouping (they still wait for its end).
-        self.early = early
-
-    @cute.jit
-    def __call__(self, *args):
-        launch(self.kernel, args, 1, self.threads)
-
-    @cute.kernel
-    def kernel(self, args):
-        ids, workspace, batch = args
-        tid = thread()[0]
-        sm = alloc(cutlass.utils.SmemAllocator(), Uint8, 32768 + 16, 1024)
-        units = view(sm.iterator, 32768, Int32, 3)
-        if cutlass.const_expr(self.early):
-            cute.arch.griddepcontrol_launch_dependents()
-        cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(not self.early):
-            cute.arch.griddepcontrol_launch_dependents()
-        self.group(sm, ids, workspace, batch, units)
-        experts, _, words = self.tables(sm, False)
-        table = workspace.iterator + self.ws_group
-        out_experts = view(table, 16, Int32, 1024)
-        for i in range(tid, units[0], self.threads):
-            out_experts[i] = experts[i]
-            row = tuple(words[4 * i + k] for k in range(4))
-            store_words(table + 16 + 4096 + 16 * i, row)
-        if tid == 0:
-            offsets = (self.ws_counter, self.ws_calls)
-            calls = [Uint32(view(workspace.iterator, o, Int32, 1)[0]) for o in offsets]
-            store_words(table, (Uint32(units[0]), *calls, Uint32(0)))

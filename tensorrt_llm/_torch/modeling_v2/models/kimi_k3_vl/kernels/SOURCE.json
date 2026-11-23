@@ -459,30 +459,11 @@
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/prepared.py",
      "source_sha256": "a361c786fbb885ded05483fe54e48fe9b336878d8b944c5865a6783c8bd2105a",
      "import_edits": 0,
-     "sha256": "a88957c1c4556472e641d3ff986f5dde16afe41378b3606b841bc72c87ec2045",
+     "sha256": "61ce1f3ab46d1b2f76e9c39bf2f2b55a50371e989ce09e14025c0077ec007ae4",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/prepared.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
-     ]
-    },
-    "kernels/k3r_attn_res/ull/rows.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/rows.py",
-     "source_sha256": "a7022cc3c48895a23e1b988afb5e3cd94a2b6f47aca79c3b80f15758e2b72257",
-     "import_edits": 0,
-     "sha256": "7514226c3d82223e13396444a66019ddc1b14b98779042a6616038212f712b47",
-     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/rows.py",
-     "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
-     ]
-    },
-    "kernels/k3r_attn_res/ull/sharded.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/sharded.py",
-     "source_sha256": "47cf2ef9d10e57ccb99efdb488248570f99e16cdc3351c9a9d676073ca8d1974",
-     "import_edits": 0,
-     "sha256": "839376dd0a6e0843cb584ec65ecc426f0b3d2c0fb22a187ff3ce680ed6cb3b7d",
-     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/sharded.py",
-     "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Remove the unbound ring-row and row-sharded paths while retaining the active ring and fused MXFP8 outputs."
      ]
     },
     "kernels/k3r_comm/ull_twoshot.py": {
@@ -683,10 +664,11 @@
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/prepared.py",
      "source_sha256": "c61491c3b9ea0af552ba3966340f4e87c8b6862cf0f90e18a0a1ade8dbafbf44",
      "import_edits": 0,
-     "sha256": "95f3e585a7e1caeceab8649dc6de01b421669f13bca5a4263e8e89cdd22bce94",
+     "sha256": "b72648fbe3f88708f6f78aa545a72c8660687af4af5c494105913b044cbd3fbd",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/prepared.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Remove wide and stream verify selection outside the ULL q=8 and up-to-64-token prepared recipe."
      ]
     },
     "kernels/k3r_kda/ull/verify.py": {
@@ -695,36 +677,6 @@
      "import_edits": 0,
      "sha256": "8718e8eb0d5d792d0e209ab4ffb9de0067ba0b69313d00226643b7b77aa8fddd",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify.py",
-     "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
-     ]
-    },
-    "kernels/k3r_kda/ull/verify_stream.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream.py",
-     "source_sha256": "83625f8c24a3e24b501d5515d31375abb4580a0f7c6483f1351aa961a30a91d2",
-     "import_edits": 0,
-     "sha256": "06a44c5bd251e696e0546786df070643dceff838dbc530e2d895f9b640fb708d",
-     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_stream.py",
-     "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
-     ]
-    },
-    "kernels/k3r_kda/ull/verify_stream3.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream3.py",
-     "source_sha256": "572b6ffa88a4e5d006610041a6b35321a914c70cf488d9805dc23da12e8e2eff",
-     "import_edits": 0,
-     "sha256": "c5e8952840f70c22ec902964891f5b9a6474e600542a4eef7c0756226e32082a",
-     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_stream3.py",
-     "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
-     ]
-    },
-    "kernels/k3r_kda/ull/verify_wide.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_wide.py",
-     "source_sha256": "fed84fd29d5bde5e71430ec94e651d04974cc5f68da40a611fb8f31444c4c6a5",
-     "import_edits": 0,
-     "sha256": "2299903b9a23a1ecf4995851893390eb80544b58a5252d9880065adbdfcb50e3",
-     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_wide.py",
      "local_edits": [
       "Updated import paths for the Kimi K3 family layout."
      ]
@@ -740,20 +692,22 @@
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts.py",
      "source_sha256": "c5633071d8864f274df9e84fca18154d8570bd4238366a12a23b82fca35606dd",
      "import_edits": 0,
-     "sha256": "cf58687ba54edb2530d3944d6c280f9e5933cbb915c26cc27512ea664476f3a1",
+     "sha256": "79eddcb07a419b3c1fc59f81bf3ef486212c1a485574e065b1e628773847a258",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Remove the unused legacy plan and pregrouped kernel entry points."
      ]
     },
     "kernels/k3r_moe/ull/experts_rubin.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_rubin.py",
      "source_sha256": "9754094753737e3765c2352c09e919c821e55595eff2f18f530fe393756eac07",
      "import_edits": 0,
-     "sha256": "62c49d0ecc55396d847d148ea7bf24fb6cacce491dfa3b1d858f88c0d08eea2f",
+     "sha256": "82e496dae6caf2d7a1790116d5d308fc9842ea3ab37d8bb75c13ad181f9c3902",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_rubin.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Remove the unused standalone image-plan kernel while preserving the NVFP4 expert base."
      ]
     },
     "kernels/k3r_moe/ull/experts_rubin64.py": {
@@ -812,11 +766,12 @@
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/prepared.py",
      "source_sha256": "73e79e31838aed2b40c404e4812fcd40fc6ccdabf14a3e5f1a838445a9d5ee32",
      "import_edits": 4,
-     "sha256": "ce3e633199c5000a3b080930647fbeee2675bb4d4aa5de7c6f0a3f8edb48febd",
+     "sha256": "6a3a719d2b90b6ba030864337445cc1d87adfa6aa40d37478d705aab84678bb3",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/prepared.py",
      "local_edits": [
       "Updated import paths for the Kimi K3 family layout.",
-      "Remove the unreachable wide front and tail and the unused legacy expert scratch; retain the narrow NVFP4 execution."
+      "Remove the unreachable wide front and tail and the unused legacy expert scratch; retain the narrow NVFP4 execution.",
+      "Remove the small-batch chain branch, which had no construction site in this target."
      ]
     },
     "kernels/k3r_moe/ull/routing.py": {
@@ -850,40 +805,22 @@
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/chain.py",
      "source_sha256": "6f16c87b43ebe88869c46f93a7ab972f3ea80effe1c0782b2847b03ab2eed83c",
      "import_edits": 0,
-     "sha256": "2858aec1522b6a6384a4726daa19d7c2ffd4d432aa297de4f3b84fe0abb089a7",
+     "sha256": "37f3884ab0aa518be5e2c744c5e2d6b42ed8390551c33806981f15a85f34db27",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/chain.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
-     ]
-    },
-    "kernels/k3r_moe/ull/small_batch/experts.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/experts.py",
-     "source_sha256": "40ef681004a0295d4508b18d8aa46b6fa2c04f8da0ea9f054f3e67b1ca8fd8aa",
-     "import_edits": 0,
-     "sha256": "a5429de8d7a97d6b62087b2a5ede678a93b6959a7edc2a5c856575f424d97f46",
-     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/experts.py",
-     "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Keep the front and hint views consumed by the live O-projection and expert paths, and remove the unused chain."
      ]
     },
     "kernels/k3r_moe/ull/small_batch/front_tp16.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp16.py",
      "source_sha256": "b25ae13012fcd1a532ed6885ceefc353fd89604622769673876f886cca429eae",
      "import_edits": 0,
-     "sha256": "526bdd5c493f9a836f21c05a779af8b5d7c2856b5fa3d874aa486f9467083750",
+     "sha256": "1d69d0a17abbf3521a2110b33bb68ab939652d80cc6a2ff21bd4bf9df78f2677",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/front_tp16.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
-     ]
-    },
-    "kernels/k3r_moe/ull/small_batch/front_tp8.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp8.py",
-     "source_sha256": "c9c1b5ba5dd3b4299494b45b47a23ec43ba3dca753d3c25fa88c502da523ef12",
-     "import_edits": 0,
-     "sha256": "83257d5540801c839da6ff3293ef7f359bc1ac4905da34aced12f77e6628eb5f",
-     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/front_tp8.py",
-     "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Retain the startup TP16 placement probe and remove the unused small-batch front kernel."
      ]
     },
     "kernels/k3r_moe/ull/tail.py": {
@@ -927,20 +864,22 @@
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/prepared.py",
      "source_sha256": "2c2522b427aa84b7bd8b9189e56989d5c76da022ad0951f9ba007e3e7c1faf18",
      "import_edits": 0,
-     "sha256": "7d2112104ab09c348d177605628c3ada8ac12e34432670c425f59a4f9650efab",
+     "sha256": "70ef1db2c3d86e2970461fde7be6f3ef8beb6347bc459502fd401f45c33adfc5",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/prepared.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Remove the oversized and row-owner paths while retaining the active O-projection and two-shot consumer."
      ]
     },
     "kernels/k3r_oproj/ull/producer.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/producer.py",
      "source_sha256": "8c8b690c41e27f0d8f3b672d225fd1661bcdb471db89ec31eba916925bfe86ec",
      "import_edits": 0,
-     "sha256": "bc60495ff3d3449eb82e2ab76ed90813d6db811ebabe85b4c41ee877b9266cf3",
+     "sha256": "5516a94c1934a44fa9ca80b652625162ecff41ef5dd50436532c05758b92507d",
      "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/producer.py",
      "local_edits": [
-      "Updated import paths for the Kimi K3 family layout."
+      "Updated import paths for the Kimi K3 family layout.",
+      "Remove the oversized O-projection producer while retaining the active producer kernels."
      ]
     },
     "ops/chain/k3_ull_prefetch.py": {

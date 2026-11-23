@@ -18,8 +18,6 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cute.runtime import make_fake_stream
 
-from ....ops.common.k3_ull_decode_shapes import Choice, Path, Shape, rows_policy
-from ...k3r_attn_res.ull.sharded import compile_gather, owned
 from ....ops.common.k3_ull_cute_host import (
     dynamic_fake,
     dynamic_view,
@@ -31,40 +29,11 @@ from ....ops.common.k3_ull_cute_host import (
 from ...k3r_common.ull.policy import batch_table
 from ...k3r_gemm.ull.projection import weight_map
 from .consumer import OprojConsumer, OprojFused
-from .producer import OprojProducer, OprojUmma, OprojUmmaRows
+from .producer import OprojProducer, OprojUmma
 
 # The largest batch (token rows) of the tuned tables, the 64-row mailboxes and the
 # producers' owned-row reduce (``reduce_owned``).
 OPROJ_ROWS = 64
-# Rubin (compute capability 10.7) decode shapes above OPROJ_ROWS ("wide") whose
-# o-projection runs the two-shot all-reduce with ``OprojUmmaRows`` (weight-stationary
-# over 64-row chunks, each chunk's reduce-scatter overlapping the next chunk's MMAs)
-# into a ``TwoShot.rows_box`` sized to the deployment's largest graph, and the
-# reduced-gather consumer with its AttnRes; other wide shapes take seam S3 (the stock
-# o-projection + all-reduce, then the unfused AttnRes). Keyed per TP on token rows
-# (``shapes.rows_policy``: every q).
-WIDE_TWOSHOT = {16: "65-768:1"}
-# Rubin wide shapes whose ``OprojUmmaRows`` runs one chunk of this many token rows
-# instead of 64-row chunks, per TP on token rows (``shapes.rows_policy``): at 65-80
-# rows a second 64-row chunk (up to 16 real rows) repeats the chunk's MMAs, drain,
-# pushes and owner reduce after the first one's. Per token the same MMAs over the
-# same K blocks and the same rounding: bitwise. 192-256 rows (DL7 B24-32, DL3 B48-64):
-# 96-row chunks, two at 192 rows and three at 200-256 instead of three / four 64-row
-# ones (axhb, 16 ranks, 93 layers, 32k, us/step: B24 -16, B28 -54, B32 -79; B17 at
-# 136 rows +13, so no row below 192).
-WIDE_CHUNK = {16: "65-80:80,192-256:96"}
-
-
-# Rubin wide shapes (per TP, token rows) whose reduced-gather consumer prefers the
-# largest shared-memory carve-out, as CONSUMER_CARVEOUT at 32 / 64 rows: its CTAs need
-# ~22 KB, and at the driver default the MoE front's big CTAs launched behind it cannot
-# share its SMs, so the front only preloads as consumer CTAs exit. A launch attribute:
-# bitwise.
-WIDE_CONSUMER_CARVEOUT: dict[int, str] = {16: ""}
-
-
-def wide_chunk(tp, shape):
-    return rows_policy(WIDE_CHUNK.get(tp, ""), shape, OprojUmmaRows.CHUNK)
 
 
 class OprojMailbox:
@@ -331,7 +300,6 @@ def compile_oproj(
     resident=False,
     xmc=1,
     vote=False,
-    chunk=64,
 ):
     """Producer, consumer or fused kernel over a [TP, cap, 7168] parity view;
     ``front``: the consumer also publishes x_moe [1, 4, 7168] and the epoch hint.
@@ -343,20 +311,11 @@ def compile_oproj(
     ``reduced``: the two-shot producer reduces the owned columns
     (``PRODUCER_REDUCE``); ``resident``: the tcgen05 producer holds every K block
     (``RESIDENT_RING``); ``xmc``: its clusters multicast x (``X_MULTICAST``);
-    ``vote``: the B<=8 consumer's poll (``OPROJ_VOTE``); ``chunk``: the wide
-    producer's token rows per chunk (``WIDE_CHUNK``)."""
+    ``vote``: the B<=8 consumer's poll (``OPROJ_VOTE``)."""
     box = fake((1 if twoshot else tp, cap, 7168), (cap * 7168, 7168, 1))
     x, w = fake((batch, k), (k, 1)), fake((7168, k), (k, 1))
     mc, slot, eps = cutlass.Int64(0), cutlass.Int32(0), cutlass.Float32(1e-6)
     recv, peers = fake((tp, cap, 7168 // tp)), fake((tp,), None, torch.int64)
-    if kind == "producer_owners":  # row-sharded AttnRes: the row owners' slots
-        owners = fake((tp, cap, 7168))  # cap: rows per owner
-        kernel = OprojUmmaRows(k, owners=True)
-        return cute.compile(kernel, x, w, owners, peers, slot, mc, make_fake_stream())
-    if kind.startswith("producer") and batch > OPROJ_ROWS:  # wide: OprojUmmaRows
-        tail = (recv, peers, slot, box, mc, mc)  # + gather, its multicast, x's map
-        kernel = OprojUmmaRows(k, chunk=chunk)
-        return cute.compile(kernel, x, w, *tail, make_fake_stream())
     if kind.startswith("producer"):  # producer_mma / producer_umma: engine A/B
         kernel = producer(
             k, batch, tp, mla, twoshot, kind[9:] or None, reduced, resident, xmc
@@ -369,9 +328,6 @@ def compile_oproj(
     xmoe = fake((1, 4, 7168), (4 * 7168, 7168, 1)) if front else None
     hints = fake((224,), (1,), torch.int32) if front else None
     rows = (row, dynamic_fake(3), weight, weight, weight, row, xmoe, hints, eps, eps)
-    if kind == "consumer_owners":  # this rank's rows: TP slots in rank order
-        kernel = OprojConsumer(nb, groups=1, has_delta=has_delta, out_mc=True)
-        return cute.compile(kernel, box, *rows, mc, slot, make_fake_stream())
     if kind == "consumer":  # B64: one 128-thread group per CTA polls every rank
         options = dict(has_delta=has_delta)
         groups = 4 if batch <= 32 and not twoshot else 1
@@ -392,7 +348,7 @@ class PreparedOproj:
 
     def __init__(
         self, decoder, mailbox, batches, mla, front=None, twoshot=None, polled=(),
-        head_polled=(), x_buffer=None, sharded=None,
+        head_polled=(), x_buffer=None,
     ):  # fmt: skip
         weight = decoder.self_attn.o_proj.weight
         norm, out_norm = decoder.mlp_res_norm, decoder.post_attention_layernorm
@@ -416,64 +372,9 @@ class PreparedOproj:
         nb = decoder.prev_valid_blocks + decoder.is_block_write_layer
         delta = not decoder.is_block_write_layer
         self.front = None if front is None else (*map(to_cute, front[:2]), front[2])
-        # Wide batches (``choose``): OprojUmmaRows + the reduced-gather consumer over
-        # a two-shot box holding ``x_buffer``'s rows (the deployment's largest graph).
-        self.wide: dict[int, tuple] = {}
-        self.owners: dict[int, tuple] = {}  # row-sharded wide batches
         wide = [b for b in batches if b > OPROJ_ROWS]
         if wide:
-            cap = x_buffer.shape[0] if x_buffer is not None else 0
-            if twoshot is None or tp != 16 or cap < max(wide):
-                raise ValueError(f"o-projection batches above {OPROJ_ROWS}: {wide}")
-            self.wide_box = box = twoshot.rows_box(cap)
-            recv, peers, gather, gather_mc = box.views(parity)
-            recv, peers, gather = to_cute(recv), to_cute(peers), to_cute(gather)
-            gather_mc = cutlass.Int64(gather_mc)
-            for b in wide:
-                rows = x_buffer[:b]
-                # x tiles {64 K, chunk rows}, over whole chunks where x_buffer holds
-                # them: the rows past b load in bounds and are never pushed (a partial
-                # last tile costs the producer +2.5-3.3 us at M65-80, gemm64); kept
-                # alive here.
-                chunk = wide_chunk(tp, Shape(b))
-                tile = min(-(-b // chunk) * chunk, cap)
-                tma = weight_map(x_buffer[:tile], chunk)
-                address = cutlass.Int64(tma.data_ptr())
-                shape = (k, b, tp, nb, delta, mla, False, cap, True)
-                codes = (  # the producer reduces; the consumer only polls the gather
-                    compile_oproj("producer", *shape, chunk=chunk),
-                    compile_oproj("consumer", *shape, False, False, False, False, True),
-                )
-                carve = rows_policy(WIDE_CONSUMER_CARVEOUT.get(tp, ""), Shape(b), None)
-                if carve is not None:  # every layer's wide consumer at this batch
-                    prepare_shared_carveout(codes[1], self.device.index, carve)
-                head = (recv, peers, rank, gather, gather_mc, address)
-                tail = (recv, gather_mc, rank)
-                self.wide[b] = codes, head, gather, tail, rows, tma
-            # Row-sharded batches (``sharded`` = (batches, attn_res.sharded.ShardBox)):
-            # the producer pushes each token's rows to its row owner, whose consumer
-            # sums the TP slots in rank order (one-shot: the same sums and rounding as
-            # the column owners'), runs the AttnRes on its rows and multicasts them into
-            # gather box 0; ``GatherRows`` copies every row into ``out``.
-            for b in wide if sharded is not None and sharded[1] is not None else ():
-                if b not in sharded[0]:
-                    continue
-                shard = sharded[1]
-                shape = (k, b, tp, nb, delta, mla, False, shard.per_cap)
-                codes = (
-                    compile_oproj("producer_owners", *shape),
-                    compile_oproj("consumer_owners", *shape),
-                )
-                address = self.wide[b][-1].data_ptr()  # x's map
-                owners = to_cute(shard.owners.buffer)
-                head = (
-                    owners,
-                    to_cute(shard.owner_peers),
-                    rank,
-                    cutlass.Int64(address),
-                )
-                self.owners[b] = codes, head, owners, shard
-            batches = [b for b in batches if b <= OPROJ_ROWS]
+            raise ValueError(f"o-projection batches above {OPROJ_ROWS}: {wide}")
         self.codes, self.twoshots = {}, twoshot_batches(tp) if self.twoshot else set()
         self.reduced: set[int] = set()  # two-shot batches reduced by the producer
         # X_MULTICAST batches: (x rows, the x tensor map) of ``x_buffer`` [:batch]
@@ -539,8 +440,6 @@ class PreparedOproj:
 
     def run(self, local, prefix, blocks, out, after_head=False, polled=False):
         batch, s = local.shape[0], stream(self.device)
-        if batch in self.wide:
-            return self.run_wide(local, prefix, blocks, out, s)
         codes, x = self.codes[batch], to_cute(local)
         if after_head:
             codes = self.after_head.get(batch, codes)
@@ -573,46 +472,3 @@ class PreparedOproj:
             codes[0](x, self.wview, *self.head, *extra, s)
             codes[1](self.box, *rows)
         return out, prefix, blocks
-
-    def run_wide(self, local, prefix, blocks, out, s):
-        codes, head, gather, tail, mapped, _ = self.wide[local.shape[0]]
-        if local.data_ptr() != mapped.data_ptr():
-            raise RuntimeError("wide o-projection: x is not the mapped buffer")
-        if local.shape[0] in self.owners:
-            return self.run_owned(local, prefix, blocks, out, s)
-        rows = (dynamic_view(prefix), dynamic_view(blocks), *self.views)
-        rows += (dynamic_view(out), None, None, *self.eps)
-        codes[0](to_cute(local), self.wview, *head, s)
-        codes[1](gather, *rows, *tail, s)
-        return out, prefix, blocks
-
-    def run_owned(self, local, prefix, blocks, out, s):
-        """Row-sharded: rows pushed to their owners, this rank's rows reduced and
-        AttnRes'd into gather box 0, then every row gathered into ``out``."""
-        codes, head, owners, shard = self.owners[local.shape[0]]
-        rows_total = local.shape[0]
-        first, count = owned(rows_total, shard.tp, shard.rank)
-        codes[0](to_cute(local), self.wview, *head, s)
-        if count:
-            mine = slice(first, first + count)
-            views = (dynamic_view(prefix[mine]), dynamic_view(blocks[mine]))
-            rows = (*views, *self.views, views[0], None, None, *self.eps)
-            mc = cutlass.Int64(shard.gathers[0].mc)
-            codes[1](owners, *rows, mc, cutlass.Int32(first), s)
-        gather = compile_gather(rows_total, shard.cap, self.device.index)
-        gather(to_cute(shard.gathers[0].buffer), to_cute(out), s)
-        return out, prefix, blocks
-
-
-def choose(shape, ctx):
-    """The fused o-projection (+ exchange + AttnRes) for a captured decode shape (the
-    runtime's family hook), or None: the attention runs the stock o-projection, its
-    all-reduce and the unfused AttnRes (seam S3). A Choice above 64 rows makes the
-    runtime prepare ``PreparedOproj`` at that shape: on Rubin the ``WIDE_TWOSHOT``
-    shapes run ``OprojUmmaRows`` + the reduced-gather consumer (``.wide``)."""
-    if shape.rows <= OPROJ_ROWS:
-        return Choice(Path.GENERIC)
-    if ctx.arch != "rubin" or not rows_policy(WIDE_TWOSHOT.get(ctx.tp, ""), shape, 0):
-        return None
-    chunk = wide_chunk(ctx.tp, shape)
-    return Choice(Path.GENERIC, ("rows", chunk), f"two-shot, {chunk}-row chunks")
