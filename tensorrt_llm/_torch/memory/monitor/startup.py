@@ -107,6 +107,63 @@ class StageSample:
 
 
 @dataclass(frozen=True)
+class KvSizingBudget:
+    """Device-wide inputs and applied deductions, in bytes, for one rank."""
+
+    device_total: int
+    torch_peak: int
+    outside_torch: int
+    temporary_kv: int
+    encoder: int
+    attention: int
+    penalty: int
+    fraction: float
+    fraction_budget: int
+    drafter: int
+    indexer: int
+    context_mla: int
+    final_budget: int
+
+    @property
+    def profiled_peak(self) -> int:
+        return self.torch_peak + self.outside_torch
+
+    @property
+    def before_fraction(self) -> int:
+        return (
+            self.device_total
+            - self.profiled_peak
+            + self.temporary_kv
+            - self.encoder
+            - self.attention
+            - self.penalty
+        )
+
+    @property
+    def non_kv_peak(self) -> int:
+        return self.device_total - self.before_fraction + self.indexer + self.context_mla
+
+    def render(self) -> list[str]:
+        before_limits = self.fraction_budget - self.drafter - self.indexer - self.context_mla
+        return [
+            "  KV sizing budget (GiB):",
+            f"    Device total {self.device_total / GIB:.3f}; profiled peak {self.profiled_peak / GIB:.3f} "
+            f"(PyTorch allocated peak {self.torch_peak / GIB:.3f} + estimated outside PyTorch "
+            f"{self.outside_torch / GIB:.3f}); temporary KV added back {self.temporary_kv / GIB:.3f}",
+            f"    Reserves before fraction: multimodal encoder {self.encoder / GIB:.3f}, "
+            f"fixed attention {self.attention / GIB:.3f}, sampler penalty {self.penalty / GIB:.3f}",
+            f"    Available {self.before_fraction / GIB:.3f} x {self.fraction:.6g} "
+            f"= {self.fraction_budget / GIB:.3f} for KV "
+            f"({(self.before_fraction - self.fraction_budget) / GIB:.3f} held back)",
+            f"    Reserves after fraction: drafter headroom {self.drafter / GIB:.3f}, "
+            f"indexer logits {self.indexer / GIB:.3f}, context MLA {self.context_mla / GIB:.3f}",
+            f"    Before user limits {before_limits / GIB:.3f}; user limits deducted "
+            f"{(before_limits - self.final_budget) / GIB:.3f}; final KV budget "
+            f"{self.final_budget / GIB:.3f} ({self.final_budget} bytes)",
+        ]
+
+
+@dataclass(frozen=True)
 class MemoryPlan:
     """KV cache sizing's plan, device-wide."""
 
@@ -114,6 +171,7 @@ class MemoryPlan:
     non_kv_peak: int
     #: PyTorch allocations made by the profiled forward pass, if profiled.
     activation: int | None
+    budget: KvSizingBudget | None = None
 
 
 @dataclass(frozen=True)
@@ -312,10 +370,14 @@ def baseline() -> dict[Group, int | None] | None:
     return _baseline
 
 
-def record_memory_plan(non_kv_peak: int, activation: int | None) -> None:
+def record_memory_plan(
+    non_kv_peak: int, activation: int | None, budget: KvSizingBudget | None = None
+) -> None:
     global _plan
     if _on():
-        _plan = MemoryPlan(non_kv_peak=int(non_kv_peak), activation=activation or None)
+        _plan = MemoryPlan(
+            non_kv_peak=int(non_kv_peak), activation=activation or None, budget=budget
+        )
 
 
 def stages() -> tuple[StageSample, ...]:
@@ -415,6 +477,8 @@ def render_plan_lines(
             f"    of which the profiled forward pass allocated {_plan.activation / GIB:.2f} GiB "
             "in PyTorch."
         )
+    if _plan.budget is not None:
+        out.extend(_plan.budget.render())
     if over > _PLAN_TOLERANCE:
         out.append(
             f"  Usage exceeds the startup plan by {over / GIB:.2f} GiB: the workload needs more "

@@ -260,6 +260,13 @@ pool, followed by consistency checks between independent readings.
   growth in *PyTorch, unattributed* up to what the profiled forward pass
   allocated is that step's activations; only growth beyond it is called held
   memory, which `TLLM_MEM_MONITOR_STACKS=1` attributes to code.
+* **KV sizing budget** shows how each rank went from the profiled PyTorch peak
+  and estimated non-PyTorch usage to its final KV byte budget. It adds back
+  the temporary sizing pools, lists the encoder, fixed attention and sampler
+  reserves, applies the configured free-memory fraction, then shows the
+  drafter, indexer and context-MLA deductions and any reduction from user
+  limits. The final budget is a capacity limit; actual pool sizes appear in
+  the KV cache row.
 * **Startup plan** compares the memory in use with what KV cache sizing
   planned for when the engine started: the peak it profiled outside the KV
   cache, workspace reserves included, plus the KV cache pools. It appears

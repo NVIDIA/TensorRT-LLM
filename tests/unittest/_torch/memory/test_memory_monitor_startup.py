@@ -423,11 +423,12 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
                 return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 500},
             ),
             patch.object(creator, "_encode_dummy_inputs", return_value=None),
-            patch.object(creator, "_get_multimodal_encoder_memory_reserve", return_value=0),
-            patch.object(creator, "_get_penalty_workspace_reserve", return_value=0),
+            patch.object(creator, "_get_multimodal_encoder_memory_reserve", return_value=7),
+            patch.object(creator, "_get_penalty_workspace_reserve", return_value=11),
+            patch.object(creator, "_get_context_kv_only_drafter_reserve", return_value=13),
             patch.object(torch.cuda, "empty_cache"),
             patch.object(torch.cuda, "reset_peak_memory_stats"),
-            patch(f"{util}.get_attention_workspace_fixed_bytes", return_value=0),
+            patch(f"{util}.get_attention_workspace_fixed_bytes", return_value=17),
             # The DeepSeek-V4 indexer workspace is taken out of the KV budget.
             patch(f"{util}.get_indexer_mqa_logits_workspace_bytes", return_value=indexer),
             patch(f"{util}.get_indexer_mqa_logits_workspace_reserve", return_value=indexer),
@@ -435,7 +436,7 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
             patch(f"{util}.get_mla_context_workspace_kv_len_cap", return_value=None),
         ):
             creator.configure_kv_cache_capacity(py_executor)
-        assert creator._kv_cache_config.max_gpu_total_bytes == budget - indexer
+        assert creator._kv_cache_config.max_gpu_total_bytes == budget - indexer - 13
         return cal.call_args
 
     sizing_pool, budget, indexer = 300, 200, 50
@@ -446,6 +447,15 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
     assert startup.memory_plan().non_kv_peak == peak - sizing_pool + indexer, (
         "the indexer reserve is outside the KV cache, so it is part of the non-KV peak"
     )
+
+    detail = startup.memory_plan().budget
+    assert detail.profiled_peak == 500 + (1024 - 400 - 128)
+    assert detail.temporary_kv == sizing_pool
+    assert (detail.encoder, detail.attention, detail.penalty) == (7, 17, 11)
+    assert (detail.drafter, detail.indexer, detail.context_mla) == (13, indexer, 0)
+    assert detail.before_fraction == 1024 - detail.profiled_peak + sizing_pool - 35
+    assert detail.final_budget == budget - indexer - 13
+    assert any(f"({detail.final_budget} bytes)" in line for line in detail.render())
 
     # Without a profiled forward pass the "peak" is only current usage: no plan.
     startup.clear()
