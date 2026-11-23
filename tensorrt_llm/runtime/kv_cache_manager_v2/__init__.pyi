@@ -461,6 +461,8 @@ class ReusePolicy(enum.IntEnum):
 class AttentionLayerConfig:
     """One attention layer's buffers and its history rules.
 
+    Buffers with an effective OPTIONAL reuse policy require a sliding window.
+
     A sparse layer may also declare a sliding window, though the combination is unusual:
     sparsity already bounds how much history a step reads. Where both apply, the window
     bounds what is *selectable* as well as what is retained -- the indexer producing the
@@ -773,25 +775,24 @@ KvCacheStatus: TypeAlias = _Status
 IndexSeq = array.array[int] | memoryview[int]
 
 class ReuseGroupStatus:
-    """Group availability at the initial prefix claim, not subsequent request progress."""
+    """Creation-time matches, narrowed to selected state at initial resume."""
 
-    # Lifecycle group from get_layer_group_id(layer_id), not a physical pool index.
     @property
     def group_id(self) -> LayerGroupId: ...
-    # REQUIRED constrains the match; OPTIONAL is selected at resume; PRIVATE is never reused.
     @property
     def policy(self) -> ReusePolicy: ...
-    # Exclusive token endpoint claimed by REQUIRED groups, shared by all groups.
+    # Latest available endpoint at creation; selected endpoint after resume.
     @property
     def endpoint(self) -> int: ...
-    # All needed state is available, not necessarily on GPU or selected for reuse.
-    # False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
+    # Complete state at endpoint, independent of the REQUIRED prefix endpoint.
     @property
     def complete(self) -> bool: ...
-    # Retained [begin, end) ranges, including block-rounded SWA windows and sinks.
-    # SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
     @property
     def coverage(self) -> Sequence[tuple[int, int]]: ...
+    # Ascending half-open ranges of selectable token endpoints, independent of page alignment.
+    # The required pages are protected until initial resume.
+    @property
+    def endpoint_ranges(self) -> Sequence[tuple[int, int]]: ...
 
 class _KVCache:
     Status: ClassVar[Type[_Status]]
@@ -806,6 +807,7 @@ class _KVCache:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
+        optional_reuse_max_backtrack: int = 0,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -864,7 +866,22 @@ class _KVCache:
         beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
         valid_only: bool = False,
     ) -> Iterator[int]: ...
-    def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
+    def resize(
+        self,
+        capacity: int | None = None,
+        history_length: int | None = None,
+        *,
+        complete_optional_recovery: bool = False,
+    ) -> bool:
+        """Resize capacity and/or history, preserving OPTIONAL recovery by default.
+
+        Set ``complete_optional_recovery`` only after submitting all recovery KV
+        accesses on the cache stream through the resulting history length. This
+        reclaims stale recovery pages even at unchanged history length. Returns
+        False on page exhaustion, rolling back capacity, history, and recovery
+        state together. ``commit`` also reports completed recovery.
+        """
+        ...
     @property
     def max_input_length(self) -> int | None:
         """Bound on ``capacity - history_length``: how far capacity may outrun the watermark.
@@ -893,7 +910,9 @@ class _KVCache:
     @property
     def history_length(self) -> int: ...
     @history_length.setter
-    def history_length(self, history_length: int) -> None: ...
+    def history_length(self, history_length: int) -> None:
+        """Set history length; pending OPTIONAL recovery requires an explicit resize call."""
+        ...
     def commit(
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
@@ -932,6 +951,7 @@ class _KVCache:
         self,
         cuda_stream: CudaStream | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
+        optional_reuse_endpoints: dict[LayerGroupId, int] | None = None,
     ) -> bool:
         """Lock this cache's pages at their required levels.
 
@@ -1882,6 +1902,7 @@ class KVCacheManager:
         enable_request_stats: bool = False,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
         locality_domain_id: int | None = None,
+        optional_reuse_max_backtrack: int = 0,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -1891,6 +1912,10 @@ class KVCacheManager:
         It defaults to the non-empty input length; without either value, the beam
         sharing boundary is zero and the statistics boundary is unset. When set,
         it also marks generation-phase allocation stats.
+
+        ``optional_reuse_max_backtrack`` bounds selectable OPTIONAL endpoints to
+        [max(1, P - max_backtrack), P], where P is the REQUIRED match. Only their
+        lookback pages are held until initial resume. Defaults to zero (P only).
         """
         ...
     def refresh_retention(self) -> None: ...

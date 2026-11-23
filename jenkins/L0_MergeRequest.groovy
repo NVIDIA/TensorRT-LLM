@@ -1961,6 +1961,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
         "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
         "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
+        "tensorrt_llm/_torch/memory/monitor/ranks.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",

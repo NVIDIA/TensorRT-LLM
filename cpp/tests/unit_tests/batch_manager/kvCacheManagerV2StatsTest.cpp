@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -1222,6 +1223,131 @@ TEST_F(ReplayCacheTest, OptionalAndPrivateHaveIndependentGroups)
     manager->shutdown();
 }
 
+TEST_F(ReplayCacheTest, EndpointCollectionSkipsNonOptionalAttention)
+{
+    for (auto policy : {ReusePolicy::REQUIRED, ReusePolicy::SINK_REQUIRED_ONLY, ReusePolicy::OPTIONAL})
+    {
+        auto config = makeConfig();
+        addWindow(config, 1, 8, policy, policy == ReusePolicy::SINK_REQUIRED_ONLY ? 4 : 0);
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const tokens = makeTokens(8);
+        TokenSpan const prefix{tokens.data(), 8};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(8));
+        source->commit(prefix, true);
+        auto const match = manager->radixTree().match({}, prefix, true, true, 0, true);
+        EXPECT_EQ(match.numTokens, 8);
+        EXPECT_EQ(match.optionalEndpointRanges.empty(), policy != ReusePolicy::OPTIONAL);
+        source->close();
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, SingleTokenOptionalWindowsNeedOnlyTheirSinks)
+{
+    for (int sinks : {0, 2})
+    {
+        auto config = makeConfig();
+        config.tokensPerBlock = 1;
+        addWindow(config, 1, 1, ReusePolicy::OPTIONAL, sinks);
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const optional = manager->getLayerGroupId(LayerId{1});
+        auto const tokens = makeTokens(3);
+        TokenSpan const prefix{tokens.data(), 3};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(3));
+        source->commit(prefix, true);
+        for (int i = sinks; i < 3; ++i)
+        {
+            auto const& block = source->blocks()[BlockOrdinal{i}].treeBlock;
+            if (auto* page = block->getPage(optional))
+            {
+                auto holder = page->hold();
+                block->unlinkPage(optional);
+            }
+        }
+        for (int endpoint : {1, 2, 3})
+        {
+            auto reader = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, {}, false, std::nullopt, 3);
+            ASSERT_EQ(reader->numCommittedTokens(), 3);
+            ASSERT_TRUE(reader->reuseStatus()[optional.value()].complete);
+            ASSERT_TRUE(reader->resume(mStream, std::nullopt, std::map<LifeCycleId, int>{{optional, endpoint}}));
+            reader->close();
+        }
+        source->close();
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, OptionalPartialCopyPreservesSharedRetentionAcrossAdmissionRetry)
+{
+    using RetentionConfig = tensorrt_llm::executor::KvCacheRetentionConfig;
+    for (int endpoint : {3, 7, 8})
+    {
+        for (bool overridePriority : {false, true})
+        {
+            for (bool sharedSource : {false, true})
+            {
+                SCOPED_TRACE(::testing::Message()
+                    << "endpoint=" << endpoint << " override=" << overridePriority << " shared=" << sharedSource);
+                auto config = makeConfig();
+                addWindow(config, 1, 8, ReusePolicy::OPTIONAL);
+                auto manager = std::make_shared<KvCacheManager>(config);
+                auto const encoder = manager->getLayerGroupId(LayerId{1});
+                auto const tokens = makeTokens(8);
+                TokenSpan const prefix{tokens.data(), static_cast<int>(tokens.size())};
+                auto source = manager->createKvCache({}, {}, 1);
+                ASSERT_TRUE(source->resume(mStream));
+                ASSERT_TRUE(source->resize(8));
+                source->commit(prefix, /*isEnd=*/true);
+                BlockOrdinal const tail{(endpoint - 1) / 4};
+                auto page = blockPageGetPage(source->blocks()[tail].pages[kDefaultBeamIndex][encoder]);
+                constexpr Priority kSourcePriority = 80;
+                constexpr Priority kReaderPriority = 10;
+                page->claimRetention(kSourcePriority, std::chrono::milliseconds{0});
+                std::optional<RetentionConfig> retention;
+                if (overridePriority)
+                {
+                    retention.emplace(std::vector{RetentionConfig::TokenRangeRetentionConfig{0, {}, kReaderPriority}});
+                }
+                auto reader
+                    = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, retention, false, std::nullopt, 8);
+                if (!sharedSource)
+                    source->close();
+                std::map<LifeCycleId, int> const endpoints{{encoder, endpoint}};
+                auto& storage = manager->storage();
+                auto const pool = storage.getPoolGroupIndex(kHotLevel, encoder);
+                auto reservations
+                    = storage.newSlotsForPoolGroup(kHotLevel, pool, storage.getStatistics(kHotLevel, pool).free);
+                bool const partialCopy = endpoint % 4 != 0;
+                Priority const expected
+                    = (partialCopy && sharedSource) || !overridePriority ? kSourcePriority : kReaderPriority;
+                for (int attempt = 0; attempt < 2; ++attempt)
+                {
+                    EXPECT_FALSE(reader->resume(mStream, std::nullopt, endpoints));
+                    EXPECT_EQ(page->priority(), expected);
+                }
+                source->close();
+                for (auto& slot : reservations)
+                {
+                    storage.releaseSlot(encoder, kHotLevel, std::move(slot));
+                }
+                ASSERT_TRUE(reader->resume(mStream, std::nullopt, endpoints));
+                EXPECT_EQ(page->priority(), expected);
+                EXPECT_EQ(reader->getPagePriorities(encoder)[tail.value()], expected);
+                reader->close();
+                manager->refreshRetention();
+                // The partial reader preserves the source's expiry; a full-block claim clears it.
+                EXPECT_EQ(page->priority(), partialCopy && sharedSource ? kPriorityDefault : expected);
+                page.reset();
+                manager->shutdown();
+            }
+        }
+    }
+}
+
 TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
 {
 
@@ -1232,12 +1358,16 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
         int window;
         int sinks;
         std::vector<int> ordinals;
+        int optionalEnd = 0;
+        bool knownNoDigest = false;
     };
 
     // Minimal retention before a partial tail, a single page, and a window
     // spanning three blocks with or without a separate sink.
     for (auto const& c : {WindowCase{8, 1, 2, 0, {1}}, WindowCase{8, 0, 4, 0, {1}}, WindowCase{20, 3, 10, 0, {2, 3, 4}},
-             WindowCase{20, 3, 6, 4, {0, 3, 4}}})
+             WindowCase{20, 3, 6, 4, {0, 3, 4}}, WindowCase{7, 1, 4, 0, {1}}, WindowCase{8, 0, 4, 0, {1}, 7},
+             WindowCase{8, 0, 10, 0, {0}, 3}, WindowCase{7, 1, 4, 0, {1}, 0, true},
+             WindowCase{8, 0, 10, 0, {0}, 3, true}})
     {
         for (int victim : c.ordinals)
         {
@@ -1265,13 +1395,24 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             ASSERT_TRUE(source->resize(std::nullopt, c.prefix + c.tail));
             source->commit(TokenSpan{tokens.data(), static_cast<int>(tokens.size())});
             source->stopCommitting();
-            auto reader = manager->createKvCache({}, prefix, 2);
+            int const optionalEnd = c.optionalEnd ? c.optionalEnd : c.prefix;
+            if (c.optionalEnd)
+            {
+                // A partial lifecycle page can belong to a longer token-path node.
+                auto* page = source->blocks()[BlockOrdinal{optionalEnd / 4}].treeBlock->getPage(encoder);
+                page->numTokensInBlock = optionalEnd % 4;
+                for (int ordinal = (optionalEnd + 3) / 4; ordinal < c.prefix / 4; ++ordinal)
+                    source->blocks()[BlockOrdinal{ordinal}].treeBlock->unlinkPage(encoder);
+            }
+            auto reader = manager->createKvCache(
+                {}, prefix, 2, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
             EXPECT_EQ(reader->numCommittedTokens(), c.prefix);
             ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+            EXPECT_EQ(reader->reuseStatus()[encoder.value()].endpoint, optionalEnd);
             std::vector<int> covered;
             for (auto const& [begin, end] : reader->reuseStatus()[encoder.value()].coverage)
             {
-                for (int i = begin / 4; i < end / 4; ++i)
+                for (int i = begin / 4; i < (end + 3) / 4; ++i)
                 {
                     covered.push_back(i);
                 }
@@ -1288,33 +1429,43 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             declined->close();
             source->blocks()[BlockOrdinal{victim}].treeBlock->unlinkPage(encoder);
             source->close();
-            auto missing = manager->createKvCache({}, prefix, 4);
+            auto missing = manager->createKvCache(
+                {}, prefix, 4, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
             EXPECT_EQ(missing->numCommittedTokens(), c.prefix);
-            EXPECT_FALSE(missing->reuseStatus()[encoder.value()].complete);
-            EXPECT_TRUE(missing->reuseStatus()[encoder.value()].coverage.empty());
+            auto const& missingStatus = missing->reuseStatus()[encoder.value()];
+            std::vector<HalfOpenRange<int>> const earlierRanges = c.sinks > 0 && victim != 0
+                ? std::vector<HalfOpenRange<int>>{{1, 5}}
+                : std::vector<HalfOpenRange<int>>{};
+            EXPECT_EQ(missingStatus.endpointRanges, earlierRanges);
+            EXPECT_EQ(missingStatus.complete, !earlierRanges.empty());
             EXPECT_TRUE(missing->reuseStatus()[peer.value()].complete);
-            EXPECT_THROW(missing->resume(mStream, selected), std::invalid_argument);
+            std::map<LifeCycleId, int> const exactEndpoints{{encoder, c.prefix}, {peer, c.prefix}};
+            EXPECT_THROW(missing->resume(mStream, std::nullopt, exactEndpoints), std::invalid_argument);
             EXPECT_FALSE(missing->isActive());
             ASSERT_TRUE(missing->resume(mStream, std::vector<LifeCycleId>{peer}));
             missing->close();
             // The earlier claim owns every candidate even after tree unlink.
             manager->getAndResetIterationReusedBlocksByLevel();
-            ASSERT_TRUE(reader->resume(mStream, selected));
+            if (optionalEnd < c.prefix)
+                EXPECT_THROW(reader->resume(mStream, selected), std::invalid_argument);
+            std::map<LifeCycleId, int> const endpoints{{encoder, optionalEnd}, {peer, c.prefix}};
+            ASSERT_TRUE(reader->resume(mStream, std::nullopt, endpoints));
             reader->commitPendingStats();
             auto const reusedByLevel = manager->getAndResetIterationReusedBlocksByLevel();
             ASSERT_NE(reusedByLevel.find(encoder), reusedByLevel.end());
-            EXPECT_EQ(reusedByLevel.at(encoder).full.at(kHotLevel), c.ordinals.size());
-            EXPECT_EQ(countsByLevelTotal(reusedByLevel.at(encoder).partial), 0);
+            EXPECT_EQ(reusedByLevel.at(encoder).full.at(kHotLevel), c.ordinals.size() - (optionalEnd % 4 != 0));
+            EXPECT_EQ(countsByLevelTotal(reusedByLevel.at(encoder).partial), optionalEnd % 4 != 0);
             reader->suspend();
             ASSERT_TRUE(reader->resume(mStream));
             reader->commitPendingStats();
             EXPECT_TRUE(manager->getAndResetIterationReusedBlocksByLevel().empty());
             for (size_t i = 0; i < original.size(); ++i)
             {
-                EXPECT_EQ(reader->getBasePageIndices(encoder)[c.ordinals[i]], original[i]);
+                EXPECT_EQ(reader->getBasePageIndices(encoder)[c.ordinals[i]] == original[i],
+                    optionalEnd % 4 == 0 || c.ordinals[i] < optionalEnd / 4);
             }
             reader->close();
-            EXPECT_EQ(manager->radixTree().match({}, prefix).numTokens, c.prefix);
+            EXPECT_EQ(manager->radixTree().match({}, prefix, false, true).numTokens, c.prefix);
             manager->shutdown();
         }
     }
@@ -1374,13 +1525,14 @@ TEST_F(ReplayCacheTest, DecliningOptionalClaimReleasesCapacityBeforeAllocation)
     source->close();
     auto reader = manager->createKvCache({}, span, 2);
     ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+    EXPECT_EQ(reader->reuseStatus()[encoder.value()].endpointRanges, (std::vector<HalfOpenRange<int>>{{8, 9}}));
     auto& storage = manager->storage();
     auto const group = storage.getPoolGroupIndex(kHotLevel, encoder);
     TypedVec<PoolGroupIndex, SlotCount> goals(storage.numPoolGroups(kHotLevel), SlotCount{0});
     goals[group] = storage.getStatistics(kHotLevel, group).total - 1;
     storage.prepareFreeSlots(kHotLevel, goals);
     auto reservations = storage.newSlotsForPoolGroup(kHotLevel, group, storage.getStatistics(kHotLevel, group).free);
-    // No host tier, no free slots: the rejected candidate is the only capacity
+    // No host tier, no free slots: the rejected candidates are the only capacity
     // available to the request's fresh writable Encoder page.
     EXPECT_TRUE(reader->resume(mStream, std::vector<LifeCycleId>{}));
     EXPECT_EQ(reader->numCommittedTokens(), 8);
@@ -1390,6 +1542,47 @@ TEST_F(ReplayCacheTest, DecliningOptionalClaimReleasesCapacityBeforeAllocation)
         storage.releaseSlot(encoder, kHotLevel, std::move(slot));
     }
     manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, DecliningOptionalPartialClaimOnRetryReleasesCapacityBeforeAllocation)
+{
+    for (int prefixLength : {7, 8})
+    {
+        SCOPED_TRACE(prefixLength);
+        auto config = makeConfig();
+        config.maxUtilForResume = 1.0f;
+        addWindow(config, 1, 4, ReusePolicy::OPTIONAL);
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const encoder = manager->getLayerGroupId(LayerId{1});
+        auto const tokens = makeTokens(8);
+        TokenSpan const span{tokens.data(), static_cast<int>(tokens.size())};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(8));
+        source->commit(span);
+        source->close();
+        TokenSpan const prefix{tokens.data(), prefixLength};
+        auto reader
+            = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, {}, false, std::nullopt, prefixLength - 7);
+        ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+        auto& storage = manager->storage();
+        auto const group = storage.getPoolGroupIndex(kHotLevel, encoder);
+        TypedVec<PoolGroupIndex, SlotCount> goals(storage.numPoolGroups(kHotLevel), SlotCount{0});
+        goals[group] = storage.getStatistics(kHotLevel, group).total - 1;
+        storage.prepareFreeSlots(kHotLevel, goals);
+        auto reservations
+            = storage.newSlotsForPoolGroup(kHotLevel, group, storage.getStatistics(kHotLevel, group).free);
+        EXPECT_FALSE(reader->resume(mStream, std::nullopt, std::map<LifeCycleId, int>{{encoder, 7}}));
+        // The rejected source is the only slot that can hold the fresh OPTIONAL page.
+        EXPECT_TRUE(reader->resume(mStream, std::vector<LifeCycleId>{}));
+        EXPECT_EQ(reader->numCommittedTokens(), prefixLength);
+        reader->close();
+        for (auto& slot : reservations)
+        {
+            storage.releaseSlot(encoder, kHotLevel, std::move(slot));
+        }
+        manager->shutdown();
+    }
 }
 
 TEST_F(ReplayCacheTest, OptionalCommitAcceptsGlobalRebase)

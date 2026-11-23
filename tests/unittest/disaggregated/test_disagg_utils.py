@@ -363,6 +363,56 @@ def test_extract_router_config_propagates_kv_model_path() -> None:
     assert router_config.args["model_path"] == "/models/gpt-oss-checkpoint"
 
 
+@pytest.mark.parametrize("router_type", ["kv_cache_aware", "KV_CACHE_AWARE"])
+@pytest.mark.parametrize("revision_key", ["revision", "hf_revision"])
+def test_extract_router_config_propagates_kv_checkpoint(router_type,
+                                                        revision_key) -> None:
+    """A cache-aware router, however its type is spelled, reads the servers' checkpoint."""
+    cfg = {
+        "model": "mistralai/Mistral-Native",
+        revision_key: "0123abcd",
+        "checkpoint_format": "mistral",
+        "router": {
+            "type": router_type
+        },
+    }
+    router_config = extract_router_config(cfg)
+    assert router_config.type == "kv_cache_aware"
+    assert router_config.args == {
+        "model_path": "mistralai/Mistral-Native",
+        "revision": "0123abcd",
+        "checkpoint_format": "mistral",
+    }
+
+    # An explicit router value wins; other router types do not tokenize.
+    cfg["router"] = {"type": router_type, "checkpoint_format": "HF"}
+    assert extract_router_config(cfg).args["checkpoint_format"] == "HF"
+    cfg["router"] = {"type": "load_balancing"}
+    assert extract_router_config(cfg).args == {}
+    assert extract_router_config({"router": {"type": router_type}}).args == {}
+
+
+def test_extract_disagg_cfg_gives_the_top_level_checkpoint_format_to_kv_routers(
+) -> None:
+    config = extract_disagg_cfg(
+        checkpoint_format="mistral_large_3",
+        context_servers={
+            "num_instances": 1,
+            "urls": ["localhost:8001"],
+            "router": {
+                "type": "kv_cache_aware"
+            },
+        },
+        generation_servers={
+            "num_instances": 1,
+            "urls": ["localhost:8002"],
+        },
+    )
+    assert config.ctx_router_config.args[
+        "checkpoint_format"] == "mistral_large_3"
+    assert "checkpoint_format" not in config.gen_router_config.args
+
+
 def test_get_server_configs_dict():
     server_configs = [
         CtxGenServerConfig(type="ctx",

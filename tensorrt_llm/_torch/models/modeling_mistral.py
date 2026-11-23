@@ -5,6 +5,7 @@ import copy
 import dataclasses
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torchvision
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
@@ -50,10 +51,10 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
+from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
                                             MultimodalParams)
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
 
@@ -326,46 +327,101 @@ class MistralCommonImageProcessor:
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
 
+    @staticmethod
+    def to_pil_image(image) -> Image.Image:
+        """An image as the media loaders hand it over -- a PIL image, a ``(C, H, W)``
+        tensor (float in [0, 1] for the ``"pt"`` format, or uint8) or a uint8
+        ``(H, W, C)`` array (``"np"``) -- as the PIL image mistral-common encodes.
+
+        A float tensor's values are 8-bit levels divided by 255; they are
+        rounded back to those levels.
+        """
+        if isinstance(image, Image.Image):
+            return image
+        if isinstance(image, torch.Tensor):
+            pixels = image.detach().cpu()
+            if pixels.is_floating_point():
+                pixels = (pixels.float() * 255.0).round_().clamp_(0, 255)
+            array = pixels.to(torch.uint8).permute(1, 2, 0).numpy()
+        elif isinstance(image, np.ndarray):
+            array = image.astype(np.uint8, copy=False)
+        else:
+            raise TypeError(
+                f"unsupported image type {type(image).__name__}; expected a PIL "
+                "image, a (C, H, W) tensor or a (H, W, C) uint8 array")
+        if array.ndim == 3 and array.shape[-1] == 1:
+            array = array[..., 0]
+        return Image.fromarray(np.ascontiguousarray(array))
+
+    @staticmethod
+    def pil_image_size(image: Any) -> Tuple[int, int]:
+        """The ``(width, height)`` of an image in any form ``to_pil_image`` takes."""
+        if isinstance(image, Image.Image):
+            return image.size
+        if isinstance(image, torch.Tensor) and image.ndim == 3:
+            return int(image.shape[2]), int(image.shape[1])
+        if isinstance(image, np.ndarray) and image.ndim in (2, 3):
+            return int(image.shape[1]), int(image.shape[0])
+        raise TypeError(
+            f"unsupported image {type(image).__name__}; expected a PIL image, "
+            "a (C, H, W) tensor or a (H, W, C) array")
+
+    @staticmethod
+    def image_list(images: Any) -> List[Any]:
+        """``images`` as a list: one image, a list or tuple of them, or none."""
+        if images is None:
+            return []
+        return list(images) if isinstance(images, (list, tuple)) else [images]
+
     def __call__(self,
                  text: str,
-                 images: list[Image.Image] | None = None,
-                 **kwargs: Any) -> dict[str, torch.Tensor]:
-        """Tokenize a native request and batch images without losing their sizes."""
-        mm_items = [{
-            "type": "image",
-            "base64": encode_base64_image(image)
-        } for image in (images or [])]
+                 images: Optional[Sequence[Any]] = None,
+                 **kwargs: Any) -> Dict[str, torch.Tensor]:
+        """Tokenize one user turn of ``text`` and its images with mistral-common.
 
-        conversation = [{
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": text
-            }, *mm_items]
-        }]
+        The images go where ``text`` has ``[IMG]`` markers, one per image, or
+        after the text when it has none. mistral-common resizes and
+        normalizes each image as loaded. Images of different sizes are padded
+        to one batch; ``image_sizes`` keeps each one's size.
+        """
+        from mistral_common.protocol.instruct.chunk import ImageChunk, TextChunk
+        from mistral_common.protocol.instruct.messages import UserMessage
+        from mistral_common.protocol.instruct.request import \
+            ChatCompletionRequest
 
-        encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
-            conversation, tokenize=True, return_dict=True, return_tensors=None)
-
-        processed = {
-            "input_ids": torch.tensor([encoded.input_ids]),
-        }
-
-        # text-only mode for VLM
-        if "pixel_values" in encoded:
-            # Native images may have different shapes. Preserve their unpadded
-            # sizes for item scheduling and the vision encoder's patch slicing.
+        images = self.image_list(images)
+        image_chunks = [
+            ImageChunk(
+                image=convert_image_mode(self.to_pil_image(image), "RGB"))
+            for image in images
+        ]
+        if "[IMG]" in text:
+            parts = text.split("[IMG]")
+            if len(parts) != len(images) + 1:
+                raise ValueError(
+                    "Image placeholder count does not match images")
+            content = []
+            for index, part in enumerate(parts):
+                if part:
+                    content.append(TextChunk(text=part))
+                if index < len(image_chunks):
+                    content.append(image_chunks[index])
+        else:
+            content = [TextChunk(text=text), *image_chunks]
+        encoded = self.tokenizer.mistral.encode_chat_completion(
+            ChatCompletionRequest(messages=[UserMessage(content=content)]))
+        processed = {"input_ids": torch.tensor([encoded.tokens])}
+        if encoded.images:
             pixel_values, image_sizes = Mistral3VLM.batch_pixel_values([
                 torch.as_tensor(image, dtype=self.dtype).unsqueeze(0)
-                for image in encoded.pixel_values
-            ], [torch.tensor([size]) for size in encoded.image_sizes])
+                for image in encoded.images
+            ], [
+                torch.tensor([list(image.shape[-2:])])
+                for image in encoded.images
+            ])
             processed.update({
-                "pixel_values":
-                pixel_values,
-                "attention_mask":
-                torch.tensor([encoded.attention_mask]),
-                "image_sizes":
-                image_sizes,
+                "pixel_values": pixel_values,
+                "image_sizes": image_sizes,
             })
         return processed
 
@@ -695,7 +751,7 @@ class MistralHFInputProcessor(MistralPixtralEncoderContract,
         """Return the vocab size of the model."""
         # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
         # config.
-        return self.config.text_config.vocab_size
+        return self.config.get_text_config().vocab_size
 
     def get_mm_token_ids(self) -> torch.Tensor:
         return torch.tensor([
@@ -723,7 +779,14 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
     Unlike the HF frontend, this one serves *every* mistral-native checkpoint
     (text-only, MoE, mamba, audio and vision), which is why the inherited
     encoder contract self-gates on the presence of a vision encoder.
+
+    The server renders a chat to token ids with mistral-common, image grids
+    included (``tensorrt_llm.inputs.utils.apply_chat_template``); token ids
+    with images are checked against the grids mistral-common makes of the
+    images.
     """
+
+    supports_token_id_mm_expansion = True
 
     def __init__(
         self,
@@ -769,7 +832,14 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         return self._dtype
 
     def get_vocab_size(self) -> int:
-        return self.config.text_config.vocab_size
+        return self.config.get_text_config().vocab_size
+
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # A uint8 (H, W, C) array: the loaders decode a JPEG into it with
+        # torchvision, and the request's multimodal hash reads it in place.
+        # The processor converts it to the PIL image mistral-common encodes,
+        # without changing a pixel.
+        return {"image": {"format": "np"}}
 
     def get_mm_token_ids(self) -> torch.Tensor:
         return torch.tensor([
@@ -784,25 +854,82 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
             self.processor.image_end_token_id,
         ])
 
+    def _image_blocks(self, token_ids):
+        """Locate complete native image grids, including their row delimiters."""
+        blocks = []
+        begin = None
+        for index, token in enumerate(token_ids):
+            if token == self.processor.image_token_id:
+                if begin is None:
+                    begin = index
+            elif token == self.processor.image_end_id:
+                if begin is None:
+                    raise ValueError("Image end token without an image grid")
+                blocks.append((begin, index + 1))
+                begin = None
+            elif token == self.processor.image_break_id:
+                if begin is None:
+                    raise ValueError(
+                        "Image row delimiter without an image grid")
+            elif begin is not None:
+                raise ValueError("Text token inside an incomplete image grid")
+        if begin is not None:
+            raise ValueError("Image grid is missing its end token")
+        return blocks
+
+    @staticmethod
+    def _image_payload(processed):
+        processed.pop("input_ids")
+        processed.pop("attention_mask", None)
+        processed["image_sizes"] = processed["image_sizes"].tolist()
+        return {"multimodal_data": {"image": processed}}
+
+    def requires_input_placeholders(self, *, tokenized: bool = False) -> bool:
+        """No caller-side check: this processor checks the images against the prompt.
+
+        Text places the images at its ``[IMG]`` markers, or after itself without
+        markers; token ids carry a whole image grid per image.
+        """
+        return False
+
+    @torch.inference_mode()
+    def call_with_token_ids(self, inputs, sampling_params):
+        # Keep native chat/control tokens intact; decoding and re-encoding the
+        # prompt would turn some control tokens into ordinary text.
+        token_ids = list(inputs["prompt_token_ids"])
+        images = self.processor.image_list(
+            inputs.get("multi_modal_data", {}).get("image"))
+        if not images:
+            if self._has_vision_encoder() and not set(
+                    self.get_mm_token_ids().tolist()).isdisjoint(token_ids):
+                raise ValueError("Image tokens require image data")
+            return token_ids, None
+        processed = self.processor(text="", images=images)
+        encoded = processed["input_ids"][0].tolist()
+        expected = [encoded[a:b] for a, b in self._image_blocks(encoded)]
+        if len(expected) != len(images):
+            raise ValueError(
+                "Native tokenizer image grid count does not match images")
+        actual = [token_ids[a:b] for a, b in self._image_blocks(token_ids)]
+        if actual != expected:
+            raise ValueError(
+                "Image token grids do not match image sizes and order")
+        return token_ids, self._image_payload(processed)
+
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], ExtraProcessedInputs | None]:
-        images = inputs.get("multi_modal_data", {}).get("image")
+        if inputs.get("prompt_token_ids") is not None:
+            return self.call_with_token_ids(inputs, sampling_params)
+        images = self.processor.image_list(
+            inputs.get("multi_modal_data", {}).get("image"))
         if not images:
-            # Text-only: tokenize directly without wrapping in a chat template.
-            # The chat template is either already applied by the caller (serve
-            # path) or intentionally absent (e.g. raw few-shot eval like MMLU).
-            input_ids = self.tokenizer.transformers_tokenizer.encode(
-                inputs["prompt"])
-            return input_ids, None
-        # Multimodal: MistralCommonImageProcessor builds the full conversation
-        # and applies the mistral-common chat template with image tokens.
+            return self.tokenizer.transformers_tokenizer.encode(
+                inputs["prompt"]), None
         processed = self.processor(text=inputs["prompt"], images=images)
-        input_ids = processed.pop("input_ids").tolist()[0]
-        processed.pop("attention_mask", None)
-        processed["image_sizes"] = processed["image_sizes"].tolist()
-        return input_ids, {"multimodal_data": {"image": {**processed}}}
+        input_ids = processed["input_ids"][0].tolist()
+        return input_ids, self._image_payload(processed)
 
 
 # Register the native processor's content-format metadata.  We do this
@@ -811,12 +938,14 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
 # overwrite the MistralHFInputProcessor entry for Mistral3VLM.
 # Mistral is the only supported case where HF preprocessor can be used with
 # non-HF checkpoints, so this hack is preferred to changing the registry itself.
+# mistral-common renders the chat from the messages with their image parts in
+# place (OPENAI content), not from text with placeholders.
 MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
     "mistral_common",
     MultimodalPlaceholderMetadata(
         placeholder_map={"image": "[IMG]"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        content_format=ContentFormat.PASSTHROUGH,
+        content_format=ContentFormat.OPENAI,
     ),
     registrant_module=__name__)
 MistralNativeInputProcessor._registered_model_type = "mistral_common"

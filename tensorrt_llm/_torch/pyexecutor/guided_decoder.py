@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Iterable, List, Optional, Tuple
 
+import llguidance
 import torch
 
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
@@ -169,7 +170,8 @@ class GuidedDecoder:
                  max_num_sequences: int,
                  vocab_size_padded: int,
                  max_num_draft_tokens: int = 0,
-                 rank: int = 0):
+                 rank: int = 0,
+                 llguidance_tokenizer: Optional[llguidance.LLTokenizer] = None):
         self.guided_decoding_backend = guided_decoding_config.backend
         self.max_num_sequences = max_num_sequences
         self.vocab_size_padded = vocab_size_padded
@@ -183,7 +185,9 @@ class GuidedDecoder:
                 max_num_draft_tokens=max_num_draft_tokens)
         elif self.guided_decoding_backend == GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE:
             self.grammar_matcher_factory = LLGuidanceMatcherFactory(
-                guided_decoding_config, vocab_size_padded)
+                guided_decoding_config,
+                vocab_size_padded,
+                tokenizer=llguidance_tokenizer)
         else:
             raise ValueError(
                 f"Invalid guided decoding backend: {self.guided_decoding_backend}"
@@ -528,12 +532,14 @@ class CapturableGuidedDecoder(GuidedDecoder):
                  max_num_sequences: int,
                  vocab_size_padded: int,
                  max_num_draft_tokens: int = 0,
-                 rank: int = 0):
+                 rank: int = 0,
+                 llguidance_tokenizer: Optional[llguidance.LLTokenizer] = None):
         super().__init__(guided_decoding_config=guided_decoding_config,
                          max_num_sequences=max_num_sequences,
                          vocab_size_padded=vocab_size_padded,
                          max_num_draft_tokens=max_num_draft_tokens,
-                         rank=rank)
+                         rank=rank,
+                         llguidance_tokenizer=llguidance_tokenizer)
         # self.requests should be accessed by normal host code;
         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None
