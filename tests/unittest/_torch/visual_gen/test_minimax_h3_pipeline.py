@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable, Optional
 
 import pytest
 import torch
@@ -258,8 +259,11 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         self,
         prompt: str,
         keyframes: list[Image.Image],
+        while_encoding: Optional[Callable[[], None]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del prompt, keyframes
+        if while_encoding is not None:
+            while_encoding()
         return torch.ones(1, 2, 4), torch.full((2,), MINIMAX_H3_TEXT_TAG)
 
     def _encode_keyframes(
