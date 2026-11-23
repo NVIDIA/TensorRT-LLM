@@ -18,13 +18,16 @@ import importlib
 import os
 import pickle  # nosec B403
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
+
+if TYPE_CHECKING:
+    import llguidance
 
 # Transformers 5.x moved ``bytes_to_unicode`` out of
 # ``transformers.models.gpt2.tokenization_gpt2`` into
@@ -67,6 +70,35 @@ except ImportError:
 
 class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
+
+    # Guided decoding reads the vocabulary grammars are matched against from the
+    # Hugging Face tokenizer. A tokenizer with no Hugging Face tokenizer JSON
+    # describes it itself: it sets this and implements `xgrammar_tokenizer_info`
+    # and `llguidance_tokenizer`.
+    describes_grammar_vocabulary: bool = False
+
+    def xgrammar_tokenizer_info(self) -> Dict[str, Any]:
+        """The vocabulary xgrammar matches grammars against.
+
+        Called only when `describes_grammar_vocabulary` is set.
+
+        Returns:
+            The `encoded_vocab` and `stop_token_ids` of a guided decoding config.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not describe its grammar vocabulary")
+
+    def llguidance_tokenizer(self, n_vocab: int) -> "llguidance.LLTokenizer":
+        """The tokenizer llguidance compiles grammars against.
+
+        Called only when `describes_grammar_vocabulary` is set.
+
+        Args:
+            n_vocab: The vocabulary size the token bitmask covers (the model's
+                padded vocabulary size).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not describe its grammar vocabulary")
 
     def __repr__(self) -> str:
         # PreTrainedTokenizerBase.__repr__ reads properties (e.g.
@@ -635,6 +667,42 @@ class TransformersTokenizer(TokenizerBase):
         return self.tokenizer.decode(pending_ids, **kwargs)
 
 
+def _load_mistral_common_tokenizer(
+        model_dir: Union[str, Path],
+        trust_remote_code: bool = True,
+        use_fast: bool = True) -> Optional[TokenizerBase]:
+    """Load a Mistral-native checkpoint directory through ``MistralTokenizer``.
+
+    A directory that ships mistral-common's ``tekken.json`` is Mistral-native
+    unless it is also a complete HF checkpoint, with both ``config.json`` and
+    ``tokenizer.json``. A native directory is read through the
+    ``mistral_common`` alias, exactly as ``custom_tokenizer="mistral_common"``
+    would read it, even when it also ships HF tokenizer files, so that every
+    reader of the directory tokenizes as mistral-common does. AutoTokenizer
+    would convert a bare ``tekken.json`` into a fast tokenizer whose ids lack
+    the special-token offset and whose ``encode`` prepends no BOS.
+
+    Args:
+        model_dir: The checkpoint or tokenizer directory.
+        trust_remote_code: Whether to trust remote code.
+        use_fast: Whether to use the fast tokenizer.
+
+    Returns:
+        The ``MistralTokenizer`` of a Mistral-native directory, or None for any
+        other path, which keeps the AutoTokenizer route.
+    """
+    model_dir = Path(model_dir)
+    if not (model_dir / "tekken.json").is_file():
+        return None
+    if ((model_dir / "config.json").is_file()
+            and (model_dir / "tokenizer.json").is_file()):
+        return None
+    return load_custom_tokenizer("mistral_common",
+                                 str(model_dir),
+                                 trust_remote_code=trust_remote_code,
+                                 use_fast=use_fast)
+
+
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
                                           TokenizerBase]] = None,
                       **kwargs) -> Optional[TokenizerBase]:
@@ -649,6 +717,11 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
             'use_fast': True,
         }
         default_kwargs.update(kwargs)
+        if (tokenizer := _load_mistral_common_tokenizer(
+                obj,
+                trust_remote_code=default_kwargs['trust_remote_code'],
+                use_fast=default_kwargs['use_fast'])) is not None:
+            return tokenizer
         return TransformersTokenizer.from_pretrained(obj, **default_kwargs)
     elif isinstance(obj, TokenizerBase):
         return obj
@@ -766,9 +839,18 @@ def load_hf_tokenizer(model_dir: str,
 
     Returns:
         A TransformersTokenizer object if the tokenizer is loaded successfully.
+        A Mistral-native directory (tekken.json, and not both config.json and
+        tokenizer.json) loads as MistralTokenizer, a TransformersTokenizer
+        subclass.
     '''
 
     _ensure_gpt2_bytes_to_unicode_compat()
+
+    if (tokenizer :=
+            _load_mistral_common_tokenizer(model_dir,
+                                           trust_remote_code=trust_remote_code,
+                                           use_fast=use_fast)) is not None:
+        return tokenizer
 
     try:
         tokenizer = TransformersTokenizer.from_pretrained(

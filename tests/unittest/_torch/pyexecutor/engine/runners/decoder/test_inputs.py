@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -33,6 +34,7 @@ from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
+    _NO_EXTRA_INPUTS,
     DecoderInputBuffers,
     DecoderInputPreparer,
     HostInputs,
@@ -59,7 +61,7 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig,
     SamplingParams,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import CpType, Mapping
 
 if TYPE_CHECKING:
@@ -78,8 +80,69 @@ _SIDE_STREAM_DELAY_CYCLES = 2_000_000_000
 _ORDER_NOT_EXERCISED = "the delayed stream finished before the other stream read"
 
 
-def _input_preparer(*, spec_config: DecodingBaseConfig | None = None) -> DecoderInputPreparer:
-    return input_preparer(decoder_config(is_spec_decode=False, spec_config=spec_config), model=None)
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("extend_as_context", [False, True])
+def test_bulk_verifying_prefix_matches_per_request_packing(extend_as_context: bool) -> None:
+    host = HostInputs(
+        use_mrope=False,
+        mrope_dummy_seq_slot=0,
+        extra_inputs=_NO_EXTRA_INPUTS,
+        context_prompt_lookahead=None,
+    )
+    host.lists.input_ids.extend([10, 11])
+    host.lists.position_ids.extend([0, 1])
+    host.lists.gather_ids.append(1)
+    host.lists.sequence_lengths.append(2)
+    host.lists.prompt_lengths.append(2)
+    host.lists.request_ids.append(99)
+    host.lists.num_cached_tokens_per_seq.append(0)
+    for previous, slot, length, compressed in ((9, 5, 17, 3), (4, 2, 41, 7), (None, 0, 9, 0)):
+        host.lists.extend_requests.append(
+            SimpleNamespace(
+                py_request_id=100 + slot,
+                py_batch_idx=previous,
+                py_seq_slot=slot,
+                max_beam_num_tokens=length,
+                py_num_compressed_tokens=compressed,
+                py_prompt_len=length - 2,
+                py_needs_onehot_draft_probs=slot == 5,
+                is_dummy=previous is None,
+                is_cuda_graph_dummy=previous is None,
+                is_attention_dp_dummy=False,
+                py_draft_tokens=[1, 2, 3],
+                py_draft_tokens_effective_len=None,
+                py_verify_len=None,
+            )
+        )
+    per_request = deepcopy(host)
+    per_request.extra_inputs = _NO_EXTRA_INPUTS
+    preparer = object.__new__(DecoderInputPreparer)
+    preparer._config = SimpleNamespace(attention_backend="TRTLLM")
+    preparer._dspark_trims_submitted_tokens = False
+    spec_config = SimpleNamespace(
+        is_linear_tree=True,
+        spec_dec_mode=SimpleNamespace(extend_ctx=lambda _: extend_as_context),
+    )
+
+    def pack(inputs: HostInputs) -> None:
+        preparer._pack_extend_requests(
+            inputs, frozenset(), object(), 4, spec_config, enable_spec_decode=True
+        )
+
+    pack(host)
+    with patch.object(DecoderInputPreparer, "_pack_verifying_prefix", return_value=0):
+        pack(per_request)
+
+    assert host.lists == per_request.lists
+    assert host.previous_batch_token_start == per_request.previous_batch_token_start == 0
+    assert host.previous_batch_tokens_per_request == per_request.previous_batch_tokens_per_request
+    assert host.lists.previous_batch_indices == [9, 4]
+    assert host.lists.padding_gen_slots == [5]
+    assert not host.lists.extend_requests[0].py_needs_onehot_draft_probs
+
+
+def _input_preparer(**config_changes: Any) -> DecoderInputPreparer:
+    return input_preparer(decoder_config(is_spec_decode=False, **config_changes), model=None)
 
 
 @pytest.mark.cpu_only
@@ -313,32 +376,36 @@ def test_zero_fill_row_spans_without_spans_is_noop() -> None:
 
 class DecoderInputPreparerTestCase(unittest.TestCase):
     def test_prepare_inputs_returns_steady_gen_fast_inputs(self) -> None:
-        inputs = _input_preparer()
-        inputs.guided_decoder = Mock()
-        inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
-        fast_inputs = PreparedInputs({"prepared": True})
-        inputs._apply_steady_gen_fast_prepare = Mock(return_value=fast_inputs)
-        batch = ScheduledRequests()
-        new_tokens = torch.zeros(1)
+        for backend in PrefillCudaGraphBackend:
+            for maybe_graph in (False, True):
+                with self.subTest(backend=backend, maybe_graph=maybe_graph):
+                    inputs = _input_preparer(prefill_cuda_graph_backend=backend)
+                    inputs.guided_decoder = Mock()
+                    inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
+                    fast_inputs = PreparedInputs({"prepared": True})
+                    inputs._apply_steady_gen_fast_prepare = Mock(return_value=fast_inputs)
+                    batch = ScheduledRequests()
+                    new_tokens = torch.zeros(1)
 
-        result = inputs.prepare_inputs(
-            batch,
-            Mock(),
-            Mock(),
-            new_tensors_device=SimpleNamespace(new_tokens=new_tokens),
-            enable_spec_decode=False,
-            runtime_draft_len=3,
-            is_dummy=True,
-        )
+                    result = inputs.prepare_inputs(
+                        batch,
+                        Mock(),
+                        Mock(),
+                        new_tensors_device=SimpleNamespace(new_tokens=new_tokens),
+                        maybe_graph=maybe_graph,
+                        enable_spec_decode=False,
+                        runtime_draft_len=3,
+                        is_dummy=True,
+                    )
 
-        self.assertIs(result.kwargs, fast_inputs.kwargs)
-        self.assertEqual(result.runtime_draft_len, 3)
-        inputs.guided_decoder.add_batch.assert_called_once_with(
-            batch, new_tokens=new_tokens, runtime_draft_len=3, is_cuda_graph=False
-        )
-        inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
-            batch, new_tokens, None, None, True
-        )
+                    self.assertIs(result.kwargs, fast_inputs.kwargs)
+                    self.assertEqual(result.runtime_draft_len, 3)
+                    inputs.guided_decoder.add_batch.assert_called_once_with(
+                        batch, new_tokens=new_tokens, runtime_draft_len=3, is_cuda_graph=maybe_graph
+                    )
+                    inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
+                        batch, new_tokens, None, None, True
+                    )
 
     def test_prepare_inputs_single_cp_rank_ignores_cp_type(self) -> None:
         for cp_type in (CpType.ULYSSES, CpType.RING):

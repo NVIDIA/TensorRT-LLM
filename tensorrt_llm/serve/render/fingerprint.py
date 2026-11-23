@@ -136,7 +136,11 @@ def _tokenizer_digest(tokenizer: Any) -> Dict[str, Any]:
                 and k in init_kwargs
             }
         )
-    encoding = _encoding_digest(inner)
+    # A tokenizer that renders chats with its own code identifies its encoding itself
+    # (MistralTokenizer: its tokenizer file and mistral-common's version).
+    encoding = getattr(tokenizer, "encoding_identity", None)
+    if not isinstance(encoding, dict):
+        encoding = _encoding_digest(inner)
     info["encoding"] = encoding
     info["complete"] = encoding is not None
     return info

@@ -1012,9 +1012,11 @@ class GuidedDecodingConfig(StrictBaseModel):
     backend: GuidedDecodingBackend = Field(
         default=GuidedDecodingBackend.XGRAMMAR,
         description="The backend for guided decoding config.")
-    encoded_vocab: Optional[List[str]] = Field(
+    encoded_vocab: Optional[List[Union[str, bytes]]] = Field(
         default=None,
-        description="The encoded vocab for guided decoding config.")
+        description=
+        "The encoded vocab for guided decoding config: each token's text, or "
+        "its raw bytes for tokenizers whose tokens need not be valid UTF-8.")
     tokenizer_str: Optional[str] = Field(
         default=None,
         description="The tokenizer string for guided decoding config.")
@@ -4548,6 +4550,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
+    # Set when validation defaults block_size to max_draft_len before a hub
+    # drafter's config.json is readable; resolve_draft_config_fields then
+    # checks the downloaded checkpoint's block size.
+    _block_size_defaulted: bool = PrivateAttr(default=False)
+
     mask_token_id: Optional[int] = Field(
         default=None,
         description=
@@ -4789,18 +4796,108 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         logger.info(f"DSpark context_recompute_tail resolved to "
                     f"{self.context_recompute_tail} ({reason}).")
 
+    def resolve_draft_config_fields(self) -> None:
+        """Fill unset ``target_layer_ids`` / ``mask_token_id`` / ``block_size`` /
+        ``markov_rank`` from the drafter's ``config.json``, and reject a
+        ``target_layer_ids`` override that does not match it.
+
+        Runs during validation for a local drafter and again from
+        ``resolve_from_checkpoint`` once a hub repo id is downloaded; without
+        it no target hidden states are captured. A missing ``config.json`` is
+        left for the later call. Once the drafter is local, a ``block_size``
+        that validation defaulted to ``max_draft_len`` must match the
+        checkpoint's, as it must for a drafter that was local at validation.
+        """
+        if self.speculative_model is None:
+            return
+        # Several checkpoint spellings are in the wild for the same knobs
+        # and all are accepted here, because a key the reader misses is
+        # not an error -- it silently falls back to a default and the
+        # drafter degrades (a markov_rank read as 0 skips the Markov
+        # head entirely, costing acceptance with no warning):
+        #   - top-level ``dspark_*``  (DeepSeek-V4-Pro)
+        #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
+        #   - nested ``dspark_config``  (forward compatibility)
+        #   - plain top-level keys  (TorchSpec drafters)
+        # V4.1 wraps the language model settings in ``text_config``;
+        # prefer that scope, retaining the top-level legacy fallback.
+        draft_config_path = os.path.join(str(self.speculative_model),
+                                         "config.json")
+        if os.path.exists(draft_config_path):
+            with open(draft_config_path) as f:
+                draft_cfg = translate_speculators_dspark_config(json.load(f))
+            text_cfg = draft_cfg.get("text_config") or {}
+
+            def _dspark_get(
+                    key: str,
+                    top_level_key: str) -> Optional[Union[List[int], int]]:
+                for scope in (text_cfg, draft_cfg):
+                    for source, name in ((scope.get("dspark_config") or {},
+                                          key), (scope.get("dflash_config")
+                                                 or {}, key),
+                                         (scope, top_level_key), (scope, key)):
+                        value = source.get(name)
+                        if value is not None:
+                            return value
+                return None
+
+            # The checkpoint's ``dspark_target_layer_ids`` is
+            # authoritative: it fixes both which target hidden states
+            # were captured during draft training and the input width of
+            # ``main_proj`` (hidden_size * num_capture_layers). If the
+            # user leaves ``target_layer_ids`` unset we copy it verbatim
+            # (order preserved, since the projection columns are
+            # order-dependent). An explicit override that does not match
+            # the checkpoint list exactly would either mismatch the
+            # projection shape at runtime (different count) or feed the
+            # draft hidden states it was not trained on (same count,
+            # different layers), so reject it during validation.
+            ckpt_layer_ids = _dspark_get("target_layer_ids",
+                                         "dspark_target_layer_ids")
+            if self.target_layer_ids is None:
+                if ckpt_layer_ids is not None:
+                    self.target_layer_ids = list(ckpt_layer_ids)
+            elif ckpt_layer_ids is not None and list(
+                    self.target_layer_ids) != list(ckpt_layer_ids):
+                raise ValueError(
+                    "DSpark target_layer_ids must match the checkpoint's "
+                    "dspark_target_layer_ids exactly (the draft "
+                    "projection weights are trained for that specific "
+                    f"layer set); got override {self.target_layer_ids} "
+                    f"but the checkpoint specifies {list(ckpt_layer_ids)}. "
+                    "Leave target_layer_ids unset to use the checkpoint "
+                    "value.")
+            if self.mask_token_id is None:
+                mask_id = _dspark_get("mask_token_id", "dspark_noise_token_id")
+                if mask_id is not None:
+                    self.mask_token_id = mask_id
+            if self.block_size is None or self._block_size_defaulted:
+                block_size = _dspark_get("block_size", "dspark_block_size")
+                if block_size is not None:
+                    if (self.block_size is not None
+                            and int(block_size) != self.block_size):
+                        raise ValueError(
+                            "DSpark block_size must equal max_draft_len; the "
+                            f"drafter checkpoint has block_size={block_size} "
+                            f"and max_draft_len={self.max_draft_len}")
+                    self.block_size = int(block_size)
+                    self._block_size_defaulted = False
+            if self.markov_rank is None:
+                markov_rank = _dspark_get("markov_rank", "dspark_markov_rank")
+                if markov_rank is not None:
+                    self.markov_rank = markov_rank
+
     def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
-        """Resolve ``context_recompute_tail`` once a hub repo id is downloaded.
+        """Resolve the checkpoint-derived fields once a hub repo id is downloaded.
 
         Called by ``CachedModelLoader`` after it swaps the repo id for the
         local directory. The embedded-vs-standalone probe was memoized against
         the repo id, which it cannot read, so it is dropped and re-probed.
-        Only the tail is resolved here: the other checkpoint fields
-        (``target_layer_ids`` and the rest) are read from a local
-        ``config.json`` during validation, and the model loader reads them for
-        a downloaded drafter.
+        The other checkpoint fields (``target_layer_ids`` and the rest), which
+        validation could not read from a repo id, are filled here too.
         """
         self.__dict__.pop("draft_is_embedded_in_target", None)
+        self.resolve_draft_config_fields()
         self.resolve_context_recompute_tail(trust_remote_code)
         if self.context_recompute_tail is None:
             logger.warning(
@@ -5102,6 +5199,93 @@ class _SleepConfigDefaultFactory:
 
     def __call__(self) -> Any:
         return self.default_mode
+
+
+# The memory monitor's bounds and defaults. The monitor's ``settings`` module
+# keeps the same values for its environment variables; a test keeps the two
+# equal, since this module cannot import the monitor at definition time.
+#: Longest interval: a week, far below ``threading.TIMEOUT_MAX``.
+_MEMORY_MONITOR_MAX_INTERVAL_S = 7 * 24 * 3600.0
+_MEMORY_MONITOR_MIN_PERIODIC_INTERVAL_S = 1.0
+_MEMORY_MONITOR_DEFAULT_OOM_INTERVAL_S = 60.0
+_MEMORY_MONITOR_MAX_PERIODIC_FILES = 100
+
+
+class MemoryMonitorConfig(StrictBaseModel):
+    """Configuration for the GPU memory monitor.
+
+    Each field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;
+    a variable set to a non-blank value overrides the field, and
+    ``TorchLlmArgs`` applies it when the arguments are validated. See
+    ``docs/source/features/memory-monitor.md``.
+    """
+
+    mode: Literal["off", "oom", "full"] = Field(
+        default="oom",
+        description="'oom' reports out-of-memory errors that the executor's "
+        "own error handling sees and records nothing else; 'full' also "
+        "records startup, reports when it completes, compares later reports "
+        "with that point and reports out-of-memory errors seen anywhere in "
+        "the process; 'off' produces no reports on its own. YAML's unquoted "
+        "off and on (booleans) and 0 and 1 are read as 'off' and 'full'. "
+        "Overridden by TLLM_MEM_MONITOR.")
+    ranks: Optional[List[NonNegativeInt]] = Field(
+        default=None,
+        min_length=1,
+        description="Ranks that report; all ranks when unset. Each must be "
+        "below the job's world size. Overridden by TLLM_MEM_MONITOR_RANKS.")
+    record_stacks: bool = Field(
+        default=False,
+        description="In 'full' mode, record the Python stack of every live "
+        "PyTorch allocation so that unattributed PyTorch memory is broken "
+        "down by the code that allocated it. Slows every PyTorch allocation; "
+        "meant for reproducing a problem. Overridden by "
+        "TLLM_MEM_MONITOR_STACKS.")
+    periodic_report_interval_s: Optional[float] = Field(
+        default=None,
+        ge=_MEMORY_MONITOR_MIN_PERIODIC_INTERVAL_S,
+        le=_MEMORY_MONITOR_MAX_INTERVAL_S,
+        allow_inf_nan=False,
+        description="In 'full' mode, report every this many seconds while "
+        "serving, at most once a week. Overridden by "
+        "TLLM_MEM_MONITOR_INTERVAL, where 0 turns the periodic report off.")
+    oom_report_interval_s: float = Field(
+        default=_MEMORY_MONITOR_DEFAULT_OOM_INTERVAL_S,
+        ge=0.0,
+        le=_MEMORY_MONITOR_MAX_INTERVAL_S,
+        allow_inf_nan=False,
+        description="Minimum seconds between two out-of-memory reports, at "
+        "most a week. Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.")
+    report_dir: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Directory to which every report except on-demand ones "
+        "is also written, one file per report. It is created readable by its "
+        "owner only, and only the newest "
+        f"{_MEMORY_MONITOR_MAX_PERIODIC_FILES} periodic reports of each rank "
+        "and process are kept. Overridden by TLLM_MEM_MONITOR_DIR.")
+
+    #: Fields whose value came from a ``TLLM_MEM_MONITOR*`` variable, so that
+    #: messages name the variable rather than the field.
+    _from_environment: frozenset = PrivateAttr(default_factory=frozenset)
+
+    @field_validator("mode",
+                     mode="before",
+                     json_schema_input_type=Union[Literal["off", "oom", "full",
+                                                          "0", "1"], bool,
+                                                  Literal[0, 1]])
+    @classmethod
+    def _mode_from_yaml_scalar(cls, value: object) -> object:
+        """Read YAML's unquoted ``off``/``on`` and ``0``/``1`` as modes.
+
+        ``yaml.safe_load`` turns ``mode: off`` into ``False`` and ``mode: 1``
+        into ``1``. ``bool`` is checked first because it is an ``int``.
+        """
+        if isinstance(value, bool):
+            return "full" if value else "off"
+        if isinstance(value, (int, str)) and str(value) in ("0", "1"):
+            return "full" if str(value) == "1" else "off"
+        return value
 
 
 class SleepConfig(StrictBaseModel):
@@ -6006,6 +6190,20 @@ class BlockReuseConfig(StrictBaseModel):
         "Only used when "
         "`policy` is 'per_conversation'.")
 
+    drop_extended_turns: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "With policy 'per_conversation', drop a retained turn as soon as a "
+        "later turn of the same conversation extends it (its committed tokens "
+        "are a prefix of the later turn's), instead of waiting for it to age "
+        "out of `max_num_turns`. Turns that are not extended keep their state "
+        "until the `max_num_turns` cap drops the oldest. This helps when one "
+        "conversation id carries several branches, such as subagents that "
+        "share their parent's id: a subagent's turns no longer push out the "
+        "parent's state. Set `max_num_turns` to at least the number of "
+        "branches to keep.")
+
     swa_endpoint_rewind_tokens: NonNegativeInt = Field(
         default=0,
         status="prototype",
@@ -6038,6 +6236,14 @@ class BlockReuseConfig(StrictBaseModel):
             raise ValueError(
                 "block_reuse_config.swa_endpoint_rewind_tokens requires "
                 "block_reuse_config.policy='all_reusable'.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_drop_extended_turns_policy(self) -> 'BlockReuseConfig':
+        """Reject drop_extended_turns outside the per_conversation policy."""
+        if self.drop_extended_turns and self.policy != "per_conversation":
+            raise ValueError("block_reuse_config.drop_extended_turns requires "
+                             "block_reuse_config.policy='per_conversation'.")
         return self
 
 
@@ -8954,6 +9160,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    memory_monitor_config: Optional[MemoryMonitorConfig] = Field(
+        default=None,
+        description="Configuration for the GPU memory monitor, which explains "
+        "out-of-memory errors. Unset uses the defaults: a report when GPU "
+        "memory runs out, and nothing else.",
+        status="prototype")
+
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
         default=None,
         description="The request reordering policy to use.",
@@ -9181,6 +9394,42 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def resolve_memory_monitor_environment(self) -> 'TorchLlmArgs':
+        """Fold the ``TLLM_MEM_MONITOR*`` variables into ``memory_monitor_config``.
+
+        Read once, in the process that builds the arguments, so that every
+        rank and the ``trtllm-serve`` frontend get the same settings with
+        them instead of reading their own environment. An invalid variable,
+        or a rank filter that selects none of the job's ranks, is reported
+        and ignored.
+        """
+        from tensorrt_llm._torch.memory.monitor.settings import \
+            resolve_environment
+        self.memory_monitor_config = resolve_environment(
+            self.memory_monitor_config, self.parallel_config.world_size)
+        return self
+
+    @model_validator(mode="after")
+    def validate_memory_monitor_ranks(self) -> 'TorchLlmArgs':
+        """Reject a memory monitor rank filter naming ranks the job lacks.
+
+        Such a filter would turn the monitor off on every rank without a
+        word. A rank filter from ``TLLM_MEM_MONITOR_RANKS`` that selects
+        none of them is ignored instead, by
+        :meth:`resolve_memory_monitor_environment`.
+        """
+        config = self.memory_monitor_config
+        if config is None or config.ranks is None:
+            return self
+        world_size = self.parallel_config.world_size
+        outside = sorted(rank for rank in config.ranks if rank >= world_size)
+        if outside:
+            raise ValueError(
+                f"memory_monitor_config.ranks {outside} are not ranks of this "
+                f"job, which has {world_size} (0-{world_size - 1}).")
+        return self
+
+    @model_validator(mode="after")
     def validate_encoder_modes(self) -> 'TorchLlmArgs':
         if self.encode_only and self.mm_encoder_only:
             raise ValueError(
@@ -9251,6 +9500,34 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"{feature} does not support dynamic-tree speculative "
                 "decoding, which moves accepted KV rows inside the cache pools."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_rocket_sparse_attention(self) -> 'TorchLlmArgs':
+        """Reject runtime features that RocketKV sparse attention does not support."""
+        if not isinstance(self.sparse_attention_config,
+                          RocketSparseAttentionConfig):
+            return self
+        unsupported = []
+        if self.enable_chunked_prefill:
+            unsupported.append("enable_chunked_prefill")
+        if self.speculative_config is not None:
+            unsupported.append("speculative_config")
+        if (self.cache_transceiver_config is not None
+                and self.cache_transceiver_config.backend is not None):
+            unsupported.append(
+                "cache_transceiver_config (disaggregated serving)")
+        if self.kv_cache_compression_config is not None:
+            unsupported.append("kv_cache_compression_config")
+        if self.kv_cache_config.enable_block_reuse:
+            unsupported.append("kv_cache_config.enable_block_reuse")
+        if self.kv_cache_config.enable_swa_scratch_reuse:
+            unsupported.append("kv_cache_config.enable_swa_scratch_reuse")
+        if self.max_beam_width is not None and self.max_beam_width > 1:
+            unsupported.append("max_beam_width > 1 (beam search)")
+        if unsupported:
+            raise ValueError("RocketKV sparse attention does not support " +
+                             ", ".join(unsupported) + ".")
         return self
 
     @model_validator(mode="after")
@@ -9808,85 +10085,10 @@ class TorchLlmArgs(BaseLlmArgs):
                     raise ValueError(
                         "use_ancestral_draft_sampling=True is not supported with a "
                         "drafter embedded in the target checkpoint.")
-                # Resolve target_layer_ids / mask_token_id / block_size /
-                # markov_rank from the draft (or main) model config if not set.
-                # Several checkpoint spellings are in the wild for the same knobs
-                # and all are accepted here, because a key the reader misses is
-                # not an error -- it silently falls back to a default and the
-                # drafter degrades (a markov_rank read as 0 skips the Markov
-                # head entirely, costing acceptance with no warning):
-                #   - top-level ``dspark_*``  (DeepSeek-V4-Pro)
-                #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
-                #   - nested ``dspark_config``  (forward compatibility)
-                #   - plain top-level keys  (TorchSpec drafters)
-                # V4.1 wraps the language model settings in ``text_config``;
-                # prefer that scope, retaining the top-level legacy fallback.
-                draft_config_path = os.path.join(spec_cfg.speculative_model,
-                                                 "config.json")
-                if os.path.exists(draft_config_path):
-                    with open(draft_config_path) as f:
-                        draft_cfg = translate_speculators_dspark_config(
-                            json.load(f))
-                    text_cfg = draft_cfg.get("text_config") or {}
-
-                    def _dspark_get(
-                            key: str, top_level_key: str
-                    ) -> Optional[Union[List[int], int]]:
-                        for scope in (text_cfg, draft_cfg):
-                            for source, name in ((scope.get("dspark_config")
-                                                  or {}, key),
-                                                 (scope.get("dflash_config")
-                                                  or {}, key),
-                                                 (scope, top_level_key), (scope,
-                                                                          key)):
-                                value = source.get(name)
-                                if value is not None:
-                                    return value
-                        return None
-
-                    # The checkpoint's ``dspark_target_layer_ids`` is
-                    # authoritative: it fixes both which target hidden states
-                    # were captured during draft training and the input width of
-                    # ``main_proj`` (hidden_size * num_capture_layers). If the
-                    # user leaves ``target_layer_ids`` unset we copy it verbatim
-                    # (order preserved, since the projection columns are
-                    # order-dependent). An explicit override that does not match
-                    # the checkpoint list exactly would either mismatch the
-                    # projection shape at runtime (different count) or feed the
-                    # draft hidden states it was not trained on (same count,
-                    # different layers), so reject it during validation.
-                    ckpt_layer_ids = _dspark_get("target_layer_ids",
-                                                 "dspark_target_layer_ids")
-                    if spec_cfg.target_layer_ids is None:
-                        if ckpt_layer_ids is not None:
-                            spec_cfg.target_layer_ids = list(ckpt_layer_ids)
-                    elif ckpt_layer_ids is not None and list(
-                            spec_cfg.target_layer_ids) != list(ckpt_layer_ids):
-                        raise ValueError(
-                            "DSpark target_layer_ids must match the checkpoint's "
-                            "dspark_target_layer_ids exactly (the draft "
-                            "projection weights are trained for that specific "
-                            f"layer set); got override {spec_cfg.target_layer_ids} "
-                            f"but the checkpoint specifies {list(ckpt_layer_ids)}. "
-                            "Leave target_layer_ids unset to use the checkpoint "
-                            "value.")
-                    if spec_cfg.mask_token_id is None:
-                        mask_id = _dspark_get("mask_token_id",
-                                              "dspark_noise_token_id")
-                        if mask_id is not None:
-                            spec_cfg.mask_token_id = mask_id
-                    if spec_cfg.block_size is None:
-                        block_size = _dspark_get("block_size",
-                                                 "dspark_block_size")
-                        if block_size is not None:
-                            spec_cfg.block_size = int(block_size)
-                    if spec_cfg.markov_rank is None:
-                        markov_rank = _dspark_get("markov_rank",
-                                                  "dspark_markov_rank")
-                        if markov_rank is not None:
-                            spec_cfg.markov_rank = markov_rank
+                spec_cfg.resolve_draft_config_fields()
                 if spec_cfg.block_size is None:
                     spec_cfg.block_size = spec_cfg.max_draft_len
+                    spec_cfg._block_size_defaulted = True
                 if spec_cfg.block_size <= 0:
                     raise ValueError(
                         "DSpark block_size must be greater than zero")

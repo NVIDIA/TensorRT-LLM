@@ -782,16 +782,9 @@ def test_native_processed_images_preserve_item_sizes(
     pixels = [
         torch.full((3, height, width), float(i + 1)) for i, (height, width) in enumerate(sizes)
     ]
-    encoded = transformers.BatchEncoding(
-        {
-            "input_ids": [1, 2, 3],
-            "attention_mask": [1, 1, 1],
-            "pixel_values": [pixel.numpy() for pixel in pixels],
-            "image_sizes": sizes,
-        }
-    )
+    encoded = SimpleNamespace(tokens=[1, 2, 3], images=[pixel.numpy() for pixel in pixels])
     tokenizer = SimpleNamespace(
-        transformers_tokenizer=mock.Mock(),
+        mistral=mock.Mock(),
         instruct=SimpleNamespace(
             mm_encoder=mock.Mock(
                 spec=modeling_mistral.ImageEncoder,
@@ -799,14 +792,7 @@ def test_native_processed_images_preserve_item_sizes(
             )
         ),
     )
-
-    def apply_chat_template(
-        *args: Any, return_tensors: str | None, **kwargs: Any
-    ) -> transformers.BatchEncoding:
-        assert return_tensors is None
-        return encoded
-
-    tokenizer.transformers_tokenizer.apply_chat_template.side_effect = apply_chat_template
+    tokenizer.mistral.encode_chat_completion.return_value = encoded
     proc._processor = modeling_mistral.MistralCommonImageProcessor(tokenizer, proc.dtype)
     input_ids, extra = proc.call_with_text_prompt(
         {

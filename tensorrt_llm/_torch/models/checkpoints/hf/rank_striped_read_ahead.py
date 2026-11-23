@@ -3,6 +3,7 @@
 
 """Private host read-ahead primitives for Hugging Face SafeTensors."""
 
+import math
 import os
 import threading
 import time
@@ -152,8 +153,90 @@ def _read_cgroup_value(path: Path, *, unlimited_threshold: int | None = None) ->
     return parsed
 
 
+def _reclaimable_file_cache(stat_path: Path, unified: bool) -> int | None:
+    """Return the file-backed page cache that a cgroup's `memory.stat` reports.
+
+    The kernel reclaims these pages before the cgroup runs out of memory, so they are as
+    available as the page cache that host memory accounting counts as available. cgroup v1
+    reports them for the whole subtree, like `memory.usage_in_bytes`, in its `total_*`
+    entries; cgroup v2 entries already cover the subtree. Returns None if `memory.stat`
+    cannot be read.
+    """
+    try:
+        lines = stat_path.read_text().splitlines()
+    except (OSError, UnicodeError):
+        return None
+    stats = {}
+    for line in lines:
+        name, _, value = line.partition(" ")
+        try:
+            stats[name] = int(value)
+        except ValueError:
+            continue
+    names = ("active_file", "inactive_file")
+    if not unified and all(f"total_{name}" in stats for name in names):
+        names = tuple(f"total_{name}" for name in names)
+    return sum(max(0, stats.get(name, 0)) for name in names)
+
+
+def _memory_protection(cgroup: Path) -> float | None:
+    """Return the larger of a cgroup v2's `memory.min` and `memory.low`, infinite for `max`.
+
+    A missing file, as for an entry that is not a cgroup or a cgroup without the memory
+    controller, means no protection. Returns None if a file exists but cannot be read or parsed.
+    """
+    protection = 0.0
+    for name in ("memory.min", "memory.low"):
+        try:
+            value = (cgroup / name).read_text().strip()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, UnicodeError):
+            return None
+        if value == "max":
+            return math.inf
+        try:
+            protection = max(protection, int(value))
+        except ValueError:
+            return None
+    return protection
+
+
+def _protected_file_cache(cgroup: Path) -> int | None:
+    """Return the page cache that a cgroup v2's children protect from its reclaim.
+
+    Reclaim for the cgroup's limit leaves each child's memory up to the child's `memory.min`, and
+    takes memory up to the child's `memory.low` only after all unprotected memory, such as the
+    pages this process reads. Up to that protection, a child's file-backed page cache, the cache
+    of the child on this process's path included, is not available under the cgroup's limit.
+    Reclaim for a cgroup's own limit does not apply that cgroup's protection, so each limit only
+    loses the protection of its cgroup's children. Returns None if the children cannot be
+    listed, or a child's protection or the page cache it protects cannot be read.
+    """
+    try:
+        children = list(cgroup.iterdir())
+    except OSError:
+        return None
+    protected = 0
+    for child in children:
+        protection = _memory_protection(child)
+        if protection is None:
+            return None
+        if protection > 0:
+            file_cache = _reclaimable_file_cache(child / "memory.stat", unified=True)
+            if file_cache is None:
+                return None
+            protected += int(min(protection, file_cache))
+    return protected
+
+
 def cgroup_available_host_memory() -> int | None:
-    """Return the tightest remaining cgroup limit, including ancestors."""
+    """Return the tightest remaining cgroup limit, including ancestors.
+
+    Reclaimable file-backed page cache charged to a cgroup counts as available, except, on cgroup
+    v2, the page cache that the cgroup's children protect. If that protection cannot be read,
+    no page cache counts as available under the cgroup's limits.
+    """
     unified_path, memory_path = _cgroup_paths()
     candidates: list[tuple[Path, Path, bool]] = []
 
@@ -188,14 +271,27 @@ def cgroup_available_host_memory() -> int | None:
                 limits = (
                     _read_cgroup_value(path / "memory.limit_in_bytes", unlimited_threshold=1 << 60),
                 )
-            if current is None:
+            finite_limits = [limit for limit in limits if limit is not None]
+            if current is None or not finite_limits:
                 continue
-            available.extend(max(0, limit - current) for limit in limits if limit is not None)
+            reclaimable = _reclaimable_file_cache(path / "memory.stat", unified) or 0
+            if unified:
+                protected = _protected_file_cache(path)
+                reclaimable = 0 if protected is None else reclaimable - protected
+            in_use = max(0, current - max(0, reclaimable))
+            available.extend(max(0, limit - in_use) for limit in finite_limits)
 
     return min(available) if available else None
 
 
 def effective_available_host_memory() -> int:
+    """Return the host memory this process can still use.
+
+    This is the host's available memory, capped by `cgroup_available_host_memory`. Checkpoint
+    loading checks rank-striped read-ahead, its refreshes and the raw HF weight cache against
+    it, and KV cache manager V2 sizes its automatic pinned host tier with it, so the page cache
+    that the cgroup accounting counts as available also counts for that tier.
+    """
     host_available = psutil.virtual_memory().available
     cgroup_available = cgroup_available_host_memory()
     return host_available if cgroup_available is None else min(host_available, cgroup_available)

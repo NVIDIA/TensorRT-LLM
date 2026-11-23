@@ -112,7 +112,7 @@ class MhcBigFuse(OpWrapper):
         dimension), followed by the input RMSNorm when ``norm_weight`` is given.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     _GLM = dict(mult=MULT, hidden=HIDDEN, **GLM_SCALARS)
     CELLS: tuple[Cell, ...] = (

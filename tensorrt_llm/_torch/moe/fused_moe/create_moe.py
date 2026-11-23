@@ -10,6 +10,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
+from .cutedsl import TrtllmCutedslFusedFc12Mxfp8Impl
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -186,7 +187,8 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslFc12FusedMoE)):
+    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslFc12FusedMoE,
+                              TrtllmCutedslFusedFc12Mxfp8Impl)):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
