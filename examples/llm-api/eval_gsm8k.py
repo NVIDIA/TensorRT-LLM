@@ -205,6 +205,8 @@ def _managed(args: argparse.Namespace) -> tuple[runner.ManagedServer, Optional[i
     if not isinstance(config, dict):
         raise runner.EvaluationError(f"{args.config} is not a YAML mapping")
     argv = ["trtllm-serve", args.model, "--config", args.config]
+    if args.served_model_name is not None:
+        argv += ["--served_model_name", args.served_model_name]
     if args.chat_template:
         argv += ["--chat_template", args.chat_template]
     env = dict(os.environ)
