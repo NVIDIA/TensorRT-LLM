@@ -342,11 +342,14 @@ class DecoderRunner(ScheduledModelRunner):
         return DecoderCudaGraphs(**self._cuda_graphs_kwargs(), inputs=self._inputs)
 
     def _dummy_requests_kwargs(self) -> dict[str, Any]:
+        release_request_state = getattr(self._model, "release_request_state", None)
+        if release_request_state is None:
+            release_request_state = getattr(self._get_spec_worker(), "release_private_tail", None)
         return dict(
             config=self._config,
             model=self._model,
             get_runtime_tokens_per_gen_step=self._get_runtime_tokens_per_gen_step,
-            release_request_state=getattr(self._model, "release_request_state", None),
+            release_request_state=release_request_state,
         )
 
     def _input_preparer_kwargs(
@@ -513,10 +516,22 @@ class DecoderRunner(ScheduledModelRunner):
     def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner:
         runner_type = DSparkCUDAGraphRunner if self._dspark_confidence_enabled else CUDAGraphRunner
         cuda_graph_runner = runner_type(self._cuda_graph_runner_config())
+        cuda_graph_runner.spec_cache_graph_eligible = self._spec_cache_graph_eligible
         register_hooks = getattr(self._model, "register_cuda_graph_pre_replay_hooks", None)
         if register_hooks is not None:
             register_hooks(cuda_graph_runner)
         return cuda_graph_runner
+
+    def _spec_cache_graph_eligible(self, batch, attention, promoted_context_ids) -> bool:
+        gate = getattr(self._get_spec_worker(), "draft_cache_graph_eligible", None)
+        if gate is None:
+            return True
+        return gate(
+            batch,
+            attention.kv_cache_manager,
+            getattr(self._model, "draft_model", None),
+            promoted_context_ids,
+        )
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         sampling_variants = getattr(self._config.cuda_graph_config, "sampling_variants", None)

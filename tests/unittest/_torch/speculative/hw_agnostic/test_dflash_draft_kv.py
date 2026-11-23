@@ -112,12 +112,20 @@ def test_slot_from_zero_cannot_store_a_chunk_past_the_trail_on_a_windowed_pool(
     assert worker._ctx_store_start(cur, first_pos) == expected
 
 
-def test_slot_from_zero_skips_a_context_store_past_the_trail(
+@pytest.mark.parametrize(
+    ("capped_unified", "first_pos", "slen"),
+    [
+        pytest.param(False, 8192, 4, id="unaddressable-window"),
+        pytest.param(True, 0, 8192, id="oversized-prompt"),
+        pytest.param(True, 2047, 1, id="unverified-reused-prefix"),
+    ],
+)
+def test_skipped_prefill_does_not_publish_draft_history(
     monkeypatch: pytest.MonkeyPatch,
+    capped_unified: bool,
+    first_pos: int,
+    slen: int,
 ) -> None:
-    """A Kimi K3 style worker whose request lost its slot mid-prompt skips that
-    chunk's context store and releases the slot, with a warning, instead of
-    failing the batch."""
     import collections
 
     import torch
@@ -129,9 +137,13 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
     worker._ctx_block_tables = object()
     worker._ctx_block_counts = torch.tensor([300])
     worker._ctx_page_size = 64
-    worker._max_ctx = 1 << 17
-    worker._ctx_reuse_addressable = False
-    worker._ctx_reads_rebased_view = False
+    worker._max_ctx = 4096 if capped_unified else 1 << 17
+    worker._ctx_unified_cache = capped_unified
+    worker._ctx_has_position_cap = capped_unified
+    worker._ctx_buf_inited = True
+    worker._private_tail_requests = set()
+    worker._ctx_reuse_addressable = capped_unified
+    worker._ctx_reads_rebased_view = capped_unified
     worker._ctx_pool_windowed = True
     worker._ctx_pool_trail = 64
     worker._req_ctx_pos = {}
@@ -144,7 +156,6 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
     warnings = []
     monkeypatch.setattr(dflash.logger, "warning", warnings.append)
 
-    slen, first_pos = 4, 8192
     draft_model = SimpleNamespace(
         fc=object(), hidden_norm=object(), project_target_hidden=lambda hs: hs
     )
@@ -164,9 +175,15 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
         slen,
     )
 
+    assert worker._ctx_len_host[2] == 0 and worker._ctx_len.tolist()[2] == 0
+    assert worker.export_disagg_context(7) is None
+    if capped_unified:
+        assert worker._private_tail_requests == {7}
+        assert worker._req_ctx_pos[7] == first_pos + slen
+        return
+
     assert 7 not in worker._req_to_slot and 7 not in worker._req_ctx_pos
     assert list(worker._free_slots) == [2]
-    assert worker._ctx_len_host[2] == 0 and worker._ctx_len.tolist()[2] == 0
     assert len(warnings) == 1
     assert "skipping its context store" in warnings[0]
     assert "drafts nothing" not in warnings[0]

@@ -12764,10 +12764,15 @@ class PyExecutor:
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
         for engine in (self.model_engine, self.draft_model_engine):
-            release = getattr(getattr(engine, "model", None),
-                              "release_request_state", None)
+            model = getattr(engine, "model", None)
+            release = getattr(model, "release_request_state", None)
             if release is not None:
                 release(request.py_request_id)
+            else:
+                worker = getattr(model, "spec_worker", None)
+                release_tail = getattr(worker, "release_private_tail", None)
+                if release_tail is not None:
+                    release_tail(request.py_request_id)
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
         self._free_request_resources(request)

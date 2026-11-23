@@ -16,6 +16,7 @@
 import os
 import weakref
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
@@ -750,6 +751,8 @@ class DFlashSpecMetadata(SpecMetadata):
             # Slot lengths (and bases) written in one batch: evicted slots are
             # emptied, newly assigned ones seeded below.
             updates, bases = {}, {}
+            if getattr(worker, "_ctx_has_position_cap", False):
+                worker._private_tail_requests.intersection_update(current)
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
@@ -779,6 +782,8 @@ class DFlashSpecMetadata(SpecMetadata):
                                 f"DFlash: no free drafter slot for generation request {rid}, "
                                 "whose transferred draft context needs one"
                             )
+                        if getattr(worker, "_ctx_has_position_cap", False):
+                            raise RuntimeError(f"DFlash: no private-tail slot for request {rid}")
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
                         logger.warning(
@@ -790,6 +795,13 @@ class DFlashSpecMetadata(SpecMetadata):
                         if not worker._ctx_unified_cache:
                             raise RuntimeError("Transferred draft context requires a unified cache")
                         draft_ctx_len, next_position = imported
+                        if (
+                            draft_ctx_len != next_position
+                            or not 0 < draft_ctx_len <= worker._max_ctx
+                        ):
+                            raise ValueError(
+                                "Transferred DFlash cursor is outside the readable draft context"
+                            )
                         updates[slot] = draft_ctx_len
                         bases[slot] = 0
                         worker._req_ctx_pos[rid] = next_position
@@ -803,7 +815,33 @@ class DFlashSpecMetadata(SpecMetadata):
                         for seq_len in self.seq_lens:
                             row_starts.append(row_starts[-1] + int(seq_len))
                     position = int(self.host_position_ids[row_starts[row]])
+                    if getattr(worker, "_ctx_has_position_cap", False) and not self.is_cuda_graph:
+                        # A seed without a completed local store or a validated
+                        # import does not prove any draft pages are readable.
+                        worker._private_tail_requests.add(rid)
+                        continue
                     worker._seed_generation_slot(slot, position, updates, bases)
+            if (
+                getattr(worker, "_ctx_has_position_cap", False)
+                and self.host_position_ids is not None
+                and not self.is_cuda_graph
+            ):
+                offset = sum(self.seq_lens[:num_contexts])
+                for rid, seq_len in zip(
+                    self.request_ids[num_contexts:], self.seq_lens[num_contexts:]
+                ):
+                    slot = worker._req_to_slot.get(rid)
+                    if (
+                        slot is not None
+                        and rid not in worker._private_tail_requests
+                        and int(self.host_position_ids[offset])
+                        + 2 * worker._draft_tokens_per_req
+                        + worker._compute_block_size
+                        >= worker._max_ctx
+                    ):
+                        updates[slot] = 0
+                        worker._private_tail_requests.add(rid)
+                    offset += int(seq_len)
             worker._write_ctx_len(updates, bases)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
@@ -1063,6 +1101,10 @@ class DFlashWorker(SpecWorkerBase):
         # Draft-context cursors received with a disaggregated request's KV
         # (import_disagg_context), bound to a slot at the request's first step.
         self._pending_disagg_imports: dict[int, tuple[int, int]] = {}
+        self._ctx_has_position_cap = False
+        self._private_tail_requests: set[int] = set()
+        self._private_tail_pool = None
+        self._private_tail_active = False
 
         # Opt-in acceptance-statistics recorder (None unless
         # TLLM_DFLASH_ACCEPT_STATS_DIR is set; see accept_stats.py). Only
@@ -1609,6 +1651,26 @@ class DFlashWorker(SpecWorkerBase):
             runtime_max = getattr(attn_metadata, "max_seq_len", None)
         candidates = [c for c in (runtime_max, max_pos) if c is not None]
         self._max_ctx = min(candidates) if candidates else 8192
+        self._ctx_has_position_cap = (
+            self._ctx_unified_cache
+            and self.spec_config.spec_dec_mode.is_dflash()
+            and max_pos is not None
+            and runtime_max is not None
+            and max_pos < runtime_max
+        )
+        self._private_tail_requests.clear()
+        self._private_tail_pool = None
+        # Attention-DP ranks can have different managed/private row partitions.
+        # Separate draft sub-forwards must not enter TP collectives in different
+        # orders. With TP1 there is no cross-rank TP group to synchronize.
+        if (
+            self._ctx_has_position_cap
+            and self.mapping.enable_attention_dp
+            and self.mapping.tp_size > 1
+        ):
+            raise ValueError(
+                "Capped unified DFlash draft KV does not support attention DP with TP > 1"
+            )
         # py_executor_creator inflates max_seq_len by at most this much for spec
         # dec (one term is overlap-only), so compare against what is served.
         from .utils import get_num_extra_kv_tokens
@@ -1622,7 +1684,7 @@ class DFlashWorker(SpecWorkerBase):
             logger.warning(
                 f"DFlash drafter covers {self._max_ctx} positions but the engine serves "
                 f"up to {runtime_max - spec_slack}. max_position_embeddings={max_pos} is "
-                "the binding constraint, so requests past it will draft nothing."
+                "the binding constraint."
             )
 
         dtype = dflash_context_dtype(draft_model)
@@ -2091,7 +2153,10 @@ class DFlashWorker(SpecWorkerBase):
         overflowing prompt, or a step that did not draft), which the receiver must reject.
         Valid until the next ``prepare`` recycles the request's slot.
         """
-        if not self._ctx_buf_inited:
+        if not self._ctx_buf_inited or (
+            getattr(self, "_ctx_has_position_cap", False)
+            and request_id in self._private_tail_requests
+        ):
             return None
         slot = self._req_to_slot.get(request_id)
         if slot is None:
@@ -2111,11 +2176,22 @@ class DFlashWorker(SpecWorkerBase):
         draft pages it describes have arrived in this engine's KV cache manager; that binding
         replaces the position-based seed a shared cache gives a request without a cursor.
         """
+        if not 0 < draft_ctx_len == next_position:
+            raise ValueError("Transferred DFlash context must cover a positive, contiguous prefix")
         self._pending_disagg_imports[request_id] = (int(draft_ctx_len), int(next_position))
 
     def release_request_state(self, request_id: int) -> None:
-        """Drop an import that was never bound (a request released before its first step)."""
+        """Drop any import or private-tail state that belongs to this request."""
         self._pending_disagg_imports.pop(request_id, None)
+        self.release_private_tail(request_id)
+
+    def release_private_tail(self, request_id: int) -> None:
+        if getattr(self, "_ctx_has_position_cap", False):
+            self._private_tail_requests.discard(request_id)
+            self._req_ctx_pos.pop(request_id, None)
+            slot = self._req_to_slot.pop(request_id, None)
+            if slot is not None:
+                self._free_slots.append(slot)
 
     def _ctx_activation_dtype(self) -> torch.dtype:
         """Dtype the drafter computes context K/V in before they are stored.
@@ -2161,7 +2237,12 @@ class DFlashWorker(SpecWorkerBase):
 
             # FP8 pool: each layer's K/V quantized with that layer's scale, stored at the
             # page and slot the paged append addresses (block table row, position).
-            pages = self._ctx_block_tables[
+            table = (
+                self._ctx_block_tables
+                if self._ctx_block_tables is not None
+                else self._ctx_page_table
+            )
+            pages = table[
                 rows.long(), torch.div(positions.long(), self._ctx_page_size, rounding_mode="floor")
             ]
             offsets = positions.long() % self._ctx_page_size
@@ -2272,8 +2353,7 @@ class DFlashWorker(SpecWorkerBase):
         request's own pages (past them, its page-table row maps page 0, another request's).
         The store is to a fixed slot, so a captured step replays it.
         """
-        self._ctx_len[slots] += num_accepted
-        self._ctx_len.clamp_(max=self._max_ctx)
+        self._ctx_len[slots] = (self._ctx_len[slots] + num_accepted).clamp(max=self._max_ctx)
         self._ctx_len[self._dummy_slot].zero_()
 
     def _rebuild_batch_to_slot(self, request_ids: List[int]) -> None:
@@ -2408,11 +2488,26 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._req_to_slot[req_id]
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
+            if getattr(self, "_ctx_has_position_cap", False) and (
+                req_id in self._private_tail_requests
+                or (reset and first_pos > 0)
+                or first_pos + slen > cap
+            ):
+                # A target prefix hit cannot distinguish draft KV written by
+                # a fitting prefill from pages published by an oversized one.
+                # Keep the target's shared pages and write no draft KV there.
+                self._private_tail_requests.add(req_id)
+                ctx_len_updates[slot] = 0
+                self._req_ctx_pos[req_id] = first_pos + slen
+                offset += slen
+                continue
             # A paired pool still holds the prefix K/V below the tail
             # (precompute_context_kv is per-token in (hidden, p)); an unpaired
             # one does not, so the slot reads from a base above it.
             start = self._ctx_store_start(cur, first_pos)
             if start is None:
+                if getattr(self, "_ctx_has_position_cap", False):
+                    self._private_tail_requests.add(req_id)
                 # Request-level, like the overflow below: the slot is released
                 # rather than failing the batch's forward.
                 logger.warning(
@@ -2507,6 +2602,16 @@ class DFlashWorker(SpecWorkerBase):
             # _ctx_len updates: roll back to the pre-forward snapshot.
             self._restore_ctx_len_device()
             self._restore_ctx_len_host()
+            if self._ctx_has_position_cap and spec_metadata is not None:
+                # A failed step can have overwritten bytes after rolling its
+                # private history over. The old length would expose those bytes.
+                self._write_ctx_len(
+                    {
+                        self._req_to_slot[rid]: 0
+                        for rid in spec_metadata.request_ids or []
+                        if rid in self._private_tail_requests and rid in self._req_to_slot
+                    }
+                )
             self._ctx_len_restore_pending = False
 
     def _forward_impl(
@@ -2644,7 +2749,7 @@ class DFlashWorker(SpecWorkerBase):
             if self._ctx_buf_inited and spec_metadata.request_ids:
                 self._rebuild_batch_to_slot(spec_metadata.request_ids)
 
-        inputs = self.prepare_1st_drafter_inputs(
+        draft_batches, inputs = self._prepare_draft_batches(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -2658,17 +2763,7 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                hidden_states_out = draft_model.dflash_forward(
-                    noise_embedding=inputs["noise_embedding"],
-                    query_positions=inputs["query_positions"],
-                    num_ctx_per_req=inputs["num_ctx_per_req"],
-                    ctx_k_cache=inputs["ctx_k_cache"],
-                    ctx_v_cache=inputs["ctx_v_cache"],
-                    ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
-                    ctx_kv_cache=inputs["ctx_kv_cache"],
-                    ctx_page_table=inputs["ctx_page_table"],
-                    block_placement=inputs["block_placement"],
-                )
+                hidden_states_out = self._run_draft_batches(draft_model, draft_batches, num_gens)
 
                 # Gather K logits per gen request from the block outputs.
                 # hidden_states_out is flat: [num_gens * block_size, hidden_dim].
@@ -2786,6 +2881,164 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def draft_cache_graph_position_limit(self, manager, draft_model) -> Optional[int]:
+        """Return the first request length at which a managed graph is unsafe."""
+        if not self.spec_config.spec_dec_mode.is_dflash() or manager is None:
+            return None
+        get_view = getattr(manager, "get_draft_kv_cache_view", None)
+        if get_view is None or get_view() is not manager:
+            return None
+        bound = self._ctx_buf_inited and self._ctx_kv_manager is manager
+        if bound:
+            if not self._ctx_has_position_cap:
+                return None
+            cap = self._max_ctx
+            width = self._compute_block_size
+        else:
+            cap = getattr(getattr(draft_model, "config", None), "max_position_embeddings", None)
+            if cap is None or cap >= manager.max_seq_len:
+                return None
+            width = self._draft_block_width(draft_model)
+        return cap - 2 * self._draft_tokens_per_req - width
+
+    def draft_cache_graph_eligible(self, batch, manager, draft_model, promoted_context_ids) -> bool:
+        """A managed graph cannot be used for rows that may change cache ownership."""
+        position_limit = self.draft_cache_graph_position_limit(manager, draft_model)
+        if position_limit is None:
+            return True
+        bound = self._ctx_buf_inited and self._ctx_kv_manager is manager
+        for request in batch.generation_requests:
+            request_id = request.py_request_id
+            if (
+                request_id in promoted_context_ids
+                or request_id in self._private_tail_requests
+                or request.max_beam_num_tokens >= position_limit
+            ):
+                return False
+            # Capturing a fitting synthetic request may use a dummy seed.
+            # A real request must already have a slot or a validated cursor.
+            if not request.is_dummy and (
+                not bound
+                or (
+                    request_id not in self._req_to_slot
+                    and request_id not in self._pending_disagg_imports
+                )
+            ):
+                return False
+        return True
+
+    @contextmanager
+    def _use_private_tail(self):
+        """Serve a bounded draft tail from pages owned only by this worker."""
+        if self._private_tail_pool is None:
+            block = self._compute_block_size
+            slots = self._ctx_len.numel()
+            page = self._ctx_page_size
+            # Retain up to three pages of local history. Include a full
+            # speculative or masked append block after the readable history.
+            history = min(3 * page, self._max_ctx - max(block, self._draft_tokens_per_req))
+            if history < self._draft_tokens_per_req:
+                raise ValueError("DFlash position limit is too small for one private draft step")
+            pages = -(-(history + max(block, self._draft_tokens_per_req)) // page)
+            device = self._ctx_len.device
+            pool = [
+                layer.new_empty((slots * pages, *layer.shape[1:])) for layer in self._ctx_kv_buf
+            ]
+            table = torch.arange(slots * pages, dtype=torch.int32, device=device).view(slots, pages)
+            indptr = torch.arange(0, (slots + 1) * pages, pages, dtype=torch.int32, device=device)
+            self._private_tail_pool = (pool, table, indptr, history)
+        pool, table, indptr, history = self._private_tail_pool
+        previous = (
+            self._ctx_kv_buf,
+            self._ctx_page_table,
+            self._ctx_kv_indptr,
+            self._ctx_block_tables,
+            self._max_ctx,
+        )
+        self._ctx_kv_buf = pool
+        self._ctx_page_table = table
+        self._ctx_kv_indptr = indptr
+        self._ctx_block_tables = None
+        self._max_ctx = history
+        self._private_tail_active = True
+        try:
+            yield
+        finally:
+            (
+                self._ctx_kv_buf,
+                self._ctx_page_table,
+                self._ctx_kv_indptr,
+                self._ctx_block_tables,
+                self._max_ctx,
+            ) = previous
+            self._private_tail_active = False
+
+    def _prepare_draft_batches(self, **kwargs):
+        """Partition managed and private draft cache rows without reordering verification."""
+        metadata = kwargs["spec_metadata"]
+        if not self._ctx_has_position_cap or not self._private_tail_requests:
+            inputs = self.prepare_1st_drafter_inputs(**kwargs)
+            return [(None, inputs)], inputs
+        num_contexts = kwargs["attn_metadata"].num_contexts
+        generation_ids = (metadata.request_ids or [])[num_contexts:]
+        private = [i for i, rid in enumerate(generation_ids) if rid in self._private_tail_requests]
+        if not private:
+            inputs = self.prepare_1st_drafter_inputs(**kwargs)
+            return [(None, inputs)], inputs
+        if metadata.is_cuda_graph:
+            raise RuntimeError("A private DFlash tail requires eager decoding")
+        private_indices = torch.tensor(private, dtype=torch.long, device=self._ctx_len.device)
+        managed = [
+            i for i, rid in enumerate(generation_ids) if rid not in self._private_tail_requests
+        ]
+        batches = []
+        if managed:
+            managed_indices = torch.tensor(managed, dtype=torch.long, device=self._ctx_len.device)
+            managed_inputs = self.prepare_1st_drafter_inputs(**kwargs, gen_indices=managed_indices)
+            batches.append((managed_indices, managed_inputs))
+        with self._use_private_tail():
+            private_inputs = self.prepare_1st_drafter_inputs(**kwargs, gen_indices=private_indices)
+        if not managed:
+            return [(None, private_inputs)], private_inputs
+        batches.append((private_indices, private_inputs))
+
+        # Candidate scorers and sampling take the original row ordering.
+        inputs = {}
+        for key in ("first_prev_tokens", "lilicorr_anchor"):
+            value = managed_inputs[key]
+            if value is None:
+                inputs[key] = None
+                continue
+            merged = value.new_empty((len(generation_ids), *value.shape[1:]))
+            for indices, prepared in batches:
+                merged.index_copy_(0, indices, prepared[key])
+            inputs[key] = merged
+        return batches, inputs
+
+    def _run_draft_batches(self, draft_model, batches, num_gens):
+        result = None
+        for indices, inputs in batches:
+            hidden = draft_model.dflash_forward(
+                noise_embedding=inputs["noise_embedding"],
+                query_positions=inputs["query_positions"],
+                num_ctx_per_req=inputs["num_ctx_per_req"],
+                ctx_k_cache=inputs["ctx_k_cache"],
+                ctx_v_cache=inputs["ctx_v_cache"],
+                ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
+                ctx_kv_cache=inputs["ctx_kv_cache"],
+                ctx_page_table=inputs["ctx_page_table"],
+                block_placement=inputs["block_placement"],
+            )
+            if indices is None:
+                return hidden
+            if result is None:
+                result = hidden.new_empty((num_gens, self._compute_block_size, hidden.shape[-1]))
+            result.index_copy_(
+                0, indices, hidden.view(indices.numel(), self._compute_block_size, -1)
+            )
+        assert result is not None
+        return result.flatten(0, 1)
 
     def _draft_block_width(self, draft_model) -> int:
         """Block slots the draft forward must compute for K draft tokens.
@@ -3001,6 +3254,7 @@ class DFlashWorker(SpecWorkerBase):
         spec_metadata: DFlashSpecMetadata,
         draft_model: nn.Module,
         total_target_tokens: int = 0,
+        gen_indices: Optional[torch.Tensor] = None,
     ):
         """Prepare inputs for DFlash's draft forward.
 
@@ -3046,7 +3300,7 @@ class DFlashWorker(SpecWorkerBase):
             else None
         )
 
-        if num_gens > 0 and self._fused_gen_prepare_applies(spec_metadata):
+        if gen_indices is None and num_gens > 0 and self._fused_gen_prepare_applies(spec_metadata):
             return self._prepare_paged_latent_gen_inputs(
                 accepted_tokens,
                 num_accepted_tokens,
@@ -3082,6 +3336,11 @@ class DFlashWorker(SpecWorkerBase):
             gen_rows_out = torch.arange(
                 num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
             )
+            if gen_indices is not None:
+                gen_num_accepted = gen_num_accepted.index_select(0, gen_indices)
+                gen_accepted_tokens = gen_accepted_tokens.index_select(0, gen_indices)
+                slots = slots.index_select(0, gen_indices)
+                gen_rows_out = gen_rows_out.index_select(0, gen_indices)
 
             K_plus_1 = K + 1
 
@@ -3089,6 +3348,12 @@ class DFlashWorker(SpecWorkerBase):
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
             ctx_len_gen = self._ctx_len[slots]
+            if self._private_tail_active:
+                # Discard old history as a unit before overwriting its slot.
+                ctx_len_gen = torch.where(
+                    ctx_len_gen + gen_num_accepted > self._max_ctx, 0, ctx_len_gen
+                )
+                self._ctx_len[slots] = ctx_len_gen
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
@@ -3111,12 +3376,16 @@ class DFlashWorker(SpecWorkerBase):
                 # Target now processes exactly K+1 tokens per gen req, so the
                 # captured slice is already the full set we need to project.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
+                if gen_indices is not None:
+                    gen_hs = gen_hs.reshape(num_gens, total_tokens_per_req, -1).index_select(
+                        0, gen_indices
+                    )
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
                 if getattr(draft_model, "lilicorr", None) is not None:
                     # The last accepted output is predicted by the corresponding input
                     # row; the newly committed token itself has no target row yet.
-                    projected_rows = projected_to_store.reshape(num_gens, K_plus_1, -1)
+                    projected_rows = projected_to_store.reshape(slots.numel(), K_plus_1, -1)
                     lilicorr_anchor = last_accepted_hidden(projected_rows, gen_num_accepted)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
@@ -3127,7 +3396,7 @@ class DFlashWorker(SpecWorkerBase):
                     # safety) and a placeholder page resolves to another's.
                     gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
                     col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
-                else:
+                elif not self._private_tail_active:
                     col_idx = col_idx.clamp(max=self._max_ctx - 1)
 
                 # Fixed-size writes for CUDA graph compatibility:

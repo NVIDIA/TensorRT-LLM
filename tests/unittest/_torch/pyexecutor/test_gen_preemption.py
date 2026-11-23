@@ -387,6 +387,7 @@ def drafter(kind, num_slots=4):
     if kind == "dflash":
         worker = object.__new__(dflash.DFlashWorker)
         worker._ctx_buf_inited, worker._req_ctx_pos, worker._dummy_slot = True, {}, num_slots
+        worker._pending_disagg_imports = {}
         worker._ctx_len_host = [0] * rows
         worker._batch_to_slot_buffer = DeviceCopyBuffer(torch.full((num_slots,), num_slots))
 
@@ -450,6 +451,7 @@ def executor_for_preemption(p, reqs, scheduler):
     executor._cancelled_disagg_model_request_ids = MethodType(
         PyExecutor._cancelled_disagg_model_request_ids, executor
     )
+    executor._requests_excluding = MethodType(PyExecutor._requests_excluding, executor)
     executor._encoder_requests_in_arrival_order = MethodType(
         PyExecutor._encoder_requests_in_arrival_order, executor
     )
