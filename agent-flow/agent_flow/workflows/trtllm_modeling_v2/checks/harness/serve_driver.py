@@ -19,7 +19,9 @@ The spec is a JSON file the serve gate writes (``serve.py``):
 * ``boot_timeout`` and ``request_timeout``: seconds;
 * ``requests``: ``{"id", "endpoint", "body"}`` each, sent in order once
   ``/health`` answers. An ``image_url`` part naming a local file is sent
-  inline, as a base64 ``data:`` URL.
+  inline, as a base64 ``data:`` URL;
+* ``attach``: the server is a step the job's script started (``infra/compute/steps.py``);
+  this waits for its ``address`` (or its step's ``exit``) and asks, starting nothing.
 
 Output, on stdout, each one JSON line behind a marker (see ``harness/workload_io.py``):
 
@@ -53,10 +55,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _HERE = Path(__file__).resolve().parent
 
@@ -75,8 +78,8 @@ _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def _load(name: str, path: Path) -> Any:
     """Import the file at ``path`` as module ``name``, without putting its directory on the path.
 
-    ``tune/`` holds a ``requests.py``: on ``sys.path`` it would shadow the
-    library of that name for the rest of the process.
+    A harness directory on ``sys.path`` would let a module of its own shadow a
+    library of the same name for the rest of the process.
     """
     module = sys.modules.get(name)
     if module is None:
@@ -162,8 +165,31 @@ def answer_of(payload: Any) -> tuple[str, Any, Any]:
     return text or "", choice.get("finish_reason"), usage.get("completion_tokens")
 
 
-def ask(port: int, index: int, request: dict[str, Any], timeout: float) -> dict[str, Any]:
-    """Send one request; its ``MV2FLOW_RECORD`` payload, whatever the server did."""
+def wait_reported(address: Path, timeout_s: float, ended: Callable[[], str]) -> tuple[str, float]:
+    """``(address, seconds waited)`` once the server reporting to ``address`` answers ``/health``.
+
+    ``ended`` says why the wait is over (a step or a process that ended).
+    """
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        why = ended()
+        if why:
+            raise SystemExit(why)
+        bound = address.read_text().strip() if address.is_file() else ""
+        if bound:
+            try:
+                with _DIRECT.open(f"http://{bound}/health", timeout=5) as response:
+                    if response.status == 200:
+                        return bound, time.monotonic() - start
+            except (urllib.error.URLError, OSError):
+                pass
+        time.sleep(0.5)
+    raise SystemExit(f"server not healthy after {timeout_s:.0f}s")
+
+
+def ask(where: int | str, index: int, request: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """Send one request to the server at ``where`` (a local port, or a base URL); its record."""
+    base = where if isinstance(where, str) else f"http://127.0.0.1:{where}"
     record: dict[str, Any] = {
         "index": index,
         "id": str(request.get("id", index)),
@@ -180,7 +206,7 @@ def ask(port: int, index: int, request: dict[str, Any], timeout: float) -> dict[
         record["error"] = f"the request could not be built: {exc}"
         return record
     http = urllib.request.Request(
-        f"http://127.0.0.1:{port}{request['endpoint']}",
+        f"{base}{request['endpoint']}",
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -232,6 +258,8 @@ def run(spec: dict[str, Any]) -> dict[str, Any]:
     world = max(1, int(spec.get("world_size", 1)))
     log_path = Path(spec["server_log"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    if spec.get("attach"):
+        return run_attached(spec, log_path)
     port = runtime.free_port()
     argv = server_argv(spec, port)
     env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"} | dict(os.environ)
@@ -264,6 +292,36 @@ def run(spec: dict[str, Any]) -> dict[str, Any]:
             report["cause"] = last_error(tail)
             print(tail, flush=True)
         wio.emit(SERVER_MARKER, report)
+    return report
+
+
+def run_attached(spec: dict[str, Any], log_path: Path) -> dict[str, Any]:
+    """Ask a server the job's script started; the same records, nothing stopped."""
+    report: dict[str, Any] = {"healthy": False, "argv": [], "log": str(log_path)}
+    try:
+        ended = Path(spec["attach"]["exit"])
+        address, boot_s = wait_reported(
+            Path(spec["attach"]["address"]),
+            int(spec.get("boot_timeout", DEFAULT_BOOT_TIMEOUT_S)),
+            lambda: (
+                f"the server's step ended with {ended.read_text().strip() or '?'} during boot"
+                if ended.is_file()
+                else ""
+            ),
+        )
+        url = f"http://{address}"
+    except SystemExit as exc:
+        if not isinstance(exc.code, str):
+            raise  # a signal: see runtime._terminate
+        tail = runtime.tail(log_path)
+        report.update(error=exc.code, cause=last_error(tail))
+        print(tail, flush=True)
+    else:
+        report.update(healthy=True, boot_s=round(boot_s, 1))
+        timeout = float(spec.get("request_timeout", DEFAULT_REQUEST_TIMEOUT_S))
+        for index, request in enumerate(spec.get("requests") or ()):
+            wio.emit(wio.RECORD_MARKER, ask(url, index, dict(request), timeout))
+    wio.emit(SERVER_MARKER, report)
     return report
 
 

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -22,7 +23,14 @@ import torch
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention.attention import _helix_sanitize_empty_kv, _helix_zero_kv_mask
+from tensorrt_llm._torch.attention.attention import (
+    Attention,
+    _helix_nccl_post_alltoall,
+    _helix_nccl_pre_alltoall,
+    _helix_post_process,
+    _helix_sanitize_empty_kv,
+    _helix_zero_kv_mask,
+)
 
 
 class _FakeAttnMetadata:
@@ -499,23 +507,27 @@ class TestHelixZeroKvMask(unittest.TestCase):
     speculative decoding), where num_tokens != num_seqs.
     """
 
-    def test_mla_skips_generic_mask_when_per_token_bounds_are_valid(self):
+    @parameterized.expand([(False,), (True,)])
+    def test_mla_derives_empty_mask_from_corrected_global_positions(self, is_cuda_graph):
         from tensorrt_llm._torch.attention.mla import MLA
 
         num_tokens = 3
         num_heads = 2
         kv_lora_rank = 4
-        helix_kv_bounds = torch.tensor([0, 5, 0], dtype=torch.int32)
+        positions = torch.tensor([31, 36, 20], dtype=torch.int32)
         attn_metadata = SimpleNamespace(
-            helix_kv_bounds=helix_kv_bounds,
+            helix_position_offsets=positions,
+            helix_kv_bounds=None,
+            kv_cache_manager=SimpleNamespace(tokens_per_block=32),
             _helix_spec_tokens_valid=True,
             num_contexts=0,
             num_generations=1,
+            is_cuda_graph=is_cuda_graph,
         )
         attn_backend = Mock()
         attn_backend.forward.return_value = torch.empty(num_tokens, num_heads * kv_lora_rank)
         mla = SimpleNamespace(
-            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            mapping=SimpleNamespace(has_cp_helix=lambda: True, cp_rank=1),
             num_heads_tp=num_heads,
             num_heads_tp_cp=num_heads,
             kv_lora_rank=kv_lora_rank,
@@ -532,7 +544,26 @@ class TestHelixZeroKvMask(unittest.TestCase):
 
         generic_mask.assert_not_called()
         actual_mask = post_process.call_args.kwargs["zero_kv_mask"]
-        torch.testing.assert_close(actual_mask, helix_kv_bounds == 0)
+        torch.testing.assert_close(actual_mask, torch.tensor([True, False, True]))
+        assert post_process.call_args.kwargs["is_cuda_graph"] is is_cuda_graph
+
+    @parameterized.expand([(False,), (True,)])
+    def test_attention_forwards_zero_kv_mask_and_cuda_graph_flag(self, is_cuda_graph):
+        num_tokens = 3
+        attn = SimpleNamespace(mapping=Mock(), num_heads_tp_cp=2, head_dim=4)
+        attn_metadata = SimpleNamespace(is_cuda_graph=is_cuda_graph)
+        partial_o = torch.empty(num_tokens, 8)
+        softmax_stats = torch.empty(num_tokens, 2, 2)
+
+        with (
+            patch("tensorrt_llm._torch.attention.attention._helix_zero_kv_mask") as generic_mask,
+            patch("tensorrt_llm._torch.attention.attention._helix_post_process") as post_process,
+        ):
+            Attention._helix_post_process(attn, partial_o, softmax_stats, attn_metadata)
+
+        generic_mask.assert_called_once_with(attn_metadata, num_tokens)
+        assert post_process.call_args.kwargs["zero_kv_mask"] is generic_mask.return_value
+        assert post_process.call_args.kwargs["is_cuda_graph"] is is_cuda_graph
 
     def test_single_token_per_seq(self):
         # Plain decode: one token per sequence, so per-seq == per-token.
@@ -600,6 +631,120 @@ class TestHelixZeroKvMask(unittest.TestCase):
         out_o, out_stats = _helix_sanitize_empty_kv(partial_o, softmax_stats, None)
         assert out_o is partial_o
         assert out_stats is softmax_stats
+
+
+class TestHelixNcclReformatCompile(unittest.TestCase):
+    """The NCCL path compiles its reformat for CUDA-graph batches only.
+
+    CUDA-graph batches are padded to the captured batch sizes, so their compiles
+    land in graph warmup. Any other batch carries an arbitrary generation-token
+    count and must not compile a new variant mid-serving. A server can also
+    capture more batch sizes than dynamo's default recompile limit, and every
+    one of them must still compile rather than silently run eagerly.
+
+    The test runs CP rank 0 of two in one process: the all-to-all is replaced by
+    one that returns rank 0's own chunks next to those of a peer rank, which owns
+    KV for every token.
+    """
+
+    cp_size = 2
+    num_heads = 4
+    kv_lora_rank = 64
+
+    def setUp(self):
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+
+    @staticmethod
+    def _num_compiled(fn):
+        return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(fn.__code__))
+
+    def _make_partials(self, num_tokens):
+        partial_o = torch.randn(
+            num_tokens, self.num_heads * self.kv_lora_rank, dtype=torch.bfloat16, device="cuda"
+        )
+        softmax_stats = torch.empty(num_tokens, self.num_heads, 2, device="cuda")
+        softmax_stats[..., 0].normal_(0.0, 2.0)
+        softmax_stats[..., 1].uniform_(0.5, 2.0)
+        return partial_o, softmax_stats
+
+    def _make_inputs(self, num_tokens):
+        partial_o, softmax_stats = self._make_partials(num_tokens)
+        # Rank 0 owns no KV for every third token, and the attention kernel
+        # leaves NaN in those rows.
+        zero_kv_mask = torch.arange(num_tokens, device="cuda") % 3 == 0
+        partial_o[zero_kv_mask] = float("nan")
+        softmax_stats[zero_kv_mask] = float("nan")
+        peer_chunks = _helix_nccl_pre_alltoall(*self._make_partials(num_tokens), None, self.cp_size)
+        return partial_o, softmax_stats, zero_kv_mask, peer_chunks
+
+    def _post_process(self, inputs, is_cuda_graph):
+        partial_o, softmax_stats, zero_kv_mask, peer_chunks = inputs
+        mapping = SimpleNamespace(
+            cp_config={"use_nccl_for_alltoall": True},
+            cp_size=self.cp_size,
+            cp_group=list(range(self.cp_size)),
+        )
+
+        def alltoall_to_rank0(chunks, group):
+            return [
+                torch.stack([chunks[i], peer_chunks[i]]) for i in range(0, len(chunks), len(group))
+            ]
+
+        with patch("tensorrt_llm._torch.attention.attention.alltoall_helix", alltoall_to_rank0):
+            return _helix_post_process(
+                partial_o,
+                softmax_stats,
+                mapping,
+                self.num_heads // self.cp_size,
+                self.kv_lora_rank,
+                zero_kv_mask=zero_kv_mask,
+                is_cuda_graph=is_cuda_graph,
+            )
+
+    def test_eager_batches_do_not_compile(self):
+        for num_tokens in (3, 7, 18, 30):
+            output = self._post_process(self._make_inputs(num_tokens), is_cuda_graph=False)
+            assert torch.isfinite(output).all()
+        assert self._num_compiled(_helix_nccl_pre_alltoall) == 0
+        assert self._num_compiled(_helix_nccl_post_alltoall) == 0
+
+    def test_every_cuda_graph_shape_compiles(self):
+        # Pin the process-wide limit to dynamo's default: other test modules
+        # collected into the same process can raise it at import time.
+        recompile_limit = 8
+        num_shapes = recompile_limit + 1
+        with torch._dynamo.config.patch(recompile_limit=recompile_limit):
+            for num_tokens in range(1, num_shapes + 1):
+                inputs = self._make_inputs(num_tokens)
+                graph_output = self._post_process(inputs, is_cuda_graph=True)
+                eager_output = self._post_process(inputs, is_cuda_graph=False)
+                torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
+        assert self._num_compiled(_helix_nccl_pre_alltoall) == num_shapes
+        assert self._num_compiled(_helix_nccl_post_alltoall) == num_shapes
+
+
+@pytest.mark.parametrize("cp_dim", [0, 1, 2], ids=["nccl", "fifo-v2", "fifo-v1"])
+def test_helix_lse_empty_rows(cp_dim):
+    """Each layout must ignore empty partials and return zero for all-empty rows."""
+    torch.manual_seed(42)
+    partial = torch.randn(4, 8, 3, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.randn(4, 8, 3, 1, device="cuda") * 80
+    lse[3] = -torch.inf
+    partial[3] = torch.nan
+    lse[:, 0] = -torch.inf
+    partial[:, 0] = torch.nan
+    weights = (lse.double() * math.log(2)).softmax(dim=0).nan_to_num()
+    expected = torch.where(weights > 0, partial.double() * weights, 0).sum(dim=0).flatten(1)
+    if cp_dim == 0:
+        output = torch.ops.trtllm.helix_post_process(partial.flatten(2), lse, 1.0, True)
+    else:
+        order = (1, 0, 2, 3) if cp_dim == 1 else (1, 2, 0, 3)
+        output = torch.ops.trtllm.helix_post_process_native(
+            partial.permute(order).contiguous(), lse.permute(order).contiguous(), 1.0, cp_dim, True
+        )
+    torch.testing.assert_close(output.double(), expected, atol=1e-3, rtol=1e-2)
+    assert torch.count_nonzero(output[0]) == 0
 
 
 if __name__ == "__main__":

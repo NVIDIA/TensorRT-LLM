@@ -150,6 +150,10 @@ def _get_mega_mhc():
 # Streams on which ``mega_mhc`` already allocated its split barriers, so a capture there may take it.
 _MEGA_MHC_CAPTURE_STREAMS: set[int] = set()
 
+# ``mega_mhc`` keeps a split task's X1 in tensor memory (up to 10 K blocks of 64), which every split choice
+# DeepGEMM makes meets up to this hidden size.
+_MEGA_MHC_MAX_HIDDEN = 5120
+
 
 def mhc_gemm_rms_dg_cuda(
     x: torch.Tensor,
@@ -273,6 +277,16 @@ _BIGFUSE_BLOCK_SIZE_OPTIONS = (128, 256, 512)
 # DeepGEMM leaves them free. Isolated profiling cannot see that and prefers
 # FMA.
 _PRE_MAPPING_DG_ONLY_MAX_M = 16
+# Its bigfuse width for lagged (V4.1) pre-mappings on SM100/SM103: widths tied in isolation do not
+# tie in the decode graph; 128 wins.
+_PRE_MAPPING_DG_ONLY_BIGFUSE_BS = 128
+
+
+def _dg_only_bigfuse_widths(lagged: bool) -> tuple[int, ...]:
+    if lagged and get_sm_version() in (100, 103):
+        return (_PRE_MAPPING_DG_ONLY_BIGFUSE_BS,)
+    return _BIGFUSE_BLOCK_SIZE_OPTIONS
+
 
 # Tactic is a tuple: (backend, tile_n, tile_m, bigfuse_bs)
 #   backend: "fma", "dg_splitk", "dg_nosplit"
@@ -350,7 +364,8 @@ class MhcPreMappingRunner(TunableRunner):
         valid_tile_n = tuple(tn for tn in _FMA_TILE_N_OPTIONS if N % tn == 0)
 
         if inputs[0].shape[0] <= _PRE_MAPPING_DG_ONLY_MAX_M and _get_dg_fn() is not None:
-            return [("dg_splitk", 0, 0, bs) for bs in _BIGFUSE_BLOCK_SIZE_OPTIONS]
+            widths = _dg_only_bigfuse_widths(kwargs.get("pre_mix_ext") is not None)
+            return [("dg_splitk", 0, 0, bs) for bs in widths]
 
         tactics = []
         for tn in valid_tile_n:
@@ -388,6 +403,10 @@ class MhcPreMappingRunner(TunableRunner):
             y_acc, r_acc, num_splits = mhc_gemm_rms_dg_cuda(
                 x, w_t, M, N, K, num_splits=_DG_NUM_SPLITS
             )
+            # A cached tactic may carry a width these calls do not tune.
+            widths = _dg_only_bigfuse_widths(kwargs.get("pre_mix_ext") is not None)
+            if M <= _PRE_MAPPING_DG_ONLY_MAX_M and bigfuse_bs not in widths:
+                bigfuse_bs = _PRE_MAPPING_DG_ONLY_BIGFUSE_BS
         elif backend == "dg_nosplit":
             y_acc, r_acc, num_splits = mhc_gemm_rms_dg_cuda(x, w_t, M, N, K, num_splits=1)
         else:
@@ -1361,14 +1380,15 @@ def mhc_fused_hc(
     explores the full tactic space regardless of ``norm_weight``.
 
     V4.1 boundaries of at least 1024 tokens (of any size with ``deterministic``) with a folded
-    RMSNorm run DeepGEMM's ``mega_mhc`` on SM100/SM103 instead: one launch with the same math.
-    Its split-K count follows the token count (DeepGEMM fits the split tasks to whole waves of
-    SMs), so a token's result can change in the last bits with its batch size; a given size
-    repeats bitwise. It allocates per-stream split barriers on its first launch, which graph capture
-    forbids, so once ``torch.cuda.graph`` has created its default capture stream, the next eager
-    launch also runs once there. A capture on another stream takes it once an eager launch ran on
-    that stream (as a pass graph's warm runs do), else keeps the backends above. The barriers
-    carry the launch's grid id, so a captured launch re-initializes them on every replay.
+    RMSNorm and a hidden size of at most 5120 run DeepGEMM's ``mega_mhc`` on SM100, SM103 and SM107
+    instead: one launch with the same math. Its split-K count follows the token count (DeepGEMM fits
+    the split tasks to whole waves of SMs), so a token's result can change in the last bits with its
+    batch size; a given size repeats bitwise. It allocates per-stream split barriers on its first
+    launch, which graph capture forbids, so once ``torch.cuda.graph`` has created its default
+    capture stream, the next eager launch also runs once there. A capture on another stream takes it
+    once an eager launch ran on that stream (as a pass graph's warm runs do), else keeps the
+    backends above. The barriers carry the launch's grid id, so a captured launch re-initializes
+    them on every replay.
 
     With ``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1`` every boundary runs one
     fixed FMA tactic instead, whose result for a token does not depend on its batch.
@@ -1392,8 +1412,9 @@ def mhc_fused_hc(
         and norm_weight is not None
         and n == 4
         and hidden_size % 1024 == 0
+        and hidden_size <= _MEGA_MHC_MAX_HIDDEN
         and (1 if deterministic else 1024) <= residual_prev.shape[0] <= 1 << 20
-        and get_sm_version() in (100, 103)
+        and get_sm_version() in (100, 103, 107)
         and not AutoTuner.get().is_tuning_mode
         and (
             not torch.cuda.is_current_stream_capturing()

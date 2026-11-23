@@ -18,7 +18,8 @@ factor; both are applied here. A routed expert component per id adapts to it as
 is re-selected, no bias is added and no weight is re-normalized here. No residual,
 normalization or collective is applied.
 
-The combination, as the source model computes it (``ops/moe/beam_dispatch_combine.py``)::
+The combination follows the Beam family operator
+``tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine``::
 
     for each selected expert e, ascending:
         out   = expert_provider(e, hidden[tokens routed to e])     [n, 5120] bf16

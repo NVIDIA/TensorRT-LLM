@@ -58,10 +58,10 @@ from tensorrt_llm.kv_hints import KvHintsEnvelope
 from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
-                                 SamplingParams)
+from tensorrt_llm.llmapi import DisaggScheduleStyle, GuidedDecodingParams
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.sampling_params import (check_logprobs_limit,
+from tensorrt_llm.sampling_params import (EmbeddingBias, SamplingParams,
+                                          check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
 from tensorrt_llm.serve.serving_extensions import structured_output_format_for
@@ -101,8 +101,8 @@ def ensure_request_chat_template_allowed(request: Any,
 
 def _logit_bias_to_embedding_bias(
         logit_bias: Optional[Dict[str, float]],
-        vocab_size: Optional[int]) -> Optional[torch.Tensor]:
-    """Convert OpenAI logit_bias dict to embedding_bias tensor for sampling."""
+        vocab_size: Optional[int]) -> Optional[EmbeddingBias]:
+    """Convert OpenAI logit_bias dict to sparse embedding_bias for sampling."""
     if logit_bias is None:
         return None
     if vocab_size is None:
@@ -114,8 +114,7 @@ def _logit_bias_to_embedding_bias(
     elif vocab_size <= 0:
         raise ValueError("vocab_size must be positive when logit_bias is used")
 
-    # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
-    embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
+    embedding_bias_dict = {}
 
     # Apply biases for specified token IDs
     for token_str, bias in logit_bias.items():
@@ -144,9 +143,12 @@ def _logit_bias_to_embedding_bias(
             raise ValueError(
                 f"logit_bias value for token ID {token_id} must be in "
                 f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}]")
-        embedding_bias[token_id] = bias_value
+        embedding_bias_dict[
+            token_id] = bias_value  # if several keys resolve to same token_id, last one wins
 
-    return embedding_bias
+    return tuple(
+        sorted(embedding_bias_dict.items(),
+               key=lambda idx_and_val: idx_and_val[0]))
 
 
 class OpenAIBaseModel(BaseModel):
@@ -1576,7 +1578,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
             check_logprobs_limit("top_logprobs", top_logprobs)
-            if not data.get("logprobs"):
+            if top_logprobs > 0 and not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
         return data
@@ -2550,8 +2552,10 @@ class MediaReferenceItem(OpenAIBaseModel):
         description="The reference payload, in the form declared by ``format``."
     )
     format: Literal["path", "url", "base64"] = Field(description=(
-        "Wire form of ``content``: ``path`` (a file readable by the server; a "
-        "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
+        "Wire form of ``content``: ``path`` (a server-side file under the "
+        "directory named by ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR``; a ``file://`` "
+        "URI is also accepted; at most 200 MiB per file and 512 MiB across "
+        "the ``path`` references of one request), ``url`` (``http(s)``, fetched "
         "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
         "also accepted). Raw bytes reach the server as a multipart upload, "
         "which carries no ``format`` of its own. Distinct from the top-level "
@@ -2793,7 +2797,7 @@ class StartProfileRequest(OpenAIBaseModel):
         default=None,
         description="Directory where chrome traces are written. Defaults "
         "to the TLLM_TORCH_PROFILER_DIR environment variable, "
-        "then /tmp.")
+        "then a temporary directory.")
     num_steps: Optional[PositiveInt] = Field(
         default=None,
         description="Number of iterations to profile. Must be >= 1 if "

@@ -300,6 +300,126 @@ def test_nvfp4_mla_context_kv_cache_gather_layouts(
     assert torch.equal(output[:, 0], expected)
 
 
+_E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def _make_nvfp4_mla_records(num_rows: int, seed: int = 0):
+    """Random ``nvfp4.fp8rope`` records and their E4M3 rows: NoPE e4m3(e2m1 * scale), RoPE as is."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    records = torch.randint(
+        0, 256, (num_rows, 352), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    scales = (torch.rand(num_rows, 32, device="cuda", generator=gen) * 4 + 0.05).to(
+        torch.float8_e4m3fn
+    )
+    rope = (torch.randn(num_rows, 64, device="cuda", generator=gen) * 3).to(torch.float8_e4m3fn)
+    records[:, 256:320] = rope.view(torch.uint8)
+    # Scale block b lives at byte 320 + 8 * (b % 4) + b // 4.
+    records[:, 320:] = scales.view(torch.uint8).unflatten(-1, (8, 4)).transpose(-1, -2).flatten(-2)
+    packed = records[:, :256]
+    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2).long()
+    nope = torch.tensor(_E2M1_VALUES, device="cuda")[codes].unflatten(-1, (32, 16))
+    nope = (nope * scales.float()[..., None]).flatten(-2).to(torch.float8_e4m3fn)
+    return records, torch.cat((nope, rope), dim=-1)
+
+
+@skip_pre_blackwell
+def test_nvfp4_mla_record_kv_cache_gather():
+    """Gather inline-scale ``nvfp4.fp8rope`` records (residual_dim = 2 * rope) into E4M3 rows."""
+    num_pool_tokens = 6
+    records, expected_rows = _make_nvfp4_mla_records(num_pool_tokens)
+    # Records keep their block scales inline; the cache has no scale pool.
+    host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    host_pool_pointers[0, 0, 0] = records.data_ptr()
+    host_pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    global_indices = torch.tensor([[5, 0, -1], [3, 1, 6]], dtype=torch.int32, device="cuda")
+    output = torch.zeros((*global_indices.shape, 576), dtype=torch.float8_e4m3fn, device="cuda")
+    compact_indices = torch.empty_like(global_indices)
+    # Records carry no global scale: the gather does not apply the one of the residual layout.
+    residual_layout_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
+        host_pool_pointers,
+        host_pool_mapping,
+        global_indices,
+        output,
+        compact_indices,
+        residual_layout_scale,
+        0,
+        128,
+        num_pool_tokens,
+    )
+
+    expected_indices = torch.tensor([[0, 1, -1], [3, 4, -1]], dtype=torch.int32, device="cuda")
+    assert torch.equal(compact_indices, expected_indices)
+    for row, col, pool_row in ((0, 0, 5), (0, 1, 0), (1, 0, 3), (1, 1, 1)):
+        assert torch.equal(
+            output[row, col].view(torch.uint8), expected_rows[pool_row].view(torch.uint8)
+        )
+
+
+@skip_pre_blackwell
+def test_nvfp4_mla_record_context_kv_cache_gather():
+    """Gather inline-scale records through a paged table with layer offsets."""
+    pool_tokens = 8
+    records, expected_rows = _make_nvfp4_mla_records(pool_tokens, seed=1)
+    pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    pointers[0, 0, 0] = records.data_ptr()
+    mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    topk = torch.tensor([[0, 2, -1], [3, 1, 8]], dtype=torch.int32, device="cuda")
+    requests = torch.zeros(2, dtype=torch.int32, device="cuda")
+    block_table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([0, 4], dtype=torch.int64, device="cuda")
+    output = torch.zeros((4, 1, 576), dtype=torch.float8_e4m3fn, device="cuda")
+    compact = torch.empty_like(topk)
+    # Records carry no global scale: the gather does not apply the one of the residual layout.
+    residual_layout_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+    # Two tokens per block and two layers per physical page. Layer one maps
+    # logical tokens [0, 1, 2, 3] to physical rows [6, 7, 2, 3].
+    torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather(
+        pointers,
+        mapping,
+        topk,
+        requests,
+        block_table,
+        lengths,
+        output,
+        compact,
+        residual_layout_scale,
+        0,
+        4,
+        2,
+        4,
+        1,
+        128,
+        pool_tokens,
+    )
+    expected_compact = torch.tensor([[0, 2, -1], [3, 1, -1]], dtype=torch.int32, device="cuda")
+    assert torch.equal(compact, expected_compact)
+    physical_rows = [6, 7, 2, 3]
+    for compact_row, physical_row in enumerate(physical_rows):
+        assert torch.equal(
+            output[compact_row, 0].view(torch.uint8), expected_rows[physical_row].view(torch.uint8)
+        )
+
+
 # ===================================================================
 # Test 1: indexer_k_cache_gather_op
 # ===================================================================
