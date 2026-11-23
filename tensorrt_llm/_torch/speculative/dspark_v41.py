@@ -28,6 +28,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         self._draft_layer_ids = ()
         self._draft_block_tables = None
         self._draft_slot_block_tables = None
+        self._draft_table_storage = None
         self._draft_capacities = None
         self._draft_page_versions = {}
         self._draft_page_indices = {}
@@ -80,12 +81,12 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 manager.get_buffers(layer, kv_layout="HND") for layer in layers
             )
             shape = (self._batch_to_slot.shape[0], manager.max_blocks_per_seq)
-            self._draft_block_tables = torch.zeros(
-                shape, dtype=torch.int32, device=self._ctx_len.device
+            slots = self._ctx_len.numel()
+            self._draft_table_storage = torch.zeros(
+                (slots + shape[0], shape[1]), dtype=torch.int32, device=self._ctx_len.device
             )
-            self._draft_slot_block_tables = torch.zeros(
-                (self._ctx_len.numel(), shape[1]), dtype=torch.int32, device=self._ctx_len.device
-            )
+            self._draft_slot_block_tables = self._draft_table_storage[:slots]
+            self._draft_block_tables = self._draft_table_storage[slots:]
             self._draft_capacities = torch.zeros(
                 shape[0], dtype=torch.long, device=self._ctx_len.device
             )
@@ -179,7 +180,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             if self._draft_page_versions.get(slot) != version:
                 table = self._page_indices(cache, row < num_contexts)
                 if self._draft_page_indices.get(slot) != table:
-                    updates.append((slot, *table))
+                    updates.append((slot, row, *table))
                     self._draft_page_indices[slot] = table
                 self._draft_page_versions[slot] = version
             first, indices = self._draft_page_indices[slot]
@@ -205,7 +206,10 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         capacities_changed = self._uploaded_capacities != capacity_values
         if not updates and not slots_changed and not capacities_changed:
             return
-        count = sum(len(indices) for _, _, indices in updates)
+        # With an unchanged execution order, publish changed pages to both
+        # table views in one scatter instead of gathering the entire table.
+        direct = private and self._table_slots == slot_values
+        count = sum(len(indices) for _, _, _, indices in updates) * (2 if direct else 1)
         host = next(
             (item for item in self._draft_metadata_host_buffers if item["event"].query()), None
         )
@@ -225,12 +229,18 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             destinations = host["indices"].numpy()
             values = host["values"].numpy()
             offset = 0
-            for slot, first, indices in updates:
+            for slot, row, first, indices in updates:
                 end = offset + len(indices)
                 begin = slot * width + first
                 destinations[offset:end] = range(begin, begin + len(indices))
                 values[offset:end] = indices
                 offset = end
+                if direct:
+                    end = offset + len(indices)
+                    begin = (self._ctx_len.numel() + row) * width + first
+                    destinations[offset:end] = range(begin, begin + len(indices))
+                    values[offset:end] = indices
+                    offset = end
             if self._draft_updates_device is None or self._draft_updates_device.numel() < count:
                 self._draft_updates_device = torch.empty(
                     count, dtype=torch.int32, device=self._ctx_len.device
@@ -242,7 +252,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             values_device = self._draft_updates_device[:count]
             device_copy.copy(DSparkCopySite.PAGE_INDICES, indices_device, host["indices"][:count])
             device_copy.copy(DSparkCopySite.PAGE_VALUES, values_device, host["values"][:count])
-            self._draft_slot_block_tables.view(-1).index_copy_(0, indices_device, values_device)
+            self._draft_table_storage.view(-1).index_copy_(0, indices_device, values_device)
         if slots_changed:
             host_slots = host["slots"].numpy()
             host_slots.fill(self._scratch_slot)
@@ -255,7 +265,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 DSparkCopySite.PAGE_CAPACITIES, self._draft_capacities, host["capacities"]
             )
             self._uploaded_capacities = capacity_values
-        if updates or self._table_slots != slot_values:
+        if not direct and (updates or self._table_slots != slot_values):
             torch.index_select(
                 self._draft_slot_block_tables, 0, self._batch_to_slot, out=self._draft_block_tables
             )

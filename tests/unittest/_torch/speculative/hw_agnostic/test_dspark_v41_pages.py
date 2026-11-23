@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """V4.1 retained draft pages and bounded context seed lifecycle."""
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -166,6 +167,74 @@ def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypa
             DSv41DSparkWorker._prepare_page_tables(worker, [42], 0)
     assert worker._ctx_len.tolist() == [140, 17]
     assert worker._valid_len.tolist() == [128, 9]
+
+
+def test_private_page_updates_preserve_execution_order_without_redundant_gathers(monkeypatch):
+    caches = {
+        42: SimpleNamespace(
+            history_length=140, page_storage_version=1, num_blocks=2, is_active=True
+        ),
+        43: SimpleNamespace(
+            history_length=268, page_storage_version=1, num_blocks=3, is_active=True
+        ),
+    }
+    tables = {id(caches[42]): (0, (7, 8)), id(caches[43]): (1, (9, 10))}
+    storage = torch.full((6, 8), BAD_PAGE_INDEX, dtype=torch.int32)
+    worker = SimpleNamespace(
+        _draft_kv_manager=SimpleNamespace(kv_cache_map=caches, tokens_per_block=128),
+        _draft_reuse_policy=ReusePolicy.PRIVATE,
+        _graph_dummy_id_floor=1 << 60,
+        _req_to_slot={42: 0, 43: 1},
+        _managed_residency=dict(caches),
+        _free_slots=deque(),
+        _scratch_slot=2,
+        _win=128,
+        _ctx_len=torch.tensor([140, 268, 0]),
+        _valid_len=torch.tensor([128, 128, 0]),
+        _draft_capacities=torch.zeros(3, dtype=torch.long),
+        _batch_to_slot=torch.full((3,), 2, dtype=torch.long),
+        _draft_table_storage=storage,
+        _draft_slot_block_tables=storage[:3],
+        _draft_block_tables=storage[3:],
+        _draft_page_versions={},
+        _draft_page_indices={},
+        _draft_metadata_host_buffers=[],
+        _draft_updates_device=None,
+        _draft_indices_device=None,
+        _uploaded_slots=None,
+        _uploaded_capacities=None,
+        _table_slots=None,
+        _page_indices=Mock(side_effect=lambda cache, _: tables[id(cache)]),
+    )
+    worker._assign_slot = DSv41DSparkWorker._assign_slot.__get__(worker)
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda: SimpleNamespace(query=lambda: True, record=lambda: None)
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.speculative.dspark_v41.prefer_pinned", lambda: False)
+    gather = Mock(wraps=torch.index_select)
+    monkeypatch.setattr(torch, "index_select", gather)
+    DSv41DSparkWorker._prepare_page_tables(worker, [42, 43], 0)
+    assert worker._draft_block_tables[0, :2].tolist() == [7, 8]
+    assert worker._draft_block_tables[1, 1:3].tolist() == [9, 10]
+    DSv41DSparkWorker._prepare_page_tables(worker, [43, 42], 0)
+    assert worker._draft_block_tables[0, 1:3].tolist() == [9, 10]
+    assert worker._draft_block_tables[1, :2].tolist() == [7, 8]
+    assert worker._batch_to_slot.tolist() == [1, 0, 2]
+    assert worker._draft_capacities.tolist() == [384, 256, 0]
+    assert worker._page_indices.call_count == gather.call_count == 2
+
+    caches[42].page_storage_version += 1
+    tables[id(caches[42])] = (0, (7, 11))
+    DSv41DSparkWorker._prepare_page_tables(worker, [43, 42], 0)
+    assert worker._draft_slot_block_tables[0, :2].tolist() == [7, 11]
+    assert worker._draft_block_tables[1, :2].tolist() == [7, 11]
+    assert worker._page_indices.call_count == 3
+    assert gather.call_count == 2
+
+    DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+    assert worker._batch_to_slot.tolist() == [1, 2, 2]
+    assert worker._draft_capacities.tolist() == [384, 0, 0]
+    assert gather.call_count == 3
 
 
 @pytest.mark.parametrize("chunks", [[180], [100, 80]], ids=["single", "chunked"])
