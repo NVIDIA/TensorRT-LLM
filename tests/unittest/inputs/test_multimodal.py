@@ -1268,6 +1268,9 @@ def test_multimodal_cache_salt_fits_the_salt_limit(cache_salt: str) -> None:
     assert salt.endswith(_MM_SALT)
     if len(cache_salt.encode("utf-8")) + 1 + len(_MM_SALT) <= GenerationRequest.MAX_CACHE_SALT_LEN:
         assert salt == f"{cache_salt}/{_MM_SALT}"
+    else:
+        assert salt != request_cache_salt("b" * 256, params)
+        assert salt != request_cache_salt(salt.split("/", 1)[0], params)
     GenerationRequest([1], SamplingParams(max_tokens=1), cache_salt=salt)
 
 

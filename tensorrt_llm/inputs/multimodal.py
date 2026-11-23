@@ -1466,6 +1466,12 @@ def validate_mm_uuids(
     return uuids_by_modality
 
 
+def new_mm_cache_salt(cache_salt: str | None = None) -> str:
+    """Create a private cache salt for one multimodal request."""
+    return _combine_mm_cache_salt(cache_salt,
+                                  f"mm-no-item-spans-{secrets.token_hex(16)}")
+
+
 def isolate_mm_request(multimodal_data: dict[str, Any], processor_name: str,
                        modalities: list[str], reason: str) -> None:
     """Give a request whose multimodal items have no prompt spans a cache salt.
@@ -1476,8 +1482,7 @@ def isolate_mm_request(multimodal_data: dict[str, Any], processor_name: str,
     `request_cache_salt`) keeps it from sharing those blocks.
     """
     multimodal_data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
-    multimodal_data[MULTIMODAL_CACHE_SALT_KEY] = (
-        f"mm-no-item-spans-{secrets.token_hex(16)}")
+    multimodal_data[MULTIMODAL_CACHE_SALT_KEY] = new_mm_cache_salt()
     logger.warning_once(
         f"{processor_name}: the prompt spans of {modalities} items were "
         f"not found ({reason}). Such requests get a cache salt of their "
@@ -1493,8 +1498,8 @@ def request_cache_salt(
 
     `cache_salt`, with the request's own multimodal salt added when its
     processed data has one (`MULTIMODAL_CACHE_SALT_KEY`), so no other request
-    reuses its KV cache blocks. When both do not fit in the salt length limit,
-    the multimodal salt alone, which keeps the request apart as well. A
+    reuses its KV cache blocks. Long caller salts use a digest so both
+    identities fit within the executor's byte limit. A
     `cache_salt` that no request may have is returned as is, so the request
     fails as any other would.
     """
@@ -1505,18 +1510,27 @@ def request_cache_salt(
     multimodal_salt = multimodal_data.get(MULTIMODAL_CACHE_SALT_KEY)
     if multimodal_salt is None:
         return cache_salt
+    return _combine_mm_cache_salt(cache_salt, multimodal_salt)
+
+
+def _combine_mm_cache_salt(cache_salt: str | None, multimodal_salt: str) -> str:
     if cache_salt is None:
         return multimodal_salt
     # The executor imports this module.
     from tensorrt_llm.executor.request import GenerationRequest
     max_bytes = GenerationRequest.MAX_CACHE_SALT_LEN
-    if (not isinstance(cache_salt, str)
-            or len(cache_salt.encode("utf-8")) > max_bytes):
+    if not isinstance(cache_salt, str):
         return cache_salt
-    salt = f"{cache_salt}/{multimodal_salt}"
-    if len(salt.encode("utf-8")) > max_bytes:
-        return multimodal_salt
-    return salt
+    caller_bytes = cache_salt.encode("utf-8")
+    if len(caller_bytes) > max_bytes:
+        return cache_salt
+    # Reserve the digest prefix so a literal caller salt cannot impersonate it.
+    if (len(caller_bytes) + 1 + len(multimodal_salt.encode("utf-8")) > max_bytes
+            or cache_salt.startswith("blake3:")):
+        digest = blake3(caller_bytes,
+                        derive_key_context="trtllm.mm.cache_salt.v1")
+        cache_salt = f"blake3:{digest.hexdigest()}"
+    return f"{cache_salt}/{multimodal_salt}"
 
 
 def apply_mm_hashes(mm_data: Dict[str, Any],
