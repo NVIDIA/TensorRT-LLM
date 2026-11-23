@@ -400,7 +400,7 @@ being replaced: do not add tests there. A test that needs no GPU carries the
 which CI list runs a test.
 
 Before merge, the DGX stages run `test_moe_multi_gpu_premerge` instead of the
-whole `test_configurable_moe_multi_gpu` matrix, which runs post-merge. It reruns
+per-backend `test_configurable_moe_multi_gpu` entries, which run post-merge. It reruns
 the matrix cases that `_MULTI_GPU_PREMERGE_CASES` in `test_moe_module.py` lists
 per SM: each communication method with each payload it dispatches differently,
 TTP with one case per quantization-method family, and MegaMoE. Each listed case
