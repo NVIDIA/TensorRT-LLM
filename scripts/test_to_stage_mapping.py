@@ -72,7 +72,19 @@ from cbts.blocks import (TARGET_SHARD_SECONDS, Stage, YAMLIndex,
 # Safety ceiling against a corrupted/stale .test_durations blowing up shard
 # counts. The per-shard target (TARGET_SHARD_SECONDS) and the duration
 # estimate come from cbts.blocks so CBTS and this script size alike.
-_DYNAMIC_SPLITS_CAP = 20
+_DYNAMIC_SPLITS_CAP = 16
+# Ceiling on one family's GPU footprint (shards * gpuCount, where gpuCount is
+# the total across a shard's nodes). Keeps resizing from asking scarce 4/8-GPU
+# and multi-node pools for more capacity than that; a family that needs more
+# than this per shard still gets one shard.
+_MAX_FAMILY_GPUS = 16
+
+
+def _max_splits_for_gpus(gpu_count):
+    """Most shards a family may have within _MAX_FAMILY_GPUS (>= 1)."""
+    if not gpu_count or gpu_count <= 0:
+        return _DYNAMIC_SPLITS_CAP
+    return max(1, min(_DYNAMIC_SPLITS_CAP, _MAX_FAMILY_GPUS // gpu_count))
 
 
 def _load_tests_file(path: str) -> List[str]:
@@ -156,7 +168,8 @@ def _dynamic_split_counts(specs, yaml_index, durations):
         total_unmatched += unmatched
         k = max(
             1,
-            min(math.ceil(seconds / TARGET_SHARD_SECONDS), _DYNAMIC_SPLITS_CAP))
+            min(math.ceil(seconds / TARGET_SHARD_SECONDS),
+                _max_splits_for_gpus(spec.get('gpuCount'))))
         overrides[spec['name']] = k
     if total_tests:
         sys.stderr.write(

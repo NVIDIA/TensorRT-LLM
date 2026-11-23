@@ -448,8 +448,11 @@ def test_dynamic_split_sizing_normalizes_directive_suffixes(tmp_path):
     ]
 
 
-def _dynamic_shards(tmp_path: Path, name: str, entries: list,
-                    durations: dict) -> list:
+def _dynamic_shards(tmp_path: Path,
+                    name: str,
+                    entries: list,
+                    durations: dict,
+                    gpu_count=None) -> list:
     """Shard names StageQuery sizes for one single-family stage."""
     (tmp_path / 'jenkins' / 'scripts').mkdir(parents=True)
     config = tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json'
@@ -461,7 +464,10 @@ def _dynamic_shards(tmp_path: Path, name: str, entries: list,
                 'slurm': False,
                 'platform': 'x',
                 'testDB': 'l0_sizing',
-                'splits': 1  # hardcoded fallback; overridden by sizing
+                'splits': 1,  # hardcoded fallback; overridden by sizing
+                **({
+                    'gpuCount': gpu_count
+                } if gpu_count else {})
             }]
         }))
     db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
@@ -511,6 +517,28 @@ def test_dynamic_split_sizing_prefers_exact_key_with_options(tmp_path):
         })
     # 9000s -> ceil(9000 / 7200) = 2 shards (the 100s decoy would give 1).
     assert shards == ['ExactK-PyTorch-1', 'ExactK-PyTorch-2']
+
+
+@pytest.mark.parametrize(
+    "gpu_count,expected_shards",
+    [
+        (None, 10),  # no gpuCount (CPU / pod stage): only the global cap
+        (1, 10),  # 10 GPUs, within the 16-GPU ceiling
+        (4, 4),  # 16 GPUs
+        (8, 2),  # 16 GPUs
+        (16, 1),  # one shard already uses the whole ceiling
+        (32, 1),  # over the ceiling per shard: still one shard
+    ])
+def test_dynamic_split_sizing_caps_family_gpus(tmp_path, gpu_count,
+                                               expected_shards):
+    """A family's shards * gpuCount stays within 16 GPUs (min one shard)."""
+    # 72000s of tests would otherwise be ceil(72000 / 7200) = 10 shards.
+    shards = _dynamic_shards(tmp_path,
+                             'Capped-PyTorch', ['unittest/test_big.py'], {
+                                 'unittest/test_big.py::test_a': 72000.0,
+                             },
+                             gpu_count=gpu_count)
+    assert len(shards) == expected_shards
 
 
 @pytest.mark.parametrize("direction",
