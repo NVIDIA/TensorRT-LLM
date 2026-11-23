@@ -73,6 +73,7 @@ from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
+    _qwen_processor_for_media,
     _qwen_vision_item_partitions,
 )
 from .modeling_utils import (
@@ -384,24 +385,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             videos = [video_data.frames for video_data in video_datas]
         else:
             videos = None
-        # HF's Qwen3-VL processor takes a single `do_rescale` kwarg that is
-        # applied to both images and videos. Mixed pre-rescale states leave
-        # the raw side at 0-255 while the pre-rescaled side gets skipped —
-        # the ViT then produces garbage for the raw modality. Fail fast; the
-        # default `get_preferred_media_io_kwargs` ships `np` for both, so a
-        # divergence here means a caller override drifted.
-        image_is_pre = bool(images) and isinstance(images[0], torch.Tensor)
-        video_is_pre = bool(videos) and isinstance(videos[0][0], torch.Tensor)
-        if images and videos and image_is_pre != video_is_pre:
-            raise ValueError(
-                "Qwen3-VL requires image and video items to arrive in the same "
-                "pre-rescaled state (both torch.Tensor, or both uint8 numpy). "
-                f"Got image_is_pre_rescaled={image_is_pre}, "
-                f"video_is_pre_rescaled={video_is_pre}. Configure consistent "
-                "formats via `media_io_kwargs`."
-            )
-        do_rescale = not (image_is_pre if images else video_is_pre)
-
         do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
 
         # Pass `do_sample_frames` plus, when sampling is needed, the
@@ -439,23 +422,20 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 m["total_num_frames"] = len(vd.frames)
                 video_metadata.append(m)
 
-        do_rescale = proc_kwargs.pop("do_rescale", do_rescale)
+        processor = _qwen_processor_for_media(self.processor, proc_kwargs, images, videos)
         normalization = self._get_vision_normalization(mm_data, mm_processor_kwargs)
-        host_do_rescale = do_rescale
-        if normalization:
-            do_rescale = False
-            proc_kwargs["do_normalize"] = False
         processor_kwargs = dict(
             text=[text],
             images=images,
             videos=videos,
             padding=True,
-            do_rescale=do_rescale,
             return_tensors="pt",
             video_metadata=video_metadata,
             **proc_kwargs,
         )
-        processed = self.processor(**processor_kwargs)
+        if normalization:
+            processor_kwargs.update(do_rescale=False, do_normalize=False)
+        processed = processor(**processor_kwargs)
         if normalization:
             if any(
                 modality in normalization and processed[pixel_key].dtype != torch.uint8
@@ -466,7 +446,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             ):
                 # The processor returned non-uint8 pixels even with rescale and normalize off, so
                 # the device lookup table cannot be applied. Rerun it with the host settings.
-                processor_kwargs["do_rescale"] = host_do_rescale
+                processor_kwargs["do_rescale"] = proc_kwargs["do_rescale"]
                 processor_kwargs.pop("do_normalize")
                 return self.processor(**processor_kwargs)
             processed["vision_normalization"] = normalization
@@ -519,7 +499,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # class default delegates to) raises on video-only calls and returns a
         # wrong-formula fallback that would break chunked prefill, so we must
         # run the full processor here.
-        do_rescale = not (video and isinstance(video[0], torch.Tensor))
+        do_rescale = not (len(video) and isinstance(video[0], torch.Tensor))
         processed = self._processor(
             text=["<|vision_start|><|video_pad|><|vision_end|>"],
             videos=[video],

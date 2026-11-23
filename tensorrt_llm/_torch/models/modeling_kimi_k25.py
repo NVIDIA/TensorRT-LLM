@@ -244,18 +244,24 @@ def _decode_video_to_chunks(
     return chunks, "".join(prompts)
 
 
+def _to_pil_image(image: Image.Image | torch.Tensor | np.ndarray) -> Image.Image:
+    if isinstance(image, np.ndarray):
+        return Image.fromarray(image)
+    if isinstance(image, torch.Tensor):
+        from torchvision.transforms.functional import to_pil_image
+
+        return to_pil_image(image)
+    return image
+
+
 def _frames_to_chunks(
-    frames: List,
+    frames: List | np.ndarray,
     temporal_merge_kernel_size: int = 4,
     timestamp_mode: str = "hh:mm:ss.fff",
     fps: float = 2.0,
     frame_indices: Optional[List[int]] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Split pre-decoded PIL frames into temporal chunks.
-
-    Same output format as ``_decode_video_to_chunks`` but skips the
-    decoding step (frames are already PIL Images).
-    """
+    """Convert decoded frames to PIL and split them into temporal chunks."""
     if fps <= 0:
         raise ValueError(f"Video fps must be positive, got {fps}")
     if frame_indices is not None and len(frame_indices) != len(frames):
@@ -269,7 +275,9 @@ def _frames_to_chunks(
     prompts: List[str] = []
 
     for i in range(0, len(frames), temporal_merge_kernel_size):
-        chunk_frames = frames[i : i + temporal_merge_kernel_size]
+        chunk_frames = [
+            _to_pil_image(frame) for frame in frames[i : i + temporal_merge_kernel_size]
+        ]
         start_frame = frame_indices[i] if frame_indices is not None else i
         start_time = start_frame / fps
         ts_text = _format_video_timestamp(start_time, timestamp_mode)
@@ -1214,7 +1222,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
 
         total_tokens = 0
         for i in range(0, len(video), temporal_k):
-            chunk = video[i : i + temporal_k]
+            chunk = [_to_pil_image(frame) for frame in video[i : i + temporal_k]]
             # Each chunk is treated as a video_chunk; token count depends
             # on the spatial dims of the first frame.
             if image_processor is not None and hasattr(image_processor, "media_tokens_calculator"):
@@ -1272,13 +1280,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         # ``split_video_chunks()`` which requires ``mecord``.
         medias: List[Dict[str, Any]] = []
         for img in images:
-            # The serving layer may pass images as torch.Tensor (default
-            # format="pt"). Convert to PIL for the HF processor.
-            if isinstance(img, torch.Tensor):
-                from torchvision.transforms.functional import to_pil_image
-
-                img = to_pil_image(img)
-            medias.append({"type": "image", "image": img})
+            medias.append({"type": "image", "image": _to_pil_image(img)})
 
         video_prompt_parts: List[str] = []
         if videos:
@@ -1299,18 +1301,13 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 fps_for_chunks = sfps
                 frame_indices = None
                 if isinstance(vid, VideoData):
-                    from torchvision.transforms.functional import to_pil_image
-
                     metadata_fps = vid.metadata.get("fps")
                     if metadata_fps is not None:
                         fps_for_chunks = float(metadata_fps)
                     frame_indices = vid.metadata.get("frames_indices")
-                    frames = [
-                        to_pil_image(f) if isinstance(f, torch.Tensor) else f for f in vid.frames
-                    ]
-                    vid = frames
+                    vid = vid.frames
 
-                if isinstance(vid, list):
+                if isinstance(vid, (list, np.ndarray)):
                     # Pre-decoded frames (from framework or VideoData).
                     # Split into temporal chunks directly.
                     chunks, vid_prompt = _frames_to_chunks(

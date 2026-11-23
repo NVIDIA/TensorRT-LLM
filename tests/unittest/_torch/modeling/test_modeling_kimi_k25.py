@@ -435,15 +435,17 @@ class TestKimiK25Structure(unittest.TestCase):
         """Pre-sampled VideoData frames keep timestamps from the original video."""
         from PIL import Image
 
-        frames = [Image.new("RGB", (16, 16), color=(i, i, i)) for i in range(4)]
-
-        _, prompt = _frames_to_chunks(
+        frames = np.arange(4 * 8 * 16 * 3, dtype=np.uint8).reshape(4, 8, 16, 3)
+        chunks, prompt = _frames_to_chunks(
             frames,
             temporal_merge_kernel_size=2,
             fps=10.0,
             frame_indices=[0, 5, 9, 12],
         )
 
+        decoded = [frame for chunk in chunks for frame in chunk["video_chunk"]]
+        self.assertTrue(all(isinstance(frame, Image.Image) for frame in decoded))
+        np.testing.assert_array_equal(np.stack(decoded), frames)
         self.assertIn("00:00:00.000<|media_begin|>video", prompt)
         self.assertIn("00:00:00.900<|media_begin|>video", prompt)
         self.assertNotIn("00:00:00.200<|media_begin|>video", prompt)
