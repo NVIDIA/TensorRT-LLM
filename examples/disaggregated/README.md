@@ -300,16 +300,18 @@ NIXL/UCX and is not covered. The control channel of the KV-cache bounce buffer
 C++ transceiver (`cache_transceiver_config.transceiver_runtime: CPP`) do not use
 the key; their control messages carry no tag.
 
-Each signed message also carries a per-socket sequence number. A receiver accepts
-a message only when its number is higher than the last one it accepted from that
-socket, so a repeated message is dropped; so is a message that arrives after a
-later one, which can happen when a connection is re-established. A receiving
-socket keeps the last number of up to 4096 sending sockets in memory. Once it
-holds 4096 and accepts a message from one more sending socket, it forgets the
-number of the socket it has least recently accepted a message from, and the next
-message from that socket is accepted with any number. A newly opened socket (each
-RankInfo exchange opens one) and a restarted worker start with none, so the first
-message they get from a sending socket is accepted with any number. A reply is
+Each signed message also carries a per-socket sequence number. For each sending
+socket, a receiver remembers the highest number it accepted and which of the 2048
+numbers up to it were accepted. It accepts each number once, so a repeated message
+is dropped. A message that arrives after later ones, which can happen when a
+connection is re-established, is accepted when it is less than 2048 numbers behind
+the highest one and dropped otherwise. A receiving socket keeps these numbers for
+up to 4096 sending sockets in memory. Once it holds 4096 and accepts a message
+from one more sending socket, it forgets the numbers of the socket it has least
+recently accepted a message from, and the next message from that socket is
+accepted with any number. A newly opened socket (each RankInfo exchange opens one)
+and a restarted worker start with none, so the first message they get from a
+sending socket is accepted with any number. A reply is
 signed for the socket that sent the request, so another socket, such as the one a
 later RankInfo exchange opens, does not accept it.
 

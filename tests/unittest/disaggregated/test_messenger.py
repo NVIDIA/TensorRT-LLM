@@ -440,7 +440,7 @@ def test_signed_dealer_rejects_repeated_reply(signed_pair: _MessengerPair) -> No
         stream_id=os.urandom(16),
     )
     assert dealer._verify(reply) == [b"reply"]
-    with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
+    with pytest.raises(FrameAuthenticationError, match="Repeated message"):
         dealer._verify(reply)
     assert dealer.replays_rejected == 1
 
@@ -469,18 +469,46 @@ def replay_router() -> Iterator[_MessengerPair]:
     router.stop()
 
 
-def test_replay_rejects_repeated_and_older_seq(replay_router: _MessengerPair) -> None:
+def test_replay_window_accepts_each_seq_once(replay_router: _MessengerPair) -> None:
     router, raw = replay_router
     stream_id = os.urandom(16)
-    message = _raw_signed(router, seq=5, stream_id=stream_id)
-    raw.send(message)
-    raw.send(message)
-    raw.send(_raw_signed(router, seq=4, stream_id=stream_id))
-    assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
-    for _ in range(2):
-        with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
-            router.receive(timeout_ms=1000)
-    assert router.replays_rejected == 2
+    window = ZMQMessenger._REPLAY_WINDOW
+    top = window + 10
+    for seq, accepted in (
+        (3, True),
+        (5, True),
+        (3, False),
+        (4, True),
+        (4, False),
+        (5, False),
+        (top, True),
+        (top - 1, True),
+        (top - window + 1, True),
+        (top - window, False),
+    ):
+        raw.send(_raw_signed(router, seq=seq, stream_id=stream_id))
+        if accepted:
+            assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
+        else:
+            with pytest.raises(FrameAuthenticationError, match="Repeated message"):
+                router.receive(timeout_ms=1000)
+    assert router.replays_rejected == 4
+
+
+def test_signed_messages_unread_at_reconnect_are_all_delivered(signed_pair: _MessengerPair) -> None:
+    router, dealer = signed_pair
+    count = 200
+    for i in range(count):
+        dealer.send([b"T", str(i).encode()])
+    # The first batch is unread at the ROUTER when the connection is
+    # re-established, so the ROUTER reads the two connections in turn.
+    dealer._socket.disconnect(router.endpoint)
+    dealer._socket.connect(router.endpoint)
+    for i in range(count, 2 * count):
+        dealer.send([b"T", str(i).encode()])
+    received = {router.receive(timeout_ms=2000)[2] for _ in range(2 * count)}
+    assert len(received) == 2 * count
+    assert router.replays_rejected == 0
 
 
 def test_replay_accepts_gaps_and_new_stream_ids(replay_router: _MessengerPair) -> None:
@@ -501,10 +529,10 @@ def test_replay_state_is_bounded_and_keeps_recently_used_streams(
     for seq, stream_id in ((1, first), (1, second), (2, first), (1, third)):
         raw.send(_raw_signed(router, seq=seq, stream_id=stream_id))
         router.receive(timeout_ms=1000)
-    assert len(router._last_seq) == 2
+    assert len(router._replay_state) == 2
     # `first` was used after `second`, so its state is the one that is kept.
     raw.send(_raw_signed(router, seq=2, stream_id=first))
-    with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
+    with pytest.raises(FrameAuthenticationError, match="Repeated message"):
         router.receive(timeout_ms=1000)
     # The state of `second` was dropped, so its seq starts over.
     raw.send(_raw_signed(router, seq=1, stream_id=second))
@@ -523,7 +551,7 @@ def test_replay_state_survives_a_rewritten_sender_id(replay_router: _MessengerPa
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         router.receive(timeout_ms=1000)
     raw.send(message)
-    with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
+    with pytest.raises(FrameAuthenticationError, match="Repeated message"):
         router.receive(timeout_ms=1000)
 
 

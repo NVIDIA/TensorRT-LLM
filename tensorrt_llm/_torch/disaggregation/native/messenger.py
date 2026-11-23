@@ -238,15 +238,18 @@ class ZMQMessenger(MessengerInterface):
     the reply does not verify on another socket of the same owner.
 
     Message ordering. Each signed socket draws a random 16-byte stream id
-    and numbers its messages from 1. The receiving socket remembers the last
-    seq accepted per (sender id, stream id) and accepts a message only when
-    its seq is larger, so a message is accepted at most once while that state
-    is kept. A gap (lost message) is accepted. A message that arrives after a
-    later one of the same stream is dropped; this can happen when a
-    connection is re-established while earlier messages are still unread at
-    the receiver. A restarted peer draws a new stream id and starts again at
-    1. Senders hold a lock around seq assignment and the socket write, so
-    threads sharing a socket cannot reorder their own messages.
+    and numbers its messages from 1. Per (sender id, stream id) the receiving
+    socket remembers the highest seq it accepted and which of the
+    ``_REPLAY_WINDOW`` seqs up to it were accepted. It accepts a seq above
+    the highest one, and a seq inside the window that it has not accepted
+    yet, so a message is accepted at most once while that state is kept. A
+    gap (lost message) is accepted. A message can arrive after later ones of
+    the same stream when a connection is re-established while earlier
+    messages are still unread at the receiver; it is accepted when it is
+    less than ``_REPLAY_WINDOW`` behind the highest seq and dropped
+    otherwise. A restarted peer draws a new stream id and starts again at 1.
+    Senders hold a lock around seq assignment and the socket write, so
+    threads sharing a socket send their messages in seq order.
 
     Args:
         mode: One of ``SOCKET_MODES``.
@@ -264,10 +267,15 @@ class ZMQMessenger(MessengerInterface):
     # Bounds on routing ids remembered for replies and on replay state.
     # Entries are added only after a MAC verifies, so messages that fail
     # verification do not add any. Evicting the replay state of a long-idle
-    # peer socket forgets its last seq, so its earlier messages would be
+    # peer socket forgets its seqs, so its earlier messages would be
     # accepted again; messages without a valid MAC are still rejected.
     _MAX_PEER_IDS = 4096
     _MAX_REPLAY_STATE = 4096
+    # Seqs remembered per stream. One connection delivers in order; after a
+    # reconnect the receiver can still hold up to a send plus a receive queue
+    # (1000 messages each by default) of the earlier connection.
+    _REPLAY_WINDOW = 2048
+    _REPLAY_WINDOW_MASK = (1 << _REPLAY_WINDOW) - 1
     _AUTH_WARNING_INTERVAL_S = 10.0
 
     SOCKET_MODES = {
@@ -321,16 +329,19 @@ class ZMQMessenger(MessengerInterface):
         self._peer_ids: "OrderedDict[bytes, bytes]" = OrderedDict()
         self._peer_ids_lock = Lock()
         # Messages the listener dropped because verification failed, repeated
-        # or out-of-order ones included. receive() callers are not counted.
+        # ones and ones below the window included. receive() callers are not
+        # counted.
         self.auth_failures = 0
         self._last_auth_warning = float("-inf")
         self._send_lock = Lock()
         self._stream_id = os.urandom(FrameSigner.STREAM_ID_SIZE)
         self._next_seq = 1
-        self._last_seq: "OrderedDict[tuple[bytes, bytes], int]" = OrderedDict()
-        self._last_seq_lock = Lock()
-        # Repeated or out-of-order messages, counted for the listener and for
-        # receive() callers alike.
+        # (sender id, stream id) -> (highest accepted seq, bitmap of accepted
+        # seqs: bit i stands for seq `highest - i`).
+        self._replay_state: "OrderedDict[tuple[bytes, bytes], tuple[int, int]]" = OrderedDict()
+        self._replay_lock = Lock()
+        # Repeated messages and messages below the window, counted for the
+        # listener and for receive() callers alike.
         self.replays_rejected = 0
 
         logger.info(
@@ -436,18 +447,31 @@ class ZMQMessenger(MessengerInterface):
         # Runs only after the MAC verified, so the state below is keyed by
         # authenticated (sender id, stream id) pairs.
         key = (header.sender_id, header.stream_id)
-        with self._last_seq_lock:
-            last = self._last_seq.get(key)
-            if last is None or header.seq > last:
-                self._last_seq[key] = header.seq
-                self._last_seq.move_to_end(key)
-                while len(self._last_seq) > self._MAX_REPLAY_STATE:
-                    self._last_seq.popitem(last=False)
-                return
-            self.replays_rejected += 1
-        raise FrameAuthenticationError(
-            f"Repeated or out-of-order message (seq {header.seq}, last {last})"
-        )
+        seq = header.seq
+        with self._replay_lock:
+            # Bit i of seen is set once seq (highest - i) was accepted.
+            highest, seen = self._replay_state.get(key, (seq, 0))
+            behind = highest - seq
+            if behind < 0:
+                # The window moves up to seq. A jump of a whole window or
+                # more leaves none of the earlier seqs in it.
+                if -behind < self._REPLAY_WINDOW:
+                    seen = (seen << -behind) & self._REPLAY_WINDOW_MASK | 1
+                else:
+                    seen = 1
+                highest = seq
+            else:
+                if behind >= self._REPLAY_WINDOW or (seen >> behind) & 1:
+                    self.replays_rejected += 1
+                    raise FrameAuthenticationError(
+                        f"Repeated message or message below the window "
+                        f"(seq {seq}, highest {highest})"
+                    )
+                seen |= 1 << behind
+            self._replay_state[key] = (highest, seen)
+            self._replay_state.move_to_end(key)
+            while len(self._replay_state) > self._MAX_REPLAY_STATE:
+                self._replay_state.popitem(last=False)
 
     def _record_auth_failure(self, error: FrameAuthenticationError) -> None:
         # Drop the message and keep listening: one rejected message must not
