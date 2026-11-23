@@ -229,9 +229,19 @@ def test_markov_exchange_uses_only_nonempty_vocabulary_slices(
 
 
 def test_sm107_markov_requires_tp8(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch import cute_dsl_utils
     from tensorrt_llm._torch.speculative import dspark_markov_chain as markov
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
+    device_supported = markov._device_supported.__wrapped__
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", True)
+    assert device_supported(8)
+    assert not device_supported(4)
+    assert not device_supported(2)
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
+    assert not device_supported(8)
+
     monkeypatch.setattr(markov, "_num_ctas", lambda vocab, device: 128)
     base = torch.empty((2, 5, 16160), device="meta", dtype=torch.bfloat16)
     w2 = torch.empty((16160, RANK_DIM), device="meta")

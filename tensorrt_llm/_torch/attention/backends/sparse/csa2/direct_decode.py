@@ -2551,14 +2551,15 @@ def direct_sparse_decode(
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Warm up CSA2 direct decode before CUDA Graph capture")
-        kernel = _kernel_type()(*config)
-        compiled = cute.compile(kernel, *args)
-        if keys_as_m:
-            from tensorrt_llm._torch.kernels.blackwell.utils import SM107_DECODE_SMEM_CARVEOUT
+        with torch.cuda.device(q.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm up CSA2 direct decode before CUDA Graph capture")
+            kernel = _kernel_type()(*config)
+            compiled = cute.compile(kernel, *args)
+            if keys_as_m:
+                from tensorrt_llm._torch.kernels.blackwell.utils import SM107_DECODE_SMEM_CARVEOUT
 
-            _set_smem_carveout(compiled, SM107_DECODE_SMEM_CARVEOUT)
+                _set_smem_carveout(compiled, SM107_DECODE_SMEM_CARVEOUT)
         _COMPILED[key] = compiled
     compiled(*args)
     return output

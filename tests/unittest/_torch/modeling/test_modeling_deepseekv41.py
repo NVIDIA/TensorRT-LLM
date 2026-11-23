@@ -69,6 +69,48 @@ from defs.deepseek_v41_serving import model_kwargs as serving_model_kwargs
 # Configuration and checkpoint topology
 
 
+@pytest.mark.parametrize(
+    "capability,tp_size,attention_dp,pair_on_consumer,schedule",
+    [
+        ((10, 7), 8, False, True, {0: (1, 14)}),
+        ((10, 7), 4, False, False, {0: (1,), 2: (14,)}),
+        ((10, 3), 8, False, False, {0: (1, 14)}),
+        ((10, 7), 8, True, True, {}),
+    ],
+    ids=["sm107-tp8", "sm107-tp4", "sm103-tp8", "sm107-attention-dp"],
+)
+def test_engram_projection_schedule_follows_topology(
+    capability: tuple[int, int],
+    tp_size: int,
+    attention_dp: bool,
+    pair_on_consumer: bool,
+    schedule: dict[int, tuple[int, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def init_base(model: DeepseekV41Model, model_config: ModelConfig) -> None:
+        nn.Module.__init__(model)
+        model.engram_layer_ids = [1, 14]
+        model.use_engram = True
+
+    monkeypatch.setattr(v4.DeepseekV4Model, "__init__", init_base)
+    monkeypatch.setattr(DeepseekV41Model, "_resolve_replay_policy", lambda self, config: (None, 0))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(v41, "get_sm_version", lambda: capability[0] * 10 + capability[1])
+    monkeypatch.setattr(v41, "is_blackwell_datacenter", lambda: capability == (10, 3))
+    monkeypatch.setattr(v41, "decode_stream_priority", lambda _: 0)
+    monkeypatch.setattr(torch.cuda, "Stream", Mock())
+    model_config = SimpleNamespace(
+        mapping=Mapping(world_size=tp_size, tp_size=tp_size, enable_attention_dp=attention_dp),
+        pretrained_config=SimpleNamespace(hidden_size=5120),
+        extra_attrs={},
+        max_num_tokens=8,
+    )
+    model = DeepseekV41Model(model_config)
+    assert model._engram_pair_on_consumer is pair_on_consumer
+    assert model._engram_projection_schedule == schedule
+
+
 def test_engram_consumer_pair_schedule_at_row_limit() -> None:
     gather = Mock()
     gather.supports_pair.return_value = True
