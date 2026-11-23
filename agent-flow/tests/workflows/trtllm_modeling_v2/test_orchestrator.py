@@ -762,6 +762,40 @@ def test_an_attempt_whose_worktree_was_never_prepared_does_not_spend_a_worker_ru
     assert "it was adopted" in g.long_goals(failed, retry)[0]
 
 
+def test_an_attempt_the_environment_ended_does_not_spend_a_worker_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agent_flow.workflows.trtllm_modeling_v2.run.orchestrator.ENVIRONMENT_RETRIES", 2
+    )
+    orchestrator = _orchestrator_orchestrator(tmp_path, _services(_plan_once()))
+    task = _task("core", "assemble", _KEYS)
+    orchestrator.graph = g.Graph(tasks=[task])
+
+    def ends(attempt, decision):
+        task.attempts, task.status = attempt, "running"
+        orchestrator._finish(task, decision, [])
+        return task.status
+
+    # A lost session, then a provider that fails the turn past its one infrastructure retry.
+    assert ends(1, "BLOCKED\nblocked_reason environment; no gates session") == "failed"
+    raised = "raised RuntimeError: Claude Code turn failed: API Error: 502 Bad Gateway"
+    assert [ends(2, raised), ends(2, raised)] == ["pending", "failed"]
+    # A BLOCKED on the task's own work is its try, and so is one past the environment's budget.
+    assert ends(3, "BLOCKED\nblocked_reason accuracy_shortfall; loads, then NaN") == "failed"
+    assert ends(4, "BLOCKED\nblocked_reason environment; no gates session") == "failed"
+    assert orchestrator.not_started_attempts == {"core": [1, 2]}
+    told = [e.text for e in orchestrator.events if " ended " in e.text]
+    assert ["not counted" in text for text in told] == [True, False, True, False, False]
+    # Two of its four attempts were not its tries: the planner may still ask for its third.
+    retry = g.Graph(tasks=[_task("core", "assemble", _KEYS)])
+    adopted, refused = g.apply_revision(
+        g.Graph(tasks=[task]),
+        retry,
+        "the site is back",
+        not_started_attempts=orchestrator.not_started_attempts,
+    )
+    assert not refused and adopted.tasks[0].attempts == 5
+
+
 _CONCURRENT_CONTRACT = c.Contract(
     checks=(
         c.Check("core", "boot", "tp1", c.TIER_INNER),
