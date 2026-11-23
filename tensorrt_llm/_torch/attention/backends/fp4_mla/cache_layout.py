@@ -214,20 +214,22 @@ class Fp4MlaCacheLayout:
         default: Callable[..., Optional[torch.Tensor]],
         layer_idx: int,
         kv_layout: str = "NHD",
+        **kwargs: Any,
     ) -> Optional[torch.Tensor]:
         """Return the layer's primary paged-cache view.
 
         FP8 fallback layers use a buffer role and physical page geometry that
         differ from the manager-wide NVFP4 layout. Construct their view from
         the role descriptor directly so FMHA dispatch observes the same FP8
-        dtype and logical shape as an all-FP8 cache manager.
+        dtype and logical shape as an all-FP8 cache manager. ``kwargs`` are
+        the manager's own keyword arguments, for the view it builds.
         """
         local_layer = self._manager.layer_offsets[layer_idx]
         is_linear_layer = getattr(self._manager, "_is_local_mamba_layer", None)
         if callable(is_linear_layer) and is_linear_layer(local_layer):
             return None
         if local_layer not in self._fp8_mla_local_layer_indices():
-            return default(layer_idx, kv_layout)
+            return default(layer_idx, kv_layout, **kwargs)
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
 
