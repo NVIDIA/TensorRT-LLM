@@ -124,7 +124,6 @@ class Fp8Attention(ScenarioAttention):
         self._hybrid_step_state: dict[str, int] | None = None
         self._hybrid_cudnn_steps: int = 8
 
-    @torch.compiler.disable
     def _hybrid_attention_forward(self, qkv, rotary_emb, key_padding_mask, timestep):
         cos, sin = rotary_emb
         if self._hybrid_step_state["step"] < self._hybrid_cudnn_steps:

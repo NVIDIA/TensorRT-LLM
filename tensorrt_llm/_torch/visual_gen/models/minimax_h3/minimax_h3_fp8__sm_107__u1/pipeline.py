@@ -45,11 +45,16 @@ class MiniMaxH3Fp8Sm107U1Pipeline(MiniMaxH3Nvfp4Sm107U1U4Pipeline):
             quant_attention_config=stock.quant_attention_config,
             fp8_dense_fmha="cudnn",
         )
+        import torch
+
         step_state = {"step": 0}
         for block in blocks:
             block.attn._hybrid_cudnn_backend = cudnn_backend
             block.attn._hybrid_step_state = step_state
             block.attn._hybrid_cudnn_steps = _HYBRID_CUDNN_INITIAL_STEPS
+            block.attn._hybrid_attention_forward = torch.compiler.disable(
+                block.attn._hybrid_attention_forward
+            )
         self.transformer.register_forward_hook(
             lambda _m, _i, _o: step_state.__setitem__("step", step_state["step"] + 1)
         )
