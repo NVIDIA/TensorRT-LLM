@@ -20,6 +20,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.cache import (
     k3_ull_cache_manager as cache,
 )
+from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManager,
@@ -225,7 +226,7 @@ def test_validate_rejects_unsupported_state() -> None:
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("misalign", [0, 16])
-def test_lifecycle(state_dtype: torch.dtype, misalign: int) -> None:
+def test_lifecycle(monkeypatch, state_dtype: torch.dtype, misalign: int) -> None:
     context, state, pool, ssm, conv = _bound_state(state_dtype, misalign)
     assert len(state.checkpoint_views) == len(LAYERS)
     assert state.checkpoint_unit_bytes in (16, 32, 64, 128, 256)
@@ -273,7 +274,16 @@ def test_lifecycle(state_dtype: torch.dtype, misalign: int) -> None:
         assert torch.equal(ssm[i], ssm_live[i]) and torch.equal(conv[i], conv_live[i])
     assert state.prev_num_accepted_tokens[transferred].tolist() == [0, 0]
 
+    # The shared acceptance kernel is CUDA-only. Use its reference write to test
+    # how the CPU checkpoint views consume the counts.
+    def record_acceptance(counts, indices, accepted, is_dummy, num_bonus_tokens):
+        live = ~is_dummy
+        drafts = (accepted[live] - num_bonus_tokens).clamp_min(0)
+        counts.index_copy_(0, indices[live].long(), drafts)
+
+    monkeypatch.setattr(_kda_kernels, "record_kda_replay_acceptance", record_acceptance)
     # The speculative tail records 2 and 3 accepted drafts; a dummy row keeps its count.
+    state.prev_num_accepted_tokens[5] = 1
     state.update(
         MambaAcceptanceBatch(
             attention_metadata=None,
@@ -286,7 +296,7 @@ def test_lifecycle(state_dtype: torch.dtype, misalign: int) -> None:
             is_dummy_request=torch.tensor([False, False, True]),
         )
     )
-    assert state.prev_num_accepted_tokens[[4, 1, 5]].tolist() == [2, 3, 0]
+    assert state.prev_num_accepted_tokens[[4, 1, 5]].tolist() == [2, 3, 1]
     slots2, accepted2 = state.checkpoint_indices(batch)
     assert accepted2.tolist() == [3, 4]
     assert torch.equal(slots2, slots)
