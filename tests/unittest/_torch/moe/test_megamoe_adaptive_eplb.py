@@ -133,3 +133,33 @@ def test_an_adaptive_route_launch_builds_its_dsl_scalars_once():
     first = op._adaptive_route_scalar(float, 1 << 40)  # float() makes a new object on every call
     assert op._adaptive_route_scalar(float, 1 << 40) is first and first == float(1 << 40)
     assert op._adaptive_route_scalar(float, 8) == 8.0
+
+
+def test_only_a_bucket_whose_kernel_has_the_adaptive_route_maps_routes_in_its_router(monkeypatch):
+    """An SM107 bucket's kernel has no adaptive route in its dispatch router: its adaptive layers
+    route through the adaptive EPLB route op, with a log line naming the bucket."""
+    logged = []
+    monkeypatch.setattr(mm, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(mm, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(mm.logger, "info_once", lambda *msg, key: logged.append((msg, key)))
+    backend = SimpleNamespace(
+        _genphase_direct_input_buckets=set(),
+        _padding_drop_buckets=set(),
+        _adaptive_router_buckets=set(),
+        layer_load_balancer=SimpleNamespace(router_route=object()),
+        _slot_of_expert=None,
+        _route_quant_fuses=lambda: True,
+        _router_launch_max_tokens=lambda num_tokens: 2048,
+    )
+    for bucket, has_route in ((2048, False), (4096, True)):
+        properties = SimpleNamespace(
+            supports_direct_inputs=False, masks_invalid_routes=True, routes_adaptive=has_route
+        )
+        IMPL._record_bucket_kernel(backend, bucket, properties)
+    assert backend._adaptive_router_buckets == {4096}
+    assert backend._padding_drop_buckets == {2048, 4096}
+    assert [key for _, key in logged] == [("megamoe_no_adaptive_router", 2048)]
+    assert "SM107 kernel of bucket 2048 has no adaptive route" in logged[0][0][0]
+    assert not IMPL.routes_adaptive_in_router(backend, 8)
+    backend._router_launch_max_tokens = lambda num_tokens: 4096
+    assert IMPL.routes_adaptive_in_router(backend, 8)

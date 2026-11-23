@@ -1366,6 +1366,10 @@ def _megamoe_ugpu_tactic() -> tuple:
         1,
         (1, 1),
     )
+def megamoe_kernel_routes_adaptive(kernel_cls) -> bool:
+    """Whether ``kernel_cls``'s dispatch router maps and counts an adaptive balancer's routes
+    (it declares ``adaptive_route_experts``)."""
+    return "adaptive_route_experts" in kernel_cls.impl_desc_require()
 
 
 def _construct_megamoe_kernel(
@@ -1487,6 +1491,13 @@ def _construct_megamoe_kernel(
             and "swiglu_alpha" not in kernel_cls.problem_desc_require()
         ):
             raise NotImplementedError(f"{kernel_cls.__name__} does not support swiglu_alpha.")
+        # ImplDesc.validate ignores undeclared keys too: a kernel without the option would pass
+        # the key on to a router that maps expert ids while the kernel passes it no route table.
+        if common.get("adaptive_route_experts") and not megamoe_kernel_routes_adaptive(kernel_cls):
+            raise NotImplementedError(
+                f"{kernel_cls.__name__} (SM{sm_version}) has no adaptive route in its dispatch "
+                "router; an adaptive EPLB layer routes through the adaptive EPLB route op there."
+            )
         return kernel_cls(problem_desc, impl_desc)
 
     def construct_genphase():
@@ -1586,6 +1597,9 @@ class MegaMoeKernelProperties:
     # The kernel's top-k reduce masks routes with an invalid expert, so routes staged as -1
     # drop their rows.
     masks_invalid_routes: bool
+    # The kernel's dispatch router can map and count an adaptive balancer's routes
+    # (``megamoe_kernel_routes_adaptive``); without it the balancer's route op stages the slots.
+    routes_adaptive: bool = False
 
 
 def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
@@ -2790,8 +2804,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ugpu_weight_layout: str = "none",
     ) -> MegaMoeKernelProperties:
         """Probe the default kernel: its shared workspace bytes, whether it reads its inputs in
-        place (direct inputs), and whether its top-k reduce masks routes with an invalid expert
-        (``masks_invalid_combine_slots``), so that routes staged as -1 drop their rows."""
+        place (direct inputs), whether its top-k reduce masks routes with an invalid expert
+        (``masks_invalid_combine_slots``), so that routes staged as -1 drop their rows, and whether
+        its dispatch router can map an adaptive balancer's routes."""
 
         sm_version = get_sm_version()
         if ugpu_weight_layout != "none" and _megamoe_ugpu_is_genphase(max_tokens_per_rank):
@@ -2937,6 +2952,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             shared_workspace_bytes=int(shared_bytes),
             supports_direct_inputs=isinstance(probe, RubinInferenceGenphaseMegaMoE),
             masks_invalid_routes=bool(getattr(probe, "masks_invalid_combine_slots", False)),
+            routes_adaptive=megamoe_kernel_routes_adaptive(type(probe)),
         )
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:

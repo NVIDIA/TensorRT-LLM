@@ -809,6 +809,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Buckets whose kernel masks routes with an invalid expert in its top-k reduce: their
         # staging drops the rows of the forward's padding requests (moe/live_rows.py).
         self._padding_drop_buckets: set[int] = set()
+        # Buckets whose kernel's dispatch router maps and counts an adaptive balancer's routes.
+        self._adaptive_router_buckets: set[int] = set()
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
@@ -1662,6 +1664,22 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         return _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank, self.apply_topk_in_fc1)
 
+    def _record_bucket_kernel(self, max_T: int, properties) -> None:
+        """Keep what bucket ``max_T``'s kernel tells the launches (``MegaMoeKernelProperties``)."""
+        if properties.supports_direct_inputs:
+            self._genphase_direct_input_buckets.add(max_T)
+        if properties.masks_invalid_routes:
+            self._padding_drop_buckets.add(max_T)
+        if properties.routes_adaptive:
+            self._adaptive_router_buckets.add(max_T)
+        elif getattr(self.layer_load_balancer, "router_route", None) is not None:
+            logger.info_once(
+                f"[MegaMoECuteDsl] adaptive EPLB: the SM{get_sm_version()} kernel of bucket "
+                f"{max_T} has no adaptive route in its dispatch router, so the bucket's routes go "
+                "through the adaptive EPLB route op",
+                key=("megamoe_no_adaptive_router", max_T),
+            )
+
     def _alloc_symm_provider(self):
         """Build-time symmetric provider allocation. See ``create_weights``.
 
@@ -1715,10 +1733,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 ugpu_weight_layout=self._ugpu_weight_layout,
             )
             shared_workspace_bytes = properties.shared_workspace_bytes
-            if properties.supports_direct_inputs:
-                self._genphase_direct_input_buckets.add(max_T)
-            if properties.masks_invalid_routes:
-                self._padding_drop_buckets.add(max_T)
+            self._record_bucket_kernel(max_T, properties)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
                 world_size=self.ep_size,
@@ -1918,12 +1933,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Whether a launch of ``num_tokens`` rows can take an adaptive balancer's routes as expert
         ids, mapped to slots and counted by its dispatch router (either router: the one-round push
         and the metadata push carry the same adaptive route): the model's fused route+quant writes
-        the launch bucket. Otherwise the balancer stages the slots itself."""
+        the launch bucket, whose kernel has the adaptive route (``_adaptive_router_buckets``).
+        Otherwise the balancer stages the slots itself."""
         if not IS_CUTLASS_DSL_AVAILABLE or self._slot_of_expert is not None:
             return False
         if not self._route_quant_fuses():
             return False
-        return self._router_launch_max_tokens(num_tokens) is not None
+        return self._router_launch_max_tokens(num_tokens) in self._adaptive_router_buckets
 
     def try_fused_route_quant(
         self,
@@ -2415,10 +2431,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 combine_format=self.combine_format,
                 ugpu_weight_layout=self._ugpu_weight_layout,
             )
-            if properties.supports_direct_inputs:
-                self._genphase_direct_input_buckets.add(max_T)
-            if properties.masks_invalid_routes:
-                self._padding_drop_buckets.add(max_T)
+            self._record_bucket_kernel(max_T, properties)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
