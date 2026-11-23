@@ -12,6 +12,7 @@ In a 901-frame Cosmos3 generation run on one B200, decoding video latents into p
 ## Contents
 
 - [Motivation and decoder architecture](#motivation-and-decoder-architecture)
+- [Prior Art](#prior-art)
 - [Methodology](#methodology)
 - [Results](#results)
 - [Discussion](#discussion)
@@ -78,6 +79,16 @@ $$
 In <a href="#eq-residual-block">Eq. 1</a>, $N_1$ and $N_2$ are root-mean-square normalization (RMSNorm) over each pixel's channels. The activation is $\mathrm{SiLU}(x)=x\,\mathrm{sigmoid}(x)$. Each $C_j$ is a learned causal 3 × 3 × 3 convolution, including its bias. The shortcut $S(x)$ is $x$ when channel counts match, or a learned 1 × 1 × 1 projection otherwise.
 
 Early convolutions have many channels and small spatial maps. Later convolutions have fewer channels and many more pixels. This shift changes how much time a kernel spends moving data relative to multiplying channels.
+
+## Prior Art
+
+vLLM-Omni's Wan VAE fast paths cover much of the same ground as WinoVAE. Both use channels-last layouts and fuse normalization, activation, bias, and residual operations. Both simplify causal-history handling, reduce encoder downsampling copies, and use a 2D convolution for eligible first frames with no history. vLLM-Omni also adopted some optimizations from our Wan VAE work. [vLLM-Omni fast-path documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/vae_fast_path/) · [Decoder fusions](https://github.com/vllm-project/vllm-omni/pull/7056) · [Encoder fusions](https://github.com/vllm-project/vllm-omni/pull/8067) · [First-frame convolution](https://github.com/vllm-project/vllm-omni/pull/8179)
+
+The two implementations combine operations at different points. For example, vLLM-Omni folds the second convolution's bias into the residual add, while WinoVAE can fold that add into the next normalization. For upsampling, vLLM-Omni produces the enlarged input with a single gather before convolution. WinoVAE folds the weights into four phase-specific 2 × 2 filters and convolves at the original resolution. WinoVAE also uses spatial and temporal Winograd to reduce convolution arithmetic. [vLLM-Omni decoder implementation](https://github.com/vllm-project/vllm-omni/pull/7056) · [WinoVAE implementation](https://github.com/NVIDIA/TensorRT-LLM/pull/21576)
+
+Occipital Labs' fastvae uses Triton kernels for normalization, activation, and surrounding operations. Reactor's Wan decoder work combines `torch.compile` with layout and chunking changes. These techniques address costs that remain relevant when Winograd reduces convolution arithmetic. [fastvae](https://github.com/Occipital-Labs/fastvae) · [Reactor's Wan decoder work](https://www.reactor.inc/blog/optimizing-wan-decoder)
+
+Choosing one of [cuDNN's Winograd convolution algorithms](https://docs.nvidia.com/deeplearning/cudnn/backend/v9.8.0/api/cudnn-ops-library.html#cudnnconvolutionfwdalgo-t) changes how a convolution runs while leaving the surrounding VAE computation unchanged. Folding repeated upsampled pixels and carrying causal history through fused normalization require changes across operation boundaries. WinoVAE controls those operations together with its spatial and temporal transforms, and retains cuDNN for convolutions where it is the better choice.
 
 ## Methodology
 
@@ -780,16 +791,6 @@ Figure 19 compares these decompositions on matched synthetic spatial 3 × 3 conv
 | Fourier68 | 13.37 to 13.53% | 68 |
 
 For the same 4 × 4 output, Fourier68 used 68 real products to direct convolution’s 144. Both had about 13.4% relative-L2 error. Spatial F4 used only 36 products, but even with optimized points its error was about 64%. A GPU implementation would also pay for the transforms, the additions in each complex product, and memory traffic. GPU latency and trained-VAE accuracy for Fourier68 remain open questions. The [measurement notes](../media/tech_blog31/measurement_notes.md#nvfp4-decomposition-comparison) specify the test dimensions and quantizer.
-
-### Relationship to other VAE optimizations
-
-vLLM-Omni's Wan VAE fast paths cover much of the same ground as WinoVAE. Both use channels-last layouts and fuse normalization, activation, bias, and residual operations. Both simplify causal-history handling, reduce encoder downsampling copies, and use a 2D convolution for eligible first frames with no history. vLLM-Omni also adopted some optimizations from our Wan VAE work. [vLLM-Omni fast-path documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/vae_fast_path/) · [Decoder fusions](https://github.com/vllm-project/vllm-omni/pull/7056) · [Encoder fusions](https://github.com/vllm-project/vllm-omni/pull/8067) · [First-frame convolution](https://github.com/vllm-project/vllm-omni/pull/8179)
-
-The two implementations combine operations at different points. For example, vLLM-Omni folds the second convolution's bias into the residual add, while WinoVAE can fold that add into the next normalization. For upsampling, vLLM-Omni produces the enlarged input with a single gather before convolution. WinoVAE folds the weights into four phase-specific 2 × 2 filters and convolves at the original resolution. WinoVAE also uses spatial and temporal Winograd to reduce convolution arithmetic. [vLLM-Omni decoder implementation](https://github.com/vllm-project/vllm-omni/pull/7056) · [WinoVAE implementation](https://github.com/NVIDIA/TensorRT-LLM/pull/21576)
-
-Occipital Labs' fastvae uses Triton kernels for normalization, activation, and surrounding operations. Reactor's Wan decoder work combines `torch.compile` with layout and chunking changes. These techniques address costs that remain relevant when Winograd reduces convolution arithmetic. [fastvae](https://github.com/Occipital-Labs/fastvae) · [Reactor's Wan decoder work](https://www.reactor.inc/blog/optimizing-wan-decoder)
-
-Choosing one of [cuDNN's Winograd convolution algorithms](https://docs.nvidia.com/deeplearning/cudnn/backend/v9.8.0/api/cudnn-ops-library.html#cudnnconvolutionfwdalgo-t) changes how a convolution runs while leaving the surrounding VAE computation unchanged. Folding repeated upsampled pixels and carrying causal history through fused normalization require changes across operation boundaries. WinoVAE controls those operations together with its spatial and temporal transforms, and retains cuDNN for convolutions where it is the better choice.
 
 ## Conclusions
 
