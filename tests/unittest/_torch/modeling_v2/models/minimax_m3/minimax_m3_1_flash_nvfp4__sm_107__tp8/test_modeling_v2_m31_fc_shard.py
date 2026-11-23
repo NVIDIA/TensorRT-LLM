@@ -146,7 +146,7 @@ def factory_fc() -> Iterator[torch.nn.Linear]:
 
 @pytest.mark.parametrize(
     ("supported_splits", "reject_first"),
-    [(22, False), (9, True), (9, False), (None, False)],
+    [(22, False), (9, True), (9, False), (None, True)],
     ids=["first-config", "second-config", "second-config-mismatch", "no-compatible-config"],
 )
 def test_the_factory_selects_only_a_compatible_configuration(
@@ -164,7 +164,7 @@ def test_the_factory_selects_only_a_compatible_configuration(
     ) -> torch.Tensor:
         nonlocal last_configuration
         last_configuration = tuple(configuration)
-        if configuration[2] == 22 and supported_splits == 9 and reject_first:
+        if configuration[2] == 22 and reject_first:
             raise NotImplementedError("the configuration is unavailable")
         reference = factory_fc(inputs)[:, : shard_weight.shape[0]]
         configuration_matches = configuration[2] == supported_splits
@@ -182,11 +182,15 @@ def test_the_factory_selects_only_a_compatible_configuration(
     shard = m31_fc_shard.FcShard.build(factory_fc, mapping)
     if supported_splits is None:
         assert shard is None
-        expected_reason = "the pinned shard GEMM differs from the full fc at 1 rows"
-        assert any(
-            all(f"SPLITK_NUM={split}: {expected_reason}" in notice for split in (22, 9))
+        failure_reasons = {
+            int(split): reason
             for notice in notices
-        )
+            for split, reason in re.findall(r"SPLITK_NUM=(\d+): ([^;]+)", notice)
+        }
+        assert "unavailable" in failure_reasons.get(22, "")
+        assert "differs" not in failure_reasons[22]
+        assert "differs" in failure_reasons.get(9, "")
+        assert "unavailable" not in failure_reasons[9]
     else:
         assert shard is not None
         rows = m31_fc_shard.MAX_ROWS if supported_splits == 9 and not reject_first else 3
