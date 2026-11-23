@@ -349,7 +349,9 @@ class TunableRunner(ABC):
 def autotune(tune_mode: bool = True,
              cache_path: str = None,
              skip_dynamic_tuning_buckets: bool = False,
-             post_tune_merge_dist: Optional[Distributed] = None):
+             post_tune_merge_dist: Optional[Distributed] = None,
+             *,
+             quiet: bool = False):
     """Context manager for autotuning with distributed support.
 
     Args:
@@ -366,8 +368,11 @@ def autotune(tune_mode: bool = True,
             collective at context exit (before the cache is saved) — for
             pipelines whose warmup is not SPMD and so cannot use the per-op
             distributed strategies.
+        quiet: Log where the tuning starts and ends at debug level rather than
+            info, for a context entered around each call of an op.
     """
     autotuner = AutoTuner.get()
+    log_bounds = logger.debug if quiet else logger.info
     if post_tune_merge_dist is not None:
         # Save the singleton's prior state: the full-world dist attached for the
         # merge is temporary and must not leak into later sessions. Attach the
@@ -400,7 +405,7 @@ def autotune(tune_mode: bool = True,
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
-        logger.info("[Autotuner] Autotuning process starts ...")
+        log_bounds("[Autotuner] Autotuning process starts ...")
 
     # Fine-grained sync kernels deadlock when profiled, so force them off for the duration via the
     # C++ override rather than mutating os.environ. TODO: remove once autotuning handles them.
@@ -424,7 +429,7 @@ def autotune(tune_mode: bool = True,
         if autotune_enabled:
             AutoTuner.L2_FLUSH_BUFFERS.clear()
             torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
-            logger.info("[Autotuner] Autotuning process ends")
+            log_bounds("[Autotuner] Autotuning process ends")
 
         try:
             # Merge tactics across ranks in one collective before the cache is

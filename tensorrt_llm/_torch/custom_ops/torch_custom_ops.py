@@ -888,7 +888,8 @@ def _choose_mxfp8_tactic(custom_op: str,
     if tune is None:
         from ..modules.linear import _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE
         tune = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
-    with autotune(tune_mode=tune, skip_dynamic_tuning_buckets=True):
+    # One tuning context per call of the op: its start and end log at debug level.
+    with autotune(tune_mode=tune, skip_dynamic_tuning_buckets=True, quiet=True):
         _, tactic = AutoTuner.get().choose_one(custom_op, [runner],
                                                runner.tuning_config, inputs)
     return tactic
