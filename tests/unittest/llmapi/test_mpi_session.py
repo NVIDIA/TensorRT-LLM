@@ -353,15 +353,15 @@ def test_mpi_pool_session_spawns_with_caller_mpi_info(
         expected_mpi_info: dict[str, str] | None) -> None:
     from tensorrt_llm.llmapi import mpi_session
 
-    spawns = []
+    spawns: list[dict[str, object]] = []
 
     class RecordingPoolExecutor:
         """Records the spawn options of the pool instead of spawning workers."""
 
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs: object) -> None:
             spawns.append(kwargs)
 
-        def shutdown(self, wait=True):
+        def shutdown(self, wait: bool = True) -> None:
             pass
 
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", RecordingPoolExecutor)

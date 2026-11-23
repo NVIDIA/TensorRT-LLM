@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
@@ -31,6 +31,12 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
+
+    # Spawn info as MPIPoolExecutor takes it: an MPI.Info, or a mapping of info
+    # keys to values.
+    _MpiSpawnInfo = mpi4py.MPI.Info | Mapping[str, str]
+else:
+    _MpiSpawnInfo = Mapping[str, str]
 
 T = TypeVar("T")
 
@@ -507,7 +513,7 @@ class MpiPoolSession(MpiSession):
                  n_workers: int,
                  wait_shutdown: bool = False,
                  env_overrides: Optional[Dict[str, str]] = None,
-                 mpi_info: Any = None):
+                 mpi_info: Optional[_MpiSpawnInfo] = None):
         """Spawn a pool of MPI worker processes.
 
         Args:
