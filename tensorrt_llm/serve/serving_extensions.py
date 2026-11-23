@@ -67,6 +67,14 @@ class ServingExtension:
     # the prompt it renders, so prepared requests from the older revision are refused.
     render_version: int = 1
 
+    # The format of the ids the server gives this model's tool calls
+    # (``make_tool_call_id``); None keeps the server's choice.
+    tool_call_id_type: Optional[str] = None
+
+    # Whether this model's chats are rendered without a Jinja chat template, so
+    # a server-level ``chat_template`` is ignored with a warning.
+    ignores_server_chat_template: bool = False
+
     def render_prompt(
         self, request: "ChatCompletionRequest", res: Any = None
     ) -> Optional[List[int]]:

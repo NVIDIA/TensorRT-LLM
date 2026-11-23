@@ -15,7 +15,8 @@
 """Serving extension for Mistral Large 4 checkpoints (``model_type == "mistral_large_4"``).
 
 Mistral Large 4 follows the Mistral-native chat rules (``mistral_native``). On top of
-them, mistral-common builds the grammar that forces a required or named tool call.
+them, it states its tool-call id format and the server chat template it ignores, and
+mistral-common builds the grammar that forces a required or named tool call.
 """
 
 from typing import Any, Dict, Optional
@@ -58,6 +59,12 @@ class MistralLarge4ServingExtension(MistralNativeServingExtension):
     It adds the output-budget check, the forced tool-call grammar, and where
     structured outputs start.
     """
+
+    # The ids mistral-common writes and checks when a client sends the calls back.
+    tool_call_id_type = "mistral"
+
+    # mistral-common renders the chats from tekken.json.
+    ignores_server_chat_template = True
 
     def validate_chat_request(
         self, request: ChatCompletionRequest, *, max_seq_len: Optional[int]

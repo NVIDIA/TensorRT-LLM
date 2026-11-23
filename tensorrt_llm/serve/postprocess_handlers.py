@@ -749,8 +749,13 @@ def chat_response_post_processor(
                     content=text,
                     reasoning_content=reasoning_text,
                     tool_calls=[
-                        ToolCall(function=FunctionCall(
-                            name=forced_name, arguments=calls[0].parameters))
+                        ToolCall(id=make_tool_call_id(
+                            id_type=args.tool_call_id_type,
+                            func_name=forced_name,
+                            idx=0),
+                                 function=FunctionCall(
+                                     name=forced_name,
+                                     arguments=calls[0].parameters))
                     ])
             else:
                 # No tool markup despite the forced choice (nothing
@@ -767,16 +772,13 @@ def chat_response_post_processor(
         else:
             text, calls = apply_tool_parser(args, output.index, text, False)
             tool_calls = [
-                ToolCall(function=FunctionCall(name=call.name or "",
+                ToolCall(id=make_tool_call_id(id_type=args.tool_call_id_type,
+                                              func_name=call.name,
+                                              idx=call.tool_index),
+                         function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))
                 for call in calls
             ]
-            if args.tool_call_id_type == "mistral":
-                # The streaming path draws every id type from
-                # make_tool_call_id; here only the Mistral format replaces the
-                # default random id.
-                for tool_call in tool_calls:
-                    tool_call.id = make_tool_call_id(id_type="mistral")
             # Only the non-forced path builds ``message`` here; each forced
             # branch above builds its own. Keeping this outside the ``else``
             # would clobber those and read ``tool_calls`` unbound.

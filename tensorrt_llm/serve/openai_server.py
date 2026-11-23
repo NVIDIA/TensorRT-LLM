@@ -96,7 +96,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
@@ -163,7 +164,8 @@ from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
-from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
+from tensorrt_llm.serve.serving_extensions import (get_serving_extension,
+                                                   load_builtin_extensions)
 from tensorrt_llm.serve.tokenization_owners import (TokenizationOwners,
                                                     start_tokenization_owners)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
@@ -1064,12 +1066,13 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
 
+        model_type = (resolve_top_level_model_type(self.model_config)
+                      if self.model_config is not None else None)
+        model_extension = get_serving_extension(model_type)
         self.chat_template = load_chat_template(chat_template)
-        if (getattr(self.model_config, "model_type", None) == "mistral_large_4"
-                and self.chat_template):
-            logger.warning(
-                "Mistral Large 4 renders chats with mistral-common; ignoring "
-                "the server chat template.")
+        if model_extension.ignores_server_chat_template and self.chat_template:
+            logger.warning("This model renders chats without a chat template; "
+                           "ignoring the server chat template.")
             self.chat_template = None
 
         # Enable response storage for Responses API
@@ -1104,8 +1107,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
-            elif self.model_config.model_type == "mistral_large_4":
-                self.tool_call_id_type = "mistral"
+        if model_extension.tool_call_id_type is not None:
+            self.tool_call_id_type = model_extension.tool_call_id_type
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()

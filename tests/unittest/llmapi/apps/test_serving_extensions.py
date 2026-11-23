@@ -239,6 +239,14 @@ class TestBuiltinExtensions:
         assert request.stream_options is not None
         assert request.stream_options.include_usage is True
 
+    def test_mistral_large_4_declares_its_ids_and_template_handling(self, clean_registry) -> None:
+        extension = serving_extensions.get_serving_extension("mistral_large_4")
+        assert extension.tool_call_id_type == "mistral"
+        assert extension.ignores_server_chat_template is True
+        default = serving_extensions.get_serving_extension("unknown")
+        assert default.tool_call_id_type is None
+        assert default.ignores_server_chat_template is False
+
     @pytest.mark.parametrize("chat_template_kwargs", [None, {"reasoning_effort": "high"}])
     def test_mistral_large_4_constrains_from_the_first_token(
         self, clean_registry, chat_template_kwargs

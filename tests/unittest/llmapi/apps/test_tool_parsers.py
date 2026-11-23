@@ -7162,6 +7162,26 @@ class TestForcedToolChoicePostprocessing:
         locations = [json.loads(argument)["location"] for argument in arguments]
         assert locations == (["Paris"] if named else ["Paris", "Berlin"])
 
+    @pytest.mark.parametrize("named", [False, True])
+    def test_non_streaming_calls_take_the_server_id_type(
+            self, sample_tools, named):
+        """Every response path draws its tool call ids from make_tool_call_id."""
+        import re
+
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(
+            sample_tools,
+            tool_parser="mistral_large_4",
+            forced_tool_name="get_weather" if named else None)
+        args.tool_call_id_type = "mistral"
+        text = '[TOOL_CALLS]get_weather[ARGS]{"location": "Paris"}'
+        choice = chat_response_post_processor(self._fake_response(text),
+                                              args).choices[0]
+        assert len(choice.message.tool_calls) == 1
+        assert re.fullmatch(r"[A-Za-z0-9]{9}", choice.message.tool_calls[0].id)
+
     def test_streaming_early_end_flushes_buffered_call(self, sample_tools):
         """Flush the buffered call when an auto-choice stream ends early.
 
