@@ -4363,6 +4363,7 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        held_handoffs = set()
         microbatch_id = 0
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
@@ -4398,7 +4399,7 @@ class PyExecutor:
                 self._activate_completed_remote_tails()
                 self.disagg.check_transfer_timeouts()
                 held_handoffs = self._cancel_pending_gen_receives(
-                    pipeline_parallel=True)
+                    pipeline_parallel=True, previous_held=held_handoffs)
                 self._sweep_transfer_held_failures()
                 self._finish_gen_requests_ended_by_first_token(held_handoffs)
 
@@ -11505,13 +11506,16 @@ class PyExecutor:
             # moves KV is handed a finished request's blocks only on the batch
             # path (_save_kv_to_connector_async).
             return
-        candidates = [
-            req for req in self.active_requests
+        ready = {
+            id(req)
+            for req in self.disagg.started_gen_receives
             if req.is_disagg_generation_transmission_complete and not req.
             py_first_token_checked and req.py_request_id not in held_handoffs
-        ]
-        if not candidates:
+        }
+        if not ready:
             return
+        # Preserve active order and exclude any detached transfer owners.
+        candidates = (req for req in self.active_requests if id(req) in ready)
         held = self._held_transfer_failures()
         closing = []
         for req in candidates:
@@ -11619,10 +11623,12 @@ class PyExecutor:
                 or request.is_disagg_generation_transmission_in_progress
                 or request.is_disagg_generation_transmission_complete)
 
-    def _cancel_pending_gen_receives(self,
-                                     *,
-                                     pipeline_parallel: bool = False
-                                     ) -> set[int]:
+    def _cancel_pending_gen_receives(
+        self,
+        *,
+        pipeline_parallel: bool = False,
+        previous_held: AbstractSet[int] = frozenset()
+    ) -> set[int]:
         """Apply aborts and expired transfer deadlines to requests awaiting handoff.
 
         Such a request is not schedulable, so neither a forward nor the
@@ -11644,7 +11650,14 @@ class PyExecutor:
         canceled_ids = set(self.canceled_req_ids)
         cancelled, timed_out = [], []
         cancel_votes, timeout_votes = set(), set()
-        for request in self.active_requests:
+        # An abort may precede admission, and a peer's previous stop must be
+        # retried even if our receive completed. Otherwise only posted
+        # receives can have an in-flight deadline.
+        has_local_work = canceled_ids or previous_held or (
+            not inflight_cancel
+            and any(req.py_kv_transfer_timed_out
+                    for req in self.disagg.started_gen_receives))
+        for request in self.active_requests if has_local_work else ():
             rid = request.py_request_id
             prior = getattr(request, "py_pp_handoff_stop", None)
             already_stopping = prior in ("cancel", "timeout")
@@ -11671,7 +11684,7 @@ class PyExecutor:
             stopping = aborted | expired
             held = stopping - drained
             cancelled, timed_out = [], []
-            for req in self.active_requests:
+            for req in self.active_requests if stopping else ():
                 rid = req.py_request_id
                 if rid not in stopping:
                     continue

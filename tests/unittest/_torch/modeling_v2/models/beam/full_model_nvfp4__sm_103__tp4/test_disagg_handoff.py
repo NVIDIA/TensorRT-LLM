@@ -704,6 +704,7 @@ def _executor(requests, transceiver, canceled=()):
         registry=None,
         enable_attention_dp=False,
     )
+    executor.disagg._started_gen_receives.update((req.py_request_id, req) for req in requests)
     return executor, failures
 
 

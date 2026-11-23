@@ -897,6 +897,7 @@ def _closing_executor(
     executor = object.__new__(PyExecutor)
     executor._disagg_coordinator = coordinator
     executor.active_requests = list(active)
+    coordinator._started_gen_receives.update((req.py_request_id, req) for req in active)
     executor.enable_attention_dp = attention_dp
     executor.dist = SimpleNamespace(
         rank=0, cp_size=cp_size, mapping=SimpleNamespace(has_cp_helix=lambda: cp_size > 1)
@@ -917,6 +918,17 @@ def _closing_executor(
     executor._pending_response_terminations = []
     executor._first_token_timer = None
     return executor
+
+
+def test_idle_handoff_hooks_do_not_visit_active_decodes() -> None:
+    class DecodeBatch(list):
+        def __iter__(self):
+            raise AssertionError("handoff hook scanned active decodes")
+
+    executor = _closing_executor(CoordinatorHarness().coordinator, [])
+    executor.active_requests = DecodeBatch([object()] * 1024)
+    assert not executor._cancel_pending_gen_receives()
+    executor._finish_gen_requests_ended_by_first_token()
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
@@ -941,8 +953,9 @@ def test_pp_handoff_waits_for_every_stage_before_retiring(stop: str) -> None:
         safe = rank == (1 if stop == "cancel" else 0)
         h.transceiver.cancel_request = lambda request: rank == 0 or safe
         executor._try_cancel_request = lambda request: safe
+        held = set()
         for _ in range(2):
-            held = executor._cancel_pending_gen_receives(pipeline_parallel=True)
+            held = executor._cancel_pending_gen_receives(pipeline_parallel=True, previous_held=held)
             assert held == {7}
             assert executor._requests_excluding(held) == [other]
             assert not h.effects.failed and not executor._pending_response_terminations
@@ -952,7 +965,7 @@ def test_pp_handoff_waits_for_every_stage_before_retiring(stop: str) -> None:
             executor._finish_gen_requests_ended_by_first_token(held)
             assert req.new_tokens == []
         safe = True
-        assert not executor._cancel_pending_gen_receives(pipeline_parallel=True)
+        assert not executor._cancel_pending_gen_receives(pipeline_parallel=True, previous_held=held)
         assert executor.active_requests == [other]
         assert not executor._cancel_pending_gen_receives(pipeline_parallel=True)
         if stop == "cancel":

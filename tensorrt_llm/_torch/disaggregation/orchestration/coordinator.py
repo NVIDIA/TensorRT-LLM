@@ -11,7 +11,7 @@ reached through the ``interfaces`` Protocols.
 import os
 import time
 import traceback
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
@@ -922,6 +922,11 @@ class DisaggTransferCoordinator:
 
     # -- batch execution -----------------------------------------------------
 
+    @property
+    def started_gen_receives(self) -> Collection[LlmRequest]:
+        """Receives posted by this coordinator and still awaiting handoff."""
+        return self._started_gen_receives.values()
+
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
         """Generation requests in the batch whose KV receive has completed, in batch order.
 
@@ -1651,6 +1656,10 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def start_deferred_gen_receives(self, wait_all: bool = True) -> None:
         return None
+
+    @property
+    def started_gen_receives(self) -> Collection[LlmRequest]:
+        return ()
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
         return []
