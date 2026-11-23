@@ -812,6 +812,6 @@ For 189-frame 720p video, WinoVAE sped up decode by **3.69× on GB200** and **2.
 
 ## Availability and data
 
-TensorRT-LLM provides a direct NVFP4 Wan VAE decoder. The WinoVAE implementation is under review in [TensorRT-LLM PR #21576](https://github.com/NVIDIA/TensorRT-LLM/pull/21576). The WinoVAE timings and Cosmos3 accuracy results here use pre-release code. NVFP4 Winograd and Fourier filtering have only been evaluated in single-convolution simulations in this study.
+TensorRT-LLM provides both WinoVAE and a direct NVFP4 Wan VAE decoder. WinoVAE and the [Wan VAE benchmark](https://github.com/NVIDIA/TensorRT-LLM/blob/6ef751b774349785036cecd4a8632d5effb9a39d/benchmarks/visual_gen/bench_wan_vae.py) merged into `main` in [PR #21576](https://github.com/NVIDIA/TensorRT-LLM/pull/21576). We measured WinoVAE latency and Cosmos3 accuracy before the merge. NVFP4 Winograd and Fourier filtering have only been evaluated in single-convolution simulations in this study.
 
 The [measurement notes](../media/tech_blog31/measurement_notes.md) record the separate experimental setups, numerical methods, and reproduction limits. [data.json](../media/tech_blog31/data.json) contains the recorded figure values. [plot.py](../media/tech_blog31/plot.py) and its [overview figure module](../media/tech_blog31/overview_plots.py) regenerate the figures with Matplotlib and NumPy. They do not rerun the experiments.
