@@ -158,7 +158,8 @@ l0_b200:
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
   - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
-  - unittest/_torch/modules/kimi_kda --ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
+  - unittest/_torch/modules/kimi_kda --ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py --ignore=unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   # Shared catalog entries used by K3's generic path.
   - unittest/_torch/modeling_v2/moe/ops/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config

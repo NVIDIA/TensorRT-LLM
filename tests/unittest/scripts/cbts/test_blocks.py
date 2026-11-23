@@ -37,6 +37,7 @@ from cbts.coverage.tier import write_coverage_test_db
 from cbts.rules import test_list as test_list_mod
 from cbts.rules._helpers import lookup_paths_into_block_filters
 from cbts.rules.base import PRInputs
+from cbts.rules.spec_dec import SpecDecRule
 from cbts.rules.waives import WAIVES_FILE, WaivesRule
 
 pytestmark = pytest.mark.cpu_only
@@ -161,6 +162,7 @@ def test_yaml_index_strips_ignore_options_from_directory_targets(tmp_path: Path)
     test_db.mkdir()
     entry = (
         "unittest/_torch/attention/sparse "
+        "--import-mode=importlib "
         "--ignore=unittest/_torch/attention/sparse/dsa "
         "--ignore unittest/_torch/attention/sparse/multi_gpu "
         '--ignore-glob="unittest/_torch/attention/sparse/msa/*" '
@@ -349,6 +351,29 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
     res_kv = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: non_fp4_diff}))
     assert res_kv is not None and res_kv.affected_stages == {"DGX_B200-PyTorch-1"}
 
+    # Unparameterized function unwaive must retain parameter-level `-k "NVFP4"` batches.
+    kv_fp4_only = 'unittest/disaggregated/test_deepseek_v4_kv_transfer.py -k "NVFP4"'
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {"version": "0.0.1", "l0_b200": [{"condition": pre_cond, "tests": [kv_fp4_only]}]},
+            sort_keys=False,
+        )
+    )
+    rule_fp4 = WaivesRule(YAMLIndex.load(test_db), stages)
+    unwaive_func_diff = (
+        "@@ -1,2 +1,1 @@\n"
+        "-unittest/disaggregated/test_deepseek_v4_kv_transfer.py::test_deepseek_v4_native_sparse_host_transfer SKIP (https://nvbugs/4)\n"
+    )
+    res_unwaive = rule_fp4.apply(
+        PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: unwaive_func_diff})
+    )
+    assert res_unwaive is not None and res_unwaive.affected_stages == {"DGX_B200-PyTorch-1"}
+    filtered_fp4 = tmp_path / "filtered_fp4"
+    write_filtered_test_db(test_db, filtered_fp4, res_unwaive.block_filters)
+    assert yaml.safe_load((filtered_fp4 / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
+        kv_fp4_only
+    ]
+
 
 def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
     tmp_path: Path,
@@ -381,6 +406,63 @@ def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
     assert yaml.safe_load((filtered / "l0_a10.yml").read_text())["l0_a10"][0]["tests"] == [
         "disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance",
         "other_suite/test_unrelated.py::test_keep_when_touched",
+    ]
+
+    # Editing one file under a `--ignore` directory batch must not re-include the ignored sibling file.
+    dir_batch = (
+        "unittest/_torch/modules/kimi_kda "
+        "--ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py"
+    )
+    prefill = "unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py"
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_b200": [{"condition": _CONDITION, "tests": [prefill, dir_batch]}],
+            },
+            sort_keys=False,
+        )
+    )
+    bf_kda, unm_kda = lookup_paths_into_block_filters(
+        YAMLIndex.load(test_db),
+        ["unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py"],
+    )
+    assert unm_kda == []
+    filtered_kda = tmp_path / "filtered_kda"
+    write_filtered_test_db(test_db, filtered_kda, bf_kda)
+    assert yaml.safe_load((filtered_kda / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
+        dir_batch
+    ]
+
+    # SpecDecRule selects standalone `_mtp` entries without dragging in `--ignore=..._mtp...` batches.
+    mtp_file = "unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py"
+    kda_batch = f"{dir_batch} --ignore={mtp_file}"
+    (test_db / "l0_b200.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_b200": [
+                    {
+                        "condition": {"terms": {"stage": "pre_merge", "backend": "pytorch"}},
+                        "tests": [prefill, mtp_file, kda_batch],
+                    }
+                ],
+            },
+            sort_keys=False,
+        )
+    )
+    stages = {"DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1, {})}
+    sd_res = SpecDecRule(YAMLIndex.load(test_db), stages).apply(
+        PRInputs(
+            changed_files={"tensorrt_llm/_torch/speculative/mtp.py"},
+            diffs={"tensorrt_llm/_torch/speculative/mtp.py": "@@ -1,1 +1,2 @@\n+# x\n"},
+        )
+    )
+    assert sd_res is not None and sd_res.affected_stages == {"DGX_B200-PyTorch-1"}
+    filtered_sd = tmp_path / "filtered_sd"
+    write_filtered_test_db(test_db, filtered_sd, sd_res.block_filters)
+    assert yaml.safe_load((filtered_sd / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
+        mtp_file
     ]
 
 

@@ -89,7 +89,7 @@ def normalize_test_id(test_id: str) -> str:
 # a YAML target spec. Used to peel options off so the bare path/node-id can be
 # indexed as an additional lookup key — that lets a fine-grained waive or path
 # match a coarse YAML entry like `dir/x.py -k "deepseek"` or `dir --ignore=...`.
-_PYTEST_OPTION_RE = re.compile(r"\s+(?:-[a-zA-Z]\b|--(?:ignore(?:-glob)?|deselect)(?:=|\b))")
+_PYTEST_OPTION_RE = re.compile(r"\s+(?:-[a-zA-Z]\b|--[a-zA-Z][\w-]*(?:=|\b))")
 
 
 def _strip_pytest_options(s: str) -> str:
@@ -188,6 +188,10 @@ def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
     Rejects entries that lie on a sibling path, explicitly `--ignore`/`--deselect`
     the waived target, or carry a `-k` expression with no token matching `waive_id`.
     """
+    norm_entry = normalize_test_id(entry)
+    norm_waive = normalize_test_id(waive_id)
+    if _PYTEST_OPTION_RE.search(norm_waive) is not None:
+        return norm_entry == norm_waive
     if _entry_excludes_waive(entry, waive_id):
         return False
     entry_target = _entry_target(entry)
@@ -210,7 +214,12 @@ def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
     real = [t for t in tokens if t.lower() not in _K_RESERVED_WORDS]
     if not real:
         return True  # all-reserved expression → can't decide; over-include
-    waive_lower = waive_id.lower()
+    waive_file = waive_target.split("::", 1)[0]
+    if "[" not in norm_waive and not (
+        waive_file.endswith(".py") and all(t.lower().endswith(".py") for t in real)
+    ):
+        return True  # unparameterized waive may match `-k` via unseen `[params]`
+    waive_lower = norm_waive.lower()
     return any(t.lower() in waive_lower for t in real)
 
 
