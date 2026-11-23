@@ -33,6 +33,7 @@ import pickle
 import sys
 import tempfile
 import traceback
+from collections.abc import Sequence
 from contextlib import nullcontext
 from itertools import product
 from typing import List, NamedTuple, Optional
@@ -1423,9 +1424,9 @@ def _generate_focused_multi_gpu_test_params(
     - Marlin: an EXTERNAL_COMM backend whose ``run_moe`` can route internally,
       but under attention-DP the scheduler precomputes routing and dispatches
       plain BF16 activations (W4A16 — no activation scales). Coverage is
-      pinned to ALLGATHER, which is available on every SM90 box; the NVLink
-      a2a strategies in ``COMM_METHODS`` require MNNVL fabric that Hopper CI
-      nodes lack.
+      pinned to ALLGATHER, which every SM90 node has; the NVLink a2a
+      strategies in ``COMM_METHODS`` also need all NVLink links up
+      (``_get_comm_method_skip_reason``).
     """
     params: List = []
     seq_lens = [8] if IS_CI_MODE else SEQ_LENS
@@ -1926,9 +1927,8 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
     backend_types=[
-        # Marlin gets focused ALLGATHER coverage below; the NVLink a2a
-        # strategies in COMM_METHODS require MNNVL fabric unavailable on
-        # the Hopper (SM90) nodes Marlin runs on.
+        # Marlin gets focused ALLGATHER coverage below instead of the
+        # COMM_METHODS grid.
         b
         for b in BACKEND_TYPES
         if b != MoeBackendType.MARLIN
@@ -1975,21 +1975,38 @@ MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
 # MULTI_GPU_TEST_PARAMS runs post-merge. Pre-merge runs what only a multi-GPU
 # test can cover, each once across DGX H100 / B200 / B300; kernels, routing,
 # dtypes and shapes are covered by the single-GPU tests.
-#   comm:  DEP x each comm method x each dispatch payload that method handles
-#          differently (DeepEP quantizes before dispatch only for NVFP4,
-#          DeepEP low-latency for NVFP4 / FP8 / W4A8, NVLink for every format),
-#          plus the backends with their own post-dispatch path: TRTLLM runs the
-#          kernel on precomputed top-k, CuteDSL takes DeepEP low-latency's
-#          direct expert metadata.
+#   comm:  DEP x each comm method, plus the backends with their own
+#          post-dispatch path (TRTLLM runs the kernel on precomputed top-k).
+#          DeepEP quantizes NVFP4 before dispatch. The DeepEP low-latency rows
+#          dispatch BF16: post-quant low-latency dispatch needs a hidden size
+#          that the CI-mode matrix does not run.
 #   shard: TTP x one case per quant-method family; the TP split lives in the
 #          quant method's weight and scale loaders, which backends share.
 #   fused: MegaMoE, whose kernels own the cross-rank exchange.
-# What Hopper can run is placed on DGX H100; DGX B300 keeps only the backends
-# with SM103-specific kernels other than CUTLASS (CuteDSL NVFP4, MegaMoE CuteDSL).
+# What Hopper can run is placed on DGX H100. DGX B300 keeps the backends with
+# SM103-specific kernels other than CUTLASS: CuteDSL NVFP4, TRTLLM
+# W4A8_NVFP4_FP8 (sm_103a cubins) and MegaMoE CuteDSL.
+_MULTI_GPU_ARGNAMES = (
+    "parallel_mode",
+    "comm_method_type",
+    "dtype",
+    "moe_backend",
+    "quant_algo",
+    "seq_len",
+    "model_config",
+    "routing_method_cls",
+    "swiglu_alpha",
+    "swiglu_beta",
+    "swiglu_limit",
+)
+
+
 class _PremergeCase(NamedTuple):
+    """One matrix case that pre-merge runs; the case is bfloat16 at seq_len 8."""
+
     tier: str
     parallel_mode: str
-    comm: Optional[str]  # None for TTP, where the comm method is not used.
+    comm: str | None  # None for TTP, where the comm method is not used.
     backend: str
     quant: str
     model: str
@@ -1997,10 +2014,38 @@ class _PremergeCase(NamedTuple):
     swiglu_alpha: float = 1
 
 
+class _PremergeProblem(NamedTuple):
+    """A listed case that the matrix does not generate exactly once on this node."""
+
+    case: _PremergeCase
+    sm_version: int
+    num_matches: int
+
+    def message(self) -> str:
+        """The failure message of the case's parameter."""
+        if self.num_matches:
+            return (
+                f"_MULTI_GPU_PREMERGE_CASES[{self.sm_version}] lists {self.case}, which matches "
+                f"{self.num_matches} test_configurable_moe_multi_gpu cases on SM{self.sm_version}; "
+                "make the row specific enough to pick one."
+            )
+        return (
+            f"_MULTI_GPU_PREMERGE_CASES[{self.sm_version}] lists {self.case}, but "
+            f"test_configurable_moe_multi_gpu generates no such case on SM{self.sm_version}. "
+            "A renamed case, a new skip rule or a matrix change can cause this; update "
+            "_MULTI_GPU_PREMERGE_CASES."
+        )
+
+
 _E60 = "e60_k4_h2048_i1408"
 _E8 = "e8_k1_h512_i512"
 _ONE_SIDED, _TWO_SIDED = "NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED"
 _DEEPEP, _DEEPEP_LL = "DEEPEP", "DEEPEPLOWLATENCY"
+_NVLINK_COMM_METHODS = (_ONE_SIDED, _TWO_SIDED, _DEEPEP)
+_ROUTING_METHODS = {
+    "Renormalize": RenormalizeMoeRoutingMethod,
+    "DeepSeekV3": DeepSeekV3MoeRoutingMethod,
+}
 
 _MULTI_GPU_PREMERGE_CASES = {
     90: [
@@ -2068,9 +2113,10 @@ _MULTI_GPU_PREMERGE_CASES = {
         ),
     ],
     103: [
-        _PremergeCase("sm103", "DEP", _DEEPEP, "CUTEDSL", "NVFP4", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP, "CUTEDSL", "NVFP4", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP, "TRTLLM", "W4A8_NVFP4_FP8", _E60),
         _PremergeCase(
-            "sm103",
+            "fused",
             "DEP",
             MEGAMOE_IGNORE_COMM_METHOD,
             "MEGAMOE_CUTEDSL",
@@ -2082,55 +2128,77 @@ _MULTI_GPU_PREMERGE_CASES = {
 }
 
 
-def _matches_premerge_case(case: _PremergeCase, values) -> bool:
-    parallel_mode, comm, dtype, backend, quant, _, model_config, routing_method_cls = values[:8]
-    swiglu_alpha = values[8]
+def _matches_premerge_case(case: _PremergeCase, values: Sequence[object]) -> bool:
+    """Whether the MULTI_GPU_TEST_PARAMS entry with ``values`` is the case ``case`` names."""
+    params = dict(zip(_MULTI_GPU_ARGNAMES, values, strict=True))
     return (
-        parallel_mode == case.parallel_mode
-        and (case.comm is None or comm == case.comm)
-        and dtype == torch.bfloat16
-        and backend == case.backend
-        and str(quant) == case.quant
-        and str(model_config) == case.model
-        and routing_method_cls.__name__ == f"{case.routing}MoeRoutingMethod"
-        and swiglu_alpha == case.swiglu_alpha
+        params["parallel_mode"] == case.parallel_mode
+        and (case.comm is None or params["comm_method_type"] == case.comm)
+        and params["dtype"] == torch.bfloat16
+        and params["moe_backend"] == MoeBackendType[case.backend].value
+        and params["quant_algo"] == QuantAlgo[case.quant]
+        and params["seq_len"] == 8
+        and str(params["model_config"]) == case.model
+        and params["routing_method_cls"] is _ROUTING_METHODS[case.routing]
+        and params["swiglu_alpha"] == case.swiglu_alpha
     )
 
 
-def _premerge_multi_gpu_params(sm_version: int) -> List:
+def _premerge_case_skip_reason(case: _PremergeCase) -> str | None:
+    """Why this node cannot generate ``case``, or None if the matrix should have it here.
+
+    The matrix drops the NVLink and DeepEP comm methods on a node that does not report all
+    NVLink links up (``_get_comm_method_skip_reason``). TTP rows match any comm variant, so
+    on such a node they can lose every variant too.
+    """
+    if _is_mnnvl_supported():
+        return None
+    if case.comm is not None and case.comm not in _NVLINK_COMM_METHODS:
+        return None
+    return f"{case.comm or 'the comm methods'} need all NVLink links up, which this node does not report"
+
+
+def _premerge_multi_gpu_params(sm_version: int) -> list:
     """The cases of _MULTI_GPU_PREMERGE_CASES for this SM, taken from MULTI_GPU_TEST_PARAMS.
 
-    A listed case that the matrix no longer generates becomes a failing
-    parameter, so a renamed or newly skipped case cannot drop out silently.
+    A listed case that the matrix no longer generates becomes a failing parameter, unless
+    this node lacks the case's comm capability, which makes it a skipped one; a DEP row that
+    matches more than one case fails too. Skips raised while a case runs are still reported
+    as skips.
     """
     params = []
     for case in _MULTI_GPU_PREMERGE_CASES.get(sm_version, []):
-        match = next(
-            (p for p in MULTI_GPU_TEST_PARAMS if _matches_premerge_case(case, p.values)), None
-        )
-        if match is None:
-            params.append(pytest.param(case, id=f"tier={case.tier}-missing"))
-        else:
+        matches = [p for p in MULTI_GPU_TEST_PARAMS if _matches_premerge_case(case, p.values)]
+        name = f"{case.parallel_mode}-{case.comm}-{case.backend}-{case.quant}-{case.model}"
+        if matches and (case.comm is None or len(matches) == 1):
+            match = matches[0]
             params.append(
                 pytest.param(match.values, id=f"tier={case.tier}-{match.id}", marks=match.marks)
             )
+            continue
+        problem = _PremergeProblem(case, sm_version, len(matches))
+        skip_reason = None if matches else _premerge_case_skip_reason(case)
+        kind = "ambiguous" if matches else ("skipped" if skip_reason else "missing")
+        marks = [pytest.mark.skip(reason=skip_reason)] if skip_reason else []
+        params.append(pytest.param(problem, id=f"tier={case.tier}-{kind}-{name}", marks=marks))
     return params
 
 
 def _run_configurable_moe_multi_gpu(
-    executor,
-    parallel_mode,
-    comm_method_type,
-    dtype,
-    moe_backend,
-    quant_algo,
-    seq_len,
-    model_config,
-    routing_method_cls,
-    swiglu_alpha,
-    swiglu_beta,
-    swiglu_limit,
-):
+    executor: MPIPoolExecutor,
+    parallel_mode: str,
+    comm_method_type: str,
+    dtype: torch.dtype,
+    moe_backend: str,
+    quant_algo: QuantAlgo | None,
+    seq_len: int,
+    model_config: MoeModelConfig,
+    routing_method_cls: type,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+) -> None:
+    """Run one ``test_configurable_moe_multi_gpu`` case on the four-rank ``executor``."""
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
     ci_skip = should_skip_to_accelerate_ci(
@@ -2182,11 +2250,7 @@ def _run_configurable_moe_multi_gpu(
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize(
-    "parallel_mode,comm_method_type,dtype,moe_backend,quant_algo,seq_len,model_config,"
-    "routing_method_cls,swiglu_alpha,swiglu_beta,swiglu_limit",
-    MULTI_GPU_TEST_PARAMS,
-)
+@pytest.mark.parametrize(",".join(_MULTI_GPU_ARGNAMES), MULTI_GPU_TEST_PARAMS)
 @pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
 def test_configurable_moe_multi_gpu(
     parallel_mode,
@@ -2201,7 +2265,7 @@ def test_configurable_moe_multi_gpu(
     swiglu_beta,
     swiglu_limit,
     moe_multi_gpu_executor,
-):
+) -> None:
     _run_configurable_moe_multi_gpu(
         moe_multi_gpu_executor,
         parallel_mode,
@@ -2221,10 +2285,12 @@ def test_configurable_moe_multi_gpu(
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("case", _premerge_multi_gpu_params(get_sm_version()))
 @pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
-def test_moe_multi_gpu_premerge(case, moe_multi_gpu_executor):
+def test_moe_multi_gpu_premerge(
+    case: tuple | _PremergeProblem, moe_multi_gpu_executor: MPIPoolExecutor
+) -> None:
     """The pre-merge cases of test_configurable_moe_multi_gpu, see _MULTI_GPU_PREMERGE_CASES."""
-    if isinstance(case, _PremergeCase):
-        pytest.fail(f"{case} matches no test_configurable_moe_multi_gpu case on this GPU")
+    if isinstance(case, _PremergeProblem):
+        pytest.fail(case.message())
     _run_configurable_moe_multi_gpu(moe_multi_gpu_executor, *case)
 
 

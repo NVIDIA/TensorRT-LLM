@@ -399,6 +399,17 @@ being replaced: do not add tests there. A test that needs no GPU carries the
 `cpu_only` mark, which is what the CPU stage collects; `tests/AGENTS.md` says
 which CI list runs a test.
 
+Before merge, the DGX stages run `test_moe_multi_gpu_premerge` instead of the
+whole `test_configurable_moe_multi_gpu` matrix, which runs post-merge. It reruns
+the matrix cases that `_MULTI_GPU_PREMERGE_CASES` in `test_moe_module.py` lists
+per SM: each communication method with each payload it dispatches differently,
+TTP with one case per quantization-method family, and MegaMoE. Each listed case
+therefore has two node IDs, `test_configurable_moe_multi_gpu[<id>]` and
+`test_moe_multi_gpu_premerge[tier=<tier>-<id>]`, and a waive must name both. A
+new backend or format runs before merge on the DGX stages only through a new
+`_PremergeCase` row. A listed case that the matrix stops generating fails as
+`tier=<tier>-missing-...`, unless the node lacks its communication capability.
+
 Selection as a model configures it is tested outside this directory, under
 `tests/unittest/_torch/`: `test_model_config.py` (the literal a tactic settles,
 `ModelConfig.copy_with`), `modeling/test_modeling_speculative.py` (draft
@@ -1223,7 +1234,8 @@ graph capture, each forward creates its own defaults and records their fills in
 that graph instead of retaining graph-pool tensors in the runner cache.
 
 The CPU resolution tests run in `l0_cpu.yml`; routing and activation numerics
-run in the H100 and B200 single-GPU lists. The H100 C++ kernel stage discovers
+run in the H100 single-GPU list before merge and in the B200 one post-merge. The
+H100 C++ kernel stage discovers
 both OSS and bundled-internal MoE variants through CTest. With OSS kernels
 disabled, `mixtureOfExpertsTest` exercises the bundled runner directly.
 

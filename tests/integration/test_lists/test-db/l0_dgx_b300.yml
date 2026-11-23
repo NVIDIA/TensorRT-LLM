@@ -75,10 +75,20 @@ l0_dgx_b300:
   # with the MTP1 acceptance gate on the second leg.
   - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tep4::test_gsm8k_identity_vs_mtp1_and_acceptance TIMEOUT (45)
   # ------------- MoE ---------------
-  # SM103 runs of the MoE tests that pre-merge leaves to DGX B200: the full multi-GPU module
-  # matrix (pre-merge runs the SM103-specific test_moe_multi_gpu_premerge cases), the
-  # CUTLASS EPLB case and the DeepSeek-V4.1 shared-expert MoE.
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu TIMEOUT (60)
+  # The multi-GPU module cases, the CUTLASS EPLB case and the DeepSeek-V4.1 shared-expert MoE
+  # that this stage ran before merge until pre-merge switched to test_moe_multi_gpu_premerge.
+  # The three e256 cases are not here: CI mode always skips them (rule 1 of
+  # should_skip_to_accelerate_ci).
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTLASS-quant=FP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_ONE_SIDED-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_ONE_SIDED-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTLASS-quant=W4A8_MXFP4_MXFP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_NVFP4_FP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_MXFP8-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=IGNORE-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_DEEPGEMM-quant=W4A8_MXFP4_MXFP8-routing=DeepSeekV3]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=IGNORE-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=DeepSeekV3]
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k2_h512_i512-slots=16-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
   - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   # The MTP3 gate: gsm8k and acceptance length at three drafts.
@@ -102,7 +112,7 @@ l0_dgx_b300:
       stage: pre_merge
       backend: pytorch
   tests:
-  # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
+  # Synthetic weights cover Engram head/row shards.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
@@ -116,8 +126,8 @@ l0_dgx_b300:
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/comm/test_modeling_v2_mhc_ar_boundary.py
   # ------------- MoE: multi-GPU module tests ---------------
   # The SM103-specific kernels of the pre-merge subset (_MULTI_GPU_PREMERGE_CASES in
-  # test_moe_module.py) other than CUTLASS; the rest runs on DGX B200 and DGX H100, and
-  # post-merge here.
+  # test_moe_module.py): CuteDSL NVFP4, TRTLLM W4A8_NVFP4_FP8 and MegaMoE CuteDSL. The other
+  # cases run on DGX B200 and DGX H100 before merge, and here post-merge.
   - unittest/_torch/moe/test_moe_module.py::test_moe_multi_gpu_premerge
   # ------------- MoE: EPLB (Expert Load Balancing) tests ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k2_h512_i512-slots=16-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize]

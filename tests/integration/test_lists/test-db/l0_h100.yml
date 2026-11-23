@@ -73,7 +73,7 @@ l0_h100:
   # Any-CUDA (Triton trtllm::situ_and_mul op + torch reference, requires_cuda
   # only; not SM100/SM103-gated), so they run on Hopper rather than consuming
   # scarce Blackwell pre-merge capacity. The Blackwell-gated K3 suites live in
-  # l0_b200.yml / l0_gb300_multi_gpus.yml. (TRTLLM-15177)
+  # l0_b200.yml, l0_b300.yml and l0_gb300_multi_gpus.yml. (TRTLLM-15177)
   - unittest/_torch/moe/test_kimi_k3_mlp.py
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py
   - unittest/_torch/moe/test_kimi_k3_situ_and_mul.py

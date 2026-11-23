@@ -94,16 +94,16 @@ l0_b300:
   - unittest/_torch/modules/test_inproj_ba_splitk.py
   - unittest/_torch/modules/test_gate_add_rmsnorm_fp8.py
   # ------------- MoE ---------------
-  # The MoE tests whose kernels SM100 and SM103 share (sm_100f) run here instead of on
-  # B200 (l0_b200), which keeps the paths SM103 runs differently or skips. CUTLASS, and
-  # the SM-agnostic checks pre-merge runs on B200 or H100, run on SM103 in this list's
-  # post_merge block.
+  # Before merge these run on B300 and not on B200 (l0_b200), which runs them post-merge;
+  # their kernels are the sm_100f ones SM100 and SM103 share. CUTLASS, and the SM-agnostic
+  # checks that pre-merge runs on B200 or H100, run here post-merge.
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py -k "not cutlass or routed_config_preserves or degrading_to_cutlass"
   # Two of the 16 cases, covering every value of each parameter, in one entry like the
   # function entry they replace; the full set runs post-merge.
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[deepseekv3-swiglu-8-separated_routing] unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[renormalize-relu2-256-fused_routing]
-  # TRTLLM W4A8_NVFP4_FP8 (sm100a cubins) runs on B200.
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM and not W4A8_NVFP4_FP8"
+  # All TRTLLM cases. W4A8_NVFP4_FP8 ships separate sm_100a and sm_103a cubins, so B200 runs
+  # it before merge too.
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
@@ -277,7 +277,6 @@ l0_b300:
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py -k "cutlass and not routed_config_preserves and not degrading_to_cutlass"
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts

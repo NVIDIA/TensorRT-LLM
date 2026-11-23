@@ -140,7 +140,7 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
-  # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
+  # Synthetic weights cover Engram head/row shards.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]

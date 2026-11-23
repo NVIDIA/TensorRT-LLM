@@ -332,10 +332,11 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass
   # ------------- MoE: test_single_gpu (by backend) ---------------
-  # Pre-merge runs the kernels that SM100 and SM103 share on B300 (l0_b300), and
-  # post-merge here. B200 keeps what SM103 runs differently or skips: CUTLASS (NVFP4 picks
-  # the Ultra kernels on SM103), MegaMoE CuteDSL (K=96 variant on SM103) and TRTLLM
-  # W4A8_NVFP4_FP8 (sm100a cubins).
+  # The paths SM103 runs differently: CUTLASS (NVFP4 picks the Ultra kernels on SM103),
+  # MegaMoE CuteDSL (K=96 variant on SM103) and TRTLLM W4A8_NVFP4_FP8 (separate sm_100a and
+  # sm_103a cubins; B300 runs the sm_103a ones). The other single-GPU module cases share
+  # their sm_100f kernels with SM103; they run on B300 (l0_b300) before merge and here
+  # post-merge.
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
