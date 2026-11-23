@@ -57,6 +57,7 @@ class _Tuning(NamedTuple):
 
 
 _REFERENCE_SMS = 208
+_MAIN_1024_AIM4 = _Tuning(family="main", block=1024, unroll=4, options=(("aim_num", 4),))
 # Inclusive (K, N minimum, N maximum, reference rows minimum/maximum, tuning).
 _REGIONS: tuple[tuple[int, int, int, int, int, _Tuning], ...] = (
     (512, 513, 2047, 3, 4, _Tuning(family="reg", block=256, min_blocks=3, bins=1024)),
@@ -197,26 +198,8 @@ _REGIONS: tuple[tuple[int, int, int, int, int, _Tuning], ...] = (
             options=(("warp_rank", True),),
         ),
     ),
-    (
-        1024,
-        32768,
-        65535,
-        65,
-        128,
-        _Tuning(
-            family="reg", block=1024, min_blocks=1, bins=2048, options=(("static_npad", True),)
-        ),
-    ),
-    (
-        1024,
-        65536,
-        262143,
-        65,
-        128,
-        _Tuning(
-            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 4),)
-        ),
-    ),
+    (1024, 32768, 65535, 65, 128, _MAIN_1024_AIM4._replace(expected_family="main")),
+    (1024, 65536, 262143, 65, 128, _MAIN_1024_AIM4),
     (
         1024,
         16384,
@@ -266,28 +249,18 @@ _REGIONS: tuple[tuple[int, int, int, int, int, _Tuning], ...] = (
     (
         2048,
         16384,
-        32767,
+        24575,
         2,
-        4,
+        128,
         _Tuning(
             family="reg", block=1024, min_blocks=1, bins=1024, options=(("static_npad", True),)
         ),
     ),
     (
         2048,
-        16384,
+        24576,
         32767,
-        5,
-        8,
-        _Tuning(
-            family="reg", block=1024, min_blocks=1, bins=1024, options=(("dense_bracket", True),)
-        ),
-    ),
-    (
-        2048,
-        16384,
-        32767,
-        9,
+        33,
         128,
         _Tuning(
             family="reg", block=1024, min_blocks=1, bins=1024, options=(("static_npad", True),)
@@ -328,10 +301,8 @@ _REGIONS: tuple[tuple[int, int, int, int, int, _Tuning], ...] = (
         65536,
         131071,
         33,
-        128,
-        _Tuning(
-            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 4),)
-        ),
+        _REFERENCE_SMS,
+        _MAIN_1024_AIM4,
     ),
     (
         2048,
@@ -343,7 +314,27 @@ _REGIONS: tuple[tuple[int, int, int, int, int, _Tuning], ...] = (
             family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 3),)
         ),
     ),
-    (2048, 16384, 163839, 129, 512, _Tuning(family="blackwell_options")),
+    (2048, 16384, 65535, 129, 512, _Tuning(family="blackwell_options")),
+    # One 1024-thread CTA uses the SM thread budget. Two 512-thread CTAs can share it.
+    (
+        2048,
+        131072,
+        163839,
+        129,
+        _REFERENCE_SMS,
+        _MAIN_1024_AIM4,
+    ),
+    (
+        2048,
+        65536,
+        163839,
+        _REFERENCE_SMS + 1,
+        2 * _REFERENCE_SMS,
+        _Tuning(
+            family="main", block=512, min_blocks=2, unroll=4, parts=1, options=(("aim_num", 4),)
+        ),
+    ),
+    (2048, 65536, 163839, 2 * _REFERENCE_SMS + 1, 512, _Tuning(family="blackwell_options")),
     (
         2048,
         16384,
@@ -455,6 +446,10 @@ def make_plan(
         )
     else:
         assert family == "main"
+        if tuning.expected_family:
+            native = baseline_route(rows, n, npad, k, num_sms, 107)
+            if native["kernel"] != tuning.expected_family:
+                return native
         plan = streaming_route(rows, n, npad, k, force_main=True, num_sms=num_sms, sm_version=107)
         block = tuning.block
         parts = tuning.parts

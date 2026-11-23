@@ -673,20 +673,34 @@ def test_rubin_gvr_fp32_launch_staging(recorded_launcher):
 @pytest.mark.parametrize(
     "k,n,rows,region,family,block",
     [
-        (2048, 131087, 256, "blackwell_options", "main", 512),
-        (2048, 163775, 256, "blackwell_options", "main", 512),
+        (2048, 131087, 256, "main", "main", 512),
+        (2048, 163775, 256, "main", "main", 512),
         (2048, 16399, 4, "reg", "reg", 1024),
-        (1024, 32771, 130, "reg", "reg", 1024),
+        (2048, 24575, 8, "reg", "reg", 1024),
+        (2048, 24576, 8, None, "reg_clus", 1024),
+        (1024, 32771, 74, "main", "reg_clus", 1024),
+        (1024, 32771, 75, "main", "main", 1024),
+        (1024, 32771, 130, "main", "main", 1024),
         (1024, 32771, 131, "main", "main", 512),
     ],
 )
 def test_rubin_gvr_fp32_region_on_212_sms(recorded_launcher, k, n, rows, region, family, block):
     tuning = dispatch.select_tuning(rows, n, k, 212, 107)
-    assert tuning is not None and tuning.family == region
+    assert (tuning.family if tuning else None) == region
     launcher, compiled = recorded_launcher(torch.float32, k, rows, n, sms=212)
     assert launcher[0] == family and compiled.args[0][0] == block
     if family == "reg":
         assert compiled.args[0][7] == (2048 if k == 1024 else 1024)
+
+
+@pytest.mark.parametrize("sms", [208, 212, 216])
+def test_rubin_fp32_long_row_wave_boundaries(recorded_launcher, sms):
+    for rows, block in [(sms, 1024), (sms + 1, 512), (2 * sms, 512)]:
+        launcher, compiled = recorded_launcher(torch.float32, 2048, rows, 131087, sms=sms)
+        assert launcher[0] == "main" and compiled.args[0][0] == block
+        assert launcher[3][0] == 4096
+    tuning = dispatch.select_tuning(2 * sms + 1, 131087, 2048, sms, 107)
+    assert tuning is not None and tuning.family == "blackwell_options"
 
 
 def test_rubin_gvr_pcw_alignment_policy() -> None:
