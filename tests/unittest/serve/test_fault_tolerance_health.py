@@ -400,7 +400,13 @@ def test_encoder_rank_failure_answers_503_with_code(serve_env, role, error, stat
     async def submit(token_ids):
         raise error
 
-    server.encode_batcher = SimpleNamespace(validate_input=lambda token_ids: None, submit=submit)
+    # An embedding request submits its inputs together.
+    async def submit_many(token_ids_list):
+        raise error
+
+    server.encode_batcher = SimpleNamespace(
+        validate_input=lambda token_ids: None, submit=submit, submit_many=submit_many
+    )
     if role is ServerRole.RERANK:
         request = RerankRequest(model="reranker", query="query", documents=["a"])
         response = asyncio.run(server._rerank(request))
