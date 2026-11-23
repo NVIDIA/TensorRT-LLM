@@ -125,6 +125,19 @@ public:
         return TransferState::kIN_PROGRESS;
     }
 
+    [[nodiscard]] bool waitForBounceScatterDrain(int64_t timeoutMs) const override
+    {
+        if (!mFut.valid() || mFut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            return false;
+        }
+        auto const& result = mFut.get();
+        return result.state == TransferState::kSUCCESS || result.remoteDrained
+            || (result.remoteDrain.valid()
+                && result.remoteDrain.wait_for(std::chrono::milliseconds(timeoutMs)) == std::future_status::ready
+                && result.remoteDrain.get());
+    }
+
     /// Failure cause recorded by the bounce transport (empty while in flight / on success).
     [[nodiscard]] std::string getLastStatusStr() const override
     {

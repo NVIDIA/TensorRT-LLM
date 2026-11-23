@@ -169,6 +169,10 @@ class OlderReleaseRequestError(ValueError):
         self.req_info = req_info
 
 
+class _DestinationDrainUnproven(RuntimeError):
+    """A failed bounce write may still have a remote scatter."""
+
+
 class ReceiveAdmissionFenced(RuntimeError):
     """The agent closed receive admission before this destination was published."""
 
@@ -365,6 +369,7 @@ class WriteMeta:
     agent_generation: Optional[int] = None
     transfer_groups: tuple[_TransferGroup, ...] = ()
     kv_result_report_token: bytes = b""
+    requires_destination_drain: bool = False
     # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
     transfer_bytes: Optional[int] = None
 
@@ -1386,7 +1391,16 @@ class Sender(SenderBase):
                         with disagg_diagnostics.suppress_diagnostic_errors():
                             on_submitted()
                     if not status.wait():
-                        return False, getattr(status, "last_status_str", lambda: None)()
+                        detail = getattr(status, "last_status_str", lambda: None)()
+                        if (
+                            member.op == TransferOp.WRITE
+                            and getattr(self._agent, "bounce_enabled", False) is True
+                            and not status.wait_for_bounce_scatter_drain(
+                                max(1, int(self._retirement_timeout_s * 1000))
+                            )
+                        ):
+                            raise _DestinationDrainUnproven(detail)
+                        return False, detail
                 return True, None
             finally:
                 with task.lock:
@@ -1693,6 +1707,11 @@ class Sender(SenderBase):
             return
 
         agent_result = AgentResult.SUCCESS
+        drained_failure = (
+            AgentResult.FAILED_QUIESCED
+            if write_meta.requires_destination_drain
+            else AgentResult.FAILED
+        )
         submitted_and_completed = False
         backend_submitted = False
         submission_callback: Optional[Callable[[], None]] = None
@@ -1750,7 +1769,7 @@ class Sender(SenderBase):
                     submitted_and_completed = True
                     del request
                 else:
-                    agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
+                    agent_result = AgentResult.IN_DOUBT if owned else drained_failure
                     agent_name = getattr(self._agent, "name", "<?>")
                     detail = (
                         f"KV transfer agent failed: "
@@ -1767,6 +1786,12 @@ class Sender(SenderBase):
                     logger.error(detail)
                     error = RuntimeError(detail)
                     task.fail(error)
+            except _DestinationDrainUnproven as error:
+                logger.error(
+                    f"KV write for {write_meta.unique_rid} still lacks bounce drain evidence: {error}"
+                )
+                agent_result = AgentResult.FAILED
+                task.fail(error)
             except _TransferNotSubmittedError as error:
                 if getattr(session, "_routed_cancelled", False) is True:
                     return
@@ -1776,7 +1801,7 @@ class Sender(SenderBase):
                     f"unique_rid={write_meta.unique_rid} slice={write_meta.slice_id} "
                     f"peer_rank={write_meta.peer_rank}: {error}; cause={error.__cause__}"
                 )
-                agent_result = AgentResult.FAILED
+                agent_result = drained_failure
                 task.fail(error)
         elif owned:
             task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
@@ -2206,6 +2231,7 @@ class Sender(SenderBase):
             is_last_slice=task._chunk.is_last,
             transfer_groups=tuple(transfer_groups),
             kv_result_report_token=req_info.kv_result_report_token,
+            requires_destination_drain=req_info.wants_no_submission_result,
             transfer_bytes=transfer_bytes,
         )
 
@@ -3492,6 +3518,7 @@ class KVRecvTask(_LogicalTask):
         # One terminal result per writer rank, keyed by the rank the result frame carries.
         self._writer_reports: dict[int, bool] = {}
         self._unsubmitted_writers: set[int] = set()
+        self._drained_writers: set[int] = set()
         # Verified-range admission accounting: the receiver-computed byte
         # total the writers must cover for this piece, and the bytes the
         # writers attested as actually submitted-and-completed. None means
@@ -4785,6 +4812,9 @@ class RxSession(RxSessionBase):
                 task.fail(error)
                 self._record_ownership_evidence_error(error)
                 return
+            if status == AgentResult.FAILED_QUIESCED and self._uses_legacy_bounce:
+                task._drained_writers.add(peer_rank)
+                status = AgentResult.FAILED
             if status == AgentResult.FAILED_QUIESCED:
                 if not self._enforce_physical_ownership:
                     raise RuntimeError("received physical settlement without ownership enabled")
@@ -5005,6 +5035,8 @@ class RxSession(RxSessionBase):
 
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
+            if self._bounce_writers_pending():
+                return False
             if self._terminal_status == SessionStatus.CANCELLED:
                 return (
                     not any(
@@ -5030,14 +5062,20 @@ class RxSession(RxSessionBase):
 
     def _legacy_outstanding_writers(self, task: KVRecvTask) -> set[int]:
         reports = task._writer_reports.keys()
-        if self._uses_legacy_bounce and task._unsubmitted_writers:
-            # A failed bounce writer can still have a scatter in progress.
+        if self._uses_legacy_bounce:
             reports = {rank for rank, succeeded in task._writer_reports.items() if succeeded}
         return (
             task._kv_result_report_tokens.keys()
             - reports
             - self._legacy_quiesced_writers
             - task._unsubmitted_writers
+            - task._drained_writers
+        )
+
+    def _bounce_writers_pending(self) -> bool:
+        return self._uses_legacy_bounce and any(
+            task._legacy_published and self._legacy_outstanding_writers(task)
+            for task in self._kv_tasks
         )
 
     def record_recovery_failure(self, error: Exception) -> None:
@@ -5175,6 +5213,9 @@ class RxSession(RxSessionBase):
         refuses while ``has_transferring_tasks``). A receive cancelled before it failed is
         not held. Polled from the executor thread.
         """
+        # A deadline cannot prove that a failed bounce writer stopped scattering.
+        if self._bounce_writers_pending():
+            return self.has_failed()
         if self._enforce_physical_ownership or not self._logical_outcomes.failed:
             return False
         if self._terminal_aux_awaits_writers():
@@ -5286,9 +5327,13 @@ class RxSession(RxSessionBase):
             with self.lock:
                 if getattr(self, "_closed", False):
                     return True
-                if self._terminal_aux_awaits_writers() or (
-                    self._terminal_status == SessionStatus.CANCELLED
-                    and not self.resources_drained()
+                if (
+                    self._bounce_writers_pending()
+                    or self._terminal_aux_awaits_writers()
+                    or (
+                        self._terminal_status == SessionStatus.CANCELLED
+                        and not self.resources_drained()
+                    )
                 ):
                     return False
                 self._closed = True

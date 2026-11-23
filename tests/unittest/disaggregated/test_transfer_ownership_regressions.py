@@ -1753,6 +1753,56 @@ def test_failed_legacy_bounce_receive_keeps_waiting_after_session_ack() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("scatter_drained", [False, True])
+def test_bounce_sender_reports_physical_failure_only_after_drain(monkeypatch, scatter_drained):
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._device_id = 0
+    sender._retirement_timeout_s = 1
+    status = Mock()
+    status.wait.return_value = False
+    status.wait_for_bounce_scatter_drain.return_value = scatter_drained
+    status.last_status_str.return_value = "bounce write failed"
+    sender._agent = Mock(bounce_enabled=True)
+    sender._agent.check_remote_descs.return_value = True
+    sender._agent.submit_transfer_requests.return_value = status
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    request = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="gen2")
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))
+    params = DisaggregatedParams(disagg_request_id=73)
+    task = transfer_mod.KVSendTask(_sole_piece(), params, slice_id=0)
+    task._enforce_physical_ownership = False
+    sender._sessions = {
+        73: SimpleNamespace(
+            kv_tasks=[task], lock=threading.Lock(), status=SessionStatus.READY, set_exception=Mock()
+        )
+    }
+    write = transfer_mod.WriteMeta(
+        task=task,
+        expected_transfers=1,
+        peer_name="gen2",
+        peer_rank=2,
+        peer_endpoint="receiver",
+        unique_rid=73,
+        src_ptrs=np.array([0x1000], dtype=np.int64),
+        dst_ptrs=np.array([0x2000], dtype=np.int64),
+        sizes=np.array([0x100], dtype=np.int64),
+        slice_id=0,
+        requires_destination_drain=True,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
+
+    sender._deliver_kv_to_agent(write)
+
+    status.wait_for_bounce_scatter_drain.assert_called_once_with(1000)
+    dealer.send.assert_called_once()
+    code = transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])[4]
+    expected = AgentResult.FAILED_QUIESCED if scatter_drained else AgentResult.FAILED
+    assert transfer_mod._AGENT_RESULT_BY_CODE[code] is expected
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("ranks", "evidence"),
     [((), None), ((0, 2, 7), 133), ((0, 10**6), frozenset({0, 10**6}))],
@@ -1825,6 +1875,23 @@ def test_mixed_bounce_rank_receives_proof_for_fenced_first_publication(
     slot = _OneSlotAllocator(rid)
     slot.apply_reuse_decision(not KvCacheTransceiverV2._retirement_blocked(session))
     assert slot.is_reusable is not other_writer_failed
+    if other_writer_failed:
+        assert not session.close()
+        session._writer_wait_expired = True
+        assert KvCacheTransceiverV2._retirement_blocked(session)
+        assert not session.close()
+        settlement = transfer_mod._make_kv_result_msg(
+            1,
+            rid,
+            0,
+            True,
+            AgentResult.FAILED_QUIESCED,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
+        Receiver._process_kv_agent_result(receiver, b"", settlement)
+        assert not KvCacheTransceiverV2._retirement_blocked(session)
+        slot.apply_reuse_decision(session.close())
+        assert slot.is_reusable
     assert not session.kv_write_verified()
     assert 1 not in (sender._get_req_info(rid) or {})
 

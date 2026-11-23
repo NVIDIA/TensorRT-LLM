@@ -393,6 +393,12 @@ public:
     {
         return {};
     }
+
+    /// Confirm that a terminal write has no outstanding bounce scatter into the destination.
+    [[nodiscard]] virtual bool waitForBounceScatterDrain(int64_t /*timeoutMs*/) const
+    {
+        return true;
+    }
 };
 
 struct BaseAgentConfig

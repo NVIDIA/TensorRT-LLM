@@ -144,6 +144,11 @@ std::string encodeNack(std::uint64_t requestId, std::uint32_t chunkIdx, std::uin
     return encodeHeaderOnly(makeHeader(BounceMsgType::kNACK, requestId, chunkIdx, 0, regionHandle, 0, 0));
 }
 
+std::string encodeDrainAck(std::uint64_t requestId)
+{
+    return encodeHeaderOnly(makeHeader(BounceMsgType::kDRAIN_ACK, requestId, 0, 0, 0, 0, 0));
+}
+
 bool decodeHeader(std::string const& blob, BounceMsgHeader& outHeader)
 {
     if (blob.size() < sizeof(BounceMsgHeader))

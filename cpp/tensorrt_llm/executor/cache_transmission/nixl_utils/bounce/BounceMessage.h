@@ -35,11 +35,12 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 /// treats any unknown `msgType` as a no-op (default branch), so a bogus type can't misroute.
 enum class BounceMsgType : std::uint16_t
 {
-    kWANT = 1,  // sender -> receiver: per-chunk byte sizes[] for requestId (empty list cancels)
-    kGRANT = 2, // receiver -> sender: credits[] for requestId
-    kDATA = 3,  // sender -> receiver: region written; scatter entries[] (after getXferStatus SUCCESS)
-    kACK = 4,   // receiver -> sender: chunk scattered; region freed
-    kNACK = 5,  // receiver -> sender: chunk/request cannot be completed; sender fails the request
+    kWANT = 1,      // sender -> receiver: per-chunk byte sizes[] for requestId (empty list cancels)
+    kGRANT = 2,     // receiver -> sender: credits[] for requestId
+    kDATA = 3,      // sender -> receiver: region written; scatter entries[] (after getXferStatus SUCCESS)
+    kACK = 4,       // receiver -> sender: chunk scattered; region freed
+    kNACK = 5,      // receiver -> sender: chunk/request cannot be completed; sender fails the request
+    kDRAIN_ACK = 6, // receiver -> sender: a cancelled flow can no longer scatter
 };
 
 #pragma pack(push, 1)
@@ -97,10 +98,9 @@ static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 byt
 static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
 
 inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
-// v2: DATA scatter entries became strided RUNS (BounceScatterRun). The out-of-band capability
-// handshake checks this version before bounce is selected; decodeHeader also rejects a mismatched
-// control message defensively.
-inline constexpr std::uint16_t kBounceVersion = 2U;
+// The handshake checks the control version before bounce is selected. Version 3 requires the
+// receiver to acknowledge cancellation after its destination scatters finish.
+inline constexpr std::uint16_t kBounceVersion = 3U;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of
@@ -127,6 +127,7 @@ inline constexpr std::uint16_t kBounceVersion = 2U;
 /// Header-only like ACK. The sender fails the WHOLE request on any NACK, so chunkIdx/regionHandle are
 /// informational only (0 when the receiver has no chunk context, e.g. a rejected WANT).
 [[nodiscard]] std::string encodeNack(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle);
+[[nodiscard]] std::string encodeDrainAck(std::uint64_t requestId);
 
 // ---- decode ----
 /// Decode the fixed header. Returns false on short blob, bad magic, or version mismatch.

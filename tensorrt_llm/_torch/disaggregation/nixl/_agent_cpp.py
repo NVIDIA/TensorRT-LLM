@@ -79,6 +79,10 @@ class BindingsNixlTransferStatus(TransferStatus):
             )
         return result == TransferState.SUCCESS
 
+    def wait_for_bounce_scatter_drain(self, timeout_ms: int) -> bool:
+        wait = getattr(self._cpp_status, "wait_for_bounce_scatter_drain", None)
+        return wait is not None and wait(timeout_ms)
+
     def last_status_str(self) -> str:
         get = getattr(self._cpp_status, "get_last_status_str", None)
         return get() if get is not None else "<unavailable>"

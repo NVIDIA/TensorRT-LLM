@@ -194,6 +194,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // holds for the whole metadata load. BindingsNixlTransferStatus.__del__ (nixl/_agent_cpp.py)
         // calls this before the status is destroyed, so that wait does not hold the GIL.
         .def("release", &kvc::TransferStatus::release, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait_for_bounce_scatter_drain", &kvc::TransferStatus::waitForBounceScatterDrain, nb::arg("timeout_ms"),
+            nb::call_guard<nb::gil_scoped_release>())
         // Failure detail for the last terminal state (empty if unavailable). Named to match the
         // lookup in BindingsNixlTransferStatus.last_status_str (nixl/_agent_cpp.py), which is what
         // the Python transceiver's error log reads.
