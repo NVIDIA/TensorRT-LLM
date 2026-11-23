@@ -38,7 +38,7 @@ class Tuning(NamedTuple):
     vs_batched: bool
     # The warp roles (among load, mma, softmax, epilogue, store) that read the valid prefix lengths with loads of their
     # own in a main launch with lengths (kernel.py, _role_work); the others read them as data that no thread writes.
-    lens_own_loads: tuple
+    lens_own_loads: tuple[str, ...]
 
 
 TUNING = {

@@ -34,6 +34,7 @@ from ...common.dsl import MMALayout, ldmatrix, nanosleep
 from ...common.expmath import bf16x2, f2u, hash01, u2f, warp_max, warp_sum
 from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.state import State
+from ...constants import INV_SQRT_HEAD_DIM
 from ..ptx.shared import ld_global_nc_b32_hint_pred, ld_shared_f32_v4_pred, mma_bf16
 from ..valid_len import valid_len
 
@@ -54,9 +55,8 @@ SM_ZC = 69248  # the MGS column in flight: two buffers of 128 floats, used in tu
 SM_RED = 70272  # per-warp parts of the sums and bounds taken over the CTA
 SM_SCL = 70976  # 32 inverse-iteration scales
 SM_IDX2 = 71168  # up to 512 sampled token indices (Gram)
-SM_VSTG = (
-    73728  # V pass (after the eigensolver / scan): input tiles at 0 (2 x 32 KB), output stages here
-)
+# V pass (after the eigensolver / scan): input tiles at 0 (2 x 32 KB), output stages here
+SM_VSTG = 73728
 SM_TOTAL = 92160
 # The eigensolver also uses the start of the buffer twice: for the two cp.async buffers of the Gram rounds, 26112 B
 # each (2 x 48 rows at a 272-byte stride) at 0 and 26112, and at the end for the Hadamard matrix (32 KB at SM_UHH).
@@ -87,14 +87,14 @@ def _uhh_off(k: Int32) -> Int32:
 # steps before the last barrier wrote.
 @cute.jit
 def sampled_token(st, sidx):
-    """The token of sample sidx of this batch element, from rows_p. With lengths (st.lens = (address of the lengths,
-    rows mode)) the batch element has st.nv valid tokens: rows mode 0 is the default draw over the padded sequence,
+    """The token of sample sidx of this batch element, from rows_p. With lengths (st.lens_p is their address) the
+    batch element has st.nv valid tokens: st.rows_mode 0 is the default draw over the padded sequence,
     whose row r stands for token floor(r nv / S); modes 1 and 2 are the caller's rows, shared by the batch [NQK] or
     per batch element [B, NQK], taken as given below nv and as the last valid token from nv on."""
-    if cutlass.const_expr(st.lens is None):
+    if cutlass.const_expr(st.lens_p is None):
         r = Int32(load_invariant(Uint32, st.rows_p + Int64(sidx) * 4))
         return Uint32(cutlass.max(cutlass.min(r, st.S - 1), Int32(0)))
-    mode = st.lens[1]
+    mode = st.rows_mode
     own = Int64(cutlass.select_(mode == 2, st.b * st.NQK, Int32(0)))
     r = Int32(load_invariant(Uint32, st.rows_p + (own + Int64(sidx)) * 4))
     mapped = Int32((Int64(r) * Int64(st.nv)) // Int64(st.S))
@@ -146,7 +146,7 @@ def stage_first_rounds(st):
             mat, sm, chk = round_chunk(st, it)
             sidx = pre * 48 + sm
             ok = Int32(sidx < st.NQK)
-            if cutlass.const_expr(st.lens is not None):
+            if cutlass.const_expr(st.lens_p is not None):
                 # a batch element without a valid token copies zeros
                 ok = ok & Int32(st.nv > 0)
             tok = preloaded_token(st, sidx)
@@ -197,7 +197,7 @@ def refill(st, buf, rd):
         mat, sm, chk = round_chunk(st, it)
         sidx = (rd + 2) * 48 + sm
         ok = Int32(sidx < st.NQK)
-        if cutlass.const_expr(st.lens is not None):
+        if cutlass.const_expr(st.lens_p is not None):
             ok = ok & Int32(st.nv > 0)
         tok = preloaded_token(st, sidx)
         if sidx >= 512:
@@ -499,7 +499,7 @@ def multisect(st, lo0, hi0, span):
     mtarget = 127 - st.jv
     lo = lo0 - span * Float32(1e-6) - Float32(1e-30)
     hi = hi0 + span * Float32(1e-6) + Float32(1e-30)
-    for it in cutlass.range_constexpr(NIT_BIS):
+    for _ in cutlass.range_constexpr(NIT_BIS):
         wdt = (hi - lo) * Float32(1.0 / 17.0)
         x = lo + wdt * Float32(st.sv + 1)
         cnt = sturm_count(st, x)
@@ -549,7 +549,7 @@ def inverse_iteration(st, span):
         for i in cutlass.range(128, unroll=4):
             sZ[i, c] = hash01(i, c + 7)
         scale = Float32(1.0)
-        for itv in cutlass.range_constexpr(NIT_INV):
+        for _ in cutlass.range_constexpr(NIT_INV):
             piv = sD[0] - lam
             piv = floored_pivot(piv, pfl)
             sPiv[0, c] = piv
@@ -657,7 +657,7 @@ def stage_hadamard(st, had_p):
     for it in cutlass.range_constexpr(4):
         ci = it * EIG_THREADS + st.tid
         w4 = load_invariant(Uint32, had_p + Int64(ci) * 16, 4)
-        store_vector(sptr(Uint32, st.hds + ci * 16, 16), (w4[0], w4[1], w4[2], w4[3]))
+        store_vector(sptr(Uint32, st.uhh + ci * 16, 16), (w4[0], w4[1], w4[2], w4[3]))
 
 
 @cute.jit
@@ -671,12 +671,12 @@ def project_basis(st, ut_p, bh):
     uo.fill(0.0)
     for j in cutlass.range(128, unroll=4):
         hv = u2f(st.sHd[j, dcol].to(Uint32) << Uint32(16))
-        v0 = load_vector(sptr(Float32, st.zb + (j * 32 + 8 * rg) * 4, 16), 4)
-        v1 = load_vector(sptr(Float32, st.zb + (j * 32 + 8 * rg + 4) * 4, 16), 4)
+        v0 = load_vector(sptr(Float32, st.work + (j * 32 + 8 * rg) * 4, 16), 4)
+        v1 = load_vector(sptr(Float32, st.work + (j * 32 + 8 * rg + 4) * 4, 16), 4)
         for e in cutlass.range_constexpr(4):
             uo[e] = uo[e] + hv * v0[e]
             uo[4 + e] = uo[4 + e] + hv * v1[e]
-    sc = Float32(0.08838834764831845)
+    sc = Float32(INV_SQRT_HEAD_DIM)
     for e in cutlass.range_constexpr(8):
         r = 8 * rg + e
         hb = bf16x2(uo[e] * sc, Float32(0.0))
@@ -699,7 +699,8 @@ def _eig(
     NQK: Int32,
     tid: Int32,
     sb: Int32,
-    lens,
+    lens_p,
+    rows_mode,
 ):
     """Run the eigensolver CTA of (batch, head) bh (thread tid of EIG_THREADS, shared memory at sb with the map SM_*).
 
@@ -711,10 +712,11 @@ def _eig(
     * st gets the coordinates, the region addresses and the typed views of a phase where the phase begins. A view
       (s...) covers a regular array of one scalar type, for the scalar loads and stores that index it; the 16-byte
       vector loads and stores, the asynchronous copies, ldmatrix and the predicated loads take the region addresses.
-    * lens: None, or (the global address of the valid prefix lengths, the rows mode of sampled_token): the sampled
-      tokens then lie in the valid prefix of the batch element.
+    * lens_p, rows_mode: None, or the global address of the valid prefix lengths and the rows mode of sampled_token:
+      the sampled tokens then lie in the valid prefix of the batch element.
     """
-    st = State(tid=tid, sb=sb, NQK=NQK, H=H, q_p=q_p, k_p=k_p, rows_p=rows_p, lens=lens)
+    st = State(tid=tid, sb=sb, NQK=NQK, H=H, q_p=q_p, k_p=k_p, rows_p=rows_p, lens_p=lens_p)
+    st.rows_mode = rows_mode
     st.lane = tid & 31
     st.warp = tid >> 5
     # the lane's entries of an mma.sync accumulator fragment: rows g and g + 8, columns 2 t and 2 t + 1
@@ -723,11 +725,10 @@ def _eig(
     b = bh // H
     st.h = bh - b * H  # head, of batch b
     st.S = S
-    if cutlass.const_expr(lens is not None):
+    if cutlass.const_expr(lens_p is not None):
         st.b = b
-        st.nv = valid_len(lens[0], b, S)  # the valid tokens of the batch element
-    st.work = sb + SM_WORK
-    st.zb = st.work  # Z [128][32], once G has left SM_WORK
+        st.nv = valid_len(lens_p, b, S)  # the valid tokens of the batch element
+    st.work = sb + SM_WORK  # also Z [128][32], once G has left it
     # the 16 warp parts of two sums or bounds (the second set at 16; at 4 for the bounds of four warps)
     st.sRed = cute.make_tensor(sptr(Float32, sb + SM_RED), cute.make_layout(32))
 
@@ -779,8 +780,7 @@ def _eig(
     st.ubuf = sb + SM_UBUF
     st.pbuf = sb + SM_PBUF
     st.dd = sb + SM_DD
-    st.uhh = sb + SM_UHH
-    st.hds = st.uhh  # Hd, once the Householder vectors have been applied
+    st.uhh = sb + SM_UHH  # also Hd, once the Householder vectors have been applied
     st.sU = cute.make_tensor(sptr(Float32, st.ubuf), cute.make_layout(128))
     st.sP = cute.make_tensor(sptr(Float32, st.pbuf), cute.make_layout(128))
     st.sD = cute.make_tensor(sptr(Float32, st.dd), cute.make_layout(128))
@@ -815,7 +815,7 @@ def _eig(
     cute.arch.sync_threads()  # publishes the 32 eigenvalues
 
     # ------------------------------------------------ inverse iteration (warp 0, one eigenvector per lane)
-    st.sZ = cute.make_tensor(sptr(Float32, st.zb), cute.make_layout((128, 32), stride=(32, 1)))
+    st.sZ = cute.make_tensor(sptr(Float32, st.work), cute.make_layout((128, 32), stride=(32, 1)))
     # the pivots [128][32], behind Z
     st.sPiv = cute.make_tensor(
         sptr(Float32, st.work + 16384), cute.make_layout((128, 32), stride=(32, 1))
@@ -844,12 +844,86 @@ def _eig(
     cute.arch.sync_threads()  # publishes the eigenvectors and Hd
 
     # ------------------------------------------------ U = Hd^T V / sqrt(128), stored as U^T bf16 [32][128]
-    st.sHd = cute.make_tensor(sptr(Uint16, st.hds), cute.make_layout((128, 128), stride=(128, 1)))
+    st.sHd = cute.make_tensor(sptr(Uint16, st.uhh), cute.make_layout((128, 128), stride=(128, 1)))
     project_basis(st, ut_p, bh)
 
 
 # ------------------------------------------------------------------------------------------------ V helpers
 # What the V scans and V passes of the kernel packages share.
+# V pass: the input rows of a half (128 keys x 256 B, the two halves from the start of shared memory), the offset in
+# the reduction area of the word of a half (the tile it took from the counter), and the byte offset of the tile
+# counter in the counters of the launch (the scan counter is first)
+VIN_BYTES = 32768
+RED_TILE = 192
+DONE_TILES = 4
+
+
+@cute.jit
+def scan_max(
+    vmax_p: Int64,
+    nspare: Int32,
+    tid: Int32,
+    red: Int32,
+    cop: cutlass.Constexpr,
+    NT: cutlass.Constexpr,
+    SYNC: cutlass.Constexpr,
+):
+    """Return max|v - vbar| over all nspare scan slots (loaded with cache operator cop), reduced by the NT threads of
+    the CTA through red. SYNC: wait for the CTA's earlier readers of red first."""
+    c = Float32(0.0)
+    for i in cutlass.range(tid, nspare, NT, unroll=1):
+        c = cute.arch.fmax(
+            c, u2f(cute.arch.load(gptr(Uint32, vmax_p + Int64(i) * 4), Uint32, cop=cop))
+        )
+    c = warp_max(c)
+    if cutlass.const_expr(SYNC):
+        cute.arch.sync_threads()
+    if (tid & 31) == 0:
+        cute.arch.store(sptr(Float32, red + (tid >> 5) * 4), c)
+    cute.arch.sync_threads()
+    c = Float32(0.0)
+    for wi in cutlass.range_constexpr(NT // 32):
+        c = cute.arch.fmax(c, cute.arch.load(sptr(Float32, red + wi * 4), Float32))
+    return c
+
+
+@cute.jit
+def store_slot(mx: Float32, tid: Int32, sb: Int32, vmax_p: Int64, slot: Int32):
+    """Store the max|v - vbar| of a scan CTA (mx: the thread's part) into V-scan slot `slot`."""
+    mx = warp_max(mx)
+    red = sb + SM_RED
+    if (tid & 31) == 0:
+        cute.arch.store(sptr(Float32, red + (tid >> 5) * 4), mx)
+    cute.arch.sync_threads()
+    if tid == 0:
+        c2 = Float32(0.0)
+        for wi in cutlass.range_constexpr(EIG_THREADS // 32):
+            c2 = cute.arch.fmax(c2, cute.arch.load(sptr(Float32, red + wi * 4), Float32))
+        cute.arch.store(gptr(Float32, vmax_p + Int64(slot) * 4), c2)
+
+
+@cute.jit
+def next_tile(word, ctr, tid_h, half):
+    """Return the next tile of a V-pass half: thread 0 takes it from the counter at ctr, the half's barrier shows it."""
+    if tid_h == 0:
+        cute.arch.store(
+            sptr(Uint32, word),
+            cute.arch.atomic_add(gptr(Uint32, ctr), Uint32(1), sem="relaxed", scope="gpu"),
+        )
+    cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
+    return Int32(cute.arch.load(sptr(Uint32, word), Uint32))
+
+
+def key_count(k0, n):
+    """The keys of the 16-key group from key k0 that lie below n."""
+    return cutlass.max(cutlass.min(n - k0, 16), 0)
+
+
+def row_addr(p, bb, row, hh, S, H, pitch):
+    """Global address of row `row` of (batch bb, head hh) of a [B, S, H] tensor of `pitch` bytes per row at p."""
+    return p + ((Int64(bb) * Int64(S) + Int64(row)) * Int64(H) + Int64(hh)) * pitch
+
+
 def bf16_f32(w, j):
     """BF16 half j (0: low, 1: high) of the word w as f32."""
     return u2f(w << Uint32(16)) if j == 0 else u2f(w & Uint32(0xFFFF0000))
@@ -884,18 +958,18 @@ def group16(base, rstride, cnt):
     return sums, vmx, vmn
 
 
-def stage_rows(v_p, vin, st, tl, S, H, T, lens_p=None):
+def stage_rows(v_p, vin, tid_h, tl, S, H, T, lens_p=None):
     """cp.async of the 128 x 256 B rows of V tile tl (flat over (batch, head, tile)) into the shared-memory buffer
-    vin by the 256 threads of a V-pass half, thread st eight of the 16-byte parts: row `key` at key * 256, its part p
+    vin by the 256 threads of a V-pass half, thread tid_h eight of the 16-byte parts: row `key` at key * 256, its part p
     at (p ^ (key >> 4)) % 16 (zeros for the keys past S; lens_p: the global address of the valid prefix lengths, the
     keys from the length of the batch element on are then zeros too)."""
     bh = tl // T
     tt = tl - bh * T
     bb = bh // H
     hh = bh - bb * H
-    nk = S if lens_p is None else valid_len(lens_p, bb, S)
+    nk = valid_len(lens_p, bb, S)
     for it in range(8):
-        c = it * 256 + st
+        c = it * 256 + tid_h
         key = c >> 4
         part = c & 15
         kg = tt * 128 + key
@@ -930,35 +1004,33 @@ def basis_cta(
     vscan_gs,
     vscan,
     vpass,
-    lens=None,
+    lens_p=None,
+    rows_mode=None,
 ):
     """The CTA of a basis launch (grid BH + nspare, EIG_THREADS threads): the CTAs below BH solve one eigenproblem
     each, the nspare others scan V with the scan of the kernel's PV format (FUSED: vscan(lo, hi, slot, tid, sb) over
     a range of tiles each, then its V pass vpass(ntiles, pid, tid, sb); otherwise vscan_gs(cta, tid, sb), grid-stride
-    over all of V). sb: the CTA's shared memory. lens: the lengths argument of _eig."""
+    over all of V). sb: the CTA's shared memory. lens_p, rows_mode: the lengths arguments of _eig."""
     tid, _, _ = cute.arch.thread_idx()
     pid, _, _ = cute.arch.block_idx()
     smem = SmemAllocator()
     buf = smem.allocate_array(Uint32, SM_TOTAL // 4, byte_alignment=128)
     sb = Int32(buf.toint())
     ntiles = BH * T
-    if cutlass.const_expr(not FUSED):
-        # eigenproblems, and the V maxima in the other CTAs (the V pass is a separate launch)
-        if pid < BH:
-            _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb, lens)
-        else:
-            vscan_gs(pid - BH, tid, sb)
+    # eigenproblems, and the V maxima in the other CTAs
+    if pid < BH:
+        _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb, lens_p, rows_mode)
+    elif cutlass.const_expr(not FUSED):
+        vscan_gs(pid - BH, tid, sb)
     else:
-        if pid < BH:
-            _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb, lens)
-        else:
-            sp = pid - BH
-            lo = (sp * ntiles) // nspare
-            hi = ((sp + 1) * ntiles) // nspare
-            vscan(lo, hi, sp, tid, sb)
-            if tid == 0:
-                cute.arch.fence_acq_rel_gpu()
-                cute.arch.atomic_add(gptr(Uint32, done_p), Uint32(1), sem="release", scope="gpu")
+        slot = pid - BH
+        lo = (slot * ntiles) // nspare
+        hi = ((slot + 1) * ntiles) // nspare
+        vscan(lo, hi, slot, tid, sb)
+        if tid == 0:
+            cute.arch.fence_acq_rel_gpu()
+            cute.arch.atomic_add(gptr(Uint32, done_p), Uint32(1), sem="release", scope="gpu")
+    if cutlass.const_expr(FUSED):
         # The scan CTAs wait for each other, then take V tiles; an eigensolver CTA joins them when it is done and the
         # scan has finished (the host takes this form only for a grid of at most as many CTAs as the device has SMs).
         # Nothing ever waits on an eigensolver CTA.

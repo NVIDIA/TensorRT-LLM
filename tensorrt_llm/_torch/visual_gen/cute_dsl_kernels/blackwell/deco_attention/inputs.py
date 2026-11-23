@@ -67,9 +67,9 @@ def sample_rows(s, device="cuda", token_tags=None, rank=DEFAULT_RANK):
     n = sample_count(s, rank)
     n_video = min(n - min(n // 2, other.numel()), video.numel())
     n_other = min(n - n_video, other.numel())
-    o = other[torch.randperm(other.numel(), device=device, generator=gen)[:n_other]]
-    w = video[torch.randperm(video.numel(), device=device, generator=gen)[:n_video]]
-    return torch.cat([w, o]).to(torch.int32).contiguous()
+    other_rows = other[torch.randperm(other.numel(), device=device, generator=gen)[:n_other]]
+    video_rows = video[torch.randperm(video.numel(), device=device, generator=gen)[:n_video]]
+    return torch.cat([video_rows, other_rows]).to(torch.int32).contiguous()
 
 
 @functools.cache
@@ -83,7 +83,10 @@ def _sample_rows(s, device, rank):
 def hadamard(device):
     """Return the rotation of Q and K: the BF16 [HEAD_DIM, HEAD_DIM] Hadamard matrix with rows scaled by random signs
     (H H^T = HEAD_DIM I, exact in BF16; the signs of a generator seeded 0), built once per device (its host-to-device
-    copy synchronizes). device: that of a tensor, which carries its index."""
+    copy synchronizes)."""
+    indexed = _indexed(device)
+    if indexed != device:
+        return hadamard(indexed)
     _not_under_capture(device, "rotation matrix")
     h = torch.ones(1, 1)
     while h.shape[0] < HEAD_DIM:

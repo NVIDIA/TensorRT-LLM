@@ -173,7 +173,11 @@ def _landed_bits(t):
     return int((15 + t) * SUBNORMAL_ULPS)
 
 
-# the blocks of the softmax (fp8pv/softmax.py, fp8pv/small.py), down to expcast_transpose4
+# the blocks of the softmax (softmax.py, small.py), down to expcast_transpose4; n ULP has the f32 bits n, TO_GRID 2^-139
+ULP = 2.0**-149
+TO_GRID = f32_literal(SUBNORMAL_ULPS * ULP)
+
+
 @dsl_user_op
 def expcast_guard(sc, anchor0, anchor1, *, loc=None, ip=None):
     """Return the warp-uniform landing path of land_pack, valid until either anchor changes.
@@ -184,9 +188,9 @@ def expcast_guard(sc, anchor0, anchor1, *, loc=None, ip=None):
     sci, m0i, m1i = 1, 2, 3
     return asm(
         "{\n.reg .f32 a, r, a0, a1;\n.reg .pred bad, b0, b1, wb;\n"
-        f"mul.rn.f32 a, ${sci}, 0f00000400;\n"
-        "mul.rn.f32 r, a, 0f62800000;\n"
-        "mul.rn.f32 r, r, 0f62000000;\n"
+        f"mul.rn.f32 a, ${sci}, {TO_GRID};\n"
+        f"mul.rn.f32 r, a, {f32_literal(2.0**70)};\n"
+        f"mul.rn.f32 r, r, {f32_literal(2.0**69)};\n"
         f"setp.neu.f32 bad, r, ${sci};\n"
         f"abs.f32 a0, ${m0i};\nabs.f32 a1, ${m1i};\n"
         "setp.eq.f32 b0, a0, 0f7F800000;\n"
@@ -217,7 +221,7 @@ def land_pack(acc, sc, anchor0, anchor1, path, *, loc=None, ip=None):
     # $0 .. $31: the packed words; then the operands: the scores, sc, the anchors and path
     acci, sci, m0i, m1i, pathi = 32, 96, 97, 98, 99
     # the offset of the landing: a score at its anchor lands on 2^T
-    bias = "0f%08X" % _landed_bits(RESCALE_THRESHOLD)
+    bias = f32_literal(_landed_bits(RESCALE_THRESHOLD) * ULP)
     body = [
         "{",
         ".reg .f32 z<64>, a, nm0, nm1, b0, b1;",
@@ -228,9 +232,9 @@ def land_pack(acc, sc, anchor0, anchor1, path, *, loc=None, ip=None):
         "LP_T: .branchtargets LP_FAST, LP_SLOW;",
         f"brx.idx.uni ${pathi}, LP_T;",
         "LP_FAST:",
-        f"mul.rn.f32 a, ${sci}, 0f00000400;",
-        f"fma.rn.f32 b0, nm0, 0f00000400, {bias};",
-        f"fma.rn.f32 b1, nm1, 0f00000400, {bias};",
+        f"mul.rn.f32 a, ${sci}, {TO_GRID};",
+        f"fma.rn.f32 b0, nm0, {TO_GRID}, {bias};",
+        f"fma.rn.f32 b1, nm1, {TO_GRID}, {bias};",
         "mov.b64 aa, {a, a};",
         "mov.b64 bb0, {b0, b0};",
         "mov.b64 bb1, {b1, b1};",
@@ -249,7 +253,7 @@ def land_pack(acc, sc, anchor0, anchor1, path, *, loc=None, ip=None):
         f"mov.b64 aa, {{${sci}, ${sci}}};",
         "mov.b64 bb0, {nm0, nm0};",
         "mov.b64 bb1, {nm1, nm1};",
-        "mov.b64 cc, {0f00000400, 0f00000400};",
+        f"mov.b64 cc, {{{TO_GRID}, {TO_GRID}}};",
         f"mov.b64 dd, {{{bias}, {bias}}};",
     ]
     for n in range(16):
@@ -308,7 +312,7 @@ def landed_flags(xs, *, loc=None, ip=None):
         "max.u32 t, t, u;",
         f"setp.gt.u32 p, t, {_landed_bits(2 * RESCALE_THRESHOLD)};",
         "vote.sync.any.pred wp, p, 0xffffffff;",
-        "setp.le.u32 z, t, 5120;",
+        f"setp.le.u32 z, t, {_landed_bits(-10)};",
         "vote.sync.all.pred wz, z, 0xffffffff;",
         "selp.s32 t, 1, 0, wp;",
         "selp.s32 u, 2, 0, wz;",
@@ -528,7 +532,7 @@ def expcast_transpose4(acc, base: int, sc, anchor0, anchor1, sum0, sum1, *, loc=
             k = 4 * n + e
             body += [
                 f"fma.rn.f32 d, ${acci + k}, ${sci}, nm{e // 2};",
-                f"fma.rn.f32 z, d, 0f4B000000, {bias};",
+                f"fma.rn.f32 z, d, {f32_literal(2.0**23)}, {bias};",
                 "cvt.rzi.u32.f32 u, z;",
                 f"mov.b32 p{k}, u;",
             ]

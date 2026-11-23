@@ -95,7 +95,7 @@ def anchor_update(need, bm, a0, a1, th0, th1, ls0, ls1, safe, c, *, loc=None, ip
     # then, behind the seven tied operands, need, bm and c
     ai, fi, thresh_i, lsi, safei, needi, bmi, ci = 0, 2, 4, 6, 8, 16, 17, 25
     # the skip threshold T, as a PTX literal
-    thr = f32_literal(RESCALE_THRESHOLD)
+    t_lit = f32_literal(RESCALE_THRESHOLD)
     body = [
         "{",
         ".reg .pred p, cpow2;",
@@ -134,14 +134,14 @@ def anchor_update(need, bm, a0, a1, th0, th1, ls0, ls1, safe, c, *, loc=None, ip
         aa, ff, tt, ss = (f"${i + r}" for i in (ai, fi, thresh_i, lsi))
         body += [
             f"mul.rn.f32 x, m{r}, ${ci};",
-            f"add.rn.f32 a, {aa}, {thr};",
+            f"add.rn.f32 a, {aa}, {t_lit};",
             "setp.gt.f32 p, x, a;",
             f"selp.f32 a, x, {aa}, p;",
             f"sub.rn.f32 x, {aa}, a;",
             f"ex2.approx.ftz.f32 {ff}, x;",
             f"mov.f32 {aa}, a;",
             f"mul.rn.f32 {ss}, {ss}, {ff};",
-            f"add.rn.f32 x, a, {thr};",
+            f"add.rn.f32 x, a, {t_lit};",
             f"@cpow2 mul.rm.f32 {tt}, x, ic;",
             f"@!cpow2 div.rm.f32 {tt}, x, ${ci};",
         ]

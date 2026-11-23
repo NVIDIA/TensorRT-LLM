@@ -51,7 +51,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 
-from ...common.expmath import bf16x2, scale_bf16x2, u2f
+from ...common.expmath import RN, bf16x2, scale_bf16x2, u2f
 from ..ptx.nvfp4pv import (
     anchor_update,
     block_scales2,
@@ -65,15 +65,13 @@ from ..ptx.nvfp4pv import (
 # 2^MIN_SCORE_LOG2 (its encode launch grows the Q group scales up to it), inside the range of the folded landing
 MIN_SCORE_LOG2 = -6
 
-RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
-
 
 # ------------------------------------------------------------------------------------------------ softmax of one tile
 # Straight-line emitters (plain Python, unrolled at trace time) on a thread's scores Sacc (layout: module docstring).
-def emit_block_max(Sacc, masked, floor=None):
+def emit_block_max(Sacc, floor):
     """Return the 16-key block maxima of the raw scores, bm[s][h] = (row g, row g + 8); the pair (t, t ^ 1) holds one
-    block. masked: the tile has keys past the sequence (scores -inf), whose blocks keep a finite max. floor: with
-    lengths, the run-time lower bound of the maxima (-1e30 for the last tile of the keys, else -inf)."""
+    block. floor: None, or the lower bound of the maxima: -1e30 for a tile with keys past the sequence (scores -inf),
+    whose blocks keep a finite max; with lengths a run-time value, -1e30 for the last tile of the keys, else -inf."""
     bm = [[None, None], [None, None]]
     for s_ in range(2):
         for h_ in range(2):
@@ -91,8 +89,6 @@ def emit_block_max(Sacc, masked, floor=None):
                 )
                 mm = cute.arch.fmax(m01, m23)
                 mm = cute.arch.fmax(mm, cute.arch.shuffle_sync_bfly(mm, offset=1))
-                if masked:
-                    mm = cute.arch.fmax(mm, Float32(-1e30))
                 if floor is not None:
                     mm = cute.arch.fmax(mm, floor)
                 pr.append(mm)
@@ -107,7 +103,7 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
     par = st.par
     P = st.Pst
     lsum = st.lsum
-    pm = st.c if two_step else st.M
+    m = st.c if two_step else st.M
     sch = [None, None]
     e4 = [None, None]
     # dsh[s][h][rr]: the log2 of block (s, h, rr)'s unrounded scale over its decoded one, this lane's for s = par and
@@ -158,7 +154,7 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
                     offsets.append(
                         cute.math.fma(dsh[s_][h_][rr], u2f(0x400), prepared[64 + gi], rounding=RN)
                     )
-        words, sums = land32_sum(vals, offsets, pm, sch[h_], par, kofs)
+        words, sums = land32_sum(vals, offsets, m, sch[h_], par, kofs)
         for s_ in range(2):
             for rr in range(2):
                 P[4 * s_ + 2 * h_ + rr] = words[2 * s_ + rr]
@@ -187,10 +183,8 @@ def softmax_phase(
     * An anchor move rescales O (after the burst's PV, behind a warp-uniform branch) and the even tile's pending means.
     * masked, cur_odd "lens": a tile of a range that ends at a run-time tile; block-max floor st.mask[1], parity st.odd.
     """
-    if cutlass.const_expr(masked == "lens"):
-        bm = emit_block_max(Sacc, False, st.mask[1])
-    else:
-        bm = emit_block_max(Sacc, masked)
+    floor = st.mask[1] if masked == "lens" else (Float32(-1e30) if masked else None)
+    bm = emit_block_max(Sacc, floor)
     bml = [bm[s_][h_][rr] for s_ in range(2) for h_ in range(2) for rr in range(2)]
     anchor, thr, safe, lsum = st.anchor, st.thr, st.safe, st.lsum
     # Full row reductions, correction exp2s and guard votes run only on a possible move (need_vote, anchor_update).
@@ -226,7 +220,6 @@ def softmax_phase(
                 # the even tile's means operand waits for its partner: bring it to the new anchor
                 Mlo[0] = scale_bf16x2(Mlo[0], f0)
                 Mlo[1] = scale_bf16x2(Mlo[1], f1)
-        if cutlass.const_expr(cur_odd):
             emit_p(st, Sacc, bm, st.Pst, 10, two_step)
         else:
             emit_p(st, Sacc, bm, Mlo, 0, two_step)

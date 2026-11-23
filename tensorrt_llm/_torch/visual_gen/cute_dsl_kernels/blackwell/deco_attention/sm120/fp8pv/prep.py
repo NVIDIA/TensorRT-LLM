@@ -80,8 +80,8 @@ def _host(
 ):
     # LENS: the call has valid prefix lengths (int32 [B] at lens_p, read by the kernels in place; rows_mode: the
     # rows mode of the eigensolver, prep/basis.py); otherwise both are unused and the kernels take None
-    lens = lens_p if cutlass.const_expr(LENS) else None
-    mode = rows_mode if cutlass.const_expr(LENS) else None
+    lens_p = lens_p if cutlass.const_expr(LENS) else None
+    rows_mode = rows_mode if cutlass.const_expr(LENS) else None
     BH = B * H
     basis_kernel(
         q_p,
@@ -103,15 +103,15 @@ def _host(
         BH,
         nspare,
         FUSED,
-        lens,
-        mode,
+        lens_p,
+        rows_mode,
     ).launch(grid=(BH + nspare, 1, 1), block=(EIG_THREADS, 1, 1), stream=stream)
     if cutlass.const_expr(not FUSED):
-        v_kernel(v_p, vmax_p, v8_p, vmean_p, v8s_p, S, H, T, nspare, nv_items, nv_cta, lens).launch(
-            grid=(nv_cta, 1, 1), block=(V_THREADS, 1, 1), stream=stream
-        )
+        v_kernel(
+            v_p, vmax_p, v8_p, vmean_p, v8s_p, S, H, T, nspare, nv_items, nv_cta, lens_p
+        ).launch(grid=(nv_cta, 1, 1), block=(V_THREADS, 1, 1), stream=stream)
     qk_kernel(
-        q_p, k_p, had_p, ut_p, q4_p, k4_p, prov_p, gmax_p, B, S, H, T, nqk_items, nqk_cta, lens
+        q_p, k_p, had_p, ut_p, q4_p, k4_p, prov_p, gmax_p, B, S, H, T, nqk_items, nqk_cta, lens_p
     ).launch(grid=(nqk_cta, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
     encode_kernel(
         prov_p, gmax_p, qsf_p, ksf_p, score_scale_p, B, H, T, nqk_cta, msl, nenc_cta
@@ -142,8 +142,8 @@ _HOST_BUFFERS = (
 scratch = chain.scratch
 
 
-def run(q, k, v, qk_rows, buffers, lens=None, map_rows=False):
+def run(q, k, v, rows, buffers, lens=None, map_rows=False):
     """Fill the operands of the attention from raw q, k, v: Q'/K', score_scale (>= 2^MIN_SCORE_LOG2), smoothed V."""
     chain.run(
-        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, qk_rows, buffers, lens, map_rows
+        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, rows, buffers, lens, map_rows
     )

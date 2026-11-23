@@ -26,7 +26,7 @@ import cutlass.cute as cute
 import torch
 
 from ...runtime import compiled, current_stream, gmem_ptr, num_sms
-from .kernel import NTHREADS, PART_BYTES, SMEM_BYTES, attn_kernel
+from .kernel import NTHREADS, RECORD_BYTES, SMEM_BYTES, attn_kernel
 from .layout import STAGE, relayout_kernel
 
 
@@ -56,7 +56,7 @@ def attn_launch(
     relayout_kernel(k_ptr, ksf_ptr, v_ptr, vsf_ptr, vm_ptr, img_ptr, S, H, lens_ptr).launch(
         grid=[nT * H * B, 1, 1], block=[256, 1, 1], stream=stream
     )
-    nfull, rsplit, kmid = split_plan(S, H, B, NSM)
+    nfull, rsplit, kmid = split_plan(B, S, H, NSM)
     attn_kernel(
         q_ptr,
         qsf_ptr,
@@ -76,21 +76,16 @@ def attn_launch(
     )
 
 
-def split_plan(S, H, B, nsm):
+def split_plan(B, S, H, nsm):
     """Return (full units, split units, split tile). The units (query tile, head, batch) are equal; the last
     R = units mod nsm of them (nsm: the SM count of the device) run as two key halves each, split at a multiple of 4
     tiles and merged by the half that finishes second through records in global memory."""
     nT = (S + 127) // 128
     n = nT * H * B
     r = n % nsm
-    kmid = 4 * ((nT + 4) // 8)
     if r == 0 or nT < 24:
         return n, 0, 0
-    return n - r, r, kmid
-
-
-# a split unit's scratch: the records of its two halves, and after the records of all units its arrival counter
-RECORD_BYTES = 2 * NTHREADS * PART_BYTES
+    return n - r, r, 4 * ((nT + 4) // 8)
 
 
 def scratch(B, S, H, nsm):
@@ -100,7 +95,7 @@ def scratch(B, S, H, nsm):
     * Only the counters must be zero when the launch starts; the half of a unit that merges returns its counter to zero.
     """
     nT = (S + 127) // 128
-    _, rsplit, _ = split_plan(S, H, B, nsm)
+    _, rsplit, _ = split_plan(B, S, H, nsm)
     return {
         "img": (torch.uint8, (B * H * nT * STAGE,)),
         "split": (torch.uint8, (rsplit * (RECORD_BYTES + 4),)),

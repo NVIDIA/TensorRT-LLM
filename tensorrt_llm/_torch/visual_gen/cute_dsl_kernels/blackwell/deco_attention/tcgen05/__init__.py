@@ -59,7 +59,7 @@ def workspace_size(b, s, h, device, pv, rank):
 def prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens=None, map_rows=False):
     """Carve the buffers of a call from the workspace and fill the operands from raw q, k, v, on the current stream.
 
-    rows, valid_seq_lens, map_rows: see fp8pv.prep.run (qk_rows, lens, map_rows). Returns the buffers, name -> tensor.
+    rows, valid_seq_lens, map_rows: see fp8pv.prep.run (rows, lens, map_rows). Returns the buffers, name -> tensor.
     """
     b, s, h, _ = q.shape
     kernel = _KERNELS[pv]

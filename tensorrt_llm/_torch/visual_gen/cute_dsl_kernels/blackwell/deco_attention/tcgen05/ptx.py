@@ -96,7 +96,7 @@ def tc_mma_means(
     *,
     loc=None,
     ip=None,
-) -> None:
+):
     """Issue the means MMA of the attention, D += A B, as tcgen05.mma.cta_group::1.kind::f16 from an elected lane.
 
     * D: the TMEM address d_addr. A: the K16 BF16 block sums at the shared address smem + a_off. B: the v_mean ring
@@ -152,7 +152,7 @@ def mbar_wait_bounded(addr, parity, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def tc_commit_means(smem, stage, bar_off: int, *, loc=None, ip=None) -> None:
+def tc_commit_means(smem, stage, bar_off: int, *, loc=None, ip=None):
     """Issue tcgen05.commit from an elected lane on the v_mean ring's empty barrier at smem + bar_off + 8 stage."""
     asm(
         "{\n"

@@ -43,8 +43,8 @@ _K64_FP8_MMA = _archs("sm_107a")
 _TMEM_LD_RED = _archs("sm_103a", "sm_107a")
 # redux.sync on f32: the maximum of a value over the lanes of a warp in one instruction
 _REDUX_F32 = _archs("sm_100a", "sm_103a", "sm_107a")
-# the tcgen05 targets -> the family name of CuTe's TMEM helpers
-_NAMES = {a: family for family in ("sm_100", "sm_103", "sm_107") for a in _archs(family + "a")}
+# the tcgen05 targets -> their name without the feature suffix, which CuTe's TMEM helpers take
+_NAMES = {a: name for name in ("sm_100", "sm_103", "sm_107") for a in _archs(name + "a")}
 # the targets with DeCo kernels -> their kernel family (deco_attention/<family>): the tcgen05 targets, and the
 # warp-level MMA targets (mma.sync, block-scaled FP4 and FP8)
 _FAMILY = {**{a: "tcgen05" for a in _NAMES}, **{a: "sm120" for a in _archs("sm_120a")}}
@@ -68,7 +68,7 @@ def kernel_family():
 
 
 def arch_name():
-    """Return the family name CuTe's TMEM helpers take ("sm_100", "sm_103", "sm_107"); tcgen05 targets only."""
+    """Return the target's name without the feature suffix ("sm_100", "sm_103", "sm_107"); tcgen05 targets only."""
     return _NAMES[arch()]
 
 

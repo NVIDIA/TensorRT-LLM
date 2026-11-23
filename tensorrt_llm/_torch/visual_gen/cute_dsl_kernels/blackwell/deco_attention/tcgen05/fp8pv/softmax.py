@@ -292,7 +292,7 @@ class SoftmaxRole:
         tiled_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i)
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i)
         tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx % (self.threads_per_warp * 4)
+        thread_idx = tidx % self.threads_per_wg
         thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
         thr_tmem_store = tiled_tmem_store.get_slice(thread_idx)
         tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i)
@@ -336,7 +336,7 @@ class SoftmaxRole:
     @cute.jit
     def softmax(
         self,
-        stage: int,
+        wg: int,
         tensor_args: Tuple,
         pipeline_args: Tuple,
         qk_thr_mma: cute.ThrMma,
@@ -344,24 +344,24 @@ class SoftmaxRole:
         sched_args: Tuple,
         vs_row: Tuple,
     ):
-        """Softmax warpgroup `stage` over its work tiles; the operands are those of kernel._run_softmax."""
+        """Softmax warpgroup `wg` over its work tiles; the operands are those of kernel._run_softmax."""
         tStS, sVecWG, tOtOi, pv_thr_mma, o_done_ptr, p_tail_ptr = tensor_args
-        p_tail_stage_ptr = p_tail_ptr + stage
+        p_tail_stage_ptr = p_tail_ptr + wg
         mma_si_consumer, si_epi_producer, pi_mma_producer = pipeline_args
         seqlen_k, n_kv_tiles, score_scale = value_args
         tile_sched, work_tile = sched_args
 
         tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx % (self.threads_per_warp * 4)
+        thread_idx = tidx % self.threads_per_wg
         sVecRow = None
         if cutlass.const_expr(self.split):
             # this thread's row of the warpgroup's anchor exchange with the epilogue warpgroup
             sVecRow = sVecWG[thread_idx, None, None]
 
         cS_base = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
-        tilePlikeFP32 = self.qk_mma_tiler[1] // 32 * self.v_dtype.width
+        tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.v_dtype.width
         tStS_P_layout = cute.composition(tStS.layout, cute.make_layout((128, tilePlikeFP32)))
-        tmem_p_offset = self.tmem_p0_offset + stage * (self.tmem_p1_offset - self.tmem_p0_offset)
+        tmem_p_offset = self.tmem_p0_offset + wg * (self.tmem_p1_offset - self.tmem_p0_offset)
         tStS_P = cute.make_tensor(tStS.iterator + tmem_p_offset, tStS_P_layout)
         if cutlass.const_expr(self.use_ld_red):
             tmem_load_atom = cute.make_copy_atom(
@@ -379,7 +379,7 @@ class SoftmaxRole:
         # TMEM load/store addresses are collective per warp: partition the memory side with the warp's first
         # thread so the address is warp-uniform; register coordinates keep the true lane.
         copy_thread_idx = (
-            cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+            cute.arch.make_warp_uniform(cute.arch.warp_idx()) % self.warps_per_wg
         ) * self.threads_per_warp
         tTMEM_LOADtS = tiled_tmem_load.get_slice(copy_thread_idx).partition_S(tStS)
         # 8-column P stores (four per tile, three before the P-full commit)
@@ -400,7 +400,7 @@ class SoftmaxRole:
         while work_tile.is_valid_tile:
             curr_block_coord = work_tile.tile_idx
             logical_offset = (
-                curr_block_coord[0] * self.cta_tiler[0] + stage * self.qk_mma_tiler[0],
+                curr_block_coord[0] * self.cta_tiler[0] + wg * self.qk_mma_tiler[0],
                 0,
             )
             cS = cute.domain_offset(logical_offset, cS_base)
@@ -476,7 +476,7 @@ class SoftmaxRole:
             cute.arch.fence_view_async_tmem_store()
             tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
             cute.arch.barrier_arrive(
-                barrier_id=self.vs_bar_id + stage, number_of_threads=self.vs_bar_threads
+                barrier_id=self.vs_bar_id + wg, number_of_threads=self.vs_bar_threads
             )
             # final stats for the epilogue
             vec_i_handle = si_epi_producer.acquire_and_advance()
@@ -485,7 +485,7 @@ class SoftmaxRole:
                 sVecRow[0, vec_i_handle.index] = row_max
             vec_i_handle.commit()
             cute.arch.barrier_arrive(
-                barrier_id=self.stats_bar_id + stage, number_of_threads=self.stats_bar_threads
+                barrier_id=self.stats_bar_id + wg, number_of_threads=self.stats_bar_threads
             )
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()

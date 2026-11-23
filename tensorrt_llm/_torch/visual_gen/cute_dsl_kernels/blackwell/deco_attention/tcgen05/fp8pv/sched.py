@@ -28,19 +28,23 @@ from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from ..valid_len import valid_len
 
+# Work tile positions after (m_block, 0, (h, b)): of a split launch, and of the valid length in a main launch
+KV_BEGIN, KV_TILES, PART, NPARTS, SLOT_BASE, SPLIT_VALID_LEN = range(3, 9)
+VALID_LEN = 3
+
 
 def thread_group(size: int):
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
 
 
 class TileSchedParams:
-    def __init__(self, problem_shape_mhb, n_valid):
+    def __init__(self, problem_shape_mhb, n_full):
         self.problem_shape_mhb = problem_shape_mhb
-        self.n_valid = n_valid
+        self.n_full = n_full
 
     def _objs(self):
         """The fields in the order the constructor takes them."""
-        return [self.problem_shape_mhb, self.n_valid]
+        return [self.problem_shape_mhb, self.n_full]
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -69,7 +73,7 @@ class TileScheduler:
 
     def _block_count(self, params):
         """The work items of the launch."""
-        return params.n_valid
+        return params.n_full
 
     def get_current_work(self):
         is_valid = self._current_work_linear_idx < self._num_blocks
@@ -97,7 +101,7 @@ class LiveTileScheduler(TileScheduler):
     * The CTA at position c of the grid takes the live units c, c + grid, ... in the order (batch, head, Q block pair).
     * Batch element b of n valid tokens has the live Q block pairs m < ceil(n / 256), rounded up to a multiple of
       `group` (2 where CTA pairs share K/V: both units of a pair are then live together), in every head; the launch
-      holds the first n_valid units of the static order, so the last head it reaches may hold fewer.
+      holds the first n_full units of the static order, so the last head it reaches may hold fewer.
     * lens: (the global address of the lengths, the padded sequence length, group). State: the live index of the
       current unit, its batch element and that element's first live index (start, advance_to_next_work move it).
     """
@@ -126,9 +130,9 @@ class LiveTileScheduler(TileScheduler):
         group = self._lens[2]
         n = self._valid_len(b)
         m_live = cutlass.min((n + (256 * group - 1)) // (256 * group) * group, m_all)
-        # the static order cuts the launch after n_valid units: whole heads up to row_cut, m_cut pairs of that head
-        row_cut = self._params.n_valid // m_all
-        m_cut = self._params.n_valid - row_cut * m_all
+        # the static order cuts the launch after n_full units: whole heads up to row_cut, m_cut pairs of that head
+        row_cut = self._params.n_full // m_all
+        m_cut = self._params.n_full - row_cut * m_all
         heads = cutlass.max(cutlass.min(row_cut - b * h_all, h_all), Int32(0))
         m_part = cutlass.select_(heads < h_all, cutlass.min(m_live, m_cut), Int32(0))
         m_part = cutlass.select_(row_cut >= b * h_all, m_part, Int32(0))
@@ -193,8 +197,7 @@ class SplitTileSchedParams(TileSchedParams):
     """Work items: n_full whole (Q-block pair, head, batch) units, then the tail units, each in n_parts KV ranges."""
 
     def __init__(self, problem_shape_mhb, n_full, n_parts, n_kv):
-        self.problem_shape_mhb = problem_shape_mhb
-        self.n_full = n_full
+        super().__init__(problem_shape_mhb, n_full)
         self.n_parts = n_parts
         self.n_kv = n_kv
 
@@ -246,19 +249,6 @@ class SplitTileScheduler(TileScheduler):
             kv_end = cutlass.min(kv_end, n_kv_live)
             # the pieces with kv_begin below n_kv_live
             nparts = (n_kv_live * nparts + n_kv - 1) // n_kv
-            cur_tile_coord = (
-                blk_coord[0],
-                0,
-                (blk_coord[1], blk_coord[2]),
-                kv_begin,
-                kv_end - kv_begin,
-                part,
-                nparts,
-                slot_base,
-                n,
-            )
-            return WorkTileInfo(cur_tile_coord, is_valid)
-        # (m_block, 0, (h, b), kv_begin, n_local_kv, part, nparts, slot_base): the last three for the epilogue
         cur_tile_coord = (
             blk_coord[0],
             0,
@@ -269,6 +259,8 @@ class SplitTileScheduler(TileScheduler):
             nparts,
             slot_base,
         )
+        if self._lens is not None:
+            cur_tile_coord += (n,)
         return WorkTileInfo(cur_tile_coord, is_valid)
 
     def __new_from_mlir_values__(self, values):

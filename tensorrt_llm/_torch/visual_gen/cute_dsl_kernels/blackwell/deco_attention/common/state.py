@@ -14,10 +14,9 @@
 # limitations under the License.
 """The state object that the steps of a kernel body share."""
 
+from types import SimpleNamespace
 
-class State:
+
+class State(SimpleNamespace):
     """The per-thread state of a kernel body that its steps share: addresses, typed views, trace-time constants and
     register tensors, by name."""
-
-    def __init__(self, **kw):
-        self.__dict__.update(kw)

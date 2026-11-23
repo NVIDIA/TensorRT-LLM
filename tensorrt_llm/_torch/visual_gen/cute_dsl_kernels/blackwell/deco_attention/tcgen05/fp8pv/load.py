@@ -79,7 +79,7 @@ class LoadRole:
         cta_coord_vmnk, kv_cta_layout, kv_mcast_mask = cluster_args
         tile_sched, work_tile = sched_args
         vm_par = Int32(3)  # wait parity of the two ring stages' empty barriers
-        gVM = cute.local_tile(tma_tensor_vm, (HEAD_DIM, self.vs_rows), (None, None, None))
+        gVM = cute.local_tile(tma_tensor_vm, (HEAD_DIM, self.vs_tiles), (None, None, None))
         tVMsVM, tVMgVM = cute.nvgpu.cpasync.tma_partition(
             tma_atom_vm,
             0,
@@ -88,7 +88,7 @@ class LoadRole:
             cute.group_modes(gVM, 0, 2),
         )
         vm_load = (tma_atom_vm, tVMgVM, tVMsVM, vm_empty)
-        # the TMA fills K rows 0..vs_rows - 1 of a B stage: the others stay zero (K slots the A operand leaves zero)
+        # the TMA fills K rows 0..vs_tiles - 1 of a B stage: the others stay zero (K slots the A operand leaves zero)
         z = Int32(0)
         half = 64 * MEANS_TILER[2] * 2  # bytes of a 64-channel atom of a stage
         for st in cutlass.range_constexpr(2):
@@ -156,7 +156,7 @@ class LoadRole:
                 if next_idx < tile_sched._num_blocks:
                     nb = tile_sched._problem_shape_mhb.get_hier_coord(next_idx)
                     self.qk.prefetch_q(qk_load, nb)
-            for i in cutlass.range(1, n_local, 1, unroll=1):
+            for _ in cutlass.range(1, n_local, 1, unroll=1):
                 self.poll_empty(load_kv_producer, kv_empty_ptr)
                 # a slot that starts a means batch also brings v_mean of the batch before (its means MMAs
                 # follow PV(i), so the wait for this slot covers it)

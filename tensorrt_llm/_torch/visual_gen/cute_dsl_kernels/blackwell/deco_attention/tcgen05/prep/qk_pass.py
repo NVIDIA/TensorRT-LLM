@@ -62,7 +62,7 @@ from ...common.dsl import Tcgen05Fence, tcgen05_fence
 from ...common.expmath import f2u, warp_max
 from ...common.mem import gptr, load_invariant, sptr, store_vector
 from ...common.state import State
-from ...constants import QPRE, qk_scale_atoms
+from ...constants import QPRE
 from ..ptx import idesc_bf16, idesc_tf32, mbar_wait_bounded, smem_desc_sw128
 from ..tmem import (
     ld_tmem_16x32bx2_f32_x32_absmax_wait,
@@ -72,11 +72,13 @@ from ..tmem import (
     tc_mma,
 )
 from ..valid_len import valid_len
+from .basis import GMAX_K, GMAX_Q
+from .encode import sfv_tile_bytes
 from .quant import quant16, quant16_dq_knownmax
 
 QK_THREADS = 22 * 32  # 16 math warps, load warp 16, MMA warp 17, compensation warps 18-21
 X_STAGES = 3  # input tile ring depth
-TM_XR, TM_AD1, TM_D = 0, 256, 384
+TM_XR, TM_DQ, TM_D = 0, 256, 384
 # mbarrier slots (module docstring: Mbarriers)
 B_XFULL, B_XEMPTY, B_XRFULL, B_XREMPTY = 0, X_STAGES, 2 * X_STAGES, 2 * X_STAGES + 2
 B_AFULL, B_AEMPTY, B_DFULL, B_DEMPTY = (
@@ -150,9 +152,13 @@ def _tile_origin(st):
     return bh, st.t0 - bh * st.nb2
 
 
+def _blocks(lens, b, S):
+    """With lengths: the 128-token blocks of batch element b that hold a valid token."""
+    return (valid_len(lens, b, S) + 127) >> 7
+
+
 def _live_blocks(st, b):
-    """With lengths: the 128-token blocks of batch element b (clamped to the last one) that hold a valid token."""
-    return (valid_len(st.lens, cutlass.min(b, st.B - 1), st.S) + 127) >> 7
+    return _blocks(st.lens, cutlass.min(b, st.B - 1), st.S)
 
 
 def _first_tile(st):
@@ -262,10 +268,10 @@ def _stage_basis(st, ut_base, bh, ucount):
     UEMPTY of the stage and arrives on its UFULL."""
     us = ucount & 1
     mbar_wait_bounded(st.bars + 8 * (B_UEMPTY + us), ((ucount >> 1) + 1) & 1)
-    for half_ in cutlass.range_constexpr(st.RANK // 16):
+    for blk in cutlass.range_constexpr(st.RANK // 16):
         uws = []
         for it in cutlass.range_constexpr(16):
-            qq = st.lane + 32 * (half_ * 16 + it)  # 16-byte chunk of the operand
+            qq = st.lane + 32 * (blk * 16 + it)  # 16-byte chunk of the operand
             nrow = qq >> 5
             cc = qq & 31
             uws.append(
@@ -277,7 +283,7 @@ def _stage_basis(st, ut_base, bh, ucount):
                 )
             )
         for it in cutlass.range_constexpr(16):
-            qq = st.lane + 32 * (half_ * 16 + it)
+            qq = st.lane + 32 * (blk * 16 + it)
             nrow = qq >> 5
             cc = qq & 31
             w = uws[it]
@@ -399,7 +405,7 @@ def _qk_projections(st, p, dp, us, idesc, idesc_neg):
     xr[p]) into the second; the negated product uses the descriptor's negate-A bit (idesc_neg)."""
     ua = st.u_base + us * st.ustage
     d = st.tm + TM_D + dp * (2 * st.RANK)
-    dq = st.tm + TM_AD1
+    dq = st.tm + TM_DQ
     _project(st, d, dq, ua, idesc, False)
     _project(st, d + st.RANK, st.tm + p * 128, ua, idesc, False)
     _project(st, d + st.RANK, dq, ua, idesc_neg, True)
@@ -469,9 +475,9 @@ def _compensation_warps(st, codes, scales, gmax):
       scales of each half go to gmax. codes, scales, gmax: the global addresses of (q4, k4), (q_sfv, k_sfv) and gmax.
     * A tile waits DFULL of its projection buffer; the warp arrives on DEMPTY once its last channels are in registers.
     """
-    q2 = st.warp & 3
-    row = q2 * 32 + st.lane
-    tl = (q2 * 32) << 16
+    lq = st.warp & 3
+    row = lq * 32 + st.lane
+    tl = (lq * 32) << 16
     mq1 = Float32(0.0)
     mq2 = Float32(0.0)
     mk1 = Float32(0.0)
@@ -479,31 +485,31 @@ def _compensation_warps(st, codes, scales, gmax):
     kind, sblk, bh, h, b = _first_tile(st)
     rstride = Int64(st.H) * Int64(128)
     thr_off = Int64(row) * rstride
-    for j in cutlass.range(st.n):
-        p = _d_buffer(j & 1, st.d_stages)
-        mbar_wait_bounded(st.bars + 8 * (B_DFULL + p), _d_rounds(j, st.d_stages) & 1)
+    for i in cutlass.range(st.n):
+        dp = _d_buffer(i & 1, st.d_stages)
+        mbar_wait_bounded(st.bars + 8 * (B_DFULL + dp), _d_rounds(i, st.d_stages) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
         tok = sblk * 128 + row
         if cutlass.const_expr(st.lens is not None):
-            n_valid = valid_len(st.lens, b, st.S)
+            n_tok = valid_len(st.lens, b, st.S)
         code_base, scale_base, row0 = _tile_outputs(st, codes, scales, rstride, kind, sblk, b, h)
-        soff = _scale_tile(st, bh, sblk) + Int64(1024 + q2 * 32 + st.lane)
+        soff = _scale_tile(st, bh, sblk) + Int64(1024 + lq * 32 + st.lane)
         for part in cutlass.range_constexpr(st.RANK // 16):
             half = part // (st.RANK // 32)
-            dv = ld_tmem_f32_x32_wait(st.tm + tl + TM_D + p * (2 * st.RANK) + part * 32)
+            dv = ld_tmem_f32_x32_wait(st.tm + tl + TM_D + dp * (2 * st.RANK) + part * 32)
             if cutlass.const_expr(part == st.RANK // 16 - 1):
                 # the last channels are in registers: release the D buffer to the MMA warp
                 tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
-                _warp_arrive(st, B_DEMPTY + p)
+                _warp_arrive(st, B_DEMPTY + dp)
             ws = []
             for grp in cutlass.range_constexpr(2):
-                cqi = part * 2 + grp
+                cq = part * 2 + grp
                 sg, w0, w1 = quant16(dv[16 * grp : 16 * grp + 16])
                 if cutlass.const_expr(st.lens is not None):
-                    sg = Float32(cutlass.select_(tok < n_valid, sg, Float32(0.0)))
+                    sg = Float32(cutlass.select_(tok < n_tok, sg, Float32(0.0)))
                 ws.append(w0)
                 ws.append(w1)
-                sg_dst = scale_base + Int64((soff + Int64(cqi * 128)) * 2)
+                sg_dst = scale_base + Int64((soff + Int64(cq * 128)) * 2)
                 sg_bits = sg.to(BFloat16).bitcast(Uint16)
                 cute.arch.store(gptr(Uint16, sg_dst), sg_bits)
                 if kind == 1:
@@ -533,7 +539,9 @@ def _compensation_warps(st, codes, scales, gmax):
                     ws,
                 )
         kind, sblk, bh, h, b = _next_tile(st, kind, sblk, bh, h, b)
-    _reduce_maxima(st, gmax, ((1, mq1), (2, mq2), (4, mk1), (5, mk2)))
+    _reduce_maxima(
+        st, gmax, ((GMAX_Q + 1, mq1), (GMAX_Q + 2, mq2), (GMAX_K + 1, mk1), (GMAX_K + 2, mk2))
+    )
 
 
 # ------------------------------------------------------------------------------------------------ math warps
@@ -586,7 +594,7 @@ def _math_warps(st, codes, scales, gmax):
         sc1, w2, w3, dq1 = quant16_dq_knownmax(x[16:32], am1)
         mbar_wait_bounded(st.bars + 8 * B_AEMPTY, (i + 1) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
-        st_tmem_16x32bx2_f32_x32_wait(st.tm + tl + TM_AD1 + n_pair * 64, dq0 + dq1)
+        st_tmem_16x32bx2_f32_x32_wait(st.tm + tl + TM_DQ + n_pair * 64, dq0 + dq1)
         tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
         _warp_arrive(st, B_AFULL)
         tok = sblk * 128 + row
@@ -613,7 +621,7 @@ def _math_warps(st, codes, scales, gmax):
         else:
             mq0 = cute.arch.fmax(mq0, m01)
         kind, sblk, bh, h, b = _next_tile(st, kind, sblk, bh, h, b)
-    _reduce_maxima(st, gmax, ((0, mq0), (3, mk0)))
+    _reduce_maxima(st, gmax, ((GMAX_Q, mq0), (GMAX_K, mk0)))
 
 
 # ------------------------------------------------------------------------------------------------ kernel
@@ -645,7 +653,7 @@ def _qk_body(
     ustage = RANK * 512
     d_stages = 2 if TM_D + 4 * RANK <= 512 else 1
     # BF16 block scales of a tile in the write-coalesced layout
-    sfv_tile = 512 * qk_scale_atoms(RANK)
+    sfv_tile = sfv_tile_bytes(RANK) // 2
     sU = smem.allocate_array(Uint8, 2 * ustage, byte_alignment=1024)
     bars = Int32(bars_p.toint())
     hold = Int32(hold_p.toint())
@@ -752,17 +760,17 @@ def _live_tiles(lens, S, H, batch, bidx, gdim):
     of their batch element; the CTAs take contiguous ranges of them of the same size."""
     total = Int32(0)
     for b in cutlass.range(batch):
-        total = total + H * 2 * ((valid_len(lens, b, S) + 127) >> 7)
+        total = total + H * 2 * _blocks(lens, b, S)
     l0 = (bidx * total) // gdim
     n = ((bidx + 1) * total) // gdim - l0
     # the batch element that holds live tile l0, and the live tiles before it
     b = Int32(0)
     before = Int32(0)
-    per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) >> 7)
+    per_head = 2 * _blocks(lens, cutlass.min(b, batch - 1), S)
     while (b < batch) & (l0 >= before + H * per_head):
         before = before + H * per_head
         b = b + 1
-        per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) >> 7)
+        per_head = 2 * _blocks(lens, cutlass.min(b, batch - 1), S)
     local = l0 - before
     h = local // cutlass.max(per_head, Int32(1))
     rem = local - h * per_head

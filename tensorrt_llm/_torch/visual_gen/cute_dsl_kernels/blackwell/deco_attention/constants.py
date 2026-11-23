@@ -23,6 +23,7 @@ ALIGN = 256
 SAMPLE_FRAC = 256
 
 HEAD_DIM = 128  # channels of q, k, v and o per head
+INV_SQRT_HEAD_DIM = HEAD_DIM**-0.5
 # The ranks of the compensation basis a kernel may be built for; a family's ranks() names those a target offers. Q'
 # and K' carry 2 x rank compensation channels after the rotated head channels
 RANKS = (32, 64)

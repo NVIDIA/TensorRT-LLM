@@ -21,6 +21,8 @@ from ..common.mem import load_invariant
 
 
 def valid_len(lens_p, b, s):
-    """Return the valid length of batch element b, clamped to [0, s]: the int32 word b at the global address lens_p."""
+    """Return the valid length of batch element b: the int32 word b at lens_p clamped to [0, s]; s without lens_p."""
+    if lens_p is None:
+        return s
     n = load_invariant(Int32, Int64(lens_p) + Int64(b) * Int64(4))
     return cutlass.max(cutlass.min(n, Int32(s)), Int32(0))

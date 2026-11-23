@@ -65,7 +65,7 @@ def carve(workspace, layout):
     return views
 
 
-def gmem_ptr(dtype, t, align=256):
+def gmem_ptr(dtype, t, align=ALIGN):
     """Return a pointer to tensor t's data, assumed aligned to `align` bytes."""
     return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 

@@ -54,10 +54,10 @@ class Operands(NamedTuple):
 
     pv: str
     rank: int
-    shape: tuple
-    buffers: dict
+    shape: tuple[int, int, int]
+    buffers: dict[str, torch.Tensor]
     # the caller's valid prefix lengths (int32 [B], read in place by the attention), or None
-    valid_seq_lens: object = None
+    valid_seq_lens: torch.Tensor | None = None
 
 
 @functools.cache
@@ -163,7 +163,7 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
             raise ValueError(
                 f"valid_seq_lens must be a contiguous int32 tensor [{shape[0]}] on {device}"
             )
-    map_rows = rows is None
+    map_rows = rows is None and lens is not None
     if rows is None:
         rows = sample_rows(shape[1], device, rank=rank)
     elif (
@@ -181,11 +181,7 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
         )
     elif rows.numel() == 0:
         raise ValueError("rows must hold at least one token: the basis is estimated on them")
-    if lens is None:
-        return Operands(pv, rank, shape[:3], family.prepare(q, k, v, workspace, pv, rank, rows))
-    buffers = family.prepare(
-        q, k, v, workspace, pv, rank, rows, valid_seq_lens=lens, map_rows=map_rows
-    )
+    buffers = family.prepare(q, k, v, workspace, pv, rank, rows, lens, map_rows)
     return Operands(pv, rank, shape[:3], buffers, lens)
 
 
@@ -195,10 +191,5 @@ def attention(operands, out):
         raise ValueError("operands is not a result of prepare")
     device = next(iter(operands.buffers.values())).device
     _check((*operands.shape, HEAD_DIM), device, out=out)
-    if operands.valid_seq_lens is None:
-        _family().attention(operands.buffers, out, operands.pv, operands.rank)
-    else:
-        _family().attention(
-            operands.buffers, out, operands.pv, operands.rank, operands.valid_seq_lens
-        )
+    _family().attention(operands.buffers, out, operands.pv, operands.rank, operands.valid_seq_lens)
     return out

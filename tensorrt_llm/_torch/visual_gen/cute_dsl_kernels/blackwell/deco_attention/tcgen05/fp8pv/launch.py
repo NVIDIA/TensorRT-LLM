@@ -66,7 +66,7 @@ def scratch(b, s, h, sm_count):
 _compiled = {}
 
 
-def _get_compiled(args, device, sm_count, rank, cluster_m, split, pdl, lens):
+def _get_compiled(args, device, sm_count, rank, cluster_m, *, split, pdl, lens):
     return compiled(
         _compiled,
         (device.index, sm_count, rank, cluster_m, split, pdl, lens),
@@ -78,7 +78,7 @@ def _get_compiled(args, device, sm_count, rank, cluster_m, split, pdl, lens):
 
 
 def _make_args(
-    qk_ptrs, v, v_mean, o, s, h, b, score_scale, v_scale, lens, stream, n_valid, n_parts=1, ws=None
+    qk_ptrs, v, v_mean, o, s, h, b, score_scale, v_scale, lens, stream, n_full, n_parts=1, ws=None
 ):
     return (
         qk_ptrs,
@@ -90,7 +90,7 @@ def _make_args(
         Int32(b),
         Int64(score_scale.data_ptr()),
         Int64(v_scale.data_ptr()),
-        Int32(n_valid),
+        Int32(n_full),
         Int32(n_parts),
         # the split launch's merge scratch (null addresses without one)
         *((Int64(t.data_ptr()) for t in ws) if ws is not None else (Int64(0),) * 3),
@@ -124,22 +124,9 @@ def run(buffers, o, rank, lens=None):
     stream = current_stream(dev)
     sm_count = num_sms(dev)
     _, n_full, n_parts = split_plan(s, h, b, sm_count)
-    if n_full > 0:
-        args = _make_args(
-            qk_ptrs, v8, v_mean, o, s, h, b, score_scale, v8_scale, lens, stream, n_full
-        )
-        # CTA pairs share K/V when both always work on the same head: an even number of 256-row blocks per head,
-        # an even unit count and an even persistent stride keep units (2c, 2c+1) in one head in every round.
-        cluster_m = (
-            2
-            if (((s + 255) // 256) % 2 == 0 and n_full % 2 == 0 and min(sm_count, n_full) % 2 == 0)
-            else 1
-        )
-        _get_compiled(args, dev, sm_count, rank, cluster_m, False, True, lens is not None)(*args)
-    if "split_flags" in buffers:
-        # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM)
-        ws = (buffers["split_o"], buffers["split_ml"], buffers["split_flags"])
-        args = _make_args(
+
+    def make_args(n_parts=1, ws=None):
+        return _make_args(
             qk_ptrs,
             v8,
             v_mean,
@@ -155,4 +142,23 @@ def run(buffers, o, rank, lens=None):
             n_parts,
             ws,
         )
-        _get_compiled(args, dev, sm_count, rank, 1, True, n_full > 0, lens is not None)(*args)
+
+    if n_full > 0:
+        args = make_args()
+        # CTA pairs share K/V when both always work on the same head: an even number of 256-row blocks per head,
+        # an even unit count and an even persistent stride keep units (2c, 2c+1) in one head in every round.
+        cluster_m = (
+            2
+            if (((s + 255) // 256) % 2 == 0 and n_full % 2 == 0 and min(sm_count, n_full) % 2 == 0)
+            else 1
+        )
+        _get_compiled(
+            args, dev, sm_count, rank, cluster_m, split=False, pdl=True, lens=lens is not None
+        )(*args)
+    if "split_flags" in buffers:
+        # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM)
+        ws = (buffers["split_o"], buffers["split_ml"], buffers["split_flags"])
+        args = make_args(n_parts, ws)
+        _get_compiled(
+            args, dev, sm_count, rank, 1, split=True, pdl=n_full > 0, lens=lens is not None
+        )(*args)

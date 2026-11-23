@@ -27,9 +27,10 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Float32, Int32, Int64
 
 from ...common.mem import gptr, load_vector, store_vector
+from ...common.state import State
 from ...constants import HEAD_DIM
 from ..valid_len import valid_len
-from .sched import SplitTileScheduler, TileScheduler
+from .sched import NPARTS, PART
 
 
 def _merge_slot(slot_base, j, merger, stage):
@@ -37,11 +38,15 @@ def _merge_slot(slot_base, j, merger, stage):
     return (slot_base + j + cutlass.select_(j >= merger, 1, 0)) * 2 + stage
 
 
+def _merger(stage, nparts):
+    return 0 if stage == 0 else stage % nparts
+
+
 class EpilogueRole:
     """The epilogue warpgroup's methods of PingPongAttention (kernel.py), which holds the attributes they read."""
 
     def _epi_copy(self, thr_mma, tOtO, dest_O):
-        """TMEM-load / SMEM-store partitions of one O tile for the epilogue warps."""
+        """TMEM-load / SMEM-store partitions of one O tile for the epilogue warps, by name (a State)."""
         cO = cute.make_identity_tensor((self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
         chunk_cols = 32 * 8 // self.o_dtype.width
         tOdO = thr_mma.partition_C(dest_O)
@@ -50,7 +55,7 @@ class EpilogueRole:
         tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, chunk_cols)))
         tOdO_i = cute.logical_divide(tOdO, cute.make_layout((128, chunk_cols)))
         tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx % (self.threads_per_warp * len(self.epilogue_warp_ids))
+        thread_idx = tidx % (self.threads_per_wg)
         epi_subtile = (self.epi_tile[0], chunk_cols)
         tmem_copy_atom = sm100_utils.get_tmem_load_op(
             self.pv_mma_tiler,
@@ -69,14 +74,35 @@ class EpilogueRole:
             self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
         )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
-        return (
-            tiled_tmem_load,
-            tTMEM_LOADtO,
-            tTMEM_LOADdO,
-            tTMEM_LOADoO,
-            tiled_smem_store,
-            thread_idx,
+        return State(
+            tiled_tmem_load=tiled_tmem_load,
+            tTMEM_LOADtO=tTMEM_LOADtO,
+            tTMEM_LOADdO=tTMEM_LOADdO,
+            tTMEM_LOADoO=tTMEM_LOADoO,
+            tiled_smem_store=tiled_smem_store,
+            thread_idx=thread_idx,
+            n_chunks=self.cta_tiler[2] // chunk_cols,
         )
+
+    def _load_chunk(self, ep, i, staged=True):
+        """Return column chunk i of an O tile in registers, its staging chunk (staged) and its (row, column) views."""
+        src = ep.tTMEM_LOADtO[None, 0, 0, i]
+        dst = ep.tTMEM_LOADdO[None, 0, 0, i] if staged else None
+        coords = ep.tTMEM_LOADoO[None, 0, 0, i]
+        tTMrO = cute.make_rmem_tensor(coords.shape, self.pv_acc_dtype)
+        cute.copy(ep.tiled_tmem_load, src, tTMrO)
+        return tTMrO, dst, coords
+
+    def _stage_chunk(self, ep, tTMrO, dst, stage, live_rows):
+        """Stage a chunk of O tile `stage` as BF16 in dst; with lengths, zeros in the rows from live_rows on."""
+        if live_rows is not None:
+            live = stage * 128 + ep.thread_idx < live_rows
+            for j in range(cute.size(tTMrO)):
+                tTMrO[j] = cutlass.select_(live, tTMrO[j], Float32(0.0))
+        tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+        o_vec = tTMrO.load()
+        tDMrO.store(o_vec.to(self.o_dtype))
+        cute.copy(ep.tiled_smem_store, tDMrO, dst)
 
     @cute.jit
     def epilogue_split(
@@ -107,8 +133,7 @@ class EpilogueRole:
             self._epi_copy(thr_mma, tOtO0, sO[None, None, 0]),
             self._epi_copy(thr_mma, tOtO1, sO[None, None, 1]),
         ]
-        thread_idx = eps[0][5]
-        n_chunks = self.cta_tiler[2] // (32 * 8 // self.o_dtype.width)
+        thread_idx = eps[0].thread_idx
         # final anchors of both tiles (published by the softmax warpgroups at the end of the piece)
         cute.arch.barrier(barrier_id=self.stats_bar_id, number_of_threads=self.stats_bar_threads)
         h0 = s0_epi_consumer.wait_and_advance()
@@ -126,24 +151,19 @@ class EpilogueRole:
         rss = [self.load_row_sum(thr_mma, tOtO0), self.load_row_sum(thr_mma, tOtO1)]
         e0_handle = epi_store_producer.acquire_and_advance()
         e1_handle = epi_store_producer.acquire_and_advance()
-        mergers = [0, 1 % nparts]
+        mergers = [_merger(stage, nparts) for stage in range(2)]
         # publish phase
         for stage in cutlass.range_constexpr(2):
-            tiled_tmem_load, tTMEM_LOADtO, tTMEM_LOADdO, tTMEM_LOADoO, tiled_smem_store, _ = eps[
-                stage
-            ]
+            ep = eps[stage]
             if part != mergers[stage]:
                 slot = (slot_base + part) * 2 + stage
                 row_base = Int64(slot * 128 + thread_idx)
                 cute.arch.store(gptr(Float32, split_ml_addr + row_base * 8), rms[stage])
                 cute.arch.store(gptr(Float32, split_ml_addr + row_base * 8 + 4), rss[stage])
-                for i in cutlass.range_constexpr(n_chunks):
-                    tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
-                    tTMEM_LOADoO_i = tTMEM_LOADoO[None, 0, 0, i]
-                    tTMrO = cute.make_rmem_tensor(tTMEM_LOADoO_i.shape, self.pv_acc_dtype)
-                    cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                for i in cutlass.range_constexpr(ep.n_chunks):
+                    tTMrO, _, coords = self._load_chunk(ep, i, staged=False)
                     for j in cutlass.range_constexpr(0, cute.size(tTMrO), 4):
-                        _, col = tTMEM_LOADoO_i[j]
+                        _, col = coords[j]
                         # checked while tracing: the 16-byte store of four columns starts at a multiple of four
                         assert col % 4 == 0
                         dst = split_o_addr + (row_base * 128 + col) * 4
@@ -161,9 +181,7 @@ class EpilogueRole:
         # merge phase: the other pieces are j = 0 .. nparts - 2 -> piece j + (j >= merger)
         n_other = nparts - 1
         for stage in cutlass.range_constexpr(2):
-            tiled_tmem_load, tTMEM_LOADtO, tTMEM_LOADdO, tTMEM_LOADoO, tiled_smem_store, _ = eps[
-                stage
-            ]
+            ep = eps[stage]
             merger = mergers[stage]
             if part == merger:
                 row_max = rms[stage]
@@ -202,12 +220,8 @@ class EpilogueRole:
                     l_fin = l_fin + l_p * cute.math.exp2(score_scale * (m_p - m_fin), fastmath=True)
                 scale = scale_output / l_fin
                 scale_o = scale * s_own
-                for i in cutlass.range_constexpr(n_chunks):
-                    tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
-                    tTMEM_LOADdO_i = tTMEM_LOADdO[None, 0, 0, i]
-                    tTMEM_LOADoO_i = tTMEM_LOADoO[None, 0, 0, i]
-                    tTMrO = cute.make_rmem_tensor(tTMEM_LOADoO_i.shape, self.pv_acc_dtype)
-                    cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                for i in cutlass.range_constexpr(ep.n_chunks):
+                    tTMrO, dst, coords = self._load_chunk(ep, i)
                     for jj in cutlass.range_constexpr(0, cute.size(tTMrO), 2):
                         tTMrO[jj], tTMrO[jj + 1] = cute.arch.mul_packed_f32x2(
                             (tTMrO[jj], tTMrO[jj + 1]), (scale_o, scale_o)
@@ -231,7 +245,7 @@ class EpilogueRole:
                         vals_a = []
                         vals_b = []
                         for jj in cutlass.range_constexpr(0, cute.size(tTMrO), 4):
-                            _, col = tTMEM_LOADoO_i[jj]
+                            _, col = coords[jj]
                             vals_a += load_vector(
                                 gptr(Float32, split_o_addr + (rb_a * 128 + col) * 4, 16),
                                 4,
@@ -250,14 +264,7 @@ class EpilogueRole:
                         )
                         for jj in cutlass.range_constexpr(cute.size(tTMrO)):
                             tTMrO[jj] = tTMrO[jj] + s_a * vals_a[jj] + s_b * vals_b[jj]
-                    if cutlass.const_expr(live_rows is not None):
-                        live = stage * 128 + thread_idx < live_rows
-                        for jj in cutlass.range_constexpr(cute.size(tTMrO)):
-                            tTMrO[jj] = cutlass.select_(live, tTMrO[jj], Float32(0.0))
-                    tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
-                    o_vec = tTMrO.load()
-                    tDMrO.store(o_vec.to(self.o_dtype))
-                    cute.copy(tiled_smem_store, tDMrO, tTMEM_LOADdO_i)
+                    self._stage_chunk(ep, tTMrO, dst, stage, live_rows)
         cute.arch.fence_view_async_shared()
         o0_handle.release()
         o1_handle.release()
@@ -285,7 +292,7 @@ class EpilogueRole:
         )
         tiled = tcgen05.make_tmem_copy(atom, tOtO_i)
         tidx, _, _ = cute.arch.thread_idx()
-        thr = tiled.get_slice(tidx % (self.threads_per_warp * 4))
+        thr = tiled.get_slice(tidx % self.threads_per_wg)
         tT, tC = thr.partition_S(tOtO_i), thr.partition_D(tOcO_i)
         tTMrS = cute.make_rmem_tensor(tC.shape, self.pv_acc_dtype)
         cute.copy(tiled, cute.make_tensor(tT.iterator + HEAD_DIM, tT.layout), tTMrS)
@@ -298,10 +305,7 @@ class EpilogueRole:
         """Main launch epilogue of O tile `stage`: O times v_scale over the row sum, as BF16 into its staging tile."""
         tOtO, dest_O = tensor_args
         si_epi_consumer, mma_epi_consumer, epi_store_producer = pipeline_args
-        chunk_cols = 32 * 8 // self.o_dtype.width
-        tiled_tmem_load, tTMEM_LOADtO, tTMEM_LOADdO, tTMEM_LOADoO, tiled_smem_store, thread_idx = (
-            self._epi_copy(thr_mma, tOtO, dest_O)
-        )
+        ep = self._epi_copy(thr_mma, tOtO, dest_O)
 
         cute.arch.barrier(
             barrier_id=self.stats_bar_id + stage, number_of_threads=self.stats_bar_threads
@@ -312,26 +316,14 @@ class EpilogueRole:
         oi_handle = mma_epi_consumer.wait_and_advance()
         row_sum = self.load_row_sum(thr_mma, tOtO)
         oi_final_handle = epi_store_producer.acquire_and_advance()
-        n_chunks = self.cta_tiler[2] // chunk_cols
         scale = scale_output / row_sum
-        for i in cutlass.range_constexpr(n_chunks):
-            tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
-            tTMEM_LOADdO_i = tTMEM_LOADdO[None, 0, 0, i]
-            tTMEM_LOADoO_i = tTMEM_LOADoO[None, 0, 0, i]
-            tTMrO = cute.make_rmem_tensor(tTMEM_LOADoO_i.shape, self.pv_acc_dtype)
-            cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+        for i in cutlass.range_constexpr(ep.n_chunks):
+            tTMrO, dst, _ = self._load_chunk(ep, i)
             for j in cutlass.range_constexpr(0, cute.size(tTMrO), 2):
                 tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                     (tTMrO[j], tTMrO[j + 1]), (scale, scale)
                 )
-            if cutlass.const_expr(live_rows is not None):
-                live = stage * 128 + thread_idx < live_rows
-                for j in cutlass.range_constexpr(cute.size(tTMrO)):
-                    tTMrO[j] = cutlass.select_(live, tTMrO[j], Float32(0.0))
-            tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
-            o_vec = tTMrO.load()
-            tDMrO.store(o_vec.to(self.o_dtype))
-            cute.copy(tiled_smem_store, tDMrO, tTMEM_LOADdO_i)
+            self._stage_chunk(ep, tTMrO, dst, stage, live_rows)
         cute.arch.fence_view_async_shared()
         oi_handle.release()
         oi_final_handle.commit()
@@ -347,7 +339,7 @@ class EpilogueRole:
         while work_tile.is_valid_tile:
             curr_block_coord = work_tile.tile_idx
             o0_coord = 2 * curr_block_coord[0]
-            o1_coord = o0_coord + 1
+            o_coords = (o0_coord, o0_coord + 1)
             gO_qdl = cute.flat_divide(mO_qdl, cute.select(self.pv_mma_tiler, mode=[0, 1]))
             gO = gO_qdl[None, None, None, 0, curr_block_coord[2]]
             tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
@@ -357,30 +349,21 @@ class EpilogueRole:
                 cute.group_modes(sO, 0, 2),
                 cute.group_modes(gO, 0, 2),
             )
-            cute.arch.barrier(barrier_id=self.epi_bar_id, number_of_threads=self.epi_bar_threads)
-            o0_handle = epi_store_consumer.wait_and_advance()
-            if cutlass.const_expr(self.split):
-                if curr_block_coord[5] == 0:  # O0 is merged by piece 0
-                    cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
-            else:
-                cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.barrier(
-                barrier_id=self.epi_bar_id + 1, number_of_threads=self.epi_bar_threads
-            )
-            o1_handle = epi_store_consumer.wait_and_advance()
-            if cutlass.const_expr(self.split):
-                if (
-                    curr_block_coord[5] == 1 % curr_block_coord[6]
-                ):  # O1 is merged by piece 1 % nparts
-                    cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
-            else:
-                cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(1, read=True)
-            o0_handle.release()
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
-            o1_handle.release()
+            handles = []
+            for j in cutlass.range_constexpr(2):
+                cute.arch.barrier(
+                    barrier_id=self.epi_bar_id + j, number_of_threads=self.epi_bar_threads
+                )
+                handles.append(epi_store_consumer.wait_and_advance())
+                if cutlass.const_expr(self.split):
+                    if curr_block_coord[PART] == _merger(j, curr_block_coord[NPARTS]):
+                        cute.copy(tma_atom_o, tOsO[None, j], tOgO[None, o_coords[j]])
+                else:
+                    cute.copy(tma_atom_o, tOsO[None, j], tOgO[None, o_coords[j]])
+                cute.arch.cp_async_bulk_commit_group()
+            for j in cutlass.range_constexpr(2):
+                cute.arch.cp_async_bulk_wait_group(1 - j, read=True)
+                handles[j].release()
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
         cute.arch.cp_async_bulk_wait_group(0, read=False)
@@ -396,14 +379,7 @@ class EpilogueRole:
         lane = tidx % self.threads_per_warp
         heads = tile_sched_params.problem_shape_mhb[1]
         group = self.cluster_shape_mn[0]
-        if cutlass.const_expr(self.split):
-            sched = SplitTileScheduler(
-                tile_sched_params,
-                cute.arch.block_idx()[0] + tile_sched_params.n_full,
-                cute.arch.grid_dim(),
-            )
-        else:
-            sched = TileScheduler(tile_sched_params, cute.arch.block_idx()[0], cute.arch.grid_dim())
+        sched = self._tile_scheduler(tile_sched_params)
         work = sched.get_current_work()
         z = Int32(0)
         while work.is_valid_tile:
@@ -411,7 +387,7 @@ class EpilogueRole:
             h, b = work.tile_idx[2]
             no_row = (m - m % group) * self.cta_tiler[0] >= valid_len(lens_addr, b, seqlen)
             if cutlass.const_expr(self.split):
-                no_row = no_row & (work.tile_idx[5] == 0)
+                no_row = no_row & (work.tile_idx[PART] == 0)
             if no_row:
                 row0 = m * self.cta_tiler[0]
                 rows = cutlass.min(Int32(self.cta_tiler[0]), seqlen - row0)

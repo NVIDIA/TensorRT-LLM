@@ -43,6 +43,7 @@ from ..ptx.shared import (
     st_global_b32_v2_hint,
 )
 from ..valid_len import valid_len
+from .basis import row_addr
 
 QK_THREADS = 256
 
@@ -123,6 +124,34 @@ def _body_block(bo, x, pq, pd, uts, stg, sst, g, t):
             pq[4 * n + e] = r1[e]
             pd[4 * n + e] = r2[e]
     return cute.arch.fmax(sc0, sc1)
+
+
+def _item_coords(item, T, BH, H):
+    bhs = item // T
+    tile = item - bhs * T
+    side = bhs // BH
+    bh = bhs - side * BH
+    bb = bh // H
+    return bhs, tile, side, bh, bb, bh - bb * H
+
+
+def _rows_base(qk, side, bb, hh, rg, S, H, t):
+    return row_addr(Int64(cutlass.select_(side != 0, qk[1], qk[0])), bb, rg, hh, S, H, 256) + t * 8
+
+
+def _load_rows(afn, base, rstride, rg, nv, live=None):
+    """A fragments of rows rg, rg + 8 into afn[4a + 0/1], afn[4a + 2/3] (channels 16a + 4t + 0..3); zero from row nv."""
+
+    def ok(row):
+        return Int32(row < nv) if live is None else live & Int32(row < nv)
+
+    for a in range(8):
+        wa = ld_global_nc_b32_hint_pred(base + a * 32, ok(rg), "evict_first", 2)
+        wb = ld_global_nc_b32_hint_pred(base + rstride * 8 + a * 32, ok(rg + 8), "evict_first", 2)
+        afn[4 * a] = wa[0]
+        afn[4 * a + 1] = wa[1]
+        afn[4 * a + 2] = wb[0]
+        afn[4 * a + 3] = wb[1]
 
 
 @cute.kernel
@@ -208,71 +237,28 @@ def qk_kernel(
     item_hi = ((cta + 1) * nitems) // ncta
     cur = Int32(-1)
     rstride = Int64(H) * 256
-    BHn = B * H
+    BH = B * H
     af = cute.make_rmem_tensor((32,), Uint32)
     afn = cute.make_rmem_tensor((32,), Uint32)
-    # af[4a + 0/1] = row g channels 16a + 4t + 0..1 / 2..3, af[4a + 2/3] = row g + 8
+
     if item_lo < item_hi:
-        bhs0 = item_lo // T
-        tile0 = item_lo - bhs0 * T
-        side0 = bhs0 // BHn
-        bh0 = bhs0 - side0 * BHn
-        bb0 = bh0 // H
-        hh0 = bh0 - bb0 * H
+        _, tile0, side0, _, bb0, hh0 = _item_coords(item_lo, T, BH, H)
         rg0 = tile0 * 128 + warp * 16 + g
-        n0 = S if cutlass.const_expr(lens_p is None) else valid_len(lens_p, bb0, S)
-        bg0 = (
-            Int64(cutlass.select_(side0 != 0, k_p, q_p))
-            + ((Int64(bb0) * Int64(S) + Int64(rg0)) * Int64(H) + Int64(hh0)) * 256
-            + t * 8
-        )
-        for a in cutlass.range_constexpr(8):
-            wa = ld_global_nc_b32_hint_pred(bg0 + a * 32, Int32(rg0 < n0), "evict_first", 2)
-            wb = ld_global_nc_b32_hint_pred(
-                bg0 + rstride * 8 + a * 32, Int32(rg0 + 8 < n0), "evict_first", 2
-            )
-            afn[4 * a] = wa[0]
-            afn[4 * a + 1] = wa[1]
-            afn[4 * a + 2] = wb[0]
-            afn[4 * a + 3] = wb[1]
+        nv0 = valid_len(lens_p, bb0, S)
+        _load_rows(afn, _rows_base((q_p, k_p), side0, bb0, hh0, rg0, S, H, t), rstride, rg0, nv0)
     for item in cutlass.range(item_lo, item_hi, unroll=1):
         for i in cutlass.range_constexpr(32):
             af[i] = afn[i]
-        bhs = item // T
-        tile = item - bhs * T
-        side = bhs // BHn
-        bh = bhs - side * BHn
-        bb = bh // H
-        hh = bh - bb * H
+        bhs, tile, side, bh, bb, hh = _item_coords(item, T, BH, H)
         # prefetch the next item's rows (zeros past the range / past S)
         nitem = item + 1
-        nbhs = nitem // T
-        ntile = nitem - nbhs * T
-        nside = nbhs // BHn
-        nbh = nbhs - nside * BHn
-        nbb = nbh // H
-        nhh = nbh - nbb * H
+        _, ntile, nside, _, nbb, nhh = _item_coords(nitem, T, BH, H)
         nrg = ntile * 128 + warp * 16 + g
         nok = Int32(nitem < item_hi)
-        nn = (
-            S
-            if cutlass.const_expr(lens_p is None)
-            else valid_len(lens_p, cutlass.min(nbb, B - 1), S)
+        nvn = valid_len(lens_p, cutlass.min(nbb, B - 1), S)
+        _load_rows(
+            afn, _rows_base((q_p, k_p), nside, nbb, nhh, nrg, S, H, t), rstride, nrg, nvn, nok
         )
-        nbg = (
-            Int64(cutlass.select_(nside != 0, k_p, q_p))
-            + ((Int64(nbb) * Int64(S) + Int64(nrg)) * Int64(H) + Int64(nhh)) * 256
-            + t * 8
-        )
-        for a in cutlass.range_constexpr(8):
-            wa = ld_global_nc_b32_hint_pred(nbg + a * 32, nok & Int32(nrg < nn), "evict_first", 2)
-            wb = ld_global_nc_b32_hint_pred(
-                nbg + rstride * 8 + a * 32, nok & Int32(nrg + 8 < nn), "evict_first", 2
-            )
-            afn[4 * a] = wa[0]
-            afn[4 * a + 1] = wa[1]
-            afn[4 * a + 2] = wb[0]
-            afn[4 * a + 3] = wb[1]
         live = cutlass.const_expr(lens_p is None) or tile * 128 < valid_len(lens_p, bb, S)
         if live:
             if bhs != cur:
@@ -342,38 +328,37 @@ def qk_kernel(
                                 acc[4 * n + e] = r[e]
                     x = [acc[i] * pre for i in range(8)]
                     gb = cute.arch.fmax(gb, _body_block(bo, x, pq, pd, uts, stg, sst, g, t))
-            # compensation channels: Q [dq U | q1 U], K [k1 U | dk U]
-            g2 = Float32(0.0)
-            g3 = Float32(0.0)
+            # compensation channels: Q [dq U | q1 U], K [k1 U | dk U]; gc: the larger block scale of either half
+            gc = [Float32(0.0)] * 2
             for ci in cutlass.range_constexpr(2):
                 for bp in cutlass.range_constexpr(2):
-                    n0 = 2 * bp
+                    nb = 2 * bp
                     v = [Float32(0.0)] * 8
                     for e in cutlass.range_constexpr(4):
-                        pqa = pq[4 * n0 + e]
-                        pqb = pq[4 * (n0 + 1) + e]
-                        pda = pd[4 * n0 + e]
-                        pdb = pd[4 * (n0 + 1) + e]
+                        pqa = pq[4 * nb + e]
+                        pqb = pq[4 * (nb + 1) + e]
+                        pda = pd[4 * nb + e]
+                        pdb = pd[4 * (nb + 1) + e]
                         if ci == 0:
                             v[e] = Float32(cutlass.select_(side != 0, pqa, pda))
                             v[4 + e] = Float32(cutlass.select_(side != 0, pqb, pdb))
                         else:
                             v[e] = Float32(cutlass.select_(side != 0, pda, pqa))
                             v[4 + e] = Float32(cutlass.select_(side != 0, pdb, pqb))
-                    cw0, sc0, d0, d1, d2, d3 = _quant_block(v[0], v[1], v[4], v[5])
-                    cw1, sc1, e0, e1, e2, e3 = _quant_block(v[2], v[3], v[6], v[7])
-                    if ci == 0:
-                        g2 = cute.arch.fmax(g2, cute.arch.fmax(sc0, sc1))
-                    else:
-                        g3 = cute.arch.fmax(g3, cute.arch.fmax(sc0, sc1))
+                    cw0, sc0, *_ = _quant_block(v[0], v[1], v[4], v[5])
+                    cw1, sc1, *_ = _quant_block(v[2], v[3], v[6], v[7])
+                    gc[ci] = cute.arch.fmax(gc[ci], cute.arch.fmax(sc0, sc1))
                     _emit(stg, sst, g, t, Int32(8 + 2 * ci + bp), cw0, cw1, sc0, sc1)
             isk = Int32(side == 1)
-            gm[0] = cute.arch.fmax(gm[0], Float32(cutlass.select_(isk != 0, Float32(0.0), gb)))
-            gm[1] = cute.arch.fmax(gm[1], Float32(cutlass.select_(isk != 0, Float32(0.0), g2)))
-            gm[2] = cute.arch.fmax(gm[2], Float32(cutlass.select_(isk != 0, Float32(0.0), g3)))
-            gm[3] = cute.arch.fmax(gm[3], Float32(cutlass.select_(isk != 0, gb, Float32(0.0))))
-            gm[4] = cute.arch.fmax(gm[4], Float32(cutlass.select_(isk != 0, g2, Float32(0.0))))
-            gm[5] = cute.arch.fmax(gm[5], Float32(cutlass.select_(isk != 0, g3, Float32(0.0))))
+            groups = (gb, gc[0], gc[1])
+            for j in cutlass.range_constexpr(3):
+                gm[j] = cute.arch.fmax(
+                    gm[j], Float32(cutlass.select_(isk != 0, Float32(0.0), groups[j]))
+                )
+            for j in cutlass.range_constexpr(3):
+                gm[3 + j] = cute.arch.fmax(
+                    gm[3 + j], Float32(cutlass.select_(isk != 0, groups[j], Float32(0.0)))
+                )
             cute.arch.sync_warp()
             # codes: 16 rows x 128 B
             for m in cutlass.range_constexpr(4):
@@ -390,9 +375,7 @@ def qk_kernel(
                     )
                     store_vector(gptr(Uint32, row_dst, 16), wv, cop="cs")
             # provisional scales: 16 rows x 3 atoms x 8 B
-            pbase = (
-                prov_p + ((Int64(side) * Int64(B * H) + Int64(bh)) * Int64(T) + Int64(tile)) * 3072
-            )
+            pbase = prov_p + ((Int64(side) * Int64(BH) + Int64(bh)) * Int64(T) + Int64(tile)) * 3072
             for m in cutlass.range_constexpr(2):
                 idx = lane + 32 * m
                 if idx < 48:

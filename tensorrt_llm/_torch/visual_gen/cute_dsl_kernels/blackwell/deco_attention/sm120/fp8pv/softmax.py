@@ -49,7 +49,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 
-from ...common.expmath import scale_bf16x2
+from ...common.expmath import RN, scale_bf16x2
 from ...constants import RESCALE_THRESHOLD
 from ..ptx.fp8pv import compare, expcast_guard, land_finish, land_pack, landed_flags
 from .layout import KT, key_grp, key_rot
@@ -57,8 +57,6 @@ from .layout import KT, key_grp, key_rot
 # The score-scale floor of this kernel: the preparation raises the score scale to a power of two of at least
 # 2^MIN_SCORE_LOG2, from which the one-FMA landing's multiplier is exact on the subnormal grid
 MIN_SCORE_LOG2 = -10
-
-RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
 
 
 # ------------------------------------------------------------------------------------------------ softmax of one tile

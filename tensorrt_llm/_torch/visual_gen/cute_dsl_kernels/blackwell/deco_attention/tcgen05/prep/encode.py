@@ -32,6 +32,7 @@ from cutlass import Float32, Int32, Int64, Uint8, Uint16, Uint32
 from ...common.expmath import e4m3x4, f2u, pow2_ceil_448, u2f
 from ...common.mem import gptr, load_invariant, sptr, store_vector
 from ...constants import E4M3_MAX, qk_scale_atoms
+from .basis import GMAX_Q, GMAX_V
 
 ENC_G = 4  # Q/K scale tiles per staging round
 
@@ -97,7 +98,9 @@ def encode_kernel(
     staged = staged_tile_bytes(RANK)
     comp_blocks = RANK // 8  # 16-channel blocks of the compensation channels
     gb = Int64(gmax.iterator.toint())
-    gq0, gq1, gq2, gk0, gk1, gk2 = (pow2_ceil_448(_gmax(gb, word)) for word in range(6))
+    gq0, gq1, gq2, gk0, gk1, gk2 = (
+        pow2_ceil_448(_gmax(gb, word)) for word in range(GMAX_Q, GMAX_V)
+    )
     prod = cute.arch.fmax(cute.arch.fmax(gq0 * gk0, gq1 * gk1), gq2 * gk2)
     if prod < Float32(MIN_PROD):
         e_up = (Int32(f2u(Float32(MIN_PROD) / prod) >> Uint32(23)) - Int32(127) + Int32(1)) >> 1
@@ -109,7 +112,7 @@ def encode_kernel(
     iq0 = Float32(1.0) / gq0
     iq1 = Float32(1.0) / gq1
     iq2 = Float32(1.0) / gq2
-    ip_ = Float32(1.0) / prod
+    inv_prod = Float32(1.0) / prod
     qsb = Int64(q_sfv.iterator.toint())
     ksb = Int64(k_sfv.iterator.toint())
     qfb = Int64(q_sf.iterator.toint())
@@ -127,15 +130,15 @@ def encode_kernel(
                 load_invariant(Uint32, ksb + Int64(tbc) * Int64(sfv_bytes) + Int64(et * 16), 4)
             )
         for g in cutlass.range_constexpr(ENC_G):
-            a = wq[g]
-            b2 = wk[g]
+            q_words = wq[g]
+            k_words = wk[g]
             store_vector(
                 sptr(Uint32, stb + g * (2 * staged) + encode_pad128(et * 16), 16),
-                (a[0], a[1], a[2], a[3]),
+                (q_words[0], q_words[1], q_words[2], q_words[3]),
             )
             store_vector(
                 sptr(Uint32, stb + g * (2 * staged) + staged + encode_pad128(et * 16), 16),
-                (b2[0], b2[1], b2[2], b2[3]),
+                (k_words[0], k_words[1], k_words[2], k_words[3]),
             )
         cute.arch.sync_threads()
         for g in cutlass.range_constexpr(ENC_G):
@@ -152,13 +155,13 @@ def encode_kernel(
                     if cutlass.const_expr(atoms == 3):
                         ilo = iq0 * (Float32(1.0) - is2) + iq1 * is2
                         ihi = iq0 * (Float32(1.0) - is2) + iq2 * is2
-                        glo = (gq0 * (Float32(1.0) - is2) + gq1 * is2) * ip_
-                        ghi = (gq0 * (Float32(1.0) - is2) + gq2 * is2) * ip_
+                        glo = (gq0 * (Float32(1.0) - is2) + gq1 * is2) * inv_prod
+                        ghi = (gq0 * (Float32(1.0) - is2) + gq2 * is2) * inv_prod
                     else:
                         is3 = Float32(atom == 3)
                         ilo = iq0 * (Float32(1.0) - is2 - is3) + iq1 * is2 + iq2 * is3
                         ihi = ilo
-                        glo = (gq0 * (Float32(1.0) - is2 - is3) + gq1 * is2 + gq2 * is3) * ip_
+                        glo = (gq0 * (Float32(1.0) - is2 - is3) + gq1 * is2 + gq2 * is3) * inv_prod
                         ghi = glo
                     fq = cute.make_rmem_tensor((4,), Float32)
                     fk = cute.make_rmem_tensor((4,), Float32)
@@ -180,12 +183,12 @@ def encode_kernel(
                     else:
                         # the atom's four blocks of compensation channels: the Q/K pass stored the scales of both
                         # tensors in the block order of Q', and K' holds the two halves swapped
-                        for c_ in cutlass.range_constexpr(4):
-                            cq = c_
+                        for c in cutlass.range_constexpr(4):
+                            cq = c
                             if cutlass.const_expr(atoms > 3):
-                                cq = (atom - 2) * 4 + c_
+                                cq = (atom - 2) * 4 + c
                             cqk = (cq + comp_blocks // 2) % comp_blocks
-                            fq[c_] = u2f(
+                            fq[c] = u2f(
                                 cute.arch.load(
                                     sptr(
                                         Uint16,
@@ -195,7 +198,7 @@ def encode_kernel(
                                 ).to(Uint32)
                                 << Uint32(16)
                             )
-                            fk[c_] = u2f(
+                            fk[c] = u2f(
                                 cute.arch.load(
                                     sptr(
                                         Uint16,
@@ -231,5 +234,5 @@ def encode_kernel(
             gptr(Uint32, Int64(score_scale.iterator.toint())), f2u(prod / Float32(128.0))
         )
         cute.arch.store(
-            gptr(Uint32, Int64(v8_scale.iterator.toint())), f2u(pow2_ceil_448(_gmax(gb, 6)))
+            gptr(Uint32, Int64(v8_scale.iterator.toint())), f2u(pow2_ceil_448(_gmax(gb, GMAX_V)))
         )

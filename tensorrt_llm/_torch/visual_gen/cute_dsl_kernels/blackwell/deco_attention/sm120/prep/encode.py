@@ -66,33 +66,23 @@ def encode_kernel(
         for wi in cutlass.range_constexpr(ENCODE_THREADS // 32):
             mv = cute.arch.fmax(mv, cute.arch.load(sptr(Float32, red + (wi * 6 + j) * 4), Float32))
         gmv[j] = mv
-    gq0 = pow2_ceil_448(gmv[0])
-    gq1 = pow2_ceil_448(gmv[1])
-    gq2 = pow2_ceil_448(gmv[2])
-    gk0 = pow2_ceil_448(gmv[3])
-    gk1 = pow2_ceil_448(gmv[4])
-    gk2 = pow2_ceil_448(gmv[5])
-    prod = cute.arch.fmax(cute.arch.fmax(gq0 * gk0, gq1 * gk1), gq2 * gk2)
+    gq = [pow2_ceil_448(gmv[j]) for j in range(3)]
+    gk = [pow2_ceil_448(gmv[3 + j]) for j in range(3)]
+    prod = cute.arch.fmax(cute.arch.fmax(gq[0] * gk[0], gq[1] * gk[1]), gq[2] * gk[2])
     minp = u2f(Uint32((127 + 7 + msl) << 23))
     ep = Int32(f2u(prod) >> Uint32(23))
     em = Int32(f2u(minp) >> Uint32(23))
     raise_ = Int32(prod < minp)
-    e = em - ep
-    up = u2f(Uint32((127 + ((e + 1) >> 1)) << 23))
+    gap = em - ep
+    up = u2f(Uint32((127 + ((gap + 1) >> 1)) << 23))
     upf = Float32(cutlass.select_(raise_ != 0, up, Float32(1.0)))
-    gq0 = gq0 * upf
-    gq1 = gq1 * upf
-    gq2 = gq2 * upf
+    gq = [x * upf for x in gq]
     prod = Float32(cutlass.select_(raise_ != 0, minp, prod))
     if cta == 0 and tid == 0:
         score_scale = prod * Float32(1.0 / 128.0)
         cute.arch.store(gptr(Float32, score_scale_p), score_scale)
-    iq0 = cute.math.rcp(gq0)
-    iq1 = cute.math.rcp(gq1)
-    iq2 = cute.math.rcp(gq2)
-    ik0 = gq0 * cute.math.rcp(prod)
-    ik1 = gq1 * cute.math.rcp(prod)
-    ik2 = gq2 * cute.math.rcp(prod)
+    iq = [cute.math.rcp(x) for x in gq]
+    ik = [x * cute.math.rcp(prod) for x in gq]
     # provisional BF16 scales -> UE4M3 bytes, 8 per thread-iteration
     per_side = B * H * T * 192  # 8-element chunks per side
     nch = 2 * per_side
@@ -102,14 +92,12 @@ def encode_kernel(
         atom = (li % 192) >> 6
         w = load_vector(gptr(Uint32, prov_p + Int64(i) * 16, 16), 4)
         f = [Float32(0.0)] * 8
-        for e2 in cutlass.range_constexpr(4):
-            f[2 * e2] = u2f(w[e2] << Uint32(16))
-            f[2 * e2 + 1] = u2f(w[e2] & Uint32(0xFFFF0000))
-        d0 = Float32(cutlass.select_(side != 0, ik0, iq0))
-        d1 = Float32(cutlass.select_(side != 0, ik1, iq1))
-        d2 = Float32(cutlass.select_(side != 0, ik2, iq2))
-        db = Float32(cutlass.select_(atom == 2, d1, d0))
-        dc = Float32(cutlass.select_(atom == 2, d2, d0))
+        for e in cutlass.range_constexpr(4):
+            f[2 * e] = u2f(w[e] << Uint32(16))
+            f[2 * e + 1] = u2f(w[e] & Uint32(0xFFFF0000))
+        d = [Float32(cutlass.select_(side != 0, ik[j], iq[j])) for j in range(3)]
+        db = Float32(cutlass.select_(atom == 2, d[1], d[0]))
+        dc = Float32(cutlass.select_(atom == 2, d[2], d[0]))
         lo = e4m3x4(f[0] * db, f[1] * db, f[2] * dc, f[3] * dc)
         hi = e4m3x4(f[4] * db, f[5] * db, f[6] * dc, f[7] * dc)
         if side == 0:

@@ -119,20 +119,20 @@ def mma_phase(
             for p in range(8):
                 steps.append(("qk", a, p))
     acc = [[Float32(0.0)] * 4 for _ in range(16)]
-    n_pv = sum(1 for st in steps if st[0] != "qk")
+    n_pv = sum(1 for step in steps if step[0] != "qk")
     w = None
     vrow = vst + voff if vst is not None else None
 
-    def load(st):
-        if st[0] == "pv":
+    def load(step):
+        if step[0] == "pv":
             # vrow: the lane's V row address (stage base + row offset + its swizzle chunk); channel group cg flips
             # the chunk bits by XOR, the quarter is an immediate
-            return ldsm_b8_x2_trans(vrow, st[2] * 16, st[1] * 32 * 128)
-        if st[0] == "m16":
+            return ldsm_b8_x2_trans(vrow, step[2] * 16, step[1] * 32 * 128)
+        if step[0] == "m16":
             # channel tile 4 hf + j of both steps of the pair
-            return ldsm_b16_x4_trans(mb, st[2] * 32, st[1] * 1024)
-        koff = koff_o if st[2] % 2 == 1 else koff_e
-        return ldsm_b16_x4(kst + koff + (st[2] // 2) * 32 * 32 + st[1] * KA_BYTES)
+            return ldsm_b16_x4_trans(mb, step[2] * 32, step[1] * 1024)
+        koff = koff_o if step[2] % 2 == 1 else koff_e
+        return ldsm_b16_x4(kst + koff + (step[2] // 2) * 32 * 32 + step[1] * KA_BYTES)
 
     def k_ready():
         # the next tile's K' and scales have landed (its full barrier); then its scale words
@@ -150,7 +150,7 @@ def mma_phase(
         frags[n] = load(steps[n])
     if turn is not None:
         turn[0]()
-    for n, st in enumerate(steps):
+    for n, step in enumerate(steps):
         if turn is not None and n == len(steps) - turn[2]:
             turn[1]()
         if n + dist == n_pv and kst is not None:
@@ -159,9 +159,9 @@ def mma_phase(
             frags[n + dist] = load(steps[n + dist])
         b = frags[n]
         frags[n] = None
-        if st[0] == "pv":
+        if step[0] == "pv":
             # A = V^T of channels 16 ct .. + 15 (the ldmatrix.trans quad in order), B = P^T of queries 8 h .. + 7
-            i, ct = st[1], st[2]
+            i, ct = step[1], step[2]
             for h in range(2):
                 c = 2 * ct + h
                 d = mma_fp8(
@@ -172,9 +172,9 @@ def mma_phase(
                 )
                 for k in range(4):
                     O[4 * c + k] = d[k]
-        elif st[0] == "m16":
+        elif step[0] == "m16":
             # A = v_mean^T of channels 16 t .. + 15 (the pair's 16 blocks), B = the pair's BF16 block sums
-            hf, j = st[1], st[2]
+            hf, j = step[1], step[2]
             for h in range(2):
                 cc = 2 * (4 * hf + j) + h
                 d = mma_bf16(
@@ -185,7 +185,7 @@ def mma_phase(
                 for k in range(4):
                     O[4 * cc + k] = d[k]
         else:
-            a, p = st[1], st[2]
+            a, p = step[1], step[2]
             for h in range(2):
                 nt = 2 * p + h
                 acc[nt] = mma_nvf4(
@@ -204,7 +204,7 @@ def pv_sparse_quarters(P, O, vst, voff, mask):
         O[j] = out[j]
 
 
-def means_pair_body(P, O, vmb, vmoff):
+def means_pair(P, O, vmb, vmoff):
     """Add the means of a step pair: 16 BF16 m16n8k16, A = the v_mean rows of both steps, B = P[18 + h], P[16 + h]."""
     mb = vmb + vmoff[2]
     frags = [ldsm_b16_x4_trans(mb, (t & 3) * 32, (t >> 2) * 1024) for t in range(2)]
@@ -231,31 +231,8 @@ def means_pair_guarded(cond, P, O, vmb, vmoff):
         O[j] = out[j]
 
 
-@cute.jit
-def means_pair(cond, P, O, vmb, vmoff):
-    """Run means_pair_body when cond != 0: an even phase whose step pair has a nonzero P, or a non-finite V / v_mean."""
-    if cond != 0:
-        means_pair_body(P, O, vmb, vmoff)
-
-
-@cute.jit
-def means_single(cond, P, O, vmb, vmoff):
-    """Add the means term of the unpaired last step when cond != 0: block sums in P[16 + h], v_mean in slot 0 of vmb."""
-    if cond != 0:
-        means_only(P, O, vmb, vmoff)
-
-
-@cute.jit
-def means_last(pair, pvl, nzp, P, O, vmb, stb, vmoff):
-    """Add the means of the last phase: the last step pair (pair != 0) or the unpaired last step (v_mean at stb)."""
-    if pair != 0:
-        means_pair(pvl | nzp, P, O, vmb, vmoff)
-    else:
-        means_single(pvl, P, O, stb, vmoff)
-
-
-def means_only(P, O, vmst, vmoff):
-    """Add the means term of a tile alone (the unpaired last step): 4 ldmatrix.x4.trans of v_mean, 16 BF16 m16n8k8."""
+def means_single(P, O, vmst, vmoff):
+    """Add the means of the unpaired last step, block sums P[16 + h]: 4 ldmatrix.x4.trans of v_mean, 16 BF16 m16n8k8."""
     frags = [ldsm_b16_x4_trans(vmst + vmoff[cp & 1] + (cp >> 1) * 1024) for cp in range(2)]
     for cp in range(4):
         if cp + 2 < 4:
@@ -274,6 +251,18 @@ def means_only(P, O, vmst, vmoff):
                     O[4 * c + k] = d[k]
 
 
+@cute.jit
+def means_last(pair, pvl, nzp, P, O, vmb, stb, vmoff):
+    """Add the means of the last phase: of the last step pair (pair != 0, v_mean in vmb) when pvl | nzp, the nonzero-P
+    flags of its steps, is set; else of the unpaired last step (v_mean at stb) when pvl is set."""
+    if pair != 0:
+        if (pvl | nzp) != 0:
+            means_pair(P, O, vmb, vmoff)
+    else:
+        if pvl != 0:
+            means_single(P, O, stb, vmoff)
+
+
 def store64(A, acc):
     """Store the 64 QK accumulator words into the rmem tensor A."""
     for i in range(64):
@@ -285,7 +274,7 @@ def load_q(
     qb,
     qsf_ptr,
     qt,
-    warp,
+    wp,
     lane,
     g,
     q,
@@ -295,8 +284,8 @@ def load_q(
     H: cutlass.Constexpr,
     nT: cutlass.Constexpr,
 ):
-    """Return the Q' fragments and scale words of rows g, g + 8 of the warp in tile qt, clamped to the last query."""
-    r0 = warp * 16 + g
+    """Return the Q' fragments and scale words of rows g, g + 8 of warp wp in tile qt, clamped to the last query."""
+    r0 = wp * 16 + g
     qi0 = qt * QT + r0
     qi1 = qi0 + 8
     if qi0 > S - 1:

@@ -37,7 +37,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Int32, Int64
 
 from ...common.mem import sptr
-from ..ptx import opaque_i32, smem_desc_hi, tc_commit_means, tc_mma_f8f6f4, tc_mma_means
+from ..ptx import idesc_bf16, opaque_i32, smem_desc_hi, tc_commit_means, tc_mma_f8f6f4, tc_mma_means
 
 # means MMA: 128 rows x 128 channels over 16 K slots of BF16 block sums
 MEANS_TILER = (128, 128, 16)
@@ -46,14 +46,7 @@ MEANS_A_DESC = (smem_desc_hi(256, 6) << 32) | (1 << 16)
 # B: the MN-major v_mean rows (128-byte swizzle, SBO 1024, the second 64-channel atom 2 KB on)
 MEANS_B_DESC = (smem_desc_hi(1024, 2) << 32) | ((2048 >> 4) << 16)
 # kind::f16 BF16 x BF16 -> F32, K-major A, MN-major B, N = M = 128
-MEANS_IDESC = (
-    (1 << 4)
-    | (1 << 7)
-    | (1 << 10)
-    | (1 << 16)
-    | ((MEANS_TILER[1] >> 3) << 17)
-    | ((MEANS_TILER[0] >> 4) << 24)
-)
+MEANS_IDESC = idesc_bf16(MEANS_TILER[0], MEANS_TILER[1]) | (1 << 16)
 # bytes of one softmax warpgroup's A operand
 MEANS_A_BYTES = MEANS_TILER[0] * MEANS_TILER[2] * 2
 

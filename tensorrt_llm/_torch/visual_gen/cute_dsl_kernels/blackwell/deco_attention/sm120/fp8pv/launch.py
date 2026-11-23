@@ -148,7 +148,7 @@ def attn_launch(
         stream=stream,
     )
     if cutlass.const_expr(n_tail > 0):
-        merge_partial_kernel(part_ptr, o_ptr, vs_ptr, S, H, nT, parts, n_full, lens_ptr).launch(
+        merge_partial_kernel(part_ptr, o_ptr, vs_ptr, S, H, parts, n_full, lens_ptr).launch(
             grid=[n_tail, 1, 1], block=[NTHR, 1, 1], smem=QT * EP, stream=stream
         )
 

@@ -40,11 +40,10 @@ from ...constants import HEAD_DIM, QK_CHANNELS
 
 KT = 128  # keys per tile
 QT = 128  # query rows per CTA
-NTHR = 256  # 8 warps x 16 rows
+NTHR = 256  # threads of a CTA: 8 warps of 16 query rows each
 STAGES = 3
-K_STEPS = (
-    QK_CHANNELS // 64
-)  # k-steps of the QK MMA: one 32-byte column of K' and one scale atom per 64 channels
+# k-steps of the QK MMA: one 32-byte column of K' and one scale atom per 64 channels
+K_STEPS = QK_CHANNELS // 64
 V_BYTES = KT * HEAD_DIM
 SF_BYTES = K_STEPS * 512
 EP = 272  # epilogue row pitch (bf16 rows of 128 channels + 16 bytes)
@@ -53,16 +52,14 @@ KA_BYTES = KT * 32  # one 32-byte K' atom column (64 channels) of a tile, 32-byt
 K_BYTES = K_STEPS * KA_BYTES
 V_OFF = K_BYTES  # V: 128 keys x 128 bytes, 128-byte swizzle (1 KB aligned)
 SF_OFF = V_OFF + V_BYTES  # the K' scale atoms
-STAGE_BYTES = 30720  # 30208 bytes used, 1 KB aligned for the swizzles
+STAGE_BYTES = (SF_OFF + SF_BYTES + 1023) // 1024 * 1024  # 1 KB aligned for the swizzles
 VM_BYTES = 8 * 256  # a tile's 8 v_mean rows: two 128-byte halves of 8 rows, 128-byte swizzle
-VMP_OFF = (
-    STAGES * STAGE_BYTES
-)  # two buffers of a step pair's v_mean rows (slot 0: the pair's first step)
+# two buffers of a step pair's v_mean rows (slot 0: the pair's first step)
+VMP_OFF = STAGES * STAGE_BYTES
 VMP_BYTES = 2 * 2 * VM_BYTES
 BAR_OFF = VMP_OFF + VMP_BYTES  # the stages' full mbarriers
-CNT_OFF = (
-    BAR_OFF + 8 * STAGES
-)  # per-stage release counters: one increment per warp and use of the stage
+# per-stage release counters: one increment per warp and use of the stage
+CNT_OFF = BAR_OFF + 8 * STAGES
 SMEM_BYTES = CNT_OFF + 4 * STAGES
 # with lengths, behind them: the valid tokens of the unit's batch element (one word), which the threads read there
 LEN_OFF = SMEM_BYTES

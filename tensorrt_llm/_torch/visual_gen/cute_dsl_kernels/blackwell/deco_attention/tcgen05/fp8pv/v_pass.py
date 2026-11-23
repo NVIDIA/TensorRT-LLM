@@ -27,6 +27,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from ...common.dsl import nanosleep
 from ...common.expmath import bf16x2, e4m3x4, f2u, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
+from ..prep.basis import GMAX_V, GMAX_V_CTAS
 from ..valid_len import valid_len
 
 V_BLOCK = 128  # keys per mean: one 128-key tile of the attention
@@ -41,32 +42,36 @@ def _grid_inv8(
     x: Float32, maxima: Int32, gb: Int64, tidx: Int32, lane: Int32, warp: Int32, gdim: Int32
 ):
     """1 / the power-of-two E4M3 scale of the grid-wide maximum of x, for a grid of 256-thread CTAs that all run at
-    once (V_CTAS_PER_SM): the warp maxima meet in maxima (shared memory), thread 0 folds the CTA's into byte 24 of
-    gmax (gb), counts the CTA at byte 32 and polls the count until every CTA has added its maximum."""
+    once (V_CTAS_PER_SM): the warp maxima meet in maxima (shared memory), thread 0 folds the CTA's into word GMAX_V of
+    gmax (gb), counts the CTA in word GMAX_V_CTAS and polls the count until every CTA has added its maximum."""
     wm = warp_max(x)
     if lane == 0:
         cute.arch.store(sptr(Float32, maxima + warp * 4), wm)
     cute.arch.sync_threads()
     if tidx == 0:
         block_max = cute.arch.load(sptr(Float32, maxima), Float32)
-        for w in cutlass.range_constexpr(1, 8):
+        for w in cutlass.range_constexpr(1, V_THREADS // 32):
             block_max = cute.arch.fmax(
                 block_max, cute.arch.load(sptr(Float32, maxima + w * 4), Float32)
             )
         # the maxima are non-negative floats: the unsigned maximum of their bits orders them
-        word = gb + Int64(24)
+        word = gb + Int64(4 * GMAX_V)
         bits = f2u(block_max)
         cute.arch.red(gptr(Uint32, word), bits, op="max", dtype="u32", sem="relaxed", scope="gpu")
         # the release part of the add orders this thread's max update before it; the acquiring loads of the poll
         # observe every CTA's maximum before the cast begins
         seen = cute.arch.atomic_add(
-            gptr(Uint32, gb + Int64(32)), Uint32(1), sem="acq_rel", scope="gpu"
+            gptr(Uint32, gb + Int64(4 * GMAX_V_CTAS)), Uint32(1), sem="acq_rel", scope="gpu"
         ) + Uint32(1)
         while seen < Uint32(gdim):
             nanosleep(256)
-            seen = cute.arch.load(gptr(Uint32, gb + Int64(32)), Uint32, sem="acquire", scope="gpu")
+            seen = cute.arch.load(
+                gptr(Uint32, gb + Int64(4 * GMAX_V_CTAS)), Uint32, sem="acquire", scope="gpu"
+            )
     cute.arch.sync_threads()
-    vmax = u2f(cute.arch.load(gptr(Uint32, gb + Int64(24)), Uint32, sem="acquire", scope="gpu"))
+    vmax = u2f(
+        cute.arch.load(gptr(Uint32, gb + Int64(4 * GMAX_V)), Uint32, sem="acquire", scope="gpu")
+    )
     return Float32(1.0) / pow2_ceil_448(vmax)
 
 
@@ -81,7 +86,7 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
     lane = tidx & 31
     warp = tidx >> 5
     smem = utils.SmemAllocator()
-    maxima_p = smem.allocate_array(Float32, 8, byte_alignment=16)
+    maxima_p = smem.allocate_array(Float32, V_THREADS // 32, byte_alignment=16)
     maxima = Int32(maxima_p.toint())
     vb = Int64(v.iterator.toint())
     ob = Int64(v8.iterator.toint())
@@ -143,7 +148,7 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
                 )
             mrow = (Int64(b) * Int64(H) + Int64(hh)) * Int64(NB) + Int64(j)
             store_vector(gptr(Uint32, mb + mrow * Int64(256) + Int64(cg) * Int64(16), 16), words)
-            q = q + Int32(256)
+            q = q + Int32(V_THREADS)
         u = u + gdim
 
     inv8 = _grid_inv8(acc, maxima, gb, tidx, lane, warp, gdim)
@@ -199,7 +204,7 @@ def _v_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
                     store_vector(gptr(Uint32, dst, 8), (Uint32(0), Uint32(0)))
             means = tuple(bf16x2(mu[2 * e] * inv8, mu[2 * e + 1] * inv8) for e in range(4))
             store_vector(gptr(Uint32, maddr, 16), means)
-            q = q + Int32(256)
+            q = q + Int32(V_THREADS)
         u = u + gdim
 
     # every thread waits before the grid retires, so the next plain launch cannot race the eigensolver grid

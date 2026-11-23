@@ -51,6 +51,7 @@ Split tail:
 """
 
 import math
+from types import SimpleNamespace
 
 import cutlass
 import cutlass.cute as cute
@@ -129,7 +130,6 @@ def cta_state(tidx, qt, hh, bb, dist):
                                       the lookahead), and the per-lane offsets of the V row and the v_mean rows
         O, P                          load_operands: the register tensors of the O accumulators and of the packed P
                                       with its block sums and quarter mask (softmax.py)
-        piece, parts                  body_lens: the key-range piece of the CTA and the pieces of its unit
     """
     warp = tidx >> 5
     lane = tidx & 31
@@ -653,6 +653,101 @@ def store_unit_rows(
 
 
 # ------------------------------------------------------------------------------------------------ CTA bodies
+# The key tiles of a CTA, for run_phases: n tiles (n_min: its lower bound at trace time), tile(j) of step j; lim0():
+# the valid keys of tile 0; refill0(): the refill of stage 0 (None: no phase 3); refill(count, k, stage): that of
+# loop phase k; last_qk(nzp, sm): phase n - 1. lim0 and refill0 are functions: they emit where run_phases calls them.
+
+
+def whole_tiles(st, rot, nT, lim):
+    """All nT key tiles for a whole unit: diagonal first by rot, the partial last tile (lim valid keys) last. A single
+    key tile is a full one: launch.run sends S < KT to small.py."""
+
+    def refill0():
+        if nT <= 2:
+            # no phase 3: stage 0 is not refilled
+            return None
+        vt2 = step_tile(2, rot, nT)
+        return lambda old: refill_full0(st, old, rot, nT, vt2)
+
+    return SimpleNamespace(
+        n=nT,
+        n_min=nT,
+        tile=lambda j: step_tile(j, rot, nT),
+        lim0=lambda: KT,
+        refill0=refill0,
+        refill=lambda old, k, stage: refill_loop_full(st, old, k, stage, rot, nT),
+        last_qk=lambda nzp, sm: last_qk_phase_full(st, nT - 1, nzp, sm, lim),
+    )
+
+
+def piece_tiles(st, t0, nK, lim, piece, split):
+    """The nK >= 2 key tiles from t0 of piece `piece` of `split`; the last piece ends with the partial tile (lim)."""
+    return SimpleNamespace(
+        n=nK,
+        n_min=2,
+        tile=lambda j: t0 + j,
+        lim0=lambda: KT,
+        refill0=lambda: lambda old: refill_part0(st, old, t0, nK),
+        refill=lambda old, k, stage: refill_loop_part(st, old, k, stage, t0, nK),
+        last_qk=lambda nzp, sm: last_qk_phase_part(st, nK - 1, nzp, sm, lim, piece, split),
+    )
+
+
+def lens_tiles(st, rng):
+    """The key tiles of the range rng of a call with lengths; the last one holds rng[3]() valid keys."""
+    n = rng[1]()
+    return SimpleNamespace(
+        n=n,
+        n_min=1,
+        tile=lambda j: lens_tile(j, rng),
+        lim0=lambda: Int32(cutlass.select_(n == 1, rng[3](), Int32(KT))),
+        refill0=lambda: lambda old: refill_lens0(st, old, rng),
+        refill=lambda old, k, stage: refill_loop_lens(st, old, k, stage, rng),
+        last_qk=lambda nzp, sm: last_qk_phase_part(st, n - 1, nzp, sm, rng[3](), Int32(0), 1),
+    )
+
+
+@cute.jit
+def run_phases(st, ops, seq, S: cutlass.Constexpr, H: cutlass.Constexpr, vs_ptr=None):
+    """Run the phases 0 .. n of a CTA over its key tiles seq (whole_tiles, piece_tiles, lens_tiles); return the softmax
+    state. A single tile goes from its QK straight to the last phase."""
+    nT = (S + KT - 1) // KT
+    n, refill, last_qk = seq.n, seq.refill, seq.last_qk
+    start_ring(st, ops, H, nT)
+    if st.warp == 4:
+        first_stages(st, seq.tile, n, seq.n_min)
+    if st.grp == 1:
+        # warp w takes the first turn of its pair
+        pass_turn(st)
+    load_operands(st, ops, S, H, nT, vs_ptr)
+    sm = softmax_init()
+    nzp = Int32(0)  # step k - 2's P had a nonzero byte (or V / v_mean a non-finite value)
+    # ---- phase 0: QK(0)
+    acc = qk_phase(st, st.smem, (st.fbar, Int32(0)), st.turn)
+    lim0 = seq.lim0()
+    refill0 = seq.refill0()
+    sm = softmax_step(st, acc, sm, lim0, stage=None if refill0 is None else 0, refill=refill0)
+    sk_i = Int32(1)  # stage of step k (loop-carried: no modulo in the loop)
+    ph = Int32(0)  # its full-barrier parity, (k // STAGES) & 1
+    # ---- phases k = 1 .. n - 2
+    for k in cutlass.range(1, n - 1, unroll=1):
+        nzp, sm = loop_phase(st, k, sk_i, ph, nzp, sm, lambda old: refill(old, k, sk_i))
+        sk_i, ph = stage_next(sk_i, ph, STAGES)
+    # ---- phase n - 1 of n >= 2: PV(n - 2), means(n - 2), QK(n - 1) with the last tile's mask
+    if cutlass.const_expr(seq.n_min >= 2):
+        nzp, sm = last_qk(nzp, sm)
+    elif cutlass.const_expr(not isinstance(n, int)):
+        if n >= 2:
+            nzp, sm = last_qk(nzp, sm)
+    # ---- phase n: PV(n - 1) from stage n % 3 and the means of the last step pair (or unpaired last step)
+    # (every phase waits for its stage, so no copy is in flight after it)
+    last_pv_phase(st, n, nzp)
+    if st.grp == 0:
+        # warp w + 4 takes the last turn of its pair
+        pass_turn(st)
+    return sm
+
+
 @cute.jit
 def full_body(ops, vs_ptr, o_ptr, S: cutlass.Constexpr, H: cutlass.Constexpr, unit):
     """Run query tile `unit` (linear over (tile, head, batch)) over all key tiles and store its final bf16 rows."""
@@ -663,43 +758,7 @@ def full_body(ops, vs_ptr, o_ptr, S: cutlass.Constexpr, H: cutlass.Constexpr, un
     # diagonal-first key order: steps 0 .. nT - 2 take full tiles qt, qt + 1, ... (mod nT - 1), the last step the
     # partial tile nT - 1
     rot = st.qt % (nT - 1) if nT >= 2 else Int32(0)
-    start_ring(st, ops, H, nT)
-    if st.warp == 4:
-        first_stages(st, lambda j: step_tile(j, rot, nT), nT, nT)
-    if st.grp == 1:
-        # warp w takes the first turn of its pair
-        pass_turn(st)
-    load_operands(st, ops, S, H, nT, vs_ptr)
-    sm = softmax_init()
-    nzp = Int32(0)  # step k - 2's P had a nonzero byte (or V / v_mean a non-finite value)
-
-    # ---- phase 0: QK(0)
-    acc = qk_phase(st, st.smem, (st.fbar, Int32(0)), st.turn)
-    if cutlass.const_expr(nT > 2):
-        vt2 = step_tile(2, rot, nT)
-        sm = softmax_step(
-            st, acc, sm, KT, stage=0, refill=lambda old: refill_full0(st, old, rot, nT, vt2)
-        )
-    else:
-        # no phase 3: stage 0 is not refilled (a single key tile is a full one: launch.run sends S < KT to small.py)
-        sm = softmax_step(st, acc, sm, KT)
-    sk_i = Int32(1)  # stage of step k (loop-carried: no modulo in the loop)
-    ph = Int32(0)  # its full-barrier parity, (k // STAGES) & 1
-    # ---- phases k = 1 .. nT - 2
-    for k in cutlass.range(1, nT - 1, unroll=1):
-        nzp, sm = loop_phase(
-            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_full(st, old, k, sk_i, rot, nT)
-        )
-        sk_i, ph = stage_next(sk_i, ph, STAGES)
-    # ---- phase nT - 1: PV(nT - 2), means(nT - 2), QK(nT - 1) with the last tile's mask
-    if cutlass.const_expr(nT >= 2):
-        nzp, sm = last_qk_phase_full(st, nT - 1, nzp, sm, LIM)
-    # ---- phase nT: PV(nT - 1) from stage nT % 3 and the means of the last step pair (or unpaired last step)
-    # (every phase waits for its stage, so no copy is in flight after it)
-    last_pv_phase(st, nT, nzp)
-    if st.grp == 0:
-        # warp w + 4 takes the last turn of its pair
-        pass_turn(st)
+    sm = run_phases(st, ops, whole_tiles(st, rot, nT, LIM), S, H, vs_ptr)
 
     # ---- epilogue: row sums over the quad; o = O * v8_scale / l, staged through a free stage as bf16 rows
     _, _, l0, l1, _ = sm
@@ -738,76 +797,9 @@ def partial_body(
         t1 = (piece + 1) * nT // split
         nK = t1 - t0
     st = cta_state(tidx, qt, hh, bb, min(DIST, nT // split))
-    start_ring(st, ops, H, nT)
-    if st.warp == 4:
-        first_stages(st, lambda j: t0 + j, nK, 2)
-    if st.grp == 1:
-        # warp w takes the first turn of its pair
-        pass_turn(st)
-    load_operands(st, ops, S, H, nT)
-    sm = softmax_init()
-    nzp = Int32(0)  # step k - 2's P had a nonzero byte (or V / v_mean a non-finite value)
-
-    # ---- phase 0: QK(0)
-    acc = qk_phase(st, st.smem, (st.fbar, Int32(0)), st.turn)
-    sm = softmax_step(st, acc, sm, KT, stage=0, refill=lambda old: refill_part0(st, old, t0, nK))
-    sk_i = Int32(1)  # stage of step k (loop-carried: no modulo in the loop)
-    ph = Int32(0)  # its full-barrier parity, (k // STAGES) & 1
-    # ---- phases k = 1 .. nK - 2
-    for k in cutlass.range(1, nK - 1, unroll=1):
-        nzp, sm = loop_phase(
-            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_part(st, old, k, sk_i, t0, nK)
-        )
-        sk_i, ph = stage_next(sk_i, ph, STAGES)
-    # ---- phase nK - 1: PV(nK - 2), means(nK - 2), QK(nK - 1) with the last tile's mask
-    nzp, sm = last_qk_phase_part(st, nK - 1, nzp, sm, LIM, piece, split)
-    # ---- phase nK: PV(nK - 1) from stage nK % 3 and the means of the last pair (or unpaired last step)
-    last_pv_phase(st, nK, nzp)
-    if st.grp == 0:
-        # warp w + 4 takes the last turn of its pair
-        pass_turn(st)
-
+    sm = run_phases(st, ops, piece_tiles(st, t0, nK, LIM, piece, split), S, H)
     anc0, anc1, l0, l1, _ = sm
     store_partials(part_ptr, bid, st.tidx, st.O, anc0, anc1, l0, l1)
-
-
-@cute.jit
-def lens_phases(st, ops, rng, S: cutlass.Constexpr, H: cutlass.Constexpr, vs_ptr=None):
-    """Run the phases of a CTA of a call with lengths over the key tiles of the range rng; return the softmax state.
-    The ring and the operands are as in full_body, the phases as in partial_body; the keys of the last tile are masked
-    from its valid count on, and a single tile goes from its QK straight to the last phase."""
-    nT = (S + KT - 1) // KT
-    start_ring(st, ops, H, nT)
-    if st.warp == 4:
-        first_stages(st, lambda j: lens_tile(j, rng), rng[1](), 1)
-    if st.grp == 1:
-        # warp w takes the first turn of its pair
-        pass_turn(st)
-    load_operands(st, ops, S, H, nT, vs_ptr)
-    sm = softmax_init()
-    nzp = Int32(0)  # step k - 2's P had a nonzero byte (or V / v_mean a non-finite value)
-    # ---- phase 0: QK(0); its tile is masked when it is the only one
-    acc = qk_phase(st, st.smem, (st.fbar, Int32(0)), st.turn)
-    lim0 = Int32(cutlass.select_(rng[1]() == 1, rng[3](), Int32(KT)))
-    sm = softmax_step(st, acc, sm, lim0, stage=0, refill=lambda old: refill_lens0(st, old, rng))
-    sk_i = Int32(1)  # stage of step k (loop-carried: no modulo in the loop)
-    ph = Int32(0)  # its full-barrier parity, (k // STAGES) & 1
-    # ---- phases k = 1 .. n - 2
-    for k in cutlass.range(1, rng[1]() - 1, unroll=1):
-        nzp, sm = loop_phase(
-            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_lens(st, old, k, sk_i, rng)
-        )
-        sk_i, ph = stage_next(sk_i, ph, STAGES)
-    # ---- phase n - 1: PV(n - 2), means(n - 2), QK(n - 1) with the last tile's mask
-    n = rng[1]()
-    if n >= 2:
-        nzp, sm = last_qk_phase_part(st, n - 1, nzp, sm, rng[3](), Int32(0), 1)
-    # ---- phase n: PV(n - 1) and the means of the last step pair (or unpaired last step)
-    last_pv_phase(st, n, nzp)
-    if st.grp == 0:
-        # warp w + 4 takes the last turn of its pair
-        pass_turn(st)
-    return sm
 
 
 def _picker(whole):
@@ -847,21 +839,21 @@ def body_lens(
     unit = pick(bid, n_full + (bid - n_full) // split)
     st = cta_state(tidx, unit % nT, (unit // nT) % H, unit // (nT * H), DIST)
     # a whole unit counts as the only piece of one
-    st.piece = pick(Int32(0), (bid - n_full) % split)
-    st.parts = pick(Int32(1), Int32(split))
+    piece = pick(Int32(0), (bid - n_full) % split)
+    parts = pick(Int32(1), Int32(split))
     nv = valid_len(lens_ptr.toint(), st.bb, S)
     if st.tidx == 0:
         cute.arch.store(sptr(Int32, st.smem + LEN_OFF), nv)
-    # the range of lens_phases: the tiles of this CTA up to the last valid one, diagonal first for a whole unit
-    r0 = st.piece * nT // st.parts
+    # the range of lens_tiles: the tiles of this CTA up to the last valid one, diagonal first for a whole unit
+    r0 = piece * nT // parts
     kv = (nv + KT - 1) // KT
-    r1 = cutlass.min((st.piece + 1) * nT // st.parts, kv) - r0
+    r1 = cutlass.min((piece + 1) * nT // parts, kv) - r0
     r2 = pick(st.qt % cutlass.max(kv - 1, Int32(1)), Int32(0))
     r3 = Int32(cutlass.select_(r0 + r1 == kv, (nv - 1) % KT + 1, Int32(KT)))
     rng = (lambda: r0, lambda: r1, lambda: r2, lambda: r3)
     if st.qt * QT < nv:
-        if st.piece * nT // st.parts < (nv + KT - 1) // KT:
-            anc0, anc1, l0, l1, _ = lens_phases(st, ops, rng, S, H, vs_ptr)
+        if r0 < kv:
+            anc0, anc1, l0, l1, _ = run_phases(st, ops, lens_tiles(st, rng), S, H, vs_ptr)
             if whole:
                 f = inv_row_sums(l0, l1, st.q)
                 # every warp must be past its last stage read before stages 0 and 1 are reused for the output rows

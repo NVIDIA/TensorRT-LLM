@@ -17,7 +17,7 @@
 * The clear launch (one CTA) zeroes the per-call words of gmax, in which the later launches accumulate their maxima
   and count their CTAs.
 * The eigensolver launch (one 288-thread CTA per (batch, head)) accumulates the Gram matrices of the sampled q and k
-  rows (the tokens of qk_rows, in 256-row chunks) with tcgen05 MMAs and normalizes each by its trace.
+  rows (the tokens of the argument rows, in 256-row chunks) with tcgen05 MMAs and normalizes each by its trace.
 * It writes the eigenvectors V of the `rank` largest eigenvalues (32 or 64) of Gq0 / tr + Gk0 / tr of the unrotated
   tokens as U^T: the shared basis of the 2 x rank compensation channels of Q' and K'.
 * U = Hd^T V / sqrt(128): G = Hd^T G0 Hd / 128 has the eigenvectors Hd^T V / sqrt(128) when G0 has V (Hd Hd^T = 128 I).
@@ -35,10 +35,9 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import Float32, Int32, Int64, Uint32
-from cutlass.cute.math import RoundingMode
 
 from ...common.dsl import Tcgen05Fence, tcgen05_fence
-from ...common.expmath import f2u, hash01, rcp_or_zero, u2f, warp_sum
+from ...common.expmath import RN, f2u, hash01, rcp_or_zero, u2f, warp_sum
 from ...common.mem import (
     cp_async16,
     gptr,
@@ -49,13 +48,15 @@ from ...common.mem import (
     store_vector,
 )
 from ...common.state import State
+from ...constants import INV_SQRT_HEAD_DIM
 from ..ptx import idesc_bf16, smem_desc_mn_sw128
 from ..tmem import ld_tmem_f32_x32_wait, tc_commit, tc_mma
 from ..valid_len import valid_len
 
 EIG_THREADS = 288  # eigensolver CTA: eight row warps and the pivot warp
-# The per-call words of gmax (module docstring)
+# Per-call words of gmax (module docstring): count; first Q' and K' maximum, V maximum, count of the V pass's CTAs
 GMAX_WORDS = 10
+GMAX_Q, GMAX_K, GMAX_V, GMAX_V_CTAS = 0, 3, 6, 8
 
 
 # ---------------------------------------------------------------- clear launch
@@ -79,7 +80,7 @@ def _gram(
     st,
     qtens: cute.Tensor,
     ktens: cute.Tensor,
-    qk_rows: cute.Tensor,
+    rows: cute.Tensor,
     bh: Int32,
     S: Int32,
     H: Int32,
@@ -91,7 +92,7 @@ def _gram(
 
     * All 288 threads participate (eight warps stage, four read TMEM rows); the step's last barrier publishes VH.
     * lens: None, or (the global address of the valid prefix lengths, rows per sample, mapped rows). With rows per
-      sample qk_rows is [B, NQK] and the batch element uses its own row; a row r of a batch element of n valid tokens
+      sample rows is [B, NQK] and the batch element uses its own row; a row r of a batch element of n valid tokens
       stands for token floor(r n / S) with mapped rows and for token min(r, n - 1) otherwise (token 0 when n is 0).
     """
     sRed = st.sRed
@@ -108,11 +109,10 @@ def _gram(
     idesc = Int32(idesc_bf16(128, 128) | (1 << 15) | (1 << 16))
     batch = bh // H
     head = bh - batch * H
-    nch = NCQ
     qb = Int64(qtens.iterator.toint())
     kb = Int64(ktens.iterator.toint())
-    rowsb = Int64(qk_rows.iterator.toint())
-    for ch in cutlass.range(nch, unroll=1):
+    rowsb = Int64(rows.iterator.toint())
+    for ch in cutlass.range(NCQ, unroll=1):
         if ch > 0:
             mbar_wait(st.mbar, (ch - 1) & 1)
         if st.tidx < 256:
@@ -154,7 +154,7 @@ def _gram(
                     + (((cc & 7) ^ (tt & 7)) << 4)
                 )
                 cp_async16(st.dmb + dst, qb + off, nb)
-                cp_async16(st.ylb + dst, kb + off, nb)
+                cp_async16(st.zbb + dst, kb + off, nb)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.fence_proxy("async.shared", space="cta")
@@ -165,13 +165,13 @@ def _gram(
             acc0 = Int32(ch > 0)
             for j in cutlass.range_constexpr(16):
                 da = smem_desc_mn_sw128(st.dmb + j * 4096)
-                dl = smem_desc_mn_sw128(st.ylb + j * 4096)
+                dl = smem_desc_mn_sw128(st.zbb + j * 4096)
                 tc_mma(tm, da, da, idesc, acc0 if j == 0 else Int32(1), kind="f16", a_tmem=False)
                 tc_mma(
                     tm + 128, dl, dl, idesc, acc0 if j == 0 else Int32(1), kind="f16", a_tmem=False
                 )
             tc_commit(st.mbar)
-    mbar_wait(st.mbar, (nch - 1) & 1)
+    mbar_wait(st.mbar, (NCQ - 1) & 1)
     tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
     # Only the first four warps use trace scratch.
     tl = (st.warp * 32) << 16
@@ -202,15 +202,8 @@ def _gram(
             gk = ld_tmem_f32_x32_wait(tm + tl + 128 + 32 * c32)
             for c4 in cutlass.range_constexpr(8):
                 dst = st.vhb + (st.tidx * 32 + ((c32 * 8 + c4) ^ (st.tidx & 7))) * 16
-                store_vector(
-                    sptr(Uint32, dst, 16),
-                    (
-                        f2u(ga[c4 * 4] * ia + gk[c4 * 4] * ib),
-                        f2u(ga[c4 * 4 + 1] * ia + gk[c4 * 4 + 1] * ib),
-                        f2u(ga[c4 * 4 + 2] * ia + gk[c4 * 4 + 2] * ib),
-                        f2u(ga[c4 * 4 + 3] * ia + gk[c4 * 4 + 3] * ib),
-                    ),
-                )
+                words = tuple(f2u(ga[c4 * 4 + e] * ia + gk[c4 * 4 + e] * ib) for e in range(4))
+                store_vector(sptr(Uint32, dst, 16), words)
     tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
     cute.arch.sync_threads()
     if st.warp == 0:
@@ -221,9 +214,7 @@ def _gram(
 
 # ---------------------------------------------------------------- eigensolver
 
-_ZS = (
-    130  # row stride (floats) of the padded L / z buffer (ylb); the D- buffer (dmb) has rows of 128
-)
+_ZS = 130  # row stride (floats) of the padded L / z buffer (zbb); the D- buffer has rows of 128
 
 
 def _eig_state(tidx, RANK):
@@ -258,8 +249,8 @@ def _eig_state(tidx, RANK):
     # cnt: the Sturm counts of the grid [512]; in the cluster repair, the chain starts (0..), ends (256..) and their
     # number (508); in the back-transform, the reflector pair products [j] as FP32
     cnt_p = smem.allocate_array(Int32, 512, byte_alignment=16)
-    # red: warp reductions: the trace partials of Gq (0..3) and Gk (8..11); in the cluster repair, the first (32..)
-    # and the last (48..) chain with a replaced member
+    # red: warp reductions: the trace partials of Gq (0..3) and Gk (8..11); in the cluster repair, per warp the last
+    # chain with a replaced member (48..)
     red_p = smem.allocate_array(Float32, 64, byte_alignment=16)
     # tw: the norm partials of a reflector [lane]; in the twisted factorization, [side][slot] each, the smallest
     # gamma (0..), its row as Uint32 (256..) and the norm half (512..)
@@ -276,7 +267,7 @@ def _eig_state(tidx, RANK):
         tpe_log2=tpe.bit_length() - 1,
         ng=32 // tpe,
         vhb=Int32(vh_p.toint()),
-        ylb=Int32(zb_p.toint()),
+        zbb=Int32(zb_p.toint()),
         dmb=Int32(dm_p.toint()),
         pbb=Int32(pb_p.toint()),
         rbb=Int32(rb_p.toint()),
@@ -400,21 +391,21 @@ def _first_reflector(st):
     sTau, sD, sE = st.sTau, st.sD, st.sE
     if st.tidx >= 256:
         x4 = load_vector(sptr(Uint32, st.rbb + 512 + st.lane * 16, 16), 4)
-        tau0, d0_, al0 = _pivot(st, Int32(0), [u2f(x4[0]), u2f(x4[1]), u2f(x4[2]), u2f(x4[3])])
+        tau0, d0, al0 = _pivot(st, Int32(0), [u2f(x4[0]), u2f(x4[1]), u2f(x4[2]), u2f(x4[3])])
         if st.lane == 0:
             sTau[0] = tau0
-            sD[0] = d0_
+            sD[0] = d0
             sE[0] = al0
 
 
 @cute.jit
-def _row_pair_products(st, rows, k, ko: cutlass.Constexpr):
+def _row_pair_products(st, pair, k, ko: cutlass.Constexpr):
     """Row warps >= ko, step k (the barrier before published reflector k in VH and tau_k): thread (rp, q) sums its
     column blocks of (A v)[r0] and (A v)[r0 + 1], the four threads of the row pair combine them, p = tau A v of the two
     rows goes to pb and the warp's partial of v . p to part (zero from an idle warp). Returns the thread's p[r0],
     p[r0 + 1], v[r0], v[r0 + 1] and tau_k for the update after the barrier."""
-    a0, a1 = rows.a0, rows.a1
-    r0, q, qoff = rows.r0, rows.q, rows.qoff
+    a0, a1 = pair.a0, pair.a1
+    r0, q, qoff = pair.r0, pair.q, pair.qoff
     vk = st.vhb + k * 512
     # only the active row warps consume these within this step
     p0 = Float32(0.0)
@@ -430,26 +421,25 @@ def _row_pair_products(st, rows, k, ko: cutlass.Constexpr):
                 w4 = load_vector(sptr(Uint32, vk + 64 * m + qoff, 16), 4)
                 for e2 in cutlass.range_constexpr(2):
                     vm2 = (u2f(w4[2 * e2]), u2f(w4[2 * e2 + 1]))
-                    ra = cute.arch.fma_packed_f32x2(
+                    fa = cute.arch.fma_packed_f32x2(
                         (a0[4 * m + 2 * e2], a0[4 * m + 2 * e2 + 1]),
                         vm2,
                         (ac[2 * e2], ac[2 * e2 + 1]),
                     )
-                    rb = cute.arch.fma_packed_f32x2(
+                    fb = cute.arch.fma_packed_f32x2(
                         (a1[4 * m + 2 * e2], a1[4 * m + 2 * e2 + 1]),
                         vm2,
                         (ac[4 + 2 * e2], ac[4 + 2 * e2 + 1]),
                     )
-                    ac[2 * e2] = ra[0]
-                    ac[2 * e2 + 1] = ra[1]
-                    ac[4 + 2 * e2] = rb[0]
-                    ac[4 + 2 * e2 + 1] = rb[1]
+                    ac[2 * e2] = fa[0]
+                    ac[2 * e2 + 1] = fa[1]
+                    ac[4 + 2 * e2] = fb[0]
+                    ac[4 + 2 * e2 + 1] = fb[1]
             s0 = (ac[0] + ac[1]) + (ac[2] + ac[3])
             s1 = (ac[4] + ac[5]) + (ac[6] + ac[7])
-            s0 = s0 + cute.arch.shuffle_sync_bfly(s0, offset=Int32(1))
-            s1 = s1 + cute.arch.shuffle_sync_bfly(s1, offset=Int32(1))
-            s0 = s0 + cute.arch.shuffle_sync_bfly(s0, offset=Int32(2))
-            s1 = s1 + cute.arch.shuffle_sync_bfly(s1, offset=Int32(2))
+            for o in (1, 2):
+                s0 = s0 + cute.arch.shuffle_sync_bfly(s0, offset=Int32(o))
+                s1 = s1 + cute.arch.shuffle_sync_bfly(s1, offset=Int32(o))
             p0 = s0 * tk
             p1 = s1 * tk
             vr0 = cute.arch.load(sptr(Float32, vk + r0 * 4), Float32)
@@ -457,9 +447,8 @@ def _row_pair_products(st, rows, k, ko: cutlass.Constexpr):
             if q == 0:
                 store_vector(sptr(Uint32, st.pbb + r0 * 4, 8), (f2u(p0), f2u(p1)))
             t = (p0 * vr0 + p1 * vr1) * Float32(q == 0)
-            t = t + cute.arch.shuffle_sync_bfly(t, offset=Int32(4))
-            t = t + cute.arch.shuffle_sync_bfly(t, offset=Int32(8))
-            t = t + cute.arch.shuffle_sync_bfly(t, offset=Int32(16))
+            for o in (4, 8, 16):
+                t = t + cute.arch.shuffle_sync_bfly(t, offset=Int32(o))
             if st.lane == 0:
                 cute.arch.store(sptr(Float32, st.partb + (st.tidx >> 3)), t)
         else:
@@ -479,13 +468,13 @@ def _reflector_dot(st):
 
 
 @cute.jit
-def _row_pair_update(st, rows, pv, ksum, k, ko: cutlass.Constexpr):
+def _row_pair_update(st, pair, prods, ksum, k, ko: cutlass.Constexpr):
     """Row warps >= ko, step k, after the barrier that publishes p (pb) and v . p (ksum): the rank-2 update
-    A <- A - v p^T - c v^T with c = p - tau (v . p) v on the thread's row pair (pv: what _row_pair_products
+    A <- A - v p^T - c v^T with c = p - tau (v . p) v on the thread's row pair (prods: what _row_pair_products
     returned); the threads of row k + 2 publish it in rb."""
-    a0, a1 = rows.a0, rows.a1
-    qoff = rows.qoff
-    p0, p1, vr0, vr1, tk = pv
+    a0, a1 = pair.a0, pair.a1
+    qoff = pair.qoff
+    p0, p1, vr0, vr1, tk = prods
     vk = st.vhb + k * 512
     if st.tidx >= 32 * ko:
         kc = ksum * tk * Float32(0.5)
@@ -513,30 +502,16 @@ def _row_pair_update(st, rows, pv, ksum, k, ko: cutlass.Constexpr):
                 a1[4 * m + 2 * e2 + 1] = x1[1]
         # publish the live column blocks of row k + 2 (of A^(k+1)) for the pivot of the next step;
         # older words of blocks m < ko are masked to zero by the pivot before any use
-        if rows.rp == ((k + 2) >> 1):
+        if pair.rp == ((k + 2) >> 1):
             rbn = st.rbb + ((k + 1) & 1) * 512
             if (k & 1) == 0:
                 for m in cutlass.range_constexpr(ko, 8):
-                    store_vector(
-                        sptr(Uint32, rbn + 64 * m + qoff, 16),
-                        (
-                            f2u(a0[4 * m]),
-                            f2u(a0[4 * m + 1]),
-                            f2u(a0[4 * m + 2]),
-                            f2u(a0[4 * m + 3]),
-                        ),
-                    )
+                    words = tuple(f2u(a0[4 * m + e]) for e in range(4))
+                    store_vector(sptr(Uint32, rbn + 64 * m + qoff, 16), words)
             else:
                 for m in cutlass.range_constexpr(ko, 8):
-                    store_vector(
-                        sptr(Uint32, rbn + 64 * m + qoff, 16),
-                        (
-                            f2u(a1[4 * m]),
-                            f2u(a1[4 * m + 1]),
-                            f2u(a1[4 * m + 2]),
-                            f2u(a1[4 * m + 3]),
-                        ),
-                    )
+                    words = tuple(f2u(a1[4 * m + e]) for e in range(4))
+                    store_vector(sptr(Uint32, rbn + 64 * m + qoff, 16), words)
 
 
 @cute.jit
@@ -591,11 +566,11 @@ def _next_reflector(st, ksum, k):
 
 
 @cute.jit
-def _store_last_diagonal(st, rows):
+def _store_last_diagonal(st, pair):
     """Thread 255, after the last step: d_127 = A[127][127] from its registers and e_127 = 0."""
     sD, sE = st.sD, st.sE
     if st.tidx == 255:
-        sD[127] = rows.a1[31]
+        sD[127] = pair.a1[31]
         sE[127] = Float32(0.0)
 
 
@@ -622,7 +597,7 @@ def _sturm_rounds(tpe):
     return rounds
 
 
-def pow2_inv_scale(a, b):
+def _pow2_inv_scale(a, b):
     """Return 2^(126 - e), e the larger biased exponent of the f32 a and b: it brings max(|a|, |b|) to [0.5, 1)."""
     e = cutlass.max(f2u(a) & Uint32(0x7F800000), f2u(b) & Uint32(0x7F800000))
     return u2f(Uint32(0x7E800000) - e)
@@ -661,8 +636,8 @@ def _sturm2(st, xa: Float32, xb: Float32):
             pp1 = pc1
             pc0 = pn[0]
             pc1 = pn[1]
-        sa = pow2_inv_scale(pc0, pp0)
-        sb = pow2_inv_scale(pc1, pp1)
+        sa = _pow2_inv_scale(pc0, pp0)
+        sb = _pow2_inv_scale(pc1, pp1)
         rc = cute.arch.mul_packed_f32x2((pc0, pc1), (sa, sb))
         rp = cute.arch.mul_packed_f32x2((pp0, pp1), (sa, sb))
         pc0 = rc[0]
@@ -732,7 +707,7 @@ def _refine_eigenvalues(st, search):
     if st.tidx < 256:
         bl = Int32(-1)
         br = Int32(512)
-        for bs in cutlass.range_constexpr(10):
+        for _ in cutlass.range_constexpr(10):
             mid = (bl + br) >> 1
             cm = Int32(
                 cute.arch.load(sptr(Uint32, st.cntb + cutlass.max(mid, Int32(0)) * 4), Uint32)
@@ -744,17 +719,17 @@ def _refine_eigenvalues(st, search):
                     br = mid
         lo = glo + stp0 * Float32(bl + 1)
         hi = glo + stp0 * Float32(br + 1)
-        for it in cutlass.range(nit):
+        for _ in cutlass.range(nit):
             stp = (hi - lo) / Float32(nsec)
-            x0_ = lo + stp * Float32(sub * 2 + 1)
-            x1_ = lo + stp * Float32(sub * 2 + 2)
-            c0, c1 = _sturm2(st, x0_, x1_)
+            x0 = lo + stp * Float32(sub * 2 + 1)
+            x1 = lo + stp * Float32(sub * 2 + 2)
+            c0, c1 = _sturm2(st, x0, x1)
             below = lo
             above = hi
-            below = Float32(cutlass.select_(c0 <= m_idx, x0_, below))
-            below = Float32(cutlass.select_(c1 <= m_idx, x1_, below))
-            above = Float32(cutlass.select_(c1 > m_idx, x1_, above))
-            above = Float32(cutlass.select_(c0 > m_idx, x0_, above))
+            below = Float32(cutlass.select_(c0 <= m_idx, x0, below))
+            below = Float32(cutlass.select_(c1 <= m_idx, x1, below))
+            above = Float32(cutlass.select_(c1 > m_idx, x1, above))
+            above = Float32(cutlass.select_(c0 > m_idx, x0, above))
             for o in (1, 2, 4):
                 bo = cute.arch.shuffle_sync_bfly(below, offset=Int32(o))
                 ao = cute.arch.shuffle_sync_bfly(above, offset=Int32(o))
@@ -868,9 +843,9 @@ def _twisted_solve(st, twist):
     if twist.act:
         b0 = st.sGamma[0, tslot]
         b1 = st.sGamma[1, tslot]
-        r0_ = Int32(st.sTwistRow[0, tslot])
-        r1_ = Int32(st.sTwistRow[1, tslot])
-        r = Int32(cutlass.select_(b1 < b0, r1_, r0_))
+        row0 = Int32(st.sTwistRow[0, tslot])
+        row1 = Int32(st.sTwistRow[1, tslot])
+        r = Int32(cutlass.select_(b1 < b0, row1, row0))
         # solve: side 0 upwards from r (L), side 1 downwards (e / D-)
         zz = Float32(1.0)
         if side == 0:
@@ -905,7 +880,7 @@ def _normalize_halves(st, twist):
     if twist.act:
         inv = Float32(1.0) / cute.math.sqrt(
             st.sNorm2[0, tslot] + st.sNorm2[1, tslot],
-            rounding=RoundingMode.NEAREST_EVEN,
+            rounding=RN,
         )
         for ii in cutlass.range(side * 64, side * 64 + 64, unroll=8):
             sZ[ii, tslot] = sZ[ii, tslot] * inv
@@ -960,9 +935,7 @@ def _degen_filter(st, slot: Int32, shift: Float32, pmin: Float32):
     for ii in cutlass.range(128, unroll=4):
         zz = sZ[ii, slot] * invmax
         n2 = cute.fma(zz, zz, n2)
-    invnorm = invmax / cute.math.sqrt(
-        cute.arch.fmax(n2, Float32(1e-30)), rounding=RoundingMode.NEAREST_EVEN
-    )
+    invnorm = invmax / cute.math.sqrt(cute.arch.fmax(n2, Float32(1e-30)), rounding=RN)
     for ii in cutlass.range(128, unroll=4):
         sZ[ii, slot] = sZ[ii, slot] * invnorm
 
@@ -983,7 +956,7 @@ def _orthogonalize_replaced(st, REPS: cutlass.Constexpr = 2, KEPT: cutlass.Const
     if st.tidx < nslot:
         mine = Int32(st.sE2[st.tidx] > Float32(0.5))
         pos = nslot - 1 - st.tidx
-    rb = st.ylb + st.tidx * (_ZS * 4)
+    zrow = st.zbb + st.tidx * (_ZS * 4)
     for jj in cutlass.range(0, nslot):
         sj = nslot - 1 - jj
         # every thread reads the same flag, so the barriers below are reached by the whole CTA
@@ -1016,7 +989,7 @@ def _orthogonalize_replaced(st, REPS: cutlass.Constexpr = 2, KEPT: cutlass.Const
                     z1 = Float32(0.0)
                     for sp in cutlass.range(0, nslot, 2, unroll=4):
                         c2 = load_vector(sptr(Uint32, st.dmb + sp * 4, 8), 2)
-                        y2 = load_vector(sptr(Uint32, rb + sp * 4, 8), 2)
+                        y2 = load_vector(sptr(Uint32, zrow + sp * 4, 8), 2)
                         z0 = cute.fma(-u2f(c2[0]), u2f(y2[0]), z0)
                         z1 = cute.fma(-u2f(c2[1]), u2f(y2[1]), z1)
                     zz = z0 + z1
@@ -1029,10 +1002,7 @@ def _orthogonalize_replaced(st, REPS: cutlass.Constexpr = 2, KEPT: cutlass.Const
             if st.tidx < 128:
                 n2 = (sCoef[128] + sCoef[129]) + (sCoef[130] + sCoef[131])
                 sZ[st.tidx, sj] = sZ[st.tidx, sj] * (
-                    Float32(1.0)
-                    / cute.math.sqrt(
-                        cute.arch.fmax(n2, Float32(1e-30)), rounding=RoundingMode.NEAREST_EVEN
-                    )
+                    Float32(1.0) / cute.math.sqrt(cute.arch.fmax(n2, Float32(1e-30)), rounding=RN)
                 )
             cute.arch.sync_threads()
 
@@ -1055,8 +1025,6 @@ def _cluster_repair(st, span: Float32):
     tolc = span * Float32(2e-5)
     if st.tidx < 128:
         sE2[st.tidx] = Float32(0.0)
-    if st.tidx < 16:
-        sRed[32 + st.tidx] = Float32(0.0)
     if st.warp == 0:
         nst = Int32(0)
         nen = Int32(0)
@@ -1089,8 +1057,7 @@ def _cluster_repair(st, span: Float32):
             cute.arch.store(sptr(Uint32, st.cntb + 508 * 4), Uint32(nst))
     cute.arch.sync_threads()
     ncl = Int32(cute.arch.load(sptr(Uint32, st.cntb + 508 * 4), Uint32))
-    # per warp, the first and the last chain with a replaced member (256 and -1 when none)
-    cmin = Int32(256)
+    # per warp, the last chain with a replaced member (-1 when none)
     cmax = Int32(-1)
     for ci in cutlass.range(st.warp, ncl, EIG_THREADS // 32):
         cstart = Int32(cute.arch.load(sptr(Uint32, st.cntb + ci * 4), Uint32))
@@ -1122,12 +1089,12 @@ def _cluster_repair(st, span: Float32):
                 n2 = warp_sum(n2)
                 if cutlass.const_expr(rep == 0):
                     degen = Int32(n2 < Float32(1e-4))
-                sc_ = Float32(1.0) / cute.math.sqrt(
-                    cute.arch.fmax(n2, Float32(1e-30)), rounding=RoundingMode.NEAREST_EVEN
+                inv_norm = Float32(1.0) / cute.math.sqrt(
+                    cute.arch.fmax(n2, Float32(1e-30)), rounding=RN
                 )
                 for e in cutlass.range_constexpr(4):
                     ii = st.lane + 32 * e
-                    sZ[ii, sj] = sZ[ii, sj] * sc_
+                    sZ[ii, sj] = sZ[ii, sj] * inv_norm
                 cute.arch.sync_warp()
             if st.lane == 0:
                 sE2[sj] = Float32(degen)
@@ -1136,16 +1103,12 @@ def _cluster_repair(st, span: Float32):
             for s in cutlass.range(cstart + st.lane, cend + 1, 32):
                 sE2[s] = Float32(1.0)
         if hit != 0:
-            cmin = cutlass.min(cmin, ci)
             cmax = cutlass.max(cmax, ci)
     if st.lane == 0:
-        sRed[32 + st.warp] = Float32(cmin)
         sRed[48 + st.warp] = Float32(cmax)
     cute.arch.sync_threads()
-    gmin = Float32(256.0)
     gmax = Float32(-1.0)
     for w in cutlass.range_constexpr(EIG_THREADS // 32):
-        gmin = cute.arch.fmin(gmin, sRed[32 + w])
         gmax = cute.arch.fmax(gmax, sRed[48 + w])
     if gmax > Float32(-0.5):
         if st.tidx < nslot:
@@ -1155,7 +1118,7 @@ def _cluster_repair(st, span: Float32):
         # one projection: the kept vectors are far from parallel; the seed columns it reads only meet zero coefficients
         _orthogonalize_replaced(st, REPS=1, KEPT=True)
         pmin = cute.arch.fmax(span * Float32(1e-9), Float32(1e-30))
-        for iteration in cutlass.range(4):
+        for _ in cutlass.range(4):
             if st.tidx < nslot:
                 if sE2[st.tidx] > Float32(0.5):
                     _degen_filter(
@@ -1173,7 +1136,7 @@ def _cluster_repair(st, span: Float32):
 
 
 @cute.jit
-def _stage_hadamard(st, hadamard: cute.Tensor):
+def _stage_hadamard_f32(st, hadamard: cute.Tensor):
     """Every thread: Hd (BF16, 2048 16-byte chunks) as FP32 into the D- buffer, which is free after the cluster
     repair; the barrier after the reflector pair products publishes it."""
     hb = Int64(hadamard.iterator.toint())
@@ -1237,20 +1200,20 @@ def _apply_reflector_pair(st, vec, jp, mo: cutlass.Constexpr):
             vs1[4 * m + e] = u2f(w1[e])
         for e2 in cutlass.range_constexpr(2):
             zp = (z[4 * m + 2 * e2], z[4 * m + 2 * e2 + 1])
-            ra = cute.arch.fma_packed_f32x2(
+            fa = cute.arch.fma_packed_f32x2(
                 (vs0[4 * m + 2 * e2], vs0[4 * m + 2 * e2 + 1]),
                 zp,
                 (da[2 * e2], da[2 * e2 + 1]),
             )
-            rb = cute.arch.fma_packed_f32x2(
+            fb = cute.arch.fma_packed_f32x2(
                 (vs1[4 * m + 2 * e2], vs1[4 * m + 2 * e2 + 1]),
                 zp,
                 (da[4 + 2 * e2], da[4 + 2 * e2 + 1]),
             )
-            da[2 * e2] = ra[0]
-            da[2 * e2 + 1] = ra[1]
-            da[4 + 2 * e2] = rb[0]
-            da[4 + 2 * e2 + 1] = rb[1]
+            da[2 * e2] = fa[0]
+            da[2 * e2 + 1] = fa[1]
+            da[4 + 2 * e2] = fb[0]
+            da[4 + 2 * e2 + 1] = fb[1]
     d0 = (da[0] + da[1]) + (da[2] + da[3])
     d1 = (da[4] + da[5]) + (da[6] + da[7])
     for o in (1, 2, 4)[: st.tpe_log2]:
@@ -1263,16 +1226,16 @@ def _apply_reflector_pair(st, vec, jp, mo: cutlass.Constexpr):
     n0 = -cf0
     for m in cutlass.range_constexpr(mo, ng):
         for e2 in cutlass.range_constexpr(2):
-            ra = cute.arch.fma_packed_f32x2(
+            fa = cute.arch.fma_packed_f32x2(
                 (n1, n1),
                 (vs1[4 * m + 2 * e2], vs1[4 * m + 2 * e2 + 1]),
                 (z[4 * m + 2 * e2], z[4 * m + 2 * e2 + 1]),
             )
-            rb = cute.arch.fma_packed_f32x2(
-                (n0, n0), (vs0[4 * m + 2 * e2], vs0[4 * m + 2 * e2 + 1]), (ra[0], ra[1])
+            fb = cute.arch.fma_packed_f32x2(
+                (n0, n0), (vs0[4 * m + 2 * e2], vs0[4 * m + 2 * e2 + 1]), (fa[0], fa[1])
             )
-            z[4 * m + 2 * e2] = rb[0]
-            z[4 * m + 2 * e2 + 1] = rb[1]
+            z[4 * m + 2 * e2] = fb[0]
+            z[4 * m + 2 * e2 + 1] = fb[1]
 
 
 @cute.jit
@@ -1308,23 +1271,23 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
     (Hd is in the D- buffer); a thread takes 16 rotated channels of one basis vector out of every 32."""
     if st.tidx < 256:
         for part in cutlass.range_constexpr(st.RANK // 32):
-            rr_ = st.lane  # basis vector (U^T row)
+            urow = st.lane  # basis vector (U^T row)
             if cutlass.const_expr(part > 0):
-                rr_ = rr_ + 32 * part
+                urow = urow + 32 * part
             k0 = st.warp * 16  # 16 rotated channels, the same for every lane of the warp
             accu = cute.make_rmem_tensor((16,), Float32)
             accu.fill(0.0)
             for j in cutlass.range(128, unroll=2):
-                zj = st.sZ[j, rr_]
+                zj = st.sZ[j, urow]
                 for c4 in cutlass.range_constexpr(4):
                     h4 = load_vector(sptr(Uint32, st.dmb + (j * 128 + k0 + 4 * c4) * 4, 16), 4)
                     for e in cutlass.range_constexpr(4):
                         accu[4 * c4 + e] = accu[4 * c4 + e] + zj * u2f(h4[e])
-            s128 = Float32(0.08838834764831845)
+            s128 = Float32(INV_SQRT_HEAD_DIM)
             ub = (
                 Int64(uT.iterator.toint())
                 + Int64(bh) * Int64(st.RANK * 512)
-                + Int64((rr_ * 128 + k0) * 4)
+                + Int64((urow * 128 + k0) * 4)
             )
             for c4 in cutlass.range_constexpr(4):
                 dst = ub + Int64(16 * c4)
@@ -1336,7 +1299,7 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
 
 
 @cute.jit
-def _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
+def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
     """Solve one eigenproblem per CTA: CTA bh writes the Q/K basis U of (batch, head) bh, U^T [B, H, RANK, 128].
 
     * The launch is a programmatic dependent of the clear launch and releases its own dependent at once: the V pass
@@ -1344,7 +1307,7 @@ def _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
     * The body is the schedule of the CTA: each step runs on the threads its docstring names; each sync_threads is the
       CTA barrier that publishes what the steps since the barrier before it wrote to shared memory (_gram and
       _cluster_repair have barriers of their own, the last of which publishes their result).
-    * st is the state that every step shares; rows, search and twist hold the registers and coordinates of the thread
+    * st is the state that every step shares; pair, search and twist hold the registers and coordinates of the thread
       in one phase, built where that phase begins. lens: None, or the lengths argument of _gram.
     """
     # the preceding launch on this stream clears the per-call words that the launches after this one read
@@ -1355,25 +1318,25 @@ def _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
     st = _eig_state(tidx, RANK)
     # DMB/YLB hold aligned Gram operand images until TC completion. The normalized matrix is then staged in VH, whose
     # first reflector is written only after all paired-row math threads have loaded their register tiles.
-    _gram(st, qtens, ktens, qk_rows, bh, S, H, NQK, NCQ, lens)
+    _gram(st, qtens, ktens, rows, bh, S, H, NQK, NCQ, lens)
 
     # Householder tridiagonalization: the reflectors in VH, tau, and the tridiagonal matrix (d, e)
-    rows = _load_row_pairs(st)
+    pair = _load_row_pairs(st)
     cute.arch.sync_threads()
     _first_reflector(st)
     cute.arch.sync_threads()
     # 8 static segments of 16 steps: in segment ko, column groups m < ko and warps < ko are idle (no predication).
     for ko in cutlass.range_constexpr(8):
         for k in cutlass.range(16 * ko, min(16 * ko + 16, 126)):
-            pv = _row_pair_products(st, rows, k, ko)
+            prods = _row_pair_products(st, pair, k, ko)
             cute.arch.sync_threads()
             ksum = _reflector_dot(st)
             if tidx < 256:
-                _row_pair_update(st, rows, pv, ksum, k, ko)
+                _row_pair_update(st, pair, prods, ksum, k, ko)
             else:
                 _next_reflector(st, ksum, k)
             cute.arch.sync_threads()
-    _store_last_diagonal(st, rows)
+    _store_last_diagonal(st, pair)
     cute.arch.sync_threads()
     _square_offdiagonal(st)
     cute.arch.sync_threads()
@@ -1399,7 +1362,7 @@ def _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
     _cluster_repair(st, span)
 
     # back-transform: z <- H_0 ... H_125 y, then U = Hd^T Z / sqrt(128)
-    _stage_hadamard(st, hadamard)
+    _stage_hadamard_f32(st, hadamard)
     _reflector_pair_products(st)
     cute.arch.sync_threads()
     _back_transform(st)
@@ -1411,7 +1374,7 @@ def _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
 def eig_kernel(
     qtens: cute.Tensor,
     ktens: cute.Tensor,
-    qk_rows: cute.Tensor,
+    rows: cute.Tensor,
     hadamard: cute.Tensor,
     uT: cute.Tensor,
     S: Int32,
@@ -1420,15 +1383,15 @@ def eig_kernel(
     NCQ: Int32,
     RANK: cutlass.Constexpr,
 ):
-    """Run the eigensolver CTA (_eig_body) of a call whose batch elements are all full: qk_rows [NQK] are tokens."""
-    _eig_body(qtens, ktens, qk_rows, hadamard, uT, S, H, NQK, NCQ, RANK, None)
+    """Run the eigensolver CTA (_eig_body) of a call whose batch elements are all full: rows [NQK] are tokens."""
+    _eig_body(qtens, ktens, rows, hadamard, uT, S, H, NQK, NCQ, RANK, None)
 
 
 @cute.kernel
 def eig_kernel_lens(
     qtens: cute.Tensor,
     ktens: cute.Tensor,
-    qk_rows: cute.Tensor,
+    rows: cute.Tensor,
     hadamard: cute.Tensor,
     uT: cute.Tensor,
     lens: cute.Tensor,
@@ -1440,12 +1403,12 @@ def eig_kernel_lens(
     ROWS_PER_SAMPLE: cutlass.Constexpr,
     MAP_ROWS: cutlass.Constexpr,
 ):
-    """Run the eigensolver CTA (_eig_body) of a call with valid prefix lengths lens, int32 [B]: qk_rows is [B, NQK] with
+    """Run the eigensolver CTA (_eig_body) of a call with valid prefix lengths lens, int32 [B]: rows is [B, NQK] with
     ROWS_PER_SAMPLE, else [NQK]; with MAP_ROWS _gram maps them from the padded sequence into each valid prefix."""
     _eig_body(
         qtens,
         ktens,
-        qk_rows,
+        rows,
         hadamard,
         uT,
         S,

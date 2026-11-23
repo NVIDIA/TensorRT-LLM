@@ -21,6 +21,8 @@ from ...common.expmath import rcp_or_zero, round_m3
 from ...common.ptx import f32x8_to_e2m1x8
 from ..ptx import e2m1x8_to_f32x8
 
+_SIXTH = 0.16666667163372040
+
 
 def _mul2_list(x, s):
     """Return [x_j * s], by packed FP32x2 multiplies."""
@@ -33,7 +35,7 @@ def _mul2_list(x, s):
 
 def _absmax(x):
     """Return max |x_j|, as a chain of maxima with the absolute values."""
-    am = cute.math.abs(x[0])
+    am = cute.math.absf(x[0])
     for j in range(1, len(x)):
         am = cute.arch.fmax(am, cute.math.absf(x[j]))
     return am
@@ -42,7 +44,7 @@ def _absmax(x):
 def _nvfp4_codes(x, am):
     """Return the UE4M3 scale of a 16-value block whose max |x| is am (am / 6 rounded to three mantissa bits, round_m3)
     and the block's two words of E2M1 codes."""
-    sc = round_m3(am * Float32(0.16666667163372040))
+    sc = round_m3(am * Float32(_SIXTH))
     inv = rcp_or_zero(sc)
     y = _mul2_list(x, inv)
     return sc, f32x8_to_e2m1x8(y[0:8]), f32x8_to_e2m1x8(y[8:16])

@@ -115,8 +115,8 @@ class QkK96:
 
     def __init__(self, mma_tiler, rank):
         # the channels of Q' and K' at this compensation rank
-        self.head_dim = qk_channels(rank)
-        self.mma_tiler_mnk = (*mma_tiler, self.head_dim)
+        self.channels = qk_channels(rank)
+        self.mma_tiler_mnk = (*mma_tiler, self.channels)
         # the K' scale-factor slot follows the Q' one
         self.tmem_ksf_offset = self.tmem_qsf_offset + 4 * qk_scale_atoms(rank)
         # the scale-factor helpers describe the K = 96 instruction of sm_103a by its canonical K = 768 tile (eight
@@ -127,7 +127,7 @@ class QkK96:
     def global_tensors(self, qk_ptrs, s, h, b):
         """Q', K' [B, S, H, 256 E2M1] -> (s, d, ((h_r, h), b)) and their scale factors in the sm103 atom layout."""
         q_ptr, k_ptr, q_sf_ptr, k_sf_ptr = qk_ptrs
-        d = self.head_dim
+        d = self.channels
         h_r = 1
         q_layout = cute.make_layout(
             (s, d, ((h_r, h), b)),
@@ -239,7 +239,7 @@ class QkK96:
             tma_load_op,
             q_sf,
             q_sf_smem_layout_tma,
-            (self.mma_tiler_mnk[0], self.head_dim),
+            (self.mma_tiler_mnk[0], self.channels),
             internal_type=cutlass.Uint8,
         )
         k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
@@ -263,7 +263,7 @@ class QkK96:
             tma_kv_load_op,
             k_sf,
             k_sf_smem_layout_tma,
-            (self.mma_tiler_mnk[1], self.head_dim),
+            (self.mma_tiler_mnk[1], self.channels),
             cluster_shape_mn[0],
             internal_type=cutlass.Uint8,
         )
@@ -346,7 +346,7 @@ class QkK96:
         tQgQ = tQgQ_qdl[None, None, 0, hb_coord]
         gQSF_qdl = cute.local_tile(
             mQSF_qdl,
-            (self.mma_tiler_mnk[0], self.head_dim),
+            (self.mma_tiler_mnk[0], self.channels),
             (None, None, None),
         )
         tQsQSF, tQgQSF_qdl = cute.nvgpu.cpasync.tma_partition(
@@ -378,7 +378,7 @@ class QkK96:
         tKgK = tKgK_kdl[None, None, 0, hb_coord]
         gKSF_kdl = cute.local_tile(
             mKSF_kdl,
-            (self.mma_tiler_mnk[1], self.head_dim),
+            (self.mma_tiler_mnk[1], self.channels),
             (None, None, None),
         )
         tKsKSF, tKgKSF_kdl = cute.nvgpu.cpasync.tma_partition(
@@ -560,7 +560,7 @@ class QkK64(QkK96):
     def __init__(self, mma_tiler, rank):
         super().__init__(mma_tiler, rank)
         self.pad_tiler = (*mma_tiler, ROW_ELEMS)
-        self.k_blocks = self.head_dim // 64
+        self.k_blocks = self.channels // 64
 
     def global_tensors(self, qk_ptrs, s, h, b):
         q_ptr, k_ptr, q_sf_ptr, k_sf_ptr = qk_ptrs
@@ -571,10 +571,10 @@ class QkK64(QkK96):
         )
         atom = blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.K).layout
         q_sf = cute.make_tensor(
-            q_sf_ptr, cute.tile_to_shape(atom, (s, self.head_dim, ((h_r, h), b)), (2, 1, 3))
+            q_sf_ptr, cute.tile_to_shape(atom, (s, self.channels, ((h_r, h), b)), (2, 1, 3))
         )
         k_sf = cute.make_tensor(
-            k_sf_ptr, cute.tile_to_shape(atom, (s, self.head_dim, (h, b)), (2, 1, 3))
+            k_sf_ptr, cute.tile_to_shape(atom, (s, self.channels, (h, b)), (2, 1, 3))
         )
         return cute.make_tensor(q_ptr, layout), cute.make_tensor(k_ptr, layout), q_sf, k_sf
 
@@ -853,7 +853,7 @@ class QkK128(QkK64):
 
     def q_slot(self, j):
         """Return the first TMEM column of Q' slot j."""
-        return self.tmem_q_offset + j * (self.head_dim // 8)
+        return self.tmem_q_offset + j * (self.channels // 8)
 
     def mma_setup(self, tiled_mma, tmem_ptr, sQ, sK, sf_smem, sf_layouts):
         """Return the QK state with Q' in TMEM: the K = 64 scale-factor setup, then the TMEM-A MMAs and their operands.
@@ -868,7 +868,7 @@ class QkK128(QkK64):
         mma128 = k128_mma(self.mma_tiler_mnk[1], a_tmem, cta_group)
         rows = self.mma_tiler_mnk[0]
         thr64, thr128 = mma64.get_slice(0), mma128.get_slice(0)
-        q64_layout = thr64.make_fragment_A(thr64.partition_shape_A((rows, self.head_dim))).layout
+        q64_layout = thr64.make_fragment_A(thr64.partition_shape_A((rows, self.channels))).layout
         q128_layout = thr128.make_fragment_A(
             thr128.partition_shape_A((rows, 128 * self.k128_mmas))
         ).layout

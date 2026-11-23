@@ -123,16 +123,16 @@ def small_mma_phase(
             for p in range(8):
                 steps.append(("qk", a, p))
     acc = [[Float32(0.0)] * 4 for _ in range(16)]
-    n_pv = sum(1 for st in steps if st[0] != "qk")
+    n_pv = sum(1 for step in steps if step[0] != "qk")
     w = None
 
-    def load(st):
-        if st[0] == "pv":
-            return ldsm_b8_x2_trans(vst + st[1] * 32 * 128 + voff + ((st[2] * 16) ^ vsw))
-        if st[0] == "vm":
-            return ldsm_b16_x4_trans(vmst + vmoff[st[1] & 1] + (st[1] >> 1) * 1024)
-        koff = koff_o if st[2] % 2 == 1 else koff_e
-        return ldsm_b16_x4(kst + koff + (st[2] // 2) * 32 * KP + st[1] * 32)
+    def load(step):
+        if step[0] == "pv":
+            return ldsm_b8_x2_trans(vst + step[1] * 32 * 128 + voff + ((step[2] * 16) ^ vsw))
+        if step[0] == "vm":
+            return ldsm_b16_x4_trans(vmst + vmoff[step[1] & 1] + (step[1] >> 1) * 1024)
+        koff = koff_o if step[2] % 2 == 1 else koff_e
+        return ldsm_b16_x4(kst + koff + (step[2] // 2) * 32 * KP + step[1] * 32)
 
     def k_ready():
         # the tile's K' and scales have landed (its mbarrier); then its scale words
@@ -145,16 +145,16 @@ def small_mma_phase(
         w = k_ready()
     for n in range(DIST):
         frags[n] = load(steps[n])
-    for n, st in enumerate(steps):
+    for n, step in enumerate(steps):
         if n + DIST == n_pv and kst is not None:
             w = k_ready()
         if n + DIST < len(steps):
             frags[n + DIST] = load(steps[n + DIST])
         b = frags[n]
         frags[n] = None
-        if st[0] == "pv":
+        if step[0] == "pv":
             # A = V^T of channels 16 ct .. + 15 (the ldmatrix.trans quad in order), B = P^T of queries 8 h .. + 7
-            i, ct = st[1], st[2]
+            i, ct = step[1], step[2]
             for h in range(2):
                 c = 2 * ct + h
                 d = mma_fp8(
@@ -165,9 +165,9 @@ def small_mma_phase(
                 )
                 for k in range(4):
                     O[4 * c + k] = d[k]
-        elif st[0] == "vm":
+        elif step[0] == "vm":
             # A = v_mean^T of channels 32 cp .. + 31 (two m16n8k8 A fragments), B = the block sums of query n-tile h
-            cp = st[1]
+            cp = step[1]
             for half in range(2):
                 for h in range(2):
                     c = 2 * (2 * cp + half) + h
@@ -180,7 +180,7 @@ def small_mma_phase(
                     for k in range(4):
                         O[4 * c + k] = d[k]
         else:
-            a, p = st[1], st[2]
+            a, p = step[1], step[2]
             for h in range(2):
                 nt = 2 * p + h
                 acc[nt] = mma_nvf4(

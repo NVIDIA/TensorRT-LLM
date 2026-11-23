@@ -43,13 +43,13 @@ from .dsl import (
     cvt_f32x2_to_f8x2,
 )
 
+RN = cute.math.RoundingMode.NEAREST_EVEN
+
 
 def subnormal_anchor_bias(m, a, prescale_log2: int):
     """-m * a + (15 + prescale_log2) * 2^-139 on the f32 subnormal grid: the anchor score m lands on 2^prescale_log2."""
     bias = Float32((15 + prescale_log2) * SUBNORMAL_ULPS * 2.0**-149)
-    return cute.math.fma(
-        cute.math.neg(Float32(m)), Float32(a), bias, rounding=cute.math.RoundingMode.NEAREST_EVEN
-    )
+    return cute.math.fma(cute.math.neg(Float32(m)), Float32(a), bias, rounding=RN)
 
 
 def subnormal_scale(a):
@@ -57,7 +57,7 @@ def subnormal_scale(a):
     return cute.math.mul(
         Float32(a),
         Float32(SUBNORMAL_ULPS * 2.0**-149),
-        rounding=cute.math.RoundingMode.NEAREST_EVEN,
+        rounding=RN,
     )
 
 
@@ -145,9 +145,7 @@ def pow2_ceil_448(m):
     """Return the power of two at or above max(m / 448, 1e-30), for a finite f32 m >= 0: the scale that brings values
     of magnitude up to m into the E4M3 range. The product with the f32 nearest to 1 / 448 gives the power of two of
     the quotient for every such m."""
-    return pow2_ceil(
-        cute.math.mul(m, Float32(1.0 / E4M3_MAX), rounding=cute.math.RoundingMode.NEAREST_EVEN)
-    )
+    return pow2_ceil(cute.math.mul(m, Float32(1.0 / E4M3_MAX), rounding=RN))
 
 
 def round_m3(x):

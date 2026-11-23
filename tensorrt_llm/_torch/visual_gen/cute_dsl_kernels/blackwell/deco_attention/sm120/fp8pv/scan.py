@@ -60,13 +60,15 @@ def v_tile_nan_kernel(
                 )
                 for w in cutlass.range_constexpr(4):
                     # Every masked byte is <= 127, so the add has no byte carries.
-                    bad = bad | (((vals[w] & 0x7F7F7F7F) + 0x01010101) & Int32(-2139062144))
+                    bad = bad | (
+                        ((vals[w] & 0x7F7F7F7F) + 0x01010101) & Int32(0x80808080 - (1 << 32))
+                    )
         # the tile's 8 v_mean rows (2 KB): one 16-byte chunk per thread; a BF16 half with exponent bits 0x7F80 is
         # non-finite, and its masked value plus 0x80 sets bit 15 (no carry between the halves)
         mrow = (batch * H + head) * (8 * nt) + tile * 8 + (tidx >> 4)
         mvals = load_invariant(Int32, vm_ptr.toint() + Int64(mrow) * 256 + (tidx & 15) * 16, 4)
         for w in cutlass.range_constexpr(4):
-            bad = bad | (((mvals[w] & 0x7F807F80) + 0x00800080) & Int32(-2147450880))
+            bad = bad | (((mvals[w] & 0x7F807F80) + 0x00800080) & Int32(0x80008000 - (1 << 32)))
     bad = Int32(cute.arch.vote_any_sync(bad != 0))
     sp = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
     sa = Int32(sp.toint())

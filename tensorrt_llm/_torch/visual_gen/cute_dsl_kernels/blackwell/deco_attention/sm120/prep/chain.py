@@ -29,10 +29,10 @@ from ...runtime import current_stream, num_sms
 from .encode import ENCODE_THREADS
 
 
-def _compile(host, cache, device, fused, lens):
+def _compile(host, cache, device, fused, with_lens):
     """Return the host function of a chain compiled for a device and a chain form (fused: the V pass in the basis
-    launch; lens: the kernels read valid prefix lengths), kept in the cache of its kernel package."""
-    fn = cache.get((device.index, fused, lens))
+    launch; with_lens: the kernels read valid prefix lengths), kept in the cache of its kernel package."""
+    fn = cache.get((device.index, fused, with_lens))
     if fn is None:
         # placeholders of the run-time parameters (Int64 addresses, Int32 sizes), then the stream and the switches
         args = [
@@ -40,12 +40,12 @@ def _compile(host, cache, device, fused, lens):
             for p in inspect.signature(host).parameters.values()
             if p.annotation in (Int64, Int32)
         ]
-        args += [cute.runtime.make_fake_stream(), fused, lens]
-        fn = cache[(device.index, fused, lens)] = cute.compile(host, *args)
+        args += [cute.runtime.make_fake_stream(), fused, with_lens]
+        fn = cache[(device.index, fused, with_lens)] = cute.compile(host, *args)
     return fn
 
 
-def _grids(nsm, B, S, H):
+def _grids(B, S, H, nsm):
     """Return the SM-count dependent sizes of the launches: spare CTAs of the basis launch, and the item and CTA counts
     of the Q/K pass, the V pass and the encode launch."""
     BH = B * H
@@ -67,7 +67,7 @@ def scratch(B, S, H, nsm):
     * ut, vmax, gmax, prov: the bases U^T, the V-scan slots, the group maxima, the provisional block scales.
     * Only done, the two counters of the basis launch (V-scan barrier, V-pass tile counter), must be zero at its start.
     """
-    nspare, _, nqk_cta, _, _, _ = _grids(nsm, B, S, H)
+    nspare, _, nqk_cta, _, _, _ = _grids(B, S, H, nsm)
     BH, T = B * H, (S + 127) // 128
     return {
         "ut": (torch.bfloat16, (BH * DEFAULT_RANK * HEAD_DIM,)),
@@ -79,23 +79,23 @@ def scratch(B, S, H, nsm):
 
 
 def run(
-    host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers, lens=None, map_rows=False
+    host, cache, host_buffers, min_score_log2, q, k, v, rows, buffers, lens=None, map_rows=False
 ):
     """Run the launches of a chain on the current stream: raw BF16 q, k, v [B, S, H, 128] into the buffers of the call.
 
     * host, cache, host_buffers: the host function of the kernel package, its compile cache and the buffers whose
       addresses it takes after q, k, v, the rows and the rotation, in its order.
-    * min_score_log2: log2 of the score-scale floor; qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows).
+    * min_score_log2: log2 of the score-scale floor; rows: the sampled tokens of the Q/K basis (inputs.sample_rows).
     * lens: None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place: every pass
       then takes the tokens of a batch element below its length only.
-    * qk_rows with lens: with map_rows the default draw over the padded sequence, which the eigensolver maps into each
+    * rows with lens: with map_rows the default draw over the padded sequence, which the eigensolver maps into each
       valid prefix; else the caller's rows [n] or [B, n] as given (a row at or past a length: the last valid token).
     """
     B, S, H, _ = q.shape
     T = (S + 127) // 128
     dev = q.device
     nsm = num_sms(dev)
-    nspare, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta = _grids(nsm, B, S, H)
+    nspare, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta = _grids(B, S, H, nsm)
     # the V pass shares the basis launch when the eigenproblems take at most a quarter of the SMs and the grid of the
     # launch has at most as many CTAs as the device has SMs
     fn = _compile(host, cache, dev, 4 * B * H <= nsm and B * H + nspare <= nsm, lens is not None)
@@ -103,14 +103,14 @@ def run(
         q.data_ptr(),
         k.data_ptr(),
         v.data_ptr(),
-        qk_rows.data_ptr(),
+        rows.data_ptr(),
         hadamard(dev).data_ptr(),
         *(buffers[n].data_ptr() for n in host_buffers),
         lens.data_ptr() if lens is not None else 0,
         B,
         S,
         H,
-        qk_rows.shape[-1],
+        rows.shape[-1],
         T,
         min_score_log2,
         nspare,
@@ -120,6 +120,6 @@ def run(
         nv_cta,
         nenc_cta,
         # rows mode of the eigensolver: 0 the mapped default draw, 1 the caller's shared rows, 2 its rows per element
-        0 if map_rows else qk_rows.dim(),
+        0 if map_rows else rows.dim(),
         current_stream(dev),
     )

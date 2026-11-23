@@ -28,11 +28,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
+from ...common.expmath import RN
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
 from ..valid_len import valid_len
-from .layout import EP, NTHR, QT
-
-RN = cute.math.RoundingMode.NEAREST_EVEN  # multiplies and FMAs that keep subnormal results
+from .layout import EP, KT, NTHR, QT
 
 PART_N = 68  # FP32 words per thread of a piece's partials: 64 of O, 2 anchors, 2 row sums
 
@@ -76,30 +75,19 @@ def store_rows(
     * f = inv_row_sums: O is normalized first, as v8_scale / l may underflow where (O / l) v8_scale does not.
     * 16-byte global stores of the rows below S (query QT qt + 16 warp + row), as zeros from nv on (with lengths).
     """
-    fa, fb, fc, fd = f
     for ct in cutlass.range_constexpr(8):
         for h in cutlass.range_constexpr(2):
             ch = ep + (16 * ct + 8 * h + g) * 2
-            sptr(BFloat16, ch + (2 * q) * EP).store(
-                cute.math.mul(
-                    cute.math.mul(O[8 * ct + 2 * h], fa, rounding=RN), vsc, rounding=RN
-                ).to(BFloat16)
-            )
-            sptr(BFloat16, ch + (2 * q + 1) * EP).store(
-                cute.math.mul(
-                    cute.math.mul(O[8 * ct + 2 * h + 1], fb, rounding=RN), vsc, rounding=RN
-                ).to(BFloat16)
-            )
-            sptr(BFloat16, ch + (8 + 2 * q) * EP).store(
-                cute.math.mul(
-                    cute.math.mul(O[8 * ct + 4 + 2 * h], fc, rounding=RN), vsc, rounding=RN
-                ).to(BFloat16)
-            )
-            sptr(BFloat16, ch + (9 + 2 * q) * EP).store(
-                cute.math.mul(
-                    cute.math.mul(O[8 * ct + 4 + 2 * h + 1], fd, rounding=RN), vsc, rounding=RN
-                ).to(BFloat16)
-            )
+            for r in cutlass.range_constexpr(4):
+                sptr(BFloat16, ch + (2 * q + (0, 1, 8, 9)[r]) * EP).store(
+                    cute.math.mul(
+                        cute.math.mul(
+                            O[8 * ct + 4 * (r >> 1) + 2 * h + (r & 1)], f[r], rounding=RN
+                        ),
+                        vsc,
+                        rounding=RN,
+                    ).to(BFloat16)
+                )
     cute.arch.sync_warp()
     for it in cutlass.range_constexpr(8):
         row = 2 * it + (lane >> 4)
@@ -200,7 +188,6 @@ def merge_partial_kernel(
     vs_ptr: cute.Pointer,
     S: cutlass.Constexpr,
     H: cutlass.Constexpr,
-    nT: cutlass.Constexpr,
     split: cutlass.Constexpr,
     unit0: cutlass.Constexpr,
     lens_ptr,
@@ -214,6 +201,7 @@ def merge_partial_kernel(
     tidx_, _, _ = cute.arch.thread_idx()
     bid = Int32(bid_)
     tidx = Int32(tidx_)
+    nT = (S + KT - 1) // KT
     unit = unit0 + bid
     qt = unit % nT
     hh = (unit // nT) % H
