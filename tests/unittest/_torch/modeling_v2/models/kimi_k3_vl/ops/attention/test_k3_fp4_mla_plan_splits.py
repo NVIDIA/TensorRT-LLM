@@ -118,6 +118,27 @@ def test_no_packed_geometry_without_packed_rows(monkeypatch):
     )  # 1536 rows > 1024
 
 
+@pytest.mark.parametrize("is_cuda_graph", [False, True])
+def test_ull_plan_uses_its_metadata_workspace(monkeypatch, is_cuda_graph):
+    decode = importlib.import_module(f"{_FAMILY}.ops.attention._fp4_mla_decode_ull")
+    kernel = SimpleNamespace(
+        SMEM_P4_PAGE_PLAN_PROFILE_KV=4096,
+        _select_runtime_kv_profile=lambda kv: 1 << (kv - 1).bit_length(),
+    )
+    reduce = SimpleNamespace(packed_plan_length=lambda requests, tasks: 3 + requests + 3 * tasks)
+    monkeypatch.setattr(decode, "cutedsl_backend", lambda: True)
+    monkeypatch.setattr(decode, "_kernel_module", lambda: kernel)
+    monkeypatch.setattr(decode, "_reduce_module", lambda: reduce)
+    monkeypatch.setattr(decode, "_packed_wave_tasks", lambda device, m_tiles: _SM_COUNT // 2)
+    monkeypatch.setattr(decode, "_get_sm_count", lambda device: _SM_COUNT)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    metadata = _metadata(4, is_cuda_graph)
+    plan = _geometry(decode.packed_plan_geometry, metadata, 4, 96, 8)
+    assert plan is not None and plan.splits == 8
+    assert plan.plan.data_ptr() == metadata.fp4_mla_state.workspaces[decode._PLAN_WS].data_ptr()
+
+
 def test_kv_update_plans_with_the_family_geometry():
     decode = importlib.import_module(f"{_FAMILY}.ops.attention._fp4_mla_decode")
     append = importlib.import_module(f"{_FAMILY}.kernels.k3r_fp4_mla.fp4_mla_kv_append")

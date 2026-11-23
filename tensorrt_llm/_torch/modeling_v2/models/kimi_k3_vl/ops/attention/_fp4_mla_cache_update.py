@@ -51,7 +51,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
 )
 
@@ -62,7 +61,6 @@ from . import _fp4_mla_decode_ull as _decode
 from ._k3_fp4_mla_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
-    _maybe_update_triton_v_packed_cache,
     _prepare_fp4_mla_q_buffers,
     _repack_cutedsl_v_packed_cache,
     can_fuse_fp4_mla_q_quant,
@@ -357,14 +355,6 @@ def _scatter_generation(
         helix_is_inactive_rank=helix_is_inactive_rank,
         write_q_rows=not q_rows_external,
     )
-    v_pack_page_ids = _fp4_mla_generation_page_ids(
-        metadata, metadata.num_seqs - metadata.num_contexts
-    )
-    v_pack_num_valid = None
-    if getattr(metadata, "is_cuda_graph", False):
-        # Frozen launch grids cannot follow the per-replay page count; the repack kernels stride
-        # over this device-side count instead.
-        v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     if not _FUSED_V_TRANSPOSE and not direct_v_packed_write:
         # Pages shared through block reuse: repack V after the update (not the deployment's).
         repack_page_indptr = None
@@ -382,7 +372,9 @@ def _scatter_generation(
                 num_tokens // num_gen + metadata.page_size - 1, metadata.page_size
             )
         else:
-            repack_page_ids = v_pack_page_ids
+            repack_page_ids = _fp4_mla_generation_page_ids(
+                metadata, metadata.num_seqs - metadata.num_contexts
+            )
         _repack_cutedsl_v_packed_cache(
             persistent_v_packed,
             kv_cache,
@@ -395,18 +387,6 @@ def _scatter_generation(
             generation_lens=repack_generation_lens,
             max_touched_pages=repack_max_touched_pages,
         )
-    _maybe_update_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_pack_page_ids,
-        num_queries=num_tokens,
-        v_head_dim=v_head_dim,
-        page_size=metadata.page_size,
-        local_layer=local_layer,
-        v_sf=v_sf[local_layer],
-        num_valid_pages=v_pack_num_valid,
-    )
     state.generation_cache_scattered = True
     return True
 
