@@ -28,6 +28,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.memory.monitor import names as monitor_names
+from tensorrt_llm._torch.memory.monitor import startup as monitor_startup
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
 from tensorrt_llm._utils import (get_size_in_bytes, prefer_pinned,
@@ -410,6 +412,12 @@ class KVCacheManager(BaseResourceManager):
     # state a second time. Only a full re-prefill (rewind target 0) is safe.
     _has_recurrent_state: bool = False
 
+    @property
+    def spec_recompute_tail(self) -> int:
+        """Prompt-tail tokens recomputed on a prefix hit for a hidden-state
+        drafter: 0 off, -1 the whole prompt."""
+        return self._spec_recompute_tail
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -457,8 +465,8 @@ class KVCacheManager(BaseResourceManager):
             "TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month "
             "migration period; it keeps working until then. Use KV cache "
             "manager V2 (kv_cache_config.use_kv_cache_manager_v2=True, the "
-            "default) for supported features. Sleep mode and RocketKV still "
-            "require V1 until V2 support is available. See "
+            "default) for supported features. Sleep mode still requires V1 "
+            "until V2 support is available. See "
             "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
             key="deprecated_kv_cache_manager_v1")
         self.mapping = mapping
@@ -1360,13 +1368,16 @@ class KVCacheManager(BaseResourceManager):
         enforced by the caller: the micro-batch scheduler admits on estimated
         reuse, and ``fit_token_budget`` needs chunking to trim the extra
         compute tokens when a batch of rewound requests exceeds
-        ``max_num_tokens``.
+        ``max_num_tokens``. A context-only (disaggregated) request is not
+        rewound: this manager's draft pages are not transferred, so the
+        generation worker's drafter starts from an empty context whatever the
+        context server recomputes.
         """
         tail = self._spec_recompute_tail
         tokens_per_block = self.tokens_per_block
         for req in batch_llm_requests:
             prepopulated = req.prepopulated_prompt_len
-            if prepopulated <= 0:
+            if prepopulated <= 0 or req.is_context_only_request:
                 continue
             prompt_len = req.prompt_len
             if tail < 0:
@@ -3350,10 +3361,14 @@ class PeftCacheManager(BaseResourceManager):
         logger.info(
             f"[PeftCacheManager] buffer_manager_stream: {buffer_manager_stream}"
         )
-        self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
-                                        model_config=model_config,
-                                        world_config=world_config,
-                                        buffer_manager=buffer_manager)
+        # The device LoRA cache is allocated here, in C++, with no size
+        # exposed to Python; the memory monitor names it by measuring.
+        with monitor_startup.region(monitor_names.REGION_LORA_DEVICE_CACHE,
+                                    per_executor=True):
+            self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
+                                            model_config=model_config,
+                                            world_config=world_config,
+                                            buffer_manager=buffer_manager)
         if initial_data_type is not None:
             self.impl.configure_data_type(
                 torch_dtype_to_binding(initial_data_type))

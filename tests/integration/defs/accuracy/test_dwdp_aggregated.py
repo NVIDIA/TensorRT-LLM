@@ -90,7 +90,7 @@ class TestDwdpAggDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             tensor_parallel_size=DWDP_SIZE,
             enable_attention_dp=True,
             dwdp_config=dwdp_config,
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(tactic="cutedsl.grouped_gemm"),
             disable_overlap_scheduler=True,
             enable_autotuner=False,
             enable_chunked_prefill=False,

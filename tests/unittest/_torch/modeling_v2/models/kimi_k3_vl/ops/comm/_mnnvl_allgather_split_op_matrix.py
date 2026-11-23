@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the ``comm/mnnvl_allgather_split`` catalog entry on its ``MnnvlWorkspace``.
+"""GPU certification matrix for the ``comm/mnnvl_allgather_split`` op on its ``MnnvlWorkspace``.
 
 The op takes one turn of the workspace's Lamport rotation, which every MNNVL op of the TP group advances (this op,
 ``comm/mnnvl_fusion_allreduce`` on either path and ``comm/mnnvl_allreduce_attn_res``). So beyond single calls (every
@@ -58,7 +58,7 @@ TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 SPLITS = tuple((LATENT // w, EXPERTS // w) for w in (2, 4, 8, 16)) + ((8, 4),)
 DECODE_MAX_TOKENS = 8
 # Kimi K3's one-shot ceilings: DECODE_AR_ONE_SHOT_MAX_BYTES on decode steps (at most 8 tokens),
-# WIDE_AR_ONE_SHOT_MAX_BYTES (main's default) on wide decode steps.
+# WIDE_AR_ONE_SHOT_MAX_BYTES (the stock MNNVL all-reduce's 1 MiB) on wide decode steps.
 DECODE_ONE_SHOT_MAX_BYTES = 4 << 20
 WIDE_ONE_SHOT_MAX_BYTES = 1 << 20
 EPS = 1e-5

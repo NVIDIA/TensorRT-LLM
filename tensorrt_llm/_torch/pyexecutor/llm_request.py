@@ -20,7 +20,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             get_multimodal_item_metadata)
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.logger import logger
-from tensorrt_llm.sampling_params import LogprobMode
+from tensorrt_llm.sampling_params import EmbeddingBias, LogprobMode
 
 from .request_inputs import ExecutorRequest
 
@@ -410,6 +410,55 @@ class PyResult:
         self._encoder_output: Optional[torch.Tensor] = None
         self.diff = PyResult.Diff()
 
+    def snapshot(self, *, beam_width: int) -> "PyResult":
+        """Freeze output containers while sharing append-only tensor storage.
+
+        Single-sequence streaming logprobs move to the response, preserving
+        cumulative totals in fresh request storage. Beam search publishes full
+        histories, so it copies their lists instead of consuming them.
+        """
+        result = copy(self)
+        if self.context_prompt_logprob_rows is not None:
+            result.context_prompt_logprob_rows = self.context_prompt_logprob_rows.copy(
+            )
+        result.diff = PyResult.Diff()
+        if self._log_probs is not None:
+            if self._streaming and beam_width <= 1 and self.log_probs:
+                self._log_probs = LogProbStorage()
+                self._log_probs._init(result.log_probs)
+                self._log_probs.cum_log_probs = result.cum_log_probs.copy()
+            else:
+                result._log_probs = copy(self._log_probs)
+                if self.log_probs is not None:
+                    result._log_probs.log_probs = [
+                        probs.copy() for probs in self.log_probs
+                    ]
+                    result._log_probs.cum_log_probs = self.cum_log_probs.copy()
+        if self._context_logits is not None:
+            result._context_logits = copy(self._context_logits)
+            result._context_logits._logits_indices = self._context_logits._logits_indices.copy(
+            )
+        if self._generation_logits is not None:
+            result._generation_logits = copy(self._generation_logits)
+            result._generation_logits._logits_indices = (
+                self._generation_logits._logits_indices[-2:] if self._streaming
+                else self._generation_logits._logits_indices.copy())
+            if self._generation_logits.use_chunked_generation_logits:
+                result._generation_logits._device_fragments = self._generation_logits._device_fragments.copy(
+                )
+        if self._additional_context_outputs is not None:
+            result._additional_context_outputs = {
+                name: outputs.copy()
+                for name, outputs in self._additional_context_outputs.items()
+            }
+        if self._additional_generation_outputs is not None:
+            result._additional_generation_outputs = {
+                name: outputs.copy()
+                for name, outputs in
+                self._additional_generation_outputs.items()
+            }
+        return result
+
     def reset_diff(self):
         self.diff = PyResult.Diff()
 
@@ -588,6 +637,21 @@ class PyResult:
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
 
+    def release_exports(self) -> None:
+        """Consume the handles this result exported; no response will deliver them."""
+        release_exported_handles(self)
+        self._mm_embeddings = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
+        self.diff.mm_embeddings = None
+        self.diff.mrope_position_ids = None
+        self.diff.mrope_position_deltas = None
+
+    def drop_context_logits(self) -> None:
+        """Drop the stored context logits; no response will deliver them."""
+        self._context_logits = None
+        self.diff.context_logits_list = []
+
     def set_encoder_output(self, encoder_output: torch.Tensor):
         self._encoder_output = encoder_output
         self.diff.encoder_output = encoder_output
@@ -726,6 +790,33 @@ class PyResult:
         return self._encoder_output
 
 
+def release_exported_handles(result: "PyResult | LlmResult") -> None:
+    """Consume a result's CUDA IPC handles that no consumer will open.
+
+    The producer cannot free an exported allocation until each of its handles is opened
+    and released, or consumed here.
+    """
+    handles = [
+        *(result.mm_embedding_handles or ()),
+        result.mrope_position_ids_handle,
+        result.mrope_position_deltas_handle,
+    ]
+    for handle in handles:
+        if handle is not None:
+            SharedTensorContainer.release_dict(handle)
+
+
+def release_undelivered_response(response: Any) -> None:
+    """Consume the exported handles of a response that no client will receive.
+
+    Takes the executor's responses, also when the worker has wrapped them; error
+    responses and other records carry no ``LlmResult`` and export nothing.
+    """
+    result = getattr(response, "result", None)
+    if isinstance(result, LlmResult):
+        release_exported_handles(result)
+
+
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
@@ -839,8 +930,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            embedding_bias: EmbeddingBias | None = None,
             return_routed_experts: bool = False,
             watermarking: Optional[bool] = None,
+            locality_domain_id: Optional[int] = None,
+            _validation_error: Exception | None = None,
             **kwargs):
         # Cached by OneModelSamplingParams.of_request.
         self.py_spec_sampling_params: "OneModelSamplingParams | None" = None
@@ -849,8 +943,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                                     None)
         # Owned entirely on the Python side: the TorchSampler is the only
         # consumer, so the C++ request no longer carries a copy.
-        self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
-            "embedding_bias", None)
+        self.py_embedding_bias = embedding_bias
         self.py_position_ids: list[int] | None = kwargs.pop(
             "position_ids", None)
         self.py_guided_decoding_params = kwargs.pop("guided_decoding_params",
@@ -936,6 +1029,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Set once a received generation request's first token is found not
         # to end it, so the executor does not recheck it while it waits.
         self.py_first_token_checked = False
+        # Python-side locality domain ownership. ``None`` is used for non-localized
+        # execution; localized requests must pass a concrete value at creation.
+        self.py_locality_domain_id = locality_domain_id
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
 
@@ -1011,7 +1107,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_ctx_decoder_held = False
 
         # In-forward Mamba snapshot point P the scheduler let this context
-        # chunk run past (MambaHybridCacheManagerV2 consumes it).
+        # chunk run past (the GDN cache manager consumes it).
         self.py_mamba_inforward_snapshot_point: Optional[int] = None
         # Whether the first GEN step of a generation-only request was streamed.
         self.py_gen_first_emitted = False
@@ -1044,6 +1140,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
         self.child_requests = []
+
+        self._validation_error = _validation_error
+
+    # NB: Not overriding validate(), because that appears not to be used.
+    def raise_if_validation_failed(self) -> None:
+        if self._validation_error is not None:
+            raise self._validation_error
 
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         """Beam width of the current (or next) decoding step.
@@ -1227,38 +1330,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """
         result, is_final = super().create_serialized_result()
 
-        # When using beam search we cannot incrementically update the logprobs in the result.
-        # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.py_beam_width <= 1
-        need_deep_copy_generation_logits = self.py_result._generation_logits is not None
-        need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
-        # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
-        # that may occur between IPC communication and the overriding of newly generated log_probs
-        # or the updating of py_result._generation_logits._logits_indices in streaming mode.
-        if self.streaming and need_any_deep_copy:
-            py_result = copy(self.py_result)
-            # Move _log_probs to py_result and create a new empty LogProbStorage in self.py_result
-            # This avoids performing a deepcopy
-            if need_deep_copy_logprobs:
-                py_result._log_probs = self.py_result._log_probs
-                self.py_result._log_probs = LogProbStorage()
-                # Initialize the storage and adjust the cum_log_probs to the previous value
-                self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = copy(
-                    py_result.cum_log_probs)
-
-            # Perform copies of py_result._generation_logits
-            if need_deep_copy_generation_logits:
-                # shallow copy of generation_logits to avoid copying the logits tensor
-                py_result._generation_logits = copy(
-                    self.py_result._generation_logits)
-                # deep copy the indices to avoid the race condition
-                # In streaming mode LogitsStorage only accesses either the last
-                # or second to last pair of indices. Therefore, copying only these two pairs is sufficient.
-                py_result._generation_logits._logits_indices = py_result._generation_logits._logits_indices[
-                    -2:]
-        else:
-            py_result = self.py_result
+        if len(result) == 0:
+            return None
+        py_result = self.py_result.snapshot(beam_width=self.py_beam_width)
 
         # Only include time_breakdown_metrics in the final response to avoid O(N²) overhead
         # during streaming (copying all step_metrics for every token is very expensive)
@@ -1282,8 +1356,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        if len(result) == 0:
-            return None
         llm_result = LlmResult(
             result,
             py_result,
@@ -1414,6 +1486,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                        is not None else None),
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
+            locality_domain_id=self.py_locality_domain_id,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
@@ -1740,14 +1813,37 @@ def _restore_trimmed_prompt(tail_tokens, trimmed_prefix: int) -> np.ndarray:
     return tokens
 
 
+def _normalize_embedding_bias(embedding_bias: torch.Tensor | None,
+                              vocab_size: int | None) -> EmbeddingBias | None:
+    if embedding_bias is None:
+        return None
+
+    embedding_bias = embedding_bias.squeeze()
+    if embedding_bias.ndim != 1:
+        raise ValueError("Embedding bias tensors must be 1-dimensional.")
+    embedding_bias_list = embedding_bias.tolist()
+
+    if vocab_size is not None and len(embedding_bias_list) != vocab_size:
+        raise ValueError(
+            f"Length of embedding bias tensor must match vocabulary size ({vocab_size})."
+        )
+
+    return tuple([(idx, val) for idx, val in enumerate(embedding_bias_list)
+                  if val != 0])
+
+
 def executor_request_to_llm_request(
-        req_id: int,
-        executor_request: ExecutorRequest | tllm_executor.Request,
-        child_req_ids: List[int],
-        exclude_last_generation_logits: bool,
-        input_token_ids: Optional[List] = None,
-        position_ids: Optional[List] = None,
-        track_unique_tokens: bool = True) -> LlmRequest:
+    req_id: int,
+    executor_request: ExecutorRequest | tllm_executor.Request,
+    child_req_ids: List[int],
+    exclude_last_generation_logits: bool,
+    input_token_ids: Optional[List] = None,
+    position_ids: Optional[List] = None,
+    track_unique_tokens: bool = True,
+    locality_domain_id: Optional[int] = None,
+    *,
+    vocab_size: int | None = None,
+) -> LlmRequest:
     envelope = ExecutorRequest.adapt(executor_request)
     inputs = envelope.inputs
     executor_request = envelope.request
@@ -1855,6 +1951,18 @@ def executor_request_to_llm_request(
             encoder_input_features = mm_encoder_input_features
             encoder_output_len = mm_encoder_output_len
 
+    # NB: Because this is called from PyExecutor._fetch_and_activate_new_requests, which does
+    #     not provide per-request error handling, validation errors are deferred until
+    #     raise_if_validation_failed() is called.
+    embedding_bias = inputs.sparse_embedding_bias
+    validation_error = None
+    try:
+        if embedding_bias is None:
+            embedding_bias = _normalize_embedding_bias(
+                executor_request.embedding_bias, vocab_size)
+    except Exception as e:
+        validation_error = e
+
     llm_request = LlmRequest(
         request_id=req_id,
         max_new_tokens=executor_request.max_tokens,
@@ -1862,7 +1970,7 @@ def executor_request_to_llm_request(
         sampling_config=sampling_config,
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
-        embedding_bias=executor_request.embedding_bias,
+        embedding_bias=embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
         multimodal_hashes=multimodal_hashes,
@@ -1921,6 +2029,8 @@ def executor_request_to_llm_request(
         logprobs_simple_format=inputs.logprobs_simple_format,
         return_routed_experts=inputs.return_routed_experts,
         watermarking=inputs.watermarking,
+        locality_domain_id=locality_domain_id,
+        _validation_error=validation_error,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native

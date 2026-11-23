@@ -12,13 +12,14 @@ A V4.1 boundary does two independent things for every token:
   its RMS scale, sigmoid gates and the Sinkhorn-normalized 4x4 ``comb``. Nothing reads them
   until the next boundary, one attention or MoE sublayer later.
 
-:class:`MhcPostCollapseNormKernel` is the critical half as one launch, one CTA per token and one
-8-wide column vector per thread: the residual and the norm weight are loaded before
-``griddepcontrol.wait`` (they are not written by the kernel this one depends on -- the
-all-reduce producing ``x``), everything else after it. The arithmetic and its rounding points
-are those of ``fused_pmap_gemm_fma_ksplit`` (post update, BF16 residual) followed by
-``mhcBigFuseKernel`` phase 2 (lagged collapse of the BF16 residual, BF16 ``li``, sum of
-squares of the BF16 values, ``bf16(li * rsqrt * w)``).
+:class:`MhcPostCollapseNormKernel` is the critical half as one launch, one CTA per token and one or
+more 8-wide column vectors per thread. Its constant inputs are loaded before
+``griddepcontrol.wait``, and so is the residual of a post update without ``residual_after_wait``
+(an earlier split boundary's output, read by that boundary's coefficient kernel, which releases this
+launch no earlier than its own dependency wait); everything else after it. The arithmetic and its
+rounding points are those of ``fused_pmap_gemm_fma_ksplit`` (post update, BF16 residual) followed
+by ``mhcBigFuseKernel`` phase 2 (lagged collapse of the BF16 residual, BF16 ``li``, sum of squares
+of the BF16 values, ``bf16(li * rsqrt * w)``).
 """
 
 from __future__ import annotations
@@ -36,12 +37,20 @@ from .mhc_boundary import (
     bf16x2_absmax4,
     bf16x2_hi,
     bf16x2_lo,
+    l2_policy,
     ldg_f32,
+    ldg_v4_f32,
+    ldg_v4_u32,
+    ldg_v4_u32_l2,
+    ldg_v4_u32_ordered,
     mxfp8_block,
     nvfp4_block,
+    pack_bf16x2,
     shfl_xor_u32,
     stg_u8,
     stg_v2_u32,
+    stg_v4_u32,
+    stg_v4_u32_l2,
 )
 
 VEC = 8  # BF16 elements per thread (one 16-byte vector)
@@ -78,6 +87,24 @@ def _mul(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
             "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _add(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """``add.rn.f32`` (a zero operand is not folded: ``+0.0 + -0.0`` stays ``+0.0``)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
             "=f,f,f",
             has_side_effects=False,
             is_align_stack=False,
@@ -294,6 +321,11 @@ class MhcPostCollapseNormKernel:
 
     ``post_update=False``: ``res`` already is the boundary's residual (a resolved state);
     only the collapse and the norm run and ``x`` / ``post`` / ``comb`` / ``res_out`` are unused.
+    ``collapse=False``: only the post update runs (``mHC.post_mapping``); ``pre`` / ``weight`` /
+    ``out`` are unused and the residual is read after the dependency wait.
+    ``residual_after_wait``: read the residual after the dependency wait even with a post update.
+    ``moe_rows``: ``x`` (the shared expert's output) plus the expert rows ``[M, moe_rows, H]`` at
+    ``rows_addr``, summed in FP32 from +0 in row order and rounded to BF16 once.
     """
 
     def __init__(
@@ -304,8 +336,15 @@ class MhcPostCollapseNormKernel:
         use_pdl: bool,
         post_update: bool = True,
         quant: str | None = None,
+        l2_residual: bool = False,
+        collapse: bool = True,
+        vectors: int = 1,
+        residual_after_wait: bool = False,
+        moe_rows: int = 0,
     ):
-        if hidden % (32 * VEC) or hidden // VEC > 1024:
+        if not (post_update or collapse):
+            raise ValueError("the kernel needs a post update or a collapse")
+        if hidden % (32 * VEC * vectors) or hidden // VEC > 1024:
             raise ValueError(f"unsupported hidden size {hidden}")
         if quant not in (None, "mxfp8", "nvfp4"):
             raise ValueError(f"unsupported output quantization {quant}")
@@ -317,11 +356,21 @@ class MhcPostCollapseNormKernel:
         # "nvfp4": fp4_quantize(out, global scale at ``scale_addr``, 16, False, False), E2M1
         #     [M, H / 2] at ``q_addr`` and row-major E4M3 scales [M, H / 16] at ``sf_addr``.
         self.quant = quant
-        self.threads = hidden // VEC
+        # 8-wide vectors per thread: more than one leaves registers for several tokens per SM.
+        self.vectors = vectors
+        self.threads = hidden // VEC // vectors
         self.num_warps = self.threads // 32
         self.norm_eps = float(norm_eps)
         self.use_pdl = use_pdl
         self.post_update = post_update
+        # Keep the new residual in L2 for its readers (the coefficient half, the next boundary) and
+        # read the previous one, whose last reader this kernel is, as first to evict.
+        self.l2_residual = l2_residual
+        self.collapse = collapse
+        self.residual_after_wait = residual_after_wait
+        self.moe_rows = moe_rows
+        # Cluster boundaries exchange the RMSNorm partials with st.async on an mbarrier per CTA.
+        self.mbar_exchange = False
 
     @cute.jit
     def __call__(
@@ -337,6 +386,7 @@ class MhcPostCollapseNormKernel:
         q_addr: Int64,
         sf_addr: Int64,
         scale_addr: Int64,
+        rows_addr: Int64,
         stream,
     ) -> None:
         m = cute.size(gRes, mode=[0])
@@ -367,6 +417,7 @@ class MhcPostCollapseNormKernel:
             q_addr,
             sf_addr,
             scale_addr,
+            rows_addr,
             copy_bf16,
             copy_f32,
             store_bf16,
@@ -392,12 +443,72 @@ class MhcPostCollapseNormKernel:
         q_addr: Int64,
         sf_addr: Int64,
         scale_addr: Int64,
+        rows_addr: Int64,
         copy_bf16: cute.CopyAtom,
         copy_f32: cute.CopyAtom,
         store_bf16: cute.CopyAtom,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         tok, _, _ = cute.arch.block_idx()
+        if const_expr(self.vectors > 1):
+            self._kernel_vectors(
+                tok,
+                tidx,
+                gX,
+                gRes,
+                gPost,
+                gComb,
+                gPre,
+                gW,
+                gResOut,
+                gOut,
+                q_addr,
+                sf_addr,
+                scale_addr,
+                rows_addr,
+            )
+        else:
+            self._kernel_single(
+                tok,
+                tidx,
+                gX,
+                gRes,
+                gPost,
+                gComb,
+                gPre,
+                gW,
+                gResOut,
+                gOut,
+                q_addr,
+                sf_addr,
+                scale_addr,
+                rows_addr,
+                copy_bf16,
+                copy_f32,
+                store_bf16,
+            )
+
+    @cute.jit
+    def _kernel_single(
+        self,
+        tok,
+        tidx,
+        gX: cute.Tensor,
+        gRes: cute.Tensor,
+        gPost: cute.Tensor,
+        gComb: cute.Tensor,
+        gPre: cute.Tensor,
+        gW: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        q_addr: Int64,
+        sf_addr: Int64,
+        scale_addr: Int64,
+        rows_addr: Int64,
+        copy_bf16: cute.CopyAtom,
+        copy_f32: cute.CopyAtom,
+        store_bf16: cute.CopyAtom,
+    ) -> None:
         vecs: cutlass.Constexpr = self.hidden // VEC
 
         gRes_v = cute.logical_divide(gRes, (None, VEC))
@@ -410,27 +521,45 @@ class MhcPostCollapseNormKernel:
         gPre_v = cute.logical_divide(gPre, (None, 4))
 
         # ---- inputs not produced by the kernel this one depends on ----
-        # With the post update the residual is the previous boundary's output, two or more launches
-        # back. Without it the residual is a resolved state that the launch just before may have
-        # written (Engram gate, post mapping): it is read after the dependency wait.
+        # With the post update and without residual_after_wait the residual is an earlier split
+        # boundary's output, complete when this launch starts (see mHC.split_hc_lagged). Otherwise
+        # the launch just before may have written it (Engram gate, post mapping, mega_mhc): it is
+        # read after the dependency wait.
         r_bf = cute.make_rmem_tensor(cute.make_layout((HC, VEC), stride=(VEC, 1)), BFloat16)
-        if const_expr(self.post_update):
+        res_early: cutlass.Constexpr = (
+            self.post_update and self.collapse and not self.residual_after_wait
+        )
+        if const_expr(res_early and self.l2_residual):
+            first = l2_policy("evict_first")
+            row = gRes.iterator.toint() + (Int64(tok) * (HC * self.hidden) + Int64(tidx) * VEC) * 2
+            for j in cutlass.range_constexpr(HC):
+                words = ldg_v4_u32_l2(row + j * self.hidden * 2, first)
+                r_words = cute.recast_tensor(r_bf[j, None], Int32)
+                for i in cutlass.range_constexpr(VEC // 2):
+                    r_words[i] = Int32(words[i])
+        elif const_expr(res_early):
             for j in cutlass.range_constexpr(HC):
                 cute.copy(copy_bf16, gRes_v[tok, (None, j * vecs + tidx)], r_bf[j, None])
         w_bf = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
-        cute.copy(copy_bf16, gW_v[0, (None, tidx)], w_bf)
+        if const_expr(self.collapse):
+            cute.copy(copy_bf16, gW_v[0, (None, tidx)], w_bf)
         gscale = Float32(0.0)
         if const_expr(self.quant == "nvfp4"):
             gscale = ldg_f32(scale_addr)
 
         if const_expr(self.use_pdl):
             griddepcontrol_wait()
-        if const_expr(not self.post_update):
+        if const_expr(not res_early):
             for j in cutlass.range_constexpr(HC):
                 cute.copy(copy_bf16, gRes_v[tok, (None, j * vecs + tidx)], r_bf[j, None])
 
         x_bf = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
-        if const_expr(self.post_update):
+        if const_expr(self.post_update and self.moe_rows > 0):
+            x_words = cute.recast_tensor(x_bf, Int32)
+            words = self._moe_x_words(tok, tidx, gX, rows_addr)
+            for i in cutlass.range_constexpr(VEC // 2):
+                x_words[i] = Int32(words[i])
+        elif const_expr(self.post_update):
             cute.copy(copy_bf16, gX_v[tok, (None, tidx)], x_bf)
         pre, post, comb = self._load_coefficients(tok, gPost_v, gComb_v, gPre_v, copy_f32)
         self._boundary(
@@ -452,6 +581,179 @@ class MhcPostCollapseNormKernel:
             sf_addr,
             gscale,
         )
+
+    @cute.jit
+    def _kernel_vectors(
+        self,
+        tok,
+        tidx,
+        gX: cute.Tensor,
+        gRes: cute.Tensor,
+        gPost: cute.Tensor,
+        gComb: cute.Tensor,
+        gPre: cute.Tensor,
+        gW: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        q_addr: Int64,
+        sf_addr: Int64,
+        scale_addr: Int64,
+        rows_addr: Int64,
+    ) -> None:
+        """``kernel`` with ``vectors`` 8-wide vectors per thread, ``tidx + i * threads``.
+
+        The update, collapse and norm run stream by stream with the same rounding points; only the
+        partition of the sum of squares (each thread's vectors in order first) differs.
+        """
+        H = self.hidden
+        V = self.vectors
+        T = self.threads
+        warp = tidx // 32
+        lane = tidx % 32
+        res_early: cutlass.Constexpr = (
+            self.post_update and self.collapse and not self.residual_after_wait
+        )
+        row = Int64(tok) * (HC * H)
+        policy = Int64(0)
+        if const_expr(self.l2_residual):
+            policy = l2_policy("evict_first")
+
+        def load_residual(i):
+            base = gRes.iterator.toint() + (row + Int64(tidx + i * T) * VEC) * 2
+            if const_expr(self.l2_residual and res_early):
+                return [ldg_v4_u32_l2(base + j * H * 2, policy) for j in range(HC)]
+            return [ldg_v4_u32(base + j * H * 2) for j in range(HC)]
+
+        r = []
+        if const_expr(res_early):
+            r = [load_residual(i) for i in range(V)]
+        w = []
+        if const_expr(self.collapse):
+            w = [ldg_v4_u32(gW.iterator.toint() + Int64(tidx + i * T) * VEC * 2) for i in range(V)]
+        gscale = Float32(0.0)
+        if const_expr(self.quant == "nvfp4"):
+            gscale = ldg_f32(scale_addr)
+
+        if const_expr(self.use_pdl):
+            griddepcontrol_wait()
+        if const_expr(not res_early):
+            r = [load_residual(i) for i in range(V)]
+        x = []
+        if const_expr(self.post_update and self.moe_rows > 0):
+            x = [self._moe_x_words(tok, tidx + i * T, gX, rows_addr) for i in range(V)]
+        elif const_expr(self.post_update):
+            x = [
+                ldg_v4_u32(gX.iterator.toint() + (Int64(tok) * H + Int64(tidx + i * T) * VEC) * 2)
+                for i in range(V)
+            ]
+        pre = ldg_v4_f32(gPre.iterator.toint() + Int64(tok) * 16)
+        post = (Float32(0.0),) * 4
+        comb = [(Float32(0.0),) * 4] * HC
+        if const_expr(self.post_update):
+            post = ldg_v4_f32(gPost.iterator.toint() + Int64(tok) * 16)
+            comb = [
+                ldg_v4_f32(gComb.iterator.toint() + Int64(tok) * 64 + k * 16) for k in range(HC)
+            ]
+
+        # Per vector: new_r[j] = post[j] * x + sum_k comb[k][j] * r[k] (FP32, then BF16), stored
+        # stream by stream; li = sum_j pre[j] * new_r[j] in the same order (FP32, then BF16).
+        last = Int64(0)
+        if const_expr(self.l2_residual):
+            last = l2_policy("evict_last")
+        li = []
+        for i in cutlass.range_constexpr(V):
+            rf = [[bf16x2_lo(r[i][k][p]) for p in range(VEC // 2)] for k in range(HC)]
+            rh = [[bf16x2_hi(r[i][k][p]) for p in range(VEC // 2)] for k in range(HC)]
+            acc = [Float32(0.0)] * VEC
+            for j in cutlass.range_constexpr(HC):
+                if const_expr(self.post_update):
+                    words = []
+                    for p in cutlass.range_constexpr(VEC // 2):
+                        lo_x = bf16x2_lo(x[i][p])
+                        hi_x = bf16x2_hi(x[i][p])
+                        a_lo = _mul(post[j], lo_x)
+                        a_hi = _mul(post[j], hi_x)
+                        for k in cutlass.range_constexpr(HC):
+                            a_lo = _fma(comb[k][j], rf[k][p], a_lo)
+                            a_hi = _fma(comb[k][j], rh[k][p], a_hi)
+                        words.append(pack_bf16x2(a_lo, a_hi))
+                    dst = gResOut.iterator.toint() + (row + j * H + Int64(tidx + i * T) * VEC) * 2
+                    if const_expr(self.l2_residual):
+                        stg_v4_u32_l2(dst, words, last)
+                    else:
+                        stg_v4_u32(dst, words)
+                else:
+                    words = [r[i][j][p] for p in range(VEC // 2)]
+                if const_expr(self.collapse):
+                    for p in cutlass.range_constexpr(VEC // 2):
+                        for h in cutlass.range_constexpr(2):
+                            vf = bf16x2_lo(words[p]) if h == 0 else bf16x2_hi(words[p])
+                            if const_expr(j == 0):
+                                acc[2 * p + h] = _mul(pre[0], vf)
+                            else:
+                                acc[2 * p + h] = _fma(pre[j], vf, acc[2 * p + h])
+            if const_expr(self.collapse):
+                li.append([pack_bf16x2(acc[2 * p], acc[2 * p + 1]) for p in range(VEC // 2)])
+
+        if const_expr(self.use_pdl):
+            griddepcontrol_launch_dependents()
+        if const_expr(self.collapse):
+            sum_sq = Float32(0.0)
+            for i in cutlass.range_constexpr(V):
+                for p in cutlass.range_constexpr(VEC // 2):
+                    for h in cutlass.range_constexpr(2):
+                        lf = bf16x2_lo(li[i][p]) if h == 0 else bf16x2_hi(li[i][p])
+                        sum_sq = _fma(lf, lf, sum_sq)
+            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+            smem = SmemAllocator()
+            red = smem.allocate_tensor(
+                Float32, cute.make_layout((self.num_warps,)), byte_alignment=16
+            )
+            if lane == 0:
+                red[warp] = sum_sq
+            cute.arch.sync_threads()
+            total = Float32(0.0)
+            for wi in cutlass.range_constexpr(self.num_warps):
+                total = total + red[wi]
+            rstd = cute.math.rsqrt(total / Float32(H) + Float32(self.norm_eps))
+            for i in cutlass.range_constexpr(V):
+                vi = tidx + i * T
+                out_bf = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
+                for p in cutlass.range_constexpr(VEC // 2):
+                    for h in cutlass.range_constexpr(2):
+                        lf = bf16x2_lo(li[i][p]) if h == 0 else bf16x2_hi(li[i][p])
+                        wf = bf16x2_lo(w[i][p]) if h == 0 else bf16x2_hi(w[i][p])
+                        out_bf[2 * p + h] = _mul(_mul(lf, rstd), wf).to(BFloat16)
+                o_words = cute.recast_tensor(out_bf, Int32)
+                stg_v4_u32(
+                    gOut.iterator.toint() + (Int64(tok) * H + Int64(vi) * VEC) * 2,
+                    [o_words[p] for p in range(VEC // 2)],
+                )
+                if const_expr(self.quant == "mxfp8"):
+                    self._store_mxfp8(tok, vi, out_bf, q_addr, sf_addr)
+                elif const_expr(self.quant == "nvfp4"):
+                    self._store_nvfp4(tok, vi, out_bf, q_addr, sf_addr, gscale)
+
+    @cute.jit
+    def _moe_x_words(self, tok, vi, gX: cute.Tensor, rows_addr: Int64):
+        """BF16 pairs of ``x`` for vector ``vi`` of the token: its MoE rows summed in FP32 from +0
+        in row order, then the shared-expert output in ``gX``, rounded to BF16 once."""
+        H = self.hidden
+        # Ordered: the preceding MoE kernels wrote these, so no load may rise above the wait.
+        base = rows_addr + (Int64(tok) * (self.moe_rows * H) + Int64(vi) * VEC) * 2
+        rows = [ldg_v4_u32_ordered(base + k * H * 2) for k in range(self.moe_rows)]
+        shared = ldg_v4_u32_ordered(gX.iterator.toint() + (Int64(tok) * H + Int64(vi) * VEC) * 2)
+        words = []
+        for p in cutlass.range_constexpr(VEC // 2):
+            lo = Float32(0.0)
+            hi = Float32(0.0)
+            for k in cutlass.range_constexpr(self.moe_rows):
+                lo = _add(lo, bf16x2_lo(rows[k][p]))
+                hi = _add(hi, bf16x2_hi(rows[k][p]))
+            lo = _add(lo, bf16x2_lo(shared[p]))
+            hi = _add(hi, bf16x2_hi(shared[p]))
+            words.append(pack_bf16x2(lo, hi))
+        return words
 
     @cute.jit
     def _load_coefficients(
@@ -500,10 +802,7 @@ class MhcPostCollapseNormKernel:
         CTAs shares the token and the sum of squares is reduced through distributed shared
         memory, in the same warp order as one CTA.
         """
-        warp = tidx // 32
-        lane = tidx % 32
         vecs: cutlass.Constexpr = self.hidden // VEC
-        num_warps: cutlass.Constexpr = self.num_warps // ctas
 
         res_bf = cute.make_rmem_tensor(cute.make_layout((HC, VEC), stride=(VEC, 1)), BFloat16)
         if const_expr(self.post_update):
@@ -524,8 +823,20 @@ class MhcPostCollapseNormKernel:
                 res_bf[1, v] = acc1.to(BFloat16)
                 res_bf[2, v] = acc2.to(BFloat16)
                 res_bf[3, v] = acc3.to(BFloat16)
-            for j in cutlass.range_constexpr(HC):
-                cute.copy(store_bf16, res_bf[j, None], gResOut_v[tok, (None, j * vecs + vi)])
+            if const_expr(self.l2_residual):
+                last = l2_policy("evict_last")
+                row = (
+                    gResOut_v.iterator.toint()
+                    + (Int64(tok) * (HC * self.hidden) + Int64(vi) * VEC) * 2
+                )
+                for j in cutlass.range_constexpr(HC):
+                    r_words = cute.recast_tensor(res_bf[j, None], Int32)
+                    stg_v4_u32_l2(
+                        row + j * self.hidden * 2, [r_words[i] for i in range(VEC // 2)], last
+                    )
+            else:
+                for j in cutlass.range_constexpr(HC):
+                    cute.copy(store_bf16, res_bf[j, None], gResOut_v[tok, (None, j * vecs + vi)])
         else:
             for j in cutlass.range_constexpr(HC):
                 for v in cutlass.range_constexpr(VEC):
@@ -533,6 +844,41 @@ class MhcPostCollapseNormKernel:
 
         if const_expr(trigger_dependents):
             griddepcontrol_launch_dependents()
+        if const_expr(self.collapse):
+            self._collapse_norm(
+                tok,
+                tidx,
+                vi,
+                ctas,
+                res_bf,
+                w_bf,
+                pre,
+                gOut_v,
+                store_bf16,
+                q_addr,
+                sf_addr,
+                gscale,
+            )
+
+    @cute.jit
+    def _collapse_norm(
+        self,
+        tok,
+        tidx,
+        vi,
+        ctas: cutlass.Constexpr,
+        res_bf: cute.Tensor,
+        w_bf: cute.Tensor,
+        pre: cute.Tensor,
+        gOut_v: cute.Tensor,
+        store_bf16: cute.CopyAtom,
+        q_addr: Int64,
+        sf_addr: Int64,
+        gscale: Float32,
+    ) -> None:
+        warp = tidx // 32
+        lane = tidx % 32
+        num_warps: cutlass.Constexpr = self.num_warps // ctas
 
         # ---- lagged collapse: li = sum_j pre[j] * res[j] (BF16), sum of squares of BF16 li ----
         li_bf = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +14,7 @@ from urllib.parse import urlparse
 
 from PIL import Image, UnidentifiedImageError
 
-from tensorrt_llm.inputs.media_io import sniff_media_kind
+from tensorrt_llm.inputs.media_io import read_allowed_local_media, sniff_media_kind
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
@@ -25,11 +28,17 @@ if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen.params import MediaRef
 
 IMAGE_EDIT_MAX_IMAGES = 16
 IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
 IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES = 256 * 1024 * 1024
 IMAGE_EDIT_MAX_OUTPUT_IMAGES = 64
+
+# Total bytes the ``format='path'`` references of one request may read from
+# local files. A pipeline slot may accept any number of references, so the
+# per-file media limit alone does not bound a request.
+PATH_REFERENCE_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 _IMAGE_EDIT_INPUT_FORMATS = {"PNG", "JPEG"}
 _INVALID_IMAGE_EDIT_INPUT_MESSAGE = "image edit input is not a PNG/JPEG image"
 
@@ -109,25 +118,53 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def local_media_path_is_disallowed() -> bool:
-    """Whether server-side filesystem paths are refused at the HTTP boundary.
+_PATH_RESPONSE_DISABLED_ENV = "TRTLLM_MEDIA_DISABLE_PATH_RESPONSE"
+# The switch's former name, no longer read; see `check_path_response_policy`.
+_FORMER_PATH_RESPONSE_DISABLED_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
 
-    One switch for both directions, because both are the same trust question:
-    a ``path`` reference has the server read its own disk, and
-    ``response_format='path'`` has it disclose where it wrote. Either is what a
-    co-located client wants and what a remote one has no business doing, and
-    the code cannot tell the two deployments apart, so both are allowed by
-    default and turned off together with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``.
-    The local Python API is unaffected: this gate is the HTTP boundary's.
+
+def path_response_is_disabled() -> bool:
+    """Whether ``response_format='path'`` is refused at the HTTP boundary.
+
+    A ``path`` response discloses where the server wrote a file: what a
+    co-located client wants and what a remote one has no business seeing. The
+    code cannot tell the two deployments apart, so it is allowed by default
+    and turned off with ``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1``. Any value
+    other than unset, empty or ``0`` counts as off; `check_path_response_policy`
+    refuses one that is not ``1`` at startup. A ``path`` *reference*, which has
+    the server read a file, follows ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` instead
+    (`_reference_transport`).
     """
-    raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
-    if raw not in ("0", "1"):
+    return os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "") not in ("", "0")
+
+
+def check_path_response_policy() -> None:
+    """Check the path-response switch when a VisualGen server starts.
+
+    Raises ``ValueError`` when the switch holds a value other than ``1``,
+    ``0`` or empty, or when ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`` is set to a
+    value other than ``0`` or empty. Logs a warning when the latter is ``0`` or
+    empty, and logs when path responses are disabled.
+    """
+    former = os.environ.get(_FORMER_PATH_RESPONSE_DISABLED_ENV)
+    if former in ("", "0"):
         logger.warning(
-            "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
-            f"{raw!r}. Expected '0' or '1'. Treating as '0' "
-            "(server-side paths allowed)."
+            f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} is no longer read; unset it. "
+            "Path responses stay allowed."
         )
-    return raw == "1"
+    elif former is not None:
+        raise ValueError(
+            f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} has been renamed; unset it and "
+            f"set {_PATH_RESPONSE_DISABLED_ENV}=1 to keep path responses off."
+        )
+    raw = os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "")
+    if raw not in ("", "0", "1"):
+        raise ValueError(
+            f"Unrecognized value for {_PATH_RESPONSE_DISABLED_ENV}: {raw!r}. "
+            "Expected '1' to disable path responses, or '0' or unset to allow them."
+        )
+    if raw == "1":
+        logger.info("response_format='path' is disabled (%s=1).", _PATH_RESPONSE_DISABLED_ENV)
 
 
 def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
@@ -135,23 +172,41 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
 
     ``ref`` is a multipart ``UploadFile`` (has ``.file``) or a
     ``MediaReferenceItem`` exposing ``content`` / ``format`` / ``role``. An
-    upload is read to ``bytes`` here — the only decode the boundary owns — and
-    its format is implied by the transport rather than declared by the client;
-    everything else passes through for the engine to resolve.
+    upload is read to ``bytes`` here, its format implied by the transport
+    rather than declared by the client. A ``path`` reference names a file on
+    the server, so it is read to ``bytes`` here as well, under the request
+    local media policy (`read_allowed_local_media`): only a regular file inside
+    ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` is read. ``url`` and ``base64`` pass
+    through for the engine to resolve.
     """
     if hasattr(ref, "file"):  # multipart UploadFile
         return ref.file.read(), "bytes", getattr(ref, "role", None)
     content = getattr(ref, "content", None)
     if not isinstance(content, str):
         raise ValueError("reference item must carry a 'content' string.")
-    if ref.format == "path" and local_media_path_is_disallowed():
-        raise ValueError(
-            "reference format='path' is disallowed on this server "
-            "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it reads server-side files "
-            "and is only meaningful for co-located clients. Send the file as "
-            "base64 or upload it via multipart/form-data."
-        )
+    if ref.format == "path":
+        try:
+            data = read_allowed_local_media(content)
+        except ValueError as exc:
+            raise ValueError(f"reference format='path': {exc}") from exc
+        return data, "bytes", getattr(ref, "role", None)
     return content, ref.format, getattr(ref, "role", None)
+
+
+def request_reads_files(
+    request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
+) -> bool:
+    """Whether `parse_visual_gen_params` reads a file for ``request``.
+
+    It reads each multipart upload and each ``format='path'`` reference.
+    """
+    fields = ("image_reference", "video_reference", "audio_reference", "input_reference")
+    for field in (*fields, "image", "mask"):
+        value = getattr(request, field, None)
+        for item in value if isinstance(value, list) else [value]:
+            if hasattr(item, "file") or getattr(item, "format", None) == "path":
+                return True
+    return False
 
 
 def _validate_video_reference_counts(request: VideoGenerationRequest, generator: VisualGen) -> None:
@@ -178,26 +233,44 @@ def _validate_video_reference_counts(request: VideoGenerationRequest, generator:
                 raise ValueError(f"'{field}' accepts at most {limit} references, got {count}.")
 
 
-def _build_reference_list(value: Any) -> Optional[list]:
-    """Normalize one HTTP reference field into a list of ``MediaRef`` objects.
+def _build_reference_lists(request: VideoGenerationRequest) -> Dict[str, List[MediaRef]]:
+    """Normalize the HTTP reference fields into lists of ``MediaRef`` objects.
 
-    ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
-    a list of those. Each entry becomes a ``MediaRef`` carrying its transport
-    content plus the declared (or, for an upload, implied) wire format.
-    Resolution to bytes happens later, at the engine choke point.
+    Each of ``image_reference`` / ``video_reference`` / ``audio_reference`` is
+    None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or a list of
+    those. Each entry becomes a ``MediaRef`` carrying its transport content
+    plus the declared (or, for an upload, implied) wire format. A ``path``
+    reference is read here under the local media policy; ``url`` and
+    ``base64`` are resolved later, at the engine choke point. The ``path``
+    references of one request read at most ``PATH_REFERENCE_MAX_TOTAL_BYTES``;
+    the entry counts are checked before this by
+    `_validate_video_reference_counts`. Only the fields that were set are
+    returned.
     """
-    if value is None:
-        return None
     # Local import: the visual_gen tree is already loaded in a VisualGen serving
     # process, and this keeps it out of every plain-LLM process (see TYPE_CHECKING).
     from tensorrt_llm.visual_gen.params import MediaRef
 
-    raw_items = value if isinstance(value, list) else [value]
-    refs = []
-    for item in raw_items:
-        content, content_format, role = _reference_transport(item)
-        refs.append(MediaRef(content=content, format=content_format, role=role))
-    return refs
+    lists: Dict[str, List[MediaRef]] = {}
+    path_bytes = 0
+    for field in ("image_reference", "video_reference", "audio_reference"):
+        value = getattr(request, field, None)
+        if value is None:
+            continue
+        raw_items = value if isinstance(value, list) else [value]
+        refs = []
+        for item in raw_items:
+            content, content_format, role = _reference_transport(item)
+            if getattr(item, "format", None) == "path":
+                path_bytes += len(content)
+                if path_bytes > PATH_REFERENCE_MAX_TOTAL_BYTES:
+                    raise ValueError(
+                        "reference format='path': the files of one request exceed "
+                        f"{PATH_REFERENCE_MAX_TOTAL_BYTES} bytes in total."
+                    )
+            refs.append(MediaRef(content=content, format=content_format, role=role))
+        lists[field] = refs
+    return lists
 
 
 def _read_image_edit_upload(value: Any) -> bytes:
@@ -438,6 +511,10 @@ def parse_visual_gen_params(
     errors (400 via ``ValueError``), and the executor's
     ``validate_visual_gen_params`` for ``extra_params``
     strict-key/type/range checks (400 via ``ValueError``).
+
+    Reads every multipart upload and every ``format='path'`` reference (under
+    ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR``), so it blocks for a request for which
+    `request_reads_files` is true; run that one off the event loop.
     """
     params = generator.default_params
 
@@ -505,17 +582,11 @@ def parse_visual_gen_params(
                 )
             params.num_frames = derived
         # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
-        # transport content (``bytes`` for an upload, the string otherwise).
-        # The engine resolves it to bytes; the boundary never touches disk.
-        image_refs = _build_reference_list(request.image_reference)
-        if image_refs:
-            params.image_reference = image_refs
-        video_refs = _build_reference_list(request.video_reference)
-        if video_refs:
-            params.video_reference = video_refs
-        audio_refs = _build_reference_list(request.audio_reference)
-        if audio_refs:
-            params.audio_reference = audio_refs
+        # transport content (``bytes`` for an upload or an allowed local file,
+        # the string otherwise). The engine resolves ``url`` and ``base64``.
+        for field, refs in _build_reference_lists(request).items():
+            if refs:
+                setattr(params, field, refs)
         _apply_deprecated_input_reference(request.input_reference, params)
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))

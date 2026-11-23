@@ -18,7 +18,6 @@ per rank over a ``FakeDistGroup``.
 import copy
 import datetime
 import json
-import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -36,6 +35,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
 from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.request_utils import partition_context_for_helix
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
@@ -1194,9 +1194,7 @@ def _flushing_executor(coordinator: DisaggTransferCoordinator, active) -> PyExec
         rank=0, cp_size=1, mapping=SimpleNamespace(tp_group=[0], has_cp_helix=lambda: False)
     )
     executor.gather_all_responses = False
-    executor.response_cv = threading.Condition()
-    executor.responses = {}
-    executor.result_wait_queues = {}
+    executor._response_channel = ResponseChannel()
     executor._maybe_record_hang_diagnostic_phase = Mock()
     executor._disagg_pp_termination_handler = None
     executor._prefetched_request_ids = set()
@@ -1234,7 +1232,7 @@ def test_close_out_of_a_native_request_responds_and_releases_once(
     executor._flush_pending_transfer_responses()
     executor._flush_pending_transfer_responses()
 
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.result.is_final
     result = response.result.get_result()
     assert result.output_token_ids == [[100]]
@@ -1250,7 +1248,7 @@ def _closed_out_response(request: LlmRequest) -> LlmResponse:
     executor = _flushing_executor(CoordinatorHarness().coordinator, [request])
     executor._finish_gen_requests_ended_by_first_token()
     executor._flush_pending_transfer_responses()
-    (response,) = executor.responses[request.py_request_id]
+    (response,) = executor._response_channel.responses[request.py_request_id]
     return response
 
 
@@ -1361,7 +1359,7 @@ def _stats_executor(coordinator: DisaggTransferCoordinator, active) -> PyExecuto
         get_request_queue=lambda: SimpleNamespace(queue=[])
     )
 
-    def update_iter_stats(stats, _iter_latency_ms, num_completed_requests, *_args):
+    def update_iter_stats(stats, _iter_latency_ms, num_completed_requests, *_args, **_kwargs):
         stats.num_completed_requests = num_completed_requests
         return stats
 

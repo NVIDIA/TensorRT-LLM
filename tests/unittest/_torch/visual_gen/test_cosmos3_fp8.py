@@ -739,7 +739,7 @@ def _run_distilled_loop(model, device) -> torch.Tensor:
     )
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(_DISTILLED_SCHEDULER_CONFIG)
-    policy = Cosmos3SamplingPolicy.from_scheduler(scheduler)
+    policy = Cosmos3SamplingPolicy.from_scheduler(scheduler, fixed_sigmas=_DISTILLED_SIGMAS)
     policy.set_timesteps(
         scheduler,
         num_inference_steps=len(_DISTILLED_SIGMAS),

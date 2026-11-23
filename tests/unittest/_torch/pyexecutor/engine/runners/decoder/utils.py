@@ -79,6 +79,7 @@ def decoder_config(**changes: Any) -> DecoderRunnerConfig:
         cuda_graph_specialize_lora=False,
         samples_from_vocab_shards=False,
         spec_decode_fast_paths=False,
+        is_disagg=False,
     )
     spec = changes.get("spec_config")
     if spec is not None and changes.get("is_spec_decode", True):

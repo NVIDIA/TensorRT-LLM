@@ -13,6 +13,7 @@ import pytest
 import torch
 import yaml
 from PIL import Image
+from transformers import AutoProcessor
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import encode_base64_image
@@ -72,8 +73,8 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
     ]
     # The tests below send media as local paths under the test data root.
     env = os.environ.copy()
-    env["TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"] = str(llm_models_root() /
-                                                 "multimodals" / "test_data")
+    env["TRTLLM_MEDIA_ALLOWED_INPUT_DIR"] = str(llm_models_root() /
+                                                "multimodals" / "test_data")
     with RemoteOpenAIServer(model_path, args, env=env) as remote_server:
         yield remote_server
 
@@ -216,10 +217,19 @@ def test_single_chat_session_image_embeds(
 
     image_content = messages[0]["content"][1]
     assert image_content["type"] == "image_url"
+    # mRoPE needs the image grid. The encoder's handle has it; it must match
+    # the model's image processor.
+    image_grid_thw = mm_embed_handle["metadata"]["image_grid_thw"]
+    image_processor = AutoProcessor.from_pretrained(
+        get_model_path(model_name)).image_processor
+    image = Image.open(image_content["image_url"]["url"]).convert("RGB")
+    assert image_grid_thw == image_processor(
+        images=image, return_tensors="pt")["image_grid_thw"][0].tolist()
     image_content.clear()
     image_content["type"] = "image_embeds"
     image_content["image_embeds"] = {
-        "data": b64encode(mm_embed_bytes).decode("ascii")
+        "data": b64encode(mm_embed_bytes).decode("ascii"),
+        "image_grid_thw": image_grid_thw,
     }
 
     chat_completion_embeds = client.chat.completions.create(

@@ -552,6 +552,8 @@ def draft_experts():
     core = SimpleNamespace(
         w=w,
         mtp_layer_idx=1,
+        mtp_expert_offset=0,
+        mtp_local_experts=E,
         num_layers=1,
         num_experts=E,
         topk=K,
