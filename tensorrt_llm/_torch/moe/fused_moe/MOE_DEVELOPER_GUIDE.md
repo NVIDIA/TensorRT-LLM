@@ -648,8 +648,8 @@ finalize (scatter-add) into one persistent kernel, driven through
   warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`. When
   `quantize_input` is called with `post_quant_comm=False` (no communication,
   or after a pre-quant dispatch), raw BF16/FP16 inputs up to
-  `FUSED_INPUT_QUANT_MAX_ELEMENTS` are passed through unquantized and
-  quantized inside the op's workspace-reset launch
+  `FUSED_INPUT_QUANT_MAX_ELEMENTS` are passed through unquantized, with
+  `x_sf=None`, and quantized inside the op's workspace-reset launch
   (`fused_fc12_mxfp8_workspace.py` / `mxfp8_input_quant.py`, bit-compatible
   with `mxfp8_quantize` for finite inputs), saving the separate quantize
   launch.

@@ -8443,6 +8443,7 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
             monkeypatch.setattr(type(backend), "FUSED_INPUT_QUANT_MAX_ELEMENTS", 0)
         x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
         assert (x_quantized.dtype == torch.float8_e4m3fn) is not fused_input_quant
+        assert (x_sf is None) is fused_input_quant
         # Raw BF16 is quantized inside the fused op; the references always
         # consume explicitly quantized activations, which are byte-identical to
         # what the op produces.

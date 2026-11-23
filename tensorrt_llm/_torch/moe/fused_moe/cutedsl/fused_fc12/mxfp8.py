@@ -326,16 +326,12 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         Returns:
             ``(x, x_sf)``: e4m3 ``[num_tokens, hidden_size]`` and uint8
             ``[num_tokens, hidden_size // 32]`` scales; or, when quantization is
-            deferred to the op, ``x`` unchanged and an uninitialized scale
-            tensor of that shape, which carries shape metadata only.
+            deferred to the op, ``(x, None)`` with ``x`` unchanged.
         """
         x_row = x.shape[0]
         sf_vec_size = self.quant_method.BLOCK_SIZE
         if not post_quant_comm and self._fuses_input_quant(x):
-            x_sf = torch.empty(
-                (x_row, x.shape[1] // sf_vec_size), dtype=torch.uint8, device=x.device
-            )
-            return x, x_sf
+            return x, None
         x, x_sf = torch.ops.trtllm.mxfp8_quantize(
             x, False, alignment=self.quant_method.weight_alignment
         )
@@ -379,12 +375,30 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         x: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
-        x_sf: torch.Tensor,
+        x_sf: torch.Tensor | None,
         moe_output: torch.Tensor | None = None,
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
-        """Autotuner wrapper: picks the routing tile and runs the fused op."""
-        assert x_sf is not None, "MXFP8 MoE requires the activation block scales"
+        """Autotuner wrapper: picks the routing tile and runs the fused op.
+
+        ``x_sf`` is None when ``quantize_input`` deferred quantization to the
+        op; ``x`` is then raw BF16/FP16.
+        """
+        if x_sf is None:
+            assert self._fuses_input_quant(x), (
+                "MXFP8 MoE without block scales requires raw input the op quantizes, "
+                f"got {x.dtype} {tuple(x.shape)} stride {x.stride()}"
+            )
+            # The op allocates its own E4M3 and scale scratch; this tensor
+            # gives the scale shape, and the token count the autotuner reads
+            # from input 2, and is never read or written.
+            x_sf = x.new_empty(
+                (x.shape[0], x.shape[1] // self.quant_method.BLOCK_SIZE), dtype=torch.uint8
+            )
+        else:
+            assert x.dtype == torch.float8_e4m3fn, (
+                f"MXFP8 MoE block scales come with E4M3 input, got {x.dtype}"
+            )
         output_dtype = torch.bfloat16
 
         if moe_output is None:
