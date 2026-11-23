@@ -1206,6 +1206,10 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         content_format=ContentFormat.PASSTHROUGH,
     ))
 class VilaModel(PreTrainedModel):
+
+    # The vision encoder uses Hugging Face CLIP or SigLIP.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     config_class = VilaConfig
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,

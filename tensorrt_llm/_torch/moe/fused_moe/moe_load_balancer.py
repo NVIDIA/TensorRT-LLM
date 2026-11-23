@@ -7,7 +7,7 @@ import threading
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -22,6 +22,11 @@ from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    from .moe_warmup_placement import WarmupPlacementController
+
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     """
@@ -30,7 +35,16 @@ def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     Args:
         t: The tensor to convert
     """
-    assert t.dim() <= 2, "t.dim() should be less than or equal to 2"
+    if t.dim() > 2:
+        # MoeWeight is a 2D (height, width, pitch) cudaMemcpy2D descriptor, so a
+        # higher-rank weight -- e.g. a TRTLLM-Gen BlockMajorK expert weight,
+        # [K / blockK, Mn, blockK] -- is described by its leading dims collapsed,
+        # which covers the same bytes. Contiguity makes that flatten a view; a
+        # copy would leave weight_ptr dangling once this function returns.
+        assert t.is_contiguous(), (
+            f"a {t.dim()}D weight must be contiguous to be described by a "
+            f"single pitch, shape={tuple(t.shape)}, strides={t.stride()}")
+        t = t.flatten(0, -2)
     shape = [1, 1]
     pitch = 1
     elt_size = torch.tensor([], dtype=t.dtype).element_size()
@@ -126,8 +140,6 @@ class HostMoeTensorSharer:
             expert_id: The ID of the expert
             name: The name of the weight
         """
-        assert len(tensor_shape
-                   ) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert 0 <= expert_id < self.expert_count
         assert expert_id < self.expert_start or expert_id >= self.expert_end
         if name not in self.name_info:
@@ -149,8 +161,6 @@ class HostMoeTensorSharer:
             name: The name of the weight
             t: The weight tensor
         """
-        assert len(
-            t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert t.is_contiguous() == True, "t.is_contiguous() must be True"
         assert (expert_id, name) not in self.shared_tensors.keys()
         assert self.expert_start <= expert_id < self.expert_end
@@ -280,7 +290,10 @@ class HostMoeTensorSharer:
 
     def pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ load balancer has shut down, so no weight update
+        still reads them, and before the barrier that lets the owner unlink them.
         """
         for shm in self.imported_shms:
             shm.close()
@@ -752,7 +765,9 @@ class SingleLayerMoeLoadBalancer:
 
     def py_pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ shutdown and before the barrier.
         """
         if self.updates_enabled:
             self.host_tensor_sharer.pre_shutdown_cleanup()
@@ -881,11 +896,13 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
     This class can be used as a context manager to manage the lifecycle of a MoeLoadBalancer.
     """
 
-    def __init__(self,
-                 ep_rank: int,
-                 ep_size: int,
-                 layer_updates_per_iter: int,
-                 shared_memory_base_name: Optional[str] = None):
+    def __init__(
+            self,
+            ep_rank: int,
+            ep_size: int,
+            layer_updates_per_iter: int,
+            shared_memory_base_name: Optional[str] = None,
+            warmup_placement: Optional["WarmupPlacementController"] = None):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -894,7 +911,14 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
             shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
+            warmup_placement: Optional ``WarmupPlacementController`` that re-places the experts
+                of the static layers during warmup, then freezes (needs static routing).
         """
+        if warmup_placement is not None and layer_updates_per_iter > 0:
+            raise ValueError(
+                "warmup placement keeps the layers static; it needs layer_updates_per_iter == 0"
+            )
+        self.warmup_placement = warmup_placement
         self.is_shutdown = True
         self.ep_rank = ep_rank
         self.ep_size = ep_size
@@ -1008,6 +1032,8 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
+        if self.warmup_placement is not None:
+            self.warmup_placement.finalize()
         torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):
@@ -1060,9 +1086,11 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         local_safe = bool(local_safe and not self.in_iter)
         if not all(self.shared_mpi_comm.allgather(local_safe)):
             return False
+        # Stop the C++ weight-update threads first. They read the host weights
+        # that the cleanup below closes.
+        self.load_balancer_impl.shutdown()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
-        self.load_balancer_impl.shutdown()
         # use this sync to make sure all the shm resources can be cleaned up
         self.shared_mpi_comm.barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
@@ -1085,6 +1113,8 @@ moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
     'DeepseekV32ForCausalLM',
     'DeepseekV4ForCausalLM',
+    'DeepseekV41ForCausalLM',
+    'DeepseekV41ForConditionalGeneration',
     'GlmMoeDsaForCausalLM',
     'GptOssForCausalLM',
     'KimiK25ForConditionalGeneration',
@@ -1133,6 +1163,23 @@ def maybe_create_moe_load_balancer(
             raise ValueError(
                 "per-layer dynamic EPLB is incompatible with smart routing "
                 "(moe_cluster_size > 1)")
+    if getattr(config, "warmup_placement", None) is not None:
+        if not in_supported_model_arch:
+            raise ValueError(
+                f"warmup placement does not support model architecture {model_arch!r}"
+            )
+        if not using_ep:
+            raise ValueError(
+                "warmup placement requires expert parallelism (moe_ep_size > 1)"
+            )
+        if using_smart_router:
+            raise ValueError(
+                "warmup placement is incompatible with smart routing (moe_cluster_size > 1)"
+            )
+        if mapping.world_size != ep_size:
+            raise ValueError(
+                "warmup placement requires pure expert parallelism: "
+                f"world size {mapping.world_size} != moe_ep_size {ep_size}")
 
     if (in_supported_model_arch and using_ep and not using_smart_router
             and config is not None):
@@ -1159,17 +1206,44 @@ def maybe_create_moe_load_balancer(
                 # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
                 pass
 
+            warmup_placement = _create_warmup_placement(model_config, ep_rank,
+                                                        ep_size)
             moe_load_balancer = MoeLoadBalancer(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
-                layer_updates_per_iter=config.layer_updates_per_iter)
+                layer_updates_per_iter=config.layer_updates_per_iter,
+                warmup_placement=warmup_placement)
             logger.info(
-                "Created standard MoE LoadBalancer, layer_updates_per_iter=%s...",
+                "Created standard MoE LoadBalancer, layer_updates_per_iter=%s, "
+                "warmup placement %s...",
                 config.layer_updates_per_iter,
+                "on" if warmup_placement is not None else "off",
             )
         else:
             raise ValueError(f"Unknown MoE load-balancer mode: {mode!r}")
     return moe_load_balancer
+
+
+def _create_warmup_placement(
+        model_config: "ModelConfig", ep_rank: int,
+        ep_size: int) -> Optional["WarmupPlacementController"]:
+    """The controller of ``moe_load_balancer.warmup_placement``, or None when unset."""
+    from .moe_warmup_placement import (WarmupPlacementController,
+                                       register_controller)
+    settings = model_config.moe_load_balancer.warmup_placement
+    if settings is None:
+        return None
+    # MoE layers past the target's decoder layers are draft (MTP) layers.
+    text_config = getattr(model_config.pretrained_config, "text_config", None)
+    if text_config is None:
+        text_config = model_config.pretrained_config
+    num_layers = getattr(text_config, "num_hidden_layers", None)
+    controller = WarmupPlacementController(settings,
+                                           ep_rank=ep_rank,
+                                           ep_size=ep_size,
+                                           num_target_layers=num_layers)
+    register_controller(controller)
+    return controller
 
 
 class MoeLoadBalancerIterContext:

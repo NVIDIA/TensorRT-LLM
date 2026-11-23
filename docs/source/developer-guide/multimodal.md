@@ -47,6 +47,20 @@ Inline encoding and prefetch write encoder outputs back to the request.
 Item-scheduled LLM chunks keep their assembled embeddings local to the forward.
 Execution paths retain their CUDA event synchronization responsibilities.
 
+Side-stream prefetch stages a request's encoder inputs, MRoPE positions, and
+embeddings on its own CUDA stream. Input preparation of the first chunk that
+reads them, through its multimodal rows or its MRoPE positions or delta, waits
+for the prefetch event and calls `record_stream` on every CUDA tensor in the
+request's multimodal data. A chunk that reads none leaves the event on the
+request.
+Later chunks then read them without their own wait, and cleanup may drop them
+while forward-stream reads are still queued.
+
+With KV cache manager V2, a request's encoder-cache references are released
+as each chunk completes. When KV reuse starts the prefill past items that were
+already bound, context-chunk item selection releases them first; whole-request
+selection keeps them until the request's next chunk completes.
+
 ## Item Metadata and Selection
 
 `item_refs` identifies processed items by modality and modality-local index, in

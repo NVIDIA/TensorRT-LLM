@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import uuid
 from functools import lru_cache, partial
@@ -23,7 +26,8 @@ from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, BaseMediaIO,
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from tensorrt_llm.inputs.utils import apply_mm_placeholders
+from tensorrt_llm.inputs.utils import (NATIVE_MISTRAL_MODEL_TYPES,
+                                       apply_mm_placeholders)
 from tensorrt_llm.logger import logger
 
 
@@ -38,9 +42,11 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     type: Required[Literal["video_url"]]
 
 
-class ImageEmbedsData(TypedDict):
+class ImageEmbedsData(TypedDict, total=False):
     """Type definition for serialized image embeddings structure."""
     data: Required[str]
+    # Image grid (t, h, w) from the image processor. mRoPE models need it.
+    image_grid_thw: List[int]
 
 
 class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
@@ -116,7 +122,7 @@ async def _load_request_media(media_io: BaseMediaIO, url: str) -> Any:
     """Load one media URL taken from a request.
 
     A local reference (`file://` URI or bare path) is read only from the
-    directory allowed by `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`, through
+    directory allowed by `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, through
     `BaseMediaIO.async_load_allowed_local_file`: the file is opened once on
     the media executor and decoded through that open descriptor. The check
     runs when the load is awaited, so a request whose media is discarded
@@ -173,9 +179,13 @@ def parse_chat_message_content_part(
 
     if part_type == "image_embeds":
         str_content = cast(str, content)
+        image_grid_thw = cast(dict, part)["image_embeds"].get("image_grid_thw")
 
         async def decode_image_embeds():
-            return load_base64_image_embeds(str_content)
+            embeds = load_base64_image_embeds(str_content)
+            if image_grid_thw is None:
+                return embeds
+            return {"mm_embeddings": embeds, "image_grid_thw": image_grid_thw}
 
         return MultimodalData(modality="image",
                               data=decode_image_embeds(),
@@ -224,11 +234,13 @@ def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionContentPartParam],
     mm_data_tracker: MultimodalDataTracker,
+    keep_content_parts: bool = False,
 ) -> ConversationMessage:
     """Parse multiple parts of a chat message.
 
     Builds both the flattened text (`content`) for backward compatibility and an ordered
     `content_parts` list that preserves the interleaved positions of text and media items.
+    `content_parts` is kept for text-only messages too when `keep_content_parts` is set.
     """
     text_parts: list[str] = []
     media_parts: list[MultimodalData] = []
@@ -256,7 +268,7 @@ def parse_chat_message_content_parts(
                                  media=media_parts)
     # Only include content_parts when media is present (to preserve
     # interleaved ordering for multimodal dispatch).
-    if media_parts:
+    if media_parts or keep_content_parts:
         result["content_parts"] = content_parts
     return result
 
@@ -265,10 +277,22 @@ def parse_chat_message_content(
         message: ChatCompletionMessageParam,
         mm_data_tracker: MultimodalDataTracker,
         lenient_tool_call_arguments: bool = False,
-        keep_message_tools: bool = False) -> ConversationMessage:
-    """Parse the content of a chat message."""
+        keep_message_tools: bool = False,
+        keep_text_parts: bool = False,
+        raw_tool_call_arguments: bool = False) -> ConversationMessage:
+    """Parse the content of a chat message.
+
+    With `keep_text_parts`, a content list keeps its text parts as separate
+    `content_parts` entries even without media, for renderers that encode each
+    part on its own rather than the newline-joined `content`.
+
+    With `raw_tool_call_arguments`, an assistant tool call keeps its
+    `function.arguments` as the client sent them, for a renderer that parses
+    them itself.
+    """
     role = message["role"]
     content = message.get("content")
+    is_part_list = content is not None and not isinstance(content, str)
 
     if content is None:
         content = []
@@ -281,11 +305,13 @@ def parse_chat_message_content(
         role,
         content,
         mm_data_tracker,
+        keep_content_parts=keep_text_parts and is_part_list,
     )
     if role == "assistant":
         result.update(
             _parse_assistant_message_content(message,
-                                             lenient_tool_call_arguments))
+                                             lenient_tool_call_arguments,
+                                             raw_tool_call_arguments))
     elif role == "tool":
         result.update(_parse_tool_message_content(message))
     elif keep_message_tools and role == "system" and message.get("tools"):
@@ -357,11 +383,17 @@ def _validate_fallback_tool_calls(
 
 def _normalize_tool_call_arguments(index: int,
                                    item: Any,
-                                   lenient_json: bool = False
-                                   ) -> dict[str, Any]:
-    """Normalize `function.arguments` to the internal dict form."""
+                                   lenient_json: bool = False,
+                                   keep_raw: bool = False) -> dict[str, Any]:
+    """Normalize `function.arguments` to the internal dict form.
+
+    `keep_raw` leaves the arguments as given, for a renderer that parses them
+    itself (mistral-common); `lenient_json` keeps an unparsable string as is.
+    """
     item = dict(item)
     item["function"] = dict(item["function"])
+    if keep_raw:
+        return item
 
     arguments = item["function"].get("arguments")
     if arguments is None:
@@ -391,9 +423,9 @@ def _normalize_tool_call_arguments(index: int,
     return item
 
 
-def _parse_fallback_tool_calls(
-        tool_calls: list[Any],
-        lenient_json: bool = False) -> list[dict[str, Any]]:
+def _parse_fallback_tool_calls(tool_calls: list[Any],
+                               lenient_json: bool = False,
+                               keep_raw: bool = False) -> list[dict[str, Any]]:
     """Parse raw tool-call lists accepted only by the tau2-bench fallback path.
 
     `openai_server.py` first attempts strict OpenAI request validation. Some tau2-bench requests
@@ -405,15 +437,15 @@ def _parse_fallback_tool_calls(
     """
     tool_calls = _validate_fallback_tool_calls(tool_calls)
     return [
-        _normalize_tool_call_arguments(index, item, lenient_json)
+        _normalize_tool_call_arguments(index, item, lenient_json, keep_raw)
         for index, item in enumerate(tool_calls)
     ]
 
 
 # Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
 def _parse_assistant_message_content(message: Dict[str, Any],
-                                     lenient_json: bool = False
-                                     ) -> Dict[str, Any]:
+                                     lenient_json: bool = False,
+                                     keep_raw: bool = False) -> Dict[str, Any]:
     result = {}
     # Include reasoning if present for interleaved thinking.
     reasoning_content = message.get("reasoning")
@@ -426,7 +458,7 @@ def _parse_assistant_message_content(message: Dict[str, Any],
     if tool_calls is not None:
         if isinstance(tool_calls, list):
             result["tool_calls"] = _parse_fallback_tool_calls(
-                tool_calls, lenient_json)
+                tool_calls, lenient_json, keep_raw)
         else:
             # The strict parse path delivers tool_calls as a single-use Pydantic `ValidatorIterator`
             # of already-validated OpenAI tool calls, so only materialize and normalize arguments.
@@ -436,7 +468,8 @@ def _parse_assistant_message_content(message: Dict[str, Any],
             # surfaces from the `list()` above, so the raw-body fallback is unchanged.
             message["tool_calls"] = tool_calls
             result["tool_calls"] = [
-                _normalize_tool_call_arguments(index, item, lenient_json)
+                _normalize_tool_call_arguments(index, item, lenient_json,
+                                               keep_raw)
                 for index, item in enumerate(tool_calls)
             ]
 
@@ -518,11 +551,17 @@ def parse_chat_messages_coroutines(
     for msg in messages:
         # kimi_k3's reference renderer keeps unparsable tool-call argument
         # strings verbatim; other templates expect the strict dict contract.
+        # mistral-common (the Mistral-native renderer) encodes each text part
+        # of a content list on its own, and parses a history tool call's
+        # arguments itself.
+        native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
         parsed_msg = parse_chat_message_content(
             msg,
             mm_data_tracker,
             lenient_tool_call_arguments=(model_type == "kimi_k3"),
-            keep_message_tools=(model_type == "kimi_k3"))
+            keep_message_tools=(model_type == "kimi_k3"),
+            keep_text_parts=native_mistral,
+            raw_tool_call_arguments=native_mistral)
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.

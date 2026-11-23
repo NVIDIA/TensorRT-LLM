@@ -16,13 +16,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
     Fc2Expected,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
     cute_dsl_nvfp4_grouped_gemm as op,
 )
-from tensorrt_llm._torch.autotuner import AutoTuner
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name

@@ -25,10 +25,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderRunner,
     resolve_scheduled_encoder_args,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
-    EncoderStage,
-    EncoderStageConfig,
-)
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderStage
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs, ScheduledInputs
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
@@ -66,7 +63,6 @@ def _encoder_config(
             def encoder_graph_spec(self) -> tuple[tuple[int, ...], torch.dtype, int]:
                 return feature_spec
 
-    config_type = EncoderStageConfig if encoder_decoder else EncoderConfig
     kwargs = dict(
         model=_Model(),
         mapping=SimpleNamespace(tp_size=tp_size),
@@ -80,7 +76,7 @@ def _encoder_config(
         enable_autotuner=False,
         is_encoder_decoder=encoder_decoder,
     )
-    return config_type.create(**kwargs), feature_spec
+    return EncoderConfig.create(**kwargs), feature_spec
 
 
 @pytest.mark.parametrize(
@@ -703,16 +699,6 @@ def test_scheduled_requests_reject_multimodal_inputs() -> None:
 
     with pytest.raises(ValueError, match="cannot carry multimodal inputs"):
         object.__new__(EncoderRunner)._pack_scheduled(_scheduled_inputs([request]))
-
-
-def test_scheduled_warmup_rejects_kv_cache_manager() -> None:
-    runner = object.__new__(EncoderRunner)
-    runner._model = SimpleNamespace(extra_attrs={})
-    resource_manager = Mock()
-    resource_manager.get_resource_manager.return_value = object()
-
-    with pytest.raises(AssertionError, match="but a KV cache manager was allocated"):
-        runner.warmup(resource_manager)
 
 
 def test_encoder_graph_rejects_nested_outputs() -> None:

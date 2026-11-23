@@ -68,9 +68,15 @@ add_th_common_family(
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  pagedFp8ContextFmhaOp.cpp
+  trtllmGenQKVProcessOp.cpp
+  csa2SparseContextOp.cpp
+  csa2SparseDecodeOp.cpp)
 target_include_directories(th_common_attention
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+# pagedFp8ContextFmhaOp.cpp includes the trtllm-gen FMHA runner headers (see
+# th_common_visual_gen below).
+target_link_libraries(th_common_attention PRIVATE trtllm_gen_fmha_interface)
 
 # MiniMax-M3 torch ops live in minimaxM3/; that directory adds them to
 # th_common_attention with target_sources() so the list stays next to the files.
@@ -111,6 +117,7 @@ add_th_common_family(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
+  lmHeadArgmaxOp.cpp
   tinygemm2.cpp)
 
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
@@ -133,6 +140,7 @@ add_th_common_family(
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
   ncclCommunicatorOp.cpp
+  nativeMemoryOp.cpp
   allocateOutput.cpp
   reducescatterOp.cpp
   localityDomainAllocator.cpp
@@ -218,9 +226,6 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
-  target_compile_definitions(th_common_gemm_quant
-                             PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
-  target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
   target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
 endif()
 

@@ -20,7 +20,7 @@ import threading
 import time
 import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
                     cast)
@@ -907,6 +907,22 @@ class BaseLLM:
                  disaggregated_params,
              )
 
+        if (not self.args.mm_encoder_only and disaggregated_params is not None
+                and disaggregated_params.multimodal_input_layout is not None):
+            disaggregated_params = replace(disaggregated_params,
+                                           multimodal_input_layout=None)
+
+        if (self.args.mm_encoder_only
+                and multimodal_params is not None and isinstance(
+                    self.input_processor, BaseMultimodalInputProcessor)):
+            encoder_layout = self.input_processor.get_disagg_prefill_inputs(
+                prompt_token_ids, multimodal_params)
+            if encoder_layout is not None:
+                disaggregated_params = replace(
+                    disaggregated_params or
+                    DisaggregatedParams(request_type="context_and_generation"),
+                    multimodal_input_layout=encoder_layout)
+
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
 
@@ -1011,14 +1027,16 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            # TODO(TRTLLM-12869): Pass encoder-side MM layout through
-            # DisaggregatedParams so prefill does not rebuild prompt tokens,
-            # positions, lengths, runs, special offsets, and cumsum here.
+            layout_kwargs = {}
+            if disaggregated_params.multimodal_input_layout is not None:
+                layout_kwargs[
+                    "encoder_inputs"] = disaggregated_params.multimodal_input_layout
             prompt_token_ids, multimodal_params = (
                 self.input_processor.build_disagg_prefill_multimodal_inputs(
                     inputs,
                     mm_handles,
-                    mm_hashes=disaggregated_params.multimodal_hashes))
+                    mm_hashes=disaggregated_params.multimodal_hashes,
+                    **layout_kwargs))
             if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
@@ -1032,8 +1050,16 @@ class BaseLLM:
                 # BaseWorker resolves embedding handles to local tensor views.
                 multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
-                    # NOTE: `ModelEngine` assumes both are present when using mrope.
-                    assert disaggregated_params.mrope_position_deltas_handle is not None
+                    if disaggregated_params.mrope_position_deltas_handle is None:
+                        raise ValueError(
+                            "mRoPE position IDs require position deltas")
+                    shape = disaggregated_params.mrope_position_ids_handle[
+                        "tensor_size"]
+                    if tuple(shape) != (3, 1, len(prompt_token_ids)):
+                        raise ValueError(
+                            f"Encoder mRoPE shape {shape} does not match prefill prompt "
+                            f"length {len(prompt_token_ids)}; preserve the encoder prompt layout"
+                        )
                     mrope_config = {}
                     mrope_config[
                         "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
@@ -1521,6 +1547,21 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
+            elif (sampling_params.stop is not None
+                  or sampling_params.bad is not None):
+                # An explicit end_id skips the end_id/pad_id/EOS defaults of
+                # _setup, but the stop and bad strings still have to be
+                # tokenized before the request is built.
+                # A bare string needs the tokenizer even when it is empty;
+                # an empty list does not.
+                if self.tokenizer is None and any(
+                        isinstance(words, str) or words
+                        for words in (sampling_params.stop,
+                                      sampling_params.bad)):
+                    raise ValueError(
+                        "tokenizer is required to tokenize the stop and bad strings of sampling_params"
+                    )
+                sampling_params._setup_word_ids(self.tokenizer)
             self._configure_bart_decoder_prefix(sampling_params)
             self._add_whisper_suppress_tokens_logits_processor(sampling_params)
             add_thinking_budget_logits_processor(
@@ -1736,7 +1777,7 @@ class BaseLLM:
             output_dir (str, optional): Directory where chrome traces are
                 written. If ``None``, falls back to the
                 ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
-                to ``/tmp``. Defaults to None.
+                to a temporary directory. Defaults to None.
             num_steps (int, optional): Number of engine iterations to
                 capture. When set, the engine stops the window automatically
                 and ``stop_profile`` does not need to be called. When
@@ -2005,6 +2046,41 @@ class _TorchLLM(BaseLLM):
         return normalized
 
     @set_api_status("prototype")
+    def get_memory_report(self) -> list[str]:
+        """Explain where the GPU workers' memory is going, as readable reports.
+
+        Each report splits one worker process's GPU memory by purpose (KV
+        cache, weights, runtime buffers, CUDA graphs, communication buffers,
+        library overhead) so that the parts add up to what the process holds.
+        In the monitor's full mode (``memory_monitor_config.mode='full'`` or
+        ``TLLM_MEM_MONITOR=1``), reports also break down startup step by step
+        and compare against the state after warmup.
+
+        Every rank reports with the Ray executor. With the default MPI
+        executor, every rank reports in full mode; otherwise rank 0 reports
+        and every other rank is listed as not gathered.
+
+        Returns:
+            list[str]: One entry per rank, rank 0 first: its report, or one
+            line saying why there is none (not gathered, not answered in
+            time, or the report could not be built). With
+            ``encode_only=True`` the encoder runs in this process, and the one
+            entry is this process's report.
+        """
+        if self._encode_only:
+            from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+            report = report_now(tag="on_demand", force=True, save=False)
+            return [
+                report or
+                "rank 0: the report could not be built; see this process's log"
+            ]
+        replies = self._collective_rpc("get_memory_report")
+        return [
+            report for reply in replies if reply for report in reply if report
+        ]
+
+    @set_api_status("prototype")
     def get_memory_status(self) -> RuntimeMemoryStatus:
         """Return the authoritative runtime-memory checkpoint status.
 
@@ -2144,6 +2220,7 @@ class _TorchLLM(BaseLLM):
             checkpoint_format,
             trust_remote_code=self.args.trust_remote_code,
             enable_tokenization_cache=self.args.enable_tokenization_cache,
+            prompt_token_cache_config=self.args.prompt_token_cache_config,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 

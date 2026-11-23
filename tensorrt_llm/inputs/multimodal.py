@@ -303,6 +303,30 @@ def get_multimodal_item_metadata(
     return metadata
 
 
+def split_multimodal_embedding_items(
+        items: Any) -> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
+    """Split one modality's external embedding items into tensors and metadata.
+
+    An item is an embedding tensor, or a dict that holds the tensor under
+    ``"mm_embeddings"`` and per-item metadata by field name, for example
+    ``{"mm_embeddings": tensor, "image_grid_thw": [1, 34, 46]}``. A bare
+    tensor has no metadata. A single item may be passed without a list.
+    """
+    if isinstance(items, (torch.Tensor, dict)):
+        items = [items]
+    tensors, metadata = [], []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            item = {"mm_embeddings": item}
+        elif "mm_embeddings" not in item:
+            raise ValueError(f"Embedding item {index} must hold its tensor "
+                             "under 'mm_embeddings'")
+        item = dict(item)
+        tensors.append(item.pop("mm_embeddings"))
+        metadata.append(item)
+    return tensors, metadata
+
+
 class MultimodalEncoderProgress(Enum):
     """Python-only progress derived from request-local MM item outputs.
 
@@ -761,6 +785,63 @@ class MultimodalInput:
 
 
 @dataclass
+class MultimodalInputLayout:
+    """Tensor-free encoder prompt snapshot carried across E/P transport.
+
+    Prefill consumes this snapshot into ``(prompt_token_ids, MultimodalParams)``.
+    It is not an execution view and owns no encoder cache references.
+    """
+
+    prompt_token_ids: List[int]
+    multimodal_lengths: List[int]
+    multimodal_positions: List[int]
+    multimodal_embedding_lengths: List[int]
+    multimodal_item_run_cu_offsets: Optional[List[int]] = None
+    multimodal_run_positions: Optional[List[int]] = None
+    multimodal_run_lengths: Optional[List[int]] = None
+    special_token_offsets: Optional[List[int]] = None
+    item_types: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        """Validate the prompt snapshot before it crosses the E/P boundary."""
+        _validate_int_list(self.prompt_token_ids, "prompt_token_ids")
+        _validate_int_list(self.multimodal_embedding_lengths,
+                           "multimodal_embedding_lengths")
+        _validate_multimodal_positions_and_lengths(
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            len(self.multimodal_embedding_lengths),
+            "multimodal_embedding_lengths",
+        )
+
+        if any(length <= 0 for length in self.multimodal_embedding_lengths):
+            raise ValueError("multimodal_embedding_lengths must be positive")
+
+        _validate_multimodal_runs(
+            len(self.multimodal_lengths),
+            self.multimodal_lengths,
+            self.multimodal_item_run_cu_offsets,
+            self.multimodal_run_positions,
+            self.multimodal_run_lengths,
+            "multimodal_lengths",
+        )
+        self._validate_optional_metadata()
+
+    def _validate_optional_metadata(self) -> None:
+        """Validate optional framing offsets and model-specific item tags."""
+        if self.special_token_offsets is not None:
+            _validate_int_list(self.special_token_offsets,
+                               "special_token_offsets")
+            if any(offset < 0 for offset in self.special_token_offsets):
+                raise ValueError("special_token_offsets must be non-negative")
+        if self.item_types is not None:
+            _validate_int_list(self.item_types, "item_types")
+            if len(self.item_types) != len(self.multimodal_lengths):
+                raise ValueError("item_types length must match "
+                                 "multimodal_lengths")
+
+
+@dataclass
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal embedding caching and reuse per request sequence.
 
@@ -881,9 +962,9 @@ class MultimodalParams:
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
-    # When set, the consume site in `get_multimodal_embeddings` issues a
-    # `wait_event` and records attached embeddings on the current stream before
-    # reading them.
+    # Input preparation waits on it and records the request's CUDA tensors on
+    # its stream when the chunk reads them; the consume site in
+    # `get_multimodal_embeddings` waits on it again before reading them.
     # Always `None` unless side-stream prefetch is enabled and a prefetch ran.
     encoder_event: Optional[torch.cuda.Event] = field(default=None,
                                                       repr=False,
@@ -1535,6 +1616,7 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_metadata",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",

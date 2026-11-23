@@ -247,6 +247,8 @@ set(TRTLLM_LINK_LIBS
     cute_dsl_src
     runtime_src
     compressorKernels_src
+    csa2_sparse_context_src
+    csa2_sparse_decode_src
     fusedSamplingKernels_src
     mhcKernels_src
     ${DECODER_SHARED_TARGET_0}
@@ -316,10 +318,12 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     ipc_nvls_memory_src
     tllm_batch_request_info
     tllm_batch_scheduler
+    tllm_common_cublas
     tllm_common_cuda
     tllm_common_environment
     tllm_common_error
     tllm_common_logging
+    tllm_common_native_memory
     tllm_common_profiler
     tllm_context_transfer_consensus
     tllm_executor_agent_name

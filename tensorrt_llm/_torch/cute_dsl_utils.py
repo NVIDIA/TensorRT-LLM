@@ -13,13 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 import platform
 import sys
 import types
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 from ..logger import logger
+from .cute_dsl_file_cache import install_cute_dsl_file_cache
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _skip_legacy_cutlass_mlir_helpers() -> None:
@@ -42,12 +47,20 @@ IS_CUTLASS_DSL_AVAILABLE = False
 # Whether the installed CuTe DSL provides ``cutlass.utils.rubin_helpers``; set
 # by the import probe below. Rubin kernels stay disabled when it is absent.
 IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
+# The Rubin MXFP8 fused FC1+FC2 MoE kernel (moe/kernels/rubin/
+# rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8.py) needs a newer
+# CuTe DSL build than the bare rubin_helpers probe guarantees: it reaches
+# ``cutlass.memory`` / ``cutlass.tensor_utils`` as real submodules, and older
+# builds (e.g. 0.3.0+20260518) that lack them also miscompile its MXFP8
+# block-scaled path even when the attribute access is shimmed. Treat the
+# presence of both submodules as the capability marker for that kernel.
+IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE = False
 
 if platform.system() != "Windows":
     try:
         from cutlass import cute  # noqa
         _skip_legacy_cutlass_mlir_helpers()
-        logger.info(f"cutlass dsl is available")
+        logger.info("cutlass dsl is available")
         IS_CUTLASS_DSL_AVAILABLE = True
 
         try:
@@ -57,8 +70,25 @@ if platform.system() != "Windows":
         else:
             logger.info("cutlass dsl Rubin helpers are available")
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
+
+        if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            try:
+                import cutlass.memory  # noqa
+                import cutlass.tensor_utils  # noqa
+                logger.info(
+                    "cutlass dsl supports the Rubin MXFP8 fused FC12 MoE kernel"
+                )
+                IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE = True
+            except ImportError:
+                logger.info(
+                    "cutlass dsl build is too old for the Rubin MXFP8 fused "
+                    "FC12 MoE kernel (no cutlass.memory / cutlass.tensor_utils); "
+                    "MXFP8 CuTe DSL MoE is disabled")
     except ImportError:
         pass
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    install_cute_dsl_file_cache()
 
 
 class _GraphSafeDlpack:
@@ -100,6 +130,26 @@ def gmem_ptr(tensor, dtype, assumed_align: int):
                                  assumed_align=assumed_align)
 
 
+@functools.lru_cache(maxsize=None)
+def _smem_optin_bytes(device_index: int) -> int:
+    import torch
+
+    return torch.cuda.get_device_properties(
+        device_index).shared_memory_per_block_optin
+
+
+def smem_optin_bytes(
+        device: Optional[Union[int, "torch.device"]] = None) -> int:
+    """A CTA's opt-in shared memory limit on ``device`` (default: the current CUDA device)."""
+    import torch
+
+    if isinstance(device, torch.device):
+        device = device.index
+    if device is None:
+        device = torch.cuda.current_device()
+    return _smem_optin_bytes(device)
+
+
 def install_cutlass_dsl_compatibility() -> None:
     """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
     if not IS_CUTLASS_DSL_AVAILABLE:
@@ -112,6 +162,18 @@ def install_cutlass_dsl_compatibility() -> None:
             setattr(cute.core, name, getattr(cute, name))
     if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
         cute.make_fragment = cute.make_rmem_tensor
+
+
+def load_flash_attn_cute_forward():
+    """FlashAttention-4's forward (``flash_attn.cute``) with the CuTe aliases it needs.
+
+    Raises ``ImportError``, ``OSError`` or ``AttributeError`` when the CuTe DSL interface
+    cannot be imported; callers decide whether that is fatal.
+    """
+    install_cutlass_dsl_compatibility()
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    return _flash_attn_fwd
 
 
 # SMs that a kernel resident for the whole step holds (the DWDP fabric gather;
@@ -193,3 +255,11 @@ def _install_sm_reserve() -> None:
 
 
 _install_sm_reserve()
+
+
+def graph_safe_from_dlpack(tensor, assumed_align: int = 16):
+    """``cutlass.cute.runtime.from_dlpack`` of ``tensor`` without the DLPack export's stream
+    synchronization, so it can run during CUDA-graph capture."""
+    from cutlass.cute.runtime import from_dlpack
+
+    return from_dlpack(_GraphSafeDlpack(tensor), assumed_align=assumed_align)

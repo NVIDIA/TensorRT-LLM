@@ -10,7 +10,7 @@ reports a miss (``ops/m3_report.capture_missed``) and gets None (the caller then
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
     m3_draft_step,
     m3_report,
     m3_sampled_accept,
