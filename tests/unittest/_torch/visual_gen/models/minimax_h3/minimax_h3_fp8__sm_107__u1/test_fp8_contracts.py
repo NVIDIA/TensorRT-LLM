@@ -40,6 +40,7 @@ def _routing_namespace():
         "_transformer_layer_quant",
         "_ulysses_size",
         "route_fp8_sm_107_u1",
+        "route_fp8_u4",
         "route_nvfp4_sm_107_u1_u4",
         "resolve_scenario",
     }
@@ -202,7 +203,9 @@ def _config():
                 quant_config=_quant_config(),
                 quant_config_dict=None,
                 torch_dtype="BF16",
-                pretrained_config=SimpleNamespace(quantization_config=None),
+                pretrained_config=SimpleNamespace(
+                    quantization_config=None, num_attention_heads=56, attention_head_dim=128
+                ),
                 extra_attrs={},
             )
         },
@@ -212,12 +215,13 @@ def _config():
         force_dynamic_quantization=False,
         attention=SimpleNamespace(
             backend="CUDNN",
+            sparse_attention_config=None,
             quant_attention_config=SimpleNamespace(
                 qk_dtype="fp8",
                 v_dtype="fp8",
             ),
         ),
-        visual_gen_mapping=SimpleNamespace(ulysses_size=1),
+        visual_gen_mapping=SimpleNamespace(ulysses_size=1, world_size=1, cp_size=1),
         mapping=SimpleNamespace(tp_size=1),
         parallel=SimpleNamespace(parallel_vae_size=1, async_ulysses=False),
         torch_compile=SimpleNamespace(enable=True),
@@ -245,6 +249,29 @@ class RoutingContracts(unittest.TestCase):
                     os.environ["NVIDIA_TF32_OVERRIDE"] = value
                 with self.assertRaises(namespace["NoScenario"]):
                     namespace["route_fp8_sm_107_u1"](_config())
+
+    def test_fp8_ulysses_scenario_for_both_architectures(self):
+        cfg = _config()
+        cfg.visual_gen_mapping.ulysses_size = cfg.visual_gen_mapping.world_size = 4
+        cfg.parallel.parallel_vae_size = 4
+        module = ModuleType("_h3_fp8_cpu_contracts.minimax_h3_fp8__sm_103_107__u4.pipeline")
+        module.MiniMaxH3Fp8U4Pipeline = type("UlyssesPipeline", (), {})
+        for capability in ((10, 3), (10, 7)):
+            namespace = _routing_namespace()
+            namespace["_device_capability"] = lambda: capability
+            with (
+                self.subTest(capability=capability),
+                patch.dict(sys.modules, {module.__name__: module}),
+            ):
+                self.assertIs(
+                    namespace["resolve_scenario"](object, cfg), module.MiniMaxH3Fp8U4Pipeline
+                )
+                cfg.parallel.async_ulysses = True
+                try:
+                    with self.assertRaisesRegex(namespace["NoScenario"], "synchronous"):
+                        namespace["route_fp8_u4"](cfg)
+                finally:
+                    cfg.parallel.async_ulysses = False
 
     def test_unsupported_combinations_are_rejected_before_import(self):
         changes = [
