@@ -506,7 +506,8 @@ class MpiPoolSession(MpiSession):
     def __init__(self,
                  n_workers: int,
                  wait_shutdown: bool = False,
-                 env_overrides: Optional[Dict[str, str]] = None):
+                 env_overrides: Optional[Dict[str, str]] = None,
+                 mpi_info: Any = None):
         """Spawn a pool of MPI worker processes.
 
         Args:
@@ -526,10 +527,14 @@ class MpiPoolSession(MpiSession):
                 replaces the racy "set os.environ around the spawn, then
                 restore" pattern for callers that spawn pools from background
                 threads.
+            mpi_info: MPI info for spawning the workers, as ``MPIPoolExecutor``
+                takes it (an ``MPI.Info`` or a mapping), e.g. to allow
+                oversubscription. ``None`` spawns with mpi4py's defaults.
         """
         self.n_workers = n_workers
         self._wait_shutdown = wait_shutdown
         self._env_overrides = dict(env_overrides) if env_overrides else {}
+        self._mpi_info = mpi_info
         self._worker_identities: Tuple = ()
         # Keeps the copies of one submission contiguous in the pool's queue.
         self._submit_lock = threading.Lock()
@@ -724,7 +729,8 @@ class MpiPoolSession(MpiSession):
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,
-                                        python_args=python_args)
+                                        python_args=python_args,
+                                        mpi_info=self._mpi_info)
 
     def __del__(self):
         self.shutdown_abort()
