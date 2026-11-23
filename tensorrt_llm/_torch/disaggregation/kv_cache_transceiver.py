@@ -126,7 +126,7 @@ def create_kv_cache_transceiver(
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
     cache_identity: Optional[dict] = None,
     context_state_exporter: Optional[Callable[[LlmRequest],
-                                              Optional[bytes]]] = None,
+                                              Optional[dict]]] = None,
     context_state_validator: Optional[Callable[[LlmRequest],
                                                Optional[str]]] = None,
 ) -> Optional["KvCacheTransceiver"]:

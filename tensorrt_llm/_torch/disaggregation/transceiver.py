@@ -384,7 +384,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
         cache_identity: Optional[dict] = None,
-        context_state_exporter: Optional[Callable[[LlmRequest], Optional[bytes]]] = None,
+        context_state_exporter: Optional[Callable[[LlmRequest], Optional[dict]]] = None,
         context_state_validator: Optional[Callable[[LlmRequest], Optional[str]]] = None,
     ):
         """``cache_identity`` is the semantic identity peers must match before any transfer;

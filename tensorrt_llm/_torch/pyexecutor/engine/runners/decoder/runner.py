@@ -343,13 +343,22 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _dummy_requests_kwargs(self) -> dict[str, Any]:
         release_request_state = getattr(self._model, "release_request_state", None)
-        if release_request_state is None:
-            release_request_state = getattr(self._get_spec_worker(), "release_private_tail", None)
+        worker = self._get_spec_worker()
+        release_tail = getattr(worker, "release_private_tail", None)
+        release = release_request_state or release_tail
+        if release_request_state is not None and release_tail is not None:
+
+            def release_model_and_draft_state(request_id: int) -> None:
+                release_request_state(request_id)
+                if getattr(worker, "generic_disagg_handoff_enabled", False):
+                    release_tail(request_id)
+
+            release = release_model_and_draft_state
         return dict(
             config=self._config,
             model=self._model,
             get_runtime_tokens_per_gen_step=self._get_runtime_tokens_per_gen_step,
-            release_request_state=release_request_state,
+            release_request_state=release,
         )
 
     def _input_preparer_kwargs(

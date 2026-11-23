@@ -5937,7 +5937,7 @@ def create_py_executor_resources(
     # A model that declares a disaggregated handoff contributes its semantic cache
     # identity and the record it freezes for each finished context request. Its draft
     # layers must share the target manager so all required pages travel together.
-    # Models without a handoff declaration keep the standard transfer path.
+    # Generic unified DFlash uses the auxiliary record to attest the draft store.
     transfer_kwargs = {}
     cache_identity_fn = getattr(model_engine.model, "disagg_cache_identity",
                                 None)
@@ -5961,6 +5961,23 @@ def create_py_executor_resources(
                 "manager; this engine keeps a separate draft KV cache. Run DFlash "
                 "with attention_backend TRTLLM and without "
                 "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on both workers.")
+    elif (cache_transceiver_config is not None
+          and cache_transceiver_config.backend is not None
+          and cache_transceiver_config.transceiver_runtime == "PYTHON"
+          and model_engine.spec_config is not None
+          and model_engine.spec_config.spec_dec_mode.is_dflash()):
+        from ..speculative.dflash import DFlashWorker
+
+        worker = getattr(model_engine.model, "spec_worker", None)
+        get_draft_view = getattr(kv_cache_manager, "get_draft_kv_cache_view",
+                                 None)
+        if (isinstance(worker, DFlashWorker) and get_draft_view is not None
+                and get_draft_view() is kv_cache_manager):
+            worker.generic_disagg_handoff_enabled = True
+            transfer_kwargs["context_state_exporter"] = (
+                worker.export_generic_disagg_context)
+            transfer_kwargs["context_state_validator"] = (
+                worker.validate_generic_disagg_context)
 
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,

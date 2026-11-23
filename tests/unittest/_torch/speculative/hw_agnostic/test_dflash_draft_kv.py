@@ -53,6 +53,138 @@ def test_eagle3_one_model_still_gets_a_separate_draft_kv_cache():
 
 
 @pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param({}, "managed", id="contiguous-cursor"),
+        pytest.param(None, "private", id="absent-record"),
+        pytest.param({"draft": None}, "private", id="skipped-store"),
+        pytest.param({"version": 0}, "reject", id="wrong-version"),
+        pytest.param({"identity": "0" * 32}, "reject", id="wrong-protocol"),
+        pytest.param({"transfer_id": 43}, "reject", id="wrong-transfer"),
+        pytest.param({"prompt_len": 76}, "reject", id="wrong-prompt"),
+        pytest.param(
+            {"draft": {"draft_ctx_len": 76, "next_position": 77}}, "reject", id="partial-store"
+        ),
+    ],
+)
+def test_generic_disagg_cursor_validation_and_binding(change: dict | None, expected: str) -> None:
+    from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+        decode_handoff_record,
+        encode_handoff_record,
+    )
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_buf_inited = worker._ctx_unified_cache = True
+    worker._ctx_has_position_cap = False
+    worker._max_ctx = 4096
+    worker.generic_disagg_handoff_enabled = True
+    worker._req_to_slot = {42: 0}
+    worker._req_ctx_pos = {42: 77}
+    worker._ctx_len_host = [77]
+    worker._private_tail_requests = set()
+    worker._untrusted_disagg_contexts = set()
+    worker._pending_disagg_imports = {}
+    worker.mapping = SimpleNamespace(enable_attention_dp=False, tp_size=1)
+    source = SimpleNamespace(
+        py_request_id=42, request_id=42, prompt_len=77, py_disaggregated_params=None
+    )
+    exported = worker.export_generic_disagg_context(source)
+    assert exported["draft"] == {"draft_ctx_len": 77, "next_position": 77}
+    worker._ctx_len_host[0] = 76
+    assert worker.export_generic_disagg_context(source)["draft"] is None
+    worker._req_to_slot.clear()
+    worker._req_ctx_pos.clear()
+
+    record = None if change is None else {**exported, **change}
+    request = SimpleNamespace(
+        py_request_id=123,
+        prompt_len=77,
+        context_phase_params=SimpleNamespace(req_id=42),
+        py_disagg_handoff=decode_handoff_record(encode_handoff_record(record)),
+    )
+    error = worker.validate_generic_disagg_context(request)
+    if expected == "reject":
+        assert error is not None
+        assert not worker._pending_disagg_imports and not worker._untrusted_disagg_contexts
+        return
+    assert error is None
+    worker.prepare_generic_disagg_generation(request)
+    if expected == "managed":
+        assert worker._pending_disagg_imports == {123: (77, 77)}
+        assert not worker._untrusted_disagg_contexts
+    else:
+        assert not worker._pending_disagg_imports
+        assert worker._untrusted_disagg_contexts == {123}
+    worker.release_request_state(123)
+    assert not worker._pending_disagg_imports and not worker._untrusted_disagg_contexts
+
+
+@pytest.mark.parametrize(
+    "generic_handoff",
+    [pytest.param(True, id="composed"), pytest.param(False, id="model-owned")],
+)
+def test_disagg_generation_keeps_model_and_worker_lifecycle_hooks(
+    monkeypatch: pytest.MonkeyPatch, generic_handoff: bool
+) -> None:
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.pyexecutor import py_executor
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    request = SimpleNamespace(
+        py_request_id=123,
+        py_beam_width=1,
+        context_phase_params=SimpleNamespace(first_gen_tokens=[2], draft_tokens=[3]),
+    )
+    worker = SimpleNamespace(
+        generic_disagg_handoff_enabled=generic_handoff,
+        prepare_generic_disagg_generation=Mock(),
+        release_request_state=Mock(),
+        release_private_tail=Mock(),
+    )
+    model = SimpleNamespace(
+        spec_worker=worker, prepare_disagg_generation_request=Mock(), release_request_state=Mock()
+    )
+    disagg = Mock()
+    disagg.completed_gen_receives.return_value = [request]
+    disagg.try_finish_gen_receive.return_value = True
+    resource_manager = Mock()
+    resource_manager.resource_managers = {ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
+    executor = SimpleNamespace(
+        disagg=disagg,
+        resource_manager=resource_manager,
+        model_engine=SimpleNamespace(model=model, max_total_draft_tokens=1),
+        draft_model_engine=None,
+        sampler=Mock(),
+        enable_attention_dp=False,
+        enable_spec_decode=True,
+        _prefetched_request_ids=set(),
+        _setup_sampler_step=Mock(),
+        _update_sampler_state_for_disagg_gen_request=Mock(return_value=True),
+        _maybe_prepend_logprobs_and_logits=Mock(),
+    )
+    monkeypatch.setattr(py_executor, "_rebuild_disagg_imported_cache", Mock())
+    monkeypatch.setattr(py_executor, "_import_first_gen_tokens", Mock())
+    monkeypatch.setattr(
+        py_executor.disagg_diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False
+    )
+
+    py_executor.PyExecutor._prepare_disagg_gen_transmission_complete(executor, object())
+    py_executor.PyExecutor._free_request_resources(executor, request)
+
+    model.prepare_disagg_generation_request.assert_called_once_with(request)
+    model.release_request_state.assert_called_once_with(123)
+    if generic_handoff:
+        worker.prepare_generic_disagg_generation.assert_called_once_with(request)
+        worker.release_request_state.assert_called_once_with(123)
+    else:
+        worker.prepare_generic_disagg_generation.assert_not_called()
+        worker.release_request_state.assert_not_called()
+    worker.release_private_tail.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("bound_to_pool", "reuse_addressable", "reads_rebased_view", "cur", "first_pos", "expected"),
     [
         # Managed pool: the block table is indexed by target position, so a

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import weakref
 from collections import deque
@@ -55,9 +56,14 @@ from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
 _PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
+_DISAGG_DRAFT_VERSION = 1
+_DISAGG_DRAFT_IDENTITY = hashlib.sha256(b"TensorRT-LLM generic unified DFlash context").hexdigest()[
+    :32
+]
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
+    from ..pyexecutor.llm_request import LlmRequest
 
 
 def dflash_context_dtype(draft_model: nn.Module) -> torch.dtype:
@@ -751,8 +757,11 @@ class DFlashSpecMetadata(SpecMetadata):
             # Slot lengths (and bases) written in one batch: evicted slots are
             # emptied, newly assigned ones seeded below.
             updates, bases = {}, {}
-            if getattr(worker, "_ctx_has_position_cap", False):
-                worker._private_tail_requests.intersection_update(current)
+            private_requests = getattr(worker, "_private_tail_requests", None)
+            if private_requests:
+                private_requests.intersection_update(current)
+            untrusted_contexts = getattr(worker, "_untrusted_disagg_contexts", ())
+            has_position_cap = getattr(worker, "_ctx_has_position_cap", False)
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
@@ -782,7 +791,7 @@ class DFlashSpecMetadata(SpecMetadata):
                                 f"DFlash: no free drafter slot for generation request {rid}, "
                                 "whose transferred draft context needs one"
                             )
-                        if getattr(worker, "_ctx_has_position_cap", False):
+                        if has_position_cap or rid in untrusted_contexts:
                             raise RuntimeError(f"DFlash: no private-tail slot for request {rid}")
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
@@ -795,6 +804,12 @@ class DFlashSpecMetadata(SpecMetadata):
                         if not worker._ctx_unified_cache:
                             raise RuntimeError("Transferred draft context requires a unified cache")
                         draft_ctx_len, next_position = imported
+                        if draft_ctx_len > worker._max_ctx and getattr(
+                            worker, "generic_disagg_handoff_enabled", False
+                        ):
+                            worker._untrusted_disagg_contexts.add(rid)
+                            worker._private_tail_requests.add(rid)
+                            continue
                         if (
                             draft_ctx_len != next_position
                             or not 0 < draft_ctx_len <= worker._max_ctx
@@ -806,6 +821,11 @@ class DFlashSpecMetadata(SpecMetadata):
                         bases[slot] = 0
                         worker._req_ctx_pos[rid] = next_position
                         continue
+                    if rid in untrusted_contexts or (has_position_cap and not self.is_cuda_graph):
+                        # A target position without a verified draft store cannot
+                        # establish that any shared draft pages are readable.
+                        worker._private_tail_requests.add(rid)
+                        continue
                     if self.host_position_ids is None or self.seq_lens is None:
                         raise RuntimeError(
                             f"DFlash: no host positions to seed the slot of generation request {rid}"
@@ -815,17 +835,8 @@ class DFlashSpecMetadata(SpecMetadata):
                         for seq_len in self.seq_lens:
                             row_starts.append(row_starts[-1] + int(seq_len))
                     position = int(self.host_position_ids[row_starts[row]])
-                    if getattr(worker, "_ctx_has_position_cap", False) and not self.is_cuda_graph:
-                        # A seed without a completed local store or a validated
-                        # import does not prove any draft pages are readable.
-                        worker._private_tail_requests.add(rid)
-                        continue
                     worker._seed_generation_slot(slot, position, updates, bases)
-            if (
-                getattr(worker, "_ctx_has_position_cap", False)
-                and self.host_position_ids is not None
-                and not self.is_cuda_graph
-            ):
+            if has_position_cap and self.host_position_ids is not None and not self.is_cuda_graph:
                 offset = sum(self.seq_lens[:num_contexts])
                 for rid, seq_len in zip(
                     self.request_ids[num_contexts:], self.seq_lens[num_contexts:]
@@ -1101,6 +1112,8 @@ class DFlashWorker(SpecWorkerBase):
         # Draft-context cursors received with a disaggregated request's KV
         # (import_disagg_context), bound to a slot at the request's first step.
         self._pending_disagg_imports: dict[int, tuple[int, int]] = {}
+        self.generic_disagg_handoff_enabled = False
+        self._untrusted_disagg_contexts: set[int] = set()
         self._ctx_has_position_cap = False
         self._private_tail_requests: set[int] = set()
         self._private_tail_pool = None
@@ -2150,13 +2163,10 @@ class DFlashWorker(SpecWorkerBase):
         readable is this cursor: the
         slot-local length stored for the request and the target position the next store
         starts at. None when the request stored no context here (no free slot, an
-        overflowing prompt, or a step that did not draft), which the receiver must reject.
+        overflowing prompt, or a step that did not draft).
         Valid until the next ``prepare`` recycles the request's slot.
         """
-        if not self._ctx_buf_inited or (
-            getattr(self, "_ctx_has_position_cap", False)
-            and request_id in self._private_tail_requests
-        ):
+        if not self._ctx_buf_inited or request_id in getattr(self, "_private_tail_requests", ()):
             return None
         slot = self._req_to_slot.get(request_id)
         if slot is None:
@@ -2168,6 +2178,71 @@ class DFlashWorker(SpecWorkerBase):
             "draft_ctx_len": ctx_len,
             "next_position": int(self._req_ctx_pos.get(request_id, ctx_len)),
         }
+
+    def export_generic_disagg_context(self, request: "LlmRequest") -> dict:
+        """Freeze the cursor only when this request stored a contiguous prompt."""
+        from ..disaggregation.base.transfer import get_unique_rid
+
+        request_id = request.py_request_id
+        draft = self.export_disagg_context(request_id)
+        if draft is not None and (
+            not 0 < draft["draft_ctx_len"] == draft["next_position"] == request.prompt_len
+            or self._req_ctx_pos.get(request_id) != request.prompt_len
+        ):
+            draft = None
+        return {
+            "version": _DISAGG_DRAFT_VERSION,
+            "identity": _DISAGG_DRAFT_IDENTITY,
+            "transfer_id": get_unique_rid(request),
+            "prompt_len": request.prompt_len,
+            "draft": draft,
+        }
+
+    def validate_generic_disagg_context(self, request: "LlmRequest") -> str | None:
+        """Check the cursor against the completed transfer before exposing its pages."""
+        record = getattr(request, "py_disagg_handoff", None)
+        prompt_len = request.prompt_len
+        if record is not None:
+            params = request.context_phase_params
+            if (
+                not isinstance(record, dict)
+                or record.get("version") != _DISAGG_DRAFT_VERSION
+                or record.get("identity") != _DISAGG_DRAFT_IDENTITY
+                or params is None
+                or params.req_id is None
+                or record.get("transfer_id") != params.req_id
+                or record.get("prompt_len") != prompt_len
+                or "draft" not in record
+            ):
+                return "DFlash cursor belongs to a different handoff, transfer, or prompt"
+            draft = record["draft"]
+            if draft is not None:
+                if (
+                    not isinstance(draft, dict)
+                    or type(draft.get("draft_ctx_len")) is not int
+                    or type(draft.get("next_position")) is not int
+                    or not 0 < draft["draft_ctx_len"] == draft["next_position"] == prompt_len
+                ):
+                    return "DFlash cursor must cover the contiguous prompt"
+                if not self._ctx_buf_inited or prompt_len <= self._max_ctx:
+                    return None
+        if self.mapping.enable_attention_dp and self.mapping.tp_size > 1:
+            return "DFlash private draft history requires uniform TP forwards without attention DP"
+        return None
+
+    def prepare_generic_disagg_generation(self, request: "LlmRequest") -> None:
+        """Bind a validated cursor after KV receive, or start with private history."""
+        if not self.generic_disagg_handoff_enabled:
+            return
+        request_id = request.py_request_id
+        record = getattr(request, "py_disagg_handoff", None)
+        draft = None if record is None else record["draft"]
+        if draft is None or (self._ctx_buf_inited and request.prompt_len > self._max_ctx):
+            self._pending_disagg_imports.pop(request_id, None)
+            self._untrusted_disagg_contexts.add(request_id)
+            return
+        self._untrusted_disagg_contexts.discard(request_id)
+        self.import_disagg_context(request_id, draft["draft_ctx_len"], draft["next_position"])
 
     def import_disagg_context(self, request_id: int, draft_ctx_len: int, next_position: int):
         """Queue a received draft-context cursor for ``request_id``.
@@ -2186,7 +2261,14 @@ class DFlashWorker(SpecWorkerBase):
         self.release_private_tail(request_id)
 
     def release_private_tail(self, request_id: int) -> None:
-        if getattr(self, "_ctx_has_position_cap", False):
+        untrusted_contexts = getattr(self, "_untrusted_disagg_contexts", None)
+        if (
+            getattr(self, "_ctx_has_position_cap", False)
+            or request_id in getattr(self, "_private_tail_requests", ())
+            or (untrusted_contexts is not None and request_id in untrusted_contexts)
+        ):
+            if untrusted_contexts is not None:
+                untrusted_contexts.discard(request_id)
             self._private_tail_requests.discard(request_id)
             self._req_ctx_pos.pop(request_id, None)
             slot = self._req_to_slot.pop(request_id, None)
@@ -2446,6 +2528,9 @@ class DFlashWorker(SpecWorkerBase):
         ctx_len_updates = {}
         ctx_base_updates = {}
         offset = 0
+        verify_history = getattr(self, "_ctx_has_position_cap", False) or getattr(
+            self, "generic_disagg_handoff_enabled", False
+        )
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
         # it must fit that row's allocation as well as the arena's length.
@@ -2488,7 +2573,7 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._req_to_slot[req_id]
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
-            if getattr(self, "_ctx_has_position_cap", False) and (
+            if verify_history and (
                 req_id in self._private_tail_requests
                 or (reset and first_pos > 0)
                 or first_pos + slen > cap
@@ -2506,7 +2591,7 @@ class DFlashWorker(SpecWorkerBase):
             # one does not, so the slot reads from a base above it.
             start = self._ctx_store_start(cur, first_pos)
             if start is None:
-                if getattr(self, "_ctx_has_position_cap", False):
+                if verify_history:
                     self._private_tail_requests.add(req_id)
                 # Request-level, like the overflow below: the slot is released
                 # rather than failing the batch's forward.
@@ -2602,7 +2687,7 @@ class DFlashWorker(SpecWorkerBase):
             # _ctx_len updates: roll back to the pre-forward snapshot.
             self._restore_ctx_len_device()
             self._restore_ctx_len_host()
-            if self._ctx_has_position_cap and spec_metadata is not None:
+            if self._private_tail_requests and spec_metadata is not None:
                 # A failed step can have overwritten bytes after rolling its
                 # private history over. The old length would expose those bytes.
                 self._write_ctx_len(
@@ -2905,16 +2990,17 @@ class DFlashWorker(SpecWorkerBase):
     def draft_cache_graph_eligible(self, batch, manager, draft_model, promoted_context_ids) -> bool:
         """A managed graph cannot be used for rows that may change cache ownership."""
         position_limit = self.draft_cache_graph_position_limit(manager, draft_model)
-        if position_limit is None:
+        untrusted_contexts = getattr(self, "_untrusted_disagg_contexts", ())
+        if position_limit is None and not (self._private_tail_requests or untrusted_contexts):
             return True
         bound = self._ctx_buf_inited and self._ctx_kv_manager is manager
         for request in batch.generation_requests:
             request_id = request.py_request_id
-            if (
-                request_id in promoted_context_ids
-                or request_id in self._private_tail_requests
-                or request.max_beam_num_tokens >= position_limit
-            ):
+            if request_id in self._private_tail_requests or request_id in untrusted_contexts:
+                return False
+            if position_limit is None:
+                continue
+            if request_id in promoted_context_ids or request.max_beam_num_tokens >= position_limit:
                 return False
             # Capturing a fitting synthetic request may use a dummy seed.
             # A real request must already have a slot or a validated cursor.
@@ -2977,7 +3063,7 @@ class DFlashWorker(SpecWorkerBase):
     def _prepare_draft_batches(self, **kwargs):
         """Partition managed and private draft cache rows without reordering verification."""
         metadata = kwargs["spec_metadata"]
-        if not self._ctx_has_position_cap or not self._private_tail_requests:
+        if not self._private_tail_requests:
             inputs = self.prepare_1st_drafter_inputs(**kwargs)
             return [(None, inputs)], inputs
         num_contexts = kwargs["attn_metadata"].num_contexts

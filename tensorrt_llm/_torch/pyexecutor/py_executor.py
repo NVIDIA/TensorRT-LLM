@@ -11793,10 +11793,14 @@ class PyExecutor:
             _import_first_gen_tokens(req, beam_width)
 
             for engine in (self.model_engine, self.draft_model_engine):
-                prepare = getattr(getattr(engine, "model", None),
-                                  "prepare_disagg_generation_request", None)
+                model = getattr(engine, "model", None)
+                prepare = getattr(model, "prepare_disagg_generation_request",
+                                  None)
                 if prepare is not None:
                     prepare(req)
+                worker = getattr(model, "spec_worker", None)
+                if getattr(worker, "generic_disagg_handoff_enabled", False):
+                    worker.prepare_generic_disagg_generation(req)
 
             self._maybe_prepend_logprobs_and_logits(req, beam_width)
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
@@ -12768,8 +12772,10 @@ class PyExecutor:
             release = getattr(model, "release_request_state", None)
             if release is not None:
                 release(request.py_request_id)
-            else:
-                worker = getattr(model, "spec_worker", None)
+            worker = getattr(model, "spec_worker", None)
+            if getattr(worker, "generic_disagg_handoff_enabled", False):
+                worker.release_request_state(request.py_request_id)
+            elif release is None:
                 release_tail = getattr(worker, "release_private_tail", None)
                 if release_tail is not None:
                     release_tail(request.py_request_id)
