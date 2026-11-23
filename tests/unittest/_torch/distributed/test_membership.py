@@ -1726,7 +1726,7 @@ def test_late_wakeup_keeps_live_authority(monkeypatch):
         liveness, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + skipped_s[0])
     )
     calls = []
-    readable = liveness._readable
+    readable = liveness.wait_readable
 
     def readable_with_late_wakeup(watched, timeout_s):
         calls.append(watched)
@@ -1737,7 +1737,7 @@ def test_late_wakeup_keeps_live_authority(monkeypatch):
         skipped_s[0] += 2 * silence_s
         return []
 
-    monkeypatch.setattr(liveness, "_readable", readable_with_late_wakeup)
+    monkeypatch.setattr(liveness, "wait_readable", readable_with_late_wakeup)
     errors = []
     with _scripted_client(errors, resend_s=0.1):
         _until(lambda: errors or len(calls) > 2)

@@ -1457,11 +1457,14 @@ class DecoderWarmup:
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         if tune_alone:
             Distributed.pause_startup_record()
-        ran_native_forward = run_autotuner_pass(
-            autotune(cache_path=cache_path), synchronize_trtllm_cache=True
-        )
+        try:
+            ran_native_forward = run_autotuner_pass(
+                autotune(cache_path=cache_path), synchronize_trtllm_cache=True
+            )
+        finally:
+            if tune_alone:
+                Distributed.resume_startup_record()
         if tune_alone:
-            Distributed.resume_startup_record()
             AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         ran_flashinfer_forward = False
         if enable_flashinfer_mxfp8_autotuner:
