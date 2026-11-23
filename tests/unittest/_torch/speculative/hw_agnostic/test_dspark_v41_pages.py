@@ -237,8 +237,12 @@ def test_private_page_updates_preserve_execution_order_without_redundant_gathers
     assert gather.call_count == 3
 
 
-@pytest.mark.parametrize("chunks", [[180], [100, 80]], ids=["single", "chunked"])
-def test_private_context_seed_rebuilds_final_window(chunks):
+@pytest.mark.parametrize(
+    "chunks,captures",
+    [([180], [180]), ([100, 80], [100, 80]), ([40, 140], [0, 140])],
+    ids=["single", "chunked", "held-tail"],
+)
+def test_private_context_seed_rebuilds_final_window(chunks, captures):
     worker = SimpleNamespace(
         _draft_reuse_policy=ReusePolicy.PRIVATE,
         _draft_kv_manager=SimpleNamespace(enable_block_reuse=True),
@@ -260,10 +264,10 @@ def test_private_context_seed_rebuilds_final_window(chunks):
 
     draft = SimpleNamespace(write_context_pages=Mock(side_effect=write))
     offset = 0
-    for length in chunks:
+    for length, capture_len in zip(chunks, captures):
         positions = torch.arange(offset, offset + length)
         metadata = SimpleNamespace(
-            context_capture_lens=(length,),
+            context_capture_lens=(capture_len,),
             request_ids=[42],
             get_hidden_states=lambda count: positions[:, None].float(),
         )
@@ -276,32 +280,10 @@ def test_private_context_seed_rebuilds_final_window(chunks):
             length,
         )
         offset += length
+        if capture_len == 0:
+            assert not written
+            assert worker._ctx_len[0] == offset
+            assert worker._valid_len[0] == 0
     assert worker._ctx_len[0] == 180
     assert worker._valid_len[0] == 128
     assert [written[token] for token in range(52, 180)] == list(range(52, 180))
-
-
-def test_intermediate_chunk_without_decoder_capture_does_not_seed():
-    worker = SimpleNamespace(
-        _draft_reuse_policy=ReusePolicy.PRIVATE,
-        _win=128,
-        _req_to_slot={42: 0},
-        _scratch_slot=1,
-        _ctx_len=torch.zeros(2, dtype=torch.long),
-        _valid_len=torch.zeros(2, dtype=torch.long),
-    )
-    draft = Mock()
-    metadata = SimpleNamespace(
-        context_capture_lens=(0,), request_ids=[42], get_hidden_states=lambda _: torch.empty(100, 1)
-    )
-    DSv41DSparkWorker._seed_context_windows(
-        worker,
-        draft,
-        metadata,
-        SimpleNamespace(num_contexts=1, _seq_lens=[100]),
-        torch.arange(100),
-        100,
-    )
-    draft.write_context_pages.assert_not_called()
-    assert worker._ctx_len[0] == 100
-    assert worker._valid_len[0] == 0

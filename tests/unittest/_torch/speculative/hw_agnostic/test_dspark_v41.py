@@ -354,7 +354,10 @@ def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
 
 @pytest.mark.cpu_only
 def test_v41_context_draft_constructs_without_moe(monkeypatch):
-    from tensorrt_llm._torch.models.modeling_dspark_v41 import _DSv41DSparkContextDraftModel
+    from tensorrt_llm._torch.models.modeling_dspark_v41 import (
+        DSv41DSparkForCausalLM,
+        _DSv41DSparkContextDraftModel,
+    )
 
     monkeypatch.setattr(
         modeling_dspark.DSv4DSparkDraftModel,
@@ -396,6 +399,9 @@ def test_v41_context_draft_constructs_without_moe(monkeypatch):
     assert len(model.mtp_layers) == 3
     assert all(not hasattr(stage, "mlp") for stage in model.mtp_layers)
     assert model.run_moe_lockstep_noop([1], torch.device("cpu")) is None
+    supports_replay = DSv41DSparkForCausalLM.supports_final_window_context_replay.fget
+    assert supports_replay(SimpleNamespace(dspark_model=model))
+    assert not supports_replay(SimpleNamespace(dspark_model=SimpleNamespace()))
 
 
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):

@@ -519,6 +519,11 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
 
     draft_model_cls = DSv41DSparkDraftModel
 
+    @property
+    def supports_final_window_context_replay(self) -> bool:
+        """The final context capture fully seeds the PRIVATE draft window."""
+        return getattr(self.dspark_model, "context_kv_only", False) is True
+
     def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
         """Whether the V4.1 draft attention reads context from pages of this size."""
         return tokens_per_block in (128, 256)
