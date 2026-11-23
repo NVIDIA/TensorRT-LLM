@@ -1385,11 +1385,21 @@ class DiffusionExecutor:
     def _session_follower(self, req: DiffusionRequest) -> None:
         """Ranks other than 0: run the same pipeline calls as rank 0, in the order
         rank 0 broadcasts them. They write no slot and answer no client."""
-        self._merge_defaults(req)
-        self.pipeline.prepare_request(req)  # as process_request does, on every rank
+        prepare_error = None
+        try:
+            self._merge_defaults(req)
+            self.pipeline.prepare_request(req)  # as process_request does, on every rank
+        except Exception as e:
+            # A request rejected here is rejected on rank 0 too, which answers
+            # the client and broadcasts OPEN_ABORT; this rank still takes that tag.
+            prepare_error = e
         tag, _ = self._recv_tag()
         if tag is not _RankTag.OPEN_GO:
             return
+        if prepare_error is not None:
+            # Rank 0 accepted what this rank rejected and is about to open the
+            # pipeline, which this rank cannot follow.
+            self._fail_rank("session request preparation", prepare_error)
         try:
             pipeline_state, _ = self._open_pipeline(req, None)
         except Exception:

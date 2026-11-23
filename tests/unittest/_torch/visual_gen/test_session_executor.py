@@ -812,6 +812,13 @@ class CollectivePipeline(CountingPipeline):
         self.fail_rank = fail_rank
         self.fail_phase = fail_phase
         self.events = events
+        self.after_advance = None  # called on this rank after each advance
+
+    def prepare_request(self, req):
+        # The ``prepare`` phase rejects a request by its content, on every rank alike.
+        if self.fail_phase == "prepare" and req.prompt == ["rejected"]:
+            self.events.append("raise:prepare")
+            raise ValueError("rejected in preparation")
 
     def _collective(self, phase):
         if self.rank == self.fail_rank and self.fail_phase == phase:
@@ -832,7 +839,10 @@ class CollectivePipeline(CountingPipeline):
 
     def advance(self, state, inputs, slot):
         self._collective("advance")
-        return self._outcome("advance", super().advance(state, inputs, slot))
+        outcome = self._outcome("advance", super().advance(state, inputs, slot))
+        if self.after_advance is not None:
+            self.after_advance()
+        return outcome
 
 
 class _EventLog(list):
@@ -910,6 +920,21 @@ def _run_rank(rank, port, fail_rank, fail_phase, events, in_client_process, hold
     ex = _make_executor(pipe, rank=rank, world_size=2, in_client_process=in_client_process)
     _instrument(ex, events)
     holder["executor"] = ex
+    if fail_phase == "prepare":
+        # A request every rank rejects in preparation, then a session that runs
+        # one advance and is closed by its client.
+        ex._serve_session(
+            DiffusionRequest(request_id=1, prompt=["rejected"], params=SimpleNamespace())
+        )
+        events.append("refused")
+        req = DiffusionRequest(request_id=2, prompt=["p"], params=SimpleNamespace())
+        if rank == 0:
+            pipe.after_advance = lambda: ex.controls_ipc.put_nowait(
+                SessionControl(2, ControlType.CLOSE)
+            )
+            ex.requests_ipc.put_nowait(SessionSubmit(2, "controls", 1))
+        ex._serve_session(req)
+        return
     req = _session_request()
     if rank == 0:
         ex.requests_ipc.put_nowait(SessionSubmit(1, "controls", 1))
@@ -1102,6 +1127,51 @@ def test_rank_local_exception_is_fatal_not_a_hung_collective(tmp_path, fail_rank
     )
     if fail_phase.startswith("advance"):
         assert any(isinstance(m, SessionOpened) for m in published)
+
+
+def test_request_rejected_in_preparation_on_every_rank_leaves_the_group_in_step(tmp_path):
+    """Rank 0 as a thread in this process, rank 1 as a dedicated process. Both
+    reject the first request in ``prepare_request``; the open is refused to the
+    client and the same two ranks then serve a session."""
+    port = _free_port()
+    child = _RankProcess(1, port, -1, "prepare", tmp_path, COLLECTIVE_TIMEOUT_S)
+    child.ready()
+    rank0_events = _EventLog()
+    outcome = {}
+
+    def rank0():
+        child.go()
+        try:
+            _run_rank(0, port, -1, "prepare", rank0_events, True, outcome, COLLECTIVE_TIMEOUT_S)
+        except BaseException as exc:  # noqa: BLE001
+            outcome["error"] = exc
+
+    t = threading.Thread(target=rank0, daemon=True)
+    t.start()
+    try:
+        t.join(timeout=120)
+        assert not t.is_alive(), "rank 0 hung"
+        child.join(timeout=60)
+        assert not child.is_alive(), "rank 1 hung"
+    finally:
+        if child.is_alive():
+            child.kill()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    assert "error" not in outcome, outcome
+    assert child.exitcode == 0, child.stderr()
+    rank1 = _names(child.events())
+    assert rank1[0] == "raise:prepare" and rank1[-1] == "returned", rank1
+    served = _after(child.events(), "refused")
+    assert "leave:open" in served and "leave:advance" in served, served
+
+    published = _published(outcome["executor"])
+    refusal = next(m for m in published if isinstance(m, SessionOpened) and m.session_id == 1)
+    assert "rejected in preparation" in refusal.error and refusal.error_type == "client"
+    opened = next(m for m in published if isinstance(m, SessionOpened) and m.session_id == 2)
+    assert opened.error is None
+    assert any(isinstance(m, SessionClosed) and m.session_id == 2 for m in published)
 
 
 def test_coordinator_contains_the_group_when_a_rank_dies(tmp_path):
