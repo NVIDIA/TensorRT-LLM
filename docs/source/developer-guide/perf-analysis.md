@@ -148,7 +148,7 @@ Say we want to profile iterations 100 to 150 on a `trtllm-bench`/`trtllm-serve` 
 # Prepare dataset for the benchmark
 trtllm-bench --model ${MODEL_PATH} \
     prepare-dataset \
-    --output dataset.txt \
+    --output /tmp/dataset.txt \
     token-norm-dist \
     --num-requests=${NUM_SAMPLES} \
     --input-mean=1000 --output-mean=1000 --input-stdev=0 --output-stdev=0
@@ -160,7 +160,7 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
   --cuda-graph-trace node \
   -e TLLM_PROFILE_RECORD_GC=1,TLLM_LLMAPI_ENABLE_NVTX=1,TLLM_TORCH_PROFILE_TRACE=trace.json \
   --trace-fork-before-exec=true \
-  trtllm-bench \ # or trtllm-serve command
+  trtllm-bench \
     --model deepseek-ai/DeepSeek-V3 \
     --model_path ${MODEL_PATH} \
     throughput \
