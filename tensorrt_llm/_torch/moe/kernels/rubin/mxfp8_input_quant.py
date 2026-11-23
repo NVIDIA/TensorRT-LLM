@@ -18,7 +18,8 @@ The format fixes the scale group; lane width controls its thread mapping.
 The exponent-zero reciprocal follows quantization.cuh::exp2f_rcp exactly, so
 for finite inputs the bytes match ``torch.ops.trtllm.mxfp8_quantize``. The
 block maximum here propagates NaN, while the native kernel ignores it, so a
-32-element block containing a NaN gets scale 0xFF and zero values here.
+32-element block containing a NaN gets scale 0xFF here and its finite values
+quantize to zero.
 """
 
 import math

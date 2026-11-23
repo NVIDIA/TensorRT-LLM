@@ -19692,20 +19692,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     Decode tiles carry a few valid rows per 128-row tile and win
                     from skipping the wholly padded 16-row groups; full tiles
                     keep the statically unrolled gather. Pick the sparse gather
-                    when the padded route count exceeds twice the valid local
-                    routes, i.e. when more than half of the gathered rows are
-                    padding. The valid count is not known statically, so
-                    estimate it as
-                    ``num_rows * top_k`` scaled by this rank's share of the
-                    experts (routes land on local experts in proportion), and
-                    never below ``num_rows`` (with alltoall every arriving row
-                    has at least one local route). Overestimating keeps the
-                    static gather, so the estimate errs that way.
+                    when the rank's valid routes are fewer than its worst-case
+                    tile padding, i.e. when padding can outnumber the gathered
+                    rows. moe_sort sizes ``padded_routes`` from all
+                    ``num_rows * top_k`` routes plus up to ``tile_size - 1``
+                    padding rows per local expert, so the padding bound is
+                    ``padded_routes - num_rows * top_k``. The valid count is not
+                    known statically, so estimate it as ``num_rows * top_k``
+                    scaled by this rank's share of the experts (routes land on
+                    local experts in proportion), and never below ``num_rows``
+                    (with alltoall every arriving row has at least one local
+                    route). Overestimating keeps the static gather, so the
+                    estimate errs that way.
                     """
-                    local_routes = -(-num_rows * self.top_k *
-                                     self.num_local_experts // self.num_experts)
+                    local_routes = ceil_div(
+                        num_rows * self.top_k * self.num_local_experts,
+                        self.num_experts)
                     local_routes = max(num_rows, local_routes)
-                    return local_routes * 2 < padded_routes
+                    padding_bound = padded_routes - num_rows * self.top_k
+                    return local_routes < padding_bound
 
                 def _default_tactic(self) -> Tuple:
                     return (
