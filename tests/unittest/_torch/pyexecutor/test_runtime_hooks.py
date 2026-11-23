@@ -77,6 +77,24 @@ def test_every_field_defaults_to_off():
             assert value in (False, None), field.name
 
 
+def test_pack_factory_preserves_the_positional_decode_prologue():
+    decode_prologue = Mock()
+    pack_factory = Mock()
+    hooks = RuntimeHooks(
+        False,
+        False,
+        False,
+        False,
+        False,
+        None,
+        decode_prologue,
+        step_input_pack_factory=pack_factory,
+    )
+
+    assert hooks.decode_prologue is decode_prologue
+    assert hooks.step_input_pack_factory is pack_factory
+
+
 def test_hooks_declared_as_none_mean_the_default():
     model = _PlainModel()
     model.runtime_hooks = None

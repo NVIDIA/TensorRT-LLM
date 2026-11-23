@@ -18,7 +18,7 @@ class the loader resolves and the engine holds as ``model_engine.model``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
 if TYPE_CHECKING:
@@ -241,7 +241,9 @@ class RuntimeHooks:
     # must implement begin, stage, flush(in_graph=...) and discard. The runner also
     # reads open, issue_after_prepare, parallel_scatter, in_graph, early_copy, epoch
     # and prologue_op, and can call capture_prologue, quiesce_graph_window and on_graph_replay.
-    step_input_pack_factory: Optional[Callable[[torch.device], StepInputPack]] = None
+    step_input_pack_factory: Optional[Callable[[torch.device], StepInputPack]] = field(
+        default=None, kw_only=True
+    )
     decode_prologue: Optional[DecodePrologue] = None
     executor_events: Optional[ExecutorEvents] = None
     # Skip host-to-device metadata copies whose values the destination already holds.
