@@ -103,7 +103,11 @@ and `TLLM_FMHA_LIBS`. If those automatic choices differ, explicitly select a
 layout supported by every exchanging server. For disaggregated NVFP4 DSA serving
 with generation-side sparse KV cache offload, setting
 `TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT=residual` on all context and generation servers
-guarantees a common supported layout, even on otherwise identical nodes.
+resolves the `auto` layout mismatch, even on otherwise identical nodes.
+Exchanging servers must also use matching
+`TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION` settings (for example, leave the default
+`1` on every server), because this setting changes the residual cache's data and
+scale byte counts.
 Offloaded caches do not support `fp8rope`, so a resident worker that selects
 `fp8rope` under `auto` would otherwise use a different representation. If `auto`
 already selects `residual` on every worker, no explicit override is needed.
