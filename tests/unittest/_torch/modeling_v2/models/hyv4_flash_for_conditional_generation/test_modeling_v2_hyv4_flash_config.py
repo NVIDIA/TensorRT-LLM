@@ -30,7 +30,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
-_CHECKPOINT = "tencent/Hy4-flash-FP8"
+_CHECKPOINT = "Hy4-flash-FP8"
 
 
 def _write_checkpoint(directory, config: dict) -> str:

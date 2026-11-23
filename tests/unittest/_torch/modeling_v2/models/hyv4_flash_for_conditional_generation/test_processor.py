@@ -9,8 +9,8 @@ mean/std 0.5, patch 16, 2x2 merge, min/max pixels 4096/4194304. ``inputs/utils.p
 must then build a text+media conversation whose image placeholder is the
 checkpoint's start/pad/end token run.
 
-Point ``HYV4_FLASH_CHECKPOINT`` at the checkpoint directory, or place it at
-``LLM_MODELS_ROOT/tencent/Hy4-flash-FP8``.
+Point ``HYV4_FLASH_CKPT`` at the checkpoint directory, or place it at
+``LLM_MODELS_ROOT/Hy4-flash-FP8``.
 """
 
 import json
@@ -26,8 +26,8 @@ from PIL import Image
 
 pytestmark = pytest.mark.cpu_only
 
-_CHECKPOINT_ENV = "HYV4_FLASH_CHECKPOINT"
-_HF_ID = "tencent/Hy4-flash-FP8"
+_CHECKPOINT_ENV = "HYV4_FLASH_CKPT"
+_MODEL_DIR = "Hy4-flash-FP8"
 
 # The checkpoint's own geometry, asserted below against processor_config.json.
 _PATCH_SIZE = 16
@@ -45,11 +45,11 @@ def checkpoint_dir() -> str:
         from utils.llm_data import llm_models_root
 
         root = llm_models_root()
-        path = None if root is None else Path(root) / _HF_ID
+        path = None if root is None else Path(root) / _MODEL_DIR
     if path is None or not (path / "processor_config.json").is_file():
         pytest.skip(
             f"set {_CHECKPOINT_ENV} to the HY4-Flash checkpoint directory, or "
-            f"place it at LLM_MODELS_ROOT/{_HF_ID}"
+            f"place it at LLM_MODELS_ROOT/{_MODEL_DIR}"
         )
     return str(path)
 
