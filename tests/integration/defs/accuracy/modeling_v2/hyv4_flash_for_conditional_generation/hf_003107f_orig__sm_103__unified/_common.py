@@ -117,19 +117,25 @@ def gsm8k_samples() -> int:
 
 
 def assert_target_engine(llm, label: str) -> None:
-    """The engine resolved what the reference rows and the target are keyed on.
+    """The engine took the modeling_v2 route, and the harness reads this checkpoint's rows.
 
-    A checkpoint that resolved another quantization would be read against the
-    wrong row (or fail to find one), and one that did not take the modeling_v2
-    route under ``require`` would not have built at all.
+    One that did not take the route under ``require`` would not have built at all.
+    The checkpoint publishes its quantization in ``text_config.quantization_config``,
+    which the LLM API front end does not read (``ModelLoader._update_from_hf_quant_config``
+    reads the top-level block only), so ``llm.args`` leaves ``quant_algo`` unset; the
+    workers' ``ModelConfig`` reads it, and ``test_modeling_v2_hyv4_flash_config.py``
+    holds that to FP8_BLOCK_SCALES. ``quant_algo`` is set here to the key the
+    reference rows are stored under, as the disaggregated test does for its launcher.
     """
     assert llm.args.modeling_v2 == "require", (
         f"{label}: the engine was built with modeling_v2={llm.args.modeling_v2!r}"
     )
-    assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES, (
-        f"{label}: the engine resolved quant_algo {llm.args.quant_config.quant_algo}; the "
-        "references are this checkpoint's FP8_BLOCK_SCALES rows"
+    quant_algo = llm.args.quant_config.quant_algo
+    assert quant_algo in (None, QuantAlgo.FP8_BLOCK_SCALES), (
+        f"{label}: the front end resolved quant_algo {quant_algo}; the references are "
+        "this checkpoint's FP8_BLOCK_SCALES rows"
     )
+    llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
 
 def gsm8k_score(llm, model_name: str) -> float:
