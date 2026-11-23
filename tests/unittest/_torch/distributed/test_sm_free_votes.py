@@ -428,6 +428,15 @@ def test_torchdist_broadcasts_on_the_sm_free_transport(monkeypatch, async_ops):
         got.append(
             td._cuda_broadcast_object({"k": 1} if rank == 0 else None, pg, 0, allow_none=True)
         )
+        # broadcast_or_none_with_header: the root's header comes back with the
+        # object (or with None), and the other ranks' placeholders are ignored.
+        header = [7, -1] if rank == 1 else [0, 0]
+        got.append(
+            td._cuda_broadcast_object(
+                bytes(60) if rank == 1 else None, pg, 1, allow_none=True, header=header
+            )
+        )
+        got.append(td._cuda_broadcast_object(None, pg, 1, allow_none=True, header=header))
         return got
 
     results, _ = _run(world, chunk, body, monkeypatch=monkeypatch, async_ops=async_ops)
@@ -435,3 +444,5 @@ def test_torchdist_broadcasts_on_the_sm_free_transport(monkeypatch, async_ops):
         assert got[:3] == payloads
         assert got[3] is None
         assert got[4] == {"k": 1}
+        assert got[5] == ([7, -1], bytes(60))
+        assert got[6] == ([7, -1], None)

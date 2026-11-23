@@ -1593,8 +1593,15 @@ class TorchDist(Distributed):
         with self._cuda_obj_guard(), self._cuda_obj_stream_ctx():
             sm_free = self._cuda_obj_sm_free.get(pg)
             if sm_free is not None:
-                return self._sm_free_broadcast_object(sm_free, obj, pg, root,
-                                                      is_root, allow_none)
+                if header is None:
+                    return self._sm_free_broadcast_object(
+                        sm_free, obj, pg, root, is_root, allow_none)
+                # The header rides in the same payload, so the call stays
+                # one round; the pair is never None, so no allow_none.
+                received_header, received = self._sm_free_broadcast_object(
+                    sm_free, ([int(v) for v in header], obj), pg, root, is_root,
+                    False)
+                return list(received_header), received
             staging = self._cuda_obj_staging_for(pg)
             size, pinned_size = self._cuda_bcast_size_buffers(
                 staging, 1 + (len(header) if header is not None else 0))
