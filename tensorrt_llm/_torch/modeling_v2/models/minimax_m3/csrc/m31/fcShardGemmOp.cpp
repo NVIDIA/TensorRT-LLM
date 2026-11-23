@@ -109,7 +109,8 @@ namespace torch_ext
 {
 
 //! x: bf16 [M, K] contiguous; w: bf16 [N, K] contiguous (a row slice of the full weight); cfg: the 9 config values
-//! above. Returns bf16 [M, N]. Throws if cuBLASLt rejects the config for this shape (the caller keeps the stock fc).
+//! above. Returns bf16 [M, N]. Unsupported algorithms raise NotImplementedError so callers can try another config.
+//! Other failures retain their existing exception types.
 at::Tensor minimaxM31FcShardGemm(at::Tensor const& x, at::Tensor const& w, std::vector<int64_t> const& cfg)
 {
     TORCH_CHECK(x.is_cuda() && w.is_cuda() && x.get_device() == w.get_device(),
@@ -150,7 +151,8 @@ at::Tensor minimaxM31FcShardGemm(at::Tensor const& x, at::Tensor const& w, std::
         cublasLtMatmulHeuristicResult_t result{};
         auto const status = cublasLtMatmulAlgoCheck(st.handle, st.desc, lay.a, lay.b, lay.c, lay.c, &algo, &result);
         TORCH_CHECK_NOT_IMPLEMENTED(status != CUBLAS_STATUS_NOT_SUPPORTED && status != CUBLAS_STATUS_ARCH_MISMATCH,
-            "minimax_m31_fc_shard_gemm: the pinned algo is not supported for this shape");
+            "minimax_m31_fc_shard_gemm: the pinned algo is not supported for this shape or device (cuBLAS status ",
+            static_cast<int>(status), ")");
         checkLt(status, "cublasLtMatmulAlgoCheck");
         TORCH_CHECK(result.workspaceSize <= static_cast<size_t>(kWorkspaceBytes),
             "minimax_m31_fc_shard_gemm: the pinned algo needs more workspace than ", kWorkspaceBytes);

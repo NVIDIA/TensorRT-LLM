@@ -23,9 +23,10 @@ from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm.logger import logger
 
-# cuBLASLt's algo for the full fc (K = 30720 -> N = 6144, bf16 in / out, fp32 compute) in the build's cuBLASLt:
+# cuBLASLt candidates for the full fc (K = 30720 -> N = 6144, bf16 in / out, fp32 compute):
 # ALGO_ID, TILE_ID, SPLITK_NUM, REDUCTION_SCHEME, CTA_SWIZZLING, CUSTOM_OPTION, STAGES_ID, INNER_SHAPE_ID,
-# CLUSTER_SHAPE_ID. The build self-check rejects it if this cuBLASLt picks a different one for the full fc.
+# CLUSTER_SHAPE_ID. PINNED_CFG is tried first; the alternative covers full-fc backends using nine K splits.
+# Every candidate must pass the bitwise self-check before use.
 PINNED_CFG = (66, 393, 22, 2, 0, 1, 35, 0, 3)
 _PINNED_CFGS = (PINNED_CFG, (66, 393, 9, 2, 0, 1, 35, 0, 3))
 MAX_ROWS = 8  # capacity: fixed: the verify rows of one request at draft length 7
@@ -78,13 +79,14 @@ class FcShard:
             return None
         logger.info(
             f"[M3 prebuild] FC_SHARD set up on rank {rank}/{tp}: fc {tuple(shard.source.shape)} -> shard "
-            f"{tuple(shard.w_shard.shape)}, bitwise to the full fc at 1..{MAX_ROWS} rows"
+            f"{tuple(shard.w_shard.shape)}, bitwise to the full fc at 1..{MAX_ROWS} rows, "
+            f"configuration {tuple(shard._cfg)}"
         )
         return shard
 
     @classmethod
     def _check(cls, fc: torch.nn.Module, tp: int, rank: int, mapping):
-        """(shard, None) when this rank's pinned shard GEMM is bitwise to the full fc on every probe, else
+        """(shard, None) when a configuration is bitwise to the full fc on every probe, else
         (None, reason)."""
         op = fc_shard_op()
         if op is None:
@@ -102,7 +104,7 @@ class FcShard:
             return None, f"fc shape / dtype / tp do not apply (tp {tp})"
         cols = w.shape[0] // tp
         shard = cls(w, w[rank * cols : (rank + 1) * cols].contiguous(), mapping, op)
-        why = None
+        reasons: list[str] = []
         try:
             for configuration in _PINNED_CFGS:
                 shard._cfg = list(configuration)
@@ -122,10 +124,12 @@ class FcShard:
                         break
                 if why is None:
                     break
+                reasons.append(f"SPLITK_NUM={configuration[2]}: {why}")
+            else:
+                return None, "; ".join(reasons)
         except RuntimeError as error:
-            return None, f"the fc self-check failed ({error})"
-        if why is not None:
-            return None, why
+            reasons.append(f"SPLITK_NUM={configuration[2]}: the fc self-check failed ({error})")
+            return None, "; ".join(reasons)
         torch.cuda.synchronize()
         return shard, None
 
