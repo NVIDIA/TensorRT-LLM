@@ -3175,3 +3175,98 @@ def test_qwen_vl_sm103_nvfp4_rejects_attached_video():
     request = SimpleNamespace(py_multimodal_data=params.multimodal_data, prompt_len=len(ids))
     with pytest.raises(ValueError, match="precomputed embeddings"):
         validate_request(None, request)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target", [{"fps": 2}, {"num_frames": 4}])
+def test_qwen3_item_video_sampling(target):
+    """A cached clip and a fresh clip keep the full request's pixels and timestamps."""
+    processor, _ = _make_qwen_vl_hf_processor("qwen3")
+    encoder, _ = _mock_qwen_vl_encoder(processor)
+    full = _qwen_vl_request(["video", "video"])
+    videos = full["multi_modal_data"]["video"]
+    videos[0] = VideoData(
+        frames=videos[0].frames[:4],
+        metadata={
+            "fps": 8.0,
+            "total_num_frames": 16,
+            "duration": 2.0,
+            "frames_indices": [0, 4, 8, 12],
+        },
+    )
+    with patch.object(MultimodalParams, "to_handle"):
+        with pytest.raises(ValueError, match="explicit.*do_sample_frames"):
+            encoder.preprocess(
+                {"multi_modal_data": {"video": videos[:1]}, "mm_processor_kwargs": target}
+            )
+
+        for sample in (True, False):
+            kwargs = {**target, "do_sample_frames": sample}
+            _, extra = create_input_processor_with_hash(processor)(
+                {**full, "mm_processor_kwargs": kwargs}, SamplingParams()
+            )
+            combined = extra["multimodal_data"]
+            pieces = [
+                encoder.preprocess(
+                    {
+                        "multi_modal_data": {"video": [video]},
+                        "mm_processor_kwargs": kwargs,
+                    }
+                ).multimodal_params.multimodal_data
+                for video in videos
+            ]
+            assert torch.equal(
+                torch.cat([piece["video"]["pixel_values_videos"] for piece in pieces]),
+                combined["video"]["pixel_values_videos"],
+            )
+            assert [piece["multimodal_embedding_metadata"][0] for piece in pieces] == combined[
+                "multimodal_embedding_metadata"
+            ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_qwen_vl_item_rescale(model):
+    processor, _ = _make_qwen_vl_hf_processor(model)
+    encoder, _ = _mock_qwen_vl_encoder(processor)
+    frame = torch.zeros(3, 64, 64)
+    for pixels in (frame, frame.byte()):
+        with (
+            patch.object(MultimodalParams, "to_handle"),
+            pytest.raises(ValueError, match="RGB PIL or uint8 NumPy"),
+        ):
+            encoder.preprocess({"multi_modal_data": {"image": [pixels]}})
+
+
+@pytest.mark.cpu_only
+def test_qwen_vl_item_encode_absent_bucket():
+    processor, _ = _make_qwen_vl_hf_processor("qwen3")
+    encoder, _ = _mock_qwen_vl_encoder(processor)
+    request = _qwen_vl_request(["wide", "tall"], text=None)
+    request["multi_modal_uuids"] = {"image": ["wide", "tall"]}
+    with patch.object(MultimodalParams, "to_handle"):
+        expected = encoder.preprocess(request)
+        actual = encoder.preprocess(
+            {
+                **request,
+                "multi_modal_data": {**request["multi_modal_data"], "video": None},
+                "multi_modal_uuids": {**request["multi_modal_uuids"], "video": None},
+            }
+        )
+    assert actual.prompt_token_ids == expected.prompt_token_ids
+    assert (
+        actual.multimodal_params.multimodal_input.multimodal_hashes
+        == expected.multimodal_params.multimodal_input.multimodal_hashes
+    )
+
+
+@pytest.mark.cpu_only
+def test_qwen_vl_item_encode_manifest():
+    processor, _ = _make_qwen_vl_hf_processor("qwen3")
+    request = _qwen_vl_request(["wide", "tall"], text=None)
+    with pytest.raises(ValueError, match="increase from zero within each modality"):
+        processor.get_mm_items_prompt(
+            request["multi_modal_data"], list(reversed(request["mm_item_order"]))
+        )
+    with pytest.raises(ValueError, match="cover every media item"):
+        processor.get_mm_items_prompt(request["multi_modal_data"], request["mm_item_order"][:1])

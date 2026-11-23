@@ -1009,10 +1009,17 @@ class BaseLLM:
                     "token IDs as inputs.")
             if mm_items_only:
                 # Encode items with no prompt: use one placeholder per item.
+                inputs["multi_modal_data"] = {
+                    modality: items if isinstance(items, list) else [items]
+                    for modality, items in inputs["multi_modal_data"].items()
+                    if items is not None
+                    and not (isinstance(items, list) and not items)
+                }
                 inputs["prompt"] = cast(
                     BaseMultimodalInputProcessor,
                     self.input_processor).get_mm_items_prompt(
-                        inputs["multi_modal_data"], inputs.get("mm_item_order"))
+                        inputs["multi_modal_data"], inputs.get("mm_item_order"),
+                        inputs.get("mm_processor_kwargs"))
 
         if inputs is None or (isinstance(inputs, dict)
                               and "prompt" not in inputs

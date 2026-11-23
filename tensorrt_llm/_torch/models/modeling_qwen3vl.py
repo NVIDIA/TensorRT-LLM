@@ -261,6 +261,26 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     # Each image or video is processed on its own.
     supports_mm_item_handoff = True
 
+    def get_mm_items_prompt(
+        self,
+        mm_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+        mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        prompt = super().get_mm_items_prompt(mm_data, mm_item_order, mm_processor_kwargs)
+        kwargs = mm_processor_kwargs or {}
+        has_target = any(kwargs.get(key) not in (None, -1) for key in ("num_frames", "fps"))
+        if (
+            mm_data.get("video")
+            and has_target
+            and not isinstance(kwargs.get("do_sample_frames"), bool)
+        ):
+            raise ValueError(
+                "Prompt-free Qwen3-VL videos with a frame target require an explicit "
+                "boolean do_sample_frames for every encode"
+            )
+        return prompt
+
     def __init__(
         self,
         model_path: str,

@@ -828,28 +828,48 @@ class BaseMultimodalInputProcessor(ABC):
         return model_type
 
     def get_mm_items_prompt(
-            self,
-            mm_data: Dict[str, Any],
-            mm_item_order: Optional[List[Dict[str, Any]]] = None) -> str:
+        self,
+        mm_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+        mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """A prompt with one registered placeholder per item and no other text.
 
-        Items follow `mm_item_order` if given, else each modality in turn, in
-        the order of `mm_data`. Used to encode items without a prompt; needs
-        `supports_mm_item_handoff`.
+        Items follow their order within each modality. An explicit manifest
+        may interleave modalities. By default, use each modality in turn.
         """
         if not self.supports_mm_item_handoff:
             raise ValueError(
                 f"{type(self).__name__} needs a prompt to encode multimodal "
                 "data: its items are not processed independently.")
-        order = mm_item_order or [{
-            "modality": modality
-        } for modality, count in _mm_data_to_counts(mm_data).items()
-                                  for _ in range(count)]
+        counts = _mm_data_to_counts(mm_data)
+        if not any(counts.values()):
+            raise ValueError(
+                "A prompt-free encode requires at least one media item")
+        if mm_item_order is None:
+            modalities = [
+                modality for modality, count in counts.items()
+                for _ in range(count)
+            ]
+        else:
+            modalities = []
+            seen = Counter()
+            for entry in mm_item_order:
+                modality = entry["modality"]
+                index = entry.get("index")
+                if type(index) is not int or index != seen[modality]:
+                    raise ValueError("mm_item_order indices must increase "
+                                     "from zero within each modality")
+                modalities.append(modality)
+                seen[modality] += 1
+            if seen != counts:
+                raise ValueError(
+                    "mm_item_order must cover every media item exactly once")
         model_type = self._placeholder_model_type()
         prompt = ""
-        for entry in order:
+        for modality in modalities:
             prompt += MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
-                model_type, entry["modality"])
+                model_type, modality)
         return prompt
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
@@ -1553,7 +1573,7 @@ def _mm_data_to_counts(mm_data: Dict[str, Any]) -> Dict[str, int]:
     """Normalize multimodal data to per-key counts (each value as list length)."""
     mm_items = {
         k: (v if isinstance(v, list) else [v])
-        for k, v in mm_data.items()
+        for k, v in mm_data.items() if v is not None
     }
     return {k: len(v) for k, v in mm_items.items()}
 

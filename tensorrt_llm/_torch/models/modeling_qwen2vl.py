@@ -78,7 +78,7 @@ from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,
-    get_multimodal_embeddings)
+    get_multimodal_embeddings, is_uint8_rgb_frame)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
@@ -151,6 +151,26 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
     supports_tokenization_cache = True
+
+    def get_mm_items_prompt(
+        self,
+        mm_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+        mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        prompt = super().get_mm_items_prompt(mm_data, mm_item_order,
+                                             mm_processor_kwargs)
+        # HF uses one rescale setting for the request. Raw RGB items keep
+        # that setting independent of which other items need encoding.
+        for modality, items in mm_data.items():
+            if items is None:
+                continue
+            for item in items if isinstance(items, list) else [items]:
+                frames = item.frames if modality == "video" else [item]
+                if not all(is_uint8_rgb_frame(frame) for frame in frames):
+                    raise ValueError("Prompt-free Qwen-VL encoding requires "
+                                     "RGB PIL or uint8 NumPy frames")
+        return prompt
 
     def export_decode_state(
             self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
