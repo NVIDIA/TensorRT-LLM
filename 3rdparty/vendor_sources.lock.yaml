@@ -26,7 +26,7 @@ vendors:
   flashinfer-prims-ts-moe:
     url: https://github.com/flashinfer-ai/flashinfer.git
     branch: main
-    commit: 855eece4e9b5b796a46148664a3e27da571cd98b
+    commit: 637f9c5309093704b9500495068627761f6ebc97
     source: flashinfer/prims_ts
     destination: tensorrt_llm/_torch/moe/kernels/prims_ts
     include:
@@ -43,7 +43,7 @@ vendors:
     - moe/*.json
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts-moe.patch
     patch_digest: sha256:0cfe8e1c35e9599bf0e1a6fbeb7382128dd1b0f7ad82356320e946698ec7f2bb
-    digest: sha256-tree-v1:4ecc60cf4ae2d51b759d7e57dbbee0793fc882e266c2675a6e7302ab127aaee9
+    digest: sha256-tree-v1:f4ceec200389d5f470ae3cbca791d2a30041a62e89cf3ee7f74495619919fffc
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

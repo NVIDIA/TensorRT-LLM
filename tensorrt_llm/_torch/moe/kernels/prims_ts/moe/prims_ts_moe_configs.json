@@ -686,8 +686,15 @@
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,num_stages_tmem_acc,num_load_b_warps,num_load_sfb_warps,load_b_regs,load_sfb_regs": [
                 [64, 64, 64, 256, 4, 4, 4, 4, 4, 4, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 0, 1, 48, 48],
                 [64, 64, 64, 128, 7, 7, 7, 7, 7, 7, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 0, 1, 48, 48],
+                [64, 64, 64, 256, 5, 5, 5, 5, 5, 5, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 1, 1, 48, 48],
+                [64, 64, 64, 128, 9, 9, 9, 9, 9, 9, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 1, 1, 48, 48],
+                [64, 64, 64, 128, 10, 10, 10, 10, 10, 10, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 1, 1, 48, 48],
                 [128, 128, 32, 256, 3, 3, 3, 3, 3, 3, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48],
-                [128, 128, 32, 128, 3, 3, 3, 3, 3, 3, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48]
+                [128, 128, 32, 128, 3, 3, 3, 3, 3, 3, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48],
+                [128, 128, 32, 256, 4, 4, 4, 4, 4, 4, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48],
+                [128, 128, 32, 128, 5, 5, 5, 5, 5, 5, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48],
+                [128, 128, 32, 128, 6, 6, 6, 6, 6, 6, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48],
+                [128, 128, 32, 128, 7, 7, 7, 7, 7, 7, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48]
             ],
             "tile_scheduler": "persistent"
         },
@@ -813,7 +820,10 @@
             "fuse_sf_copy_to_mma": true,
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,num_load_b_warps,num_load_sfb_warps,load_b_regs,load_sfb_regs": [
                 [256, 256, 64, 128, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
-                [256, 256, 64, 256, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56]
+                [256, 256, 64, 256, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
+                [256, 256, 64, 128, 4, 4, 4, 4, 4, 4, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
+                [256, 256, 64, 128, 5, 5, 5, 5, 5, 5, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
+                [256, 256, 64, 128, 6, 6, 6, 6, 6, 6, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56]
             ],
             "tile_scheduler": "persistent",
             "num_stages_tmem_acc": 1
@@ -860,6 +870,7 @@
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,load_b_regs,num_stages_tmem_acc": [
                 [64, 64, 64, 256, 4, 4, 4, 4, 4, 4, "8x4", 168, 96, 96, 96, 96, 96, 96, 96, 2],
                 [64, 64, 64, 128, 7, 7, 7, 7, 7, 7, "8x4", 168, 96, 96, 96, 96, 96, 96, 96, 2],
+                [64, 64, 64, 128, 9, 9, 9, 9, 9, 9, "8x4", 168, 96, 96, 96, 96, 96, 96, 96, 2],
                 [128, 128, 64, 256, 3, 3, 3, 3, 3, 3, "128x4", 168, 96, 96, 96, 96, 96, 96, 96, 2],
                 [128, 128, 64, 128, 7, 7, 7, 7, 7, 7, "128x4", 168, 96, 96, 96, 96, 96, 96, 96, 2]
             ],

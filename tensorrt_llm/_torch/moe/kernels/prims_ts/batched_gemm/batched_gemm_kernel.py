@@ -1566,6 +1566,10 @@ def _batched_gemm_kernel_bf16_body(
     act_tensor: cute.Tensor,
     sfa_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
     sfb_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
+    finalize_out_tensor: cute.Tensor,
+    c_rows_tensor: cute.Tensor,
+    expanded_idx_tensor: cute.Tensor,
+    expert_weights_tensor: cute.Tensor,
     problem_m: cutlass.Int32,
     c_row_stride: cutlass.Int32,
     sf_c_m_offset: cutlass.Int32,
@@ -2017,6 +2021,24 @@ def _batched_gemm_kernel_bf16_body(
         c_row_stride=c_row_stride,
         sf_c_m_offset=sf_c_m_offset,
         problem_n=problem_n,
+        finalize_out_tensor=(
+            finalize_out_tensor
+            if cutlass.const_expr(cfg.fused_finalize_top_k)
+            else None
+        ),
+        c_rows_tensor=(
+            c_rows_tensor if cutlass.const_expr(cfg.fused_finalize_top_k) else None
+        ),
+        expanded_idx_tensor=(
+            expanded_idx_tensor
+            if cutlass.const_expr(cfg.fused_finalize_top_k)
+            else None
+        ),
+        expert_weights_tensor=(
+            expert_weights_tensor
+            if cutlass.const_expr(cfg.fused_finalize_top_k)
+            else None
+        ),
         name="GmemC",
     )
 
@@ -2786,6 +2808,10 @@ def batched_gemm_kernel_bf16(
     act_tensor: cute.Tensor,
     sfa_gmem_tensor: cute.Tensor,
     sfb_gmem_tensor: cute.Tensor,
+    finalize_out_tensor: cute.Tensor,
+    c_rows_tensor: cute.Tensor,
+    expanded_idx_tensor: cute.Tensor,
+    expert_weights_tensor: cute.Tensor,
     problem_m: cutlass.Int32,
     c_row_stride: cutlass.Int32,
     sf_c_m_offset: cutlass.Int32,
@@ -2824,6 +2850,10 @@ def batched_gemm_kernel_bf16(
         act_tensor,
         sfa_gmem_tensor,
         sfb_gmem_tensor,
+        finalize_out_tensor,
+        c_rows_tensor,
+        expanded_idx_tensor,
+        expert_weights_tensor,
         problem_m,
         c_row_stride,
         sf_c_m_offset,
@@ -2864,6 +2894,9 @@ def gemm(
     gemm1_alpha_raw_ptr,
     gemm1_beta_raw_ptr,
     gemm1_clamp_limit_raw_ptr,
+    finalize_out_raw_ptr: cute.Pointer,  # MoE output (fused finalize only)
+    expanded_idx_raw_ptr: cute.Pointer,  # Int32 expanded-to-permuted map (fused finalize)
+    expert_weights_raw_ptr: cute.Pointer,  # routing weights (fused finalize only)
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
     c_row_stride: cutlass.Int32,
@@ -3539,8 +3572,8 @@ def gemm(
     tile_idx_layout = cute.make_layout((num_token_cgas,), stride=(1,))
     tile_idx_tensor = cute.make_tensor(tile_idx_raw_ptr, tile_idx_layout)
 
-    # Route map (gather only; dummy 1-element when off)
-    if cutlass.const_expr(cfg.has_routed_act):
+    # Route map (gather and fused finalize only; dummy 1-element when off)
+    if cutlass.const_expr(cfg.has_routed_act or cfg.fused_finalize_top_k):
         num_total_tokens = n if cutlass.const_expr(cfg.is_swap_ab) else m
         route_map_layout = cute.make_layout((num_total_tokens,), stride=(1,))
     else:
@@ -3619,6 +3652,27 @@ def gemm(
             cute.make_layout((1,), stride=(1,)),
         )
 
+    # Fused finalize: row-major [rows, m] views of the MoE output and of C.
+    if cutlass.const_expr(cfg.fused_finalize_top_k):
+        finalize_out_tensor = cute.make_tensor(
+            finalize_out_raw_ptr, cute.make_layout((num_tokens * m,), stride=(1,))
+        )
+        c_rows_tensor = cute.make_tensor(
+            c_raw_ptr, cute.make_layout((n * c_row_stride,), stride=(1,))
+        )
+        expanded_layout = cute.make_layout(
+            (num_tokens * cfg.fused_finalize_top_k,), stride=(1,)
+        )
+    else:
+        # Placeholders, never accessed.
+        finalize_out_tensor = cute.make_tensor(
+            finalize_out_raw_ptr, cute.make_layout((1,), stride=(1,))
+        )
+        c_rows_tensor = finalize_out_tensor
+        expanded_layout = cute.make_layout((1,), stride=(1,))
+    expanded_idx_tensor = cute.make_tensor(expanded_idx_raw_ptr, expanded_layout)
+    expert_weights_tensor = cute.make_tensor(expert_weights_raw_ptr, expanded_layout)
+
     kernel = batched_gemm_kernel_bf16(
         tma_a_desc,
         tma_b_desc,
@@ -3643,6 +3697,10 @@ def gemm(
         act_tensor,
         sfa_gmem_tensor,
         sfb_gmem_tensor,
+        finalize_out_tensor,
+        c_rows_tensor,
+        expanded_idx_tensor,
+        expert_weights_tensor,
         m,
         c_row_stride,
         sf_c_m_offset,

@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Int64, Float32
 from cutlass._mlir import ir as _ir
 from cutlass._mlir.dialects import llvm, nvvm as _nvvm_dialect
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -54,6 +54,8 @@ Constexpr = cutlass.Constexpr
 # epilogue task.  Naming them here prevents store paths from silently drifting.
 _TMA_STORE_BARRIER_BASE = 7
 _EPILOGUE_BARRIER_ID = 9
+# Destination row of a fused-finalize column that is not stored.
+_SKIP_ROW = -1
 _FP4_VALUES_PER_PACKED_WORD = 8
 _PACKED_WORD_BYTES = 4
 
@@ -220,6 +222,20 @@ class GmemCResource(MemoryResource):
     problem_n: Any = None
     c_row_stride: Any = None
     sf_c_m_offset: Any = None
+    # Fused finalize (cfg.fused_finalize_top_k > 0): flat views of the MoE
+    # output and of C, the expanded-to-permuted index map and the routing
+    # weights.
+    finalize_out_tensor: Any = None
+    c_rows_tensor: Any = None
+    expanded_idx_tensor: Any = None
+    expert_weights_tensor: Any = None
+    gFinalizeOut: Any = None
+    gCRows: Any = None
+    gExpandedIdx: Any = None
+    gExpertWeights: Any = None
+    sFinalizeOutRow: Any = None
+    sFinalizeCRow: Any = None
+    sFinalizeWeight: Any = None
     gC: Any = None  # make_array_view of c_tensor
     gCBytes: Any = None
     gCInt16: Any = None
@@ -257,6 +273,7 @@ class GmemCResource(MemoryResource):
     _alloc_bias: Constexpr[Optional[SmemAllocation]] = None
     _alloc_per_token_sf_a: Constexpr[Optional[SmemAllocation]] = None
     _alloc_per_token_sf_b: Constexpr[Optional[SmemAllocation]] = None
+    _alloc_fused_finalize: Constexpr[Optional[SmemAllocation]] = None
 
     def __post_init__(self):
         if self._alloc_sc is None:
@@ -293,6 +310,21 @@ class GmemCResource(MemoryResource):
                 size_bytes=self.cfg.tile_n * 4,
                 alignment=16,
             )
+        if self._alloc_fused_finalize is None and self.cfg.fused_finalize_top_k:
+            # Per token-tile column: MoE output row, C row and routing weight.
+            self._alloc_fused_finalize = SmemAllocation(
+                f"{self.name}_fused_finalize",
+                size_bytes=self.cfg.tile_n * 12,
+                alignment=16,
+            )
+        if self.finalize_out_tensor is not None:
+            self.gFinalizeOut = cutlass.make_array_view(self.finalize_out_tensor)
+        if self.c_rows_tensor is not None:
+            self.gCRows = cutlass.make_array_view(self.c_rows_tensor)
+        if self.expanded_idx_tensor is not None:
+            self.gExpandedIdx = cutlass.make_array_view(self.expanded_idx_tensor)
+        if self.expert_weights_tensor is not None:
+            self.gExpertWeights = cutlass.make_array_view(self.expert_weights_tensor)
         if self.c_tensor is not None:
             self.gC = cutlass.make_array_view(self.c_tensor)
             if (
@@ -345,6 +377,8 @@ class GmemCResource(MemoryResource):
             requirements.append(self._alloc_per_token_sf_a)
         if self._alloc_per_token_sf_b is not None:
             requirements.append(self._alloc_per_token_sf_b)
+        if self._alloc_fused_finalize is not None:
+            requirements.append(self._alloc_fused_finalize)
         return requirements
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -415,6 +449,28 @@ class GmemCResource(MemoryResource):
             self.sPerTokenSfB = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc_per_token_sf_b.offset,
                 dtype=cutlass.Float32,
+                shape=(self.cfg.tile_n,),
+                addrspace=3,
+            )
+        if cutlass.const_expr(self._alloc_fused_finalize is not None):
+            finalize_base = (
+                context.smem_base.data_ptr() + self._alloc_fused_finalize.offset
+            )
+            self.sFinalizeOutRow = cutlass.Array(
+                finalize_base,
+                dtype=Int32,
+                shape=(self.cfg.tile_n,),
+                addrspace=3,
+            )
+            self.sFinalizeCRow = cutlass.Array(
+                finalize_base + self.cfg.tile_n * 4,
+                dtype=Int32,
+                shape=(self.cfg.tile_n,),
+                addrspace=3,
+            )
+            self.sFinalizeWeight = cutlass.Array(
+                finalize_base + self.cfg.tile_n * 8,
+                dtype=Float32,
                 shape=(self.cfg.tile_n,),
                 addrspace=3,
             )
@@ -955,6 +1011,8 @@ class GmemCResource(MemoryResource):
                 token_rows,
             )
         self.tile_token_limit = token_limit
+        if cutlass.const_expr(self.cfg.fused_finalize_top_k):
+            self._load_fused_finalize_rows(tile_coord_n, token_limit)
         self.tile_scale_c = self._load_scale_c_global(expert_idx)
         self.tile_scale_gate = self._load_scale_gate_global(expert_idx)
         if cutlass.const_expr(self.cfg.has_gemm1_activation_params):
@@ -1047,6 +1105,93 @@ class GmemCResource(MemoryResource):
                 barrier_id=_EPILOGUE_BARRIER_ID,
                 thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
             )
+
+    @cute.jit
+    def _load_fused_finalize_rows(self, tile_coord_n, token_limit):
+        """Destination rows and routing weights of this token tile's columns.
+
+        A column whose token has exactly one expert in this launch goes to
+        that token's MoE output row, scaled by the expert's weight; any other
+        valid column goes unscaled to its own C row. Padding columns get
+        ``_SKIP_ROW`` for both.
+        """
+        top_k = self.cfg.fused_finalize_top_k
+        num_threads = self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE
+        tidx, _, _ = cute.arch.thread_idx()
+        # The previous tile's stores may still read the old rows.
+        prims.barrier_cta_sync(barrier_id=6, thread_count=num_threads)
+        for i in cutlass.range_constexpr(
+            (self.cfg.tile_n + num_threads - 1) // num_threads
+        ):
+            col = tidx + Int32(i * num_threads)
+            if col < Int32(self.cfg.tile_n):
+                out_row = Int32(_SKIP_ROW)
+                c_row = Int32(_SKIP_ROW)
+                weight = Float32(1.0)
+                if col < token_limit:
+                    permuted_row = tile_coord_n * Int32(self.cfg.tile_n) + col
+                    token = self.route_map_view.load(idx=permuted_row, vector_size=1)[0]
+                    expanded_base = token * Int32(top_k)
+                    num_local = Int32(0)
+                    slot = Int32(0)
+                    for k in cutlass.range_constexpr(top_k):
+                        idx = self.gExpandedIdx.load(
+                            idx=expanded_base + Int32(k), vector_size=1
+                        )[0]
+                        if idx >= Int32(0):
+                            num_local = num_local + Int32(1)
+                        if idx == permuted_row:
+                            slot = Int32(k)
+                    if num_local == Int32(1):
+                        out_row = token
+                        weight = Float32(
+                            self.gExpertWeights.load(
+                                idx=expanded_base + slot, vector_size=1
+                            )[0]
+                        )
+                    else:
+                        c_row = permuted_row
+                self.sFinalizeOutRow.subview(col).store(out_row)
+                self.sFinalizeCRow.subview(col).store(c_row)
+                self.sFinalizeWeight.subview(col).store(weight)
+        prims.barrier_cta_sync(barrier_id=6, thread_count=num_threads)
+
+    @cute.jit
+    def _store_fused_finalize_vec4(self, val0, val1, val2, val3, col, m_row, output_m):
+        """Store four consecutive hidden values of one token-tile column.
+
+        A column of a single-expert token is scaled by its routing weight and
+        goes to the token's MoE output row; other valid columns go to C. Rows
+        from ``output_m`` on (the second CTA of a two-CTA tile past the end of
+        the hidden dimension) are not stored. Row offsets are 64-bit: rows
+        times the row pitch may exceed ``Int32``.
+        """
+        out_row = self.sFinalizeOutRow.load(idx=col, vector_size=1)[0]
+        c_row = self.sFinalizeCRow.load(idx=col, vector_size=1)[0]
+        weight = self.sFinalizeWeight.load(idx=col, vector_size=1)[0]
+        val0, val1 = self._fmul2(val0, val1, weight, weight)
+        val2, val3 = self._fmul2(val2, val3, weight, weight)
+        packed = (
+            self._to_output_value(val0),
+            self._to_output_value(val1),
+            self._to_output_value(val2),
+            self._to_output_value(val3),
+        )
+        if m_row < output_m:
+            if out_row != Int32(_SKIP_ROW):
+                self.gFinalizeOut.store(
+                    packed,
+                    idx=Int64(out_row) * Int64(output_m) + Int64(m_row),
+                    vector_size=4,
+                    alignment=8,
+                )
+            elif c_row != Int32(_SKIP_ROW):
+                self.gCRows.store(
+                    packed,
+                    idx=Int64(c_row) * Int64(self._c_pitch(output_m)) + Int64(m_row),
+                    vector_size=4,
+                    alignment=8,
+                )
 
     @producer_work
     @cute.jit
@@ -5302,52 +5447,65 @@ class GmemCResource(MemoryResource):
                         val1_f32 = self._maybe_apply_scale_c(val1_f32, scale_c)
                         val2_f32 = self._maybe_apply_scale_c(val2_f32, scale_c)
                         val3_f32 = self._maybe_apply_scale_c(val3_f32, scale_c)
-                        if cutlass.const_expr(group == 0 and col_sub == 0):
-                            # Overlap T2R and register arithmetic with the
-                            # previous TMA read, then protect the first writer.
-                            prims.cp_async_bulk_wait_group(0, read=True)
-                            prims.barrier_cta_sync(
-                                barrier_id=Int32(_TMA_STORE_BARRIER_BASE)
-                                + warpgroup_idx,
-                                thread_count=self.cfg.epilogue_threads_per_warpgroup,
-                            )
-                        if cutlass.const_expr(self.cfg.uses_fp8_output):
-                            self._stage_swap_ab_fp8_tma_vec4(
+                        if cutlass.const_expr(self.cfg.fused_finalize_top_k):
+                            # Straight from registers to the destination rows.
+                            self._store_fused_finalize_vec4(
                                 val0_f32,
                                 val1_f32,
                                 val2_f32,
                                 val3_f32,
-                                base_row_idx,
-                                tmem_col,
+                                n_subtile_offset + tmem_col,
+                                m_tile_base + base_row_idx,
+                                output_m,
                             )
                         else:
-                            if cutlass.const_expr(
-                                self.cfg.swap_tma_store_offsets_are_col_linear
-                            ):
-                                if cutlass.const_expr(col_sub == 0):
-                                    smem_offset = tma_smem_base_even
-                                else:
-                                    smem_offset = tma_smem_base_odd
-                                smem_offset += Int32(
-                                    group * self.cfg.swap_tma_store_col_group_step_elems
+                            if cutlass.const_expr(group == 0 and col_sub == 0):
+                                # Overlap T2R and register arithmetic with the
+                                # previous TMA read, then protect the first writer.
+                                prims.cp_async_bulk_wait_group(0, read=True)
+                                prims.barrier_cta_sync(
+                                    barrier_id=Int32(_TMA_STORE_BARRIER_BASE)
+                                    + warpgroup_idx,
+                                    thread_count=self.cfg.epilogue_threads_per_warpgroup,
+                                )
+                            if cutlass.const_expr(self.cfg.uses_fp8_output):
+                                self._stage_swap_ab_fp8_tma_vec4(
+                                    val0_f32,
+                                    val1_f32,
+                                    val2_f32,
+                                    val3_f32,
+                                    base_row_idx,
+                                    tmem_col,
                                 )
                             else:
-                                group_stride_elems = Int32(
-                                    self.cfg.num_bytes_c_tma_store_per_group // 2
-                                )
-                                smem_offset = (
-                                    warpgroup_idx * group_stride_elems
-                                    + self._bf16_tma_smem_element_offset(
-                                        base_row_idx, tmem_col
+                                if cutlass.const_expr(
+                                    self.cfg.swap_tma_store_offsets_are_col_linear
+                                ):
+                                    if cutlass.const_expr(col_sub == 0):
+                                        smem_offset = tma_smem_base_even
+                                    else:
+                                        smem_offset = tma_smem_base_odd
+                                    smem_offset += Int32(
+                                        group
+                                        * self.cfg.swap_tma_store_col_group_step_elems
                                     )
+                                else:
+                                    group_stride_elems = Int32(
+                                        self.cfg.num_bytes_c_tma_store_per_group // 2
+                                    )
+                                    smem_offset = (
+                                        warpgroup_idx * group_stride_elems
+                                        + self._bf16_tma_smem_element_offset(
+                                            base_row_idx, tmem_col
+                                        )
+                                    )
+                                self._stage_swap_ab_bf16_tma_vec4(
+                                    self._to_output_value(val0_f32),
+                                    self._to_output_value(val1_f32),
+                                    self._to_output_value(val2_f32),
+                                    self._to_output_value(val3_f32),
+                                    smem_offset,
                                 )
-                            self._stage_swap_ab_bf16_tma_vec4(
-                                self._to_output_value(val0_f32),
-                                self._to_output_value(val1_f32),
-                                self._to_output_value(val2_f32),
-                                self._to_output_value(val3_f32),
-                                smem_offset,
-                            )
                     else:
                         for row_sub in cutlass.range_constexpr(4):
                             m_local_row = base_row_idx + Int32(row_sub)
@@ -5402,7 +5560,9 @@ class GmemCResource(MemoryResource):
                                             1 if self.cfg.uses_fp8_output else 2
                                         ),
                                     )
-            if cutlass.const_expr(self.cfg.use_tma_store):
+            if cutlass.const_expr(
+                self.cfg.use_tma_store and not self.cfg.fused_finalize_top_k
+            ):
                 self._commit_swap_ab_plain_tma(
                     tile_coord_m,
                     tile_coord_n,

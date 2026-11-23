@@ -541,6 +541,79 @@ def _make_gemm1_oa_ptrs(
     return alpha_dp, beta_dp, clamp_limit_dp, alpha, beta, clamp_limit
 
 
+def _fused_finalize_io(
+    *,
+    cfg,
+    finalize_output: torch.Tensor | None,
+    expanded_idx_to_permuted_idx: torch.Tensor | None,
+    expert_weights: torch.Tensor | None,
+    num_tokens: int,
+    top_k: int,
+    hidden_size: int,
+) -> dict:
+    """Pointers of an FC2 launch with a fused finalize epilogue."""
+    from cutlass.cute.runtime import make_ptr
+    import cutlass
+
+    if int(cfg.fused_finalize_top_k) != top_k:
+        raise ValueError(
+            f"fused_finalize_top_k {cfg.fused_finalize_top_k} does not match "
+            f"top_k {top_k}"
+        )
+    if finalize_output is None or expanded_idx_to_permuted_idx is None:
+        raise ValueError("a fused finalize needs the MoE output and expanded map")
+    if expert_weights is None:
+        raise ValueError("a fused finalize needs the expert weights")
+    if finalize_output.dtype != torch.bfloat16 or tuple(finalize_output.shape) != (
+        num_tokens,
+        hidden_size,
+    ):
+        raise ValueError(
+            f"finalize_output must be bfloat16 [{num_tokens}, {hidden_size}], got "
+            f"{finalize_output.dtype} {tuple(finalize_output.shape)}"
+        )
+    if expanded_idx_to_permuted_idx.dtype != torch.int32 or (
+        expanded_idx_to_permuted_idx.numel() < num_tokens * top_k
+    ):
+        raise ValueError(
+            "expanded_idx_to_permuted_idx must be int32 with num_tokens * top_k entries"
+        )
+    weight_dtypes = {torch.float32: cutlass.Float32, torch.bfloat16: cutlass.BFloat16}
+    if expert_weights.dtype not in weight_dtypes or (
+        expert_weights.numel() < num_tokens * top_k
+    ):
+        raise ValueError(
+            "expert_weights must be float32 or bfloat16 with num_tokens * top_k entries"
+        )
+    for name, tensor in (
+        ("finalize_output", finalize_output),
+        ("expanded_idx_to_permuted_idx", expanded_idx_to_permuted_idx),
+        ("expert_weights", expert_weights),
+    ):
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    return {
+        "finalize_out_dp": make_ptr(
+            cutlass.BFloat16,
+            finalize_output.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        "expanded_idx_dp": make_ptr(
+            cutlass.Int32,
+            expanded_idx_to_permuted_idx.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        "expert_weights_dp": make_ptr(
+            weight_dtypes[expert_weights.dtype],
+            expert_weights.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=2,
+        ),
+    }
+
+
 def build_bf16_launch_io(
     *,
     fc: Literal["fc1", "fc2"],
@@ -1294,8 +1367,16 @@ def build_mxfp4_mxfp8_launch_io(
     top_k: int,
     intermediate_size: int,
     hidden_size: int,
+    finalize_output: torch.Tensor | None = None,
+    expanded_idx_to_permuted_idx: torch.Tensor | None = None,
+    expert_weights: torch.Tensor | None = None,
 ) -> dict:
-    """Build Prims-TS launch IO for the MXFP4xMXFP8 MoE path."""
+    """Build Prims-TS launch IO for the MXFP4xMXFP8 MoE path.
+
+    An FC2 config with ``fused_finalize_top_k`` also takes the MoE output
+    (``finalize_output``), ``expanded_idx_to_permuted_idx`` and the routing
+    ``expert_weights``.
+    """
     from cutlass.cute.runtime import make_ptr
     import cutlass
 
@@ -1594,7 +1675,7 @@ def build_mxfp4_mxfp8_launch_io(
         total_num_padded_tokens,
     ]
 
-    return {
+    io = {
         "cfg": cfg,
         "launch_early_exit_max_token_ctas": launch_early_exit_max_token_ctas,
         "M": m_val,
@@ -1630,6 +1711,22 @@ def build_mxfp4_mxfp8_launch_io(
         "gemm1_clamp_limit_dp": gemm1_clamp_limit_dp,
         "_keepalive": _keepalive,
     }
+    if cfg.fused_finalize_top_k:
+        io.update(
+            _fused_finalize_io(
+                cfg=cfg,
+                finalize_output=finalize_output,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                expert_weights=expert_weights,
+                num_tokens=num_tokens,
+                top_k=top_k,
+                hidden_size=hidden_size,
+            )
+        )
+        _keepalive.extend(
+            (finalize_output, expanded_idx_to_permuted_idx, expert_weights)
+        )
+    return io
 
 
 def build_fp8_block_scale_launch_io(

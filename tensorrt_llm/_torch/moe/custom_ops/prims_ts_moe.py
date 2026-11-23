@@ -22,8 +22,10 @@ launch arguments are built the way FlashInfer's own runner builds them
 autotuner.
 """
 
+import hashlib
 from dataclasses import replace
-from functools import lru_cache
+from functools import cache, lru_cache
+from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
 import torch
@@ -42,8 +44,21 @@ from ...custom_ops.trtllm_gen_custom_ops import (
 #: TMA descriptors need at least this much backing storage per tensor.
 _MIN_TMA_BYTES = 128 * 1024
 
-#: Version tag of the tactic space, part of the autotuner cache key.
-_TACTIC_SPACE_VERSION = "prims_ts_moe_v1"
+
+@cache
+def _tactic_space_version() -> str:
+    """Digest of the vendored sources that say what a tactic index means.
+
+    Part of the autotuner cache key, so tuned tactics saved under other config
+    tables are not replayed against these.
+    """
+    from ..kernels.prims_ts.moe import config_mapper
+
+    root = Path(config_mapper.__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted([root / "config_mapper.py", *root.glob("*.json")]):
+        digest.update(path.read_bytes())
+    return f"prims_ts_moe_{digest.hexdigest()[:16]}"
 
 
 class _GemmPlan(NamedTuple):
@@ -361,7 +376,7 @@ class PrimsTSMoERunner(TunableRunner):
 
     def unique_id(self) -> tuple:
         return (
-            _TACTIC_SPACE_VERSION,
+            _tactic_space_version(),
             self.num_experts,
             self.local_expert_offset,
             self.activation_type,

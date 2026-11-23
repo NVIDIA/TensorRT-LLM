@@ -26,6 +26,7 @@ from importlib import resources
 import math
 from typing import Sequence
 
+from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 
 SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 192, 256)
@@ -1242,6 +1243,48 @@ def apply_weight_l2_policy(pair: PrimsTsGemmPair) -> PrimsTsGemmPair:
         moe_config_index=pair.moe_config_index,
         fc1=with_policy(pair.fc1),
         fc2=with_policy(pair.fc2),
+    )
+
+
+def apply_fused_finalize(
+    pair: PrimsTsGemmPair, *, num_tokens: int, top_k: int, num_local_experts: int
+) -> PrimsTsGemmPair:
+    """Fuse the MoE finalize into the FC2 epilogue when its config allows it.
+
+    The FC2 epilogue then stores every token with exactly one local expert
+    straight into the MoE output, scaled by its routing weight, and the
+    finalize kernel only zeroes tokens without a local expert and reduces
+    tokens with several. Configs that cannot host the fused epilogue are
+    returned unchanged.
+    """
+    kwargs = dict(pair.fc2.cfg.kwargs)
+    kwargs["fused_finalize_top_k"] = int(top_k)
+    spec = PrimsTsConfigSpec(kwargs=kwargs)
+    try:
+        _ensure_config_task_manager_buildable(
+            spec,
+            dtype_label="",
+            fc="FC2",
+            tile_n=pair.tile_n,
+            moe_config_index=pair.moe_config_index,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_experts=num_local_experts,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.debug(
+            "[Prims-TS MoE] Keeping the unfused FC2 epilogue for tactic "
+            f"[{pair.tile_n}, {pair.moe_config_index}]: {exc}"
+        )
+        return pair
+    return PrimsTsGemmPair(
+        tile_n=pair.tile_n,
+        moe_config_index=pair.moe_config_index,
+        fc1=pair.fc1,
+        fc2=PrimsTsMoeGemmConfig(
+            cfg=spec,
+            prims_ts_gemm_config_index=pair.fc2.prims_ts_gemm_config_index,
+        ),
     )
 
 
