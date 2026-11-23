@@ -293,6 +293,9 @@ class _GraphRecorder:
 _TARGET_IDS = ((tp2, "tp2"), (tp4, "tp4"), (tp8, "tp8"))
 _ATTENTION = "trtllm.modeling_v2_m3_prefill_attention.default"
 _ROUTED_EXPERTS = "trtllm.modeling_v2_m3_prefill_routed_experts.default"
+# The serving token budget. The MoE runner then gets every trailing argument at its default, which the dispatcher
+# drops before calling the op's fake.
+_SERVING_TOKENS = {"max_num_tokens": 8192, "moe_max_num_tokens": 8192}
 
 
 @pytest.mark.parametrize(
@@ -303,7 +306,7 @@ _ROUTED_EXPERTS = "trtllm.modeling_v2_m3_prefill_routed_experts.default"
             pytest.param(
                 modeling,
                 fused,
-                {"moe_max_num_tokens": 64},
+                _SERVING_TOKENS,
                 (64, 48, 33, 32, 9, 8, 2),
                 _ATTENTION,
                 [2],
@@ -316,7 +319,7 @@ _ROUTED_EXPERTS = "trtllm.modeling_v2_m3_prefill_routed_experts.default"
         pytest.param(
             tp2,
             True,
-            {"moe_max_num_tokens": 64, "router_tc_cluster16": True},
+            {**_SERVING_TOKENS, "router_tc_cluster16": True},
             (64, 48, 9, 8, 2),
             "trtllm.minimax_m3_router_tc",
             [0, 1],
