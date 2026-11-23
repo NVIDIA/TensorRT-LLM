@@ -1373,6 +1373,51 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def wait_event(event: torch.cuda.Event) -> None:
+    """``event.synchronize()``, skipped for a completed event: ``synchronize``
+    releases the GIL even then, ``query`` keeps it."""
+    if not event.query():
+        event.synchronize()
+
+
+_current_cuda_streams: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def current_cuda_stream(
+        device_index: Optional[int] = None) -> torch.cuda.Stream:
+    """``torch.cuda.current_stream()`` without a per-call device lookup or Stream construction."""
+    if device_index is None:
+        device_index = torch._C._cuda_getDevice()
+    key = (device_index, torch._C._cuda_getCurrentRawStream(device_index))
+    stream = _current_cuda_streams.get(key)
+    if stream is None:
+        stream = _current_cuda_streams[key] = torch.cuda.current_stream(
+            device_index)
+    return stream
+
+
+class CudaStreamScope:
+    """``torch.cuda.stream(stream)`` for a stream of the current device, without
+    the per-call device lookups."""
+
+    __slots__ = ("_stream", "_previous")
+
+    def __init__(self, stream: Optional[torch.cuda.Stream]) -> None:
+        self._stream = stream
+        self._previous = None
+
+    def __enter__(self) -> None:
+        if self._stream is not None:
+            self._previous = torch.cuda.current_stream(
+                self._stream.device_index)
+            torch.cuda.set_stream(self._stream)
+
+    def __exit__(self, *exc_info) -> None:
+        if self._previous is not None:
+            torch.cuda.set_stream(self._previous)
+            self._previous = None
+
+
 def async_tensor_h2d(data, dtype: torch.dtype,
                      device: Union[str, torch.device]) -> torch.Tensor:
     """Build a CPU tensor from `data` and ship it to `device` with a

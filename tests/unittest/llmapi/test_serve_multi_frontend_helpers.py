@@ -104,7 +104,9 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server.app = FastAPI(lifespan=lifespan)
     server.generator = SimpleNamespace(
         _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
+        args=SimpleNamespace(
+            return_perf_metrics=False, memory_monitor_config=None, num_serve_frontends=1
+        ),
     )
     server.use_harmony = False
     server._enable_rl_control_endpoints = False

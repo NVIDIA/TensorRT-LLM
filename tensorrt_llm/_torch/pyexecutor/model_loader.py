@@ -41,6 +41,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from ..locality_domain.policy import LocalityDomainPolicy
+from ..memory.monitor import claims as monitor_claims
+from ..memory.monitor import names as monitor_names
 from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
                           wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
@@ -946,7 +948,7 @@ def _load_checkpoint_into_model(
         # MX indicate weights to be preloaded successfully by returning
         # `weights` as empty. It does not yet support draft model.
         if (weights or is_draft_model
-                or not checkpoint_loader.is_weights_preloaded()):
+                or not mx_loading.is_mx_weights_preloaded(checkpoint_loader)):
             _copy_weights_into_model(
                 model_load_weights,
                 model_hooks.select_draft_weights(weights, key_prefixes),
@@ -958,7 +960,9 @@ def _load_checkpoint_into_model(
     # Take the policy after the weight session finished, which can turn
     # read-ahead into native I/O, and before a draft read with the same loader
     # resets it.
-    return checkpoint_io_policy_metadata(checkpoint_loader)
+    return checkpoint_io_policy_metadata(
+        checkpoint_loader,
+        weights_preloaded=mx_loading.is_mx_weights_preloaded(checkpoint_loader))
 
 
 def _copy_weights_into_model(model_load_weights: Callable[..., None],
@@ -1039,7 +1043,7 @@ def load_model_from_auto_load_format(
         metrics=metrics)
     # Read before the draft load: an MX draft read without MX state resets
     # this flag.
-    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+    weights_preloaded = mx_loading.is_mx_weights_preloaded(checkpoint_loader)
 
     # load separate draft weights
     if spec_config is not None and spec_config.needs_separate_draft_weights:
@@ -1457,6 +1461,9 @@ class ModelLoader:
                             for name, value in self._metrics.items())
         logger.info(
             f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+        # Attribute the parameters the model ended up with, whichever load
+        # path produced them. Only a weak reference; read when reporting.
+        monitor_claims.claim_module_memory(model, monitor_names.WEIGHTS)
         return model, moe_load_balancer
 
     def _timed_load(
@@ -1609,19 +1616,16 @@ class ModelLoader:
         with timing_metric(
                 ModelLoaderMetricNames.POST_LOAD_PROCESSING_SECONDS.value,
                 self._metrics):
-            # GMS RW and RO have already run the post_load_* hooks
-            # themselves. RW handles them inside `mem_pool_scope` so the
-            # committed pool reflects the post-post_load layout; RO runs
+            # GMS RW and RO have already run the post-load hooks and the MX
+            # publish themselves. RW handles them inside `mem_pool_scope` so
+            # the committed pool reflects the post-post_load layout; RO runs
             # `setup_aliases()` before `materialize_module` to wire aliases
             # prior to zero-copy mapping, then refreshes derived state after
             # real GMS tensors are bound.
             if load_format != LoadFormat.GMS:
-                checkpoint_loader.post_load_apply(
-                    model, weights_preloaded=weights_preloaded)
                 mx_loading.run_post_load_walks_and_publish(
                     checkpoint_loader,
                     model,
-                    checkpoint_dir=checkpoint_dir,
                     weights_preloaded=weights_preloaded,
                     qualification=post_transform_qualification,
                     source_identity=source_identity)
@@ -1811,6 +1815,7 @@ class ModelLoader:
             replicate_embedding=self.llm_args.replicate_embedding,
             cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
                 self.llm_args, self.max_num_tokens, self.spec_config),
+            max_batch_size=self.llm_args.max_batch_size,
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,

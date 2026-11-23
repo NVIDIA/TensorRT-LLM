@@ -37,6 +37,8 @@ l0_b200:
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/spec/test_modeling_v2_mtp_step.py
   - unittest/_torch/models/test_qwen3_5_int4_loading.py
   - unittest/_torch/modules/test_linear_uneven_tp.py::TestW4A16AWQMLP::test_optional_pre_quant_scale
+  - unittest/_torch/modeling/test_gemma_swa_scratch.py
+  - accuracy/test_gemma3_swa_scratch_default.py::TestGemma3SwaScratchDefault::test_default_scratch_matches_opt_out
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[False]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[True]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_block_reuse_is_disabled_for_v2
@@ -159,6 +161,7 @@ l0_b200:
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
+  - unittest/_torch/modules/test_logits_cast.py
   # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2 (decode / route fronts below).
   - unittest/_torch/moe/test_moe_nvfp4_engine.py
   - unittest/_torch/moe/test_moe_bf16_engine.py
@@ -266,7 +269,12 @@ l0_b200:
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp8_quant.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp8_quant.py
+  - unittest/_torch/kernels/fused_ops/test_soft_cap_logits.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
+  - unittest/_torch/modeling/test_gemma4_fused_ops.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_swiglu_nvfp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
@@ -293,8 +301,11 @@ l0_b200:
   - unittest/_torch/modules/dwdp/test_dense_attached_gpu.py
   # Real ConfigurableMoE layers sized and registered for DWDP while the model is built.
   - unittest/_torch/modules/dwdp/test_dwdp_moe_construction_gpu.py
+  # PagePool occupancy on the real VMM path, read by the memory monitor.
+  - unittest/_torch/modules/dwdp/test_page_pool_statistics.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
+  - unittest/_torch/moe/test_trtllm_gen_bf16_moe_inplace_refit.py
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/test_moe_comm_timeout_guard.py
@@ -313,6 +324,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_mxe2m1_weights_valid_dimensions
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_in_kernel_routing_256_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
@@ -386,6 +398,7 @@ l0_b200:
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
+  - unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"
@@ -489,6 +502,8 @@ l0_b200:
   - unittest/_torch/kernels/parallel_hw_agnostic/test_rotate_rows.py
   - unittest/_torch/kernels/parallel_hw_agnostic/test_scatter_kv_slots.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_wino_vae.py
+  - unittest/_torch/visual_gen/test_wino_vae_kernels.py
   - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
@@ -612,8 +627,8 @@ l0_b200:
   # Covered by H100 pre_merge for primary HW-agnostic signal; keep B200 runtime
   # canary in post_merge for CUDA IPC / virtual memory / profiling paths.
   - unittest/_torch/misc
-  # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
-  # checkpoint); ~13 min, too heavy for pre_merge. Mirrors l0_gb300_multi_gpus.
+  # Kimi K3 routing shape (896 experts, top_k 16) on the TRTLLM backend.
+  # Single-GPU, random weights; too heavy for pre_merge.
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   # Keep new full-corpus EAGLE-3 baselines in post_merge until repeated green
   # runs establish stable references.

@@ -66,6 +66,7 @@ from cutlass.cute import runtime as _crt
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
+from ....cute_dsl_file_cache import KernelCache
 from . import gvr_topk_decode_self_sampling_bf16 as _bf16
 from . import gvr_topk_decode_self_sampling_fp16 as _fp16
 
@@ -8269,7 +8270,7 @@ class GvrMainKernel:
 # ---------------------------------------------------------------------------
 # compile cache + torch-facing entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE = {}
+_COMPILE_CACHE = KernelCache(f"{__name__}._COMPILE_CACHE", __file__)
 
 
 def get_compiled(
@@ -16069,7 +16070,7 @@ class GvrTopkRegKernel:
 # ---------------------------------------------------------------------------
 # host wrapper: compile cache + route()-driven entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__reg: dict = {}
+_COMPILE_CACHE__reg: dict = KernelCache(f"{__name__}._COMPILE_CACHE__reg", __file__)
 
 
 def get_compiled__reg(
@@ -16212,7 +16213,8 @@ def get_compiled__reg(
         assert static_k is None or static_k == static_env_bf16[2]
         assert static_npad is None or static_npad == static_env_bf16[1]
         key += ("static_env_bf16",) + static_env_bf16
-    compiled = _COMPILE_CACHE__reg.get(key)
+    # A dump needs a compile, so it skips the stored kernels.
+    compiled = dict.get(_COMPILE_CACHE__reg, key) if dump_dir else _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
@@ -19410,7 +19412,7 @@ class GvrClusKernel:
 # ---------------------------------------------------------------------------
 # compile cache + torch-facing entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__clus = {}
+_COMPILE_CACHE__clus = KernelCache(f"{__name__}._COMPILE_CACHE__clus", __file__)
 
 
 def get_compiled__clus(
@@ -23827,7 +23829,7 @@ class GvrRegClusKernel:
 # ---------------------------------------------------------------------------
 # host wrapper: compile cache + route()-driven entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__regclus: dict = {}
+_COMPILE_CACHE__regclus: dict = KernelCache(f"{__name__}._COMPILE_CACHE__regclus", __file__)
 
 
 def get_compiled__regclus(
@@ -23918,7 +23920,10 @@ def get_compiled__regclus(
         assert 0 < static_env_bf16[0] <= static_env_bf16[1]
         assert static_env_bf16[2] == tpl[3] == 1024
         key += ("static_env_bf16",) + static_env_bf16
-    compiled = _COMPILE_CACHE__regclus.get(key)
+    # A dump needs a compile, so it skips the stored kernels.
+    compiled = (
+        dict.get(_COMPILE_CACHE__regclus, key) if dump_dir else _COMPILE_CACHE__regclus.get(key)
+    )
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
@@ -24509,7 +24514,9 @@ class ComplementKernel:
             )
 
 
-_COMPLEMENT_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
+_COMPLEMENT_COMPILE_CACHE: dict[tuple[Any, ...], Any] = KernelCache(
+    f"{__name__}._COMPLEMENT_COMPILE_CACHE", __file__
+)
 
 
 def get_compiled_complement(
